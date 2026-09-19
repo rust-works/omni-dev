@@ -25,6 +25,7 @@
 
 use anyhow::Result;
 
+use crate::cli::gmail::helpers::label_ids_contain_any;
 use crate::gmail::types::Label;
 
 /// Gmail system labels safe to replay onto a destination mailbox.
@@ -101,13 +102,13 @@ pub(crate) fn resolve_label_id_by_name(labels: &[Label], name: &str) -> Result<S
 /// the fan-out, since faithful replay can otherwise dump thousands of
 /// messages into an Inbox with no warning.
 pub(crate) fn lands_in_inbox_or_unread(label_ids: &[String]) -> bool {
-    label_ids.iter().any(|id| id == "INBOX" || id == "UNREAD")
+    label_ids_contain_any(label_ids, &["INBOX", "UNREAD"])
 }
 
 /// Whether any of `label_ids` would land a message somewhere Gmail
 /// auto-purges from — see the module doc's `TRASH`/`SPAM` note.
 pub(crate) fn lands_in_trash_or_spam(label_ids: &[String]) -> bool {
-    label_ids.iter().any(|id| id == "TRASH" || id == "SPAM")
+    label_ids_contain_any(label_ids, &["TRASH", "SPAM"])
 }
 
 #[cfg(test)]

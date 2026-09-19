@@ -65,6 +65,21 @@ pub(crate) struct ManifestRecord {
     /// the id again clears this via [`Manifest::undelete`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) deleted_at: Option<DateTime<Utc>>,
+    /// The `--exclude-label` value(s) currently known to explain why this
+    /// record is soft-deleted (#1780) — always empty when `deleted_at` is
+    /// unset. Set only by [`Manifest::mark_excluded`]/
+    /// [`Manifest::set_excluded_labels`] (`run_incremental`'s own
+    /// labelsAdded/labelsRemoved-driven tracking, the one place the
+    /// record's current label set is known precisely rather than guessed);
+    /// [`Manifest::mark_deleted`] (a real `messagesDeleted` event, or
+    /// `run_full_sync`'s listing-absence pass) always clears it, since a
+    /// generic deletion for an unrelated reason must never be mistaken for
+    /// a label exclusion later. This precision is load-bearing: it's what
+    /// lets an undelete-on-`labelsRemoved` fire safely and automatically,
+    /// without risking resurrecting a message soft-deleted for a reason
+    /// that has nothing to do with labels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) excluded_labels: Vec<String>,
 }
 
 impl ManifestRecord {
@@ -154,19 +169,59 @@ impl Manifest {
         }
     }
 
-    /// Soft-deletes a record: the `.eml` is never touched, only
-    /// `deleted_at` is set (a no-op if `id` is absent or already deleted).
+    /// Soft-deletes a record for a reason unrelated to `--exclude-label`
+    /// tracking (a real `messagesDeleted` event, or `run_full_sync`'s
+    /// listing-absence pass): the `.eml` is never touched, only
+    /// `deleted_at` is set (a no-op if `id` is absent). Also clears any
+    /// previously-tracked [`ManifestRecord::excluded_labels`] (#1780) — once
+    /// this generic path has touched a record, its `deleted_at` no longer
+    /// means what that tracking assumed, so a stale reason must never
+    /// survive to justify a later automatic undelete. Use
+    /// [`Self::mark_excluded`] instead when the reason *is* a label match.
     pub(crate) fn mark_deleted(&mut self, id: &str, at: DateTime<Utc>) {
         if let Some(record) = self.0.get_mut(id) {
             record.deleted_at = Some(at);
+            record.excluded_labels.clear();
+        }
+    }
+
+    /// Soft-deletes a record specifically because its current label set
+    /// matches `--exclude-label` (#1780) — unlike [`Self::mark_deleted`],
+    /// this records exactly which configured labels caused it, which is
+    /// what lets an undelete on the reverse transition
+    /// (`run_incremental`'s `reconcile_label_exclusion`) fire safely and
+    /// automatically instead of guessing from possibly-stale cached state.
+    pub(crate) fn mark_excluded(
+        &mut self,
+        id: &str,
+        at: DateTime<Utc>,
+        excluded_labels: Vec<String>,
+    ) {
+        if let Some(record) = self.0.get_mut(id) {
+            record.deleted_at = Some(at);
+            record.excluded_labels = excluded_labels;
+        }
+    }
+
+    /// Updates the label-exclusion reason [`Self::mark_excluded`] recorded,
+    /// without changing `deleted_at` — used when a still-excluded record's
+    /// *specific* matching label(s) change (e.g. one of two configured
+    /// excluded labels is removed from the message but another still
+    /// applies, so it must stay deleted rather than undelete).
+    pub(crate) fn set_excluded_labels(&mut self, id: &str, excluded_labels: Vec<String>) {
+        if let Some(record) = self.0.get_mut(id) {
+            record.excluded_labels = excluded_labels;
         }
     }
 
     /// Clears a previously-set soft-delete marker (a no-op if `id` is
-    /// absent or not currently deleted).
+    /// absent or not currently deleted) — also clears
+    /// [`ManifestRecord::excluded_labels`], since an undeleted record isn't
+    /// excluded by definition (#1780).
     pub(crate) fn undelete(&mut self, id: &str) {
         if let Some(record) = self.0.get_mut(id) {
             record.deleted_at = None;
+            record.excluded_labels.clear();
         }
     }
 
@@ -234,6 +289,7 @@ mod tests {
             size: 42,
             history_id: Some("1000".to_string()),
             deleted_at: None,
+            excluded_labels: Vec::new(),
         }
     }
 
@@ -357,6 +413,56 @@ mod tests {
 
         manifest.undelete("m1");
         assert_eq!(manifest.get("m1").unwrap().deleted_at, None);
+    }
+
+    #[test]
+    fn mark_deleted_clears_any_previously_tracked_excluded_labels() {
+        let mut manifest = Manifest::default();
+        manifest.upsert(sample_record("m1"));
+        manifest.mark_excluded("m1", Utc::now(), vec!["SPAM".to_string()]);
+        assert_eq!(manifest.get("m1").unwrap().excluded_labels, vec!["SPAM"]);
+
+        // A generic deletion (e.g. a real messagesDeleted event) must not
+        // leave a stale exclusion reason behind for a later undelete to
+        // trust (#1780).
+        manifest.mark_deleted("m1", Utc::now());
+        assert!(manifest.get("m1").unwrap().excluded_labels.is_empty());
+    }
+
+    #[test]
+    fn mark_excluded_sets_deleted_at_and_the_exact_reason() {
+        let mut manifest = Manifest::default();
+        manifest.upsert(sample_record("m1"));
+        let now = Utc::now();
+        manifest.mark_excluded("m1", now, vec!["SPAM".to_string(), "TRASH".to_string()]);
+        let record = manifest.get("m1").unwrap();
+        assert_eq!(record.deleted_at, Some(now));
+        assert_eq!(record.excluded_labels, vec!["SPAM", "TRASH"]);
+    }
+
+    #[test]
+    fn set_excluded_labels_updates_the_reason_without_touching_deleted_at() {
+        let mut manifest = Manifest::default();
+        manifest.upsert(sample_record("m1"));
+        let now = Utc::now();
+        manifest.mark_excluded("m1", now, vec!["SPAM".to_string(), "TRASH".to_string()]);
+
+        manifest.set_excluded_labels("m1", vec!["SPAM".to_string()]);
+        let record = manifest.get("m1").unwrap();
+        assert_eq!(record.deleted_at, Some(now), "deleted_at must be untouched");
+        assert_eq!(record.excluded_labels, vec!["SPAM"]);
+    }
+
+    #[test]
+    fn undelete_clears_excluded_labels() {
+        let mut manifest = Manifest::default();
+        manifest.upsert(sample_record("m1"));
+        manifest.mark_excluded("m1", Utc::now(), vec!["SPAM".to_string()]);
+
+        manifest.undelete("m1");
+        let record = manifest.get("m1").unwrap();
+        assert_eq!(record.deleted_at, None);
+        assert!(record.excluded_labels.is_empty());
     }
 
     #[test]

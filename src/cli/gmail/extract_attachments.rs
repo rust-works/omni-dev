@@ -213,6 +213,7 @@ Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
             size: raw.len() as u64,
             history_id: None,
             deleted_at: None,
+            excluded_labels: Vec::new(),
         });
         manifest
             .save(&crate::cli::gmail::sync::engine::manifest_path(archive_dir))
@@ -295,6 +296,7 @@ Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
             size: 0,
             history_id: None,
             deleted_at: None,
+            excluded_labels: Vec::new(),
         });
         manifest
             .save(&crate::cli::gmail::sync::engine::manifest_path(

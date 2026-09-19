@@ -31,6 +31,7 @@ use chrono::Utc;
 use futures::stream::{self, FuturesUnordered, StreamExt as _};
 use tokio::sync::{mpsc, Semaphore};
 
+use crate::cli::gmail::helpers::label_ids_contain_any;
 use crate::gmail::attachments::{extract_attachments, ExtractedAttachment};
 use crate::gmail::client::GmailClient;
 use crate::gmail::error::GmailError;
@@ -297,17 +298,37 @@ async fn run_full_sync(
     }
 
     for id in &listed_ids {
-        if manifest.get(id).is_some_and(|r| r.deleted_at.is_some()) {
-            if opts.dry_run {
-                report
-                    .actions
-                    .push(SyncAction::WouldUndelete { id: id.clone() });
-            } else {
-                manifest.undelete(id);
-                report
-                    .actions
-                    .push(SyncAction::Undeleted { id: id.clone() });
-            }
+        let Some(record) = manifest.get(id) else {
+            continue;
+        };
+        if record.deleted_at.is_none() {
+            continue;
+        }
+        // A record whose cached `excluded_labels` names a label this run's
+        // query could *not* have filtered server-side (a custom/untranslated
+        // one — see `full_sync_query`'s doc comment) must not be resurrected
+        // just because it still shows up in an otherwise-unfiltered listing:
+        // `run_incremental`'s own labelsRemoved tracking is the only source
+        // of truth for that label (#1780). A translated label (SPAM/TRASH)
+        // is safe to trust here even if cached: the listing query itself
+        // excludes it, so reappearing despite that is authoritative proof
+        // it's gone.
+        let stuck_on_untranslated_exclusion = record
+            .excluded_labels
+            .iter()
+            .any(|label| !translated_exclude_labels.iter().any(|t| t == label));
+        if stuck_on_untranslated_exclusion {
+            continue;
+        }
+        if opts.dry_run {
+            report
+                .actions
+                .push(SyncAction::WouldUndelete { id: id.clone() });
+        } else {
+            manifest.undelete(id);
+            report
+                .actions
+                .push(SyncAction::Undeleted { id: id.clone() });
         }
     }
 
@@ -320,13 +341,15 @@ async fn run_full_sync(
         if opts.dry_run {
             report.actions.push(SyncAction::WouldDelete { id });
         } else {
-            // Tag first (#1780) — see `full_sync_query`'s doc comment for
-            // why an id that vanished from this listing needs its cached
-            // label_ids primed with the labels that excluded it, before
-            // `run_incremental` ever gets a chance to trust that cache.
-            if !translated_exclude_labels.is_empty() {
-                manifest.add_labels(&id, &translated_exclude_labels);
-            }
+            // Plain, reason-less soft-delete: this pass has no way to know
+            // *which* configured label (if any) actually explains a given
+            // id's absence — `--query` can narrow the listing for entirely
+            // unrelated reasons too — so it must never guess and tag
+            // `excluded_labels` (#1780). Leaving it untouched (cleared, via
+            // `mark_deleted`) means only `run_incremental`'s own precise,
+            // event-driven tracking ever populates that field, which is
+            // exactly what keeps the undelete-on-reappearance check above
+            // safe.
             manifest.mark_deleted(&id, Utc::now());
             report.actions.push(SyncAction::Deleted { id });
         }
@@ -349,48 +372,56 @@ const FULL_SYNC_EXCLUDABLE_LABELS: &[(&str, &str)] = &[("SPAM", "spam"), ("TRASH
 
 /// Folds `opts.exclude_labels` into the query used for [`run_full_sync`]'s
 /// listing pass, for whichever entries have a known translation (see
-/// [`FULL_SYNC_EXCLUDABLE_LABELS`]) — combined with `opts.query` via a
-/// plain space-joined `AND`. An entry with no known translation (a custom/
-/// user label, or a system label outside the allow-list) can't be reliably
-/// excluded server-side by id alone, so it's left out of the query and a
-/// [`SyncAction::Note`] is pushed instead: `run_incremental` still filters
-/// it going forward (it works generally, off `label_ids` rather than a
-/// query translation), but this pass won't retroactively exclude it unless
-/// the caller also sets `--query`.
+/// [`FULL_SYNC_EXCLUDABLE_LABELS`]). An entry with no known translation (a
+/// custom/user label, or a system label outside the allow-list) can't be
+/// reliably excluded server-side by id alone, so it's left out of the query
+/// and a [`SyncAction::Note`] is pushed instead: `run_incremental` still
+/// filters it going forward (it works generally, off `label_ids` rather
+/// than a query translation), but this pass won't retroactively exclude it
+/// unless the caller also sets `--query`.
+///
+/// A caller-supplied `--query` is parenthesized before any exclusion
+/// clause is appended — `q OR r -in:spam` would parse as `q OR (r AND
+/// -in:spam)` (Gmail's implicit AND-by-juxtaposition binds tighter than an
+/// explicit `OR`), silently narrowing the exclusion to only the right-hand
+/// side of the caller's own query; `(q OR r) -in:spam` applies it to the
+/// whole thing, which is what `--exclude-label` promises regardless of
+/// what `--query` happens to contain (#1780). Parenthesizing is skipped
+/// when no exclusion clause ends up being appended, so a caller who never
+/// uses `--exclude-label` sees `--query` passed through byte-for-byte,
+/// unchanged from before this flag existed.
 ///
 /// Also returns the subset of `exclude_labels` that *did* get a
-/// translation — [`run_full_sync`]'s stale-deletion pass tags a vanished
-/// record's cached `label_ids` with exactly these before marking it
-/// deleted (#1780), since a record can fall out of this listing without
-/// ever being fetched again (presence-on-disk skips it), so its cached
-/// labels would otherwise never learn about the exclusion that just
-/// happened. Without that tag, `run_incremental`'s labelsRemoved-triggered
-/// undelete — which trusts the cached label set — could be fooled by any
-/// unrelated later label change into resurrecting a message that is (as
-/// far as this tool can tell) still excluded.
+/// translation, deduplicated — [`run_full_sync`]'s undelete-on-reappearance
+/// pass uses it to tell a translated (trustworthy, since the listing query
+/// itself enforces it) cached exclusion reason from an untranslated
+/// (custom-label) one it must not casually undo.
 fn full_sync_query(opts: &SyncOptions, report: &mut SyncReport) -> (Option<String>, Vec<String>) {
-    let mut query = opts.query.clone().unwrap_or_default();
-    // Tracks every `-in:<keyword>` token already in `query` — both ones
-    // `--query` already spelled out and ones this loop has itself added —
-    // so a repeated `--exclude-label` value, or one that duplicates
-    // `--query`'s own text, doesn't fold in the same `-in:` token twice.
-    let mut tokens: HashSet<String> = query.split_whitespace().map(str::to_string).collect();
+    // Tokens already present in the caller's own `--query`, so a repeated
+    // `--exclude-label` value that duplicates `--query`'s own text doesn't
+    // fold in the same `-in:` token twice.
+    let existing_tokens: HashSet<&str> = opts
+        .query
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
     let mut translated = Vec::new();
+    let mut exclusion_tokens: Vec<String> = Vec::new();
+    let mut seen_tokens: HashSet<String> = HashSet::new();
     for label in &opts.exclude_labels {
         match FULL_SYNC_EXCLUDABLE_LABELS
             .iter()
             .find(|(id, _)| *id == label)
         {
             Some((_, keyword)) => {
-                translated.push(label.clone());
+                if !translated.contains(label) {
+                    translated.push(label.clone());
+                }
                 let token = format!("-in:{keyword}");
-                if !tokens.insert(token.clone()) {
-                    continue;
+                if !existing_tokens.contains(token.as_str()) && seen_tokens.insert(token.clone()) {
+                    exclusion_tokens.push(token);
                 }
-                if !query.is_empty() {
-                    query.push(' ');
-                }
-                query.push_str(&token);
             }
             None => report.actions.push(SyncAction::Note {
                 message: format!(
@@ -401,7 +432,20 @@ fn full_sync_query(opts: &SyncOptions, report: &mut SyncReport) -> (Option<Strin
             }),
         }
     }
-    ((!query.is_empty()).then_some(query), translated)
+    if exclusion_tokens.is_empty() {
+        return (opts.query.clone(), translated);
+    }
+    let mut query = match opts.query.as_deref().filter(|q| !q.is_empty()) {
+        Some(user_query) => format!("({user_query})"),
+        None => String::new(),
+    };
+    for token in exclusion_tokens {
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        query.push_str(&token);
+    }
+    (Some(query), translated)
 }
 
 /// Applies `messagesAdded`/`messagesDeleted`/`labelsAdded`/`labelsRemoved`
@@ -434,15 +478,18 @@ fn full_sync_query(opts: &SyncOptions, report: &mut SyncReport) -> (Option<Strin
 /// manifest record is ever created for it — see [`SyncAction::Excluded`]);
 /// a `labelsAdded`/`labelsRemoved` event that changes an already-archived
 /// record's current label set across the excluded boundary
-/// soft-deletes/undeletes it via the same [`Manifest::mark_deleted`]/
-/// [`Manifest::undelete`] machinery [`run_full_sync`]'s stale-deletion/
-/// undelete-on-reappearance passes use. One known gap, not solved here: a
-/// message that arrives already excluded is never archived, so if the
-/// excluded label is later removed there is no manifest record for the
-/// `labelsRemoved` event to act on — it stays un-archived until the next
-/// `--full`/reconciliation pass re-lists and fetches it fresh, the same
-/// "self-healing on the next full pass" framing this module already uses
-/// for a listing race (see [`run_full_sync`]'s doc comment).
+/// soft-deletes/undeletes it via [`Manifest::mark_excluded`]/
+/// [`Manifest::undelete`] — see [`reconcile_label_exclusion`], which this
+/// only calls *after* the fetch phase below (not inline in the event
+/// loop), so a message added and given an excluded label within the same
+/// `history.list` response still has a manifest record to reconcile
+/// against by the time its exclusion state is decided. One known gap, not
+/// solved here: a message that arrives already excluded is never archived,
+/// so if the excluded label is later removed there is no manifest record
+/// for the `labelsRemoved` event to act on — it stays un-archived until
+/// the next `--full`/reconciliation pass re-lists and fetches it fresh,
+/// the same "self-healing on the next full pass" framing this module
+/// already uses for a listing race (see [`run_full_sync`]'s doc comment).
 async fn run_incremental(
     client: &GmailClient,
     manifest: &mut Manifest,
@@ -465,10 +512,15 @@ async fn run_incremental(
 
     let mut seen = HashSet::new();
     let mut to_fetch = Vec::new();
+    // Every id touched by a labelsAdded/labelsRemoved event this window,
+    // in first-seen order — reconciled against `--exclude-label` only
+    // *after* the fetch phase (see this function's doc comment).
+    let mut labels_touched = Vec::new();
+    let mut labels_touched_seen = HashSet::new();
     for record in &history.history {
         for added in &record.messages_added {
             if !deleted_ids.contains(&added.message.id) && seen.insert(added.message.id.clone()) {
-                if label_ids_excluded(&added.message.label_ids, &opts.exclude_labels) {
+                if label_ids_contain_any(&added.message.label_ids, &opts.exclude_labels) {
                     report.actions.push(SyncAction::Excluded {
                         id: added.message.id.clone(),
                     });
@@ -492,19 +544,8 @@ async fn run_incremental(
                 added: change.label_ids.clone(),
                 removed: Vec::new(),
             });
-            // Re-check the record's *current* label set (not just this
-            // event's delta) — correct under more than one configured
-            // exclude label, where a single labelsAdded event only ever
-            // carries one of them.
-            if let Some(record) = manifest.get(&change.message.id) {
-                if record.deleted_at.is_none()
-                    && label_ids_excluded(&record.label_ids, &opts.exclude_labels)
-                {
-                    manifest.mark_deleted(&change.message.id, Utc::now());
-                    report.actions.push(SyncAction::Deleted {
-                        id: change.message.id.clone(),
-                    });
-                }
+            if labels_touched_seen.insert(change.message.id.clone()) {
+                labels_touched.push(change.message.id.clone());
             }
         }
         for change in &record.labels_removed {
@@ -514,15 +555,8 @@ async fn run_incremental(
                 added: Vec::new(),
                 removed: change.label_ids.clone(),
             });
-            if let Some(record) = manifest.get(&change.message.id) {
-                if record.deleted_at.is_some()
-                    && !label_ids_excluded(&record.label_ids, &opts.exclude_labels)
-                {
-                    manifest.undelete(&change.message.id);
-                    report.actions.push(SyncAction::Undeleted {
-                        id: change.message.id.clone(),
-                    });
-                }
+            if labels_touched_seen.insert(change.message.id.clone()) {
+                labels_touched.push(change.message.id.clone());
             }
         }
     }
@@ -538,21 +572,68 @@ async fn run_incremental(
     fetch_and_archive_messages(client, manifest, &to_fetch, limiter, opts, report, progress)
         .await?;
 
+    for id in &labels_touched {
+        reconcile_label_exclusion(manifest, report, id, &opts.exclude_labels);
+    }
+
     Ok(history
         .history_id
         .unwrap_or_else(|| start_history_id.to_string()))
 }
 
-/// Whether any of `label_ids` is in `exclude_labels` — the one check
-/// `run_incremental`'s label-set exclusion filter (#1780) is built from,
-/// applied both to a history event's own label set (deciding whether to
-/// fetch a new message at all) and to a manifest record's current label set
-/// (deciding whether an already-archived message should now be
-/// soft-deleted/undeleted).
-fn label_ids_excluded(label_ids: &[String], exclude_labels: &[String]) -> bool {
-    exclude_labels
+/// Recomputes and applies `--exclude-label` state for `id` from its
+/// manifest record's *current* `label_ids` (#1780) — the one place that
+/// current set is known precisely, since it's built by replaying real
+/// `labelsAdded`/`labelsRemoved` events rather than guessed. A no-op if
+/// `id` has no manifest record (e.g. it was itself excluded at add-time, so
+/// never archived — see [`run_incremental`]'s "known gap" doc note).
+///
+/// Three outcomes, decided by comparing the freshly-recomputed exclusion
+/// set against the record's current state:
+/// - not deleted → now excluded: soft-deletes via
+///   [`Manifest::mark_excluded`], recording exactly which label(s) caused
+///   it.
+/// - deleted *because of* a previously-tracked exclusion (i.e.
+///   [`ManifestRecord::excluded_labels`] was non-empty) → no longer
+///   excluded: undeletes. This is the one branch [`Manifest::mark_deleted`]
+///   exists specifically to keep safe: a record soft-deleted for *any other
+///   reason* (a real `messagesDeleted` event, or `run_full_sync`'s
+///   listing-absence pass) always has an empty `excluded_labels`, so this
+///   condition can never fire for it — an unrelated label change on such a
+///   record does not resurrect it.
+/// - anything else (still excluded by a possibly-different label subset,
+///   or deleted for an unrelated reason) → only the cached reason is kept
+///   current via [`Manifest::set_excluded_labels`], `deleted_at` untouched.
+fn reconcile_label_exclusion(
+    manifest: &mut Manifest,
+    report: &mut SyncReport,
+    id: &str,
+    exclude_labels: &[String],
+) {
+    let Some(record) = manifest.get(id) else {
+        return;
+    };
+    let now_excluded: Vec<String> = exclude_labels
         .iter()
-        .any(|excluded| label_ids.iter().any(|l| l == excluded))
+        .filter(|label| record.label_ids.iter().any(|existing| existing == *label))
+        .cloned()
+        .collect();
+    let was_tracked_excluded = !record.excluded_labels.is_empty();
+    let currently_deleted = record.deleted_at.is_some();
+
+    if !currently_deleted && !now_excluded.is_empty() {
+        manifest.mark_excluded(id, Utc::now(), now_excluded);
+        report
+            .actions
+            .push(SyncAction::Deleted { id: id.to_string() });
+    } else if currently_deleted && was_tracked_excluded && now_excluded.is_empty() {
+        manifest.undelete(id);
+        report
+            .actions
+            .push(SyncAction::Undeleted { id: id.to_string() });
+    } else if was_tracked_excluded {
+        manifest.set_excluded_labels(id, now_excluded);
+    }
 }
 
 /// [`run_full_sync`]'s fetch/consumer side of the listing+fetch pipeline
@@ -890,6 +971,7 @@ async fn fetch_and_write_one(
         size: bytes.len() as u64,
         history_id: message.history_id,
         deleted_at: None,
+        excluded_labels: Vec::new(),
     })
 }
 
@@ -1405,6 +1487,7 @@ not-really-a-pdf\r\n\
                 size: std::fs::metadata(&path).unwrap().len(),
                 history_id: Some("50".to_string()),
                 deleted_at: None,
+                excluded_labels: Vec::new(),
             });
         }
         manifest.save(&manifest_path(&output_dir)).unwrap();
@@ -1519,6 +1602,186 @@ not-really-a-pdf\r\n\
     // ── --exclude-label (#1780) ─────────────────────────────────────────
 
     #[tokio::test]
+    async fn run_incremental_never_undeletes_a_record_with_no_tracked_exclusion_reason_by_default()
+    {
+        // Regression test: a user who never passes --exclude-label at all
+        // must see run_incremental behave exactly as it did before this
+        // flag existed — never undeleting anything. Before the fix, this
+        // failed because `!label_ids_excluded(labels, [])` was vacuously
+        // `true`, collapsing the undelete guard to just "is it currently
+        // soft-deleted" for every default caller, not only --exclude-label
+        // adopters.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "100".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+            },
+            &state_path(&output_dir),
+        )
+        .unwrap();
+
+        // m1 is already soft-deleted for a reason with nothing to do with
+        // labels (a real messagesDeleted event, or run_full_sync's
+        // listing-absence pass) — plain mark_deleted, no exclusion
+        // tracking.
+        let mut manifest = Manifest::default();
+        let path = shard_path(&output_dir, "m1", None);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "From: a@example.com\r\n\r\nm1 body").unwrap();
+        manifest.upsert(ManifestRecord {
+            id: "m1".to_string(),
+            thread_id: Some("t1".to_string()),
+            label_ids: vec!["INBOX".to_string()],
+            internal_date: None,
+            subject: None,
+            from: None,
+            to: None,
+            rfc822_msgid: None,
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
+            path: path.strip_prefix(&output_dir).unwrap().to_path_buf(),
+            size: std::fs::metadata(&path).unwrap().len(),
+            history_id: Some("50".to_string()),
+            deleted_at: None,
+            excluded_labels: Vec::new(),
+        });
+        manifest.mark_deleted("m1", Utc::now());
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": [{
+                        "id": "150",
+                        "labelsRemoved": [
+                            {"message": {"id": "m1", "threadId": "t1"}, "labelIds": ["IMPORTANT"]},
+                        ],
+                    }],
+                    "historyId": "300",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        // Default opts(): exclude_labels is empty, i.e. --exclude-label was
+        // never passed.
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(
+            !report
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::Undeleted { id } if id == "m1")),
+            "an unrelated labelsRemoved event must never undelete a message soft-deleted for a \
+             reason unrelated to label exclusion, even when --exclude-label was never configured"
+        );
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        assert!(manifest.get("m1").unwrap().deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn run_incremental_excludes_a_message_labeled_within_the_same_history_window_it_was_added_in(
+    ) {
+        // Regression test: a message added via messagesAdded (not yet
+        // excluded per that event's own label set) and then given an
+        // excluded label via labelsAdded, both within the *same*
+        // history.list response, must still end up excluded — not archived
+        // despite matching --exclude-label within this very run. Before the
+        // fix, the exclusion recheck ran inline in the event-scanning loop,
+        // before the batched fetch (which only happens after that loop)
+        // had created a manifest record for the message, so the recheck was
+        // always a no-op for a same-window id.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "100".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+            },
+            &state_path(&output_dir),
+        )
+        .unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": [{
+                        "id": "150",
+                        "messagesAdded": [
+                            {"message": {"id": "m1", "threadId": "t1", "labelIds": ["INBOX"]}},
+                        ],
+                    }, {
+                        "id": "151",
+                        "labelsAdded": [
+                            {"message": {"id": "m1", "threadId": "t1"}, "labelIds": ["SPAM"]},
+                        ],
+                    }],
+                    "historyId": "300",
+                })),
+            )
+            .mount(&server)
+            .await;
+        // Not `mount_raw_get` (hardcoded to `labelIds: ["INBOX"]`): the
+        // live fetch is authoritative for the message's label state *at
+        // fetch time*, which is after the labelsAdded event above already
+        // happened server-side — so the mock must reflect that SPAM is
+        // already present, exactly as the real Gmail API would return.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "raw"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "threadId": "t1",
+                    "labelIds": ["INBOX", "SPAM"],
+                    "internalDate": "1700000000000",
+                    "historyId": "500",
+                    "raw": raw_message_body("m1", "New but spammed"),
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let opts = SyncOptions {
+            exclude_labels: vec!["SPAM".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::Deleted { id } if id == "m1")),
+            "a message excluded within the same window it was added in must still be excluded"
+        );
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        let record = manifest.get("m1").unwrap();
+        assert!(record.deleted_at.is_some());
+        assert_eq!(record.excluded_labels, vec!["SPAM".to_string()]);
+    }
+
+    #[tokio::test]
     async fn run_incremental_skips_fetching_a_new_message_with_an_excluded_label() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
@@ -1610,6 +1873,7 @@ not-really-a-pdf\r\n\
             size: std::fs::metadata(&path).unwrap().len(),
             history_id: Some("50".to_string()),
             deleted_at: None,
+            excluded_labels: Vec::new(),
         });
         manifest.save(&manifest_path(&output_dir)).unwrap();
 
@@ -1686,8 +1950,17 @@ not-really-a-pdf\r\n\
                 path: path.strip_prefix(&output_dir).unwrap().to_path_buf(),
                 size: std::fs::metadata(&path).unwrap().len(),
                 history_id: Some("50".to_string()),
-                deleted_at: Some(Utc::now()),
+                deleted_at: None,
+                excluded_labels: Vec::new(),
             });
+            // Simulate an earlier incremental run's own tracked exclusion
+            // (via `mark_excluded`, not a raw `deleted_at`) — only that
+            // precise tracking makes an automatic undelete safe (#1780).
+            manifest.mark_excluded(
+                id,
+                Utc::now(),
+                vec!["SPAM".to_string(), "TRASH".to_string()],
+            );
         }
         manifest.save(&manifest_path(&output_dir)).unwrap();
 
@@ -1766,10 +2039,15 @@ not-really-a-pdf\r\n\
         let client = client_with_bootstrapped_token(&server).await;
         mount_profile(&server, "user@example.com", "500").await;
         // `--query "-in:spam"` and `--exclude-label SPAM` both name spam —
-        // the folded query must not repeat the `-in:spam` token.
+        // the folded query must not repeat the `-in:spam` token. The
+        // caller's query is still parenthesized before `-in:trash` is
+        // appended (#1780) even though nothing here actually needs the
+        // protection — parenthesizing is unconditional once at least one
+        // exclusion clause is appended, not just when the query contains an
+        // `OR` that needs it.
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
-            .and(wiremock::matchers::query_param("q", "-in:spam -in:trash"))
+            .and(wiremock::matchers::query_param("q", "(-in:spam) -in:trash"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"messages": []})),
@@ -1782,6 +2060,75 @@ not-really-a-pdf\r\n\
         let opts = SyncOptions {
             query: Some("-in:spam".to_string()),
             exclude_labels: vec!["SPAM".to_string(), "TRASH".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_full_sync_parenthesizes_an_or_query_before_appending_an_exclusion() {
+        // Gmail's implicit AND-by-juxtaposition binds tighter than an
+        // explicit `OR` — appending `-in:spam` as a bare trailing token to
+        // `from:x OR from:y` would parse as `from:x OR (from:y AND
+        // -in:spam)`, silently narrowing the exclusion to only the
+        // right-hand side. Parenthesizing the caller's query first
+        // (`(from:x OR from:y) -in:spam`) applies it to the whole
+        // expression instead (#1780).
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "user@example.com", "500").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .and(wiremock::matchers::query_param(
+                "q",
+                "(from:x OR from:y) -in:spam",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"messages": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        let opts = SyncOptions {
+            query: Some("from:x OR from:y".to_string()),
+            exclude_labels: vec!["SPAM".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_full_sync_leaves_query_untouched_when_no_exclude_label_translates() {
+        // Parenthesizing is conditional on actually appending an exclusion
+        // clause — a caller who passes `--query` alone (no
+        // `--exclude-label`, or one with no known translation) must see it
+        // reach the API byte-for-byte, unchanged from before this flag
+        // existed.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "user@example.com", "500").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .and(wiremock::matchers::query_param("q", "from:x OR from:y"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"messages": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        let opts = SyncOptions {
+            query: Some("from:x OR from:y".to_string()),
+            exclude_labels: vec!["Label_16".to_string()],
             ..opts(output_dir.clone())
         };
         let report = run_sync(&client, &opts).await.unwrap();
@@ -1819,8 +2166,16 @@ not-really-a-pdf\r\n\
     }
 
     #[tokio::test]
-    async fn run_full_sync_tags_a_vanished_records_labels_so_incremental_cannot_bogus_undelete_it()
-    {
+    async fn run_full_sync_vanished_record_is_never_bogus_undeleted_by_an_unrelated_label_change() {
+        // A record `run_full_sync` soft-deletes via listing-absence never
+        // learns *why* it vanished (`--query` can narrow a listing for
+        // reasons that have nothing to do with `--exclude-label`, so
+        // guessing would be unsound — see `run_full_sync`'s stale-deletion
+        // doc comment). `excluded_labels` therefore stays empty for it, and
+        // that's what a later unrelated `labelsRemoved` event must respect
+        // (#1780): `reconcile_label_exclusion` only ever undeletes a record
+        // whose `excluded_labels` shows it was *this* mechanism that
+        // deleted it.
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
         let dir = tempfile::tempdir().unwrap();
@@ -1851,6 +2206,7 @@ not-really-a-pdf\r\n\
             size: std::fs::metadata(&path).unwrap().len(),
             history_id: Some("50".to_string()),
             deleted_at: None,
+            excluded_labels: Vec::new(),
         });
         manifest.save(&manifest_path(&output_dir)).unwrap();
 
@@ -1883,15 +2239,21 @@ not-really-a-pdf\r\n\
         let record = manifest.get("m1").unwrap();
         assert!(record.deleted_at.is_some());
         assert!(
-            record.label_ids.iter().any(|l| l == "SPAM"),
-            "the record's cached label_ids must learn the exclusion label it vanished under \
-             on this pass, or a later unrelated labelsRemoved event could bogus-undelete it \
-             (#1780)"
+            record.excluded_labels.is_empty(),
+            "run_full_sync doesn't know *why* a listing-absent record vanished, so it must \
+             never guess and tag excluded_labels (#1780)"
+        );
+        assert_eq!(
+            record.label_ids,
+            vec!["INBOX".to_string()],
+            "a plain stale-deletion must never rewrite label_ids"
         );
 
         // An incremental run now observes a totally unrelated label change
-        // on the same message. Because the full-sync pass above tagged it
-        // with SPAM, run_incremental must not resurrect it.
+        // on the same message. run_incremental must not resurrect it: it
+        // has no tracked exclusion reason for m1 at all, so
+        // reconcile_label_exclusion's undelete branch can't fire regardless
+        // of what changed.
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
             .respond_with(
@@ -1916,11 +2278,148 @@ not-really-a-pdf\r\n\
                 .actions
                 .iter()
                 .any(|a| matches!(a, SyncAction::Undeleted { id } if id == "m1")),
-            "m1 is still excluded (SPAM) on the server; an unrelated label change must not \
-             resurrect it"
+            "m1 has no tracked exclusion reason; an unrelated label change must not resurrect it"
         );
         let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
         assert!(manifest.get("m1").unwrap().deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn run_full_sync_reappearance_does_not_undelete_a_record_excluded_by_a_custom_label() {
+        // A record run_incremental soft-deleted via a custom (untranslated)
+        // `--exclude-label` must not be resurrected just because it still
+        // appears in a full-sync listing that couldn't have filtered that
+        // label out server-side (#1780) — see run_full_sync's
+        // undelete-on-reappearance doc comment.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let mut manifest = Manifest::default();
+        let path = shard_path(&output_dir, "m1", None);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "From: a@example.com\r\n\r\nm1 body").unwrap();
+        manifest.upsert(ManifestRecord {
+            id: "m1".to_string(),
+            thread_id: Some("t1".to_string()),
+            label_ids: vec!["INBOX".to_string(), "Label_16".to_string()],
+            internal_date: None,
+            subject: None,
+            from: None,
+            to: None,
+            rfc822_msgid: None,
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
+            path: path.strip_prefix(&output_dir).unwrap().to_path_buf(),
+            size: std::fs::metadata(&path).unwrap().len(),
+            history_id: Some("50".to_string()),
+            deleted_at: None,
+            excluded_labels: Vec::new(),
+        });
+        // Simulate a prior incremental run's tracked exclusion via the
+        // custom label.
+        manifest.mark_excluded("m1", Utc::now(), vec!["Label_16".to_string()]);
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+
+        mount_profile(&server, "user@example.com", "100").await;
+        // No `-in:` clause can express `Label_16`, so the listing is
+        // unfiltered — m1 still appears in it even though it's still
+        // excluded per our own tracking.
+        mount_message_list(&server, &["m1"]).await;
+
+        let opts = SyncOptions {
+            exclude_labels: vec!["Label_16".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(
+            !report
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::Undeleted { id } if id == "m1")),
+            "m1 is still tracked as excluded by a custom label the listing query couldn't \
+             filter; merely reappearing in it must not resurrect it"
+        );
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        let record = manifest.get("m1").unwrap();
+        assert!(record.deleted_at.is_some());
+        assert_eq!(record.excluded_labels, vec!["Label_16".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn run_full_sync_reappearance_undeletes_a_record_once_a_translated_label_is_confirmed_gone(
+    ) {
+        // Unlike a custom label, a translated one (SPAM/TRASH) reappearing
+        // in a listing this run's own query excludes it from is
+        // authoritative proof it's gone — the reappearance-undelete must
+        // still fire even though excluded_labels is non-empty (#1780).
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let mut manifest = Manifest::default();
+        let path = shard_path(&output_dir, "m1", None);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "From: a@example.com\r\n\r\nm1 body").unwrap();
+        manifest.upsert(ManifestRecord {
+            id: "m1".to_string(),
+            thread_id: Some("t1".to_string()),
+            label_ids: vec!["INBOX".to_string()],
+            internal_date: None,
+            subject: None,
+            from: None,
+            to: None,
+            rfc822_msgid: None,
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
+            path: path.strip_prefix(&output_dir).unwrap().to_path_buf(),
+            size: std::fs::metadata(&path).unwrap().len(),
+            history_id: Some("50".to_string()),
+            deleted_at: None,
+            excluded_labels: Vec::new(),
+        });
+        manifest.mark_excluded("m1", Utc::now(), vec!["SPAM".to_string()]);
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+
+        mount_profile(&server, "user@example.com", "100").await;
+        // m1 reappears in the `-in:spam`-filtered listing: confirmation
+        // it's no longer spam on the server.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages"))
+            .and(wiremock::matchers::query_param("q", "-in:spam"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "messages": [{"id": "m1", "threadId": "t1"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let opts = SyncOptions {
+            exclude_labels: vec!["SPAM".to_string()],
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Undeleted { id } if id == "m1")));
+        let manifest = Manifest::load(&manifest_path(&output_dir)).unwrap();
+        let record = manifest.get("m1").unwrap();
+        assert!(record.deleted_at.is_none());
+        assert!(record.excluded_labels.is_empty());
     }
 
     #[tokio::test]
@@ -2125,6 +2624,7 @@ not-really-a-pdf\r\n\
             size: original_bytes.len() as u64,
             history_id: Some("1".to_string()),
             deleted_at: None,
+            excluded_labels: Vec::new(),
         });
         manifest.save(&manifest_path(&output_dir)).unwrap();
         // `state.json` is deliberately absent — as if it were deleted, or
@@ -2518,6 +3018,7 @@ not-really-a-pdf\r\n\
                 size: 4,
                 history_id: Some("1".to_string()),
                 deleted_at: None,
+                excluded_labels: Vec::new(),
             });
         }
         manifest.save(&manifest_path(&output_dir)).unwrap();
@@ -2954,6 +3455,7 @@ not-really-a-pdf\r\n\
             history_id: Some("1".to_string()),
             // Previously soft-deleted; the server lists it again this run.
             deleted_at: Some(Utc::now()),
+            excluded_labels: Vec::new(),
         });
         manifest.upsert(ManifestRecord {
             id: "gone".to_string(),
@@ -2972,6 +3474,7 @@ not-really-a-pdf\r\n\
             size: 4,
             history_id: Some("1".to_string()),
             deleted_at: None,
+            excluded_labels: Vec::new(),
         });
         manifest.save(&manifest_path(&output_dir)).unwrap();
 
@@ -3023,6 +3526,7 @@ not-really-a-pdf\r\n\
             size: 4,
             history_id: Some("1".to_string()),
             deleted_at: None,
+            excluded_labels: Vec::new(),
         });
         manifest.save(&manifest_path(&output_dir)).unwrap();
         let manifest_bytes_before = std::fs::read(manifest_path(&output_dir)).unwrap();

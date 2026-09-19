@@ -526,6 +526,7 @@ mod tests {
             size: raw.len() as u64,
             history_id: None,
             deleted_at: deleted.then(chrono::Utc::now),
+            excluded_labels: Vec::new(),
         });
         manifest.save(&manifest_file).unwrap();
     }
