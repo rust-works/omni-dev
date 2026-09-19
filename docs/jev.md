@@ -1,0 +1,501 @@
+# Jev (TypeSafe System One)
+
+omni-dev calls TypeSafe AI's **Jev** "System One" API through the
+`omni-dev ai jev` command tree. Jev does not write text. You give it an opaque
+program **state** (a string, object or array) and one or more typed
+**questions**, and it returns **typed, probabilistic judgments**. A question
+can pick one of a labelled set, rate the state on an ordered scale, or give the
+probability of a yes/no condition. All the questions are answered in one
+parallel pass over `POST /v1/systemone`.
+
+Use it instead of `omni-dev ai chat` when a script needs a *decision* rather
+than prose: routing a ticket, grading a diff's risk, or asking "is this commit
+a breaking change?". The answer arrives as a number or a label with
+probabilities attached. There is no free text to parse, no prompt to coax into
+JSON, and no model-registry token limit to fit into.
+
+Jev lives under `ai` but is deliberately **not** an [AI backend](ai-backends.md).
+It cannot be selected with `--ai-backend`, commit/PR generation never uses it,
+and its request shape (state plus a question map) has nothing in common with a
+chat completion.
+
+## Table of Contents
+
+1. [Prerequisites](#prerequisites)
+2. [Authentication](#authentication)
+3. [Choosing a model](#choosing-a-model)
+4. [State input](#state-input)
+5. [Output formats](#output-formats)
+6. [choice](#choice)
+7. [score](#score)
+8. [noul](#noul)
+9. [ask](#ask)
+10. [Ordering caveats](#ordering-caveats)
+11. [Retries and timeouts](#retries-and-timeouts)
+12. [Request log](#request-log)
+13. [Troubleshooting](#troubleshooting)
+14. [See also](#see-also)
+
+## Prerequisites
+
+- A TypeSafe account and a Jev **API key**. The same key works with
+  TypeSafe's own SDKs, which read it from `TYPESAFE_API_KEY`.
+
+## Authentication
+
+Credentials are read from environment variables first, falling back to the
+`env` map in `~/.omni-dev/settings.json`. There is no `auth login` flow, so to
+persist the key, add it to that map by hand.
+
+### Environment variables
+
+| Variable                | Purpose                                                                                   | Default                   |
+|-------------------------|-------------------------------------------------------------------------------------------|---------------------------|
+| `TYPESAFE_API_KEY`      | Jev API key. This is the vendor's own variable, so a key you already exported just works. | _none_                    |
+| `OMNI_DEV_JEV_API_KEY`  | omni-dev-specific API key, used only when `TYPESAFE_API_KEY` is unset or empty.           | _none_                    |
+| `OMNI_DEV_JEV_BASE_URL` | API base URL. A trailing `/` is trimmed. Use it for proxies or tests.                     | `https://api.typesafe.ai` |
+| `TYPESAFE_MODEL`        | Jev model identifier. See [Choosing a model](#choosing-a-model).                          | `jev-latest`              |
+
+One of the two key variables is required. An empty value counts as unset.
+
+Each variable is looked up in the process environment first, then in the
+`settings.json` `env` map, so an exported shell or CI variable always wins:
+
+```json
+{
+  "env": {
+    "TYPESAFE_API_KEY": "..."
+  }
+}
+```
+
+Credential profiles apply too. Under `--profile work` (or
+`OMNI_DEV_PROFILE=work`), the lookup falls back to `profiles.work.env` instead
+of the base `env` map. See
+[Credential Profiles](configuration-best-practices.md#credential-profiles) for
+the general rule.
+
+The key is sent as `Authorization: Bearer <key>` and is redacted from `Debug`
+output and from the [request log](#request-log).
+
+## Choosing a model
+
+The model is resolved in this order, and the first one set wins:
+
+1. `--jev-model <MODEL>` on the subcommand.
+2. `TYPESAFE_MODEL` (process env, then `settings.json`).
+3. `jev-latest`.
+
+> **Footgun: the global `--model` flag does not apply to Jev.** It still
+> *parses* on `omni-dev ai jev choice --model x`, because it is a global flag,
+> but it is silently ignored. Jev also never reads `OMNI_DEV_MODEL`, the
+> variable `--model` sets. A user with `OMNI_DEV_MODEL=claude-opus-5` exported
+> for the AI backends must not have every Jev call sent to a model Jev has
+> never heard of. Use `--jev-model` or `TYPESAFE_MODEL`.
+
+The response's `model` field names the **concrete** version that answered,
+such as `jev-1.13.0`, even when you asked for the `jev-latest` alias. Pin that
+value with `--jev-model` if you need reproducible judgments across a Jev
+release.
+
+## State input
+
+Every subcommand takes the state as an optional positional `[STATE]` argument,
+and reads it from **stdin** when that argument is omitted. A state that is
+empty or only whitespace is rejected before any request is sent:
+
+```
+Error: state must not be empty (pass it as an argument or on stdin)
+```
+
+By default the state is sent as a **literal JSON string**, exactly as given.
+omni-dev never guesses, because silently re-parsing plain text that happens to
+start with `{` would change what Jev sees.
+
+Pass `--state-json` to send **structured** state instead. The text is then
+parsed as YAML. YAML is a superset of JSON, so plain JSON works too, and the
+resulting object or array is sent as-is:
+
+```bash
+# Literal string (default)
+omni-dev ai jev noul "payouts failing for 3 days" --instructions "Is this urgent?"
+
+# Structured state from a JSON file on stdin
+omni-dev ai jev noul --state-json --instructions "Is this urgent?" < ticket.json
+
+# A diff piped in as a literal string
+git diff origin/main | omni-dev ai jev score --instructions "How risky is this change?" \
+    --level Trivial --level Moderate --level Risky
+```
+
+## Output formats
+
+Every subcommand accepts `-o/--output <FORMAT>`. It defaults to `json`.
+
+| Format | Best for                                   |
+|--------|--------------------------------------------|
+| `json` | Scripting; pipe into `jq`. Pretty-printed. |
+| `yaml` | Reading in a terminal.                     |
+
+There is no bare-value mode. `model` and `usage` are always kept in the output,
+because they are the only place the concrete model version and the token cost
+show up. `jq -r .answer.choice` gets a bare value when a script needs one.
+
+The single-question subcommands (`choice`, `score`, `noul`) emit:
+
+```json
+{ "model": "...", "answer": { "type": "...", ... }, "usage": { "input_tokens": 0, "output_tokens": 0 } }
+```
+
+`ask` emits the same thing with an `answers` map, keyed by your question names,
+in place of `answer`:
+
+```json
+{ "model": "...", "answers": { "<name>": { "type": "...", ... } }, "usage": { ... } }
+```
+
+Each answer carries a `type` tag (`choice`, `score` or `noul`), and the rest of
+its shape depends on that type. The shapes are shown in the sections below.
+
+## choice
+
+Picks exactly one of a labelled set of options.
+
+| Flag                    | Meaning                                               |
+|-------------------------|-------------------------------------------------------|
+| `--instructions <TEXT>` | What to choose and why (required).                    |
+| `--option <NAME=DESC>`  | One option. Repeatable, and at least one is required. |
+
+`--option` splits on the **first** `=` only, so `--option "eq=a = b"` keeps
+`a = b` as the description. An empty name is rejected, and so is a duplicate
+name. A later duplicate does not silently win.
+
+```bash
+$ omni-dev ai jev choice "Card was charged twice for one order" \
+    --instructions "Which team should handle this ticket?" \
+    --option billing="Payments, refunds, invoices" \
+    --option technical="Bugs, outages, errors" \
+    --option sales="Pricing, upgrades, new accounts"
+{
+  "model": "jev-1.13.0",
+  "answer": {
+    "type": "choice",
+    "choice": "billing",
+    "confidence": 0.97,
+    "probabilities": {
+      "billing": 0.98,
+      "sales": 0.0,
+      "technical": 0.02
+    }
+  },
+  "usage": {
+    "input_tokens": 142,
+    "output_tokens": 24
+  }
+}
+```
+
+`choice` is one of the option names. `probabilities` has one entry per option.
+Options come out **alphabetised**, not in `--option` order. See
+[Ordering caveats](#ordering-caveats).
+
+## score
+
+Rates the state against an ordered scale.
+
+| Flag                    | Meaning                                                                                          |
+|-------------------------|--------------------------------------------------------------------------------------------------|
+| `--instructions <TEXT>` | What to rate and how (required).                                                                 |
+| `--level <DESC>`        | One scale level, **low to high**. Repeatable, and at least two are required. Order is preserved. |
+
+```bash
+$ omni-dev ai jev score "This is the THIRD time I've asked. Fix it today." \
+    --instructions "How frustrated is the customer?" \
+    --level "Calm, just stating facts" \
+    --level "Frustrated but civil" \
+    --level "Very angry, strong language" \
+    -o yaml
+model: jev-1.13.0
+answer:
+  type: score
+  score: 1.01
+  confidence: 0.98
+  legend:
+    '0': Calm, just stating facts
+    '1': Frustrated but civil
+    '2': Very angry, strong language
+  probabilities:
+    '0': 0.0
+    '1': 0.99
+    '2': 0.01
+usage:
+  input_tokens: 151
+  output_tokens: 23
+```
+
+`score` is a **continuous** position on the scale. It is index-like, counting
+from `0` for the first `--level`, but it is not necessarily a whole number.
+`legend` maps each index to the level you supplied. `probabilities` gives each
+index's probability, keyed by that index as a string.
+
+## noul
+
+Estimates the probability that a yes/no condition holds.
+
+| Flag                    | Meaning                                        |
+|-------------------------|------------------------------------------------|
+| `--instructions <TEXT>` | The yes/no condition to estimate (required).   |
+| `--true-means <TEXT>`   | Optional: what a `true`-leaning answer means.  |
+| `--false-means <TEXT>`  | Optional: what a `false`-leaning answer means. |
+
+When neither `--true-means` nor `--false-means` is given, the request omits
+`criteria` entirely.
+
+```bash
+$ omni-dev ai jev noul "Payouts have been failing for 3 days, I want my money back" \
+    --instructions "Is the customer asking for a refund?"
+{
+  "model": "jev-1.13.0",
+  "answer": {
+    "type": "noul",
+    "noul": 0.98
+  },
+  "usage": {
+    "input_tokens": 124,
+    "output_tokens": 24
+  }
+}
+```
+
+`noul` is the probability that the condition is true, in `[0, 1]`. Unlike
+`choice` and `score`, a `noul` answer has **no `confidence` field**. The
+probability already *is* the confidence.
+
+## ask
+
+Asks several questions about **one** state in a single request, and so in a
+single parallel pass. The questions come from a YAML or JSON file given with
+`--questions <FILE>`. Both formats go through the same parser, so the file
+extension does not matter.
+
+The questions are read only from the file. The state keeps the
+positional-or-stdin slot, so `git diff | omni-dev ai jev ask --questions q.yaml`
+is never ambiguous about which input stdin feeds.
+
+The file maps a caller-chosen **question name** to a question spec. The spec is
+the Jev wire shape, with a `type` of `choice`, `score` or `noul`:
+
+| `type`   | `criteria`                                                |
+|----------|-----------------------------------------------------------|
+| `choice` | Required map of option name to description.               |
+| `score`  | Required list of levels, low to high.                     |
+| `noul`   | Optional map with `"true"` and/or `"false"` descriptions. |
+
+```yaml
+# triage.yaml
+department:
+  type: choice
+  instructions: Which team should handle this ticket?
+  criteria:
+    billing: Payments, refunds, invoices
+    technical: Bugs, outages, errors
+    sales: Pricing, upgrades, new accounts
+frustration:
+  type: score
+  instructions: How frustrated is the customer?
+  criteria:
+    - Calm, just stating facts
+    - Frustrated but civil
+    - Very angry, strong language
+refund_requested:
+  type: noul
+  instructions: Is the customer asking for a refund?
+  criteria:
+    "true": Explicitly asks for money back
+    "false": Wants the problem fixed, not refunded
+```
+
+Quote the `"true"`/`"false"` keys in YAML. Unquoted, they parse as booleans
+rather than strings.
+
+```bash
+$ omni-dev ai jev ask "Payouts failing 3 days, I want my money back NOW" \
+    --questions triage.yaml
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "department": {
+      "type": "choice",
+      "choice": "billing",
+      "confidence": 0.97,
+      "probabilities": {
+        "billing": 0.98,
+        "sales": 0.0,
+        "technical": 0.02
+      }
+    },
+    "frustration": {
+      "type": "score",
+      "score": 1.01,
+      "confidence": 0.98,
+      "legend": {
+        "0": "Calm, just stating facts",
+        "1": "Frustrated but civil",
+        "2": "Very angry, strong language"
+      },
+      "probabilities": {
+        "0": 0.0,
+        "1": 0.99,
+        "2": 0.01
+      }
+    },
+    "refund_requested": {
+      "type": "noul",
+      "noul": 0.98
+    }
+  },
+  "usage": {
+    "input_tokens": 417,
+    "output_tokens": 71
+  }
+}
+```
+
+A file that defines no questions is rejected before any request is sent. So is
+a spec with an unknown `type` or a missing required field, which fails with
+`Failed to parse questions file <path>` plus the parser's reason.
+
+## Ordering caveats
+
+Every map in the request and the response is kept **sorted by key**. This
+makes the output byte-stable from run to run, which scripts and snapshot tests
+rely on. The cost is that insertion order is never preserved:
+
+- **`choice` options are alphabetised.** Both the request's `criteria` and the
+  answer's `probabilities` list options by name, not in the order you passed
+  `--option` (or wrote them in an `ask` file). If option order matters to how
+  Jev reads the question, spell that out in `--instructions`.
+- **`score` keys sort as strings, not numbers.** `legend` and `probabilities`
+  are keyed `"0"`, `"1"`, `"2"`, and so on, in lexicographic order. With 10 or
+  more levels, `"10"` sorts before `"2"`. The `--level` order you gave is still
+  what is *sent*, because the request's `criteria` is an ordered list, so this
+  only affects how the answer maps are displayed. Sort numerically when
+  consuming them, e.g. `jq '.answer.probabilities | to_entries | sort_by(.key | tonumber)'`.
+- **`ask` answers are ordered by question name**, not by their order in the
+  questions file.
+
+## Retries and timeouts
+
+Jev signals throttling with HTTP **429** and overload with HTTP **529**, and
+omni-dev retries both automatically:
+
+- Up to **3 retries** per request (4 attempts in total).
+- The backoff delay comes from, in order of preference:
+  1. The `Retry-After` response header.
+  2. The `X-RateLimit-Reset` response header.
+  3. An exponential fallback, `2 ^ (attempt + 1)` seconds.
+- Each retry logs to stderr: `Rate limited (529). Retrying in {N}s (attempt {K})...`
+
+No other status is retried. A 401 or 422 fails on the first attempt.
+
+Jev uses the REST-client timeouts shared with Atlassian, Datadog and Gmail,
+**not** the AI backends' 300 s `OMNI_DEV_AI_TIMEOUT_SECS`:
+
+| Variable                             | Purpose                                    | Default |
+|--------------------------------------|--------------------------------------------|---------|
+| `OMNI_DEV_HTTP_CONNECT_TIMEOUT_SECS` | Connect phase (TCP + TLS handshake).       | `10`    |
+| `OMNI_DEV_HTTP_READ_TIMEOUT_SECS`    | Each individual read of the response body. | `120`   |
+
+Both take whole seconds. A missing, non-numeric or non-positive value falls
+back to the default. Both can also be set in the `settings.json` `env` map.
+
+## Request log
+
+Every Jev call, including each retry attempt, is recorded in the local
+[request log](log.md) with `service: jev`, like any other HTTP call omni-dev
+makes:
+
+```bash
+omni-dev log --query 'service:jev' --limit 5
+```
+
+Request/response headers and bodies are **not** logged unless you opt in with
+`OMNI_DEV_LOG_HEADERS` / `OMNI_DEV_LOG_BODIES`. Even then, the `Authorization`
+header is redacted centrally, so the API key never reaches the log. The state
+you send *is* part of the request body, so think before enabling
+`OMNI_DEV_LOG_BODIES` for sensitive state.
+
+## Troubleshooting
+
+### Credentials not configured
+
+```
+Error: Jev credentials not configured. Set TYPESAFE_API_KEY (or OMNI_DEV_JEV_API_KEY), or add one to ~/.omni-dev/settings.json
+```
+
+Neither `TYPESAFE_API_KEY` nor `OMNI_DEV_JEV_API_KEY` was found in the process
+environment or in the active `settings.json` `env` map. An empty value counts
+as missing. If you use profiles, remember that a selected profile's `env` map
+**replaces** the base one: a key stored only in the base map is invisible
+under `--profile work`.
+
+### HTTP 401: bad or missing API key
+
+```
+Error: Jev API request failed: HTTP 401: <body>
+```
+
+The key was sent but rejected. It may be revoked or mistyped. Check which
+variable is actually winning: `TYPESAFE_API_KEY` beats `OMNI_DEV_JEV_API_KEY`,
+and an exported variable beats `settings.json`. If you set
+`OMNI_DEV_JEV_BASE_URL`, also check that it points at a server that accepts
+this key.
+
+### HTTP 422: invalid request
+
+```
+Error: Jev API request failed: HTTP 422: <body>
+```
+
+Jev understood the request but rejected its contents. omni-dev validates only
+what it can see locally (option names, level count, the shape of an `ask`
+file), so check the things it cannot: the model name passed to `--jev-model`
+or `TYPESAFE_MODEL`, and the values inside each question spec. The error body
+is undocumented upstream and is passed through as-is, so read it for
+specifics.
+
+### HTTP 429 / 529: retries exhausted
+
+```
+Error: Jev API request failed: HTTP 529: <body>
+```
+
+omni-dev already retried 3 times (see
+[Retries and timeouts](#retries-and-timeouts)). Wait and re-run. When running
+a batch, prefer one `ask` call with several questions over several
+single-question calls: it is one request instead of many.
+
+### Unrecognised answer
+
+```
+Error: Failed to parse Jev API response; this may mean the API returned an answer type this version of omni-dev does not recognise yet — try upgrading omni-dev
+```
+
+The API returned an answer `type` other than `choice`, `score` or `noul`.
+omni-dev is deliberately strict here rather than guessing at an unknown shape.
+A new *field* on a known answer type, by contrast, is ignored without error.
+Upgrade omni-dev.
+
+### `--model` seems to have no effect
+
+This is expected. See [Choosing a model](#choosing-a-model). Use `--jev-model`.
+
+## See also
+
+- [AI Backends](ai-backends.md): the chat-completion backends, which Jev is
+  deliberately not one of.
+- [Configuration Best Practices: Credential Profiles](configuration-best-practices.md#credential-profiles):
+  the environment and `settings.json` precedence.
+- [Request Log](log.md): querying and redaction.
+- [Issue #1760](https://github.com/rust-works/omni-dev/issues/1760): the
+  original request and API notes.
