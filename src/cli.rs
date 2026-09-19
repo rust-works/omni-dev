@@ -301,12 +301,13 @@ impl Cli {
     }
 
     /// Thin disk boundary for [`Self::validate_active_profile`]: loads
-    /// `~/.omni-dev/settings.json`, degrading to defaults when it is absent or
-    /// unreadable rather than failing (an unreadable settings file must not block
-    /// commands that use no profile). A named function so it can be unit-tested
-    /// directly instead of as an inline closure.
+    /// `~/.omni-dev/settings.json`, warning and degrading to defaults when it
+    /// is absent, unreadable, or fails to parse, rather than failing (an
+    /// unreadable settings file must not block commands that use no
+    /// profile). A named function so it can be unit-tested directly instead
+    /// of as an inline closure.
     fn load_settings_or_default() -> crate::utils::settings::Settings {
-        crate::utils::settings::Settings::load().unwrap_or_default()
+        crate::utils::settings::Settings::load_or_warn_default()
     }
 
     /// Executes the CLI command.

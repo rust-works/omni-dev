@@ -108,7 +108,7 @@ async fn run_login(env: &(impl EnvSource + Sync), modify: bool) -> Result<()> {
     // Snapshot whether this call could be the first empty→non-empty
     // transition (issue #1500) *before* logging in — `login_for` mutates
     // settings.json on success, so the check must run first.
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     let might_shadow_legacy = {
         let legacy = auth::status();
         let had_legacy =
@@ -120,7 +120,7 @@ async fn run_login(env: &(impl EnvSource + Sync), modify: bool) -> Result<()> {
     let status = auth::login_for(None, &client_id, &client_secret, scope, &browser).await?;
 
     if might_shadow_legacy {
-        let settings = Settings::load().unwrap_or_default();
+        let settings = Settings::load_or_warn_default();
         if !settings.gmail.accounts.is_empty() {
             helpers::print_shadowing_notice();
         }
@@ -301,7 +301,7 @@ impl StatusCommand {
 /// Degenerates to [`run_auth_status`]'s single-account behavior when no
 /// named accounts are configured (the zero-migration path).
 async fn run_auth_status_all() -> Result<()> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     let accounts = account::list_accounts(&settings.gmail);
     if accounts.is_empty() {
         let credentials = auth::load_credentials_for(None)?;

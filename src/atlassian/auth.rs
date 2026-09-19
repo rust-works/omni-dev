@@ -67,7 +67,7 @@ pub fn load_credentials() -> Result<AtlassianCredentials> {
 pub fn load_credentials_with_instance(
     instance_override: Option<&str>,
 ) -> Result<AtlassianCredentials> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
 
     let instance_url = match instance_override {
         Some(url) => url.to_string(),
@@ -128,7 +128,7 @@ pub struct AuthStatus {
 /// only. Safe to call with no credentials configured (returns a scope with
 /// every flag `false`).
 pub fn status() -> AuthStatus {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
 
     let instance_url = settings
         .get_env_var(ATLASSIAN_INSTANCE_URL)

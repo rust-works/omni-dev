@@ -96,7 +96,7 @@ async fn run_login(
         resolve_login_credentials(env, prompt_client_id, prompt_client_secret)?;
     let scope = resolve_requested_scopes(write, write_file, write_full);
 
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     let browser = auth::resolve_browser_config_for(&settings.drive, None)?;
 
     let status = auth::login_for(None, &client_id, &client_secret, scope, &browser).await?;
@@ -272,7 +272,7 @@ impl StatusCommand {
 }
 
 async fn run_auth_status_all() -> Result<()> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     let accounts = account::list_accounts(&settings.drive);
     if accounts.is_empty() {
         // Zero-migration guarantee: degenerates to the single-account path.

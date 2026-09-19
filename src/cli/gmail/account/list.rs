@@ -21,7 +21,7 @@ impl ListCommand {
     /// Reads accounts from `~/.omni-dev/settings.json` only — no network
     /// call, no secret ever rendered.
     pub fn execute(self) -> Result<()> {
-        let settings = Settings::load().unwrap_or_default();
+        let settings = Settings::load_or_warn_default();
         let accounts = account::list_accounts(&settings.gmail);
         run_list(&accounts, &self.output)
     }

@@ -288,7 +288,7 @@ fn run_auth_status(account: Option<&str>) -> Result<String> {
 /// Renders the configured Gmail accounts (name/email/scope/default) as
 /// YAML — never a secret, never a network call.
 fn run_account_list() -> Result<String> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     let accounts = account::list_accounts(&settings.gmail);
     yaml_result(&accounts)
 }

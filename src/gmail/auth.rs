@@ -267,7 +267,7 @@ pub fn load_credentials() -> Result<GmailCredentials> {
 /// [`load_credentials_with`]'s exact legacy behavior when no named account
 /// applies — the zero-migration guarantee.
 pub(crate) fn load_credentials_for(explicit: Option<&str>) -> Result<GmailCredentials> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     match resolve(&settings.gmail, explicit)? {
         ResolvedAccount::Legacy => {
             let profile = active_profile_from(&SystemEnv);
@@ -387,7 +387,7 @@ pub(crate) fn status_with(env: &impl crate::utils::env::EnvSource) -> GmailAuthS
 /// [`load_credentials_for`] instead.
 #[cfg(feature = "mcp")]
 pub(crate) fn status_for(explicit: Option<&str>) -> Result<GmailAuthStatus> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     match resolve(&settings.gmail, explicit)? {
         ResolvedAccount::Legacy => {
             let profile = active_profile_from(&SystemEnv);
@@ -421,7 +421,7 @@ fn status_from_named(gmail: &GmailSettings, name: &str) -> GmailAuthStatus {
 /// no-op when `name` already has an `email_address` — an explicit or
 /// previously-backfilled value is never overwritten (issue #1505).
 pub(crate) fn record_account_email(name: &str, email: &str) -> Result<()> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     if settings
         .gmail
         .accounts
@@ -533,7 +533,7 @@ pub(crate) fn remove_credentials_at(settings_path: &Path, profile: Option<&str>)
 /// [`account::GMAIL_ACCOUNT_ENV`] override, if any. Removes the whole
 /// `gmail.accounts.<name>` entry — an account is coherent as a unit.
 pub(crate) fn remove_credentials_for(explicit: Option<&str>) -> Result<bool> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     match resolve(&settings.gmail, explicit)? {
         ResolvedAccount::Legacy => remove_credentials_at(
             &Settings::get_settings_path()?,
@@ -1031,7 +1031,7 @@ pub(crate) async fn login_for(
     scope: GmailScope,
     browser: &BrowserConfig,
 ) -> Result<GmailAuthStatus> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_or_warn_default();
     match resolve_for_write(&settings.gmail, explicit)? {
         ResolvedAccount::Legacy => {
             login_to(
