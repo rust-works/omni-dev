@@ -137,7 +137,7 @@ async fn release_inner(opts: &ReleaseOptions) -> ReleaseResult {
     let outcome = async {
         let lock = LedgerLock::acquire_waiting(&opts.ledger_path).await?;
         LeaseLedger::mutate(&lock, &opts.ledger_path, |ledger| {
-            ledger.release(&opts.token, Utc::now())
+            ledger.release(&opts.token, Utc::now(), None)
         })
     }
     .await;
@@ -251,6 +251,7 @@ mod tests {
             acquired_at: Utc::now() - ChronoDuration::minutes(5),
             expires_at,
             released_at,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         });

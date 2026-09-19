@@ -23,7 +23,13 @@
 //! zero and never participates in that budget, so it is reachable only
 //! through `--older-than` — a `DriveCopy` sorted behind an oversized
 //! `Bytes` backup must never be dropped as that backup's collateral
-//! damage. The ledger lock is held only briefly per step (once to decide
+//! damage. A second, narrower case is exempted the same way (issue #1768):
+//! a row released because `drive lease restore` superseded it, whose
+//! superseding restore then never actually completed
+//! ([`is_unresolved_supersede_orphan`]), remains the file's only real
+//! backup — competing it by raw `expires_at` against the superseding
+//! lease's own fresher-but-operationally-useless backup could otherwise
+//! evict the wrong one. The ledger lock is held only briefly per step (once to decide
 //! candidates, then once per row to persist that row's removal) rather
 //! than for the whole run, so a large batch never blocks a concurrent
 //! `drive lease acquire`/`restore`/write for longer than a single row's
@@ -198,6 +204,33 @@ fn keep_count_by_size(sorted_desc: &[&LeaseRecord], max: u64) -> usize {
     keep
 }
 
+/// A row released because `drive lease restore` superseded it (issue
+/// #1685), where the restore that superseded it never actually completed —
+/// `restored_at` (stamped only on [`RestoreResult::Restored`]/
+/// [`RestoreResult::RestoredSheet`], see `restore.rs`'s
+/// `stamp_backup_restored`) is still `None`. This row remains the file's
+/// only real backup: the superseding lease's own backup is a pre-restore
+/// snapshot nothing ever wrote over, and is comparatively worthless, so
+/// `--max-size`'s competitive keep must not let that lease's fresher (and
+/// always-later, since it was minted after this row) `expires_at` win and
+/// evict this one instead (issue #1768).
+///
+/// Two related rows are deliberately **not** exempted, and keep competing
+/// by raw `expires_at` exactly as before: a row released by a *successful*
+/// supersede (`restored_at` is `Some`) — its content is live again, so the
+/// superseding lease's own backup is now meaningful too, and ordinary
+/// recency ordering between them is fine — and a row released by a plain
+/// `drive lease release` (`superseded_by` is `None` there), which
+/// `releasing_a_row_early_puts_its_bytes_into_the_max_size_budget` pins as
+/// intended: an operator releasing a lease early still wants its bytes to
+/// count against the budget.
+///
+/// [`RestoreResult::Restored`]: super::restore::RestoreResult::Restored
+/// [`RestoreResult::RestoredSheet`]: super::restore::RestoreResult::RestoredSheet
+fn is_unresolved_supersede_orphan(rec: &LeaseRecord) -> bool {
+    rec.superseded_by.is_some() && rec.restored_at.is_none()
+}
+
 /// The ledger-only half of [`prune`]: computes removal candidates by age
 /// and/or size, never touching Drive. Shared by `prune`'s live path and by
 /// [`plan`] (`--dry-run`, issue #1743) so their accounting can never drift
@@ -237,23 +270,30 @@ fn compute_removals(opts: &PruneOptions) -> Result<(usize, Vec<LeaseRecord>)> {
             None => true,
         });
 
-    // Size filter, applied only to the `Bytes`-backed age survivors —
-    // a `DriveCopy` contributes zero local bytes and must stay
-    // reachable only through `--older-than`, so it is set aside first
-    // and always kept here regardless of position, never dropped as
-    // collateral damage from an oversized `Bytes` backup sorted ahead
-    // of it in the same budget.
+    // Size filter, applied only to the `Bytes`-backed age survivors that
+    // are not otherwise exempt from the budget:
+    //   - a `DriveCopy` contributes zero local bytes and must stay
+    //     reachable only through `--older-than`, so it is set aside first
+    //     and always kept here regardless of position, never dropped as
+    //     collateral damage from an oversized `Bytes` backup sorted ahead
+    //     of it in the same budget.
+    //   - an unresolved-supersede orphan (issue #1768,
+    //     `is_unresolved_supersede_orphan`) is set aside the same way — it
+    //     is the file's only real backup, and must not be competed by raw
+    //     `expires_at` against the always-fresher, possibly-useless lease
+    //     that superseded it.
     if let Some(max) = opts.max_size {
-        let (mut bytes_survivors, copy_survivors): (Vec<LeaseRecord>, Vec<LeaseRecord>) =
-            age_survivors
-                .into_iter()
-                .partition(|rec| matches!(rec.backup, LeaseBackup::Bytes { .. }));
+        let (mut bytes_survivors, budget_exempt): (Vec<LeaseRecord>, Vec<LeaseRecord>) =
+            age_survivors.into_iter().partition(|rec| {
+                matches!(rec.backup, LeaseBackup::Bytes { .. })
+                    && !is_unresolved_supersede_orphan(rec)
+            });
         bytes_survivors.sort_by_key(|rec| std::cmp::Reverse(rec.expires_at));
         let refs: Vec<&LeaseRecord> = bytes_survivors.iter().collect();
         let keep = keep_count_by_size(&refs, max);
         removed.extend(bytes_survivors.split_off(keep));
         age_survivors = bytes_survivors;
-        age_survivors.extend(copy_survivors);
+        age_survivors.extend(budget_exempt);
     }
 
     Ok((live_count + age_survivors.len(), removed))
@@ -460,6 +500,7 @@ mod tests {
             acquired_at: expires_at - ChronoDuration::minutes(30),
             expires_at,
             released_at: None,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         }
@@ -477,6 +518,7 @@ mod tests {
             acquired_at: expires_at - ChronoDuration::minutes(30),
             expires_at,
             released_at: None,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         }
@@ -610,6 +652,184 @@ mod tests {
             !older_backup.exists(),
             "the released row's bytes now count against the budget, evicting the older row"
         );
+    }
+
+    /// The direct regression test for issue #1768: `T` was superseded by
+    /// `N` (`drive lease restore`'s supersede, issue #1685), but the write
+    /// under `N` never completed (`FreshLeaseButWriteFailed`), so `T` is
+    /// still the file's only real backup — and its own `expires_at` is
+    /// older than `N`'s always-fresher one. Before the fix, the two
+    /// competed head-to-head by raw `expires_at` and `N` — an
+    /// operationally useless pre-restore snapshot — could win, evicting
+    /// `T`. A third, unrelated row (`newer`) proves the exemption is
+    /// scoped to `T` alone: `N` still competes normally and loses to it.
+    #[tokio::test]
+    async fn max_size_never_evicts_a_bytes_backup_orphaned_by_a_failed_supersede() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let orphan_backup = dir.path().join("orphan-backup");
+        let superseder_backup = dir.path().join("superseder-backup");
+        let newer_backup = dir.path().join("newer-backup");
+        std::fs::write(&orphan_backup, b"xx").unwrap();
+        std::fs::write(&superseder_backup, b"xx").unwrap();
+        std::fs::write(&newer_backup, b"xx").unwrap();
+
+        let mut ledger = LeaseLedger::default();
+        let mut orphan = bytes_record(
+            "old-real-backup",
+            Utc::now() - ChronoDuration::hours(3),
+            2,
+            orphan_backup.clone(),
+        );
+        orphan.released_at = Some(Utc::now() - ChronoDuration::hours(3));
+        orphan.superseded_by = Some("fresh-token".to_string());
+        ledger.insert(orphan);
+        ledger.insert(bytes_record(
+            "fresh-token",
+            Utc::now() - ChronoDuration::hours(2),
+            2,
+            superseder_backup.clone(),
+        ));
+        ledger.insert(bytes_record(
+            "newer-unrelated",
+            Utc::now() - ChronoDuration::hours(1),
+            2,
+            newer_backup.clone(),
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let outcome = prune(
+            &client,
+            &PruneOptions {
+                older_than: None,
+                // Room for exactly one of the two *competing* 2-byte
+                // backups — `orphan` is exempt, so it never enters this
+                // budget at all.
+                max_size: Some(2),
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert!(
+            orphan_backup.exists(),
+            "the unresolved supersede orphan must survive regardless of the budget"
+        );
+        assert!(
+            newer_backup.exists(),
+            "the more-recently-expired unrelated row wins the budget fairly"
+        );
+        assert!(
+            !superseder_backup.exists(),
+            "the superseding lease's own backup is not exempt and loses to the newer row"
+        );
+    }
+
+    /// The mirror image of the regression test above: when the restore that
+    /// superseded `T` actually *succeeded* (`restored_at` is `Some`), `T` is
+    /// not exempted — its content is live again, and ordinary
+    /// `expires_at`-based competition against the superseding lease's own
+    /// (now meaningful) backup is exactly what's wanted.
+    #[tokio::test]
+    async fn max_size_still_competes_a_successfully_restored_supersede_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let restored_backup = dir.path().join("restored-backup");
+        let superseder_backup = dir.path().join("superseder-backup");
+        std::fs::write(&restored_backup, b"xx").unwrap();
+        std::fs::write(&superseder_backup, b"xx").unwrap();
+
+        let mut ledger = LeaseLedger::default();
+        let mut restored = bytes_record(
+            "old-real-backup",
+            Utc::now() - ChronoDuration::hours(2),
+            2,
+            restored_backup.clone(),
+        );
+        restored.released_at = Some(Utc::now() - ChronoDuration::hours(2));
+        restored.superseded_by = Some("fresh-token".to_string());
+        restored.restored_at = Some(Utc::now() - ChronoDuration::hours(2));
+        ledger.insert(restored);
+        ledger.insert(bytes_record(
+            "fresh-token",
+            Utc::now() - ChronoDuration::hours(1),
+            2,
+            superseder_backup.clone(),
+        ));
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let outcome = prune(
+            &client,
+            &PruneOptions {
+                older_than: None,
+                max_size: Some(2),
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert!(
+            superseder_backup.exists(),
+            "the superseding lease expires furthest in the future, so it wins the budget"
+        );
+        assert!(
+            !restored_backup.exists(),
+            "a successfully-restored-from row is not exempted — it competes normally"
+        );
+    }
+
+    /// The exemption above is `--max-size`-only, not a permanent shield:
+    /// `--older-than` filters on absolute `expires_at` before the size
+    /// filter even runs, so an unresolved supersede orphan is still
+    /// reachable once it's actually old enough.
+    #[tokio::test]
+    async fn older_than_still_reaches_an_unresolved_supersede_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let _audit = AuditGuard::redirect(dir.path());
+        let ledger_path = dir.path().join("lease-ledger.jsonl");
+        let orphan_backup = dir.path().join("orphan-backup");
+        std::fs::write(&orphan_backup, b"x").unwrap();
+
+        let mut ledger = LeaseLedger::default();
+        let mut orphan = bytes_record(
+            "old-real-backup",
+            Utc::now() - ChronoDuration::days(10),
+            1,
+            orphan_backup.clone(),
+        );
+        orphan.released_at = Some(Utc::now() - ChronoDuration::days(10));
+        orphan.superseded_by = Some("fresh-token".to_string());
+        ledger.insert(orphan);
+        ledger.save(&ledger_path).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let outcome = prune(
+            &client,
+            &PruneOptions {
+                older_than: Some(Utc::now() - ChronoDuration::days(1)),
+                max_size: None,
+                dry_run: false,
+                ledger_path: ledger_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert!(!orphan_backup.exists());
     }
 
     #[tokio::test]

@@ -179,6 +179,7 @@ pub(crate) fn seed_lease_at(
         acquired_at,
         expires_at,
         released_at: None,
+        superseded_by: None,
         restored_at: None,
         restored_sheet_id: None,
     });

@@ -117,6 +117,17 @@ pub(crate) struct LeaseRecord {
     /// [`super::prune`] drops it together with its backup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) released_at: Option<DateTime<Utc>>,
+    /// The token that superseded this row via `drive lease restore`'s
+    /// supersede (issue #1685), if that is why it was released — `None` for
+    /// a plain `drive lease release` (or for a row that has never been
+    /// released at all). Distinct from `released_at` alone, which both
+    /// paths stamp identically: this is what lets [`super::prune`] (issue
+    /// #1768) tell "released because a restore replaced this lease" apart
+    /// from "released on purpose", since only the former can leave this row
+    /// as the file's only real backup while the token named here points at
+    /// an operationally useless one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) superseded_by: Option<String>,
     /// Set once `drive lease restore <TOKEN>` successfully restores from
     /// this row's backup (ADR-0080 §4/§10) — the "transition" §4 says a
     /// restored-from row is marked with, kept rather than dropped so a
@@ -290,9 +301,12 @@ impl LeaseLedger {
     }
 
     /// Ends `token`'s write authority early, stamping `released_at` with
-    /// `at`. The row itself is kept — a released lease's backup stays
-    /// restorable, and only [`super::prune`] ever drops a row (together with
-    /// its backup).
+    /// `at` and, when `superseded_by` is given, `superseded_by` too — the
+    /// durable record of *why* this row was released, which `insert_record`
+    /// passes for `drive lease restore`'s supersede (issue #1685) and
+    /// `drive lease release` leaves `None` for a plain release. The row
+    /// itself is kept — a released lease's backup stays restorable, and only
+    /// [`super::prune`] ever drops a row (together with its backup).
     ///
     /// Idempotent in effect but not in report: an already-released or
     /// already-expired row is left exactly as it is and reported as
@@ -301,7 +315,12 @@ impl LeaseLedger {
     /// claiming to have done something. Re-stamping such a row would
     /// overwrite the original release's timestamp, losing audit fidelity for
     /// no gain.
-    pub(crate) fn release(&mut self, token: &str, at: DateTime<Utc>) -> ReleaseOutcome {
+    pub(crate) fn release(
+        &mut self,
+        token: &str,
+        at: DateTime<Utc>,
+        superseded_by: Option<&str>,
+    ) -> ReleaseOutcome {
         let Some(rec) = self.0.get_mut(token) else {
             return ReleaseOutcome::NotFound;
         };
@@ -313,6 +332,7 @@ impl LeaseLedger {
             };
         }
         rec.released_at = Some(at);
+        rec.superseded_by = superseded_by.map(str::to_string);
         ReleaseOutcome::Released {
             file_id: rec.file_id.clone(),
             expires_at: rec.expires_at,
@@ -744,6 +764,7 @@ mod tests {
             acquired_at: Utc::now(),
             expires_at: Utc::now() + ChronoDuration::minutes(30),
             released_at: None,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         }
@@ -777,6 +798,42 @@ mod tests {
         let mut rec = sample_record("t1");
         rec.released_at = Some(Utc::now());
         assert!(!rec.is_live(Utc::now()));
+    }
+
+    #[test]
+    fn release_with_no_superseder_leaves_superseded_by_unset() {
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(sample_record("t1"));
+        let outcome = ledger.release("t1", Utc::now(), None);
+        assert!(matches!(outcome, ReleaseOutcome::Released { .. }));
+        assert_eq!(ledger.get("t1").unwrap().superseded_by, None);
+    }
+
+    #[test]
+    fn release_with_a_superseder_stamps_superseded_by() {
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(sample_record("t1"));
+        let outcome = ledger.release("t1", Utc::now(), Some("fresh-token"));
+        assert!(matches!(outcome, ReleaseOutcome::Released { .. }));
+        assert_eq!(
+            ledger.get("t1").unwrap().superseded_by.as_deref(),
+            Some("fresh-token")
+        );
+    }
+
+    #[test]
+    fn releasing_an_already_dead_row_never_stamps_superseded_by() {
+        let mut rec = sample_record("t1");
+        rec.expires_at = Utc::now() - ChronoDuration::hours(1);
+        let mut ledger = LeaseLedger::default();
+        ledger.insert(rec);
+        let outcome = ledger.release("t1", Utc::now(), Some("fresh-token"));
+        assert!(matches!(outcome, ReleaseOutcome::NotLive { .. }));
+        assert_eq!(
+            ledger.get("t1").unwrap().superseded_by,
+            None,
+            "an already-dead row must be left exactly as it was, not stamped"
+        );
     }
 
     #[test]
@@ -1011,6 +1068,20 @@ mod tests {
 
         let record = LeaseLedger::load(&path).unwrap();
         assert_eq!(record.get("t1").unwrap().restored_sheet_id, None);
+    }
+
+    #[test]
+    fn a_ledger_line_predating_superseded_by_still_parses() {
+        // Same additive-field contract as `restored_sheet_id` above — a
+        // ledger written by a build before #1768 must keep loading.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease-ledger.jsonl");
+        let mut without = serde_json::to_value(sample_record("t1")).unwrap();
+        without.as_object_mut().unwrap().remove("superseded_by");
+        std::fs::write(&path, format!("{without}\n")).unwrap();
+
+        let record = LeaseLedger::load(&path).unwrap();
+        assert_eq!(record.get("t1").unwrap().superseded_by, None);
     }
 
     #[test]

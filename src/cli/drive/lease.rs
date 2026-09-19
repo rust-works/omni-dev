@@ -964,6 +964,7 @@ mod tests {
             acquired_at: chrono::Utc::now() - chrono::Duration::hours(2),
             expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
             released_at: None,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         });
@@ -1141,6 +1142,7 @@ mod tests {
             acquired_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
             released_at: None,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         });
@@ -1479,6 +1481,7 @@ mod tests {
             acquired_at: chrono::Utc::now() - chrono::Duration::days(10),
             expires_at: chrono::Utc::now() - chrono::Duration::days(9),
             released_at: None,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         });
@@ -1531,6 +1534,7 @@ mod tests {
             acquired_at: chrono::Utc::now() - chrono::Duration::hours(3),
             expires_at: chrono::Utc::now() - chrono::Duration::hours(2),
             released_at: None,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         });
@@ -1547,6 +1551,7 @@ mod tests {
             acquired_at: chrono::Utc::now() - chrono::Duration::hours(2),
             expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
             released_at: None,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         });
@@ -1596,6 +1601,7 @@ mod tests {
             acquired_at: chrono::Utc::now() - chrono::Duration::days(10),
             expires_at: chrono::Utc::now() - chrono::Duration::days(9),
             released_at: None,
+            superseded_by: None,
             restored_at: None,
             restored_sheet_id: None,
         });
