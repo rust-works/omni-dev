@@ -460,6 +460,41 @@ impl EnvSource for SettingsEnv {
     }
 }
 
+/// Process-wide de-duplication for [`Settings::load_or_warn_default`]'s
+/// warning (issue #1744). Remembers the last failure warned about: a repeat
+/// of the same failure is silent, while a successful load forgets it — so a
+/// long-lived process (the daemon, the MCP server) warns afresh if the file is
+/// fixed and later broken again, even with an identical error.
+struct LoadWarnDedup(Mutex<Option<String>>);
+
+impl LoadWarnDedup {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// Records one load's outcome (`None` = success, `Some` = the failure's
+    /// message) and returns whether that failure should be warned about.
+    fn observe(&self, failure: Option<&str>) -> bool {
+        let mut last = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match failure {
+            None => {
+                *last = None;
+                false
+            }
+            Some(message) if last.as_deref() == Some(message) => false,
+            Some(message) => {
+                *last = Some(message.to_string());
+                true
+            }
+        }
+    }
+}
+
+static LOAD_WARN_DEDUP: LoadWarnDedup = LoadWarnDedup::new();
+
 impl Settings {
     /// Loads settings from the default location.
     pub fn load() -> Result<Self> {
@@ -472,14 +507,29 @@ impl Settings {
     /// the disk boundary every non-`Result` call site shares (issue #1744).
     /// A *missing* file is not an error and never warns (see
     /// [`Self::load_from_path`]).
+    ///
+    /// The warning fires once per distinct failure per process, not once per
+    /// call: a single command loads settings several times (client creation,
+    /// then each account/lease helper), and repeating an identical warning
+    /// for every read buried the refusal it explains. A successful load resets
+    /// this, so a long-lived process warns again if the file breaks again.
     pub fn load_or_warn_default() -> Self {
-        Self::load().unwrap_or_else(|e| {
-            tracing::warn!(
-                "{e:#}; falling back to default settings for this invocation — \
-                 any settings.json configuration is being ignored"
-            );
-            Self::default()
-        })
+        match Self::load() {
+            Ok(settings) => {
+                LOAD_WARN_DEDUP.observe(None);
+                settings
+            }
+            Err(e) => {
+                let message = format!("{e:#}");
+                if LOAD_WARN_DEDUP.observe(Some(&message)) {
+                    tracing::warn!(
+                        "{message}; falling back to default settings for this invocation — \
+                         any settings.json configuration is being ignored"
+                    );
+                }
+                Self::default()
+            }
+        }
     }
 
     /// Loads just the [`mcp`](McpSettings) section, warning and falling back
@@ -1083,6 +1133,25 @@ mod tests {
         // Check env vars
         assert_eq!(settings.env.get("TEST_VAR").unwrap(), "test_value");
         assert_eq!(settings.env.get("CLAUDE_API_KEY").unwrap(), "test_api_key");
+    }
+
+    #[test]
+    fn load_warn_dedup_warns_once_per_distinct_failure() {
+        let dedup = LoadWarnDedup::new();
+        assert!(dedup.observe(Some("broken A")));
+        assert!(!dedup.observe(Some("broken A")), "a repeat is silent");
+        assert!(dedup.observe(Some("broken B")), "a new failure warns");
+        assert!(!dedup.observe(Some("broken B")));
+    }
+
+    #[test]
+    fn load_warn_dedup_rewarns_after_a_successful_load() {
+        // A long-lived process must warn again if the file is fixed and then
+        // broken again, even with an identical error message.
+        let dedup = LoadWarnDedup::new();
+        assert!(dedup.observe(Some("broken")));
+        assert!(!dedup.observe(None), "a success never warns");
+        assert!(dedup.observe(Some("broken")));
     }
 
     #[test]

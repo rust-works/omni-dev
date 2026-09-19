@@ -180,15 +180,9 @@ impl LeaseFlags {
         // finding). A parse failure warns rather than silently falling back
         // (issue #1695) — `biometrics_only`'s default is the less-secure
         // direction, so a broken settings.json must not silently downgrade
-        // it.
-        let loaded = Settings::load().unwrap_or_else(|e| {
-            tracing::warn!(
-                "{e:#}; falling back to default settings for this invocation — any \
-                 `lease.*` config in settings.json (backup_dir, default_expiry_minutes, \
-                 biometrics_only, allow_headless) is being ignored"
-            );
-            Settings::default()
-        });
+        // it. The shared loader owns that warning (issue #1744), so the
+        // helpers `acquire`/`restore` call next don't repeat it.
+        let loaded = Settings::load_or_warn_default();
         let lease = loaded.lease.clone();
         let profile = crate::utils::settings::active_profile_from(&crate::utils::env::SystemEnv);
         let env = SettingsEnv::from_settings(loaded, profile.as_deref());
