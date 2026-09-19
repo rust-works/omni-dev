@@ -41,6 +41,10 @@ pub struct CreatePrCommand {
     /// Use commit messages (not the diff) as the primary input for PR generation.
     #[arg(long)]
     pub from_commits: bool,
+
+    /// AI backend selection (`--ai-backend`, `--model`, …).
+    #[command(flatten)]
+    pub ai: crate::cli::ai_backend_args::AiBackendArgs,
 }
 
 /// PR action choices.
@@ -118,6 +122,8 @@ impl CreatePrCommand {
 
     /// Executes the create PR command.
     pub async fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
+        self.ai.apply();
+
         // Resolve the repo root once; every git, config, scratch, PR-template,
         // and `gh` read below anchors to it (the CWD is the default when no
         // path is injected).
@@ -129,8 +135,8 @@ impl CreatePrCommand {
 
         // Preflight check: validate all prerequisites before any processing
         // This catches missing credentials/tools early before wasting time
-        // Model selection uses the global `--model` flag (propagated as
-        // OMNI_DEV_MODEL) and the per-backend env chain.
+        // Model selection uses this command's `--model` flag (propagated as
+        // OMNI_DEV_MODEL by `self.ai.apply()`) and the per-backend env chain.
         let ai_info = crate::utils::check_pr_command_prerequisites(None, repo_root)?;
         println!(
             "✓ {} credentials verified (model: {})",
@@ -1525,6 +1531,7 @@ pub async fn run_create_pr(
         context_dir: None,
         no_push: true,
         from_commits: false,
+        ai: crate::cli::ai_backend_args::AiBackendArgs::default(),
     };
 
     let repo_view = cmd.generate_repository_view(&repo_root)?;
@@ -1625,6 +1632,7 @@ mod run_create_pr_tests {
             context_dir: None,
             no_push: true,
             from_commits: false,
+            ai: crate::cli::ai_backend_args::AiBackendArgs::default(),
         }
     }
 

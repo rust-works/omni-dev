@@ -13,15 +13,23 @@ use crate::utils::terminal::RawModeGuard;
 
 /// Interactive AI chat session.
 ///
-/// Model selection uses the global `--model` flag (propagated as
-/// `OMNI_DEV_MODEL`) and the per-backend env chain; there is no
-/// subcommand-local flag.
+/// Backend and model selection use the flattened [`AiBackendArgs`] flags
+/// (`--ai-backend`, `--model`, …; propagated as `OMNI_DEV_AI_BACKEND`,
+/// `OMNI_DEV_MODEL`, …) and the per-backend env chain.
+///
+/// [`AiBackendArgs`]: crate::cli::ai_backend_args::AiBackendArgs
 #[derive(Parser)]
-pub struct ChatCommand {}
+pub struct ChatCommand {
+    /// AI backend selection (`--ai-backend`, `--model`, …).
+    #[command(flatten)]
+    pub ai: crate::cli::ai_backend_args::AiBackendArgs,
+}
 
 impl ChatCommand {
     /// Executes the chat command.
     pub async fn execute(self) -> Result<()> {
+        self.ai.apply();
+
         let ai_info = crate::utils::preflight::check_ai_credentials(None)?;
         eprintln!(
             "Connected to {} (model: {})",

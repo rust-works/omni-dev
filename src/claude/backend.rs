@@ -15,7 +15,7 @@
 //! Backend selection precedence:
 //!
 //! 1. [`AI_BACKEND_ENV`] (`OMNI_DEV_AI_BACKEND`), set directly or via the
-//!    global `--ai-backend` flag — wins outright, including the value
+//!    per-command `--ai-backend` flag — wins outright, including the value
 //!    `default`, which forces the direct Anthropic API even when a `USE_*`
 //!    flag is set. An unknown value is a hard error.
 //! 2. Legacy flags, first match wins: [`USE_OLLAMA_ENV`] → [`USE_OPENAI_ENV`]
@@ -24,7 +24,7 @@
 //!
 //! Model resolution stops at the first non-empty value: the explicit value
 //! (CLI-independent callers such as MCP tools) → [`MODEL_ENV`]
-//! (`OMNI_DEV_MODEL`, set by the global `--model` flag) → the backend
+//! (`OMNI_DEV_MODEL`, set by the per-command `--model` flag) → the backend
 //! family's own variables → the registry default for the provider. The
 //! Claude-family variables ([`CLAUDE_MODEL_ENV`], [`CLAUDE_CODE_MODEL_ENV`],
 //! [`ANTHROPIC_MODEL_ENV`]) apply only to Claude-family backends; OpenAI and
@@ -37,7 +37,8 @@ use crate::claude::model_config::ModelRegistry;
 use crate::utils::env::{non_empty_var, EnvSource};
 
 /// Env var selecting the AI backend (`default`, `claude-cli`, `openai`,
-/// `ollama`, `bedrock`); set by the global `--ai-backend` flag.
+/// `ollama`, `bedrock`); set by the per-command `--ai-backend` flag
+/// ([`crate::cli::ai_backend_args::AiBackendArgs`]).
 pub const AI_BACKEND_ENV: &str = "OMNI_DEV_AI_BACKEND";
 /// Env var carrying the backend-agnostic model override; set by the global
 /// `--model` flag. Outranks every per-family model variable.
@@ -245,7 +246,7 @@ pub fn parse_beta_header(s: &str) -> Result<(String, String)> {
 /// Resolves the beta header to send with AI API requests.
 ///
 /// `explicit` (callers with their own parameter) wins; otherwise
-/// [`BETA_HEADER_ENV`] (set by the global `--beta-header` flag) is parsed as
+/// [`BETA_HEADER_ENV`] (set by the per-command `--beta-header` flag) is parsed as
 /// `key:value`. A set-but-malformed value is a hard error; unset (or empty)
 /// resolves to `None`.
 pub fn resolve_beta_header(

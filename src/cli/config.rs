@@ -50,6 +50,10 @@ pub struct ShowCommand {
     /// user/project overrides.
     #[arg(long)]
     pub embedded_only: bool,
+
+    /// `--models-yaml` override for the catalog being shown.
+    #[command(flatten)]
+    pub models_yaml: crate::cli::ai_backend_args::ModelsYamlArg,
 }
 
 impl ConfigCommand {
@@ -79,6 +83,8 @@ impl ModelsCommand {
 impl ShowCommand {
     /// Executes the show command.
     pub fn execute(self) -> Result<()> {
+        self.models_yaml.apply();
+
         if self.embedded_only {
             print!("{MODELS_YAML}");
             return Ok(());
@@ -181,6 +187,7 @@ models:
     fn embedded_only_flag_round_trips_embedded_yaml() {
         let cmd = ShowCommand {
             embedded_only: true,
+            models_yaml: crate::cli::ai_backend_args::ModelsYamlArg::default(),
         };
         // execute() prints to stdout; we just confirm it does not error and
         // that the underlying constant is what `--embedded-only` would emit.

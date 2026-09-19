@@ -79,6 +79,10 @@ pub struct TwiddleCommand {
     /// Only shows errors/warnings, suppresses info-level output.
     #[arg(long)]
     pub quiet: bool,
+
+    /// AI backend selection (`--ai-backend`, `--model`, …).
+    #[command(flatten)]
+    pub ai: crate::cli::ai_backend_args::AiBackendArgs,
 }
 
 impl TwiddleCommand {
@@ -90,6 +94,8 @@ impl TwiddleCommand {
 
     /// Executes the twiddle command with contextual intelligence.
     pub async fn execute(mut self, repo: Option<&std::path::Path>) -> Result<()> {
+        self.ai.apply();
+
         // Resolve deprecated --batch-size into --concurrency
         if let Some(bs) = self.batch_size {
             eprintln!("warning: --batch-size is deprecated; use --concurrency instead");
@@ -113,9 +119,10 @@ impl TwiddleCommand {
         }
 
         // Preflight check: validate AI credentials before any processing.
-        // Model/beta-header selection uses the global `--model`/`--beta-header`
-        // flags (propagated as OMNI_DEV_MODEL/OMNI_DEV_BETA_HEADER) and the
-        // per-backend env chain.
+        // Model/beta-header selection uses this command's `--model`/
+        // `--beta-header` flags (propagated as OMNI_DEV_MODEL/
+        // OMNI_DEV_BETA_HEADER by `self.ai.apply()`) and the per-backend env
+        // chain.
         let ai_info = crate::utils::check_ai_command_prerequisites(None, repo_root)?;
         println!(
             "✓ {} credentials verified (model: {})",
@@ -2233,6 +2240,7 @@ mod execute_tests {
             refine: false,
             check: false,
             quiet: true,
+            ai: crate::cli::ai_backend_args::AiBackendArgs::default(),
         }
     }
 
@@ -2388,6 +2396,7 @@ mod execute_tests {
             refine: false,
             check: false,
             quiet: true,
+            ai: crate::cli::ai_backend_args::AiBackendArgs::default(),
         };
 
         cmd.execute(Some(temp_dir.path())).await.unwrap();
@@ -2771,6 +2780,7 @@ mod tests {
             refine: false,
             check: false,
             quiet: false,
+            ai: crate::cli::ai_backend_args::AiBackendArgs::default(),
         }
     }
 
