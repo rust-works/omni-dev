@@ -165,6 +165,7 @@ Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
             size: 0,
             history_id: None,
             deleted_at: None,
+            excluded_labels: Vec::new(),
         }
     }
 

@@ -522,7 +522,10 @@ would just be a second, redundant dump.
                                 #   internal_date, subject, from, to, rfc822_msgid,
                                 #   in_reply_to, references, attachment_count,
                                 #   attachment_filenames, path, size, history_id,
-                                #   deleted_at (soft-deleted messages only)
+                                #   deleted_at (soft-deleted messages only),
+                                #   excluded_labels (--exclude-label reason, only
+                                #   for a record soft-deleted by run_incremental's
+                                #   own precise tracking — see Sync below)
   messages/<year>/<month>/<day>/<id>.eml   # sharded by the message's internal_date
   messages/<year>/<month>/<day>/<id>/attachments/<filename>  # only with --extract-attachments
   insert-ledger.jsonl          # only after `gmail insert` has run — see Insert below
@@ -581,9 +584,16 @@ the label data `history.list` events already carry for free rather than a
 server-side query string: a new message with an excluded label is never
 fetched, and a `labelsAdded`/`labelsRemoved` event that later moves an
 already-archived message across the excluded boundary soft-deletes/
-undeletes it (the same mechanism a message's real disappearance from the
-server uses). On backfill/`--full`/reconciliation passes, only labels with
-a well-known `-in:` query translation take effect this way — currently just
+undeletes it. That undelete is deliberately conservative: the manifest
+records *precisely which* configured label(s) caused a soft-delete only
+when `run_incremental` itself made that call (from the message's real,
+event-driven current label set) — a record soft-deleted for any other
+reason (a real message deletion, or simply falling out of a `--full`
+listing) never gets tagged, so an unrelated later label change can never be
+mistaken for that exclusion having lifted and resurrect it.
+
+On backfill/`--full`/reconciliation passes, only labels with a well-known
+`-in:` query translation take effect this way — currently just
 `SPAM`/`TRASH`, since Gmail's `label:`/`in:` search operators match a
 label's *display name*, not its internal id, and most other system labels
 use `is:` rather than `in:`; folding an arbitrary label id in reliably would
@@ -591,15 +601,21 @@ need an extra `labels.list` lookup. Any other `--exclude-label` value still
 filters incremental runs (fully generally, by id), and a full/backfill pass
 prints a `Note` explaining it wasn't excluded on that pass — add it to
 `--query` yourself if you also want it gone from a `--full` re-run. A
-message that falls out of a `SPAM`/`TRASH`-filtered listing on a full/
-backfill pass has its cached label set tagged with the label(s) that
-excluded it (even though it's never re-fetched), specifically so a later,
-unrelated label change on an incremental run can't be mistaken for the
-exclusion having lifted and resurrect it. One edge case, not solved: a
-message that arrives *already* carrying an excluded label is never
-archived, so if that label is later removed there's no manifest record for
-the `labelsRemoved` event to act on — it self-heals on the next
-`--full`/reconciliation pass, same as this section's other races.
+message a full/backfill pass excludes by a custom label (tracked only via a
+prior incremental run) is not casually resurrected just because it still
+appears in a listing that couldn't have filtered that label out — only an
+actual `labelsRemoved` event (via a later incremental run) or a
+`--query`-assisted `--full` pass can undo it. Combining `--query` with
+`--exclude-label` is safe with either operator: any of your own query's
+`OR`-joined clauses is parenthesized before an exclusion clause is
+appended, so the exclusion always applies to the query as a whole rather
+than binding only to its last term.
+
+One edge case, not solved: a message that arrives *already* carrying an
+excluded label is never archived, so if that label is later removed
+there's no manifest record for the `labelsRemoved` event to act on — it
+self-heals on the next `--full`/reconciliation pass, same as this
+section's other races.
 
 **Header fields:** `subject`/`from`/`to`/`rfc822_msgid`/`in_reply_to`/
 `references` in the manifest are parsed directly from the already-fetched

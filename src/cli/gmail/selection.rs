@@ -224,6 +224,7 @@ mod tests {
             size: 0,
             history_id: None,
             deleted_at: None,
+            excluded_labels: Vec::new(),
         }
     }
 

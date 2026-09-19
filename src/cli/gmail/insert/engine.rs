@@ -476,6 +476,7 @@ mod tests {
             size: raw.len() as u64,
             history_id: None,
             deleted_at: None,
+            excluded_labels: Vec::new(),
         });
         manifest.save(&manifest_path(archive_dir)).unwrap();
     }

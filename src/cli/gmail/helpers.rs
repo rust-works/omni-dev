@@ -44,6 +44,47 @@ pub fn print_shadowing_notice() {
     );
 }
 
+/// Whether `label_ids` contains any of `targets` — a plain membership
+/// check shared by `gmail insert`'s system-label replay filter
+/// (`insert/labels.rs`'s `lands_in_inbox_or_unread`/`lands_in_trash_or_spam`)
+/// and `gmail sync`'s `--exclude-label` matching (`sync/engine.rs`), so a
+/// future change to label-comparison semantics (case normalization, etc.)
+/// only needs fixing in one place. Generic over `T: AsRef<str>` so callers
+/// can pass either a `&[&str]` literal (a small fixed set of system
+/// labels) or a `&[String]` (a caller-supplied list like
+/// `--exclude-label`) without an intermediate allocation.
+pub(crate) fn label_ids_contain_any<T: AsRef<str>>(label_ids: &[String], targets: &[T]) -> bool {
+    targets
+        .iter()
+        .any(|target| label_ids.iter().any(|label| label == target.as_ref()))
+}
+
+#[cfg(test)]
+mod label_membership_tests {
+    use super::label_ids_contain_any;
+
+    #[test]
+    fn label_ids_contain_any_matches_str_targets() {
+        let label_ids = vec!["INBOX".to_string(), "UNREAD".to_string()];
+        assert!(label_ids_contain_any(&label_ids, &["UNREAD", "STARRED"]));
+        assert!(!label_ids_contain_any(&label_ids, &["SPAM", "TRASH"]));
+    }
+
+    #[test]
+    fn label_ids_contain_any_matches_string_targets() {
+        let label_ids = vec!["SPAM".to_string()];
+        let targets = vec!["SPAM".to_string(), "TRASH".to_string()];
+        assert!(label_ids_contain_any(&label_ids, &targets));
+    }
+
+    #[test]
+    fn label_ids_contain_any_is_false_for_empty_targets() {
+        let label_ids = vec!["INBOX".to_string()];
+        let targets: Vec<String> = Vec::new();
+        assert!(!label_ids_contain_any(&label_ids, &targets));
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
