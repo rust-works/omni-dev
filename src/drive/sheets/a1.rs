@@ -157,7 +157,7 @@ pub(crate) fn compose(sheet: Option<&str>, range: Option<&str>) -> Result<String
 /// newline smuggled into a value that ends up in a URL is a request-splitting
 /// shape, not a domain error. Everything else is the server's call — see the
 /// module docs.
-fn validate_range(range: &str) -> Result<()> {
+pub(crate) fn validate_range(range: &str) -> Result<()> {
     anyhow::ensure!(!range.trim().is_empty(), "range must not be empty");
     anyhow::ensure!(
         !range.contains(['\r', '\n']),
