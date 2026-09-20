@@ -92,9 +92,14 @@ pub enum DriveOperation {
     /// renaming and inserting rows or columns; and, since issue #1643
     /// ([ADR-0078](../../docs/adrs/adr-0078.md)), cell/border formatting,
     /// merging, auto-resize, column width/row height, data validation,
-    /// `duplicateSheet`, and sheet reorder/hide. None of that later set
-    /// destroys data either, which is what earns it the same operation as
-    /// the original three rather than one of its own.
+    /// `duplicateSheet`, and sheet reorder/hide. Since issue #1795
+    /// ([ADR-0081](../../docs/adrs/adr-0081.md) §4), also developer-metadata
+    /// management (`set-developer-metadata`/`delete-developer-metadata`),
+    /// restricted to `DOCUMENT` visibility — `PROJECT`-visibility metadata,
+    /// which belongs to a different OAuth client, is never reachable
+    /// through this surface. None of that later set destroys data either,
+    /// which is what earns it the same operation as the original three
+    /// rather than one of its own.
     ///
     /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
     /// reason that one is not folded into [`Self::Edit`]. Every existing

@@ -10,6 +10,7 @@
 //! is a Drive concept.
 
 pub(crate) mod create;
+pub(crate) mod developer_metadata;
 pub(crate) mod format;
 pub(crate) mod info;
 pub(crate) mod protection;
@@ -126,6 +127,20 @@ pub enum SheetsSubcommands {
     /// Removes a range's data validation rule. Gated by the folder
     /// write-permission rules' `sheets-structure` operation (issue #1643).
     ClearDataValidation(validation::ClearDataValidationCommand),
+    /// Creates or updates a developer-metadata key/value pair on a
+    /// spreadsheet, sheet, row or column. Restricted to `DOCUMENT`
+    /// visibility. Gated by the folder write-permission rules'
+    /// `sheets-structure` operation (issue #1795).
+    SetDeveloperMetadata(developer_metadata::SetDeveloperMetadataCommand),
+    /// Removes developer metadata matching a key and location, after
+    /// reporting what would be removed. Restricted to `DOCUMENT`
+    /// visibility. Gated by the folder write-permission rules'
+    /// `sheets-structure` operation (issue #1795).
+    DeleteDeveloperMetadata(developer_metadata::DeleteDeveloperMetadataCommand),
+    /// Searches for developer metadata by key and/or location, restricted
+    /// to `DOCUMENT` visibility. Read-only and ungated, like `sheets info`
+    /// (issue #1795).
+    SearchDeveloperMetadata(developer_metadata::SearchDeveloperMetadataCommand),
     /// Protects a range or an entire sheet. Gated by the folder
     /// write-permission rules' `sheets-protection` operation — distinct
     /// from `sheets-structure` (issue #1643).
@@ -177,6 +192,9 @@ impl SheetsCommand {
             SheetsSubcommands::UpdateDimensionProperties(cmd) => cmd.execute(client).await,
             SheetsSubcommands::SetDataValidation(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ClearDataValidation(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::SetDeveloperMetadata(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteDeveloperMetadata(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::SearchDeveloperMetadata(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ProtectRange(cmd) => cmd.execute(client).await,
             SheetsSubcommands::UpdateProtection(cmd) => cmd.execute(client).await,
             SheetsSubcommands::UnprotectRange(cmd) => cmd.execute(client).await,

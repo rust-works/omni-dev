@@ -621,17 +621,17 @@ scope would technically permit.
 **Default policy** — what applies when no configured rule names an
 operation anywhere in a target's ancestor chain:
 
-| Operation           | Default | Granted to                                                                                                                                                                                                                                                                                                    |
-|---------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `read`              | allow   | `search`, `read`, `dedupe` (not yet enforced)                                                                                                                                                                                                                                                                 |
-| `create`            | deny    | `create`, `sheets create`                                                                                                                                                                                                                                                                                     |
-| `upload`            | deny    | `upload`                                                                                                                                                                                                                                                                                                      |
-| `edit`              | deny    | `edit` — raw file content only                                                                                                                                                                                                                                                                                |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values                                                                                                                                                                                                                                                 |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation` |
-| `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`                                                                                                                                                                                                                                        |
-| `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range`                                                                                                                                                                                                                                                |
-| `docs-write`        | deny    | `docs replace`, `docs append`                                                                                                                                                                                                                                                                                 |
+| Operation           | Default | Granted to                                                                                                                                                                                                                                                                                                                                                           |
+|---------------------|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `read`              | allow   | `search`, `read`, `dedupe` (not yet enforced)                                                                                                                                                                                                                                                                                                                        |
+| `create`            | deny    | `create`, `sheets create`                                                                                                                                                                                                                                                                                                                                            |
+| `upload`            | deny    | `upload`                                                                                                                                                                                                                                                                                                                                                             |
+| `edit`              | deny    | `edit` — raw file content only                                                                                                                                                                                                                                                                                                                                       |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values                                                                                                                                                                                                                                                                                                        |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata` |
+| `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`                                                                                                                                                                                                                                                                                               |
+| `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range`                                                                                                                                                                                                                                                                                                       |
+| `docs-write`        | deny    | `docs replace`, `docs append`                                                                                                                                                                                                                                                                                                                                        |
 
 There is no "enabled: true" flag — an absent or empty rule list already
 means "deny every write everywhere," via this table alone, which *is* the
@@ -666,6 +666,20 @@ of that destroys data — `merge-cells` is the one request that discards
 non-top-left values, and its `--dry-run` (and real run) names every cell
 that would be lost before it happens — so it earns the same operation as
 the original four verbs rather than a new one.
+
+**`sheets-structure` also covers developer-metadata management, restricted
+to `DOCUMENT` visibility** (issue #1795, [ADR-0081](adrs/adr-0081.md) §4).
+`createDeveloperMetadata`/`updateDeveloperMetadata`/`deleteDeveloperMetadata`
+attach or remove key/value annotations on the spreadsheet, a sheet, a row
+or a column — none of that is grid data and none of it is a permission
+change, so it earns the same operation as everything else here rather than
+a new one. The surface reads and writes `DOCUMENT`-visibility metadata
+only; `PROJECT`-visibility metadata belongs to whatever OAuth client
+created it and is never reachable through this tool. `delete-developer-metadata`
+reads back and reports the key, value and location of every entry it would
+remove before deleting it, the same preview pattern as `merge-cells`.
+`search-developer-metadata` is read-only and ungated, like
+`list-protections` below.
 
 **`sheets-protection` is separate from `sheets-structure`, and the reason is
 different in kind from every split above.** A protected range is a
@@ -1976,6 +1990,53 @@ a documented cut rather than a silent gap: `TEXT_IS_EMAIL`, `TEXT_IS_URL`,
 `DATE_ON_OR_BEFORE`, `DATE_ON_OR_AFTER`, `DATE_NOT_BETWEEN`,
 `DATE_IS_VALID`, and every condition type meaningful only inside a
 conditional-format rule.
+
+#### drive sheets set-developer-metadata / delete-developer-metadata / search-developer-metadata
+
+Key/value pairs attached to a spreadsheet, sheet, row or column — the
+channel other add-ons key their own state on. Also gated by
+`sheets-structure` (issue #1795, [ADR-0081](adrs/adr-0081.md) §4).
+`--sheet`/`--dimension`/`--start`/`--end` are optional on all three and
+compose into one of three locations: none of them means the whole
+spreadsheet, `--sheet` alone means the whole sheet, and all four together
+mean a row or column span.
+
+```bash
+# Spreadsheet-scoped: no --sheet/--dimension/--start/--end at all.
+omni-dev drive sheets set-developer-metadata <ID> --key owner --value team-a
+
+# Sheet-scoped.
+omni-dev drive sheets set-developer-metadata <ID> --key owner --value team-a \
+  --sheet Q2
+
+# Row/column-scoped, 1-based and inclusive like every other --start/--end
+# pair in this crate.
+omni-dev drive sheets set-developer-metadata <ID> --key source --value import \
+  --sheet Q2 --dimension rows --start 2 --end 100
+
+# Re-running set-developer-metadata with an existing key and location
+# updates its value instead of creating a duplicate entry.
+omni-dev drive sheets set-developer-metadata <ID> --key owner --value team-b
+
+# --dry-run reports every entry that would be removed before it happens.
+omni-dev drive sheets delete-developer-metadata <ID> --key owner --dry-run
+omni-dev drive sheets delete-developer-metadata <ID> --key owner
+
+# search-developer-metadata is read-only and ungated. Omit --key and every
+# location flag to list every DOCUMENT-visibility entry in the workbook.
+omni-dev drive sheets search-developer-metadata <ID>
+omni-dev drive sheets search-developer-metadata <ID> --sheet Q2
+```
+
+**There is no `--visibility` flag.** `DeveloperMetadata` carries a
+visibility of `DOCUMENT` or `PROJECT`; `PROJECT`-visibility metadata
+belongs to whatever OAuth client created it, not to this tool, so every
+request this surface sends is hardcoded to `DOCUMENT` and every response it
+reads is checked against it — there is no way, from the CLI or otherwise,
+to reach a `PROJECT`-visibility entry through `drive sheets`.
+`delete-developer-metadata` bulk-removes: since a key/location filter can
+match more than one entry, the preview (and the real run) lists every entry
+it applies to, not just one.
 
 #### drive sheets protect-range / update-protection / unprotect-range / list-protections
 

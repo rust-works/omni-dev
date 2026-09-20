@@ -4465,6 +4465,9 @@ Commands:
   update-dimension-properties  Sets an explicit pixel width (columns) or height (rows). Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
   set-data-validation          Sets a data validation rule on a range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
   clear-data-validation        Removes a range's data validation rule. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  set-developer-metadata       Creates or updates a developer-metadata key/value pair on a spreadsheet, sheet, row or column. Restricted to `DOCUMENT` visibility. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1795)
+  delete-developer-metadata    Removes developer metadata matching a key and location, after reporting what would be removed. Restricted to `DOCUMENT` visibility. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1795)
+  search-developer-metadata    Searches for developer metadata by key and/or location, restricted to `DOCUMENT` visibility. Read-only and ungated, like `sheets info` (issue #1795)
   protect-range                Protects a range or an entire sheet. Gated by the folder write-permission rules' `sheets-protection` operation — distinct from `sheets-structure` (issue #1643)
   update-protection            Changes an existing protected range's description, warning-only flag, or editor list. Gated by the folder write-permission rules' `sheets-protection` operation (issue #1643)
   unprotect-range              Removes a protected range. Gated by the folder write-permission rules' `sheets-protection` operation (issue #1643)
@@ -4620,6 +4623,29 @@ Options:
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets delete-developer-metadata - Removes developer metadata matching a key and location, after reporting what would be removed. Restricted to `DOCUMENT` visibility. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1795)
+
+Removes developer metadata matching a key and location, after reporting what would be removed. Restricted to `DOCUMENT` visibility. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1795)
+
+Usage: delete-developer-metadata [OPTIONS] --key <KEY> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --key <KEY>              The key to remove
+      --sheet <NAME>           Title of the sheet, when the location is sheet- or dimension-scoped. Omit entirely, along with `--dimension`/`--start`/`--end`, for a spreadsheet-scoped entry
+      --dimension <DIMENSION>  Rows or columns, when the location is a row/column span. Requires `--sheet`, `--start` and `--end` together [possible values: rows, columns]
+      --start <N>              1-based first row/column, inclusive
+      --end <N>                1-based last row/column, inclusive
+      --dry-run                Reports the gate verdict and every entry that would be removed, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
 
 
 ================================================================================
@@ -4947,6 +4973,27 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets search-developer-metadata - Searches for developer metadata by key and/or location, restricted to `DOCUMENT` visibility. Read-only and ungated, like `sheets info` (issue #1795)
+
+Searches for developer metadata by key and/or location, restricted to `DOCUMENT` visibility. Read-only and ungated, like `sheets info` (issue #1795)
+
+Usage: search-developer-metadata [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --key <KEY>              Restrict to this key. Omit to match every key
+      --sheet <NAME>           Title of the sheet, when restricting the search to a sheet or dimension span. Omit entirely, along with `--dimension`/`--start`/`--end`, to search the whole workbook
+      --dimension <DIMENSION>  Rows or columns, when restricting the search to a row/column span [possible values: rows, columns]
+      --start <N>              1-based first row/column, inclusive
+      --end <N>                1-based last row/column, inclusive
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets set-data-validation - Sets a data validation rule on a range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
 
 Sets a data validation rule on a range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
@@ -4988,6 +5035,30 @@ Options:
       --lease <TOKEN>                   The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>                 Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                            Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets set-developer-metadata - Creates or updates a developer-metadata key/value pair on a spreadsheet, sheet, row or column. Restricted to `DOCUMENT` visibility. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1795)
+
+Creates or updates a developer-metadata key/value pair on a spreadsheet, sheet, row or column. Restricted to `DOCUMENT` visibility. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1795)
+
+Usage: set-developer-metadata [OPTIONS] --key <KEY> --value <VALUE> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --key <KEY>              The key to set
+      --value <VALUE>          The value to write
+      --sheet <NAME>           Title of the sheet, when the location is sheet- or dimension-scoped. Omit entirely, along with `--dimension`/`--start`/`--end`, for a spreadsheet-scoped entry
+      --dimension <DIMENSION>  Rows or columns, when the location is a row/column span. Requires `--sheet`, `--start` and `--end` together [possible values: rows, columns]
+      --start <N>              1-based first row/column, inclusive
+      --end <N>                1-based last row/column, inclusive
+      --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
 
 
 ================================================================================

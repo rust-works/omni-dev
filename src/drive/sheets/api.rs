@@ -12,8 +12,9 @@ use crate::drive::files_api::{append_write_scope_hint, WriteCapability};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::types::{
     AppendValuesResponse, BatchGetValuesResponse, BatchUpdateRequest, BatchUpdateRequestItem,
-    BatchUpdateResponse, ClearValuesResponse, CopySheetToAnotherSpreadsheetRequest,
-    SheetProperties, Spreadsheet, UpdateValuesResponse, ValueRange,
+    BatchUpdateResponse, ClearValuesResponse, CopySheetToAnotherSpreadsheetRequest, DataFilter,
+    SearchDeveloperMetadataRequest, SearchDeveloperMetadataResponse, SheetProperties, Spreadsheet,
+    UpdateValuesResponse, ValueRange,
 };
 
 /// `fields` mask for `spreadsheets.get`.
@@ -310,6 +311,39 @@ impl<'a> SheetsApi<'a> {
             .await
             .map_err(|err| append_write_scope_hint(err, WriteCapability::EditContent))
     }
+
+    /// Searches for developer-metadata entries matching `filters`
+    /// (issue #1795, [ADR-0081](../../../docs/adrs/adr-0081.md) §4).
+    ///
+    /// Read-only, so — unlike [`Self::batch_update`]/[`Self::copy_to`] —
+    /// this is plain `pub`, not `pub(in crate::drive)`, and never goes
+    /// through [`append_write_scope_hint`]: nothing here mutates.
+    /// `developer_metadata.rs` is the one caller, and it always includes
+    /// `visibility: DOCUMENT_VISIBILITY` in every filter it builds, so the
+    /// server itself never returns a `PROJECT`-visibility entry to begin
+    /// with.
+    pub async fn search_developer_metadata(
+        &self,
+        spreadsheet_id: &str,
+        filters: Vec<DataFilter>,
+    ) -> Result<SearchDeveloperMetadataResponse> {
+        let url = build_developer_metadata_search_url(self.client.base_url(), spreadsheet_id)?;
+        let body = SearchDeveloperMetadataRequest {
+            data_filters: filters,
+        };
+        let response = self
+            .client
+            .transport()
+            .post_json(url.as_str(), &body)
+            .await?;
+        self.client
+            .transport()
+            .parse_response(
+                response,
+                "Failed to parse Sheets developerMetadata.search response",
+            )
+            .await
+    }
 }
 
 fn build_spreadsheet_get_url(base_url: &str, spreadsheet_id: &str) -> Result<Url> {
@@ -447,6 +481,18 @@ fn build_copy_to_url(base_url: &str, spreadsheet_id: &str, sheet_id: i64) -> Res
         &mut url,
         &[spreadsheet_id, "sheets", &format!("{sheet_id}:copyTo")],
     )?;
+    Ok(url)
+}
+
+/// `POST /v4/spreadsheets/{spreadsheetId}/developerMetadata:search`.
+///
+/// Same `:suffix`-on-segment trick as [`build_copy_to_url`]'s `:copyTo` —
+/// `spreadsheet_id` is always `[A-Za-z0-9_-]`, so nothing caller-controlled
+/// reaches the path unescaped.
+fn build_developer_metadata_search_url(base_url: &str, spreadsheet_id: &str) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id, "developerMetadata:search"])?;
     Ok(url)
 }
 

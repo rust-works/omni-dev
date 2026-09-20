@@ -301,15 +301,18 @@ pub struct ClearValuesResponse {
 /// `DriveOperation::SheetsStructure` (issue #1613,
 /// [ADR-0075](../../../docs/adrs/adr-0075.md), extended by issue #1643,
 /// [ADR-0078](../../../docs/adrs/adr-0078.md), with formatting, data
-/// validation, `duplicateSheet` and reorder/hide), the destructive ones
-/// behind `DriveOperation::SheetsDelete` (issue #1623,
+/// validation, `duplicateSheet`, reorder/hide and, since issue #1795
+/// ([ADR-0081](../../../docs/adrs/adr-0081.md) §4), developer-metadata
+/// management), the destructive ones behind `DriveOperation::SheetsDelete`
+/// (issue #1623,
 /// [ADR-0077](../../../docs/adrs/adr-0077-sheets-deletion-via-batchupdate.md)),
 /// and the protected-range ones behind `DriveOperation::SheetsProtection`
 /// (issue #1643, [ADR-0078](../../../docs/adrs/adr-0078.md) §2) — there is
 /// still no raw `--requests` passthrough that could construct one of these
 /// outside its gate. `structure.rs`'s `every_delete_verb_gates_on_sheets_delete_not_sheets_structure`/
-/// `every_additive_verb_still_gates_on_sheets_structure` tests pin that every
-/// verb reaches exactly one gate, never the other.
+/// `every_additive_verb_still_gates_on_sheets_structure` tests, and
+/// `developer_metadata.rs`'s own analogous test, pin that every verb reaches
+/// exactly one gate, never the other.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum BatchUpdateRequestItem {
@@ -359,6 +362,22 @@ pub enum BatchUpdateRequestItem {
     /// [`Self::AddProtectedRange`] — a permission removal, not a *data*
     /// deletion, which is why it needs no `SheetsDelete` grant.
     DeleteProtectedRange(DeleteProtectedRangeRequest),
+    /// Attach a new developer-metadata entry (`set-developer-metadata`,
+    /// when no existing entry matched). Gated by
+    /// [`crate::drive::write_gate::DriveOperation::SheetsStructure`], like
+    /// every other additive verb — see [`DeveloperMetadata`]'s doc comment
+    /// for the DOCUMENT-only guarantee (issue #1795, ADR-0081 §4).
+    CreateDeveloperMetadata(CreateDeveloperMetadataRequest),
+    /// Change an existing developer-metadata entry's value
+    /// (`set-developer-metadata`, when an existing entry matched). Same
+    /// gate as [`Self::CreateDeveloperMetadata`].
+    UpdateDeveloperMetadata(UpdateDeveloperMetadataRequest),
+    /// Remove developer metadata (`delete-developer-metadata`) — a
+    /// third-party add-on's own state, not this spreadsheet's grid data, so
+    /// it stays under `SheetsStructure` rather than `SheetsDelete` (ADR-0081
+    /// §4). `developer_metadata.rs` reads back and reports every entry a
+    /// request like this would remove before ever sending it.
+    DeleteDeveloperMetadata(DeleteDeveloperMetadataRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -467,7 +486,7 @@ pub struct DuplicateSheetRequest {
 }
 
 /// Which axis a [`DimensionRange`] runs along.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Dimension {
     /// Rows.
     #[serde(rename = "ROWS")]
@@ -504,7 +523,7 @@ impl Dimension {
 /// 1-based and inclusive, matching A1 and the spreadsheet UI. The single
 /// conversion lives in `structure.rs::dimension_range`, never at a call
 /// site.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DimensionRange {
     /// The sheet the span belongs to.
     #[serde(rename = "sheetId")]
@@ -1133,6 +1152,246 @@ pub struct AddSheetReply {
     /// The created sheet's properties, including its assigned `sheetId`.
     #[serde(default)]
     pub properties: Option<SheetProperties>,
+}
+
+/// The wire literal every developer-metadata request this crate sends
+/// carries as `visibility` — issue #1795,
+/// [ADR-0081](../../../docs/adrs/adr-0081.md) §4.
+///
+/// `PROJECT`-visibility metadata belongs to whatever OAuth client created
+/// it and is never this tool's to read or write. `developer_metadata.rs`
+/// is the only module that constructs this, and it never reads it from a
+/// flag — there is no `--visibility` option on any of the three CLI
+/// verbs, so no user input can reach anything but this literal.
+pub const DOCUMENT_VISIBILITY: &str = "DOCUMENT";
+
+/// Where a developer-metadata entry is attached — `DeveloperMetadataLocation`.
+///
+/// Sheets models this as a union of `spreadsheet`/`sheetId`/
+/// `dimensionRange`; exactly one is set by the one function that builds it
+/// (`developer_metadata.rs::resolve_location`), matching the
+/// [`ConditionValue`] convention for unions elsewhere in this module —
+/// discipline enforced by the builder, not the type.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeveloperMetadataLocation {
+    /// `true` when this entry is attached to the whole spreadsheet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spreadsheet: Option<bool>,
+    /// Set when attached to a whole sheet.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sheetId")]
+    pub sheet_id: Option<i64>,
+    /// Set when attached to a row or column span.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "dimensionRange"
+    )]
+    pub dimension_range: Option<DimensionRange>,
+}
+
+impl DeveloperMetadataLocation {
+    /// A location spanning the whole spreadsheet.
+    #[must_use]
+    pub fn spreadsheet() -> Self {
+        Self {
+            spreadsheet: Some(true),
+            ..Self::default()
+        }
+    }
+
+    /// A location spanning one whole sheet.
+    #[must_use]
+    pub fn sheet(sheet_id: i64) -> Self {
+        Self {
+            sheet_id: Some(sheet_id),
+            ..Self::default()
+        }
+    }
+
+    /// A location spanning a row or column range.
+    #[must_use]
+    pub fn dimension(range: DimensionRange) -> Self {
+        Self {
+            dimension_range: Some(range),
+            ..Self::default()
+        }
+    }
+}
+
+/// The developer-metadata fields settable on create —
+/// `CreateDeveloperMetadataRequest.developerMetadata`.
+///
+/// No `metadata_id` field (server-assigned) and `visibility` is always
+/// [`DOCUMENT_VISIBILITY`] — see that constant's doc comment.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NewDeveloperMetadata {
+    /// The key this entry is looked up by.
+    #[serde(rename = "metadataKey")]
+    pub metadata_key: String,
+    /// The value stored under `metadata_key`.
+    #[serde(rename = "metadataValue")]
+    pub metadata_value: String,
+    /// Where this entry is attached.
+    pub location: DeveloperMetadataLocation,
+    /// Always [`DOCUMENT_VISIBILITY`].
+    pub visibility: String,
+}
+
+/// `CreateDeveloperMetadataRequest`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CreateDeveloperMetadataRequest {
+    /// The entry to create.
+    #[serde(rename = "developerMetadata")]
+    pub developer_metadata: NewDeveloperMetadata,
+}
+
+/// The mutable subset of an existing entry `set-developer-metadata` may
+/// change on update — currently only its value.
+///
+/// Sheets' own `DeveloperMetadata` can also change `metadataKey`/
+/// `location`/`visibility` via `update`, but this surface never offers
+/// that: the key and location are how the entry was found, so changing
+/// them out from under the same request would silently repoint a
+/// different caller's lookup.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DeveloperMetadataValueUpdate {
+    /// The new value.
+    #[serde(rename = "metadataValue")]
+    pub metadata_value: String,
+}
+
+/// `UpdateDeveloperMetadataRequest`.
+///
+/// Applies to every entry matched by `data_filters` — Sheets bulk-updates
+/// by filter, not by id, which is what lets `set-developer-metadata`
+/// resolve "does this key already exist here" and "update it" with the
+/// same filter, no id round-trip needed.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UpdateDeveloperMetadataRequest {
+    /// Selects which existing entries this updates.
+    #[serde(rename = "dataFilters")]
+    pub data_filters: Vec<DataFilter>,
+    /// The new value.
+    #[serde(rename = "developerMetadata")]
+    pub developer_metadata: DeveloperMetadataValueUpdate,
+    /// The field mask limiting what this request may change. Always
+    /// `"metadataValue"` — the only field [`DeveloperMetadataValueUpdate`]
+    /// models.
+    pub fields: String,
+}
+
+/// `DeleteDeveloperMetadataRequest`.
+///
+/// **Singular** `dataFilter`, matching the real API — one filter can match
+/// and delete several entries in a single request, which is why
+/// `delete-developer-metadata`'s preview lists every match rather than
+/// assuming exactly one.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DeleteDeveloperMetadataRequest {
+    /// Selects which existing entries this deletes.
+    #[serde(rename = "dataFilter")]
+    pub data_filter: DataFilter,
+}
+
+/// A lookup by key and/or location, restricted (by every caller in this
+/// crate) to [`DOCUMENT_VISIBILITY`] — the `developerMetadataLookup` arm of
+/// a [`DataFilter`].
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct DeveloperMetadataLookupFilter {
+    /// Restricts the match to one location, when given.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "metadataLocation"
+    )]
+    pub metadata_location: Option<DeveloperMetadataLocation>,
+    /// Restricts the match to one key, when given.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "metadataKey"
+    )]
+    pub metadata_key: Option<String>,
+    /// Always `Some(DOCUMENT_VISIBILITY)` — every filter this crate builds
+    /// restricts to document-visibility metadata; see that constant's doc
+    /// comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// `"EXACT_LOCATION"` when `metadata_location` is given (this crate
+    /// never sends `"INTERSECTING_LOCATION"`, which would also match a
+    /// dimension range straddling the requested one).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "locationMatchingStrategy"
+    )]
+    pub location_matching_strategy: Option<String>,
+}
+
+/// `DataFilter`, restricted to the one shape this crate ever sends: a
+/// `developerMetadataLookup`.
+///
+/// Sheets' `DataFilter` also has `a1Range`/`gridRange` alternatives, never
+/// constructed here — the same curated, not full-coverage, stance as
+/// [`BooleanCondition`]'s doc comment.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DataFilter {
+    /// The lookup this filter applies.
+    #[serde(rename = "developerMetadataLookup")]
+    pub developer_metadata_lookup: DeveloperMetadataLookupFilter,
+}
+
+/// One developer-metadata entry as read back from the server —
+/// `DeveloperMetadata`, the response/search shape (has an id; the create
+/// payload, [`NewDeveloperMetadata`], does not).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct DeveloperMetadata {
+    /// The server-assigned id.
+    #[serde(default, rename = "metadataId")]
+    pub metadata_id: i64,
+    /// The key this entry is looked up by.
+    #[serde(default, rename = "metadataKey")]
+    pub metadata_key: String,
+    /// The value stored under `metadata_key`.
+    #[serde(default, rename = "metadataValue")]
+    pub metadata_value: String,
+    /// Where this entry is attached.
+    #[serde(default)]
+    pub location: DeveloperMetadataLocation,
+    /// The entry's visibility. `developer_metadata.rs` asserts this is
+    /// always [`DOCUMENT_VISIBILITY`] on every entry it reads — the
+    /// defense-in-depth half of the DOCUMENT-only guarantee, on top of
+    /// every request already restricting the search itself (issue #1795,
+    /// ADR-0081 §4).
+    #[serde(default)]
+    pub visibility: String,
+}
+
+/// Body of `spreadsheets.developerMetadata:search`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SearchDeveloperMetadataRequest {
+    /// Every filter must match (Sheets ANDs a multi-entry list); this crate
+    /// always sends exactly one.
+    #[serde(rename = "dataFilters")]
+    pub data_filters: Vec<DataFilter>,
+}
+
+/// Response to `spreadsheets.developerMetadata:search`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct SearchDeveloperMetadataResponse {
+    /// Every entry that matched, unwrapped from its `MatchedDeveloperMetadata`
+    /// wrapper (the echoed `dataFilters` that wrapper also carries are not
+    /// modelled — this crate already knows which filter it sent).
+    #[serde(default, rename = "matchedDeveloperMetadata")]
+    pub matched_developer_metadata: Vec<MatchedDeveloperMetadata>,
+}
+
+/// One match within a [`SearchDeveloperMetadataResponse`].
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct MatchedDeveloperMetadata {
+    /// The matched entry.
+    #[serde(rename = "developerMetadata")]
+    pub developer_metadata: DeveloperMetadata,
 }
 
 #[cfg(test)]
