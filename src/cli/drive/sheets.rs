@@ -17,6 +17,7 @@ pub(crate) mod developer_metadata;
 pub(crate) mod filter;
 pub(crate) mod format;
 pub(crate) mod info;
+pub(crate) mod named_range;
 pub(crate) mod protection;
 pub(crate) mod read;
 pub(crate) mod structure;
@@ -197,6 +198,21 @@ pub enum SheetsSubcommands {
     /// Lists the conditional format rules in a spreadsheet. Read-only and
     /// ungated, like `list-protections` (issue #1793).
     ListConditionalFormats(conditional_format::ListConditionalFormatsCommand),
+    /// Adds a named range. Gated by the folder write-permission rules'
+    /// `sheets-structure` operation (issue #1796).
+    AddNamedRange(named_range::AddNamedRangeCommand),
+    /// Changes an existing named range's name and/or the range it covers.
+    /// Gated by the folder write-permission rules' `sheets-structure`
+    /// operation (issue #1796).
+    UpdateNamedRange(named_range::UpdateNamedRangeCommand),
+    /// Removes a named range. Gated by the folder write-permission rules'
+    /// `sheets-structure` operation — not `sheets-delete`, since a named
+    /// range is a label, not grid data (issue #1796, ADR-0081 §2). Reports
+    /// every formula that referenced the name before removing it.
+    DeleteNamedRange(named_range::DeleteNamedRangeCommand),
+    /// Lists the named ranges in a spreadsheet. Read-only and ungated, like
+    /// `sheets list-protections` (issue #1796).
+    ListNamedRanges(named_range::ListNamedRangesCommand),
 }
 
 impl SheetsCommand {
@@ -251,6 +267,10 @@ impl SheetsCommand {
             SheetsSubcommands::UpdateConditionalFormat(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeleteConditionalFormat(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ListConditionalFormats(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::AddNamedRange(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::UpdateNamedRange(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteNamedRange(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::ListNamedRanges(cmd) => cmd.execute(client).await,
         }
     }
 }
