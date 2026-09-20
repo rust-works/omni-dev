@@ -514,7 +514,8 @@ fn build_item_query(refs: &[ItemRef]) -> Option<(String, QueryIndex)> {
     let mut repos = Vec::new();
     for (ri, (project, items)) in by_project.iter().enumerate() {
         let Some((owner, name)) = project.split_once('/') else {
-            continue; // validated by the citation parser; defensive skip only
+            // omni-dev: coverage ignore-line reason="validated by the citation parser; every ItemRef reaching here already has a project of the form owner/repo"
+            continue;
         };
         let mut frags = Vec::new();
         for (ii, item_ref) in items.iter().enumerate() {
@@ -673,6 +674,7 @@ pub fn fetch_items(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<IssueDoc>>
     let mut by_key = HashMap::with_capacity(refs.len());
     for chunk in refs.chunks(MAX_ISSUES_PER_QUERY) {
         let Some((query, index)) = build_item_query(chunk) else {
+            // omni-dev: coverage ignore-line reason="chunks() never yields an empty chunk from a non-empty refs slice, and build_item_query returns None only for an empty slice"
             continue;
         };
         let body = crate::pr_status::run_gh_graphql(bin, &query)?;
@@ -793,6 +795,11 @@ mod tests {
     #[test]
     fn build_issue_query_is_none_for_no_refs() {
         assert!(build_issue_query(&[]).is_none());
+    }
+
+    #[test]
+    fn build_item_query_is_none_for_no_refs() {
+        assert!(build_item_query(&[]).is_none());
     }
 
     #[test]
@@ -1210,5 +1217,40 @@ mod tests {
         assert!(fragment.contains("__typename"));
         assert!(fragment.contains("... on Issue"));
         assert!(fragment.contains("... on PullRequest"));
+    }
+
+    // ── build_item_doc ─────────────────────────────────────────────────
+
+    #[test]
+    fn build_item_doc_rejects_an_unrecognised_typename() {
+        let node = serde_json::json!({
+            "__typename": "Gist", "title": "t", "body": "b", "state": "OPEN", "url": "u"
+        });
+        let err = build_item_doc(&item_ref("rust-works/omni-dev", 1), &node).unwrap_err();
+        assert!(err.to_string().contains("unrecognised __typename"), "{err}");
+    }
+
+    #[test]
+    fn build_item_doc_rejects_an_unrecognised_state() {
+        let node = serde_json::json!({
+            "__typename": "Issue", "title": "t", "body": "b", "state": "DRAFT", "url": "u"
+        });
+        let err = build_item_doc(&item_ref("rust-works/omni-dev", 1), &node).unwrap_err();
+        assert!(err.to_string().contains("unrecognised state"), "{err}");
+    }
+
+    /// A node missing from the reply with no accompanying GraphQL error
+    /// (rather than an explicit `NOT_FOUND`) is still treated as not found.
+    #[test]
+    fn fetch_items_treats_a_silently_missing_node_as_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            &serde_json::json!({"data": {"r0": {"i0": null}}}).to_string(),
+            0,
+        );
+        let docs = retry_on_etxtbsy(|| fetch_items(&bin, &[item_ref("rust-works/omni-dev", 1614)]))
+            .unwrap();
+        assert!(docs[0].is_none());
     }
 }

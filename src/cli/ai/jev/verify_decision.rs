@@ -255,4 +255,25 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].label, "#1614");
     }
+
+    /// An `owner/repo#N` issue argument already names its project, so
+    /// `fetch_input` never needs to shell out to `gh repo view` for it.
+    #[test]
+    fn fetch_input_skips_project_resolution_when_the_issue_names_its_own_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(dir.path());
+        let (issue, comment, citations, sources) = retry_on_etxtbsy(|| {
+            fetch_input(
+                &bin,
+                dir.path(),
+                "rust-works/omni-dev#1",
+                &CommentSelector::Latest,
+            )
+        })
+        .unwrap();
+        assert_eq!(issue.number, 1);
+        assert_eq!(comment.body, "settled by #1614");
+        assert_eq!(citations.len(), 1);
+        assert_eq!(sources.len(), 1);
+    }
 }
