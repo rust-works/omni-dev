@@ -633,12 +633,17 @@ usage: {jev: {input_tokens: 5120, output_tokens: 61}}
 
 The AI backend receives the comment and every citation `verify-decision`
 found in it (`#N`, `PR #N` / `pull request #N`, `owner/repo#N`, or a full
-GitHub issue/pull URL), and is asked to split it into statements that each
-name one item exactly as the comment names it, keeping the original wording's
-certainty ("was decided" and "was considered" are different facts) and
-adding nothing the comment does not say. The prompt also tells the backend
-which issue is being judged and what shape to reply in; it is new to #1779,
-not validated the way `route`'s questions were.
+GitHub issue/pull URL). A number that runs straight into a letter, digit,
+`_` or `-` is **not** a citation, so a hex colour (`#1f77b4`) or a heading
+anchor (`#1-overview`) is left alone, and any other `http(s)://` link is
+skipped whole, so a path or fragment inside it (`docs/jev.md#4-state-input`)
+is never read as one. The backend is asked to split the comment into
+statements that each name one item exactly as the comment names it,
+keeping the original wording's certainty ("was decided" and "was
+considered" are different facts) and adding nothing the comment does not
+say. The prompt also tells the backend which issue is being judged and
+what shape to reply in; it is new to #1779, not validated the way
+`route`'s questions were.
 
 **No JSON schema is attached to this call**, unlike every other structured
 call omni-dev makes. Attaching one made the default model degenerate:
