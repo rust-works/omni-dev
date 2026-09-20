@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::{SheetsApi, ValueRenderOption, MAX_RANGES_PER_BATCH};
+use crate::drive::sheets::api::{SheetsApi, ValueRenderOption};
 
 /// Refuse to fan out across more tabs than this in one command.
 ///
@@ -142,22 +142,18 @@ async fn read_whole_workbook(api: &SheetsApi<'_>, opts: &ReadOptions) -> Result<
     }
 
     // Each range is a quoted, percent-encoded title in the query string, so
-    // a wide workbook has to be split across requests.
+    // a wide workbook has to be split across requests — see
+    // `SheetsApi::batch_get_every_sheet`.
     let mut by_title: Vec<SheetValues> = Vec::with_capacity(titles.len());
-    for chunk in titles.chunks(MAX_RANGES_PER_BATCH) {
-        let ranges: Vec<String> = chunk.iter().map(|t| a1::quote_sheet_title(t)).collect();
-        let response = api
-            .values_batch_get(&opts.spreadsheet_id, &ranges, opts.render)
-            .await?;
-        for value_range in response.value_ranges {
-            by_title.push(SheetValues {
-                // Match on the range the server echoes, never on request
-                // order — see `ValueRange::range`.
-                title: value_range.range.as_deref().and_then(a1::sheet_title_of),
-                range: value_range.range,
-                values: value_range.values,
-            });
-        }
+    for (title, value_range) in api
+        .batch_get_every_sheet(&opts.spreadsheet_id, &titles, opts.render)
+        .await?
+    {
+        by_title.push(SheetValues {
+            title,
+            range: value_range.range,
+            values: value_range.values,
+        });
     }
 
     Ok(ReadOutcome {

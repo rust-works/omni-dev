@@ -99,12 +99,53 @@ pub(crate) fn find_sheet_id<E>(
         .ok_or_else(|| not_found(title.to_string(), workbook.sheet_titles()))
 }
 
+/// The reverse of [`find_sheet_id`]: a sheet's title by its numeric id, or
+/// `None` if the workbook carries no sheet with that id. Needed by any
+/// list verb (e.g. `list-named-ranges`) that renders a workbook-scoped
+/// object's `sheetId` back into a human-readable title.
+pub(crate) fn sheet_title_by_id(workbook: &Spreadsheet, sheet_id: i64) -> Option<String> {
+    workbook
+        .sheets
+        .iter()
+        .find(|sheet| sheet.sheet_id() == Some(sheet_id))
+        .map(|sheet| sheet.title().to_string())
+}
+
+/// Renders a numeric [`GridRange`] as a compact 1-based description for a
+/// list verb's human-readable output — e.g. `"sheetId 0, rows 1-5, cols
+/// 1-2"`, `"sheetId 0, rows 5+"` for a bound left open at one end (the
+/// `A5:A` grammar `parse_grid_range` accepts), or `"sheetId 0 (whole
+/// sheet)"` when every bound is `None`. Shared by `list-protections`/
+/// `list-named-ranges`, which were previously two independent copies of
+/// this function — one of which silently dropped an open-ended bound
+/// instead of showing it, rather than falling back to "whole sheet".
+pub(crate) fn render_grid_range(range: &GridRange) -> String {
+    let rows = describe_bound(range.start_row_index, range.end_row_index, "rows");
+    let cols = describe_bound(range.start_column_index, range.end_column_index, "cols");
+    if rows.is_empty() && cols.is_empty() {
+        format!("sheetId {} (whole sheet)", range.sheet_id)
+    } else {
+        format!("sheetId {}{rows}{cols}", range.sheet_id)
+    }
+}
+
+/// One axis of [`render_grid_range`]: `start`/`end` are zero-based,
+/// `end` exclusive, exactly like [`GridRange`]'s own fields.
+fn describe_bound(start: Option<i64>, end: Option<i64>, label: &str) -> String {
+    match (start, end) {
+        (Some(start), Some(end)) => format!(", {label} {}-{end}", start + 1),
+        (Some(start), None) => format!(", {label} {}+", start + 1),
+        (None, Some(end)) => format!(", {label} 1-{end}"),
+        (None, None) => String::new(),
+    }
+}
+
 /// Resolves an already-composed `--sheet`/`--range` string into a numeric
 /// [`GridRange`]: the shared "split off the sheet prefix, find its id,
 /// parse the bare range" pipeline every range-targeted verb in
-/// `format.rs`/`protection.rs`/`validation.rs` needs. `invalid_range` and
-/// `not_found` build the caller's own error variants, so this stays usable
-/// across their differently-shaped result enums.
+/// `format.rs`/`protection.rs`/`validation.rs`/`named_range.rs` needs.
+/// `invalid_range` and `not_found` build the caller's own error variants,
+/// so this stays usable across their differently-shaped result enums.
 ///
 /// Returns the sheet's title alongside the range, since some callers (e.g.
 /// `format.rs`'s merge-cells preview) need it again afterward.
@@ -115,10 +156,24 @@ pub(crate) fn resolve_grid_range<E>(
     not_found: impl FnOnce(String, Vec<String>) -> E,
 ) -> Result<(String, GridRange), E> {
     let Some((title, bare_range)) = a1::split_sheet_prefix(composed) else {
-        return Err(invalid_range(format!(
-            "'{composed}' does not name a sheet; pass --sheet, or a --range carrying its own \
-             'Sheet!' prefix"
-        )));
+        // `--sheet` alone (with no `--range`) composes to a bare quoted
+        // sheet name with no `!` — a distinct, common mistake from a
+        // genuinely malformed range, and one `--whole-sheet` names the fix
+        // for directly, so it earns its own message rather than the
+        // generic one below (which would otherwise tell a `--sheet` caller
+        // to "pass --sheet" when they already did).
+        let detail = if a1::is_whole_sheet_reference(composed) {
+            format!(
+                "'{composed}' names a sheet but not a range within it; pass --whole-sheet to \
+                 target the whole sheet, or add --range to name a range inside it"
+            )
+        } else {
+            format!(
+                "'{composed}' does not name a sheet; pass --sheet, or a --range carrying its \
+                 own 'Sheet!' prefix"
+            )
+        };
+        return Err(invalid_range(detail));
     };
     let sheet_id = find_sheet_id(workbook, &title, not_found)?;
     let grid = parse_grid_range(sheet_id, bare_range).map_err(invalid_range)?;
@@ -411,5 +466,75 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("does not name a sheet"), "{err}");
+    }
+
+    #[test]
+    fn resolve_grid_range_points_a_sheet_only_composition_at_whole_sheet() {
+        // `--sheet Q1` alone composes to `'Q1'` (a1::compose's
+        // sheet-only arm) — a distinct mistake from a malformed range,
+        // deserving its own message rather than "pass --sheet" when the
+        // caller already did.
+        let workbook = workbook_with_sheet(0, "Q1");
+        let err = resolve_grid_range(
+            &workbook,
+            "'Q1'",
+            |detail| detail,
+            |t, a| format!("{t} {a:?}"),
+        )
+        .unwrap_err();
+        assert!(err.contains("--whole-sheet"), "{err}");
+    }
+
+    #[test]
+    fn sheet_title_by_id_finds_the_matching_sheet() {
+        let workbook = workbook_with_sheet(3, "Q1");
+        assert_eq!(sheet_title_by_id(&workbook, 3), Some("Q1".to_string()));
+        assert_eq!(sheet_title_by_id(&workbook, 99), None);
+    }
+
+    #[test]
+    fn render_grid_range_whole_sheet_when_all_bounds_none() {
+        let range = GridRange {
+            sheet_id: 0,
+            ..Default::default()
+        };
+        assert_eq!(render_grid_range(&range), "sheetId 0 (whole sheet)");
+    }
+
+    #[test]
+    fn render_grid_range_rows_and_cols() {
+        let range = GridRange {
+            sheet_id: 3,
+            start_row_index: Some(0),
+            end_row_index: Some(5),
+            start_column_index: Some(0),
+            end_column_index: Some(2),
+        };
+        assert_eq!(render_grid_range(&range), "sheetId 3, rows 1-5, cols 1-2");
+    }
+
+    #[test]
+    fn render_grid_range_shows_an_open_ended_bound_rather_than_dropping_it() {
+        // The `A5:A` grammar: bounded start, open end. Regression test for
+        // the bug where this silently rendered as if unbounded.
+        let range = GridRange {
+            sheet_id: 0,
+            start_row_index: Some(4),
+            end_row_index: None,
+            start_column_index: Some(0),
+            end_column_index: Some(1),
+        };
+        assert_eq!(render_grid_range(&range), "sheetId 0, rows 5+, cols 1-1");
+    }
+
+    #[test]
+    fn render_grid_range_shows_an_open_start_bound() {
+        let range = GridRange {
+            sheet_id: 0,
+            start_row_index: None,
+            end_row_index: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(render_grid_range(&range), "sheetId 0, rows 1-5");
     }
 }

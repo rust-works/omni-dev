@@ -28,6 +28,11 @@ pub mod developer_metadata;
 pub mod filter;
 pub mod format;
 mod grid_range;
+// Re-exported (not the whole module) so the CLI layer's list verbs can
+// render a `GridRange`/resolve a sheet title without every other
+// `grid_range` internal (A1 parsing, `resolve_grid_range`, …) becoming
+// reachable outside the engine layer.
+pub(crate) use grid_range::{render_grid_range, sheet_title_by_id};
 pub mod named_range;
 pub mod protection;
 pub mod read;
