@@ -153,6 +153,20 @@ pub struct Sheet {
         rename = "conditionalFormats"
     )]
     pub conditional_formats: Vec<ConditionalFormatRule>,
+    /// Charts embedded on this sheet. Empty unless the caller requested
+    /// them with a wider `fields` mask — only
+    /// `SheetsApi::get_spreadsheet_with_embedded_objects` populates it
+    /// (issue #1797). `chartId`-addressed by `update-chart`/`delete-chart`;
+    /// `list-charts` is how that id is discovered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub charts: Vec<EmbeddedChart>,
+    /// Slicers embedded on this sheet. Empty unless the caller requested
+    /// them with a wider `fields` mask — only
+    /// `SheetsApi::get_spreadsheet_with_embedded_objects` populates it
+    /// (issue #1797). `slicerId`-addressed by `update-slicer`/
+    /// `delete-slicer`; `list-slicers` is how that id is discovered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slicers: Vec<Slicer>,
 }
 
 impl Sheet {
@@ -470,6 +484,30 @@ pub enum BatchUpdateRequestItem {
     /// referencing-formula preview that mitigates the resulting `#NAME?`
     /// errors.
     DeleteNamedRange(DeleteNamedRangeRequest),
+    /// Add a chart (`add-chart`). Gated by `DriveOperation::SheetsStructure`
+    /// — additive, destroys no data (ADR-0081 §3, issue #1797).
+    AddChart(AddChartRequest),
+    /// Replace an existing chart's spec wholesale (`update-chart`). Same
+    /// gate as [`Self::AddChart`]. Unlike `updateFilterView`, this request
+    /// carries **no field mask** — see [`UpdateChartSpecRequest`]'s doc
+    /// comment.
+    UpdateChartSpec(UpdateChartSpecRequest),
+    /// Add a slicer (`add-slicer`). Same gate as [`Self::AddChart`].
+    AddSlicer(AddSlicerRequest),
+    /// Change an existing slicer's spec (`update-slicer`). Same gate as
+    /// [`Self::AddChart`]. Unlike [`Self::UpdateChartSpec`], this request
+    /// *does* carry a field mask — see [`UpdateSlicerSpecRequest`].
+    UpdateSlicerSpec(UpdateSlicerSpecRequest),
+    /// Remove a chart or slicer (`delete-chart`/`delete-slicer`) — the one
+    /// request shared by both, addressed by `objectId` alone with no
+    /// discriminator naming which kind it is. Gated by
+    /// `DriveOperation::SheetsStructure`, not `SheetsDelete`: ADR-0081 §3
+    /// judges a chart/slicer the same *kind* of removal as
+    /// `unmerge-cells`/`clear-data-validation` — a property of the sheet,
+    /// not the sheet's data — despite being genuinely unrecoverable, which
+    /// is why `embedded_object.rs` reads back and reports the object's
+    /// spec before ever sending this.
+    DeleteEmbeddedObject(DeleteEmbeddedObjectRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -1473,6 +1511,427 @@ pub struct DeleteNamedRangeRequest {
     pub named_range_id: String,
 }
 
+// ── Charts and slicers (issue #1797) ────────────────────────────────────
+//
+// `ChartSpec` is the largest union in the Sheets API — roughly 15 chart
+// types, each with its own nested spec. This crate models only what it
+// builds or needs to read back to merge an update: `basicChart` (the
+// COLUMN/BAR/LINE/AREA/SCATTER subset `embedded_object.rs` supports) and
+// `pieChart`. Every other named field of `ChartSpec`/`BasicChartSpec`/
+// `BasicChartAxis`/`BasicChartSeries`/`PieChartSpec` — `titleTextFormat`,
+// `backgroundColor`, `hiddenDimensionStrategy`, per-series `styleOverrides`,
+// the other 13 chart-type variants (`bubbleChart`, `histogramChart`, …) —
+// is **not modelled as a named field**. Instead each of these types carries
+// `#[serde(flatten)] extra: BTreeMap<String, serde_json::Value>`, which does
+// two jobs at once: reading an existing chart preserves every field this
+// crate doesn't touch losslessly (essential for `update-chart`, which sends
+// a *whole* replacement spec — see [`UpdateChartSpecRequest`]), and finding
+// a key like `"histogramChart"` in `ChartSpec::extra` is exactly how
+// `embedded_object.rs::merge_chart_spec` detects an unsupported existing
+// chart and refuses rather than silently discarding it.
+//
+// `BTreeMap`, not `HashMap`, for the same determinism reason `jev`'s wire
+// types use it (STYLE, `src/jev/protocol.rs`).
+//
+// These types are `PartialEq`-only, never `Eq`: `PieChartSpec::pie_hole` is
+// an `f64` and `serde_json::Value` itself has no meaningful `Eq`, the same
+// reason [`Color`] forces `PartialEq`-only up through everything that embeds
+// it.
+
+/// One chart embedded on a sheet — `EmbeddedChart`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EmbeddedChart {
+    /// The server-assigned stable id. Absent on an `add-chart` request this
+    /// crate is building; always present on one read back or on an
+    /// `update-chart`/`delete-chart` request.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "chartId")]
+    pub chart_id: Option<i64>,
+    /// The chart's content and styling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<ChartSpec>,
+    /// Where the chart is anchored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<EmbeddedObjectPosition>,
+}
+
+/// A chart's content and styling — `ChartSpec`. See the module-level note
+/// above for which chart types this crate models and why unmodelled fields
+/// round-trip through `extra`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ChartSpec {
+    /// The chart's title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The chart's subtitle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    /// A basic (column/bar/line/area/scatter) chart's configuration.
+    /// Mutually exclusive with [`Self::pie_chart`] and with every
+    /// unmodelled chart-type field that may be present in `extra`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "basicChart"
+    )]
+    pub basic_chart: Option<BasicChartSpec>,
+    /// A pie chart's configuration. Mutually exclusive with
+    /// [`Self::basic_chart`].
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "pieChart")]
+    pub pie_chart: Option<PieChartSpec>,
+    /// Every other `ChartSpec` field this crate doesn't model — including
+    /// the other 13 chart-type variants — preserved verbatim across a
+    /// read-merge-write cycle. See the module-level note above.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// `BasicChartSpec` — the COLUMN/BAR/LINE/AREA/SCATTER subset this crate
+/// supports (issue #1797's chosen v1 cut). `COMBO` and `STEPPED_AREA` are
+/// also valid wire values for `chartType`, and reading one back is
+/// tolerated (it lands here, not in `extra`, since `chartType` is a named
+/// field) — but `embedded_object.rs::merge_chart_spec` refuses to *update*
+/// one, since `COMBO` needs a per-series `type` this crate doesn't model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BasicChartSpec {
+    /// `"COLUMN"`, `"BAR"`, `"LINE"`, `"AREA"`, `"SCATTER"` (this crate's
+    /// supported set), or another wire value read back from an existing
+    /// chart this crate didn't create.
+    #[serde(rename = "chartType")]
+    pub chart_type: String,
+    /// Where the legend is drawn, e.g. `"BOTTOM_LEGEND"`, `"NONE"`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "legendPosition"
+    )]
+    pub legend_position: Option<String>,
+    /// `"NOT_STACKED"`, `"STACKED"`, or `"PERCENT_STACKED"`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "stackedType"
+    )]
+    pub stacked_type: Option<String>,
+    /// How many leading rows/columns of the source range are headers rather
+    /// than data.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "headerCount"
+    )]
+    pub header_count: Option<i64>,
+    /// The chart's axes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub axis: Vec<BasicChartAxis>,
+    /// The domain (typically the x-axis / category column).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<BasicChartDomain>,
+    /// The data series.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub series: Vec<BasicChartSeries>,
+    /// Every other `BasicChartSpec` field this crate doesn't model
+    /// (`threeDimensional`, `interpolateNulls`, `lineSmoothing`, …).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// One axis of a [`BasicChartSpec`] — `BasicChartAxis`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BasicChartAxis {
+    /// Which physical axis this is — `"BOTTOM_AXIS"`, `"LEFT_AXIS"`, or
+    /// `"RIGHT_AXIS"`. `--horizontal-axis-title`/`--vertical-axis-title`
+    /// map to `BOTTOM_AXIS`/`LEFT_AXIS` literally — the physical axis, not
+    /// the domain/series role, since a BAR chart's domain axis is
+    /// `LEFT_AXIS`.
+    pub position: String,
+    /// The axis title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Every other `BasicChartAxis` field this crate doesn't model
+    /// (`format`, `viewWindowOptions`, …).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// One domain of a [`BasicChartSpec`] — `BasicChartDomain`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BasicChartDomain {
+    /// The domain's source data.
+    pub domain: ChartData,
+    /// Every other `BasicChartDomain` field this crate doesn't model
+    /// (`reversed`).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// One series of a [`BasicChartSpec`] — `BasicChartSeries`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BasicChartSeries {
+    /// The series' source data.
+    pub series: ChartData,
+    /// Which axis (by position) this series plots against — for a chart
+    /// with more than one axis on the same side.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "targetAxis"
+    )]
+    pub target_axis: Option<String>,
+    /// Every other `BasicChartSeries` field this crate doesn't model
+    /// (`type` — COMBO-only, `color`, `lineStyle`, `styleOverrides`, …).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// A pie chart's configuration — `PieChartSpec`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PieChartSpec {
+    /// The category labels (the pie's slices).
+    pub domain: ChartData,
+    /// The values (the slices' sizes).
+    pub series: ChartData,
+    /// Where the legend is drawn.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "legendPosition"
+    )]
+    pub legend_position: Option<String>,
+    /// `0.0`-`1.0`: the radius of the center hole, as a fraction of the
+    /// pie's radius. `0.0` (or absent) is a solid pie; anything above `0`
+    /// is a donut.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "pieHole")]
+    pub pie_hole: Option<f64>,
+    /// Every other `PieChartSpec` field this crate doesn't model
+    /// (`threeDimensional`).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// One chart series or domain's source data — `ChartData`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ChartData {
+    /// The cell range(s) this series/domain reads from.
+    #[serde(rename = "sourceRange")]
+    pub source_range: ChartSourceRange,
+    /// Every other `ChartData` field this crate doesn't model
+    /// (`aggregateType`, `groupRule`, `columnReference`).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// The cell range(s) backing one [`ChartData`] — `ChartSourceRange`.
+///
+/// A `Vec` on the wire (Sheets allows discontiguous sources for one
+/// series), though this crate's builders only ever populate one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChartSourceRange {
+    /// The range(s).
+    pub sources: Vec<GridRange>,
+}
+
+/// Where an [`EmbeddedChart`] or [`Slicer`] is anchored —
+/// `EmbeddedObjectPosition`. A three-way union on the wire: exactly one of
+/// `overlay_position`/`new_sheet` is set on a chart this crate builds (a
+/// slicer can only ever be `overlay_position` — the API has no
+/// `newSheet`/own-`sheetId` slicer placement).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddedObjectPosition {
+    /// The chart occupies its own sheet, whose id this names. Read-back
+    /// only — this crate never sets it directly; use `new_sheet` to
+    /// request one.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sheetId")]
+    pub sheet_id: Option<i64>,
+    /// The object floats over an existing sheet, anchored to a cell.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "overlayPosition"
+    )]
+    pub overlay_position: Option<OverlayPosition>,
+    /// Request a brand-new sheet to hold this chart alone. Write-only
+    /// (`--new-sheet`); the server never echoes `true` back — a
+    /// server-created chart sheet reads back with `sheet_id` set instead.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "newSheet")]
+    pub new_sheet: Option<bool>,
+}
+
+/// An object floating over a sheet, anchored to a cell — `OverlayPosition`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OverlayPosition {
+    /// The cell the object's top-left corner is anchored to.
+    #[serde(rename = "anchorCell")]
+    pub anchor_cell: GridCoordinate,
+    /// Additional horizontal offset from the anchor cell, in pixels.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "offsetXPixels"
+    )]
+    pub offset_x_pixels: Option<i64>,
+    /// Additional vertical offset from the anchor cell, in pixels.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "offsetYPixels"
+    )]
+    pub offset_y_pixels: Option<i64>,
+    /// The object's width in pixels. Absent means the API's own default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "widthPixels"
+    )]
+    pub width_pixels: Option<i64>,
+    /// The object's height in pixels. Absent means the API's own default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "heightPixels"
+    )]
+    pub height_pixels: Option<i64>,
+}
+
+/// A single grid cell, addressed by sheet and 0-based row/column —
+/// `GridCoordinate`. Distinct from [`GridRange`] (a rectangular span): an
+/// anchor is one cell, never a range.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GridCoordinate {
+    /// The sheet this coordinate is on.
+    #[serde(rename = "sheetId")]
+    pub sheet_id: i64,
+    /// 0-based row.
+    #[serde(rename = "rowIndex")]
+    pub row_index: i64,
+    /// 0-based column.
+    #[serde(rename = "columnIndex")]
+    pub column_index: i64,
+}
+
+/// A slicer embedded on a sheet — `Slicer`. Filters an existing range or
+/// pivot table interactively, the same `FilterCriteria` vocabulary
+/// `filter.rs` curates (`hiddenValues` only — see that module's doc
+/// comment for the condition-based cut this crate makes uniformly).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Slicer {
+    /// The server-assigned stable id. Absent on an `add-slicer` request
+    /// this crate is building; always present on one read back or on an
+    /// `update-slicer`/`delete-slicer` request.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "slicerId")]
+    pub slicer_id: Option<i64>,
+    /// The slicer's filtering configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<SlicerSpec>,
+    /// Where the slicer is anchored. Always `overlay_position` — a slicer
+    /// cannot occupy its own sheet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<EmbeddedObjectPosition>,
+}
+
+/// A slicer's filtering configuration — `SlicerSpec`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SlicerSpec {
+    /// The range the slicer filters.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "dataRange")]
+    pub data_range: Option<GridRange>,
+    /// Which values to hide, within `column_index`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "filterCriteria"
+    )]
+    pub filter_criteria: Option<FilterCriteria>,
+    /// The column within `data_range` the criteria apply to. See
+    /// `embedded_object.rs`'s `--column` doc comment for the
+    /// absolute-vs-relative indexing this needs to be verified against a
+    /// live account.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "columnIndex"
+    )]
+    pub column_index: Option<i64>,
+    /// Whether this slicer also filters pivot tables built from
+    /// `data_range`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "applyToPivotTables"
+    )]
+    pub apply_to_pivot_tables: Option<bool>,
+    /// A human-readable name for the slicer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Every other `SlicerSpec` field this crate doesn't model
+    /// (`textFormat`, `backgroundColor`, `horizontalAlignment`, …).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// `AddChartRequest`.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct AddChartRequest {
+    /// The chart to create. `chart_id` is left unset — the server assigns
+    /// it, only knowable from the reply.
+    pub chart: EmbeddedChart,
+}
+
+/// `UpdateChartSpecRequest`.
+///
+/// **No `fields` mask** — unlike every other update request in this file,
+/// Sheets' `updateChartSpec` replaces the chart's entire `ChartSpec`
+/// wholesale; there is no way to name "just the title". `embedded_object.rs`
+/// fetches the existing spec, merges the caller's flags onto it (preserving
+/// every unmodelled field via `extra`), and sends the full result here —
+/// the same reason `update-filter-view` computes a full `sortSpecs`/
+/// `criteria` client-side, except here it isn't optional: there is no
+/// narrower request to fall back to.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UpdateChartSpecRequest {
+    /// Which chart to update.
+    #[serde(rename = "chartId")]
+    pub chart_id: i64,
+    /// The chart's new, complete spec.
+    pub spec: ChartSpec,
+}
+
+/// `AddSlicerRequest`.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct AddSlicerRequest {
+    /// The slicer to create. `slicer_id` is left unset — the server assigns
+    /// it, only knowable from the reply.
+    pub slicer: Slicer,
+}
+
+/// `UpdateSlicerSpecRequest`.
+///
+/// Unlike [`UpdateChartSpecRequest`], this request **does** carry a field
+/// mask — `updateSlicerSpec` supports partial updates, so
+/// `embedded_object.rs` only ever names the fields the caller actually set.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UpdateSlicerSpecRequest {
+    /// Which slicer to update.
+    #[serde(rename = "slicerId")]
+    pub slicer_id: i64,
+    /// The fields to write. `data_range`/`title`/`apply_to_pivot_tables`
+    /// are independently settable; `filter_criteria` and `column_index`
+    /// travel together (a criteria value is meaningless without knowing
+    /// which column it filters).
+    pub spec: SlicerSpec,
+    /// The field mask limiting what this request may change.
+    pub fields: String,
+}
+
+/// `DeleteEmbeddedObjectRequest` — removes a chart or a slicer; the API
+/// gives no way to name which kind `object_id` refers to, and none is
+/// needed (issue #1797).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct DeleteEmbeddedObjectRequest {
+    /// Which chart or slicer to remove.
+    #[serde(rename = "objectId")]
+    pub object_id: i64,
+}
+
 /// `InsertDimensionRequest`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct InsertDimensionRequest {
@@ -1544,7 +2003,10 @@ pub struct DeleteRangeRequest {
 /// Only `replies` is modelled, and only the `addSheet` arm of it: the new
 /// sheet's server-assigned `sheetId` is the one fact the response carries
 /// that the request did not already know, and the request log records it.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+///
+/// `PartialEq`-only, not `Eq` since #1797 — see [`BatchUpdateReply`]'s doc
+/// comment.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct BatchUpdateResponse {
     /// One reply per request, in request order. Replies for requests with
     /// nothing to report are empty objects, not omitted.
@@ -1553,7 +2015,11 @@ pub struct BatchUpdateResponse {
 }
 
 /// One reply within a [`BatchUpdateResponse`].
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+///
+/// `PartialEq`-only, not `Eq` (issue #1797): [`AddChartReply`] embeds a
+/// [`ChartSpec`], which can carry a `PieChartSpec::pie_hole` (`f64`) — the
+/// same reason [`Spreadsheet`] lost `Eq` in #1793.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct BatchUpdateReply {
     /// Present only for an `addSheet` request.
     #[serde(default, rename = "addSheet")]
@@ -1576,6 +2042,15 @@ pub struct BatchUpdateReply {
     /// server-assigned `namedRangeId`, only knowable from the reply.
     #[serde(default, rename = "addNamedRange")]
     pub add_named_range: Option<AddNamedRangeReply>,
+    /// Present only for an `addChart` request — carries the server-assigned
+    /// `chartId`, only knowable from the reply (issue #1797).
+    #[serde(default, rename = "addChart")]
+    pub add_chart: Option<AddChartReply>,
+    /// Present only for an `addSlicer` request — carries the
+    /// server-assigned `slicerId`, only knowable from the reply
+    /// (issue #1797).
+    #[serde(default, rename = "addSlicer")]
+    pub add_slicer: Option<AddSlicerReply>,
 }
 
 /// The `addProtectedRange` arm of a [`BatchUpdateReply`].
@@ -1600,6 +2075,22 @@ pub struct AddNamedRangeReply {
     /// The created named range, including its assigned `namedRangeId`.
     #[serde(default, rename = "namedRange")]
     pub named_range: Option<NamedRange>,
+}
+
+/// The `addChart` arm of a [`BatchUpdateReply`] (issue #1797).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct AddChartReply {
+    /// The created chart, including its assigned `chartId`.
+    #[serde(default)]
+    pub chart: Option<EmbeddedChart>,
+}
+
+/// The `addSlicer` arm of a [`BatchUpdateReply`] (issue #1797).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct AddSlicerReply {
+    /// The created slicer, including its assigned `slicerId`.
+    #[serde(default)]
+    pub slicer: Option<Slicer>,
 }
 
 /// The `addSheet`/`duplicateSheet` arm of a [`BatchUpdateReply`].

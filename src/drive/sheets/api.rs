@@ -73,6 +73,23 @@ const SPREADSHEET_FIELDS_WITH_NAMED_RANGES: &str = "spreadsheetId,properties.tit
     sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
     namedRanges(namedRangeId,name,range)";
 
+/// `fields` mask for `spreadsheets.get` when charts and slicers are needed
+/// too (issue #1797's `add-chart`/`update-chart`/`delete-chart`/
+/// `list-charts`/`add-slicer`/`update-slicer`/`delete-slicer`/
+/// `list-slicers`, all eight of which share one fetch, mirroring
+/// `SPREADSHEET_FIELDS_WITH_CONDITIONAL_FORMATS`'s reuse across its four
+/// verbs). Deliberately requests `sheets.charts`/`sheets.slicers`
+/// **unmasked below the object level** — every other wider mask in this
+/// file narrows to the specific sub-fields each verb reads, but
+/// `update-chart` must merge onto the chart's *entire* existing spec (see
+/// [`crate::drive::sheets::types::UpdateChartSpecRequest`]'s doc comment),
+/// so nothing here can be safely left out. A superset of
+/// [`SPREADSHEET_FIELDS`], kept separate for the same reason
+/// [`SPREADSHEET_FIELDS_WITH_PROTECTIONS`] is.
+const SPREADSHEET_FIELDS_WITH_EMBEDDED_OBJECTS: &str = "spreadsheetId,properties.title,\
+    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.charts,sheets.slicers";
+
 /// Maximum ranges sent in a single `values.batchGet`.
 ///
 /// Each range is a percent-encoded, quoted sheet title in the query string,
@@ -247,6 +264,28 @@ impl<'a> SheetsApi<'a> {
             .get_parsed(
                 url.as_str(),
                 "Failed to parse Sheets spreadsheet metadata (with named ranges)",
+            )
+            .await
+    }
+
+    /// Fetches a spreadsheet's metadata **including charts and slicers** —
+    /// shared by all eight `embedded_object.rs` verbs (issue #1797), the
+    /// same way [`Self::get_spreadsheet_with_conditional_formats`] is
+    /// shared by its four. See
+    /// [`SPREADSHEET_FIELDS_WITH_EMBEDDED_OBJECTS`].
+    pub async fn get_spreadsheet_with_embedded_objects(
+        &self,
+        spreadsheet_id: &str,
+    ) -> Result<Spreadsheet> {
+        let url = build_spreadsheet_get_with_embedded_objects_url(
+            self.client.base_url(),
+            spreadsheet_id,
+        )?;
+        self.client
+            .transport()
+            .get_parsed(
+                url.as_str(),
+                "Failed to parse Sheets spreadsheet metadata (with embedded objects)",
             )
             .await
     }
@@ -530,6 +569,18 @@ fn build_spreadsheet_get_with_named_ranges_url(
     Ok(url)
 }
 
+fn build_spreadsheet_get_with_embedded_objects_url(
+    base_url: &str,
+    spreadsheet_id: &str,
+) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
+    url.query_pairs_mut()
+        .append_pair("fields", SPREADSHEET_FIELDS_WITH_EMBEDDED_OBJECTS);
+    Ok(url)
+}
+
 fn build_values_get_url(
     base_url: &str,
     spreadsheet_id: &str,
@@ -696,6 +747,19 @@ mod tests {
         assert!(fields.contains("sheets.conditionalFormats"));
         assert!(fields.contains("booleanRule"));
         assert!(fields.contains("gradientRule"));
+    }
+
+    #[test]
+    fn spreadsheet_get_with_embedded_objects_url_masks_the_wider_fields() {
+        let url = build_spreadsheet_get_with_embedded_objects_url(BASE, "sheet-1").unwrap();
+        assert_eq!(url.path(), "/v4/spreadsheets/sheet-1");
+        let fields = url
+            .query_pairs()
+            .find(|(k, _)| k == "fields")
+            .map(|(_, v)| v.to_string())
+            .expect("fields mask must always be sent");
+        assert!(fields.contains("sheets.charts"));
+        assert!(fields.contains("sheets.slicers"));
     }
 
     // ── values.get: encoding is the whole point ────────────────────────
