@@ -253,6 +253,7 @@ pub fn build_route_questions(ladders: &[Ladder]) -> Result<BTreeMap<String, Ques
         if !templates.contains_key(stage.template_key()) {
             bail!(
                 "the embedded stage questions have no {:?}",
+                // omni-dev: coverage ignore-line reason="defensive: the embedded questions YAML always has all three stage keys, pinned by stage_questions_are_the_tested_wording"
                 stage.template_key()
             );
         }
@@ -262,6 +263,7 @@ pub fn build_route_questions(ladders: &[Ladder]) -> Result<BTreeMap<String, Ques
         for (key, template) in &templates {
             let mut question = template.clone();
             let Question::Choice { criteria, .. } = &mut question else {
+                // omni-dev: coverage ignore-line reason="defensive: every embedded stage question is a choice question, pinned by stage_questions_are_the_tested_wording"
                 bail!("embedded stage question {key:?} is not a choice question");
             };
             for tier in ladder.tiers.as_slice() {
@@ -269,6 +271,7 @@ pub fn build_route_questions(ladders: &[Ladder]) -> Result<BTreeMap<String, Ques
                     .insert(tier.name.clone(), tier.description.clone())
                     .is_some()
                 {
+                    // omni-dev: coverage ignore-line reason="defensive: no embedded or --tiers tier is ever named `none`, the one fixed criterion (stage_design's no-design-work option)"
                     bail!(
                         "tier {:?} of provider {:?} collides with a fixed option of {key:?}",
                         tier.name,
@@ -817,6 +820,7 @@ mod tests {
                     rung.description,
                     reference.description,
                     "{}: {} differs from {}",
+                    // omni-dev: coverage ignore-line reason="assert_eq!'s message args are only evaluated on failure, and this test always passes"
                     provider.name(),
                     rung.name,
                     reference.name
@@ -1296,6 +1300,7 @@ mod tests {
 
     fn provider<'a>(outcome: &'a RouteOutcome, name: &str) -> &'a ProviderRoute {
         let RouteOutcome::Routed { providers, .. } = outcome else {
+            // omni-dev: coverage ignore-line reason="guards this test helper against misuse; every call site below passes an already-routed outcome"
             panic!("expected a routed issue: {outcome:?}");
         };
         &providers[name]
@@ -1409,6 +1414,7 @@ mod tests {
             depends_on,
         } = outcome
         else {
+            // omni-dev: coverage ignore-line reason="guards this test's assumption; the mocked response above always answers with a routed outcome"
             panic!("expected a routed issue: {outcome:?}");
         };
         assert_eq!(
@@ -1462,6 +1468,7 @@ mod tests {
         .await
         .unwrap();
         let RouteOutcome::Failed { error } = &report.issues[0].outcome else {
+            // omni-dev: coverage ignore-line reason="guards this test's assumption; the mocked response above always leaves gemini's answers missing"
             panic!("expected a failed issue: {:?}", report.issues[0]);
         };
         assert!(error.contains("gemini.stage_design"), "{error}");
