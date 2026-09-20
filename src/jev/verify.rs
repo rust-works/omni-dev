@@ -135,6 +135,7 @@ fn citation_from_captures(
             .ok()
             .map(|number| (default_project.to_string(), ItemKind::Issue, number))
     } else {
+        // omni-dev: coverage ignore-line reason="unreachable: both call sites (find_citations, first_citation) already filtered out the only alternative with no numbered group (other_url) via number_end before calling this"
         None
     }
 }
@@ -1142,6 +1143,8 @@ mod tests {
     use super::*;
     use crate::claude::test_utils::ConfigurableMockAiClient;
     use crate::provider::{GitProvider, ItemState};
+    use crate::test_support::shim::{retry_on_etxtbsy, shim_lock, write_exec_script};
+    use std::path::PathBuf;
 
     fn judged(number: u64) -> ItemRef {
         ItemRef {
@@ -1164,6 +1167,31 @@ mod tests {
         assert_eq!(cites[1].item_ref.project, "other/repo");
         assert_eq!(cites[2].item_ref.number, 1629);
         assert_eq!(cites[2].item_ref.kind, ItemKind::ChangeRequest);
+    }
+
+    #[test]
+    fn a_github_issue_url_resolves_to_issue_kind() {
+        let cites = find_citations(
+            "see https://github.com/rust-works/omni-dev/issues/1614",
+            "rust-works/omni-dev",
+            &judged(1779),
+        );
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0].item_ref.kind, ItemKind::Issue);
+        assert_eq!(cites[0].item_ref.number, 1614);
+    }
+
+    /// A citation number too large for `u64` fails to parse; the citation is
+    /// skipped rather than propagating the parse failure.
+    #[test]
+    fn an_overflowing_citation_number_is_skipped() {
+        let cites = find_citations(
+            "see #99999999999999999999 and #1614",
+            "rust-works/omni-dev",
+            &judged(1779),
+        );
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0].item_ref.number, 1614);
     }
 
     #[test]
@@ -1252,6 +1280,39 @@ mod tests {
         }
     }
 
+    // ── resolve_cites_index / cites_judged_issue ───────────────────────
+
+    #[test]
+    fn resolve_cites_index_matches_a_sources_keys() {
+        let citations = find_citations("see #1614", "rust-works/omni-dev", &judged(1));
+        let issue = issue_doc(1614, "Title", "Body.", vec![], vec![]);
+        let fetched = BTreeMap::from([(("rust-works/omni-dev".to_string(), 1614), issue)]);
+        let sources = group_sources(&citations, "rust-works/omni-dev", &fetched);
+        assert_eq!(
+            resolve_cites_index("#1614", "rust-works/omni-dev", &sources),
+            Some(0)
+        );
+    }
+
+    /// A `cites` string that names nothing citable (no boundary-safe number)
+    /// resolves no index rather than mis-reading it.
+    #[test]
+    fn resolve_cites_index_is_none_for_an_unparseable_cites_string() {
+        let sources = Vec::new();
+        assert_eq!(
+            resolve_cites_index("#1-overview", "rust-works/omni-dev", &sources),
+            None
+        );
+    }
+
+    #[test]
+    fn cites_judged_issue_is_true_only_for_the_judged_number() {
+        let issue = doc_with_comments(vec![]);
+        assert!(cites_judged_issue("#1779", &issue));
+        assert!(!cites_judged_issue("#1614", &issue));
+        assert!(!cites_judged_issue("#1-overview", &issue));
+    }
+
     // ── parse_comment_selector / select_comment ───────────────────────
 
     #[test]
@@ -1282,6 +1343,16 @@ mod tests {
     #[test]
     fn rejects_garbage_selector() {
         assert!(parse_comment_selector("whenever").is_err());
+    }
+
+    /// An `#issuecomment-` suffix whose digits do not parse as `u64` is not
+    /// a recognised selector, even though the prefix matched.
+    #[test]
+    fn rejects_an_issue_comment_url_with_a_non_numeric_id() {
+        assert!(parse_comment_selector(
+            "https://github.com/rust-works/omni-dev/issues/1779#issuecomment-abc"
+        )
+        .is_err());
     }
 
     fn doc_with_comments(comments: Vec<Comment>) -> IssueDoc {
@@ -1418,6 +1489,37 @@ mod tests {
              \n\n# Pull request #1629: Add drive_sheets_info\n\n\
              PR body text.\n"
         );
+    }
+
+    /// A closing PR in a different repository from the judged issue gets the
+    /// qualified `PR project#N` label and heading, not the bare `PR #N` form.
+    #[test]
+    fn group_sources_uses_a_qualified_label_for_a_cross_repo_closing_pr() {
+        let citations = find_citations("settled by #1614", "rust-works/omni-dev", &judged(1779));
+        let issue = issue_doc(
+            1614,
+            "Title",
+            "Body.",
+            vec![],
+            vec![ItemRef {
+                provider: GitProvider::GitHub,
+                project: "other/repo".to_string(),
+                kind: ItemKind::ChangeRequest,
+                number: 42,
+            }],
+        );
+        let mut pr = pr_doc(42, "Fix", "PR body.");
+        pr.project = "other/repo".to_string();
+        let fetched = BTreeMap::from([
+            (("rust-works/omni-dev".to_string(), 1614), issue),
+            (("other/repo".to_string(), 42), pr),
+        ]);
+        let sources = group_sources(&citations, "rust-works/omni-dev", &fetched);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "#1614 and PR other/repo#42");
+        assert!(sources[0]
+            .text
+            .contains("# Pull request other/repo#42: Fix"));
     }
 
     /// Mirrors E4's source "E": `("#1237", 1237, [])` — an issue with no
@@ -1579,6 +1681,53 @@ mod tests {
         assert_eq!(strip_code_fence("{\"a\":1}"), "{\"a\":1}");
     }
 
+    /// A non-JSON reply (a schema-less backend may not honour the requested
+    /// shape exactly) falls back to YAML, fence and all.
+    #[test]
+    fn parse_split_response_falls_back_to_yaml() {
+        let raw =
+            "```yaml\nstatements:\n  - text: \"PR #1629 added a tool.\"\n    cites: \"#1614\"\n```";
+        let parsed = parse_split_response(raw).unwrap();
+        assert_eq!(parsed.statements.len(), 1);
+        assert_eq!(parsed.statements[0].text, "PR #1629 added a tool.");
+        assert_eq!(parsed.statements[0].cites.as_deref(), Some("#1614"));
+    }
+
+    #[test]
+    fn parse_split_response_errors_when_neither_json_nor_yaml_parses() {
+        let err = parse_split_response("This is not json or yaml.").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Failed to parse the statement splitter's response"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_statements_rejects_an_empty_reply() {
+        let ai = ai_client(vec![Ok(serde_json::json!({"statements": []}).to_string())]);
+        let err = split_statements(&ai, "comment", &[]).await.unwrap_err();
+        assert!(err.to_string().contains("no statements"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn split_statements_rejects_more_than_the_statement_limit() {
+        let stmts: Vec<serde_json::Value> = (0..=MAX_STATEMENTS)
+            .map(|i| serde_json::json!({"text": format!("statement {i}"), "cites": null}))
+            .collect();
+        let ai = ai_client(vec![Ok(
+            serde_json::json!({"statements": stmts}).to_string()
+        )]);
+        let err = split_statements(&ai, "comment", &[]).await.unwrap_err();
+        assert!(err.to_string().contains("limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn split_statements_rejects_a_blank_statement() {
+        let ai = ai_client(vec![Ok(split_response_json(&[("   ", None)]))]);
+        let err = split_statements(&ai, "comment", &[]).await.unwrap_err();
+        assert!(err.to_string().contains("empty statement"), "{err}");
+    }
+
     // ── validate_verify_options ─────────────────────────────────────────
 
     fn opts() -> VerifyOptions {
@@ -1611,6 +1760,106 @@ mod tests {
             f(&mut o);
             assert!(validate_verify_options(&o).is_err());
         }
+    }
+
+    // ── fetch_verify_input (fake-gh shim) ────────────────────────────────
+
+    fn fake_gh_no_citations(dir: &Path) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
+        let guard = shim_lock();
+        let issue = serde_json::json!({
+            "title": "t", "body": "b", "state": "OPEN", "url": "u",
+            "comments": {"totalCount": 1, "nodes": [
+                {"databaseId": 1, "author": {"login": "newhoggy"}, "body": "thanks!"}
+            ]},
+            "closedByPullRequestsReferences": {"nodes": []}
+        });
+        let path = dir.join("fake-gh");
+        write_exec_script(
+            &path,
+            &format!(
+                "#!/bin/sh\ncat <<'JSON'\n{{\"data\": {{\"r0\": {{\"i0\": {issue}}}}}}}\nJSON\n"
+            ),
+        );
+        (path, guard)
+    }
+
+    #[test]
+    fn fetch_verify_input_short_circuits_when_the_comment_cites_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh_no_citations(dir.path());
+        let (issue, comment, citations, sources) = retry_on_etxtbsy(|| {
+            fetch_verify_input(
+                &bin,
+                "rust-works/omni-dev",
+                &judged(1),
+                &CommentSelector::Id(1),
+            )
+        })
+        .unwrap();
+        assert_eq!(issue.number, 1);
+        assert_eq!(comment.body, "thanks!");
+        assert!(citations.is_empty());
+        assert!(sources.is_empty());
+    }
+
+    /// A cited issue's own closing PR is not among the original citations,
+    /// so resolving it takes a second `fetch_items` round.
+    fn fake_gh_second_round_pr(dir: &Path) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
+        let guard = shim_lock();
+        let issue = serde_json::json!({
+            "title": "t", "body": "b", "state": "OPEN", "url": "u",
+            "comments": {"totalCount": 1, "nodes": [
+                {"databaseId": 1, "author": {"login": "newhoggy"}, "body": "settled by #1614"}
+            ]},
+            "closedByPullRequestsReferences": {"nodes": []}
+        });
+        let cited_issue = serde_json::json!({
+            "__typename": "Issue",
+            "title": "cited", "body": "cited body", "state": "CLOSED", "url": "u2",
+            "comments": {"totalCount": 0, "nodes": []},
+            "closedByPullRequestsReferences": {"nodes": [{"number": 1629}]}
+        });
+        let closing_pr = serde_json::json!({
+            "__typename": "PullRequest",
+            "title": "closer", "body": "pr body", "state": "MERGED", "url": "u3"
+        });
+        let path = dir.join("fake-gh");
+        write_exec_script(
+            &path,
+            &format!(
+                "#!/bin/sh\ncase \"$4\" in\n\
+                 *'number:1614'*) cat <<'JSON'\n{{\"data\": {{\"r0\": {{\"i0\": {cited_issue}}}}}}}\nJSON\n;;\n\
+                 *'number:1629'*) cat <<'JSON'\n{{\"data\": {{\"r0\": {{\"i0\": {closing_pr}}}}}}}\nJSON\n;;\n\
+                 *) cat <<'JSON'\n{{\"data\": {{\"r0\": {{\"i0\": {issue}}}}}}}\nJSON\n;;\n\
+                 esac\n",
+            ),
+        );
+        (path, guard)
+    }
+
+    #[test]
+    fn fetch_verify_input_fetches_a_second_round_of_closing_prs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh_second_round_pr(dir.path());
+        let (_issue, _comment, citations, sources) = retry_on_etxtbsy(|| {
+            fetch_verify_input(
+                &bin,
+                "rust-works/omni-dev",
+                &judged(1),
+                &CommentSelector::Latest,
+            )
+        })
+        .unwrap();
+        assert_eq!(citations.len(), 1);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "#1614 and PR #1629");
+        assert_eq!(
+            sources[0].keys,
+            vec![
+                ("rust-works/omni-dev".to_string(), 1614),
+                ("rust-works/omni-dev".to_string(), 1629)
+            ]
+        );
     }
 
     // ── run_verify (wiremock + mock AI client) ───────────────────────────
@@ -1954,5 +2203,134 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("Failed to verify against source #1614"));
+    }
+
+    /// An auth failure on the coverage call itself (distinct from a
+    /// per-source call) still aborts the whole run.
+    #[tokio::test]
+    async fn run_verify_stops_on_a_coverage_auth_failure() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("## SOURCE:"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "jev-1.13.0",
+                    "answers": {"s1": noul_json(0.95)},
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("## COMMENT"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string("bad key"))
+            .mount(&server)
+            .await;
+        let jev = JevClient::new(&server.uri(), "key").unwrap();
+        let ai = ai_client(vec![Ok(split_response_json(&[(
+            "A claim.",
+            Some("#1614"),
+        )]))]);
+        let (issue, comment, citations, sources) = issue_and_source();
+
+        let err = run_verify(&jev, &ai, &issue, &comment, &citations, &sources, &opts())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Failed to check statement coverage"),
+            "{err:#}"
+        );
+    }
+
+    /// A non-auth failure on the coverage call is a review reason, not a
+    /// fatal error — the per-statement checks already ran.
+    #[tokio::test]
+    async fn run_verify_needs_review_when_the_coverage_call_fails() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("## SOURCE:"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "jev-1.13.0",
+                    "answers": {"s1": noul_json(0.95)},
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("## COMMENT"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let jev = JevClient::new(&server.uri(), "key").unwrap();
+        let ai = ai_client(vec![Ok(split_response_json(&[(
+            "A claim.",
+            Some("#1614"),
+        )]))]);
+        let (issue, comment, citations, sources) = issue_and_source();
+
+        let report = run_verify(&jev, &ai, &issue, &comment, &citations, &sources, &opts())
+            .await
+            .unwrap();
+        assert_eq!(report.verdict, Verdict::NeedsReview);
+        assert!(report.coverage.is_none());
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|r| r.contains("coverage unavailable")),
+            "{:?}",
+            report.reasons
+        );
+    }
+
+    /// A coverage reply that carries no `coverage` answer must not read as a
+    /// guard that ran and passed.
+    #[tokio::test]
+    async fn run_verify_needs_review_when_the_coverage_answer_is_missing() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("## SOURCE:"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "jev-1.13.0",
+                    "answers": {"s1": noul_json(0.95)},
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("## COMMENT"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "jev-1.13.0",
+                    "answers": {},
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
+            .mount(&server)
+            .await;
+        let jev = JevClient::new(&server.uri(), "key").unwrap();
+        let ai = ai_client(vec![Ok(split_response_json(&[(
+            "A claim.",
+            Some("#1614"),
+        )]))]);
+        let (issue, comment, citations, sources) = issue_and_source();
+
+        let report = run_verify(&jev, &ai, &issue, &comment, &citations, &sources, &opts())
+            .await
+            .unwrap();
+        assert_eq!(report.verdict, Verdict::NeedsReview);
+        assert!(report.coverage.is_none());
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|r| r.contains("no `coverage` answer")),
+            "{:?}",
+            report.reasons
+        );
     }
 }
