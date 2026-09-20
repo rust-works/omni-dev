@@ -1183,6 +1183,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_sheets_set_developer_metadata() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::SetDeveloperMetadata(
+                sheets::developer_metadata::SetDeveloperMetadataCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    key: "owner".to_string(),
+                    value: "team-a".to_string(),
+                    sheet: None,
+                    dimension: None,
+                    start: None,
+                    end: None,
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        // See `dispatch_routes_docs_replace` for why this is `is_ok()`: with
+        // no configured account, `developer_metadata()` never returns
+        // `Err` — it reports `Blocked`/`Failed` as a printed outcome.
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_delete_developer_metadata() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::DeleteDeveloperMetadata(
+                sheets::developer_metadata::DeleteDeveloperMetadataCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    key: "owner".to_string(),
+                    sheet: None,
+                    dimension: None,
+                    start: None,
+                    end: None,
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_search_developer_metadata() {
+        // Read-only and ungated, like `sheets info`/`list-protections` —
+        // needs the host redirect so it fails fast against a dead port
+        // instead of trying the real Sheets API.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::SearchDeveloperMetadata(
+                sheets::developer_metadata::SearchDeveloperMetadataCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    key: None,
+                    sheet: None,
+                    dimension: None,
+                    start: None,
+                    end: None,
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_sheets_protect_range() {
         let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();
