@@ -99,6 +99,14 @@ impl RelativeDate {
 
     /// Matches case- and separator-insensitively (`past-week`, `past_week`,
     /// `Past Week` all match) so the CLI value doesn't force one style.
+    ///
+    /// Deriving this from [`Self::as_sheets_str`] via [`Self::ALL`] costs a
+    /// per-candidate allocation (up to 6, plus one for `normalized`) instead
+    /// of a single hand-written match — negligible for a one-shot CLI
+    /// parse of 6 short constants, and deliberate: it's what keeps this
+    /// keyword table and `as_sheets_str` from drifting apart on a typo (see
+    /// `relative_date_all_covers_every_variant`). Don't "optimize" this back
+    /// into a second hardcoded match.
     fn parse(s: &str) -> Option<Self> {
         let normalized = s.to_ascii_lowercase().replace(['-', '_', ' '], "");
         Self::ALL
@@ -207,8 +215,9 @@ pub enum Condition {
 impl Condition {
     /// The Sheets API `condition_type` string, and the `validation_type` the
     /// request log records — one source of truth shared by
-    /// [`Self::into_boolean_condition`] and [`Self::log_type`], so a typo
-    /// fixed in one can't drift from the other.
+    /// [`Self::into_boolean_condition`] and the request log's
+    /// `validation_type` field, so a typo fixed in one can't drift from the
+    /// other.
     const fn condition_type_str(&self) -> &'static str {
         match self {
             Self::OneOfList(_) => "ONE_OF_LIST",
@@ -271,11 +280,6 @@ impl Condition {
             condition_type,
             values,
         }
-    }
-
-    /// The `validation_type` the request log records.
-    const fn log_type(&self) -> &'static str {
-        self.condition_type_str()
     }
 }
 
@@ -756,9 +760,8 @@ fn reject_blank_date(date: &DateValue, flag: &str) -> Result<(), String> {
 /// of this file takes for formats Sheets itself will parse at evaluation
 /// time.
 fn reject_invalid_date_between(start: &str, end: &str) -> Result<(), String> {
-    if start.trim().is_empty() || end.trim().is_empty() {
-        return Err("--date-between's values must not be empty".to_string());
-    }
+    reject_blank(start, "--date-between")?;
+    reject_blank(end, "--date-between")?;
     if RelativeDate::parse(start).is_some() || RelativeDate::parse(end).is_some() {
         return Err(
             "--date-between only accepts absolute dates, not a relative keyword like 'today' \
@@ -794,7 +797,10 @@ fn describe_effect(verb: &ValidationVerb) -> String {
             };
             format!(
                 "set data validation ({}, {strictness})",
-                condition.log_type().to_ascii_lowercase().replace('_', " ")
+                condition
+                    .condition_type_str()
+                    .to_ascii_lowercase()
+                    .replace('_', " ")
             )
         }
         ValidationVerb::ClearDataValidation { .. } => "clear data validation".to_string(),
@@ -830,7 +836,7 @@ fn record_attempt(outcome: &ValidationOutcome, opts: &ValidationOptions, duratio
     let decided_by = write_gate::decided_by_log_fields(decided_by);
     let validation_type = match &opts.verb {
         ValidationVerb::SetDataValidation { condition, .. } => {
-            Some(condition.log_type().to_string())
+            Some(condition.condition_type_str().to_string())
         }
         ValidationVerb::ClearDataValidation { .. } => Some("cleared".to_string()),
     };
@@ -1143,31 +1149,31 @@ mod tests {
     }
 
     #[test]
-    fn log_type_covers_every_condition() {
+    fn condition_type_str_covers_every_condition() {
         let types = [
-            Condition::OneOfList(vec!["a".to_string()]).log_type(),
-            Condition::OneOfRange("A1:A10".to_string()).log_type(),
-            Condition::NumberBetween(1.0, 2.0).log_type(),
-            Condition::NumberNotBetween(1.0, 2.0).log_type(),
-            Condition::NumberGreater(1.0).log_type(),
-            Condition::NumberGreaterEq(1.0).log_type(),
-            Condition::NumberLess(1.0).log_type(),
-            Condition::NumberLessEq(1.0).log_type(),
-            Condition::NumberEq(1.0).log_type(),
-            Condition::NumberNotEq(1.0).log_type(),
-            Condition::TextContains("x".to_string()).log_type(),
-            Condition::TextNotContains("x".to_string()).log_type(),
-            Condition::TextStartsWith("x".to_string()).log_type(),
-            Condition::TextEndsWith("x".to_string()).log_type(),
-            Condition::TextEq("x".to_string()).log_type(),
-            Condition::DateAfter(DateValue::Absolute("d".to_string())).log_type(),
-            Condition::DateBefore(DateValue::Absolute("d".to_string())).log_type(),
-            Condition::DateOn(DateValue::Absolute("d".to_string())).log_type(),
-            Condition::DateBetween("a".to_string(), "b".to_string()).log_type(),
-            Condition::Blank.log_type(),
-            Condition::NotBlank.log_type(),
-            Condition::Checkbox.log_type(),
-            Condition::CustomFormula("=TRUE".to_string()).log_type(),
+            Condition::OneOfList(vec!["a".to_string()]).condition_type_str(),
+            Condition::OneOfRange("A1:A10".to_string()).condition_type_str(),
+            Condition::NumberBetween(1.0, 2.0).condition_type_str(),
+            Condition::NumberNotBetween(1.0, 2.0).condition_type_str(),
+            Condition::NumberGreater(1.0).condition_type_str(),
+            Condition::NumberGreaterEq(1.0).condition_type_str(),
+            Condition::NumberLess(1.0).condition_type_str(),
+            Condition::NumberLessEq(1.0).condition_type_str(),
+            Condition::NumberEq(1.0).condition_type_str(),
+            Condition::NumberNotEq(1.0).condition_type_str(),
+            Condition::TextContains("x".to_string()).condition_type_str(),
+            Condition::TextNotContains("x".to_string()).condition_type_str(),
+            Condition::TextStartsWith("x".to_string()).condition_type_str(),
+            Condition::TextEndsWith("x".to_string()).condition_type_str(),
+            Condition::TextEq("x".to_string()).condition_type_str(),
+            Condition::DateAfter(DateValue::Absolute("d".to_string())).condition_type_str(),
+            Condition::DateBefore(DateValue::Absolute("d".to_string())).condition_type_str(),
+            Condition::DateOn(DateValue::Absolute("d".to_string())).condition_type_str(),
+            Condition::DateBetween("a".to_string(), "b".to_string()).condition_type_str(),
+            Condition::Blank.condition_type_str(),
+            Condition::NotBlank.condition_type_str(),
+            Condition::Checkbox.condition_type_str(),
+            Condition::CustomFormula("=TRUE".to_string()).condition_type_str(),
         ];
         let unique: HashSet<&&str> = types.iter().collect();
         assert_eq!(unique.len(), types.len());

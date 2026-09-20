@@ -60,35 +60,37 @@ pub struct SetDataValidationCommand {
     pub one_of_range: Option<String>,
 
     /// Restrict entries to a number in this inclusive range.
-    #[arg(long, num_args = 2, value_names = ["MIN", "MAX"])]
+    // `allow_hyphen_values` lets a negative bound (e.g. `-5`) pass instead of
+    // being misread as an unrecognized flag.
+    #[arg(long, num_args = 2, value_names = ["MIN", "MAX"], allow_hyphen_values = true)]
     pub number_between: Option<Vec<f64>>,
 
     /// Restrict entries to a number outside this inclusive range.
-    #[arg(long, num_args = 2, value_names = ["MIN", "MAX"])]
+    #[arg(long, num_args = 2, value_names = ["MIN", "MAX"], allow_hyphen_values = true)]
     pub number_not_between: Option<Vec<f64>>,
 
     /// Restrict entries to a number strictly greater than this.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
     pub number_greater: Option<f64>,
 
     /// Restrict entries to a number greater than or equal to this.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
     pub number_greater_eq: Option<f64>,
 
     /// Restrict entries to a number strictly less than this.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
     pub number_less: Option<f64>,
 
     /// Restrict entries to a number less than or equal to this.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
     pub number_less_eq: Option<f64>,
 
     /// Restrict entries to a number equal to this.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
     pub number_eq: Option<f64>,
 
     /// Restrict entries to a number not equal to this.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
     pub number_not_eq: Option<f64>,
 
     /// Restrict entries to text containing this substring.
@@ -170,75 +172,55 @@ pub struct SetDataValidationCommand {
     pub output: OutputFormat,
 }
 
-/// The numeric-comparator family: `--number-between` through
-/// `--number-not-eq`.
-fn numeric_condition(cmd: &SetDataValidationCommand) -> Option<Condition> {
-    if let Some(v) = &cmd.number_between {
-        Some(Condition::NumberBetween(v[0], v[1]))
-    } else if let Some(v) = &cmd.number_not_between {
-        Some(Condition::NumberNotBetween(v[0], v[1]))
-    } else if let Some(n) = cmd.number_greater {
-        Some(Condition::NumberGreater(n))
-    } else if let Some(n) = cmd.number_greater_eq {
-        Some(Condition::NumberGreaterEq(n))
-    } else if let Some(n) = cmd.number_less {
-        Some(Condition::NumberLess(n))
-    } else if let Some(n) = cmd.number_less_eq {
-        Some(Condition::NumberLessEq(n))
-    } else if let Some(n) = cmd.number_eq {
-        Some(Condition::NumberEq(n))
-    } else {
-        cmd.number_not_eq.map(Condition::NumberNotEq)
-    }
-}
-
-/// The text family: `--text-contains` through `--text-eq`.
-fn text_condition(cmd: &SetDataValidationCommand) -> Option<Condition> {
-    if let Some(text) = &cmd.text_contains {
-        Some(Condition::TextContains(text.clone()))
-    } else if let Some(text) = &cmd.text_not_contains {
-        Some(Condition::TextNotContains(text.clone()))
-    } else if let Some(text) = &cmd.text_starts_with {
-        Some(Condition::TextStartsWith(text.clone()))
-    } else if let Some(text) = &cmd.text_ends_with {
-        Some(Condition::TextEndsWith(text.clone()))
-    } else {
-        cmd.text_eq.clone().map(Condition::TextEq)
-    }
-}
-
-/// The date family: `--date-after`/`--date-before`/`--date-on` (absolute or
-/// relative) and `--date-between` (absolute only).
-fn date_condition(cmd: &SetDataValidationCommand) -> Option<Condition> {
-    if let Some(raw) = &cmd.date_after {
-        Some(Condition::DateAfter(DateValue::parse(raw.clone())))
-    } else if let Some(raw) = &cmd.date_before {
-        Some(Condition::DateBefore(DateValue::parse(raw.clone())))
-    } else if let Some(raw) = &cmd.date_on {
-        Some(Condition::DateOn(DateValue::parse(raw.clone())))
-    } else {
-        cmd.date_between
-            .as_ref()
-            .map(|v| Condition::DateBetween(v[0].clone(), v[1].clone()))
-    }
-}
-
-/// Everything else: the two dropdown flags, the two blank flags, the
-/// checkbox flag, and `--custom-formula` as the unconditional final
-/// fallback — the `ArgGroup` on [`SetDataValidationCommand`] guarantees
-/// exactly one condition flag is set, so if nothing else in this chain
-/// matched, `--custom-formula` must be it.
-fn misc_condition(cmd: &SetDataValidationCommand) -> Condition {
+/// Selects the one condition flag the `ArgGroup` on
+/// [`SetDataValidationCommand`] guarantees is set. `--custom-formula` is the
+/// unconditional final fallback: if nothing else in this chain matched, it
+/// must be the one that's set.
+fn select_condition(cmd: &SetDataValidationCommand) -> Condition {
     if let Some(items) = &cmd.one_of_list {
         Condition::OneOfList(items.clone())
     } else if let Some(range) = &cmd.one_of_range {
         Condition::OneOfRange(range.clone())
-    } else if cmd.checkbox {
-        Condition::Checkbox
+    } else if let Some(v) = &cmd.number_between {
+        Condition::NumberBetween(v[0], v[1])
+    } else if let Some(v) = &cmd.number_not_between {
+        Condition::NumberNotBetween(v[0], v[1])
+    } else if let Some(n) = cmd.number_greater {
+        Condition::NumberGreater(n)
+    } else if let Some(n) = cmd.number_greater_eq {
+        Condition::NumberGreaterEq(n)
+    } else if let Some(n) = cmd.number_less {
+        Condition::NumberLess(n)
+    } else if let Some(n) = cmd.number_less_eq {
+        Condition::NumberLessEq(n)
+    } else if let Some(n) = cmd.number_eq {
+        Condition::NumberEq(n)
+    } else if let Some(n) = cmd.number_not_eq {
+        Condition::NumberNotEq(n)
+    } else if let Some(text) = &cmd.text_contains {
+        Condition::TextContains(text.clone())
+    } else if let Some(text) = &cmd.text_not_contains {
+        Condition::TextNotContains(text.clone())
+    } else if let Some(text) = &cmd.text_starts_with {
+        Condition::TextStartsWith(text.clone())
+    } else if let Some(text) = &cmd.text_ends_with {
+        Condition::TextEndsWith(text.clone())
+    } else if let Some(text) = &cmd.text_eq {
+        Condition::TextEq(text.clone())
+    } else if let Some(raw) = &cmd.date_after {
+        Condition::DateAfter(DateValue::parse(raw.clone()))
+    } else if let Some(raw) = &cmd.date_before {
+        Condition::DateBefore(DateValue::parse(raw.clone()))
+    } else if let Some(raw) = &cmd.date_on {
+        Condition::DateOn(DateValue::parse(raw.clone()))
+    } else if let Some(v) = &cmd.date_between {
+        Condition::DateBetween(v[0].clone(), v[1].clone())
     } else if cmd.blank {
         Condition::Blank
     } else if cmd.not_blank {
         Condition::NotBlank
+    } else if cmd.checkbox {
+        Condition::Checkbox
     } else {
         Condition::CustomFormula(cmd.custom_formula.clone().unwrap_or_default())
     }
@@ -248,10 +230,7 @@ impl SetDataValidationCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         // The `ArgGroup` above guarantees exactly one condition flag is set.
-        let condition = numeric_condition(&self)
-            .or_else(|| text_condition(&self))
-            .or_else(|| date_condition(&self))
-            .unwrap_or_else(|| misc_condition(&self));
+        let condition = select_condition(&self);
         let opts = ValidationOptions {
             spreadsheet_id: self.spreadsheet_id,
             verb: ValidationVerb::SetDataValidation {
@@ -447,6 +426,32 @@ mod tests {
             ..base_cmd()
         };
         assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    /// Regression: `--number-greater -5` and friends start with `-`, which
+    /// clap will otherwise mistake for an unrecognized flag rather than a
+    /// negative value. `allow_hyphen_values = true` on each numeric field
+    /// keeps the parse working.
+    #[test]
+    fn numeric_flags_accept_a_negative_value() {
+        let cmd = SetDataValidationCommand::try_parse_from([
+            "set-data-validation",
+            "sheet-1",
+            "--number-greater",
+            "-5",
+        ])
+        .expect("clap should accept a negative --number-greater value");
+        assert_eq!(cmd.number_greater, Some(-5.0));
+
+        let cmd = SetDataValidationCommand::try_parse_from([
+            "set-data-validation",
+            "sheet-1",
+            "--number-between",
+            "-5",
+            "10",
+        ])
+        .expect("clap should accept a negative --number-between bound");
+        assert_eq!(cmd.number_between, Some(vec![-5.0, 10.0]));
     }
 
     #[tokio::test]
