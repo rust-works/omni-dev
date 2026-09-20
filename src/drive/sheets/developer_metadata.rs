@@ -1326,7 +1326,7 @@ mod tests {
             .await;
 
         let outcome = developer_metadata(&drive, &sheets, &set_opts(true), &rules).await;
-        match outcome.result {
+        match &outcome.result {
             DeveloperMetadataResult::WouldCreate { key, value, .. } => {
                 assert_eq!(key, "owner");
                 assert_eq!(value, "team-a");
@@ -1335,6 +1335,8 @@ mod tests {
         }
         // No batchUpdate mock is mounted, so a stray call would 404 and the
         // outcome would be `Failed` instead.
+        let text = describe(&outcome);
+        assert!(text.contains("Would create developer metadata"), "{text}");
     }
 
     #[tokio::test]
@@ -1351,7 +1353,7 @@ mod tests {
         .await;
 
         let outcome = developer_metadata(&drive, &sheets, &set_opts(true), &rules).await;
-        match outcome.result {
+        match &outcome.result {
             DeveloperMetadataResult::WouldUpdate {
                 new_value,
                 previous,
@@ -1363,6 +1365,12 @@ mod tests {
             }
             other => panic!("expected WouldUpdate, got {other:?}"),
         }
+        let text = describe(&outcome);
+        assert!(
+            text.contains("Would update 1 existing entry to \"team-a\""),
+            "{text}"
+        );
+        assert!(text.contains("id 42"), "{text}");
     }
 
     #[tokio::test]
@@ -1377,13 +1385,15 @@ mod tests {
             .await;
 
         let outcome = developer_metadata(&drive, &sheets, &set_opts(false), &rules).await;
-        match outcome.result {
+        match &outcome.result {
             DeveloperMetadataResult::Created { key, value, .. } => {
                 assert_eq!(key, "owner");
                 assert_eq!(value, "team-a");
             }
             other => panic!("expected Created, got {other:?}"),
         }
+        let text = describe(&outcome);
+        assert!(text.contains("Created developer metadata"), "{text}");
     }
 
     #[tokio::test]
@@ -1432,13 +1442,18 @@ mod tests {
             .await;
 
         let outcome = developer_metadata(&drive, &sheets, &delete_opts(false), &rules).await;
-        match outcome.result {
+        match &outcome.result {
             DeveloperMetadataResult::RefusedNotFound { key } => assert_eq!(key, "owner"),
             other => panic!("expected RefusedNotFound, got {other:?}"),
         }
         // No batchUpdate mock is mounted — the absence of a resulting
         // `Failed` outcome is itself the assertion that no delete was
         // attempted.
+        let text = describe(&outcome);
+        assert!(
+            text.contains("no developer metadata matching key \"owner\""),
+            "{text}"
+        );
     }
 
     #[tokio::test]
@@ -1459,7 +1474,7 @@ mod tests {
         .await;
 
         let outcome = developer_metadata(&drive, &sheets, &delete_opts(true), &rules).await;
-        match outcome.result {
+        match &outcome.result {
             DeveloperMetadataResult::WouldDelete { entries } => {
                 assert_eq!(entries.len(), 2);
                 assert_eq!(entries[0].metadata_id, 1);
@@ -1468,6 +1483,8 @@ mod tests {
             other => panic!("expected WouldDelete, got {other:?}"),
         }
         // No batchUpdate mock is mounted, so a stray delete call would 404.
+        let text = describe(&outcome);
+        assert!(text.contains("Would delete 2 entries"), "{text}");
     }
 
     #[tokio::test]
@@ -1507,6 +1524,8 @@ mod tests {
                 ["developerMetadataLookup"]["visibility"],
             "DOCUMENT"
         );
+        let text = describe(&outcome);
+        assert!(text.contains("Deleted 1 entry"), "{text}");
     }
 
     #[tokio::test]
@@ -1516,12 +1535,20 @@ mod tests {
 
         let outcome = developer_metadata(&drive, &sheets, &set_opts(false), &deny_rule()).await;
         assert!(
-            matches!(outcome.result, DeveloperMetadataResult::Blocked { .. }),
+            matches!(
+                outcome.result,
+                DeveloperMetadataResult::Blocked { decided_by: None }
+            ),
             "{:?}",
             outcome.result
         );
         // No developerMetadata:search or batchUpdate mock is mounted — the
         // gate must short-circuit before either is ever reached.
+        let text = describe(&outcome);
+        assert!(
+            text.contains("refused by default policy (no matching rule for sheets-structure)"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
@@ -1554,5 +1581,653 @@ mod tests {
         // No drive/v3/files, folder, or batchUpdate mock is mounted — a
         // search needs none of the write-gate machinery.
         let _ = drive;
+    }
+
+    // ── refusals that must precede the gate and the network ─────────────
+
+    #[tokio::test]
+    async fn non_spreadsheet_is_refused_before_any_gate_or_search_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", "application/pdf", &["folder-1"])
+            .mount(&server)
+            .await;
+        // Deliberately no folder or developerMetadata:search mock — the
+        // refusal must short-circuit both, even though the rule below
+        // would otherwise permit the write.
+        let outcome =
+            developer_metadata(&drive, &sheets, &set_opts(false), &[allow_rule("folder-1")]).await;
+        assert!(
+            matches!(
+                outcome.result,
+                DeveloperMetadataResult::RefusedNotASpreadsheet { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        let text = describe(&outcome);
+        assert!(text.contains("is not a Google Sheet"), "{text}");
+        assert!(
+            text.contains("drive sheets set-developer-metadata"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shortcut_is_refused_with_its_own_message_not_the_generic_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.shortcut",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let outcome = developer_metadata(
+            &drive,
+            &sheets,
+            &delete_opts(false),
+            &[allow_rule("folder-1")],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, DeveloperMetadataResult::RefusedShortcut),
+            "{:?}",
+            outcome.result
+        );
+        let text = describe(&outcome);
+        assert!(text.contains("is a shortcut"), "{text}");
+        assert!(
+            text.contains("drive sheets delete-developer-metadata"),
+            "{text}"
+        );
+        assert!(!text.contains("is not a Google Sheet"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_sheet_with_no_visible_parents_is_refused_distinctly_from_a_blocked_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // The shape a Sheet shared by link comes back as.
+        mount_file("sheet-1", crate::drive::types::GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let outcome = developer_metadata(&drive, &sheets, &set_opts(false), &[]).await;
+        assert!(
+            matches!(
+                outcome.result,
+                DeveloperMetadataResult::RefusedNoVisibleParents
+            ),
+            "{:?}",
+            outcome.result
+        );
+        let text = describe(&outcome);
+        assert!(text.contains("no parent folder visible"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn ancestor_chain_fetch_failure_produces_failed_not_allow() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let outcome =
+            developer_metadata(&drive, &sheets, &set_opts(false), &[allow_rule("folder-1")]).await;
+        assert!(
+            matches!(outcome.result, DeveloperMetadataResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    // ── the gate ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_blocked_by_rule_names_the_deciding_folder_in_the_message() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        let deny_by_rule = FolderPermissionRule {
+            folder_id: Some("folder-1".to_string()),
+            file_id: None,
+            recursive: true,
+            allow: HashSet::default(),
+            deny: std::iter::once(DriveOperation::SheetsStructure).collect(),
+            require_lease: true,
+        };
+        let outcome =
+            developer_metadata(&drive, &sheets, &delete_opts(false), &[deny_by_rule]).await;
+        assert!(
+            matches!(
+                outcome.result,
+                DeveloperMetadataResult::Blocked {
+                    decided_by: Some(_)
+                }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        let text = describe(&outcome);
+        assert!(
+            text.contains("refused by rule on folder folder-1"),
+            "{text}"
+        );
+    }
+
+    // ── location resolution, via the full flow ───────────────────────────
+
+    #[tokio::test]
+    async fn set_with_an_unknown_sheet_is_refused_via_the_full_flow() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        // No developerMetadata:search mock — resolve_location must refuse
+        // before any search call.
+        let mut o = set_opts(false);
+        o.verb = DeveloperMetadataVerb::Set {
+            key: "owner".to_string(),
+            value: "team-a".to_string(),
+            sheet: Some("Nope".to_string()),
+            dimension: None,
+            start: None,
+            end: None,
+        };
+        let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                DeveloperMetadataResult::RefusedSheetNotFound { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        let text = describe(&outcome);
+        assert!(text.contains("no sheet titled 'Nope'"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn set_with_a_dimension_but_no_span_is_refused_via_the_full_flow() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        let mut o = set_opts(false);
+        o.verb = DeveloperMetadataVerb::Set {
+            key: "owner".to_string(),
+            value: "team-a".to_string(),
+            sheet: Some("Q1".to_string()),
+            dimension: Some(Dimension::Rows),
+            start: None,
+            end: None,
+        };
+        let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                DeveloperMetadataResult::RefusedInvalidLocation { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        let text = describe(&outcome);
+        assert!(text.starts_with("Refused:"), "{text}");
+    }
+
+    // ── a real search or batchUpdate failure ─────────────────────────────
+
+    #[tokio::test]
+    async fn a_failed_search_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/developerMetadata:search",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let outcome = developer_metadata(&drive, &sheets, &set_opts(false), &rules).await;
+        assert!(
+            matches!(outcome.result, DeveloperMetadataResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+        let text = describe(&outcome);
+        assert!(text.starts_with("Failed:"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_batch_update_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let outcome = developer_metadata(&drive, &sheets, &set_opts(false), &rules).await;
+        assert!(
+            matches!(outcome.result, DeveloperMetadataResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn set_updates_every_matching_entry_when_one_exists() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": [
+            {"developerMetadata": {
+                "metadataId": 42, "metadataKey": "owner", "metadataValue": "team-b",
+                "location": {"spreadsheet": true}, "visibility": "DOCUMENT",
+            }},
+        ]}))
+        .mount(&server)
+        .await;
+        mount_batch_update(serde_json::json!({"replies": [{}]}))
+            .mount(&server)
+            .await;
+
+        let outcome = developer_metadata(&drive, &sheets, &set_opts(false), &rules).await;
+        match &outcome.result {
+            DeveloperMetadataResult::Updated {
+                new_value,
+                previous,
+            } => {
+                assert_eq!(new_value, "team-a");
+                assert_eq!(previous.len(), 1);
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+        let text = describe(&outcome);
+        assert!(text.contains("Updated 1 entry to \"team-a\""), "{text}");
+    }
+
+    // ── the Drive write lease (ADR-0080 §9) ──────────────────────────────
+
+    #[tokio::test]
+    async fn refuses_without_a_lease_when_the_rule_requires_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+        // No batchUpdate mock is mounted — a refusal must make zero
+        // mutating calls.
+        let mut o = set_opts(false);
+        o.lease_token = None;
+        let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
+        assert_eq!(outcome.result, DeveloperMetadataResult::RefusedNoLease);
+        let text = describe(&outcome);
+        assert!(text.contains("lease"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+        let mut o = set_opts(false);
+        o.lease_token = Some("bogus-token".to_string());
+        // Never seeded — no ledger exists at this fresh path.
+        o.ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
+        assert_eq!(outcome.result, DeveloperMetadataResult::RefusedLeaseExpired);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_lease_bound_to_a_different_file() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "other-sheet", "1");
+        let mut o = set_opts(false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
+        assert_eq!(
+            outcome.result,
+            DeveloperMetadataResult::RefusedLeaseWrongFile
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_stale_lease() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+        // Live version "1" (`mount_file`'s default, via `setup`) but the
+        // lease was acquired at "0" — the file has moved since.
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let mut o = set_opts(false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
+        assert_eq!(outcome.result, DeveloperMetadataResult::RefusedLeaseStale);
+    }
+
+    // ── JSONL output ──────────────────────────────────────────────────
+
+    #[test]
+    fn write_jsonl_serializes_the_outcome_as_one_json_line() {
+        let outcome = DeveloperMetadataOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: DeveloperMetadataVerb::Set {
+                key: "owner".to_string(),
+                value: "team-a".to_string(),
+                sheet: None,
+                dimension: None,
+                start: None,
+                end: None,
+            },
+            result: DeveloperMetadataResult::Created {
+                key: "owner".to_string(),
+                value: "team-a".to_string(),
+                location: "the whole spreadsheet".to_string(),
+            },
+        };
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("\"status\":\"created\""), "{text}");
+        assert!(text.contains("\"spreadsheet_id\":\"sheet-1\""), "{text}");
+    }
+
+    // ── the remaining lease-refusal describe_lines arms ──────────────────
+
+    #[tokio::test]
+    async fn describe_of_an_unknown_lease_token_names_it_a_lease_refusal() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+        let mut o = set_opts(false);
+        o.lease_token = Some("bogus-token".to_string());
+        o.ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
+        let text = describe(&outcome);
+        assert!(text.contains("lease"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn describe_of_a_lease_bound_to_a_different_file_names_it_a_lease_refusal() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "other-sheet", "1");
+        let mut o = set_opts(false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
+        let text = describe(&outcome);
+        assert!(text.contains("lease"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn describe_of_a_stale_lease_names_it_a_lease_refusal() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let mut o = set_opts(false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
+        let text = describe(&outcome);
+        assert!(text.contains("lease"), "{text}");
+    }
+
+    // ── from_lease_failed (a lock-acquisition failure) ───────────────────
+
+    #[tokio::test]
+    async fn a_lock_acquisition_failure_is_reported_as_failed() {
+        // A directory at the lock path simulates another `drive lease`
+        // operation genuinely in progress — opening it for write fails
+        // outright with an I/O error, which `FromLeaseRefusal::from_lease_failed`
+        // folds into `Failed` rather than any of the lease-expiry variants
+        // (mirrors `write.rs::reports_a_lock_acquisition_failure_as_failed`).
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+        let o = set_opts(false);
+        let mut lock_path = o.ledger_path.clone().into_os_string();
+        lock_path.push(".lock");
+        std::fs::create_dir(std::path::PathBuf::from(lock_path)).unwrap();
+
+        let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
+        assert!(
+            matches!(outcome.result, DeveloperMetadataResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    // ── a real spreadsheets.get failure after the gate allows ────────────
+
+    #[tokio::test]
+    async fn a_failed_spreadsheet_refetch_after_the_gate_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let outcome =
+            developer_metadata(&drive, &sheets, &set_opts(false), &[allow_rule("folder-1")]).await;
+        assert!(
+            matches!(outcome.result, DeveloperMetadataResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    // ── location rendering ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_at_a_dimension_location_describes_the_row_span() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+        let mut o = set_opts(true);
+        o.verb = DeveloperMetadataVerb::Set {
+            key: "owner".to_string(),
+            value: "team-a".to_string(),
+            sheet: Some("Q1".to_string()),
+            dimension: Some(Dimension::Rows),
+            start: Some(2),
+            end: Some(5),
+        };
+        let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
+        let text = describe(&outcome);
+        assert!(text.contains("row(s) 2-5 of sheet 'Q1'"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn set_with_an_unknown_sheet_in_an_empty_workbook_lists_no_available_sheets() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut o = set_opts(false);
+        o.verb = DeveloperMetadataVerb::Set {
+            key: "owner".to_string(),
+            value: "team-a".to_string(),
+            sheet: Some("Nope".to_string()),
+            dimension: None,
+            start: None,
+            end: None,
+        };
+        let outcome = developer_metadata(&drive, &sheets, &o, &[allow_rule("folder-1")]).await;
+        let text = describe(&outcome);
+        assert!(text.contains("Available: none"), "{text}");
+    }
+
+    #[test]
+    fn sheet_title_or_id_falls_back_to_the_raw_id_when_unknown() {
+        let workbook = test_workbook();
+        assert_eq!(sheet_title_or_id(&workbook, 999), "id 999");
+    }
+
+    #[test]
+    fn describe_location_falls_back_for_an_unrecognized_shape() {
+        let workbook = test_workbook();
+        let empty_location = DeveloperMetadataLocation::default();
+        assert_eq!(
+            describe_location(&workbook, &empty_location),
+            "an unknown location"
+        );
+    }
+
+    #[test]
+    fn log_status_maps_a_would_change_variant_to_would_change() {
+        // Never actually reached through `record_attempt` (only called when
+        // `!opts.dry_run`, and a `Would*` result only ever comes back under
+        // `--dry-run`) — exercised directly since the match must still
+        // handle it exhaustively.
+        let would_create = DeveloperMetadataResult::WouldCreate {
+            key: "owner".to_string(),
+            value: "team-a".to_string(),
+            location: "the whole spreadsheet".to_string(),
+        };
+        assert_eq!(would_create.log_status(), "would-change");
+    }
+
+    // ── search()'s own location-error rendering ───────────────────────
+
+    #[tokio::test]
+    async fn search_rejects_an_unknown_sheet_when_the_workbook_has_none() {
+        let server = wiremock::MockServer::start().await;
+        let (_drive, sheets) = clients(&server).await;
+        let api = SheetsApi::new(&sheets);
+        let workbook: Spreadsheet = serde_json::from_value(serde_json::json!({
+            "spreadsheetId": "sheet-1",
+            "properties": {"title": "Budget"},
+            "sheets": [],
+        }))
+        .unwrap();
+        let err = search(
+            &api,
+            "sheet-1",
+            &workbook,
+            None,
+            SearchLocationFilter {
+                sheet: Some("Nope"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("Available: none"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_rejects_an_invalid_location_combination() {
+        let server = wiremock::MockServer::start().await;
+        let (_drive, sheets) = clients(&server).await;
+        let api = SheetsApi::new(&sheets);
+        let workbook = test_workbook();
+        let err = search(
+            &api,
+            "sheet-1",
+            &workbook,
+            None,
+            SearchLocationFilter {
+                dimension: Some(Dimension::Rows),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("--dimension/--start/--end need --sheet too"),
+            "{err}"
+        );
     }
 }

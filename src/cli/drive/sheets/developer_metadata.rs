@@ -251,3 +251,227 @@ impl SearchDeveloperMetadataCommand {
         Ok(())
     }
 }
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::utils::secret::Secret;
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    fn dead_client() -> DriveClient {
+        DriveClient::new("http://127.0.0.1:1", &test_credentials()).unwrap()
+    }
+
+    /// A `DriveClient` pointed at `server`, whose token endpoint is already
+    /// mocked. Callers must additionally point `SHEETS_API_URL` at the same
+    /// server, since every command here derives its `SheetsClient`
+    /// internally from the real process environment (mirrors
+    /// `create.rs::client_with_bootstrapped_token`).
+    async fn client_with_bootstrapped_token(server: &wiremock::MockServer) -> DriveClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+        let mut client = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    fn mount_workbook() -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+                    ],
+                })),
+            )
+    }
+
+    fn mount_search(body: serde_json::Value) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/developerMetadata:search",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+    }
+
+    fn search_cmd(
+        key: Option<&str>,
+        sheet: Option<&str>,
+        output: OutputFormat,
+    ) -> SearchDeveloperMetadataCommand {
+        SearchDeveloperMetadataCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            key: key.map(str::to_string),
+            sheet: sheet.map(str::to_string),
+            dimension: None,
+            start: None,
+            end: None,
+            output,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_command_execute_with_no_configured_account_reports_blocked() {
+        // No `SheetsClient` HTTP call ever succeeds here: with every
+        // credential cleared, `active_account_rules` returns an empty rule
+        // set and the target's own metadata fetch against a dead port
+        // fails fast, both of which `developer_metadata` reports as a
+        // printed outcome rather than an `Err` — see
+        // `run_developer_metadata`'s doc comment.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDeveloperMetadataCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            key: "owner".to_string(),
+            value: "team-a".to_string(),
+            sheet: None,
+            dimension: None,
+            start: None,
+            end: None,
+            dry_run: false,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn set_command_execute_json_output_short_circuits_before_the_text_lines() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDeveloperMetadataCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            key: "owner".to_string(),
+            value: "team-a".to_string(),
+            sheet: None,
+            dimension: None,
+            start: None,
+            end: None,
+            dry_run: false,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: OutputFormat::Json,
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_command_execute_with_no_configured_account_reports_blocked() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DeleteDeveloperMetadataCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            key: "owner".to_string(),
+            sheet: None,
+            dimension: None,
+            start: None,
+            end: None,
+            dry_run: false,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn search_command_execute_reports_no_matching_entries() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        mount_workbook().mount(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+
+        let cmd = search_cmd(None, None, OutputFormat::Table);
+        cmd.execute(&client).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_command_execute_prints_every_matching_entry() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        mount_workbook().mount(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": [
+            {"developerMetadata": {
+                "metadataId": 7, "metadataKey": "owner", "metadataValue": "team-a",
+                "location": {"spreadsheet": true}, "visibility": "DOCUMENT",
+            }},
+        ]}))
+        .mount(&server)
+        .await;
+
+        let cmd = search_cmd(Some("owner"), None, OutputFormat::Table);
+        cmd.execute(&client).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_command_execute_json_output_short_circuits_before_the_text_lines() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        mount_workbook().mount(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+
+        let cmd = search_cmd(None, None, OutputFormat::Json);
+        cmd.execute(&client).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_command_execute_maps_an_invalid_location_to_an_error() {
+        // `--sheet` naming a title absent from the workbook drives
+        // `search`'s `resolve_location` failure through
+        // `location_error_to_string`, which `execute` maps into a plain
+        // `anyhow::Error` since `search` has no `DeveloperMetadataOutcome`
+        // to attach a structured result to.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        mount_workbook().mount(&server).await;
+
+        let cmd = search_cmd(None, Some("Nope"), OutputFormat::Table);
+        let err = cmd.execute(&client).await.unwrap_err();
+        assert!(err.to_string().contains("Nope"), "{err}");
+    }
+}
