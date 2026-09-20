@@ -71,6 +71,23 @@ pub struct TabContent {
     pub footnotes: Vec<SegmentContent>,
 }
 
+impl TabContent {
+    /// Every segment kind's content, in header/footer/footnote order.
+    ///
+    /// The single source of truth both [`ReadOutcome::flat_elements`]
+    /// (`-o jsonl`) and the CLI's `-o table` renderer walk, so a future
+    /// segment kind is added in one place rather than kept in sync by hand
+    /// across both.
+    #[must_use]
+    pub fn segments_by_kind(&self) -> [(SegmentKind, &Vec<SegmentContent>); 3] {
+        [
+            (SegmentKind::Header, &self.headers),
+            (SegmentKind::Footer, &self.footers),
+            (SegmentKind::Footnote, &self.footnotes),
+        ]
+    }
+}
+
 /// The full result of one read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReadOutcome {
@@ -92,11 +109,36 @@ pub struct ReadOutcome {
     pub tabs: Vec<TabContent>,
 }
 
+/// Which kind of segment a header, footer or footnote is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SegmentKind {
+    /// A page header.
+    Header,
+    /// A page footer.
+    Footer,
+    /// A footnote.
+    Footnote,
+}
+
+impl SegmentKind {
+    /// `"header"`, `"footer"` or `"footnote"` — the label the CLI's
+    /// `-o table` renderer uses for a segment's block heading.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Header => "header",
+            Self::Footer => "footer",
+            Self::Footnote => "footnote",
+        }
+    }
+}
+
 /// Identifies a header/footer/footnote segment on a `-o jsonl` line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SegmentRef<'a> {
-    /// `"header"`, `"footer"` or `"footnote"`.
-    pub kind: &'static str,
+    /// The segment's kind.
+    pub kind: SegmentKind,
     /// The segment's id — the map key Docs stores it under.
     pub segment_id: &'a str,
 }
@@ -155,11 +197,7 @@ impl ReadOutcome {
                     element,
                 });
             }
-            for (kind, segments) in [
-                ("header", &tab.headers),
-                ("footer", &tab.footers),
-                ("footnote", &tab.footnotes),
-            ] {
+            for (kind, segments) in tab.segments_by_kind() {
                 for segment in segments {
                     for element in &segment.elements {
                         out.push(FlatElement {
@@ -206,9 +244,9 @@ pub async fn read(api: &DocsApi<'_>, opts: &ReadOptions) -> Result<ReadOutcome> 
             title: tab.title.map(ToString::to_string),
             nesting_level: tab.nesting_level,
             elements: tab.body.map(flatten).unwrap_or_default(),
-            headers: segments_to_content(&tab.headers),
-            footers: segments_to_content(&tab.footers),
-            footnotes: segments_to_content(&tab.footnotes),
+            headers: segments_to_content(&tab.headers()),
+            footers: segments_to_content(&tab.footers()),
+            footnotes: segments_to_content(&tab.footnotes()),
         })
         .collect();
 

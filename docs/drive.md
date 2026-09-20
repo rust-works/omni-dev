@@ -2070,6 +2070,14 @@ Two fields are worth more than they look:
 - **Named ranges** are the *stable* way to name a region. An index shifts on
   every insertion; a named range's name does not.
 
+**Body only.** The per-tab counts and heading outline above cover the tab's
+**body** alone. Headers, footers and footnotes — which `drive docs read`
+fetches and renders (see below) — do not contribute a paragraph, table, or
+heading to this command's output. A heading that lives inside a header,
+footer or footnote is invisible here even though `drive docs read` on the
+same document now shows it. Folding segments into the outline is unstarted
+follow-up work.
+
 #### `drive docs read`
 
 One line per structural element, indented by nesting depth.

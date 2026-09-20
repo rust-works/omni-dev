@@ -239,6 +239,14 @@ fn is_heading_style(style: &str) -> bool {
 }
 
 /// Counts and outlines one tab.
+///
+/// **Body only.** Unlike `docs read` (issue #1799), this does not walk
+/// `tab.headers()`/`.footers()`/`.footnotes()` — a heading inside a header,
+/// footer or footnote is invisible to `docs info`'s outline and does not
+/// contribute to its counts, even though `docs read` on the same document
+/// now surfaces that content. Folding segments into the outline is
+/// unstarted follow-up work, not a deliberately-kept gap the way
+/// `write.rs`'s dry-run count is.
 #[must_use]
 pub fn outline(tab: &ResolvedTab<'_>) -> TabOutline {
     let mut out = TabOutline {

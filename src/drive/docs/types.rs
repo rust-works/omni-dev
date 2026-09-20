@@ -112,7 +112,14 @@ pub struct ResolvedSegment<'a> {
 
 /// One tab's content, with the legacy single-`body` response normalised into
 /// the same shape so callers never branch on which form arrived.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Header/footer/footnote content is resolved **lazily**, via
+/// [`Self::headers`]/[`Self::footers`]/[`Self::footnotes`], rather than
+/// eagerly at construction: `docs info`'s outline and the write-preview
+/// corpus builders only ever read [`Self::body`], and paying the sort for
+/// a footnote-heavy document they discard immediately would be pure waste.
+/// Only `docs read` calls the accessors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedTab<'a> {
     /// The tab's id, or `None` for a legacy single-body document.
     pub tab_id: Option<&'a str>,
@@ -122,13 +129,31 @@ pub struct ResolvedTab<'a> {
     pub nesting_level: i64,
     /// The tab's body, when it has one.
     pub body: Option<&'a Body>,
-    /// The tab's page headers, sorted by `segment_id` for deterministic
-    /// output — map iteration order is not.
-    pub headers: Vec<ResolvedSegment<'a>>,
-    /// The tab's page footers, likewise sorted.
-    pub footers: Vec<ResolvedSegment<'a>>,
-    /// The tab's footnotes, likewise sorted.
-    pub footnotes: Vec<ResolvedSegment<'a>>,
+    headers_map: Option<&'a HashMap<String, Header>>,
+    footers_map: Option<&'a HashMap<String, Footer>>,
+    footnotes_map: Option<&'a HashMap<String, Footnote>>,
+}
+
+impl<'a> ResolvedTab<'a> {
+    /// The tab's page headers, resolved and sorted by `segment_id` — map
+    /// iteration order is not deterministic.
+    #[must_use]
+    pub fn headers(&self) -> Vec<ResolvedSegment<'a>> {
+        self.headers_map
+            .map_or_else(Vec::new, |m| resolve_segments(m, |h| h.content.as_slice()))
+    }
+    /// The tab's page footers, likewise resolved and sorted.
+    #[must_use]
+    pub fn footers(&self) -> Vec<ResolvedSegment<'a>> {
+        self.footers_map
+            .map_or_else(Vec::new, |m| resolve_segments(m, |f| f.content.as_slice()))
+    }
+    /// The tab's footnotes, likewise resolved and sorted.
+    #[must_use]
+    pub fn footnotes(&self) -> Vec<ResolvedSegment<'a>> {
+        self.footnotes_map
+            .map_or_else(Vec::new, |m| resolve_segments(m, |f| f.content.as_slice()))
+    }
 }
 
 /// Resolves one segment map into sorted [`ResolvedSegment`]s.
@@ -155,25 +180,33 @@ impl Document {
     }
 
     /// Every tab's content, depth-first through `childTabs`, falling back to
-    /// the legacy top-level [`Self::body`] as a single anonymous tab.
+    /// the legacy top-level [`Self::body`] (and its sibling
+    /// `headers`/`footers`/`footnotes` maps) as a single anonymous tab.
     ///
     /// The fallback is what makes the `tabs`-xor-`body` split invisible to
     /// callers. A document fetched without `includeTabsContent` yields
-    /// exactly one `ResolvedTab` whose `tab_id` and `title` are `None`.
+    /// exactly one `ResolvedTab` whose `tab_id` and `title` are `None` —
+    /// unless the document has neither body content nor any segment, in
+    /// which case there is nothing to synthesise a tab for.
     #[must_use]
     pub fn resolved_tabs(&self) -> Vec<ResolvedTab<'_>> {
         if self.tabs.is_empty() {
-            return self.body.as_ref().map_or_else(Vec::new, |body| {
-                vec![ResolvedTab {
-                    tab_id: None,
-                    title: None,
-                    nesting_level: 0,
-                    body: Some(body),
-                    headers: resolve_segments(&self.headers, |h| h.content.as_slice()),
-                    footers: resolve_segments(&self.footers, |f| f.content.as_slice()),
-                    footnotes: resolve_segments(&self.footnotes, |f| f.content.as_slice()),
-                }]
-            });
+            if self.body.is_none()
+                && self.headers.is_empty()
+                && self.footers.is_empty()
+                && self.footnotes.is_empty()
+            {
+                return Vec::new();
+            }
+            return vec![ResolvedTab {
+                tab_id: None,
+                title: None,
+                nesting_level: 0,
+                body: self.body.as_ref(),
+                headers_map: Some(&self.headers),
+                footers_map: Some(&self.footers),
+                footnotes_map: Some(&self.footnotes),
+            }];
         }
         let mut out = Vec::new();
         for tab in &self.tabs {
@@ -195,15 +228,9 @@ fn push_tab<'a>(tab: &'a Tab, depth: i64, out: &mut Vec<ResolvedTab<'a>>) {
         // response and keeps a truncated one self-consistent.
         nesting_level: props.and_then(|p| p.nesting_level).unwrap_or(depth),
         body: doc_tab.and_then(|dt| dt.body.as_ref()),
-        headers: doc_tab.map_or_else(Vec::new, |dt| {
-            resolve_segments(&dt.headers, |h| h.content.as_slice())
-        }),
-        footers: doc_tab.map_or_else(Vec::new, |dt| {
-            resolve_segments(&dt.footers, |f| f.content.as_slice())
-        }),
-        footnotes: doc_tab.map_or_else(Vec::new, |dt| {
-            resolve_segments(&dt.footnotes, |f| f.content.as_slice())
-        }),
+        headers_map: doc_tab.map(|dt| &dt.headers),
+        footers_map: doc_tab.map(|dt| &dt.footers),
+        footnotes_map: doc_tab.map(|dt| &dt.footnotes),
     });
     for child in &tab.child_tabs {
         push_tab(child, depth + 1, out);
@@ -763,10 +790,10 @@ mod tests {
             "footnotes": {"fn1": {"content": []}},
         }));
         let tabs = doc.resolved_tabs();
-        assert_eq!(tabs[0].headers.len(), 1);
-        assert_eq!(tabs[0].headers[0].segment_id, "h1");
-        assert_eq!(tabs[0].footers.len(), 1);
-        assert_eq!(tabs[0].footnotes.len(), 1);
+        assert_eq!(tabs[0].headers().len(), 1);
+        assert_eq!(tabs[0].headers()[0].segment_id, "h1");
+        assert_eq!(tabs[0].footers().len(), 1);
+        assert_eq!(tabs[0].footnotes().len(), 1);
     }
 
     /// A tab with none of these maps yields empty `Vec`s, not an error.
@@ -774,9 +801,24 @@ mod tests {
     fn resolved_tabs_has_empty_segments_when_the_document_has_none() {
         let doc = parse(serde_json::json!({"body": {"content": []}}));
         let tabs = doc.resolved_tabs();
-        assert!(tabs[0].headers.is_empty());
-        assert!(tabs[0].footers.is_empty());
-        assert!(tabs[0].footnotes.is_empty());
+        assert!(tabs[0].headers().is_empty());
+        assert!(tabs[0].footers().is_empty());
+        assert!(tabs[0].footnotes().is_empty());
+    }
+
+    /// A document with no `tabs` and no `body` but a populated segment map
+    /// still yields a tab to hang that segment off, rather than silently
+    /// discarding fetched content because the legacy fallback keyed only on
+    /// `body`'s presence.
+    #[test]
+    fn resolved_tabs_synthesises_a_tab_for_segments_with_no_body() {
+        let doc = parse(serde_json::json!({
+            "headers": {"h1": {"content": [{"endIndex": 1, "sectionBreak": {}}]}},
+        }));
+        let tabs = doc.resolved_tabs();
+        assert_eq!(tabs.len(), 1);
+        assert!(tabs[0].body.is_none());
+        assert_eq!(tabs[0].headers().len(), 1);
     }
 
     /// Segments are tab-scoped in the `tabs` shape, and resolved sorted by
@@ -796,9 +838,10 @@ mod tests {
             }],
         }));
         let tabs = doc.resolved_tabs();
-        let ids: Vec<_> = tabs[0].headers.iter().map(|s| s.segment_id).collect();
+        let headers = tabs[0].headers();
+        let ids: Vec<_> = headers.iter().map(|s| s.segment_id).collect();
         assert_eq!(ids, vec!["h1", "h2"]);
-        assert_eq!(tabs[0].headers[0].content.len(), 1);
+        assert_eq!(headers[0].content.len(), 1);
     }
 
     #[test]
