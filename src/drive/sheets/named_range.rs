@@ -919,10 +919,7 @@ mod tests {
 
     fn workbook_with(named_ranges: Vec<NamedRange>) -> Spreadsheet {
         Spreadsheet {
-            sheets: vec![Sheet {
-                properties: None,
-                protected_ranges: Vec::new(),
-            }],
+            sheets: vec![Sheet::default()],
             named_ranges,
             ..Default::default()
         }
