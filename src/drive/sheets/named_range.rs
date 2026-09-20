@@ -457,8 +457,7 @@ async fn named_range_inner(
     let (request, existing_id) = match &opts.verb {
         NamedRangeVerb::AddNamedRange { name, .. } => {
             let Some(grid) = new_grid else {
-                // omni-dev: coverage ignore-line reason="new_grid is always Some for AddNamedRange: resolve_grid above either returns it or refuses and returns early"
-                unreachable!("new_grid is resolved for AddNamedRange above")
+                unreachable!("new_grid is resolved for AddNamedRange above") // omni-dev: coverage ignore-line reason="new_grid is always Some for AddNamedRange: resolve_grid above either returns it or refuses and returns early"
             };
             (
                 BatchUpdateRequestItem::AddNamedRange(AddNamedRangeRequest {
@@ -473,8 +472,7 @@ async fn named_range_inner(
         }
         NamedRangeVerb::UpdateNamedRange { new_name, .. } => {
             let Some(existing) = existing else {
-                // omni-dev: coverage ignore-line reason="existing is always Some for UpdateNamedRange: find_existing_named_range above either returns it or refuses and returns early"
-                unreachable!("existing is resolved for UpdateNamedRange above")
+                unreachable!("existing is resolved for UpdateNamedRange above") // omni-dev: coverage ignore-line reason="existing is always Some for UpdateNamedRange: find_existing_named_range above either returns it or refuses and returns early"
             };
             (
                 BatchUpdateRequestItem::UpdateNamedRange(build_update(
@@ -485,8 +483,7 @@ async fn named_range_inner(
         }
         NamedRangeVerb::DeleteNamedRange { .. } => {
             let Some(existing) = existing else {
-                // omni-dev: coverage ignore-line reason="existing is always Some for DeleteNamedRange: find_existing_named_range above either returns it or refuses and returns early"
-                unreachable!("existing is resolved for DeleteNamedRange above")
+                unreachable!("existing is resolved for DeleteNamedRange above") // omni-dev: coverage ignore-line reason="existing is always Some for DeleteNamedRange: find_existing_named_range above either returns it or refuses and returns early"
             };
             let id = existing.named_range_id.clone();
             (
@@ -2156,5 +2153,206 @@ mod tests {
         };
         let outcome = named_range(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, NamedRangeResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_failed_pre_lease_refetch_is_reported_as_failed_with_no_batch_update_call() {
+        // The gate's own resolve step succeeds off the first `files.get`,
+        // but the fresh re-fetch feeding the staleness check (ADR-0080 §6)
+        // fails — the change must report `Failed` and never reach
+        // `batchUpdate`.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, NamedRangeResult::Failed { .. }));
+    }
+
+    // ── AddNamedRange's own resolve_grid failure, reached through
+    // named_range() rather than by calling resolve_grid directly ────────
+
+    #[tokio::test]
+    async fn add_named_range_reports_sheet_not_found_for_an_unknown_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: NamedRangeVerb::AddNamedRange {
+                name: "Foo".to_string(),
+                sheet: Some("Missing".to_string()),
+                range: None,
+                whole_sheet: true,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            NamedRangeResult::RefusedSheetNotFound { .. }
+        ));
+    }
+
+    // ── delete-named-range's formula scan failing surfaces as Failed ────
+
+    #[tokio::test]
+    async fn a_referencing_formula_scan_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([{
+            "namedRangeId": "id-1",
+            "name": "Foo",
+            "range": {"sheetId": 0},
+        }]))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values:batchGet",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: NamedRangeVerb::DeleteNamedRange {
+                name: "Foo".to_string(),
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, NamedRangeResult::Failed { .. }));
+    }
+
+    // ── write_jsonl / log_status ─────────────────────────────────────────
+
+    #[test]
+    fn write_jsonl_emits_one_line_of_json() {
+        let outcome = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            NamedRangeResult::Changed {
+                summary: "add named range 'Foo'".to_string(),
+                named_range_id: Some("id-1".to_string()),
+                referencing_formulas: Vec::new(),
+            },
+        );
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(parsed["result"]["status"], "changed");
+    }
+
+    #[test]
+    fn named_range_result_log_status_names_every_variant() {
+        assert_eq!(
+            NamedRangeResult::WouldChange {
+                summary: String::new(),
+                referencing_formulas: Vec::new(),
+            }
+            .log_status(),
+            "would-change"
+        );
+        assert_eq!(
+            NamedRangeResult::RefusedNotASpreadsheet {
+                mime_type: String::new(),
+            }
+            .log_status(),
+            "refused-not-a-spreadsheet"
+        );
+        assert_eq!(
+            NamedRangeResult::RefusedShortcut.log_status(),
+            "refused-shortcut"
+        );
+        assert_eq!(
+            NamedRangeResult::RefusedNoVisibleParents.log_status(),
+            "refused-no-visible-parents"
+        );
+        assert_eq!(
+            NamedRangeResult::RefusedSheetNotFound {
+                title: String::new(),
+                available: Vec::new(),
+            }
+            .log_status(),
+            "refused-sheet-not-found"
+        );
+        assert_eq!(
+            NamedRangeResult::RefusedInvalidRange {
+                detail: String::new(),
+            }
+            .log_status(),
+            "refused-invalid-range"
+        );
+        assert_eq!(
+            NamedRangeResult::RefusedNotFound {
+                name: String::new(),
+            }
+            .log_status(),
+            "refused-not-found"
+        );
+        assert_eq!(
+            NamedRangeResult::Failed {
+                detail: String::new(),
+            }
+            .log_status(),
+            "failed"
+        );
     }
 }
