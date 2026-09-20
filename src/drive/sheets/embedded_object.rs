@@ -1600,16 +1600,15 @@ fn build_delete_slicer(
 
 // ── list-charts / list-slicers ───────────────────────────────────────────
 
-/// Fetches every chart in the workbook, for `list-charts`.
-pub async fn list_charts(
-    sheets: &SheetsClient,
-    spreadsheet_id: &str,
-) -> anyhow::Result<Vec<EmbeddedObjectSummary>> {
-    let api = SheetsApi::new(sheets);
-    let workbook = api
-        .get_spreadsheet_with_embedded_objects(spreadsheet_id)
-        .await?;
-    Ok(workbook
+/// Extracts every chart's summary from an already-fetched workbook, for
+/// `list-charts`.
+///
+/// Takes the workbook rather than fetching it itself — the CLI leaf fetches
+/// once and reuses the same `Spreadsheet` for `-o json`/`-o yaml`'s raw
+/// dump, matching `list-protections`/`list-filter-views`' own shape.
+#[must_use]
+pub fn charts_from_workbook(workbook: &Spreadsheet) -> Vec<EmbeddedObjectSummary> {
+    workbook
         .sheets
         .iter()
         .flat_map(|sheet| {
@@ -1618,19 +1617,14 @@ pub async fn list_charts(
                 .iter()
                 .filter_map(move |chart| summarise_chart(sheet, chart))
         })
-        .collect())
+        .collect()
 }
 
-/// Fetches every slicer in the workbook, for `list-slicers`.
-pub async fn list_slicers(
-    sheets: &SheetsClient,
-    spreadsheet_id: &str,
-) -> anyhow::Result<Vec<EmbeddedObjectSummary>> {
-    let api = SheetsApi::new(sheets);
-    let workbook = api
-        .get_spreadsheet_with_embedded_objects(spreadsheet_id)
-        .await?;
-    Ok(workbook
+/// Extracts every slicer's summary from an already-fetched workbook, for
+/// `list-slicers`. See [`charts_from_workbook`]'s doc comment.
+#[must_use]
+pub fn slicers_from_workbook(workbook: &Spreadsheet) -> Vec<EmbeddedObjectSummary> {
+    workbook
         .sheets
         .iter()
         .flat_map(|sheet| {
@@ -1639,7 +1633,7 @@ pub async fn list_slicers(
                 .iter()
                 .filter_map(move |slicer| summarise_slicer(sheet, slicer))
         })
-        .collect())
+        .collect()
 }
 
 // ── logging and rendering ────────────────────────────────────────────────
