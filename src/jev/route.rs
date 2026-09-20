@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::jev::citations::Citation;
 use crate::jev::client::JevClient;
 use crate::jev::error::is_auth_failure;
 use crate::jev::input::truncate_middle;
@@ -45,6 +46,13 @@ pub const DEFAULT_MAX_INPUT_CHARS: usize = 60_000;
 /// Fewest tiers a tiers file may define — routing between one class is not
 /// a judgment.
 const MIN_TIERS: usize = 2;
+
+/// The open citations found in each routed issue's own text (#1812).
+///
+/// Keyed by the citing issue's `(project, number)`. Built by the CLI's
+/// blocking `gh` fetch (`fetch_docs`) — [`run_route`] only reads it, so it
+/// stays free of GitHub-specific I/O.
+pub type OpenDependencies = BTreeMap<(String, u64), Vec<Citation>>;
 
 /// One stage of the work on an issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -243,6 +251,25 @@ impl StageAnswers {
     }
 }
 
+/// One open issue/PR a routed issue's text cites, and whether resolving it
+/// would plausibly reduce the remaining work (#1812).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DependencyEntry {
+    /// The citation exactly as written, e.g. `"#1129"` or `"PR #1629"` — not
+    /// a reconstructed `owner/repo#N`, since the raw text already carries
+    /// whatever form the issue used.
+    #[serde(rename = "ref")]
+    pub item_ref: String,
+    /// Always [`ItemState::Open`]: a closed citation is settled and is not
+    /// reported here.
+    pub state: ItemState,
+    /// The probability, per stage, that resolving this citation would leave
+    /// less of that stage's work remaining than the text implies. Only
+    /// `"design"` is populated for v1 — `"implement"` is deferred pending
+    /// the same kind of live validation `design` got (see #1812).
+    pub could_be_cheaper: BTreeMap<String, f64>,
+}
+
 /// The routing result for one issue.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IssueRoute {
@@ -269,12 +296,15 @@ pub struct IssueRoute {
 pub enum RouteOutcome {
     /// Jev answered every stage.
     Routed {
-        /// Jev's answer per stage.
-        stages: StageAnswers,
+        /// Jev's answer per stage. Boxed: `Failed` is otherwise ten times
+        /// smaller, and `Vec<IssueRoute>` pays that gap on every element.
+        stages: Box<StageAnswers>,
         /// The issue's class: the higher of the design and implement choices.
         class: String,
         /// Stages whose confidence is below the close-call threshold.
         close_calls: Vec<Stage>,
+        /// Open issues/PRs this issue's text cites (#1812).
+        depends_on: Vec<DependencyEntry>,
     },
     /// The Jev call for this issue failed, or its answer was unusable. The
     /// other issues are still routed, so a long run keeps what it paid for.
@@ -322,6 +352,11 @@ pub struct RouteOptions {
 /// Refuses closed issues unless [`RouteOptions::allow_closed`]: their comments
 /// often describe how the work was actually done, which leaks the answer.
 ///
+/// `dependencies` is each issue's open citations (#1812), keyed by `(project,
+/// number)` — pre-resolved by the caller's `gh` fetch, since this function
+/// only ever talks to Jev. An issue with no entry (or an empty one) gets an
+/// empty `depends_on` and no extra questions.
+///
 /// A failure on one issue is recorded on that issue as
 /// [`RouteOutcome::Failed`] and the run continues, so a transient error late
 /// in a long `--all-open` run does not discard the answers already paid for.
@@ -332,6 +367,7 @@ pub async fn run_route(
     docs: &[IssueDoc],
     tiers: &Tiers,
     opts: &RouteOptions,
+    dependencies: &OpenDependencies,
 ) -> Result<RouteReport> {
     validate_options(docs, opts)?;
     let questions = build_route_questions(tiers)?;
@@ -348,10 +384,20 @@ pub async fn run_route(
                 opts.max_input_chars
             );
         }
+        let citations = dependencies
+            .get(&(doc.project.clone(), doc.number))
+            .map_or(&[][..], Vec::as_slice);
+        let mut request_questions = questions.clone();
+        for (i, citation) in citations.iter().enumerate() {
+            request_questions.insert(
+                could_be_cheaper_key(i),
+                could_be_cheaper_question(&citation.raw),
+            );
+        }
         let request = SystemOneRequest {
             state: serde_json::Value::String(state),
             model: opts.model.clone(),
-            questions: questions.clone(),
+            questions: request_questions,
         };
         let outcome = match jev.system_one(&request).await {
             Err(err) if is_auth_failure(&err) => {
@@ -366,7 +412,8 @@ pub async fn run_route(
                     Ok(stages) => RouteOutcome::Routed {
                         class: issue_class(&stages, tiers),
                         close_calls: close_calls(&stages, opts.close_call),
-                        stages,
+                        depends_on: dependency_entries(&item_ref, citations, &response.answers),
+                        stages: Box::new(stages),
                     },
                     Err(err) => failed(&item_ref, &err.context("Unexpected Jev answer")),
                 }
@@ -480,11 +527,66 @@ fn close_calls(stages: &StageAnswers, threshold: f64) -> Vec<Stage> {
         .collect()
 }
 
+/// The request key for the `i`th open citation's `could_be_cheaper` question.
+fn could_be_cheaper_key(i: usize) -> String {
+    format!("could_be_cheaper_{i}")
+}
+
+/// Builds the `could_be_cheaper` question for one open citation (#1812).
+/// Design-stage only for v1 — the exact wording validated live against
+/// `jev-1.13.0`, 2026-09-20; see docs/jev.md for the evidence. Do not reword
+/// without re-validating (pinned by
+/// `could_be_cheaper_question_is_the_tested_wording`).
+fn could_be_cheaper_question(citation: &str) -> Question {
+    Question::Noul {
+        instructions: format!(
+            "This issue cites {citation}, which is still open. If {citation} is resolved, how \
+             likely is it that LESS design work would remain for THIS issue than the current \
+             text implies — as opposed to this issue's own remaining work being unaffected, \
+             because it is already scoped separately, is a parallel/sibling effort, or \
+             {citation} is otherwise not a precondition for finishing this issue's own \
+             remaining work?"
+        ),
+        criteria: None,
+    }
+}
+
+/// Builds `depends_on` from `citations` and the Jev response that answered
+/// one `could_be_cheaper` question per citation.
+///
+/// A missing or malformed answer for one citation drops just that
+/// dependency — logged, not failed — since `could_be_cheaper` is additive on
+/// top of a routing result ([`stage_answers`]) that already succeeded.
+fn dependency_entries(
+    item_ref: &str,
+    citations: &[Citation],
+    answers: &BTreeMap<String, Answer>,
+) -> Vec<DependencyEntry> {
+    citations
+        .iter()
+        .enumerate()
+        .filter_map(|(i, citation)| {
+            if let Some(Answer::Noul { noul }) = answers.get(&could_be_cheaper_key(i)) {
+                return Some(DependencyEntry {
+                    item_ref: citation.raw.clone(),
+                    state: ItemState::Open,
+                    could_be_cheaper: BTreeMap::from([("design".to_string(), *noul)]),
+                });
+            }
+            warn!(
+                "Issue {item_ref}: no could_be_cheaper answer for citation {:?}",
+                citation.raw
+            );
+            None
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::provider::{Comment, GitProvider, ItemKind};
+    use crate::provider::{Comment, GitProvider, ItemKind, ItemRef};
 
     fn doc(number: u64, state: ItemState) -> IssueDoc {
         IssueDoc {
@@ -798,6 +900,65 @@ mod tests {
     }
 
     #[test]
+    fn could_be_cheaper_key_is_stable_and_indexed() {
+        assert_eq!(could_be_cheaper_key(0), "could_be_cheaper_0");
+        assert_eq!(could_be_cheaper_key(1), "could_be_cheaper_1");
+    }
+
+    #[test]
+    fn could_be_cheaper_question_is_the_tested_wording() {
+        let Question::Noul {
+            instructions,
+            criteria,
+        } = could_be_cheaper_question("#1129")
+        else {
+            panic!("expected a noul question");
+        };
+        assert_eq!(
+            instructions,
+            "This issue cites #1129, which is still open. If #1129 is resolved, how likely is \
+             it that LESS design work would remain for THIS issue than the current text \
+             implies — as opposed to this issue's own remaining work being unaffected, because \
+             it is already scoped separately, is a parallel/sibling effort, or #1129 is \
+             otherwise not a precondition for finishing this issue's own remaining work?"
+        );
+        assert!(criteria.is_none());
+    }
+
+    #[test]
+    fn dependency_entries_reads_the_noul_answer_per_citation() {
+        let citations = vec![
+            Citation {
+                item_ref: ItemRef {
+                    provider: GitProvider::GitHub,
+                    project: "rust-works/omni-dev".to_string(),
+                    kind: ItemKind::Issue,
+                    number: 1129,
+                },
+                raw: "#1129".to_string(),
+            },
+            Citation {
+                item_ref: ItemRef {
+                    provider: GitProvider::GitHub,
+                    project: "rust-works/omni-dev".to_string(),
+                    kind: ItemKind::Issue,
+                    number: 1349,
+                },
+                raw: "#1349".to_string(),
+            },
+        ];
+        let answers = BTreeMap::from([(
+            "could_be_cheaper_0".to_string(),
+            Answer::Noul { noul: 0.75 },
+        )]);
+        let deps = dependency_entries("o/r#1", &citations, &answers);
+        assert_eq!(deps.len(), 1, "{deps:?}");
+        assert_eq!(deps[0].item_ref, "#1129");
+        assert_eq!(deps[0].state, ItemState::Open);
+        assert_eq!(deps[0].could_be_cheaper.get("design"), Some(&0.75));
+    }
+
+    #[test]
     fn stage_answers_reject_none_outside_design() {
         let choice = |c: &str| Answer::Choice {
             choice: c.to_string(),
@@ -886,6 +1047,7 @@ mod tests {
             &[doc(7, ItemState::Open), doc(7, ItemState::Open)],
             &default_tiers(),
             &opts(),
+            &OpenDependencies::new(),
         )
         .await
         .unwrap();
@@ -944,6 +1106,7 @@ mod tests {
             &[doc(1, ItemState::Open), doc(2, ItemState::Open)],
             &default_tiers(),
             &opts(),
+            &OpenDependencies::new(),
         )
         .await
         .unwrap();
@@ -971,6 +1134,7 @@ mod tests {
             &[doc(3, ItemState::Open), doc(4, ItemState::Open)],
             &default_tiers(),
             &opts(),
+            &OpenDependencies::new(),
         )
         .await
         .unwrap_err();
@@ -999,6 +1163,7 @@ mod tests {
             &[doc(9, ItemState::Open)],
             &default_tiers(),
             &opts(),
+            &OpenDependencies::new(),
         )
         .await
         .unwrap();
@@ -1007,6 +1172,105 @@ mod tests {
         };
         assert!(error.contains("Unexpected Jev answer"), "{error}");
         assert!(error.contains("not offered"), "{error}");
+    }
+
+    fn citation(raw: &str, number: u64) -> Citation {
+        Citation {
+            item_ref: ItemRef {
+                provider: GitProvider::GitHub,
+                project: "rust-works/omni-dev".to_string(),
+                kind: ItemKind::Issue,
+                number,
+            },
+            raw: raw.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_route_asks_could_be_cheaper_for_each_open_citation() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "jev-1.13.0",
+                    "answers": {
+                        "stage_design": choice_json("opus", 0.2),
+                        "stage_implement": choice_json("sonnet", 0.61),
+                        "stage_review": choice_json("opus", 0.9),
+                        "could_be_cheaper_0": {"type": "noul", "noul": 0.75},
+                    },
+                    "usage": {"input_tokens": 10, "output_tokens": 1}
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = JevClient::new(&server.uri(), "key").unwrap();
+        let dependencies = OpenDependencies::from([(
+            ("rust-works/omni-dev".to_string(), 7),
+            vec![citation("#1129", 1129)],
+        )]);
+
+        let report = run_route(
+            &client,
+            &[doc(7, ItemState::Open)],
+            &default_tiers(),
+            &opts(),
+            &dependencies,
+        )
+        .await
+        .unwrap();
+
+        let RouteOutcome::Routed { depends_on, .. } = &report.issues[0].outcome else {
+            panic!("expected a routed issue: {:?}", report.issues[0]);
+        };
+        assert_eq!(depends_on.len(), 1);
+        assert_eq!(depends_on[0].item_ref, "#1129");
+        assert_eq!(depends_on[0].state, ItemState::Open);
+        assert_eq!(depends_on[0].could_be_cheaper.get("design"), Some(&0.75));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        let keys: Vec<&String> = body["questions"].as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            [
+                "could_be_cheaper_0",
+                "stage_design",
+                "stage_implement",
+                "stage_review"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_route_drops_a_dependency_with_no_could_be_cheaper_answer() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(routed_json()))
+            .mount(&server)
+            .await;
+        let client = JevClient::new(&server.uri(), "key").unwrap();
+        let dependencies = OpenDependencies::from([(
+            ("rust-works/omni-dev".to_string(), 7),
+            vec![citation("#1129", 1129)],
+        )]);
+
+        let report = run_route(
+            &client,
+            &[doc(7, ItemState::Open)],
+            &default_tiers(),
+            &opts(),
+            &dependencies,
+        )
+        .await
+        .unwrap();
+
+        // routed_json() has no could_be_cheaper_0 answer; the issue still
+        // routes, just with no dependencies reported.
+        let RouteOutcome::Routed { depends_on, .. } = &report.issues[0].outcome else {
+            panic!("expected a routed issue: {:?}", report.issues[0]);
+        };
+        assert!(depends_on.is_empty(), "{depends_on:?}");
     }
 
     #[test]
@@ -1018,9 +1282,10 @@ mod tests {
                 url: "u".to_string(),
                 title: "t".to_string(),
                 outcome: RouteOutcome::Routed {
-                    stages: stages("none", "sonnet", "opus"),
+                    stages: Box::new(stages("none", "sonnet", "opus")),
                     class: "sonnet".to_string(),
                     close_calls: vec![],
+                    depends_on: vec![],
                 },
                 truncated: false,
             }],

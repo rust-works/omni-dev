@@ -396,7 +396,8 @@ usually means the spec was mistyped.
 Asks which **model class** should handle each stage of the work on a GitHub
 issue: the **design** (choosing the approach and settling open questions), the
 **implementation** and the **review**. It makes one Jev call per issue, with
-three `choice` questions, and fetches the issues through `gh`.
+three `choice` questions plus one `noul` question per open issue/PR the text
+cites, and fetches the issues through `gh`.
 
 ```bash
 omni-dev ai jev route '#1779' rust-works/omni-dev#1641 -o yaml
@@ -421,6 +422,10 @@ issues:
     review:    {choice: opus,   confidence: 0.41, probabilities: {fable: 0.02, opus: 0.57, sonnet: 0.41}}
   class: fable
   close_calls: []
+  depends_on:
+  - ref: "#1129"
+    state: open
+    could_be_cheaper: {design: 0.75}
 usage: {input_tokens: 1432, output_tokens: 61}
 ```
 
@@ -432,6 +437,19 @@ usage: {input_tokens: 1432, output_tokens: 61}
   (default `0.3`, a working heuristic that has not been validated). Jev is
   noisy on close calls: identical inputs changed the design answer in 2 of 19
   cases, so treat a flagged stage as a judgement call, not an answer.
+- **`depends_on`** lists every issue or pull request the text cites (via the
+  same citation regex `verify-decision` uses, see below) that is still
+  **open**; a closed citation is settled and is not reported. `ref` is the
+  citation exactly as written (`"#1129"`, `"PR #1629"`, `"owner/repo#42"`),
+  not a reconstructed `owner/repo#N`. `could_be_cheaper.design` is the
+  probability, from one extra `noul` Jev call per open citation, that
+  resolving it would leave **less design work** remaining than the text
+  implies — as opposed to this issue's own remaining work being unaffected
+  (already scoped separately, a parallel/sibling effort, or not a
+  precondition). Only the `design` stage is asked for v1; `implement` is
+  deferred pending the same kind of validation `design` got (see
+  [#1812](https://github.com/rust-works/omni-dev/issues/1812)). There is no
+  suppression threshold: every open citation gets a score, unfiltered.
 - **`truncated: true`** appears when the issue was longer than
   `--max-input-chars` (default 60,000 characters). The first and last halves
   are kept, with a visible `[... truncated]` marker between them, and a
@@ -479,6 +497,10 @@ and inflated small issues: an issue asking to update two constants was routed
 to the top class once it carried the whole of the issue it referenced. If an
 issue depends on a decision made elsewhere, write the decision into the issue
 as a comment (see below) rather than relying on the reference.
+
+`depends_on` scans this same text for citations — it does not fetch or send
+the cited issue's content, only its open/closed state, so it costs a `gh`
+lookup, not extra tokens in the routing call itself.
 
 ### Closed issues
 
@@ -558,6 +580,22 @@ sends, agreement was 11–12 of 16.
 The sets are small (9, 12 and 16 issues), come from this one repository, and
 the labels are one person's judgement, not ground truth. A newer model behind
 `jev-latest` needs re-checking: note the `model` in the output.
+
+`depends_on`/`could_be_cheaper` come from a separate, smaller round of
+experiments (9 citations total, this repository, `jev-1.13.0`, September
+2026), recorded in
+[#1812](https://github.com/rust-works/omni-dev/issues/1812). Two alternatives
+were tried and dropped: a classification-*range* idea (no evidence it added
+anything once `could_be_cheaper` exists per citation) and plain
+deletion-ablation as the bearing signal (confounded whenever a citation rides
+along with independent decision content — a citation to an already-closed
+issue produced the *largest* measured shift of the set, because the sentence
+also independently disposed of a separate open item). The self-report
+question tracked a more expensive resolved-simulation check in all 4
+validation cases and matched the author's own reading throughout, but there
+has been no **forward** validation: no case yet where an open citation
+actually resolved and `could_be_cheaper`'s prediction was checked against
+what really happened. Treat the score as informative, not calibrated.
 
 ## verify-decision
 
