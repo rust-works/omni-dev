@@ -849,22 +849,39 @@ pub struct UpdateDimensionPropertiesRequest {
 }
 
 /// One literal value a [`BooleanCondition`] compares against.
+///
+/// Sheets models this as a union: exactly one of `userEnteredValue` (a
+/// literal string, parsed against the cell's type at evaluation time) or
+/// `relativeDate` (one of Sheets' `RelativeDate` enum strings, used by the
+/// date conditions' relative forms) is ever present.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConditionValue {
-    /// The literal, always sent/read as a string (Sheets parses it against
-    /// the cell's type at evaluation time).
-    #[serde(default, rename = "userEnteredValue")]
-    pub user_entered_value: String,
+    /// A literal value, present unless `relative_date` is.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "userEnteredValue"
+    )]
+    pub user_entered_value: Option<String>,
+    /// A `RelativeDate` enum string (`"TODAY"`, `"PAST_WEEK"`, …), present
+    /// unless `user_entered_value` is.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "relativeDate"
+    )]
+    pub relative_date: Option<String>,
 }
 
 /// A data validation rule's condition — `DataValidationRule.condition`.
 ///
 /// Only the handful of `type`s `validation.rs` builds are ever constructed
-/// here (`ONE_OF_LIST`, `NUMBER_BETWEEN`, `BOOLEAN`, `CUSTOM_FORMULA`), but
-/// the type itself is a plain string so a rule this crate didn't create
-/// (read back via `list-protections`' wider fields mask, or a workbook
-/// edited outside this tool) still round-trips rather than failing to
-/// parse.
+/// here (`ONE_OF_LIST`, `ONE_OF_RANGE`, `NUMBER_BETWEEN`/`NUMBER_NOT_BETWEEN`,
+/// the numeric comparators, `TEXT_*`, `DATE_*`, `BLANK`/`NOT_BLANK`,
+/// `BOOLEAN`, `CUSTOM_FORMULA`), but the type itself is a plain string so a
+/// rule this crate didn't create (read back via `list-protections`' wider
+/// fields mask, or a workbook edited outside this tool) still round-trips
+/// rather than failing to parse.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BooleanCondition {
     /// Sheets' condition type string.

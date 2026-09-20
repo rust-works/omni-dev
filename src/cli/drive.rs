@@ -1123,13 +1123,32 @@ mod tests {
         let _dir = guard.clear_credentials();
 
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
-            command: sheets::SheetsSubcommands::SetDataValidation(
+            command: sheets::SheetsSubcommands::SetDataValidation(Box::new(
                 sheets::validation::SetDataValidationCommand {
                     spreadsheet_id: "sheet-1".to_string(),
                     range: Some("A1:A10".to_string()),
                     sheet: None,
                     one_of_list: Some(vec!["yes".to_string(), "no".to_string()]),
+                    one_of_range: None,
                     number_between: None,
+                    number_not_between: None,
+                    number_greater: None,
+                    number_greater_eq: None,
+                    number_less: None,
+                    number_less_eq: None,
+                    number_eq: None,
+                    number_not_eq: None,
+                    text_contains: None,
+                    text_not_contains: None,
+                    text_starts_with: None,
+                    text_ends_with: None,
+                    text_eq: None,
+                    date_after: None,
+                    date_before: None,
+                    date_on: None,
+                    date_between: None,
+                    blank: false,
+                    not_blank: false,
                     checkbox: false,
                     custom_formula: None,
                     input_message: Some("Pick one".to_string()),
@@ -1138,7 +1157,7 @@ mod tests {
                     lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
                     output: OutputFormat::Table,
                 },
-            ),
+            )),
         });
         assert!(cmd.dispatch(&dead_client()).await.is_ok());
     }

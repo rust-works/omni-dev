@@ -4951,24 +4951,43 @@ omni-dev drive sheets set-data-validation - Sets a data validation rule on a ran
 
 Sets a data validation rule on a range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
 
-Usage: set-data-validation [OPTIONS] <--one-of-list <A,B,C>|--number-between <MIN> <MAX>|--checkbox|--custom-formula <FORMULA>> <SPREADSHEET_ID>
+Usage: set-data-validation [OPTIONS] <--one-of-list <A,B,C>|--one-of-range <A1_RANGE>|--number-between <MIN> <MAX>|--number-not-between <MIN> <MAX>|--number-greater <N>|--number-greater-eq <N>|--number-less <N>|--number-less-eq <N>|--number-eq <N>|--number-not-eq <N>|--text-contains <TEXT>|--text-not-contains <TEXT>|--text-starts-with <TEXT>|--text-ends-with <TEXT>|--text-eq <TEXT>|--date-after <DATE>|--date-before <DATE>|--date-on <DATE>|--date-between <START> <END>|--blank|--not-blank|--checkbox|--custom-formula <FORMULA>> <SPREADSHEET_ID>
 
 Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
 
 Options:
-      --range <A1>                  A1 range to validate, optionally carrying its own `Sheet!` prefix
-      --sheet <NAME>                Sheet (tab) title. Supplies the prefix for a bare `--range`
-      --one-of-list <A,B,C>         Restrict entries to this comma-separated list (renders as a dropdown)
-      --number-between <MIN> <MAX>  Restrict entries to a number in this inclusive range
-      --checkbox                    Restrict entries to `TRUE`/`FALSE`, rendered as a checkbox
-      --custom-formula <FORMULA>    Restrict entries to ones for which this formula evaluates truthy
-      --input-message <TEXT>        Tooltip text shown on the cell
-      --show-warning                Allow an invalid entry through with a warning, instead of rejecting it outright
-      --dry-run                     Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
-      --lease <TOKEN>               The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
-  -o, --output <OUTPUT>             Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
-  -h, --help                        Print help (see more with '--help')
+      --range <A1>                      A1 range to validate, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>                    Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --one-of-list <A,B,C>             Restrict entries to this comma-separated list (renders as a dropdown)
+      --one-of-range <A1_RANGE>         Restrict entries to a dropdown sourced from this range
+      --number-between <MIN> <MAX>      Restrict entries to a number in this inclusive range
+      --number-not-between <MIN> <MAX>  Restrict entries to a number outside this inclusive range
+      --number-greater <N>              Restrict entries to a number strictly greater than this
+      --number-greater-eq <N>           Restrict entries to a number greater than or equal to this
+      --number-less <N>                 Restrict entries to a number strictly less than this
+      --number-less-eq <N>              Restrict entries to a number less than or equal to this
+      --number-eq <N>                   Restrict entries to a number equal to this
+      --number-not-eq <N>               Restrict entries to a number not equal to this
+      --text-contains <TEXT>            Restrict entries to text containing this substring
+      --text-not-contains <TEXT>        Restrict entries to text not containing this substring
+      --text-starts-with <TEXT>         Restrict entries to text starting with this substring
+      --text-ends-with <TEXT>           Restrict entries to text ending with this substring
+      --text-eq <TEXT>                  Restrict entries to text equal to this
+      --date-after <DATE>               Restrict entries to a date after this one. Accepts an absolute date or a relative keyword (`today`, `tomorrow`, `yesterday`, `past-week`, `past-month`, `past-year`)
+      --date-before <DATE>              Restrict entries to a date before this one. Accepts an absolute date or a relative keyword (see `--date-after`)
+      --date-on <DATE>                  Restrict entries to a date equal to this one. Accepts an absolute date or a relative keyword (see `--date-after`)
+      --date-between <START> <END>      Restrict entries to a date in this inclusive range (absolute dates only; relative keywords are not accepted here)
+      --blank                           Restrict entries to an empty cell
+      --not-blank                       Restrict entries to a non-empty cell
+      --checkbox                        Restrict entries to `TRUE`/`FALSE`, rendered as a checkbox
+      --custom-formula <FORMULA>        Restrict entries to ones for which this formula evaluates truthy
+      --input-message <TEXT>            Tooltip text shown on the cell
+      --show-warning                    Allow an invalid entry through with a warning, instead of rejecting it outright
+      --dry-run                         Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>                   The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>                 Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                            Print help (see more with '--help')
 
 
 ================================================================================

@@ -117,7 +117,12 @@ pub enum SheetsSubcommands {
     UpdateDimensionProperties(format::UpdateDimensionPropertiesCommand),
     /// Sets a data validation rule on a range. Gated by the folder
     /// write-permission rules' `sheets-structure` operation (issue #1643).
-    SetDataValidation(validation::SetDataValidationCommand),
+    ///
+    /// Boxed (#1792): tranche 2's ~19 extra condition flags pushed this
+    /// variant far past every sibling's size, which `clippy::large_enum_variant`
+    /// flags transitively up through `SheetsSubcommands`/`DriveSubcommands`/
+    /// `Commands`.
+    SetDataValidation(Box<validation::SetDataValidationCommand>),
     /// Removes a range's data validation rule. Gated by the folder
     /// write-permission rules' `sheets-structure` operation (issue #1643).
     ClearDataValidation(validation::ClearDataValidationCommand),
