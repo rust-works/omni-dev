@@ -197,7 +197,10 @@ pub enum DimensionArg {
 }
 
 impl DimensionArg {
-    const fn engine(self) -> Dimension {
+    /// `pub(crate)`, not private: `developer_metadata.rs`'s CLI leaf also
+    /// converts a `--dimension` flag this way, reusing this mirror rather
+    /// than duplicating a second `DimensionArg`-alike (issue #1795).
+    pub(crate) const fn engine(self) -> Dimension {
         match self {
             Self::Rows => Dimension::Rows,
             Self::Columns => Dimension::Columns,
