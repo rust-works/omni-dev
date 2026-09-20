@@ -621,17 +621,17 @@ scope would technically permit.
 **Default policy** — what applies when no configured rule names an
 operation anywhere in a target's ancestor chain:
 
-| Operation           | Default | Granted to                                                                                                                                                                                                                                                                                                                                                           |
-|---------------------|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `read`              | allow   | `search`, `read`, `dedupe` (not yet enforced)                                                                                                                                                                                                                                                                                                                        |
-| `create`            | deny    | `create`, `sheets create`                                                                                                                                                                                                                                                                                                                                            |
-| `upload`            | deny    | `upload`                                                                                                                                                                                                                                                                                                                                                             |
-| `edit`              | deny    | `edit` — raw file content only                                                                                                                                                                                                                                                                                                                                       |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values                                                                                                                                                                                                                                                                                                        |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata` |
-| `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`                                                                                                                                                                                                                                                                                               |
-| `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range`                                                                                                                                                                                                                                                                                                       |
-| `docs-write`        | deny    | `docs replace`, `docs append`                                                                                                                                                                                                                                                                                                                                        |
+| Operation           | Default | Granted to                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+|---------------------|---------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `read`              | allow   | `search`, `read`, `dedupe` (not yet enforced)                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `create`            | deny    | `create`, `sheets create`                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `upload`            | deny    | `upload`                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `edit`              | deny    | `edit` — raw file content only                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view` |
+| `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range`                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `docs-write`        | deny    | `docs replace`, `docs append`                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 There is no "enabled: true" flag — an absent or empty rule list already
 means "deny every write everywhere," via this table alone, which *is* the
@@ -1033,8 +1033,10 @@ content-mutating write verb: `drive edit`; `drive sheets`
 `show-sheet`, `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range`,
 `format-cells`/`merge-cells`/`unmerge-cells`/`update-borders`/
 `update-dimension-properties`/`auto-resize-columns`,
-`set-data-validation`/`clear-data-validation`, and
-`protect-range`/`update-protection`/`unprotect-range`; and `drive docs
+`set-data-validation`/`clear-data-validation`,
+`protect-range`/`update-protection`/`unprotect-range`, and
+`set-basic-filter`/`clear-basic-filter`/`add-filter-view`/
+`update-filter-view`/`delete-filter-view`; and `drive docs
 replace`/`append`. `--dry-run` never needs one on any of them.
 
 **The backup fidelity splits by file type** ([ADR-0080](adrs/adr-0080.md)
@@ -2076,6 +2078,48 @@ current editors before sending it.
 count rather than returning part of it — silently returning half a workbook is
 indistinguishable from a workbook that small. Narrow the read with `--sheet` or
 `--range` if you hit it.
+
+#### drive sheets set-basic-filter / clear-basic-filter / add-filter-view / update-filter-view / delete-filter-view / list-filter-views
+
+The basic filter and filter views (issue #1794), gated by
+`sheets-structure` like formatting and data validation — see
+[ADR-0081](adrs/adr-0081.md): a filter hides rows, which is view state, not
+data. The two are shaped differently: a sheet has **at most one** basic
+filter, so `set-basic-filter` is an upsert and `clear-basic-filter` needs
+only `--sheet`. Filter views are **many, named and id-addressed** —
+`list-filter-views` is how you discover a view's numeric id, the same way
+`list-protections` is for protected ranges.
+
+```bash
+# The basic filter — one per sheet.
+omni-dev drive sheets set-basic-filter <ID> --sheet Q2 --range A1:D100 \
+  --sort-by 0:asc --hide-values 1:Discontinued,Returned
+omni-dev drive sheets clear-basic-filter <ID> --sheet Q2
+
+# Filter views — many per sheet, addressed by id.
+omni-dev drive sheets add-filter-view <ID> --sheet Q2 --range A1:D100 \
+  --title 'Open only' --hide-values 2:Closed
+omni-dev drive sheets list-filter-views <ID>
+omni-dev drive sheets update-filter-view <ID> --filter-view-id 3 \
+  --hide-values 2:Closed,Cancelled
+omni-dev drive sheets delete-filter-view <ID> --filter-view-id 3
+```
+
+`--sort-by`/`--hide-values` take `COLUMN:...` pairs, where `COLUMN` is a
+0-based column index (not an A1 letter) — the same indexing the underlying
+API uses. `update-filter-view`'s `--sort-by`/`--hide-values` **merge** onto
+the view's existing sort order and criteria: a given column's entry is
+replaced (or appended, for a new sort column), but every other column's
+entry survives untouched. This matters because Sheets' own `fields` mask
+would otherwise replace `sortSpecs`/`criteria` wholesale — `--clear-sort`/
+`--clear-criteria` reset to empty first, if that whole-replacement behavior
+is actually what you want.
+
+**Two things this issue does not cover.** `duplicateFilterView` has no CLI
+verb — the issue's own proposed scope omits it, though the API supports it.
+And `FilterCriteria` support is `hiddenValues` only: filtering by a boolean
+condition (the same vocabulary `set-data-validation` curates) isn't
+exposed. Both are documented cuts, not silent gaps.
 
 ## Docs
 

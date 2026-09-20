@@ -36,6 +36,17 @@ const SPREADSHEET_FIELDS_WITH_PROTECTIONS: &str = "spreadsheetId,properties.titl
     sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
     sheets.protectedRanges(protectedRangeId,range,description,warningOnly,editors.users)";
 
+/// `fields` mask for `spreadsheets.get` when the basic filter and filter
+/// views are needed too (issue #1794's `set-basic-filter`/
+/// `list-filter-views`/`update-filter-view`/`delete-filter-view`, which must
+/// resolve an *existing* filter view before they can act on one). A
+/// superset of [`SPREADSHEET_FIELDS`], kept separate for the same reason
+/// [`SPREADSHEET_FIELDS_WITH_PROTECTIONS`] is.
+const SPREADSHEET_FIELDS_WITH_FILTER_VIEWS: &str = "spreadsheetId,properties.title,\
+    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.basicFilter(range,sortSpecs,criteria),\
+    sheets.filterViews(filterViewId,title,range,sortSpecs,criteria)";
+
 /// Maximum ranges sent in a single `values.batchGet`.
 ///
 /// Each range is a percent-encoded, quoted sheet title in the query string,
@@ -149,6 +160,24 @@ impl<'a> SheetsApi<'a> {
             .get_parsed(
                 url.as_str(),
                 "Failed to parse Sheets spreadsheet metadata (with protections)",
+            )
+            .await
+    }
+
+    /// Fetches a spreadsheet's metadata **including the basic filter and
+    /// filter views** — the one read `filter.rs`'s verbs need that no other
+    /// caller does. See [`SPREADSHEET_FIELDS_WITH_FILTER_VIEWS`].
+    pub async fn get_spreadsheet_with_filter_views(
+        &self,
+        spreadsheet_id: &str,
+    ) -> Result<Spreadsheet> {
+        let url =
+            build_spreadsheet_get_with_filter_views_url(self.client.base_url(), spreadsheet_id)?;
+        self.client
+            .transport()
+            .get_parsed(
+                url.as_str(),
+                "Failed to parse Sheets spreadsheet metadata (with filter views)",
             )
             .await
     }
@@ -361,6 +390,18 @@ fn build_spreadsheet_get_with_protections_url(base_url: &str, spreadsheet_id: &s
     GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
     url.query_pairs_mut()
         .append_pair("fields", SPREADSHEET_FIELDS_WITH_PROTECTIONS);
+    Ok(url)
+}
+
+fn build_spreadsheet_get_with_filter_views_url(
+    base_url: &str,
+    spreadsheet_id: &str,
+) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
+    url.query_pairs_mut()
+        .append_pair("fields", SPREADSHEET_FIELDS_WITH_FILTER_VIEWS);
     Ok(url)
 }
 

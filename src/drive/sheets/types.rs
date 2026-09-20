@@ -15,6 +15,8 @@
 //!   row 2 only 2. Renderers must decide explicitly what to do about that
 //!   rather than assuming a rectangle.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// A spreadsheet's metadata, from `spreadsheets.get`.
@@ -108,6 +110,22 @@ pub struct Sheet {
         rename = "protectedRanges"
     )]
     pub protected_ranges: Vec<ProtectedRange>,
+    /// This sheet's basic filter, if it has one. Empty unless the caller
+    /// requested it with a wider `fields` mask — only
+    /// `SheetsApi::get_spreadsheet_with_filter_views` populates it
+    /// (issue #1794).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "basicFilter"
+    )]
+    pub basic_filter: Option<BasicFilter>,
+    /// The named, id-addressed filter views on this sheet. Empty unless the
+    /// caller requested them with a wider `fields` mask — only
+    /// `SheetsApi::get_spreadsheet_with_filter_views` populates it
+    /// (issue #1794).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "filterViews")]
+    pub filter_views: Vec<FilterView>,
 }
 
 impl Sheet {
@@ -380,6 +398,22 @@ pub enum BatchUpdateRequestItem {
     /// §4). `developer_metadata.rs` reads back and reports every entry a
     /// request like this would remove before ever sending it.
     DeleteDeveloperMetadata(DeleteDeveloperMetadataRequest),
+    /// Upsert a sheet's basic filter (`set-basic-filter`). Gated by
+    /// `SheetsStructure` (issue #1794, ADR-0081): a filter hides rows,
+    /// which is view state, not data.
+    SetBasicFilter(SetBasicFilterRequest),
+    /// Remove a sheet's basic filter (`clear-basic-filter`). Same gate as
+    /// [`Self::SetBasicFilter`].
+    ClearBasicFilter(ClearBasicFilterRequest),
+    /// Add a named filter view (`add-filter-view`). Same gate as
+    /// [`Self::SetBasicFilter`].
+    AddFilterView(AddFilterViewRequest),
+    /// Change an existing filter view's title, range, sort order, or hidden
+    /// values (`update-filter-view`). Same gate as [`Self::SetBasicFilter`].
+    UpdateFilterView(UpdateFilterViewRequest),
+    /// Remove a filter view (`delete-filter-view`). Same gate as
+    /// [`Self::SetBasicFilter`].
+    DeleteFilterView(DeleteFilterViewRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -1044,6 +1078,153 @@ pub struct DeleteProtectedRangeRequest {
     pub protected_range_id: i64,
 }
 
+/// One column's filter criteria within a [`BasicFilter`] or [`FilterView`]
+/// (issue #1794).
+///
+/// **`hiddenValues` only** — the literal "uncheck a value in the dropdown"
+/// filter, which is by far the most common real use. Sheets' full
+/// `FilterCriteria` also supports a `condition` field carrying the same
+/// `BooleanCondition` vocabulary `validation.rs` curates for data
+/// validation; that is a documented cut for this issue, not a silent gap —
+/// see `filter.rs`'s module docs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FilterCriteria {
+    /// Values to hide in this column.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "hiddenValues"
+    )]
+    pub hidden_values: Vec<String>,
+}
+
+/// Sort direction within a [`SortSpec`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SortOrder {
+    /// Low to high.
+    Ascending,
+    /// High to low.
+    Descending,
+}
+
+/// One column's sort order within a [`BasicFilter`] or [`FilterView`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SortSpec {
+    /// The 0-based column index within the sheet — absolute, not relative
+    /// to the filter's own range.
+    #[serde(rename = "dimensionIndex")]
+    pub dimension_index: i64,
+    /// The direction to sort that column.
+    #[serde(rename = "sortOrder")]
+    pub sort_order: SortOrder,
+}
+
+/// A sheet's basic filter.
+///
+/// As `setBasicFilter` builds one and `spreadsheets.get` (with the wider
+/// filter-views `fields` mask) reads one back. A sheet has at most one, so
+/// `set-basic-filter` is an upsert and `clear-basic-filter` needs only a
+/// `sheetId` (see [`ClearBasicFilterRequest`]) — issue #1794.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BasicFilter {
+    /// The filtered range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<GridRange>,
+    /// Sort order applied on top of the filter, in priority order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "sortSpecs")]
+    pub sort_specs: Vec<SortSpec>,
+    /// Per-column criteria, keyed by the 0-based column index as a string
+    /// (the wire format's own map key shape). `BTreeMap`, not `HashMap`, so
+    /// serialization is deterministic.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub criteria: BTreeMap<String, FilterCriteria>,
+}
+
+/// `SetBasicFilterRequest` — upserts the sheet's basic filter, replacing any
+/// existing one wholesale (issue #1794).
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct SetBasicFilterRequest {
+    /// The filter to set. `range.sheet_id` selects the target sheet.
+    pub filter: BasicFilter,
+}
+
+/// `ClearBasicFilterRequest` — a basic filter needs no identifier beyond the
+/// sheet, since a sheet has at most one (issue #1794).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct ClearBasicFilterRequest {
+    /// The sheet to clear the basic filter from.
+    #[serde(rename = "sheetId")]
+    pub sheet_id: i64,
+}
+
+/// A named, id-addressed filter view.
+///
+/// As `addFilterView`/`updateFilterView` build one and `spreadsheets.get`
+/// (with the wider filter-views `fields` mask) reads one back (issue
+/// #1794). Unlike the basic filter, a sheet may have many;
+/// `filter_view_id` is the stable handle `list-filter-views` discovers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FilterView {
+    /// The server-assigned stable id. Absent on an `add-filter-view`
+    /// request this crate is building; always present on one read back or
+    /// on an `update-filter-view`/`delete-filter-view` request.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "filterViewId"
+    )]
+    pub filter_view_id: Option<i64>,
+    /// A human-readable name for the view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The filtered range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<GridRange>,
+    /// Sort order applied on top of the filter, in priority order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "sortSpecs")]
+    pub sort_specs: Vec<SortSpec>,
+    /// Per-column criteria, keyed by the 0-based column index as a string.
+    /// See [`BasicFilter::criteria`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub criteria: BTreeMap<String, FilterCriteria>,
+}
+
+/// `AddFilterViewRequest`.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct AddFilterViewRequest {
+    /// The view to create. `filter_view_id` is left unset — the server
+    /// assigns it, only knowable from the reply.
+    pub filter: FilterView,
+}
+
+/// `UpdateFilterViewRequest`.
+///
+/// Reuses [`FilterView`] itself, unlike `update-protection`'s
+/// `ProtectedRangeUpdate` split: every field here (`title`/`range`/
+/// `sortSpecs`/`criteria`) is independently updatable, and `filter_view_id`
+/// must be set to select the target, so there is no "response-only field a
+/// caller could accidentally overwrite" hazard to guard against.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct UpdateFilterViewRequest {
+    /// The properties to write. `filter_view_id` selects the target.
+    pub filter: FilterView,
+    /// The field mask limiting what this request may change. Sheets
+    /// replaces `sortSpecs`/`criteria` wholesale when named, never merging
+    /// per-entry — `filter.rs` computes the full resulting state
+    /// client-side before sending, the same way `protection.rs` does for
+    /// `editors`.
+    pub fields: String,
+}
+
+/// `DeleteFilterViewRequest`.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct DeleteFilterViewRequest {
+    /// Which filter view to remove.
+    #[serde(rename = "filterId")]
+    pub filter_id: i64,
+}
+
 /// `InsertDimensionRequest`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct InsertDimensionRequest {
@@ -1138,6 +1319,11 @@ pub struct BatchUpdateReply {
     /// server-assigned `protectedRangeId`, only knowable from the reply.
     #[serde(default, rename = "addProtectedRange")]
     pub add_protected_range: Option<AddProtectedRangeReply>,
+    /// Present only for an `addFilterView` request — carries the
+    /// server-assigned `filterViewId`, only knowable from the reply
+    /// (issue #1794).
+    #[serde(default, rename = "addFilterView")]
+    pub add_filter_view: Option<AddFilterViewReply>,
 }
 
 /// The `addProtectedRange` arm of a [`BatchUpdateReply`].
@@ -1146,6 +1332,14 @@ pub struct AddProtectedRangeReply {
     /// The created protection, including its assigned `protectedRangeId`.
     #[serde(default, rename = "protectedRange")]
     pub protected_range: Option<ProtectedRange>,
+}
+
+/// The `addFilterView` arm of a [`BatchUpdateReply`] (issue #1794).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct AddFilterViewReply {
+    /// The created view, including its assigned `filterViewId`.
+    #[serde(default)]
+    pub filter: Option<FilterView>,
 }
 
 /// The `addSheet`/`duplicateSheet` arm of a [`BatchUpdateReply`].

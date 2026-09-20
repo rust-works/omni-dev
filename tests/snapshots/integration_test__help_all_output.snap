@@ -4472,10 +4472,39 @@ Commands:
   update-protection            Changes an existing protected range's description, warning-only flag, or editor list. Gated by the folder write-permission rules' `sheets-protection` operation (issue #1643)
   unprotect-range              Removes a protected range. Gated by the folder write-permission rules' `sheets-protection` operation (issue #1643)
   list-protections             Lists the protected ranges in a spreadsheet. Read-only and ungated, like `sheets info` (issue #1643)
+  set-basic-filter             Sets (upserting any existing one) the basic filter on a sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+  clear-basic-filter           Removes a sheet's basic filter. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+  add-filter-view              Adds a named filter view. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+  update-filter-view           Changes an existing filter view's title, range, sort order, or hidden values. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+  delete-filter-view           Removes a filter view. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+  list-filter-views            Lists the filter views in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1794)
   help                         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev drive sheets add-filter-view - Adds a named filter view. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+
+Adds a named filter view. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+
+Usage: add-filter-view [OPTIONS] --sheet <NAME> --range <A1> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>                 Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --range <A1>                   A1 range to filter, optionally carrying its own `Sheet!` prefix
+      --title <TEXT>                 A human-readable name for the view
+      --sort-by <COLUMN:asc|desc>    A `COLUMN:asc|desc` sort spec, in priority order. Repeatable
+      --hide-values <COLUMN:VALUES>  A `COLUMN:VALUE[,VALUE...]` hidden-value criterion, one per column. Repeatable
+      --dry-run                      Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>                The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>              Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                         Print help (see more with '--help')
 
 
 ================================================================================
@@ -4567,6 +4596,25 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets clear-basic-filter - Removes a sheet's basic filter. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+
+Removes a sheet's basic filter. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+
+Usage: clear-basic-filter [OPTIONS] --sheet <NAME> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Sheet (tab) title
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets clear-data-validation - Removes a range's data validation rule. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
 
 Removes a range's data validation rule. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
@@ -4646,6 +4694,25 @@ Options:
       --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets delete-filter-view - Removes a filter view. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+
+Removes a filter view. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+
+Usage: delete-filter-view [OPTIONS] --filter-view-id <ID> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --filter-view-id <ID>  Which filter view to remove
+      --dry-run              Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>        The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>      Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                 Print help (see more with '--help')
 
 
 ================================================================================
@@ -4853,6 +4920,22 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets list-filter-views - Lists the filter views in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1794)
+
+Lists the filter views in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1794)
+
+Usage: list-filter-views [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets list-protections - Lists the protected ranges in a spreadsheet. Read-only and ungated, like `sheets info` (issue #1643)
 
 Lists the protected ranges in a spreadsheet. Read-only and ungated, like `sheets info` (issue #1643)
@@ -4990,6 +5073,28 @@ Options:
       --end <N>                1-based last row/column, inclusive
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets set-basic-filter - Sets (upserting any existing one) the basic filter on a sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+
+Sets (upserting any existing one) the basic filter on a sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+
+Usage: set-basic-filter [OPTIONS] --sheet <NAME> --range <A1> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>                 Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --range <A1>                   A1 range to filter, optionally carrying its own `Sheet!` prefix
+      --sort-by <COLUMN:asc|desc>    A `COLUMN:asc|desc` sort spec, in priority order. Repeatable
+      --hide-values <COLUMN:VALUES>  A `COLUMN:VALUE[,VALUE...]` hidden-value criterion, one per column. Repeatable
+      --dry-run                      Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>                The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>              Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                         Print help (see more with '--help')
 
 
 ================================================================================
@@ -5171,6 +5276,32 @@ Options:
       --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets update-filter-view - Changes an existing filter view's title, range, sort order, or hidden values. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+
+Changes an existing filter view's title, range, sort order, or hidden values. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
+
+Usage: update-filter-view [OPTIONS] --filter-view-id <ID> <--title <TEXT>|--range <A1>|--sort-by <COLUMN:asc|desc>|--hide-values <COLUMN:VALUES>|--clear-sort|--clear-criteria> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --filter-view-id <ID>          Which filter view to change
+      --sheet <NAME>                 Sheet (tab) title, when changing the filtered range. Supplies the prefix for a bare `--range`
+      --range <A1>                   The new A1 range, when changing it, optionally carrying its own `Sheet!` prefix
+      --title <TEXT>                 The new title, when changing it
+      --sort-by <COLUMN:asc|desc>    A `COLUMN:asc|desc` sort spec to merge in, replacing any existing entry for that column (else appending). Repeatable
+      --hide-values <COLUMN:VALUES>  A `COLUMN:VALUE[,VALUE...]` hidden-value criterion to merge in, replacing any existing entry for that column. Repeatable
+      --clear-sort                   Reset the sort order to empty before applying `--sort-by`
+      --clear-criteria               Reset the criteria to empty before applying `--hide-values`
+      --dry-run                      Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>                The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>              Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                         Print help (see more with '--help')
 
 
 ================================================================================

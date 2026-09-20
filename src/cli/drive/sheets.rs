@@ -2,7 +2,8 @@
 //! *cells* of a Google Sheet via the Sheets v4 API (issue #1589), editing
 //! its *structure* via `spreadsheets.batchUpdate` (issue #1613),
 //! *destructively* editing it the same way (issue #1623), and applying
-//! formatting, data validation and protected ranges (issue #1643).
+//! formatting, data validation and protected ranges (issue #1643), and the
+//! basic filter and filter views (issue #1794).
 //!
 //! Nested under `drive` rather than given its own top-level tree so it
 //! inherits `--account` resolution, the `auth` commands and the write-
@@ -11,6 +12,7 @@
 
 pub(crate) mod create;
 pub(crate) mod developer_metadata;
+pub(crate) mod filter;
 pub(crate) mod format;
 pub(crate) mod info;
 pub(crate) mod protection;
@@ -155,6 +157,26 @@ pub enum SheetsSubcommands {
     /// Lists the protected ranges in a spreadsheet. Read-only and ungated,
     /// like `sheets info` (issue #1643).
     ListProtections(protection::ListProtectionsCommand),
+    /// Sets (upserting any existing one) the basic filter on a sheet. Gated
+    /// by the folder write-permission rules' `sheets-structure` operation
+    /// (issue #1794).
+    SetBasicFilter(filter::SetBasicFilterCommand),
+    /// Removes a sheet's basic filter. Gated by the folder write-permission
+    /// rules' `sheets-structure` operation (issue #1794).
+    ClearBasicFilter(filter::ClearBasicFilterCommand),
+    /// Adds a named filter view. Gated by the folder write-permission
+    /// rules' `sheets-structure` operation (issue #1794).
+    AddFilterView(filter::AddFilterViewCommand),
+    /// Changes an existing filter view's title, range, sort order, or
+    /// hidden values. Gated by the folder write-permission rules'
+    /// `sheets-structure` operation (issue #1794).
+    UpdateFilterView(filter::UpdateFilterViewCommand),
+    /// Removes a filter view. Gated by the folder write-permission rules'
+    /// `sheets-structure` operation (issue #1794).
+    DeleteFilterView(filter::DeleteFilterViewCommand),
+    /// Lists the filter views in a spreadsheet. Read-only and ungated, like
+    /// `list-protections` (issue #1794).
+    ListFilterViews(filter::ListFilterViewsCommand),
 }
 
 impl SheetsCommand {
@@ -199,6 +221,12 @@ impl SheetsCommand {
             SheetsSubcommands::UpdateProtection(cmd) => cmd.execute(client).await,
             SheetsSubcommands::UnprotectRange(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ListProtections(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::SetBasicFilter(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::ClearBasicFilter(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::AddFilterView(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::UpdateFilterView(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteFilterView(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::ListFilterViews(cmd) => cmd.execute(client).await,
         }
     }
 }
