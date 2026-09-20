@@ -1346,6 +1346,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_sheets_set_basic_filter() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::SetBasicFilter(
+                sheets::filter::SetBasicFilterCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q1".to_string(),
+                    range: "A1:D10".to_string(),
+                    sort_by: vec!["0:asc".to_string()],
+                    hide_values: vec!["1:Closed".to_string()],
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_clear_basic_filter() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::ClearBasicFilter(
+                sheets::filter::ClearBasicFilterCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q1".to_string(),
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_add_filter_view() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::AddFilterView(
+                sheets::filter::AddFilterViewCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q1".to_string(),
+                    range: "A1:D10".to_string(),
+                    title: Some("Open only".to_string()),
+                    sort_by: Vec::new(),
+                    hide_values: Vec::new(),
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_update_filter_view() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::UpdateFilterView(
+                sheets::filter::UpdateFilterViewCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    filter_view_id: 7,
+                    sheet: None,
+                    range: None,
+                    title: Some("Renamed".to_string()),
+                    sort_by: Vec::new(),
+                    hide_values: Vec::new(),
+                    clear_sort: false,
+                    clear_criteria: false,
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_delete_filter_view() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::DeleteFilterView(
+                sheets::filter::DeleteFilterViewCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    filter_view_id: 7,
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_list_filter_views() {
+        // Read-only and ungated, like `list-protections` — needs the host
+        // redirect so it fails fast against a dead port instead of trying
+        // the real Sheets API.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::ListFilterViews(
+                sheets::filter::ListFilterViewsCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_search() {
         let cmd = DriveSubcommands::Search(search::SearchCommand {
             query: "name contains 'x'".to_string(),

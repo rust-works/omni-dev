@@ -576,4 +576,159 @@ mod tests {
         // the gate through rather than silently allowing.
         assert!(cmd.execute(&client).await.is_ok());
     }
+
+    async fn mount_orphan_sheet(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1", "name": "sheet-1",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": [],
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn set_basic_filter_command_json_output_skips_the_table() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = SetBasicFilterCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: "Q1".to_string(),
+            range: "A1:D10".to_string(),
+            sort_by: Vec::new(),
+            hide_values: Vec::new(),
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Json,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn clear_basic_filter_command_wires_the_gate_through() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = ClearBasicFilterCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: "Q1".to_string(),
+            dry_run: false,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn add_filter_view_command_wires_the_gate_through() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = AddFilterViewCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: "Q1".to_string(),
+            range: "A1:D10".to_string(),
+            title: Some("Open only".to_string()),
+            sort_by: vec!["0:asc".to_string()],
+            hide_values: vec!["1:Closed".to_string()],
+            dry_run: false,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_filter_view_command_wires_the_gate_through() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = UpdateFilterViewCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            filter_view_id: 7,
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:D20".to_string()),
+            title: Some("Renamed".to_string()),
+            sort_by: vec!["0:desc".to_string()],
+            hide_values: vec!["1:Closed".to_string()],
+            clear_sort: true,
+            clear_criteria: true,
+            dry_run: false,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_filter_view_command_wires_the_gate_through() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = DeleteFilterViewCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            filter_view_id: 7,
+            dry_run: false,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_filter_views_json_output_skips_the_table() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1"}}],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListFilterViewsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: crate::cli::drive::format::OutputFormat::Json,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
 }
