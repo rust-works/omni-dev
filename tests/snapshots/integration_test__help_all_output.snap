@@ -4495,6 +4495,9 @@ Commands:
   update-slicer                Changes an existing slicer's range, filter column/criteria, title, or pivot-table linkage. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
   delete-slicer                Removes a slicer, after reporting its spec. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3) — not `sheets-delete`. Cannot be undone through omni-dev
   list-slicers                 Lists the slicers in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1797)
+  add-pivot-table              Writes a new pivot table at an anchor cell. Gated by **both** the folder write-permission rules' `sheets-write` and `sheets-structure` operations (issue #1798, ADR-0081 §5)
+  delete-pivot-table           Clears the pivot table at an anchor cell. Gated by the folder write-permission rules' `sheets-write` operation alone (issue #1798, ADR-0081 §5)
+  list-pivot-tables            Lists the pivot tables in a spreadsheet, by anchor cell. Read-only and ungated, like `list-conditional-formats` (issue #1798)
   help                         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -4633,24 +4636,42 @@ Options:
 
 ================================================================================
 
-omni-dev drive sheets add-named-range - Adds a named range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1796)
+omni-dev drive sheets add-pivot-table - Writes a new pivot table at an anchor cell. Gated by **both** the folder write-permission rules' `sheets-write` and `sheets-structure` operations (issue #1798, ADR-0081 §5)
 
-Adds a named range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1796)
+Writes a new pivot table at an anchor cell. Gated by **both** the folder write-permission rules' `sheets-write` and `sheets-structure` operations (issue #1798, ADR-0081 §5)
 
-Usage: add-named-range [OPTIONS] --name <NAME> <SPREADSHEET_ID>
+Usage: add-pivot-table [OPTIONS] --sheet <NAME> --anchor <A1> --source <[SHEET!]A1_RANGE> --value <COLUMN:FUNC> <SPREADSHEET_ID>
 
 Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
 
 Options:
-      --name <NAME>      The name to create. Must be unique workbook-wide
-      --range <A1>       A1 range the name refers to, optionally carrying its own `Sheet!` prefix. Mutually exclusive with `--whole-sheet`
-      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`, or the target sheet directly with `--whole-sheet`
-      --whole-sheet      Cover the entire sheet named by `--sheet`, rather than a range within it
-      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
-      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
-  -h, --help             Print help (see more with '--help')
+      --sheet <NAME>
+          Sheet (tab) title `--anchor` lives on
+      --anchor <A1>
+          A single-cell A1 reference (no `Sheet!` prefix — `--sheet` supplies it) the pivot table is anchored at
+      --source <[SHEET!]A1_RANGE>
+          The pivot's source range. May carry its own `Sheet!` prefix (a pivot commonly sources from a different tab than it's anchored on); falls back to `--sheet` when it doesn't. Must be a bounded rectangle
+      --row <COLUMN[:asc|desc]>
+          A row grouping, by 0-based column offset into `--source`, optionally followed by a sort order. Repeatable, outermost first
+      --column <COLUMN[:asc|desc]>
+          A column grouping, by 0-based column offset into `--source`, optionally followed by a sort order. Repeatable, outermost first
+      --value <COLUMN:FUNC>
+          An aggregated value column, by 0-based column offset into `--source` and a summarize function (`sum`, `counta`, `count`, `countunique`, `average`, `max`, `min`, `median`, `product`, `stdev`, `stdevp`, `var`, `varp`). Repeatable; at least one is required
+      --filter <COLUMN:VALUE[,VALUE...]>
+          A source-row filter, by 0-based column offset into `--source` and a comma-separated allow-list of raw values. Repeatable
+      --value-layout <VALUE_LAYOUT>
+          Lays values out as columns (the default) or rows [possible values: horizontal, vertical]
+      --no-totals
+          Omits the totals row/column that every group shows by default
+      --dry-run
+          Reports the gate verdict, the pivot configuration, and the anchor's current content, without calling `spreadsheets.batchUpdate`. Cannot report the region the pivot table will actually overwrite — see `docs/drive.md`
+      --lease <TOKEN>
+          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>
+          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help
+          Print help (see more with '--help')
 
 
 ================================================================================
@@ -4931,18 +4952,19 @@ Options:
 
 ================================================================================
 
-omni-dev drive sheets delete-named-range - Removes a named range. Gated by the folder write-permission rules' `sheets-structure` operation — not `sheets-delete`, since a named range is a label, not grid data (issue #1796, ADR-0081 §2). Reports every cell formula that referenced the name before removing it
+omni-dev drive sheets delete-pivot-table - Clears the pivot table at an anchor cell. Gated by the folder write-permission rules' `sheets-write` operation alone (issue #1798, ADR-0081 §5)
 
-Removes a named range. Gated by the folder write-permission rules' `sheets-structure` operation — not `sheets-delete`, since a named range is a label, not grid data (issue #1796, ADR-0081 §2). Reports every cell formula that referenced the name before removing it
+Clears the pivot table at an anchor cell. Gated by the folder write-permission rules' `sheets-write` operation alone (issue #1798, ADR-0081 §5)
 
-Usage: delete-named-range [OPTIONS] --name <NAME> <SPREADSHEET_ID>
+Usage: delete-pivot-table [OPTIONS] --sheet <NAME> --anchor <A1> <SPREADSHEET_ID>
 
 Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
 
 Options:
-      --name <NAME>      The existing name to remove, by case-insensitive exact match
-      --dry-run          Reports the gate verdict and the referencing-formula preview, without calling `spreadsheets.batchUpdate`
+      --sheet <NAME>     Sheet (tab) title `--anchor` lives on
+      --anchor <A1>      A single-cell A1 reference (no `Sheet!` prefix — `--sheet` supplies it) the pivot table is anchored at. See `list-pivot-tables`
+      --dry-run          Reports the gate verdict and the pivot table currently at `--anchor`, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
@@ -5220,11 +5242,11 @@ Options:
 
 ================================================================================
 
-omni-dev drive sheets list-named-ranges - Lists the named ranges in a spreadsheet. Read-only and ungated, like `sheets list-protections` (issue #1796)
+omni-dev drive sheets list-pivot-tables - Lists the pivot tables in a spreadsheet, by anchor cell. Read-only and ungated, like `list-conditional-formats` (issue #1798)
 
-Lists the named ranges in a spreadsheet. Read-only and ungated, like `sheets list-protections` (issue #1796)
+Lists the pivot tables in a spreadsheet, by anchor cell. Read-only and ungated, like `list-conditional-formats` (issue #1798)
 
-Usage: list-named-ranges [OPTIONS] <SPREADSHEET_ID>
+Usage: list-pivot-tables [OPTIONS] <SPREADSHEET_ID>
 
 Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
@@ -5715,29 +5737,6 @@ Options:
       --lease <TOKEN>                The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>              Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                         Print help (see more with '--help')
-
-
-================================================================================
-
-omni-dev drive sheets update-named-range - Changes an existing named range's name and/or the range it covers. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1796)
-
-Changes an existing named range's name and/or the range it covers. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1796)
-
-Usage: update-named-range [OPTIONS] --name <NAME> <SPREADSHEET_ID>
-
-Arguments:
-  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
-
-Options:
-      --name <NAME>      The existing name to change, by case-insensitive exact match
-      --new-name <NAME>  The new name, when renaming
-      --range <A1>       A1 range for the new target, optionally carrying its own `Sheet!` prefix. Mutually exclusive with `--whole-sheet`. Omitting this, `--sheet` and `--whole-sheet` together keeps the existing range unchanged — this command may be a rename only
-      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`, or the target sheet directly with `--whole-sheet`
-      --whole-sheet      Re-point at the entire sheet named by `--sheet`, rather than a range within it
-      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
-      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
-  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================

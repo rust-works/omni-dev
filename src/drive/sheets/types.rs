@@ -167,6 +167,15 @@ pub struct Sheet {
     /// `delete-slicer`; `list-slicers` is how that id is discovered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slicers: Vec<Slicer>,
+    /// Grid data — cell-by-cell, in row-major chunks — read back only when
+    /// the caller asked for it via a `fields` mask naming individual cell
+    /// properties. Empty unless the caller requested a wider mask; only
+    /// [`SheetsApi::get_spreadsheet_with_pivot_tables`](crate::drive::sheets::api::SheetsApi::get_spreadsheet_with_pivot_tables)/
+    /// `SheetsApi::get_cell_pivot` populate it (issue #1798). Chunked
+    /// rather than one flat grid because the API itself returns it that
+    /// way — see [`GridData`]'s doc comment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data: Vec<GridData>,
 }
 
 impl Sheet {
@@ -508,6 +517,19 @@ pub enum BatchUpdateRequestItem {
     /// is why `embedded_object.rs` reads back and reports the object's
     /// spec before ever sending this.
     DeleteEmbeddedObject(DeleteEmbeddedObjectRequest),
+    /// Write a pivot table into (`add-pivot-table`) or clear one from
+    /// (`delete-pivot-table`) a single anchor cell. The crate's only
+    /// `updateCells` request — issue #1643's "`updateCells` stays unused"
+    /// decision ([`RepeatCellData`]'s doc comment) was specifically about
+    /// writing a *value*, which [`PivotCellData`] still cannot do (it has
+    /// no `userEnteredValue` field, same guarantee as `RepeatCellData`).
+    /// Gated by **both** `DriveOperation::SheetsWrite` and
+    /// `DriveOperation::SheetsStructure` for `add-pivot-table` (a grid
+    /// write with a server-computed extent, but also a named structural
+    /// feature — ADR-0081 §5's union composition), and by `SheetsWrite`
+    /// alone for `delete-pivot-table` (it only ever clears the one anchor
+    /// cell's value, no structural effect).
+    UpdateCells(UpdateCellsRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -1938,6 +1960,228 @@ pub struct DeleteEmbeddedObjectRequest {
     /// Which chart or slicer to remove.
     #[serde(rename = "objectId")]
     pub object_id: i64,
+/// A single cell, addressed absolutely — `GridCoordinate`. Only used as
+/// [`UpdateCellsRequest::start`]; the API extends the write from there
+/// using `rows`' own shape, never a second coordinate.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GridCoordinate {
+    /// Which sheet.
+    #[serde(rename = "sheetId")]
+    pub sheet_id: i64,
+    /// Zero-based row.
+    pub row_index: i64,
+    /// Zero-based column.
+    pub column_index: i64,
+}
+
+/// `updateCells` — issue #1798's `add-pivot-table`/`delete-pivot-table`,
+/// the crate's only user of this request (see
+/// [`BatchUpdateRequestItem::UpdateCells`]'s doc comment).
+///
+/// Always exactly one row of one cell: a pivot table has exactly one
+/// anchor, so `rows` is a single-element `Vec` rather than a genuine grid
+/// — kept as `Vec` because that is the wire shape, not because this crate
+/// ever sends more than one.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UpdateCellsRequest {
+    /// The anchor cell.
+    pub start: GridCoordinate,
+    /// Always one [`PivotRowData`] of one [`PivotCellData`].
+    pub rows: Vec<PivotRowData>,
+    /// Always the literal `"pivotTable"` — the field mask that makes this
+    /// request touch nothing but the anchor's `pivotTable` property,
+    /// preserving whatever value or formatting the cell already had.
+    pub fields: String,
+}
+
+/// One row of [`UpdateCellsRequest::rows`].
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct PivotRowData {
+    /// The row's cells.
+    pub values: Vec<PivotCellData>,
+}
+
+/// The `cell` payload of an `updateCells` request — deliberately **has no
+/// `userEnteredValue` field**.
+///
+/// Same guarantee [`RepeatCellData`]'s doc comment describes: there is
+/// nowhere on this type to put a literal value, so `add-pivot-table`
+/// cannot be used to write one regardless of what a caller asks for.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct PivotCellData {
+    /// The pivot table to write, or `None` to clear an existing one
+    /// (`delete-pivot-table`) — serializes as `{}` when absent, which is
+    /// what `fields: "pivotTable"` interprets as "clear this property".
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "pivotTable"
+    )]
+    pub pivot_table: Option<PivotTable>,
+}
+
+/// A pivot table definition — `PivotTable`.
+///
+/// Also `Deserialize`: unlike most other request-only pieces in this
+/// file, a pivot table is read back too, via
+/// [`CellSnapshot::pivot_table`], so `list-pivot-tables` and
+/// `delete-pivot-table`'s "currently:" preview can round-trip one.
+///
+/// **A curated surface, not full API coverage** — mirroring
+/// `conditional_format.rs`'s own stance. Not modelled: the deprecated
+/// `criteria` field (`filterSpecs` replaces it), `PivotGroup.groupRule`
+/// (date/number bucketing), `PivotGroup.valueBucket`/`valueMetadata`
+/// (sort-by-value-column and collapsed-group state), data-source pivots
+/// (`dataSourceId`/`dataExecutionStatus`), and
+/// `PivotValue.calculatedDisplayType`. `docs/drive.md` names each gap.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PivotTable {
+    /// The range this pivot table is built from.
+    pub source: GridRange,
+    /// Row grouping(s), outermost first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<PivotGroup>,
+    /// Column grouping(s), outermost first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<PivotGroup>,
+    /// Aggregated value column(s).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<PivotValue>,
+    /// Source-row filters, by column offset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "filterSpecs")]
+    pub filter_specs: Vec<PivotFilterSpec>,
+    /// `"HORIZONTAL"` (values as columns, the API default) or
+    /// `"VERTICAL"` (values as rows). Absent means the API default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "valueLayout"
+    )]
+    pub value_layout: Option<String>,
+}
+
+/// One row or column grouping of a [`PivotTable`] — `PivotGroup`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PivotGroup {
+    /// Which source column this groups by, 0-based and relative to
+    /// [`PivotTable::source`]'s first column — not an absolute sheet
+    /// column index.
+    #[serde(rename = "sourceColumnOffset")]
+    pub source_column_offset: i64,
+    /// Whether to show a totals row/column for this grouping. Always sent
+    /// explicitly (never omitted) since the API's own default (`true`)
+    /// would otherwise silently differ from a caller's expectation.
+    #[serde(rename = "showTotals")]
+    pub show_totals: bool,
+    /// `"ASCENDING"` or `"DESCENDING"`. Absent means the API default
+    /// (source order).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sortOrder")]
+    pub sort_order: Option<String>,
+}
+
+/// One aggregated value column of a [`PivotTable`] — `PivotValue`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PivotValue {
+    /// Which source column this aggregates, 0-based and relative to
+    /// [`PivotTable::source`]'s first column.
+    #[serde(rename = "sourceColumnOffset")]
+    pub source_column_offset: i64,
+    /// One of Sheets' `SUM`/`COUNTA`/`COUNT`/`COUNTUNIQUE`/`AVERAGE`/
+    /// `MAX`/`MIN`/`MEDIAN`/`PRODUCT`/`STDEV`/`STDEVP`/`VAR`/`VARP`
+    /// (`CUSTOM`, a value driven by a formula rather than a source column,
+    /// is a documented cut). A plain string, the same tolerate-unmodelled
+    /// stance as [`InterpolationPoint::point_type`].
+    #[serde(rename = "summarizeFunction")]
+    pub summarize_function: String,
+    /// An optional display name overriding the default
+    /// (`"<function> of <column>"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// A source-row filter on one column of a [`PivotTable`] —
+/// `PivotFilterSpec`.
+///
+/// Only the `filterCriteria` form is modelled (a fixed allow-list of
+/// values); the newer `dataSourceColumnReference`, meaningful only for
+/// data-source pivots, is a documented cut alongside them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PivotFilterSpec {
+    /// Which source column this filters, 0-based and relative to
+    /// [`PivotTable::source`]'s first column.
+    #[serde(rename = "columnOffsetIndex")]
+    pub column_offset_index: i64,
+    /// The filter itself.
+    #[serde(rename = "filterCriteria")]
+    pub filter_criteria: PivotFilterCriteria,
+}
+
+/// [`PivotFilterSpec`]'s filter.
+///
+/// Only `visibleValues` (a fixed allow-list of raw string values) is
+/// modelled; the API's condition-based form (`BooleanCondition`,
+/// mirroring data validation) is a documented cut.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PivotFilterCriteria {
+    /// The raw source values that pass this filter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_values: Vec<String>,
+}
+
+/// One row-major chunk of a sheet's cell data — `GridData`.
+///
+/// The API chunks rather than returning one flat grid because a `fields`
+/// mask can request disjoint ranges in one call; this crate only ever
+/// requests one contiguous range at a time, so `Sheet::data` is a
+/// single-element `Vec` in practice, but the type stays a `Vec` because
+/// that is the wire shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GridData {
+    /// The zero-based row this chunk starts at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_row: Option<i64>,
+    /// The zero-based column this chunk starts at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_column: Option<i64>,
+    /// The rows themselves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_data: Vec<RowData>,
+}
+
+/// One row of [`GridData::row_data`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RowData {
+    /// The row's cells, in the `fields` mask the caller requested — every
+    /// property not asked for is simply absent, even one that exists on
+    /// the real cell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<CellSnapshot>,
+}
+
+/// One cell, read back only for the properties a caller's `fields` mask
+/// requested — `CellSnapshot`.
+///
+/// Distinct from [`PivotCellData`] (the *write*-side, value-incapable
+/// type) precisely so this read-only type can carry
+/// [`Self::formatted_value`] without ever creating a path for a literal
+/// value to be written back through it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CellSnapshot {
+    /// The pivot table anchored at this cell, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pivot_table: Option<PivotTable>,
+    /// The cell's value as displayed in the UI — used only to describe an
+    /// occupied anchor in a refusal/dry-run message, never parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formatted_value: Option<String>,
 }
 
 /// `InsertDimensionRequest`.

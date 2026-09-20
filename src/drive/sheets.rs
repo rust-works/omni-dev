@@ -35,6 +35,7 @@ mod grid_range;
 // reachable outside the engine layer.
 pub(crate) use grid_range::{render_grid_range, sheet_title_by_id};
 pub mod named_range;
+pub mod pivot;
 pub mod protection;
 pub mod read;
 pub mod structure;

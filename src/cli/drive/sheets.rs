@@ -19,6 +19,7 @@ pub(crate) mod filter;
 pub(crate) mod format;
 pub(crate) mod info;
 pub(crate) mod named_range;
+pub(crate) mod pivot;
 pub(crate) mod protection;
 pub(crate) mod read;
 pub(crate) mod structure;
@@ -248,6 +249,17 @@ pub enum SheetsSubcommands {
     /// Lists the slicers in a spreadsheet. Read-only and ungated, like
     /// `list-protections` (issue #1797).
     ListSlicers(embedded_object::ListSlicersCommand),
+    /// Writes a new pivot table at an anchor cell. Gated by **both** the
+    /// folder write-permission rules' `sheets-write` and
+    /// `sheets-structure` operations (issue #1798, ADR-0081 §5).
+    AddPivotTable(pivot::AddPivotTableCommand),
+    /// Clears the pivot table at an anchor cell. Gated by the folder
+    /// write-permission rules' `sheets-write` operation alone (issue
+    /// #1798, ADR-0081 §5).
+    DeletePivotTable(pivot::DeletePivotTableCommand),
+    /// Lists the pivot tables in a spreadsheet, by anchor cell. Read-only
+    /// and ungated, like `list-conditional-formats` (issue #1798).
+    ListPivotTables(pivot::ListPivotTablesCommand),
 }
 
 impl SheetsCommand {
@@ -314,6 +326,9 @@ impl SheetsCommand {
             SheetsSubcommands::UpdateSlicer(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeleteSlicer(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ListSlicers(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::AddPivotTable(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeletePivotTable(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::ListPivotTables(cmd) => cmd.execute(client).await,
         }
     }
 }

@@ -90,6 +90,30 @@ const SPREADSHEET_FIELDS_WITH_EMBEDDED_OBJECTS: &str = "spreadsheetId,properties
     sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
     sheets.charts,sheets.slicers";
 
+/// `fields` mask for `spreadsheets.get` when every pivot table in the
+/// workbook is needed (issue #1798's `list-pivot-tables`, which must scan
+/// every sheet's grid data for a populated `pivotTable` property — there is
+/// no index or list endpoint for pivot tables the way there is for
+/// protected ranges or filter views). Requesting `pivotTable` alone (no
+/// `formattedValue`) keeps the response to one `{}` per populated cell that
+/// has no pivot, same order of cost as `sheets read`. A superset of
+/// [`SPREADSHEET_FIELDS`], kept separate for the same reason
+/// [`SPREADSHEET_FIELDS_WITH_PROTECTIONS`] is.
+const SPREADSHEET_FIELDS_WITH_PIVOT_TABLES: &str = "spreadsheetId,properties.title,\
+    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.data(startRow,startColumn,rowData.values(pivotTable))";
+
+/// `fields` mask for `spreadsheets.get` when only a single cell's pivot
+/// table (and displayed value) is needed — `add-pivot-table`'s
+/// occupied-anchor check and `delete-pivot-table`'s "currently:" preview,
+/// both of which read exactly one cell rather than the whole workbook.
+/// Paired with a `ranges=` query parameter scoping the response to that one
+/// cell (see [`SheetsApi::get_cell_pivot`]), so this mask alone would still
+/// return every sheet's grid data without it.
+const CELL_PIVOT_FIELDS: &str = "spreadsheetId,properties.title,\
+    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.data(startRow,startColumn,rowData.values(pivotTable,formattedValue))";
+
 /// Maximum ranges sent in a single `values.batchGet`.
 ///
 /// Each range is a percent-encoded, quoted sheet title in the query string,
@@ -287,6 +311,44 @@ impl<'a> SheetsApi<'a> {
                 url.as_str(),
                 "Failed to parse Sheets spreadsheet metadata (with embedded objects)",
             )
+            .await
+    }
+
+    /// Fetches a spreadsheet's metadata **including every populated cell's
+    /// `pivotTable` property** — `list-pivot-tables`' one fetch (issue
+    /// #1798). See [`SPREADSHEET_FIELDS_WITH_PIVOT_TABLES`].
+    pub async fn get_spreadsheet_with_pivot_tables(
+        &self,
+        spreadsheet_id: &str,
+    ) -> Result<Spreadsheet> {
+        let url =
+            build_spreadsheet_get_with_pivot_tables_url(self.client.base_url(), spreadsheet_id)?;
+        self.client
+            .transport()
+            .get_parsed(
+                url.as_str(),
+                "Failed to parse Sheets spreadsheet metadata (with pivot tables)",
+            )
+            .await
+    }
+
+    /// Fetches a single cell's `pivotTable` property and displayed value —
+    /// `add-pivot-table`'s occupied-anchor check and `delete-pivot-table`'s
+    /// "currently:" preview (issue #1798). `composed_a1` must be a
+    /// single-cell A1 reference carrying its own `Sheet!` prefix; the
+    /// response's `sheets` list still carries every sheet's properties (the
+    /// mask's own `sheets.properties(...)` clause), but `sheets.data` is
+    /// scoped to `composed_a1` by the `ranges` query parameter. See
+    /// [`CELL_PIVOT_FIELDS`].
+    pub async fn get_cell_pivot(
+        &self,
+        spreadsheet_id: &str,
+        composed_a1: &str,
+    ) -> Result<Spreadsheet> {
+        let url = build_cell_pivot_get_url(self.client.base_url(), spreadsheet_id, composed_a1)?;
+        self.client
+            .transport()
+            .get_parsed(url.as_str(), "Failed to parse Sheets cell pivot response")
             .await
     }
 
@@ -581,6 +643,32 @@ fn build_spreadsheet_get_with_embedded_objects_url(
     Ok(url)
 }
 
+fn build_spreadsheet_get_with_pivot_tables_url(
+    base_url: &str,
+    spreadsheet_id: &str,
+) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
+    url.query_pairs_mut()
+        .append_pair("fields", SPREADSHEET_FIELDS_WITH_PIVOT_TABLES);
+    Ok(url)
+}
+
+fn build_cell_pivot_get_url(
+    base_url: &str,
+    spreadsheet_id: &str,
+    composed_a1: &str,
+) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
+    url.query_pairs_mut()
+        .append_pair("ranges", composed_a1)
+        .append_pair("fields", CELL_PIVOT_FIELDS);
+    Ok(url)
+}
+
 fn build_values_get_url(
     base_url: &str,
     spreadsheet_id: &str,
@@ -792,6 +880,39 @@ mod tests {
             .expect("fields mask must always be sent");
         assert!(fields.contains("sheets.charts"));
         assert!(fields.contains("sheets.slicers"));
+    }
+
+    #[test]
+    fn spreadsheet_get_with_pivot_tables_url_masks_the_wider_fields() {
+        let url = build_spreadsheet_get_with_pivot_tables_url(BASE, "sheet-1").unwrap();
+        assert_eq!(url.path(), "/v4/spreadsheets/sheet-1");
+        let fields = url
+            .query_pairs()
+            .find(|(k, _)| k == "fields")
+            .map(|(_, v)| v.to_string())
+            .expect("fields mask must always be sent");
+        assert!(fields.contains("sheets.data"));
+        assert!(fields.contains("pivotTable"));
+        assert!(!fields.contains("formattedValue"));
+    }
+
+    #[test]
+    fn cell_pivot_get_url_scopes_ranges_and_masks_fields() {
+        let url = build_cell_pivot_get_url(BASE, "sheet-1", "'Report'!A1").unwrap();
+        assert_eq!(url.path(), "/v4/spreadsheets/sheet-1");
+        let ranges = url
+            .query_pairs()
+            .find(|(k, _)| k == "ranges")
+            .map(|(_, v)| v.to_string())
+            .expect("ranges must always be sent");
+        assert_eq!(ranges, "'Report'!A1");
+        let fields = url
+            .query_pairs()
+            .find(|(k, _)| k == "fields")
+            .map(|(_, v)| v.to_string())
+            .expect("fields mask must always be sent");
+        assert!(fields.contains("pivotTable"));
+        assert!(fields.contains("formattedValue"));
     }
 
     // ── values.get: encoding is the whole point ────────────────────────
