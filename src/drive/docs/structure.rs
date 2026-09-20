@@ -100,8 +100,18 @@ impl DocElement {
 /// document-index order, containers before their contents.
 #[must_use]
 pub fn flatten(body: &Body) -> Vec<DocElement> {
+    flatten_content(&body.content)
+}
+
+/// Like [`flatten`], but over a bare content slice rather than a [`Body`].
+///
+/// This is what a header, footer or footnote segment needs, since each is
+/// the same `content: Vec<StructuralElement>` shape without the `Body`
+/// wrapper.
+#[must_use]
+pub fn flatten_content(content: &[StructuralElement]) -> Vec<DocElement> {
     let mut out = Vec::new();
-    walk(&body.content, &mut Vec::new(), &mut out);
+    walk(content, &mut Vec::new(), &mut out);
     out
 }
 
@@ -300,6 +310,23 @@ mod tests {
         );
         assert_eq!(elements[0].kind, ElementKind::SectionBreak);
         assert_eq!(elements[1].kind, ElementKind::Paragraph);
+    }
+
+    /// `flatten_content` is what a header/footer/footnote segment uses —
+    /// same content shape as a `Body`, minus the wrapper. It must agree with
+    /// `flatten` exactly for the same content.
+    #[test]
+    fn flatten_content_agrees_with_flatten_on_the_same_content() {
+        let via_body = flatten(&body(serde_json::json!({
+            "content": [paragraph(0, 9, "Header\n", "NORMAL_TEXT")],
+        })));
+        let structural: Vec<StructuralElement> = serde_json::from_value(serde_json::Value::Array(
+            vec![paragraph(0, 9, "Header\n", "NORMAL_TEXT")],
+        ))
+        .unwrap();
+        let via_content = flatten_content(&structural);
+        assert_eq!(via_body, via_content);
+        assert_eq!(via_content[0].text, "Header");
     }
 
     /// The paragraph terminator is dropped from `text` and kept in

@@ -85,11 +85,34 @@ pub struct Document {
         rename = "namedRanges"
     )]
     pub named_ranges: HashMap<String, NamedRanges>,
+    /// Page headers, keyed by `segmentId`. Legacy shape only — see
+    /// [`Self::resolved_tabs`].
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, Header>,
+    /// Page footers, keyed by `segmentId`. Legacy shape only.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub footers: HashMap<String, Footer>,
+    /// Footnotes, keyed by `segmentId`. Legacy shape only.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub footnotes: HashMap<String, Footnote>,
+}
+
+/// One header, footer or footnote segment, resolved and ready to flatten.
+///
+/// The map key Google addresses it by (a `segmentId`) is carried alongside
+/// its content rather than discarded, since it is the only thing that
+/// distinguishes e.g. two headers on the same tab from one another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedSegment<'a> {
+    /// The segment's id — the map key it is stored under.
+    pub segment_id: &'a str,
+    /// The segment's structural elements, in index order.
+    pub content: &'a [StructuralElement],
 }
 
 /// One tab's content, with the legacy single-`body` response normalised into
 /// the same shape so callers never branch on which form arrived.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTab<'a> {
     /// The tab's id, or `None` for a legacy single-body document.
     pub tab_id: Option<&'a str>,
@@ -99,6 +122,29 @@ pub struct ResolvedTab<'a> {
     pub nesting_level: i64,
     /// The tab's body, when it has one.
     pub body: Option<&'a Body>,
+    /// The tab's page headers, sorted by `segment_id` for deterministic
+    /// output — map iteration order is not.
+    pub headers: Vec<ResolvedSegment<'a>>,
+    /// The tab's page footers, likewise sorted.
+    pub footers: Vec<ResolvedSegment<'a>>,
+    /// The tab's footnotes, likewise sorted.
+    pub footnotes: Vec<ResolvedSegment<'a>>,
+}
+
+/// Resolves one segment map into sorted [`ResolvedSegment`]s.
+fn resolve_segments<'a, T>(
+    map: &'a HashMap<String, T>,
+    content: impl Fn(&'a T) -> &'a [StructuralElement],
+) -> Vec<ResolvedSegment<'a>> {
+    let mut out: Vec<ResolvedSegment<'a>> = map
+        .iter()
+        .map(|(id, seg)| ResolvedSegment {
+            segment_id: id.as_str(),
+            content: content(seg),
+        })
+        .collect();
+    out.sort_by_key(|s| s.segment_id);
+    out
 }
 
 impl Document {
@@ -123,6 +169,9 @@ impl Document {
                     title: None,
                     nesting_level: 0,
                     body: Some(body),
+                    headers: resolve_segments(&self.headers, |h| h.content.as_slice()),
+                    footers: resolve_segments(&self.footers, |f| f.content.as_slice()),
+                    footnotes: resolve_segments(&self.footnotes, |f| f.content.as_slice()),
                 }]
             });
         }
@@ -137,6 +186,7 @@ impl Document {
 /// Walks one tab and its `childTabs` depth-first, parent before children.
 fn push_tab<'a>(tab: &'a Tab, depth: i64, out: &mut Vec<ResolvedTab<'a>>) {
     let props = tab.tab_properties.as_ref();
+    let doc_tab = tab.document_tab.as_ref();
     out.push(ResolvedTab {
         tab_id: props.and_then(|p| p.tab_id.as_deref()),
         title: props.and_then(|p| p.title.as_deref()),
@@ -144,7 +194,16 @@ fn push_tab<'a>(tab: &'a Tab, depth: i64, out: &mut Vec<ResolvedTab<'a>>) {
         // to the walk depth, which agrees with it for every well-formed
         // response and keeps a truncated one self-consistent.
         nesting_level: props.and_then(|p| p.nesting_level).unwrap_or(depth),
-        body: tab.document_tab.as_ref().and_then(|dt| dt.body.as_ref()),
+        body: doc_tab.and_then(|dt| dt.body.as_ref()),
+        headers: doc_tab.map_or_else(Vec::new, |dt| {
+            resolve_segments(&dt.headers, |h| h.content.as_slice())
+        }),
+        footers: doc_tab.map_or_else(Vec::new, |dt| {
+            resolve_segments(&dt.footers, |f| f.content.as_slice())
+        }),
+        footnotes: doc_tab.map_or_else(Vec::new, |dt| {
+            resolve_segments(&dt.footnotes, |f| f.content.as_slice())
+        }),
     });
     for child in &tab.child_tabs {
         push_tab(child, depth + 1, out);
@@ -215,17 +274,55 @@ pub struct DocumentTab {
         rename = "namedRanges"
     )]
     pub named_ranges: HashMap<String, NamedRanges>,
+    /// Page headers, keyed by `segmentId`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, Header>,
+    /// Page footers, keyed by `segmentId`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub footers: HashMap<String, Footer>,
+    /// Footnotes, keyed by `segmentId`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub footnotes: HashMap<String, Footnote>,
 }
 
 /// A document body — the main index segment.
 ///
 /// Headers, footers and footnotes live in their own segments, addressed by
-/// `segmentId`, and are **not** returned here. A Doc's header text is
-/// therefore invisible to `drive docs read`; that is a documented gap, the
-/// Docs analogue of "export gives you the first sheet only".
+/// `segmentId`. They are modelled as sibling maps on [`Document`] and
+/// [`DocumentTab`] ([`Header`], [`Footer`], [`Footnote`]) rather than folded
+/// into this type, and normalised onto [`ResolvedTab::headers`],
+/// `.footers` and `.footnotes` by [`Document::resolved_tabs`] the same way
+/// `body` is normalised here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Body {
     /// The body's structural elements, in index order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<StructuralElement>,
+}
+
+/// One page header — a segment addressed by the map key it is stored under.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Header {
+    /// The header's structural elements, in index order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<StructuralElement>,
+}
+
+/// One page footer — same shape as [`Header`]; Google models these as
+/// distinct message types even though the field is identical, so this
+/// mirrors that instead of aliasing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Footer {
+    /// The footer's structural elements, in index order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<StructuralElement>,
+}
+
+/// One footnote body — same shape again. The footnote's own id is the map
+/// key it is stored under, not a field on this struct.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Footnote {
+    /// The footnote's structural elements, in index order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<StructuralElement>,
 }
@@ -654,6 +751,54 @@ mod tests {
         assert!(parse(serde_json::json!({"title": "Empty"}))
             .resolved_tabs()
             .is_empty());
+    }
+
+    /// The legacy single-body shape carries its segments at the top level.
+    #[test]
+    fn resolved_tabs_resolves_top_level_segments_for_a_legacy_body() {
+        let doc = parse(serde_json::json!({
+            "body": {"content": []},
+            "headers": {"h1": {"content": [{"endIndex": 1, "sectionBreak": {}}]}},
+            "footers": {"f1": {"content": []}},
+            "footnotes": {"fn1": {"content": []}},
+        }));
+        let tabs = doc.resolved_tabs();
+        assert_eq!(tabs[0].headers.len(), 1);
+        assert_eq!(tabs[0].headers[0].segment_id, "h1");
+        assert_eq!(tabs[0].footers.len(), 1);
+        assert_eq!(tabs[0].footnotes.len(), 1);
+    }
+
+    /// A tab with none of these maps yields empty `Vec`s, not an error.
+    #[test]
+    fn resolved_tabs_has_empty_segments_when_the_document_has_none() {
+        let doc = parse(serde_json::json!({"body": {"content": []}}));
+        let tabs = doc.resolved_tabs();
+        assert!(tabs[0].headers.is_empty());
+        assert!(tabs[0].footers.is_empty());
+        assert!(tabs[0].footnotes.is_empty());
+    }
+
+    /// Segments are tab-scoped in the `tabs` shape, and resolved sorted by
+    /// `segment_id` since map iteration order is not guaranteed.
+    #[test]
+    fn resolved_tabs_resolves_tab_scoped_segments_sorted_by_segment_id() {
+        let doc = parse(serde_json::json!({
+            "tabs": [{
+                "tabProperties": {"tabId": "t.0"},
+                "documentTab": {
+                    "body": {"content": []},
+                    "headers": {
+                        "h2": {"content": []},
+                        "h1": {"content": [{"endIndex": 1, "sectionBreak": {}}]},
+                    },
+                },
+            }],
+        }));
+        let tabs = doc.resolved_tabs();
+        let ids: Vec<_> = tabs[0].headers.iter().map(|s| s.segment_id).collect();
+        assert_eq!(ids, vec!["h1", "h2"]);
+        assert_eq!(tabs[0].headers[0].content.len(), 1);
     }
 
     #[test]

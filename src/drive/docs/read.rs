@@ -20,7 +20,8 @@ use serde::Serialize;
 
 use crate::cli::drive::format::{write_items_jsonl, JsonlSerialize};
 use crate::drive::docs::api::{DocsApi, SuggestionsViewMode};
-use crate::drive::docs::structure::{flatten, DocElement};
+use crate::drive::docs::structure::{flatten, flatten_content, DocElement};
+use crate::drive::docs::types::ResolvedSegment;
 
 /// Per-call options.
 #[derive(Debug, Clone)]
@@ -37,6 +38,15 @@ pub struct ReadOptions {
     pub suggestions: SuggestionsViewMode,
 }
 
+/// One header, footer or footnote segment's flattened content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SegmentContent {
+    /// The segment's id — the map key Docs stores it under.
+    pub segment_id: String,
+    /// The segment's structural elements, in index order.
+    pub elements: Vec<DocElement>,
+}
+
 /// One tab's flattened content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TabContent {
@@ -50,6 +60,15 @@ pub struct TabContent {
     pub nesting_level: i64,
     /// The tab's structural elements, in index order.
     pub elements: Vec<DocElement>,
+    /// The tab's page headers, when it has any, ordered by segment id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<SegmentContent>,
+    /// The tab's page footers, likewise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub footers: Vec<SegmentContent>,
+    /// The tab's footnotes, likewise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub footnotes: Vec<SegmentContent>,
 }
 
 /// The full result of one read.
@@ -73,6 +92,15 @@ pub struct ReadOutcome {
     pub tabs: Vec<TabContent>,
 }
 
+/// Identifies a header/footer/footnote segment on a `-o jsonl` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SegmentRef<'a> {
+    /// `"header"`, `"footer"` or `"footnote"`.
+    pub kind: &'static str,
+    /// The segment's id — the map key Docs stores it under.
+    pub segment_id: &'a str,
+}
+
 /// One element, with the document and tab identity denormalised onto it.
 ///
 /// The `-o jsonl` record. A document's element list *is* a record stream,
@@ -94,6 +122,10 @@ pub struct FlatElement<'a> {
     /// The holding tab's id, absent for a legacy single-body document.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<&'a str>,
+    /// Which header/footer/footnote segment this element came from, absent
+    /// for a body element.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment: Option<SegmentRef<'a>>,
     /// The element itself, inlined.
     #[serde(flatten)]
     pub element: &'a DocElement,
@@ -106,27 +138,61 @@ impl JsonlSerialize for ReadOutcome {
 }
 
 impl ReadOutcome {
-    /// Every element across every tab, carrying the identity of the document
-    /// and tab that hold it.
+    /// Every element across every tab, carrying the identity of the document,
+    /// tab and (for a header/footer/footnote element) segment that hold it.
     ///
     /// This is the `-o jsonl` projection; see [`FlatElement`].
     #[must_use]
     pub fn flat_elements(&self) -> Vec<FlatElement<'_>> {
-        self.tabs
-            .iter()
-            .flat_map(|tab| {
-                tab.elements.iter().map(move |element| FlatElement {
+        let mut out = Vec::new();
+        for tab in &self.tabs {
+            for element in &tab.elements {
+                out.push(FlatElement {
                     document_id: &self.document_id,
                     revision_id: self.revision_id.as_deref(),
                     tab_id: tab.tab_id.as_deref(),
+                    segment: None,
                     element,
-                })
-            })
-            .collect()
+                });
+            }
+            for (kind, segments) in [
+                ("header", &tab.headers),
+                ("footer", &tab.footers),
+                ("footnote", &tab.footnotes),
+            ] {
+                for segment in segments {
+                    for element in &segment.elements {
+                        out.push(FlatElement {
+                            document_id: &self.document_id,
+                            revision_id: self.revision_id.as_deref(),
+                            tab_id: tab.tab_id.as_deref(),
+                            segment: Some(SegmentRef {
+                                kind,
+                                segment_id: &segment.segment_id,
+                            }),
+                            element,
+                        });
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
-/// Reads a document and flattens each tab's body.
+/// Flattens a resolved tab's header/footer/footnote segments, preserving the
+/// `segment_id` ordering [`ResolvedSegment`]s already carry.
+fn segments_to_content(segments: &[ResolvedSegment<'_>]) -> Vec<SegmentContent> {
+    segments
+        .iter()
+        .map(|segment| SegmentContent {
+            segment_id: segment.segment_id.to_string(),
+            elements: flatten_content(segment.content),
+        })
+        .collect()
+}
+
+/// Reads a document and flattens each tab's body and segments.
 pub async fn read(api: &DocsApi<'_>, opts: &ReadOptions) -> Result<ReadOutcome> {
     let document = api
         .get_document(&opts.document_id, opts.suggestions)
@@ -140,6 +206,9 @@ pub async fn read(api: &DocsApi<'_>, opts: &ReadOptions) -> Result<ReadOutcome> 
             title: tab.title.map(ToString::to_string),
             nesting_level: tab.nesting_level,
             elements: tab.body.map(flatten).unwrap_or_default(),
+            headers: segments_to_content(&tab.headers),
+            footers: segments_to_content(&tab.footers),
+            footnotes: segments_to_content(&tab.footnotes),
         })
         .collect();
 
@@ -624,5 +693,79 @@ mod tests {
 
         let outcome = read(&DocsApi::new(&client), &opts(None)).await.unwrap();
         assert_eq!(render_jsonl(&outcome), "");
+    }
+
+    /// A document response with headers, footers and footnotes is no longer
+    /// a silent drop — this is the read half of issue #1799.
+    #[tokio::test]
+    async fn read_populates_headers_footers_and_footnotes() {
+        let server = MockServer::start().await;
+        let client = docs_client(&server).await;
+        mount_document(serde_json::json!({
+            "documentId": "d1",
+            "body": {"content": [paragraph(1, 5, "body\n")]},
+            "headers": {"h1": {"content": [paragraph(0, 8, "Header\n")]}},
+            "footers": {"f1": {"content": [paragraph(0, 8, "Footer\n")]}},
+            "footnotes": {"n1": {"content": [paragraph(0, 5, "Note\n")]}},
+        }))
+        .mount(&server)
+        .await;
+
+        let outcome = read(&DocsApi::new(&client), &opts(None)).await.unwrap();
+        let tab = &outcome.tabs[0];
+        assert_eq!(tab.headers.len(), 1);
+        assert_eq!(tab.headers[0].segment_id, "h1");
+        assert_eq!(tab.headers[0].elements[0].text, "Header");
+        assert_eq!(tab.footers[0].elements[0].text, "Footer");
+        assert_eq!(tab.footnotes[0].elements[0].text, "Note");
+    }
+
+    /// A document with none of these segments still round-trips exactly as
+    /// before: the new fields are omitted, not emitted as empty arrays.
+    #[tokio::test]
+    async fn a_document_with_no_segments_serialises_without_the_new_fields() {
+        let server = MockServer::start().await;
+        let client = docs_client(&server).await;
+        mount_document(serde_json::json!({
+            "documentId": "d1",
+            "body": {"content": [paragraph(1, 5, "a\n")]},
+        }))
+        .mount(&server)
+        .await;
+
+        let outcome = read(&DocsApi::new(&client), &opts(None)).await.unwrap();
+        let json = serde_json::to_value(&outcome).unwrap();
+        let tab = &json["tabs"][0];
+        assert!(tab.get("headers").is_none());
+        assert!(tab.get("footers").is_none());
+        assert!(tab.get("footnotes").is_none());
+    }
+
+    /// `-o jsonl` carries segment identity on each of its lines, and leaves
+    /// it off body lines rather than emitting `null`.
+    #[tokio::test]
+    async fn jsonl_carries_segment_identity_for_segment_elements() {
+        let server = MockServer::start().await;
+        let client = docs_client(&server).await;
+        mount_document(serde_json::json!({
+            "documentId": "d1",
+            "body": {"content": [paragraph(1, 5, "body\n")]},
+            "footnotes": {"n1": {"content": [paragraph(0, 5, "Note\n")]}},
+        }))
+        .mount(&server)
+        .await;
+
+        let outcome = read(&DocsApi::new(&client), &opts(None)).await.unwrap();
+        let rendered = render_jsonl(&outcome);
+        let lines: Vec<serde_json::Value> = rendered
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].get("segment").is_none());
+        assert_eq!(lines[1]["segment"]["kind"], "footnote");
+        assert_eq!(lines[1]["segment"]["segment_id"], "n1");
+        assert_eq!(lines[1]["text"], "Note");
     }
 }
