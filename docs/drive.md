@@ -628,7 +628,7 @@ operation anywhere in a target's ancestor chain:
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
 | `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format` |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range` |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -685,6 +685,17 @@ remove before deleting it, the same preview pattern as `merge-cells`.
 [ADR-0081](adrs/adr-0081.md) §1) — presentational, destroys no data, exactly
 like `format-cells`/`set-data-validation`. `list-conditional-formats` is a
 plain read and needs no grant, the same as `list-protections`.
+
+**`sheets-structure` also covers named-range add/update/delete** (issue
+#1796, [ADR-0081](adrs/adr-0081.md) §2). A named range is a label over a
+region, not grid data, so `delete-named-range` leaves every cell's stored
+value and formula text untouched — even though a formula referencing the
+removed name starts evaluating to `#NAME?`. That effect is mitigated the
+same way `merge-cells`' data loss is: `delete-named-range`'s `--dry-run`
+(and real run) scans the workbook's formulas for the name and reports the
+count and A1 locations of every reference before it deletes.
+`drive sheets list-named-ranges` is a plain read and needs no grant, the
+same as `list-protections`.
 
 **`sheets-protection` is separate from `sheets-structure`, and the reason is
 different in kind from every split above.** A protected range is a
@@ -2180,6 +2191,47 @@ And `FilterCriteria` support is `hiddenValues` only: filtering by a boolean
 condition (the same vocabulary `set-data-validation` curates) isn't
 exposed. Both are documented cuts, not silent gaps.
 
+#### drive sheets add-named-range / update-named-range / delete-named-range / list-named-ranges
+
+Named ranges, gated by `sheets-structure` — including `delete-named-range`.
+See [ADR-0081](adrs/adr-0081.md) §2 for why: a named range is a label over a
+region, not grid data, so removing one leaves every cell's stored value and
+formula text untouched, even though every formula referencing the removed
+name starts evaluating to `#NAME?`.
+
+```bash
+# Add a named range, or one covering an entire sheet with --whole-sheet.
+omni-dev drive sheets add-named-range <ID> --name Prices --sheet Q2 --range B2:B50
+omni-dev drive sheets add-named-range <ID> --name AllOfQ2 --sheet Q2 --whole-sheet
+
+# See what's defined — a plain, ungated read.
+omni-dev drive sheets list-named-ranges <ID>
+
+# Rename and/or re-point an existing named range, resolved by exact name.
+omni-dev drive sheets update-named-range <ID> --name Prices --new-name UnitPrices
+omni-dev drive sheets update-named-range <ID> --name Prices --sheet Q3 --range B2:B50
+
+# Remove a named range — read --dry-run first.
+omni-dev drive sheets delete-named-range <ID> --name Prices --dry-run
+omni-dev drive sheets delete-named-range <ID> --name Prices
+```
+
+`update-named-range`/`delete-named-range` resolve their target by the
+*exact* name — `list-named-ranges` is how you find it. Unlike
+`update-protection`/`unprotect-range`'s range-based lookup, this can never
+be ambiguous: Sheets enforces unique names workbook-wide, so a name either
+matches one named range or none. `update-named-range` may rename only,
+re-point only, or both — passing neither `--new-name` nor a new range is
+refused as nothing to change.
+
+`delete-named-range --dry-run` (and the real run, before mutating) scans
+every sheet's formulas for the name being removed and reports the count and
+A1 locations of every reference — never the formula text or a cell's value
+— so read it before running for real. The break is also recoverable:
+re-adding a named range with the same name over the same range restores
+every dependent formula to working order, since the name is what changed,
+not the formula text.
+
 ## Docs
 
 `drive docs` reads the *structural model* of a Google Doc through the Docs v1
@@ -2724,6 +2776,11 @@ Only Docs/Sheets/Slides have a safe default export MIME type (see
   (a permission change inside the document, not a structural one), and
   `merge-cells`' `--dry-run` honesty requirement for the one request here
   that discards data.
+- [ADR-0081](adrs/adr-0081.md) — the gate mapping for the second Sheets
+  capability tranche (issue #1663), settled once rather than per issue:
+  named-range add/update/delete join `sheets-structure`, including why
+  `delete-named-range` stays there rather than joining `sheets-delete`, and
+  the mandatory referencing-formula preview that mitigates it.
 - [ADR-0063](adrs/adr-0063.md) — the OAuth2 authorization-code + PKCE
   design, refresh-token-only persistence, and bring-your-own Google Cloud
   project rationale ADR-0069 applies unchanged.
