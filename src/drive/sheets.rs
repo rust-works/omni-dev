@@ -23,6 +23,7 @@ pub mod api;
 pub mod client;
 pub mod create;
 pub mod developer_metadata;
+pub mod filter;
 pub mod format;
 mod grid_range;
 pub mod protection;

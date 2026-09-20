@@ -1530,6 +1530,15 @@ pub struct DriveMutationOutcome {
     /// Editors an `update-protection` removed the exemption from — the
     /// decrease-side counterpart of [`Self::protection_editors_added`].
     pub protection_editors_removed: Vec<String>,
+    /// The stable numeric id of a filter view an `add-filter-view`/
+    /// `update-filter-view`/`delete-filter-view` acted on (issue #1794).
+    /// Set from the `addFilterView` reply for `add-filter-view` (the id is
+    /// server-assigned, like [`Self::protected_range_id`] for
+    /// `protect-range`) and from the id resolved against for
+    /// `update-filter-view`/`delete-filter-view`. `None` for
+    /// `set-basic-filter`/`clear-basic-filter`, which are scoped to a sheet
+    /// rather than a filter view — see [`Self::sheet_id`].
+    pub filter_view_id: Option<i64>,
     /// The API/validation error, when the attempt failed.
     pub error: Option<String>,
     /// Wall time of the attempt.
@@ -1669,6 +1678,9 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
             "protection_editors_removed".to_string(),
             outcome.protection_editors_removed.join(","),
         );
+    }
+    if let Some(filter_view_id) = outcome.filter_view_id {
+        context.insert("filter_view_id".to_string(), filter_view_id.to_string());
     }
     rec.context = context;
     rec

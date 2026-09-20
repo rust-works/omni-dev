@@ -975,6 +975,7 @@ mod tests {
             sheets: vec![Sheet {
                 properties: None,
                 protected_ranges: protections,
+                ..Default::default()
             }],
             ..Default::default()
         }
@@ -1537,6 +1538,7 @@ mod tests {
                     ..Default::default()
                 }),
                 protected_ranges: Vec::new(),
+                ..Default::default()
             }],
             ..Default::default()
         };

@@ -134,6 +134,19 @@ types, so the log is a complete invocation history, not just an HTTP history:
   otherwise the one resolved against), and `protection_editors_added`/
   `protection_editors_removed` (comma-separated).
 
+  Filter views and the basic filter (issue
+  [#1794](https://github.com/rust-works/omni-dev/issues/1794),
+  [ADR-0081](adrs/adr-0081.md)) use the same kind again. New `operation`
+  values: `sheets-set-basic-filter`, `sheets-clear-basic-filter`,
+  `sheets-add-filter-view`, `sheets-update-filter-view`,
+  `sheets-delete-filter-view`. One more omit-if-absent context key:
+  `filter_view_id` (the stable numeric id of a filter view acted on —
+  server-assigned for `add-filter-view`, otherwise the one resolved
+  against; absent for `set-basic-filter`/`clear-basic-filter`, which
+  reuse `sheet_id` instead, since a basic filter is scoped to a sheet
+  rather than id-addressed). `fields_changed` is reused as-is for
+  `update-filter-view`'s changed-field summary.
+
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of
