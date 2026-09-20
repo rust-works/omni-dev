@@ -1539,6 +1539,18 @@ pub struct DriveMutationOutcome {
     /// `set-basic-filter`/`clear-basic-filter`, which are scoped to a sheet
     /// rather than a filter view — see [`Self::sheet_id`].
     pub filter_view_id: Option<i64>,
+    /// The stable id of a named range a named-range verb acted on (issue
+    /// #1796, [ADR-0081](../docs/adrs/adr-0081.md) §2). Set by
+    /// `add-named-range` from the `addNamedRange` reply (server-assigned,
+    /// like [`Self::protected_range_id`]) and by `update-named-range`/
+    /// `delete-named-range` from the named range they resolved against.
+    pub named_range_id: Option<String>,
+    /// `delete-named-range` only (ADR-0081 §2): the A1 locations of every
+    /// formula referencing the name being removed, as `"Sheet!A1"` strings —
+    /// **never** the formula text or a cell's value, matching
+    /// [`Self::discarded_cells`]'s no-content-exposure line. Empty when
+    /// nothing references the name, and for every other named-range verb.
+    pub referencing_formula_locations: Vec<String>,
     /// The API/validation error, when the attempt failed.
     pub error: Option<String>,
     /// Wall time of the attempt.
@@ -1681,6 +1693,19 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
     }
     if let Some(filter_view_id) = outcome.filter_view_id {
         context.insert("filter_view_id".to_string(), filter_view_id.to_string());
+    }
+    if let Some(named_range_id) = outcome.named_range_id {
+        context.insert("named_range_id".to_string(), named_range_id);
+    }
+    if !outcome.referencing_formula_locations.is_empty() {
+        context.insert(
+            "referencing_formula_count".to_string(),
+            outcome.referencing_formula_locations.len().to_string(),
+        );
+        context.insert(
+            "referencing_formula_locations".to_string(),
+            outcome.referencing_formula_locations.join("; "),
+        );
     }
     rec.context = context;
     rec

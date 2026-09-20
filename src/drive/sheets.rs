@@ -28,6 +28,7 @@ pub mod developer_metadata;
 pub mod filter;
 pub mod format;
 mod grid_range;
+pub mod named_range;
 pub mod protection;
 pub mod read;
 pub mod structure;
