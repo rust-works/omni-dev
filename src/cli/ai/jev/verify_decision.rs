@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use crate::jev::citations::Citation;
 use crate::jev::client::JevClient;
 use crate::jev::config::JevConfig;
 use crate::jev::verify::{
-    fetch_verify_input, parse_comment_selector, run_verify, Citation, CommentSelector, Source,
-    VerifyOptions, DEFAULT_COVERAGE, DEFAULT_REJECT_BELOW, DEFAULT_SUPPORTED,
+    fetch_verify_input, parse_comment_selector, run_verify, CommentSelector, Source, VerifyOptions,
+    DEFAULT_COVERAGE, DEFAULT_REJECT_BELOW, DEFAULT_SUPPORTED,
 };
 use crate::provider::{Comment, IssueDoc};
 

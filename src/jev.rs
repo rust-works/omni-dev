@@ -8,6 +8,7 @@
 //! under [`crate::claude`], mirroring the standalone [`crate::datadog`]
 //! client.
 //!
+//! - [`citations`] — shared citation-finding, used by `route` and `verify`.
 //! - [`client`] — the `reqwest` client and its single `POST /v1/systemone` call.
 //! - [`config`] — credential and base-URL resolution.
 //! - [`error`] — the [`error::JevError`] domain error type.
@@ -16,6 +17,7 @@
 //! - [`route`] — stage routing of issues to model classes (`ai jev route`).
 //! - [`verify`] — decision-comment verification (`ai jev verify-decision`).
 
+pub mod citations;
 pub mod client;
 pub mod config;
 pub mod error;
