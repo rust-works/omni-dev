@@ -290,6 +290,14 @@ pub struct FilterOutcome {
     /// The folder the gate evaluated against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_folder_id: Option<String>,
+    /// The sheet a `set-basic-filter`/`clear-basic-filter` resolved
+    /// against, once known — the only identifier that can distinguish
+    /// which sheet in a multi-sheet workbook was affected, since a basic
+    /// filter (unlike a filter view) is scoped to a sheet rather than
+    /// id-addressed (issue #1794, `docs/log.md`). `None` before the
+    /// workbook resolves it, and for every other verb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sheet_id: Option<i64>,
     /// Which mutation was attempted. Not serialised.
     #[serde(skip)]
     pub verb: FilterVerb,
@@ -328,6 +336,7 @@ async fn filter_inner(
         spreadsheet_id: opts.spreadsheet_id.clone(),
         file_name: None,
         resolved_folder_id: None,
+        sheet_id: None,
         verb: opts.verb.clone(),
         result,
     };
@@ -371,6 +380,7 @@ async fn filter_inner(
                 spreadsheet_id: opts.spreadsheet_id.clone(),
                 file_name: Some(target.name),
                 resolved_folder_id: None,
+                sheet_id: None,
                 verb: opts.verb.clone(),
                 result,
             };
@@ -380,6 +390,7 @@ async fn filter_inner(
                 spreadsheet_id: opts.spreadsheet_id.clone(),
                 file_name: Some(target.name),
                 resolved_folder_id: None,
+                sheet_id: None,
                 verb: opts.verb.clone(),
                 result: FilterResult::Failed { detail },
             };
@@ -396,6 +407,7 @@ async fn filter_inner(
         spreadsheet_id: opts.spreadsheet_id.clone(),
         file_name: Some(target.name.clone()),
         resolved_folder_id: resolved_folder_id.clone(),
+        sheet_id: None,
         verb: opts.verb.clone(),
         result,
     };
@@ -424,6 +436,23 @@ async fn filter_inner(
         Err(result) => return gated(result),
     };
 
+    // `set-basic-filter`/`clear-basic-filter` have no id-addressed handle
+    // the way a filter view does, so the sheet id resolved above is the
+    // only thing that can tell an audit record which sheet in a
+    // multi-sheet workbook was affected (docs/log.md). Shadows the
+    // pre-resolution `gated` above; every return from here on carries it.
+    let gated = |result| FilterOutcome {
+        spreadsheet_id: opts.spreadsheet_id.clone(),
+        file_name: Some(target.name.clone()),
+        resolved_folder_id: resolved_folder_id.clone(),
+        sheet_id: match &opts.verb {
+            FilterVerb::SetBasicFilter { .. } | FilterVerb::ClearBasicFilter { .. } => sheet_id,
+            _ => None,
+        },
+        verb: opts.verb.clone(),
+        result,
+    };
+
     let existing = match &opts.verb {
         FilterVerb::UpdateFilterView { filter_view_id, .. }
         | FilterVerb::DeleteFilterView { filter_view_id } => {
@@ -448,10 +477,7 @@ async fn filter_inner(
     // view's `sort_specs`/`criteria`.
     let built = match &opts.verb {
         FilterVerb::SetBasicFilter { .. } => {
-            let Some(sheet_id) = sheet_id else {
-                unreachable!("sheet_id is resolved for SetBasicFilter above")
-            };
-            let grid = grid_for(&opts.verb, sheet_id, composed_range.as_deref(), &workbook);
+            let grid = grid_for(composed_range.as_deref(), &workbook);
             let grid = match grid {
                 Ok(grid) => grid,
                 Err(result) => return gated(result),
@@ -477,10 +503,7 @@ async fn filter_inner(
             ))
         }
         FilterVerb::AddFilterView { title, .. } => {
-            let Some(sheet_id) = sheet_id else {
-                unreachable!("sheet_id is resolved for AddFilterView above")
-            };
-            let grid = grid_for(&opts.verb, sheet_id, composed_range.as_deref(), &workbook);
+            let grid = grid_for(composed_range.as_deref(), &workbook);
             let grid = match grid {
                 Ok(grid) => grid,
                 Err(result) => return gated(result),
@@ -509,12 +532,10 @@ async fn filter_inner(
                 unreachable!("existing is resolved for UpdateFilterView above")
             };
             let grid = match sheet_id {
-                Some(sheet_id) => {
-                    match grid_for(&opts.verb, sheet_id, composed_range.as_deref(), &workbook) {
-                        Ok(grid) => Some(grid),
-                        Err(result) => return gated(result),
-                    }
-                }
+                Some(_) => match grid_for(composed_range.as_deref(), &workbook) {
+                    Ok(grid) => Some(grid),
+                    Err(result) => return gated(result),
+                },
                 None => None,
             };
             build_update(
@@ -757,13 +778,7 @@ fn resolve_sheet_target(
 /// full [`GridRange`] — called only once a sheet id is already known to
 /// exist, so this cannot itself fail on a missing sheet; it can still fail
 /// on a malformed bare range.
-fn grid_for(
-    verb: &FilterVerb,
-    _sheet_id: i64,
-    composed: Option<&str>,
-    workbook: &Spreadsheet,
-) -> Result<GridRange, FilterResult> {
-    let _ = verb;
+fn grid_for(composed: Option<&str>, workbook: &Spreadsheet) -> Result<GridRange, FilterResult> {
     let composed = composed.unwrap_or_default();
     let (_, grid) = grid_range::resolve_grid_range(
         workbook,
@@ -975,6 +990,7 @@ fn record_attempt(outcome: &FilterOutcome, opts: &FilterOptions, duration: Durat
         decided_by_folder_id: decided_by.folder_id,
         decided_by_depth: decided_by.depth,
         decided_by_file_id: decided_by.file_id,
+        sheet_id: outcome.sheet_id,
         filter_view_id,
         fields_changed,
         error,
@@ -1396,6 +1412,7 @@ mod tests {
             spreadsheet_id: "sheet-1".to_string(),
             file_name: Some("Budget".to_string()),
             resolved_folder_id: None,
+            sheet_id: None,
             verb: FilterVerb::DeleteFilterView { filter_view_id: 3 },
             result: FilterResult::Changed {
                 summary: "delete filter view".to_string(),
@@ -1585,6 +1602,55 @@ mod tests {
         };
         let outcome = filter(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, FilterResult::Changed { .. }));
+        // A basic filter has no id of its own to log (unlike a filter
+        // view's `filter_view_id`), so the resolved sheet id is the only
+        // thing that can tell an audit record which sheet was affected —
+        // see `record_attempt`/`docs/log.md`.
+        assert_eq!(outcome.sheet_id, Some(0));
+    }
+
+    #[tokio::test]
+    async fn clear_basic_filter_reports_the_resolved_sheet_id() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 7, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: FilterVerb::ClearBasicFilter {
+                sheet: "Q1".to_string(),
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FilterResult::Changed { .. }));
+        assert_eq!(outcome.sheet_id, Some(7));
     }
 
     #[tokio::test]
@@ -1637,6 +1703,11 @@ mod tests {
             }
             other => panic!("expected Changed, got {other:?}"),
         }
+        // Unlike the basic filter, a filter view is already identified by
+        // its own `filter_view_id`, so `sheet_id` stays unset here — see
+        // `clear_basic_filter_reports_the_resolved_sheet_id` for the case
+        // that needs it.
+        assert_eq!(outcome.sheet_id, None);
     }
 
     #[tokio::test]
