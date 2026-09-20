@@ -403,7 +403,13 @@ async fn filter_inner(
         } => (target, decision, resolved_folder_id, requires_lease),
     };
 
-    let gated = |result| FilterOutcome {
+    // Returns before the sheet/range resolution just below always have
+    // `sheet_id: None` — there is nothing to resolve it against yet.
+    // Distinct from `gated` below (never a shadow of it) so a future early
+    // return accidentally added between the two is a compile error
+    // ("cannot find value `gated`"), not a silent bind to the wrong
+    // closure.
+    let pre_gated = |result| FilterOutcome {
         spreadsheet_id: opts.spreadsheet_id.clone(),
         file_name: Some(target.name.clone()),
         resolved_folder_id: resolved_folder_id.clone(),
@@ -413,7 +419,7 @@ async fn filter_inner(
     };
 
     if decision.verdict == write_gate::Verdict::Deny {
-        return gated(FilterResult::Blocked {
+        return pre_gated(FilterResult::Blocked {
             decided_by: decision.decided_by,
         });
     }
@@ -425,22 +431,23 @@ async fn filter_inner(
     {
         Ok(workbook) => workbook,
         Err(err) => {
-            return gated(FilterResult::Failed {
+            return pre_gated(FilterResult::Failed {
                 detail: format!("{err:#}"),
             })
         }
     };
 
-    let sheet_id = match resolve_sheet_target(&workbook, &opts.verb, composed_range.as_deref()) {
-        Ok(sheet_id) => sheet_id,
-        Err(result) => return gated(result),
-    };
+    let resolved_target =
+        match resolve_sheet_target(&workbook, &opts.verb, composed_range.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(result) => return pre_gated(result),
+        };
+    let sheet_id = resolved_target.map(|grid| grid.sheet_id);
 
     // `set-basic-filter`/`clear-basic-filter` have no id-addressed handle
     // the way a filter view does, so the sheet id resolved above is the
     // only thing that can tell an audit record which sheet in a
-    // multi-sheet workbook was affected (docs/log.md). Shadows the
-    // pre-resolution `gated` above; every return from here on carries it.
+    // multi-sheet workbook was affected (docs/log.md).
     let gated = |result| FilterOutcome {
         spreadsheet_id: opts.spreadsheet_id.clone(),
         file_name: Some(target.name.clone()),
@@ -474,13 +481,13 @@ async fn filter_inner(
 
     // Only past the dry-run return does building the actual request do any
     // work — in particular `update-filter-view`'s merge onto the existing
-    // view's `sort_specs`/`criteria`.
+    // view's `sort_specs`/`criteria`. Every branch here reuses
+    // `resolved_target` rather than re-parsing `composed_range` a second
+    // time; `resolve_sheet_target` already did that work once, above.
     let built = match &opts.verb {
         FilterVerb::SetBasicFilter { .. } => {
-            let grid = grid_for(composed_range.as_deref(), &workbook);
-            let grid = match grid {
-                Ok(grid) => grid,
-                Err(result) => return gated(result),
+            let Some(grid) = resolved_target else {
+                unreachable!("resolved_target is resolved for SetBasicFilter above")
             };
             Ok((
                 BatchUpdateRequestItem::SetBasicFilter(SetBasicFilterRequest {
@@ -503,10 +510,8 @@ async fn filter_inner(
             ))
         }
         FilterVerb::AddFilterView { title, .. } => {
-            let grid = grid_for(composed_range.as_deref(), &workbook);
-            let grid = match grid {
-                Ok(grid) => grid,
-                Err(result) => return gated(result),
+            let Some(grid) = resolved_target else {
+                unreachable!("resolved_target is resolved for AddFilterView above")
             };
             Ok((
                 BatchUpdateRequestItem::AddFilterView(AddFilterViewRequest {
@@ -531,18 +536,11 @@ async fn filter_inner(
             let Some(existing) = existing else {
                 unreachable!("existing is resolved for UpdateFilterView above")
             };
-            let grid = match sheet_id {
-                Some(_) => match grid_for(composed_range.as_deref(), &workbook) {
-                    Ok(grid) => Some(grid),
-                    Err(result) => return gated(result),
-                },
-                None => None,
-            };
             build_update(
                 existing,
                 *filter_view_id,
                 title,
-                grid,
+                resolved_target,
                 sort_specs,
                 criteria,
                 *clear_sort,
@@ -735,14 +733,21 @@ fn validate_verb(verb: &FilterVerb) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolves the sheet a verb targets to its numeric id, when the verb
-/// targets one at all. `UpdateFilterView` may target no sheet (leaving the
-/// existing view's range untouched), hence the `Option`.
+/// Resolves the sheet (and, for every verb but `ClearBasicFilter`, the full
+/// [`GridRange`]) a verb targets — once, so callers never need to re-parse
+/// the same `--sheet`/`--range` composition a second time to get the range
+/// they already resolved a sheet id from. `ClearBasicFilter`'s grid carries
+/// only `sheet_id`, with every other bound `Default`, since it names a
+/// sheet directly rather than a range within it — the same "whole sheet"
+/// shape `protection.rs::resolve_grid`'s `--whole-sheet` case uses.
+/// `UpdateFilterView` may target no sheet at all (leaving the existing
+/// view's range untouched), hence the `Option`; `DeleteFilterView` never
+/// does.
 fn resolve_sheet_target(
     workbook: &Spreadsheet,
     verb: &FilterVerb,
     composed: Option<&str>,
-) -> Result<Option<i64>, FilterResult> {
+) -> Result<Option<GridRange>, FilterResult> {
     match verb {
         FilterVerb::SetBasicFilter { .. } | FilterVerb::AddFilterView { .. } => {
             let composed = composed.unwrap_or_default();
@@ -752,11 +757,14 @@ fn resolve_sheet_target(
                 |detail| FilterResult::RefusedInvalidRange { detail },
                 |title, available| FilterResult::RefusedSheetNotFound { title, available },
             )?;
-            Ok(Some(grid.sheet_id))
+            Ok(Some(grid))
         }
         FilterVerb::ClearBasicFilter { sheet } => {
             let sheet_id = find_sheet_id(workbook, sheet)?;
-            Ok(Some(sheet_id))
+            Ok(Some(GridRange {
+                sheet_id,
+                ..Default::default()
+            }))
         }
         FilterVerb::UpdateFilterView { .. } => match composed {
             Some(composed) => {
@@ -766,27 +774,12 @@ fn resolve_sheet_target(
                     |detail| FilterResult::RefusedInvalidRange { detail },
                     |title, available| FilterResult::RefusedSheetNotFound { title, available },
                 )?;
-                Ok(Some(grid.sheet_id))
+                Ok(Some(grid))
             }
             None => Ok(None),
         },
         FilterVerb::DeleteFilterView { .. } => Ok(None),
     }
-}
-
-/// Re-resolves the already-validated `--sheet`/`--range` composition into a
-/// full [`GridRange`] — called only once a sheet id is already known to
-/// exist, so this cannot itself fail on a missing sheet; it can still fail
-/// on a malformed bare range.
-fn grid_for(composed: Option<&str>, workbook: &Spreadsheet) -> Result<GridRange, FilterResult> {
-    let composed = composed.unwrap_or_default();
-    let (_, grid) = grid_range::resolve_grid_range(
-        workbook,
-        composed,
-        |detail| FilterResult::RefusedInvalidRange { detail },
-        |title, available| FilterResult::RefusedSheetNotFound { title, available },
-    )?;
-    Ok(grid)
 }
 
 fn find_sheet_id(workbook: &Spreadsheet, title: &str) -> Result<i64, FilterResult> {
