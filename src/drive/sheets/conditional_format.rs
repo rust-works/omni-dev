@@ -1185,6 +1185,302 @@ mod tests {
         assert_eq!(built.values[0].relative_date, Some("TODAY".to_string()));
     }
 
+    #[test]
+    fn into_boolean_condition_covers_every_remaining_variant() {
+        // NumberGreater, DateAfter, CellEmpty and CellNotEmpty are already
+        // covered by the tests above; this exercises the rest of the
+        // `values` match in `into_boolean_condition`.
+        let cases: Vec<(FormatCondition, &str, usize)> = vec![
+            (
+                FormatCondition::NumberBetween(1.0, 2.0),
+                "NUMBER_BETWEEN",
+                2,
+            ),
+            (
+                FormatCondition::NumberNotBetween(1.0, 2.0),
+                "NUMBER_NOT_BETWEEN",
+                2,
+            ),
+            (
+                FormatCondition::NumberGreaterEq(1.0),
+                "NUMBER_GREATER_THAN_EQ",
+                1,
+            ),
+            (FormatCondition::NumberLess(1.0), "NUMBER_LESS", 1),
+            (FormatCondition::NumberLessEq(1.0), "NUMBER_LESS_THAN_EQ", 1),
+            (FormatCondition::NumberEq(1.0), "NUMBER_EQ", 1),
+            (FormatCondition::NumberNotEq(1.0), "NUMBER_NOT_EQ", 1),
+            (
+                FormatCondition::TextContains("x".to_string()),
+                "TEXT_CONTAINS",
+                1,
+            ),
+            (
+                FormatCondition::TextNotContains("x".to_string()),
+                "TEXT_NOT_CONTAINS",
+                1,
+            ),
+            (
+                FormatCondition::TextStartsWith("x".to_string()),
+                "TEXT_STARTS_WITH",
+                1,
+            ),
+            (
+                FormatCondition::TextEndsWith("x".to_string()),
+                "TEXT_ENDS_WITH",
+                1,
+            ),
+            (FormatCondition::TextEq("x".to_string()), "TEXT_EQ", 1),
+            (
+                FormatCondition::DateBefore(DateValue::Absolute("2024-01-01".to_string())),
+                "DATE_BEFORE",
+                1,
+            ),
+            (
+                FormatCondition::DateOn(DateValue::Absolute("2024-01-01".to_string())),
+                "DATE_EQ",
+                1,
+            ),
+            (
+                FormatCondition::DateBetween("2024-01-01".to_string(), "2024-01-02".to_string()),
+                "DATE_BETWEEN",
+                2,
+            ),
+            (
+                FormatCondition::CustomFormula("=A1>0".to_string()),
+                "CUSTOM_FORMULA",
+                1,
+            ),
+        ];
+        for (condition, expected_type, expected_len) in cases {
+            let built = condition.into_boolean_condition();
+            assert_eq!(built.condition_type, expected_type, "{expected_type}");
+            assert_eq!(built.values.len(), expected_len, "{expected_type}");
+        }
+    }
+
+    // ── GradientSpec ──────────────────────────────────────────────────
+
+    #[test]
+    fn into_gradient_rule_builds_each_midpoint_type() {
+        for (point_type, expected) in [
+            (GradientPointType::Number, "NUMBER"),
+            (GradientPointType::Percent, "PERCENT"),
+            (GradientPointType::Percentile, "PERCENTILE"),
+        ] {
+            let spec = GradientSpec {
+                min_color: "#FFFFFF".to_string(),
+                max_color: "#000000".to_string(),
+                mid: Some(GradientMidpoint {
+                    color: "#FF00FF".to_string(),
+                    point_type,
+                    value: "50".to_string(),
+                }),
+            };
+            let built = spec.into_gradient_rule().unwrap();
+            let midpoint = built.midpoint.expect("midpoint should be set");
+            assert_eq!(midpoint.point_type, expected, "{expected}");
+            assert_eq!(midpoint.value, "50");
+            assert_eq!(
+                midpoint.color_style.rgb_color,
+                parse_hex_color("#FF00FF").unwrap()
+            );
+            assert_eq!(
+                built.min_color_style.rgb_color,
+                parse_hex_color("#FFFFFF").unwrap()
+            );
+            assert_eq!(
+                built.max_color_style.rgb_color,
+                parse_hex_color("#000000").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn into_gradient_rule_propagates_a_malformed_midpoint_color() {
+        // `validate_gradient` catches this before `into_gradient_rule` is
+        // ever reached in the real flow, so this exercises the `?`
+        // error-propagation arm directly, the same way
+        // `into_cell_format_propagates_a_malformed_color` below does for
+        // `FormatEffect`.
+        let spec = GradientSpec {
+            min_color: "#FFFFFF".to_string(),
+            max_color: "#000000".to_string(),
+            mid: Some(GradientMidpoint {
+                color: "not-a-color".to_string(),
+                point_type: GradientPointType::Number,
+                value: "50".to_string(),
+            }),
+        };
+        let err = spec.into_gradient_rule().unwrap_err();
+        assert!(err.contains("--gradient-mid-color"), "{err}");
+    }
+
+    #[test]
+    fn into_cell_format_propagates_a_malformed_color() {
+        // Like the gradient case above: `validate_format_effect` catches
+        // this in the real flow, so this exercises `into_cell_format`'s two
+        // `?` error-propagation arms (background, then text color)
+        // directly.
+        let err = FormatEffect {
+            background: Some("not-a-color".to_string()),
+            text_color: None,
+            bold: None,
+        }
+        .into_cell_format()
+        .unwrap_err();
+        assert!(err.contains("--background"), "{err}");
+
+        let err = FormatEffect {
+            background: None,
+            text_color: Some("not-a-color".to_string()),
+            bold: None,
+        }
+        .into_cell_format()
+        .unwrap_err();
+        assert!(err.contains("--text-color"), "{err}");
+    }
+
+    #[test]
+    fn into_gradient_rule_propagates_a_malformed_min_or_max_color() {
+        let err = GradientSpec {
+            min_color: "not-a-color".to_string(),
+            max_color: "#000000".to_string(),
+            mid: None,
+        }
+        .into_gradient_rule()
+        .unwrap_err();
+        assert!(err.contains("--gradient-min-color"), "{err}");
+
+        let err = GradientSpec {
+            min_color: "#FFFFFF".to_string(),
+            max_color: "not-a-color".to_string(),
+            mid: None,
+        }
+        .into_gradient_rule()
+        .unwrap_err();
+        assert!(err.contains("--gradient-max-color"), "{err}");
+    }
+
+    #[test]
+    fn into_gradient_rule_with_no_midpoint_leaves_it_none() {
+        // `mid: None` is the shape `mount_workbook`'s fixture and every
+        // add/update test use, but none of them go through
+        // `into_gradient_rule` itself (they all build a boolean rule) —
+        // this hits the `None => None` arm directly.
+        let built = GradientSpec {
+            min_color: "#FFFFFF".to_string(),
+            max_color: "#000000".to_string(),
+            mid: None,
+        }
+        .into_gradient_rule()
+        .unwrap();
+        assert!(built.midpoint.is_none());
+    }
+
+    #[test]
+    fn into_conditional_format_rule_covers_both_variants_and_their_errors() {
+        // No test anywhere in this file builds a `FormatRule::Gradient`
+        // through the verb/engine flow (`add_verb` and friends only use
+        // `FormatRule::Boolean`), so `into_conditional_format_rule`'s
+        // `Gradient` arm — and its own `?` forwarding for both arms — is
+        // otherwise never reached.
+        let rule = FormatRule::Boolean {
+            condition: FormatCondition::CellEmpty,
+            format: FormatEffect {
+                background: Some("#FF0000".to_string()),
+                text_color: None,
+                bold: None,
+            },
+        }
+        .into_conditional_format_rule(vec![GridRange::default()])
+        .unwrap();
+        assert!(rule.boolean_rule.is_some());
+        assert!(rule.gradient_rule.is_none());
+
+        let err = FormatRule::Boolean {
+            condition: FormatCondition::CellEmpty,
+            format: FormatEffect {
+                background: Some("not-a-color".to_string()),
+                text_color: None,
+                bold: None,
+            },
+        }
+        .into_conditional_format_rule(vec![GridRange::default()])
+        .unwrap_err();
+        assert!(err.contains("--background"), "{err}");
+
+        let rule = FormatRule::Gradient(GradientSpec {
+            min_color: "#FFFFFF".to_string(),
+            max_color: "#000000".to_string(),
+            mid: None,
+        })
+        .into_conditional_format_rule(vec![GridRange::default()])
+        .unwrap();
+        assert!(rule.gradient_rule.is_some());
+        assert!(rule.boolean_rule.is_none());
+
+        let err = FormatRule::Gradient(GradientSpec {
+            min_color: "not-a-color".to_string(),
+            max_color: "#000000".to_string(),
+            mid: None,
+        })
+        .into_conditional_format_rule(vec![GridRange::default()])
+        .unwrap_err();
+        assert!(err.contains("--gradient-min-color"), "{err}");
+    }
+
+    // ── validate_format_rule ─────────────────────────────────────────
+
+    #[test]
+    fn validate_format_rule_short_circuits_on_a_condition_error() {
+        // The one existing wiremock test that reaches `validate_format_rule`
+        // (`add_rejects_a_malformed_background_color_before_the_lease_gate`)
+        // always uses `FormatCondition::CellEmpty`, which never fails, so
+        // the condition-side `?`'s error arm is otherwise never taken.
+        let err = validate_format_rule(&FormatRule::Boolean {
+            condition: FormatCondition::NumberBetween(10.0, 1.0),
+            format: FormatEffect {
+                background: Some("#FF0000".to_string()),
+                text_color: None,
+                bold: None,
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("must not exceed"), "{err}");
+
+        validate_format_rule(&FormatRule::Boolean {
+            condition: FormatCondition::CellEmpty,
+            format: FormatEffect {
+                background: Some("#FF0000".to_string()),
+                text_color: None,
+                bold: None,
+            },
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_format_rule_dispatches_gradient_specs_to_validate_gradient() {
+        // No test anywhere in this file calls `validate_format_rule` with a
+        // `FormatRule::Gradient` — every wiremock verb builder uses
+        // `FormatRule::Boolean` — so this arm is otherwise dead.
+        validate_format_rule(&FormatRule::Gradient(GradientSpec {
+            min_color: "#FFFFFF".to_string(),
+            max_color: "#000000".to_string(),
+            mid: None,
+        }))
+        .unwrap();
+
+        let err = validate_format_rule(&FormatRule::Gradient(GradientSpec {
+            min_color: "not-a-color".to_string(),
+            max_color: "#000000".to_string(),
+            mid: None,
+        }))
+        .unwrap_err();
+        assert!(err.contains("--gradient-min-color"), "{err}");
+    }
+
     // ── validate_condition / validate_format_effect / validate_gradient ─
 
     #[test]
@@ -1197,6 +1493,124 @@ mod tests {
     fn validate_condition_accepts_cell_empty() {
         validate_condition(&FormatCondition::CellEmpty).unwrap();
         validate_condition(&FormatCondition::CellNotEmpty).unwrap();
+    }
+
+    #[test]
+    fn validate_condition_rejects_a_reversed_number_not_between() {
+        let err = validate_condition(&FormatCondition::NumberNotBetween(10.0, 1.0)).unwrap_err();
+        assert!(err.contains("--number-not-between"), "{err}");
+        assert!(err.contains("must not exceed"), "{err}");
+    }
+
+    #[test]
+    fn validate_condition_rejects_nan_across_every_single_number_flag() {
+        let cases = [
+            (FormatCondition::NumberGreater(f64::NAN), "--number-greater"),
+            (
+                FormatCondition::NumberGreaterEq(f64::NAN),
+                "--number-greater-eq",
+            ),
+            (FormatCondition::NumberLess(f64::NAN), "--number-less"),
+            (FormatCondition::NumberLessEq(f64::NAN), "--number-less-eq"),
+            (FormatCondition::NumberEq(f64::NAN), "--number-eq"),
+            (FormatCondition::NumberNotEq(f64::NAN), "--number-not-eq"),
+        ];
+        for (condition, flag) in cases {
+            let err = validate_condition(&condition).unwrap_err();
+            assert!(err.contains(flag), "{err}");
+            assert!(err.contains("NaN"), "{err}");
+        }
+        // A non-NaN value on each of those flags is accepted.
+        validate_condition(&FormatCondition::NumberGreater(1.0)).unwrap();
+        validate_condition(&FormatCondition::NumberGreaterEq(1.0)).unwrap();
+        validate_condition(&FormatCondition::NumberLess(1.0)).unwrap();
+        validate_condition(&FormatCondition::NumberLessEq(1.0)).unwrap();
+        validate_condition(&FormatCondition::NumberEq(1.0)).unwrap();
+        validate_condition(&FormatCondition::NumberNotEq(1.0)).unwrap();
+    }
+
+    #[test]
+    fn validate_condition_rejects_an_empty_string_across_every_text_flag() {
+        let cases = [
+            (
+                FormatCondition::TextContains(String::new()),
+                "--text-contains",
+            ),
+            (
+                FormatCondition::TextNotContains(String::new()),
+                "--text-not-contains",
+            ),
+            (
+                FormatCondition::TextStartsWith(String::new()),
+                "--text-starts-with",
+            ),
+            (
+                FormatCondition::TextEndsWith(String::new()),
+                "--text-ends-with",
+            ),
+            (FormatCondition::TextEq(String::new()), "--text-eq"),
+        ];
+        for (condition, flag) in cases {
+            let err = validate_condition(&condition).unwrap_err();
+            assert!(err.contains(flag), "{err}");
+        }
+        // A non-empty value on each of those flags is accepted.
+        validate_condition(&FormatCondition::TextContains("x".to_string())).unwrap();
+        validate_condition(&FormatCondition::TextNotContains("x".to_string())).unwrap();
+        validate_condition(&FormatCondition::TextStartsWith("x".to_string())).unwrap();
+        validate_condition(&FormatCondition::TextEndsWith("x".to_string())).unwrap();
+        validate_condition(&FormatCondition::TextEq("x".to_string())).unwrap();
+    }
+
+    #[test]
+    fn validate_condition_rejects_a_blank_date_across_every_single_date_flag() {
+        let blank = DateValue::Absolute(String::new());
+        let cases = [
+            (FormatCondition::DateAfter(blank.clone()), "--date-after"),
+            (FormatCondition::DateBefore(blank.clone()), "--date-before"),
+            (FormatCondition::DateOn(blank), "--date-on"),
+        ];
+        for (condition, flag) in cases {
+            let err = validate_condition(&condition).unwrap_err();
+            assert!(err.contains(flag), "{err}");
+        }
+        // A non-blank date is accepted.
+        let today = DateValue::parse("today".to_string());
+        validate_condition(&FormatCondition::DateAfter(today.clone())).unwrap();
+        validate_condition(&FormatCondition::DateBefore(today.clone())).unwrap();
+        validate_condition(&FormatCondition::DateOn(today)).unwrap();
+    }
+
+    #[test]
+    fn validate_condition_rejects_an_invalid_or_reversed_date_between() {
+        let err = validate_condition(&FormatCondition::DateBetween(
+            "2024-01-01".to_string(),
+            String::new(),
+        ))
+        .unwrap_err();
+        assert!(err.contains("--date-between"), "{err}");
+
+        let err = validate_condition(&FormatCondition::DateBetween(
+            "2024-06-01".to_string(),
+            "2024-01-01".to_string(),
+        ))
+        .unwrap_err();
+        assert!(err.contains("--date-between"), "{err}");
+
+        validate_condition(&FormatCondition::DateBetween(
+            "2024-01-01".to_string(),
+            "2024-06-01".to_string(),
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_condition_rejects_a_blank_custom_formula() {
+        let err =
+            validate_condition(&FormatCondition::CustomFormula("   ".to_string())).unwrap_err();
+        assert!(err.contains("--custom-formula"), "{err}");
+
+        validate_condition(&FormatCondition::CustomFormula("=A1>0".to_string())).unwrap();
     }
 
     #[test]
@@ -1291,6 +1705,76 @@ mod tests {
         assert!(describe_existing_rule(&gradient).contains("gradient rule"));
     }
 
+    #[test]
+    fn describe_existing_rule_joins_multiple_boolean_format_parts() {
+        let rule = ConditionalFormatRule {
+            ranges: vec![GridRange::default()],
+            boolean_rule: Some(BooleanRule {
+                condition: BooleanCondition {
+                    condition_type: "CELL_EMPTY".to_string(),
+                    values: Vec::new(),
+                },
+                format: CellFormat {
+                    background_color_style: Some(ColorStyle {
+                        rgb_color: parse_hex_color("#FF0000").unwrap(),
+                    }),
+                    text_format: Some(TextFormat {
+                        foreground_color_style: Some(ColorStyle {
+                            rgb_color: parse_hex_color("#00FF00").unwrap(),
+                        }),
+                        bold: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            }),
+            gradient_rule: None,
+        };
+        let described = describe_existing_rule(&rule);
+        assert!(
+            described.contains("background+text color+bold"),
+            "{described}"
+        );
+    }
+
+    #[test]
+    fn describe_existing_rule_includes_the_gradient_midpoint() {
+        let rule = ConditionalFormatRule {
+            ranges: vec![GridRange::default()],
+            boolean_rule: None,
+            gradient_rule: Some(GradientRule {
+                min_color_style: ColorStyle {
+                    rgb_color: parse_hex_color("#FFFFFF").unwrap(),
+                },
+                midpoint: Some(InterpolationPoint {
+                    color_style: ColorStyle {
+                        rgb_color: parse_hex_color("#888888").unwrap(),
+                    },
+                    point_type: "PERCENT".to_string(),
+                    value: "50".to_string(),
+                }),
+                max_color_style: ColorStyle {
+                    rgb_color: parse_hex_color("#000000").unwrap(),
+                },
+            }),
+        };
+        let described = describe_existing_rule(&rule);
+        assert!(described.contains("mid percent at 50"), "{described}");
+    }
+
+    #[test]
+    fn describe_existing_rule_falls_back_for_an_unrecognized_rule_type() {
+        // Not a shape the real API would send (a `ConditionalFormatRule`
+        // with neither variant of its union set), but the struct allows it,
+        // so the defensive fallback is worth pinning directly.
+        let rule = ConditionalFormatRule {
+            ranges: vec![GridRange::default()],
+            boolean_rule: None,
+            gradient_rule: None,
+        };
+        assert_eq!(describe_existing_rule(&rule), "rule (unrecognized type)");
+    }
+
     // ── log_operation / label ────────────────────────────────────────
 
     #[test]
@@ -1323,6 +1807,390 @@ mod tests {
         assert_eq!(add.label(), "add-conditional-format");
         assert_eq!(update.label(), "update-conditional-format");
         assert_eq!(delete.label(), "delete-conditional-format");
+    }
+
+    // ── ConditionalFormatResult: FromLeaseRefusal / log_status ─────────
+
+    #[test]
+    fn from_lease_refusal_maps_every_variant() {
+        assert_eq!(
+            <ConditionalFormatResult as FromLeaseRefusal>::from_no_lease(),
+            ConditionalFormatResult::RefusedNoLease
+        );
+        assert_eq!(
+            <ConditionalFormatResult as FromLeaseRefusal>::from_lease_expired(),
+            ConditionalFormatResult::RefusedLeaseExpired
+        );
+        assert_eq!(
+            <ConditionalFormatResult as FromLeaseRefusal>::from_lease_wrong_file(),
+            ConditionalFormatResult::RefusedLeaseWrongFile
+        );
+        assert_eq!(
+            <ConditionalFormatResult as FromLeaseRefusal>::from_lease_stale(),
+            ConditionalFormatResult::RefusedLeaseStale
+        );
+        assert_eq!(
+            <ConditionalFormatResult as FromLeaseRefusal>::from_lease_failed("boom".to_string()),
+            ConditionalFormatResult::Failed {
+                detail: "boom".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn log_status_covers_every_result_variant() {
+        let cases = [
+            (
+                ConditionalFormatResult::WouldChange {
+                    summary: String::new(),
+                },
+                "would-change",
+            ),
+            (
+                ConditionalFormatResult::RefusedNotASpreadsheet {
+                    mime_type: String::new(),
+                },
+                "refused-not-a-spreadsheet",
+            ),
+            (ConditionalFormatResult::RefusedShortcut, "refused-shortcut"),
+            (
+                ConditionalFormatResult::RefusedNoVisibleParents,
+                "refused-no-visible-parents",
+            ),
+            (
+                ConditionalFormatResult::RefusedSheetNotFound {
+                    title: String::new(),
+                    available: Vec::new(),
+                },
+                "refused-sheet-not-found",
+            ),
+            (
+                ConditionalFormatResult::RefusedInvalidRange {
+                    detail: String::new(),
+                },
+                "refused-invalid-range",
+            ),
+            (
+                ConditionalFormatResult::RefusedIndexOutOfBounds {
+                    sheet: String::new(),
+                    index: 0,
+                    count: 0,
+                },
+                "refused-index-out-of-bounds",
+            ),
+            (
+                ConditionalFormatResult::Blocked { decided_by: None },
+                "blocked",
+            ),
+            (ConditionalFormatResult::RefusedNoLease, "refused-no-lease"),
+            (
+                ConditionalFormatResult::RefusedLeaseExpired,
+                "refused-lease-expired",
+            ),
+            (
+                ConditionalFormatResult::RefusedLeaseWrongFile,
+                "refused-lease-wrong-file",
+            ),
+            (
+                ConditionalFormatResult::RefusedLeaseStale,
+                "refused-lease-stale",
+            ),
+            (
+                ConditionalFormatResult::Changed {
+                    summary: String::new(),
+                },
+                "changed",
+            ),
+            (
+                ConditionalFormatResult::Failed {
+                    detail: String::new(),
+                },
+                "failed",
+            ),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(result.log_status(), expected, "{result:?}");
+        }
+    }
+
+    #[test]
+    fn write_jsonl_delegates_to_write_scalar_jsonl() {
+        let outcome = ConditionalFormatOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: add_verb(),
+            result: ConditionalFormatResult::Changed {
+                summary: "x".to_string(),
+            },
+        };
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("\"status\":\"changed\""), "{text}");
+        assert!(text.contains("\"spreadsheet_id\":\"sheet-1\""), "{text}");
+    }
+
+    // ── describe_lines ───────────────────────────────────────────────
+
+    fn describe_outcome(
+        verb: ConditionalFormatVerb,
+        result: ConditionalFormatResult,
+    ) -> ConditionalFormatOutcome {
+        ConditionalFormatOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb,
+            result,
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_would_change_and_changed() {
+        let outcome = describe_outcome(
+            add_verb(),
+            ConditionalFormatResult::WouldChange {
+                summary: "add conditional format (boolean rule)".to_string(),
+            },
+        );
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("Would add conditional format"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("'Budget'"), "{lines:?}");
+
+        let outcome = describe_outcome(
+            add_verb(),
+            ConditionalFormatResult::Changed {
+                summary: "add conditional format (boolean rule)".to_string(),
+            },
+        );
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("Applied: add conditional format"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn describe_lines_falls_back_to_the_spreadsheet_id_with_no_file_name() {
+        let outcome = ConditionalFormatOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: None,
+            resolved_folder_id: None,
+            verb: add_verb(),
+            result: ConditionalFormatResult::Changed {
+                summary: "add conditional format".to_string(),
+            },
+        };
+        let lines = describe_lines(&outcome);
+        assert!(lines[0].contains("'sheet-1'"), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_lines_renders_refused_not_a_spreadsheet() {
+        let outcome = describe_outcome(
+            add_verb(),
+            ConditionalFormatResult::RefusedNotASpreadsheet {
+                mime_type: "text/plain".to_string(),
+            },
+        );
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("not a Google Sheet"), "{lines:?}");
+        assert!(lines[0].contains("text/plain"), "{lines:?}");
+        assert!(lines[0].contains("add-conditional-format"), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_lines_renders_refused_shortcut() {
+        let outcome = describe_outcome(add_verb(), ConditionalFormatResult::RefusedShortcut);
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("is a shortcut"), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_lines_renders_refused_no_visible_parents() {
+        let outcome =
+            describe_outcome(add_verb(), ConditionalFormatResult::RefusedNoVisibleParents);
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("no parent folder visible"), "{lines:?}");
+        assert!(lines[0].contains("sheets-structure"), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_lines_renders_refused_sheet_not_found() {
+        let outcome = describe_outcome(
+            add_verb(),
+            ConditionalFormatResult::RefusedSheetNotFound {
+                title: "Missing".to_string(),
+                available: vec!["Q1".to_string(), "Q2".to_string()],
+            },
+        );
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("no sheet titled 'Missing'"), "{lines:?}");
+        assert!(lines[0].contains("'Q1', 'Q2'"), "{lines:?}");
+
+        let outcome = describe_outcome(
+            add_verb(),
+            ConditionalFormatResult::RefusedSheetNotFound {
+                title: "Missing".to_string(),
+                available: Vec::new(),
+            },
+        );
+        let lines = describe_lines(&outcome);
+        assert!(lines[0].contains("Available: none"), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_lines_renders_refused_invalid_range() {
+        let outcome = describe_outcome(
+            add_verb(),
+            ConditionalFormatResult::RefusedInvalidRange {
+                detail: "bad range".to_string(),
+            },
+        );
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines, vec!["Refused: bad range".to_string()]);
+    }
+
+    #[test]
+    fn describe_lines_renders_index_out_of_bounds_for_add_with_full_range() {
+        // `add-conditional-format` may append at `count`, so its valid
+        // range is `0..=count` — max_valid == count.
+        let outcome = describe_outcome(
+            add_verb(),
+            ConditionalFormatResult::RefusedIndexOutOfBounds {
+                sheet: "Q1".to_string(),
+                index: 5,
+                count: 3,
+            },
+        );
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("valid indices 0-3"), "{lines:?}");
+        assert!(lines[0].contains("index 5 is out of bounds"), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_lines_renders_index_out_of_bounds_for_update_and_delete_with_shrunk_range() {
+        // `update`/`delete` may only act on an existing rule, so their
+        // valid range is `0..count` — max_valid == count - 1.
+        let update_verb = ConditionalFormatVerb::UpdateConditionalFormat {
+            sheet: "Q1".to_string(),
+            ranges: vec!["A1".to_string()],
+            index: 5,
+            rule: FormatRule::Boolean {
+                condition: FormatCondition::CellEmpty,
+                format: FormatEffect::default(),
+            },
+        };
+        let outcome = describe_outcome(
+            update_verb,
+            ConditionalFormatResult::RefusedIndexOutOfBounds {
+                sheet: "Q1".to_string(),
+                index: 5,
+                count: 3,
+            },
+        );
+        let lines = describe_lines(&outcome);
+        assert!(lines[0].contains("valid indices 0-2"), "{lines:?}");
+
+        let delete_verb = ConditionalFormatVerb::DeleteConditionalFormat {
+            sheet: "Q1".to_string(),
+            index: 5,
+        };
+        let outcome = describe_outcome(
+            delete_verb,
+            ConditionalFormatResult::RefusedIndexOutOfBounds {
+                sheet: "Q1".to_string(),
+                index: 5,
+                count: 3,
+            },
+        );
+        let lines = describe_lines(&outcome);
+        assert!(lines[0].contains("valid indices 0-2"), "{lines:?}");
+
+        // The `count == 0` edge case: `saturating_sub` keeps max_valid at 0
+        // rather than underflowing.
+        let delete_verb = ConditionalFormatVerb::DeleteConditionalFormat {
+            sheet: "Q1".to_string(),
+            index: 0,
+        };
+        let outcome = describe_outcome(
+            delete_verb,
+            ConditionalFormatResult::RefusedIndexOutOfBounds {
+                sheet: "Q1".to_string(),
+                index: 0,
+                count: 0,
+            },
+        );
+        let lines = describe_lines(&outcome);
+        assert!(lines[0].contains("valid indices 0-0"), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_lines_renders_blocked_with_and_without_a_deciding_rule() {
+        let outcome = describe_outcome(
+            add_verb(),
+            ConditionalFormatResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 2,
+                }),
+            },
+        );
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("Blocked: add-conditional-format"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("rule on folder folder-1"), "{lines:?}");
+        assert!(lines[0].contains("(depth 2)"), "{lines:?}");
+
+        let outcome = describe_outcome(
+            add_verb(),
+            ConditionalFormatResult::Blocked { decided_by: None },
+        );
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("refused by default policy"), "{lines:?}");
+        assert!(lines[0].contains("sheets-structure"), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_lines_renders_every_lease_refusal() {
+        for result in [
+            ConditionalFormatResult::RefusedNoLease,
+            ConditionalFormatResult::RefusedLeaseExpired,
+            ConditionalFormatResult::RefusedLeaseWrongFile,
+            ConditionalFormatResult::RefusedLeaseStale,
+        ] {
+            let outcome = describe_outcome(add_verb(), result.clone());
+            let lines = describe_lines(&outcome);
+            assert_eq!(lines.len(), 1, "{result:?} -> {lines:?}");
+            assert!(lines[0].starts_with("Refused:"), "{result:?} -> {lines:?}");
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_failed() {
+        let outcome = describe_outcome(
+            add_verb(),
+            ConditionalFormatResult::Failed {
+                detail: "boom".to_string(),
+            },
+        );
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines, vec!["Failed: boom".to_string()]);
     }
 
     // ── integration (wiremock) ───────────────────────────────────────
@@ -1778,5 +2646,38 @@ mod tests {
             }
             other => panic!("expected RefusedInvalidRange, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_empty_ranges_list_before_any_network_call() {
+        // No mounts at all: an empty `--range` list is refused before the
+        // metadata fetch, so nothing should reach the mock server.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = ConditionalFormatOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ConditionalFormatVerb::AddConditionalFormat {
+                sheet: "Q1".to_string(),
+                ranges: Vec::new(),
+                index: None,
+                rule: FormatRule::Boolean {
+                    condition: FormatCondition::CellEmpty,
+                    format: FormatEffect::default(),
+                },
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = conditional_format(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            ConditionalFormatResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("needs at least one --range"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.is_empty(), "{requests:?}");
     }
 }
