@@ -51,8 +51,8 @@ use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
     AutoResizeDimensionsRequest, BatchUpdateRequestItem, Border, CellFormat, ColorStyle, Dimension,
-    DimensionProperties, DimensionRange, GridRange, MergeCellsRequest, NumberFormat,
-    RepeatCellData, RepeatCellRequest, Spreadsheet, TextFormat, UnmergeCellsRequest,
+    DimensionProperties, DimensionRange, GridRange, MergeCellsRequest, NumberFormat, Padding,
+    RepeatCellData, RepeatCellRequest, Spreadsheet, TextFormat, TextRotation, UnmergeCellsRequest,
     UpdateBordersRequest, UpdateDimensionPropertiesRequest, ValueRange,
 };
 use crate::drive::types::SheetTargetRefusal;
@@ -94,9 +94,33 @@ pub struct CellFormatFlags {
     pub number_format_type: Option<String>,
     /// Already wire-shaped (`"OVERFLOW_CELL"`/`"CLIP"`/`"WRAP"`).
     pub wrap: Option<String>,
+    /// Font family name, e.g. `"Arial"`.
+    pub font_family: Option<String>,
+    /// Rotation angle in degrees, -90 to 90. Mutually exclusive with
+    /// `text_rotation_vertical` — [`build_cell_format`] refuses both set.
+    pub text_rotation_angle: Option<i64>,
+    /// Stack text vertically instead of rotating it. Mutually exclusive
+    /// with `text_rotation_angle`.
+    pub text_rotation_vertical: Option<bool>,
+    /// Already wire-shaped (`"LINKED"`/`"PLAIN_TEXT"`).
+    pub hyperlink_display_type: Option<String>,
+    /// Top padding, in pixels.
+    pub padding_top: Option<i64>,
+    /// Right padding, in pixels.
+    pub padding_right: Option<i64>,
+    /// Bottom padding, in pixels.
+    pub padding_bottom: Option<i64>,
+    /// Left padding, in pixels.
+    pub padding_left: Option<i64>,
+    /// Already wire-shaped (`"LEFT_TO_RIGHT"`/`"RIGHT_TO_LEFT"`).
+    pub text_direction: Option<String>,
 }
 
 /// Which sides an `update-borders` verb sets. At least one must be `true`.
+///
+/// `inner_horizontal`/`inner_vertical` are the grid lines *between* cells
+/// in a multi-cell range — deliberately excluded from `--all`, which
+/// stays scoped to the four outer edges.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BorderSides {
     /// Top edge.
@@ -107,11 +131,20 @@ pub struct BorderSides {
     pub left: bool,
     /// Right edge.
     pub right: bool,
+    /// Horizontal grid lines between rows within the range.
+    pub inner_horizontal: bool,
+    /// Vertical grid lines between columns within the range.
+    pub inner_vertical: bool,
 }
 
 impl BorderSides {
     fn any(self) -> bool {
-        self.top || self.bottom || self.left || self.right
+        self.top
+            || self.bottom
+            || self.left
+            || self.right
+            || self.inner_horizontal
+            || self.inner_vertical
     }
 }
 
@@ -124,8 +157,10 @@ pub enum FormatVerb {
         sheet: Option<String>,
         /// An explicit A1 range, which may carry its own `Sheet!` prefix.
         range: Option<String>,
-        /// The properties to set.
-        format: CellFormatFlags,
+        /// The properties to set. Boxed: `CellFormatFlags` has grown large
+        /// enough that an unboxed field would make every other, far
+        /// smaller `FormatVerb` variant pay for its size.
+        format: Box<CellFormatFlags>,
     },
     /// Set border lines on a range's edges.
     UpdateBorders {
@@ -436,6 +471,11 @@ fn build_cell_format(flags: &CellFormatFlags) -> Result<(CellFormat, String), St
         text_format_used = true;
         fields.push("userEnteredFormat.textFormat.foregroundColorStyle");
     }
+    if let Some(font_family) = &flags.font_family {
+        text_format.font_family = Some(font_family.clone());
+        text_format_used = true;
+        fields.push("userEnteredFormat.textFormat.fontFamily");
+    }
     if text_format_used {
         format.text_format = Some(text_format);
     }
@@ -471,6 +511,50 @@ fn build_cell_format(flags: &CellFormatFlags) -> Result<(CellFormat, String), St
     if let Some(wrap) = &flags.wrap {
         format.wrap_strategy = Some(wrap.clone());
         fields.push("userEnteredFormat.wrapStrategy");
+    }
+    match (flags.text_rotation_angle, flags.text_rotation_vertical) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "--text-rotation-angle and --text-rotation-vertical are mutually exclusive"
+                    .to_string(),
+            )
+        }
+        (Some(angle), None) => {
+            format.text_rotation = Some(TextRotation {
+                angle: Some(angle as i32),
+                vertical: None,
+            });
+            fields.push("userEnteredFormat.textRotation");
+        }
+        (None, Some(vertical)) => {
+            format.text_rotation = Some(TextRotation {
+                angle: None,
+                vertical: Some(vertical),
+            });
+            fields.push("userEnteredFormat.textRotation");
+        }
+        (None, None) => {}
+    }
+    if let Some(hyperlink_display_type) = &flags.hyperlink_display_type {
+        format.hyperlink_display_type = Some(hyperlink_display_type.clone());
+        fields.push("userEnteredFormat.hyperlinkDisplayType");
+    }
+    if flags.padding_top.is_some()
+        || flags.padding_right.is_some()
+        || flags.padding_bottom.is_some()
+        || flags.padding_left.is_some()
+    {
+        format.padding = Some(Padding {
+            top: flags.padding_top.map(|n| n as i32),
+            right: flags.padding_right.map(|n| n as i32),
+            bottom: flags.padding_bottom.map(|n| n as i32),
+            left: flags.padding_left.map(|n| n as i32),
+        });
+        fields.push("userEnteredFormat.padding");
+    }
+    if let Some(text_direction) = &flags.text_direction {
+        format.text_direction = Some(text_direction.clone());
+        fields.push("userEnteredFormat.textDirection");
     }
 
     if fields.is_empty() {
@@ -869,7 +953,7 @@ fn describe_effect(verb: &FormatVerb, discarded_cells: &[String]) -> Result<Stri
             if !sides.any() {
                 return Err(
                     "update-borders needs at least one side (--top, --bottom, --left, --right, \
-                     --all)"
+                     --all, --inner-horizontal, --inner-vertical)"
                         .to_string(),
                 );
             }
@@ -885,6 +969,12 @@ fn describe_effect(verb: &FormatVerb, discarded_cells: &[String]) -> Result<Stri
             }
             if sides.right {
                 names.push("right");
+            }
+            if sides.inner_horizontal {
+                names.push("inner-horizontal");
+            }
+            if sides.inner_vertical {
+                names.push("inner-vertical");
             }
             Ok(format!("{} border(s), style {style}", names.join(", ")))
         }
@@ -969,7 +1059,13 @@ fn build_request(
                 request.left = Some(border.clone());
             }
             if sides.right {
-                request.right = Some(border);
+                request.right = Some(border.clone());
+            }
+            if sides.inner_horizontal {
+                request.inner_horizontal = Some(border.clone());
+            }
+            if sides.inner_vertical {
+                request.inner_vertical = Some(border);
             }
             Ok(BatchUpdateRequestItem::UpdateBorders(request))
         }
@@ -1265,10 +1361,10 @@ mod tests {
             verb: FormatVerb::FormatCells {
                 sheet: Some("Q1".to_string()),
                 range: Some("A1:B2".to_string()),
-                format: CellFormatFlags {
+                format: Box::new(CellFormatFlags {
                     bold: Some(true),
                     ..Default::default()
-                },
+                }),
             },
             dry_run,
             lease_token: Some(token),
@@ -1641,6 +1737,16 @@ mod tests {
             ..Default::default()
         }
         .any());
+        assert!(BorderSides {
+            inner_horizontal: true,
+            ..Default::default()
+        }
+        .any());
+        assert!(BorderSides {
+            inner_vertical: true,
+            ..Default::default()
+        }
+        .any());
     }
 
     #[test]
@@ -1770,6 +1876,14 @@ mod tests {
             number_format_pattern: Some("0.00".to_string()),
             number_format_type: Some("NUMBER".to_string()),
             wrap: Some("WRAP".to_string()),
+            font_family: Some("Arial".to_string()),
+            text_rotation_angle: Some(45),
+            hyperlink_display_type: Some("PLAIN_TEXT".to_string()),
+            padding_top: Some(1),
+            padding_right: Some(2),
+            padding_bottom: Some(3),
+            padding_left: Some(4),
+            text_direction: Some("RIGHT_TO_LEFT".to_string()),
             ..Default::default()
         };
         let (format, fields) = build_cell_format(&flags).unwrap();
@@ -1779,23 +1893,63 @@ mod tests {
         assert_eq!(text_format.underline, Some(true));
         assert_eq!(text_format.font_size, Some(14));
         assert!(text_format.foreground_color_style.is_some());
+        assert_eq!(text_format.font_family.as_deref(), Some("Arial"));
         assert_eq!(format.horizontal_alignment.as_deref(), Some("CENTER"));
         assert_eq!(format.vertical_alignment.as_deref(), Some("MIDDLE"));
         assert!(format.number_format.is_some());
         assert_eq!(format.wrap_strategy.as_deref(), Some("WRAP"));
+        let text_rotation = format.text_rotation.unwrap();
+        assert_eq!(text_rotation.angle, Some(45));
+        assert_eq!(text_rotation.vertical, None);
+        assert_eq!(format.hyperlink_display_type.as_deref(), Some("PLAIN_TEXT"));
+        let padding = format.padding.unwrap();
+        assert_eq!(padding.top, Some(1));
+        assert_eq!(padding.right, Some(2));
+        assert_eq!(padding.bottom, Some(3));
+        assert_eq!(padding.left, Some(4));
+        assert_eq!(format.text_direction.as_deref(), Some("RIGHT_TO_LEFT"));
         for expected in [
             "userEnteredFormat.textFormat.italic",
             "userEnteredFormat.textFormat.strikethrough",
             "userEnteredFormat.textFormat.underline",
             "userEnteredFormat.textFormat.fontSize",
             "userEnteredFormat.textFormat.foregroundColorStyle",
+            "userEnteredFormat.textFormat.fontFamily",
             "userEnteredFormat.horizontalAlignment",
             "userEnteredFormat.verticalAlignment",
             "userEnteredFormat.numberFormat",
             "userEnteredFormat.wrapStrategy",
+            "userEnteredFormat.textRotation",
+            "userEnteredFormat.hyperlinkDisplayType",
+            "userEnteredFormat.padding",
+            "userEnteredFormat.textDirection",
         ] {
             assert!(fields.contains(expected), "{fields} missing {expected}");
         }
+    }
+
+    #[test]
+    fn build_cell_format_sets_text_rotation_vertical() {
+        let flags = CellFormatFlags {
+            text_rotation_vertical: Some(true),
+            ..Default::default()
+        };
+        let (format, fields) = build_cell_format(&flags).unwrap();
+        let text_rotation = format.text_rotation.unwrap();
+        assert_eq!(text_rotation.angle, None);
+        assert_eq!(text_rotation.vertical, Some(true));
+        assert_eq!(fields, "userEnteredFormat.textRotation");
+    }
+
+    #[test]
+    fn build_cell_format_rejects_conflicting_text_rotation() {
+        let flags = CellFormatFlags {
+            text_rotation_angle: Some(45),
+            text_rotation_vertical: Some(true),
+            ..Default::default()
+        };
+        let err = build_cell_format(&flags).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
     }
 
     // ── build_request: defensive unreachable branches ────────────────────
@@ -1939,10 +2093,10 @@ mod tests {
         let verb = FormatVerb::FormatCells {
             sheet: Some("Other".to_string()),
             range: Some("Sheet1!A1:B2".to_string()),
-            format: CellFormatFlags {
+            format: Box::new(CellFormatFlags {
                 bold: Some(true),
                 ..Default::default()
-            },
+            }),
         };
 
         let outcome = format(&drive, &sheets, &opts(verb, false), &rules).await;
@@ -2088,10 +2242,10 @@ mod tests {
         let verb = FormatVerb::FormatCells {
             sheet: Some("Nope".to_string()),
             range: Some("A1:B2".to_string()),
-            format: CellFormatFlags {
+            format: Box::new(CellFormatFlags {
                 bold: Some(true),
                 ..Default::default()
-            },
+            }),
         };
 
         let outcome = format(&drive, &sheets, &opts(verb, true), &rules).await;
@@ -2121,10 +2275,10 @@ mod tests {
         let verb = FormatVerb::FormatCells {
             sheet: Some("Q1".to_string()),
             range: Some("definitely bogus".to_string()),
-            format: CellFormatFlags {
+            format: Box::new(CellFormatFlags {
                 bold: Some(true),
                 ..Default::default()
-            },
+            }),
         };
 
         let outcome = format(&drive, &sheets, &opts(verb, true), &rules).await;
@@ -2357,6 +2511,7 @@ mod tests {
             bottom: true,
             left: true,
             right: true,
+            ..Default::default()
         };
         let verb = update_borders_verb(sides, "DASHED", Some("00FF00"));
 
@@ -2374,6 +2529,50 @@ mod tests {
         for side in ["top", "bottom", "left", "right"] {
             assert_eq!(update_borders[side]["style"], "DASHED", "{update_borders}");
         }
+    }
+
+    #[tokio::test]
+    async fn update_borders_sets_inner_horizontal_and_inner_vertical() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let sides = BorderSides {
+            inner_horizontal: true,
+            inner_vertical: true,
+            ..Default::default()
+        };
+        let verb = update_borders_verb(sides, "DOTTED", Some("00FF00"));
+
+        let outcome = format(&drive, &sheets, &opts(verb, false), &rules).await;
+        match &outcome.result {
+            FormatResult::Changed { summary, .. } => {
+                assert!(
+                    summary.contains("inner-horizontal, inner-vertical"),
+                    "{summary}"
+                );
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let body = find_batch_update(&requests);
+        let update_borders = &body["requests"][0]["updateBorders"];
+        for side in ["innerHorizontal", "innerVertical"] {
+            assert_eq!(update_borders[side]["style"], "DOTTED", "{update_borders}");
+        }
+        assert!(update_borders.get("top").is_none());
     }
 
     #[tokio::test]

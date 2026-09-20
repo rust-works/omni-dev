@@ -631,6 +631,9 @@ pub struct TextFormat {
         rename = "foregroundColorStyle"
     )]
     pub foreground_color_style: Option<ColorStyle>,
+    /// Font family name, e.g. `"Arial"`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "fontFamily")]
+    pub font_family: Option<String>,
 }
 
 /// A cell's display number format — `CellFormat.numberFormat`.
@@ -642,6 +645,39 @@ pub struct NumberFormat {
     pub format_type: String,
     /// The display pattern, e.g. `"#,##0.00"`.
     pub pattern: String,
+}
+
+/// `CellFormat.textRotation` — a union.
+///
+/// Exactly one of `angle`/`vertical` may be set, never both.
+/// `format.rs::build_cell_format` enforces that even though the CLI
+/// already refuses the conflicting flag pair, since this type is also
+/// constructible directly (e.g. in engine tests).
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct TextRotation {
+    /// Rotation angle in degrees, -90 to 90.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub angle: Option<i32>,
+    /// Whether the text is stacked vertically instead of rotated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vertical: Option<bool>,
+}
+
+/// `CellFormat.padding` — each side is independently optional.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct Padding {
+    /// Top padding, in pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top: Option<i32>,
+    /// Right padding, in pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<i32>,
+    /// Bottom padding, in pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<i32>,
+    /// Left padding, in pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<i32>,
 }
 
 /// The mutable subset of `CellFormat` this crate can set via `repeatCell`.
@@ -675,6 +711,21 @@ pub struct CellFormat {
     /// `"OVERFLOW_CELL"` / `"CLIP"` / `"WRAP"`.
     #[serde(skip_serializing_if = "Option::is_none", rename = "wrapStrategy")]
     pub wrap_strategy: Option<String>,
+    /// Rotation of text in the cell.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "textRotation")]
+    pub text_rotation: Option<TextRotation>,
+    /// `"LINKED"` / `"PLAIN_TEXT"`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "hyperlinkDisplayType"
+    )]
+    pub hyperlink_display_type: Option<String>,
+    /// Cell padding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padding: Option<Padding>,
+    /// `"LEFT_TO_RIGHT"` / `"RIGHT_TO_LEFT"`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "textDirection")]
+    pub text_direction: Option<String>,
 }
 
 /// The `cell` payload of a `repeatCellRequest` — deliberately **has no
@@ -719,10 +770,11 @@ pub struct Border {
 ///
 /// Each side is independently optional — an unset side is left exactly as
 /// it was, which is what lets `format.rs::update-borders` touch only the
-/// sides `--top`/`--bottom`/`--left`/`--right`/`--all` actually named.
-/// `innerHorizontal`/`innerVertical` (the grid lines *between* cells in a
-/// multi-cell range) have no flag in v1 — a documented cut, not a silent
-/// gap.
+/// sides `--top`/`--bottom`/`--left`/`--right`/`--all`/
+/// `--inner-horizontal`/`--inner-vertical` actually named.
+/// `innerHorizontal`/`innerVertical` are the grid lines *between* cells in
+/// a multi-cell range, deliberately left out of `--all` since they don't
+/// apply to a single-cell range the way the four outer edges do.
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct UpdateBordersRequest {
     /// Which cells this applies to.
@@ -739,6 +791,12 @@ pub struct UpdateBordersRequest {
     /// Right edge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub right: Option<Border>,
+    /// Horizontal grid lines between rows within the range.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "innerHorizontal")]
+    pub inner_horizontal: Option<Border>,
+    /// Vertical grid lines between columns within the range.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "innerVertical")]
+    pub inner_vertical: Option<Border>,
 }
 
 /// `MergeCellsRequest`.
