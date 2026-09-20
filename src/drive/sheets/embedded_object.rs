@@ -618,14 +618,27 @@ async fn embedded_object_inner(
     gated(result)
 }
 
+/// Rejects a `--pie-hole` value outside the API's `0.0`-`1.0` range.
+fn validate_pie_hole(pie_hole: Option<f64>) -> Result<(), String> {
+    match pie_hole {
+        Some(hole) if !(0.0..=1.0).contains(&hole) => Err(format!(
+            "--pie-hole must be between 0.0 and 1.0, got {hole}"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Rejects a verb whose own arguments are internally inconsistent, cheaply,
 /// before ever fetching the workbook.
 fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
     match verb {
-        EmbeddedObjectVerb::AddChart { series, .. } => {
+        EmbeddedObjectVerb::AddChart {
+            series, pie_hole, ..
+        } => {
             if series.is_empty() {
                 return Err("at least one --series is required".to_string());
             }
+            validate_pie_hole(*pie_hole)?;
             Ok(())
         }
         EmbeddedObjectVerb::UpdateChart {
@@ -661,13 +674,14 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            if domain.is_some() && series.is_empty() {
+            if domain.is_some() == series.is_empty() {
                 return Err(
-                    "--domain requires --series (Sheets replaces both together, \
-                    never one alone)"
+                    "--domain and --series must be passed together (Sheets replaces \
+                    both together, never one alone)"
                         .to_string(),
                 );
             }
+            validate_pie_hole(*pie_hole)?;
             Ok(())
         }
         EmbeddedObjectVerb::UpdateSlicer {
@@ -691,6 +705,9 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
                      --clear-criteria, --title, or --apply-to-pivot-tables"
                         .to_string(),
                 );
+            }
+            if *clear_criteria && !hide_values.is_empty() {
+                return Err("--clear-criteria and --hide-values are mutually exclusive".to_string());
             }
             Ok(())
         }
@@ -2188,7 +2205,102 @@ mod tests {
             pie_hole: None,
         };
         let err = validate_verb(&verb).unwrap_err();
-        assert!(err.contains("--domain requires --series"), "{err}");
+        assert!(
+            err.contains("--domain and --series must be passed together"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_verb_rejects_update_chart_series_without_domain() {
+        let verb = EmbeddedObjectVerb::UpdateChart {
+            chart_id: 1,
+            chart_type: None,
+            domain: None,
+            series: vec!["B1:B10".to_string()],
+            sheet: None,
+            title: None,
+            subtitle: None,
+            legend: None,
+            stacked: None,
+            header_count: None,
+            horizontal_axis_title: None,
+            vertical_axis_title: None,
+            pie_hole: None,
+        };
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(
+            err.contains("--domain and --series must be passed together"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_verb_accepts_update_chart_domain_and_series_together() {
+        let verb = EmbeddedObjectVerb::UpdateChart {
+            chart_id: 1,
+            chart_type: None,
+            domain: Some("A1:A10".to_string()),
+            series: vec!["B1:B10".to_string()],
+            sheet: None,
+            title: None,
+            subtitle: None,
+            legend: None,
+            stacked: None,
+            header_count: None,
+            horizontal_axis_title: None,
+            vertical_axis_title: None,
+            pie_hole: None,
+        };
+        assert!(validate_verb(&verb).is_ok());
+    }
+
+    #[test]
+    fn validate_verb_rejects_add_chart_pie_hole_out_of_range() {
+        let mut verb = add_chart_verb();
+        let EmbeddedObjectVerb::AddChart { pie_hole, .. } = &mut verb else {
+            unreachable!()
+        };
+        *pie_hole = Some(1.5);
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(
+            err.contains("--pie-hole must be between 0.0 and 1.0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_verb_accepts_add_chart_pie_hole_in_range() {
+        let mut verb = add_chart_verb();
+        let EmbeddedObjectVerb::AddChart { pie_hole, .. } = &mut verb else {
+            unreachable!()
+        };
+        *pie_hole = Some(0.5);
+        assert!(validate_verb(&verb).is_ok());
+    }
+
+    #[test]
+    fn validate_verb_rejects_update_chart_pie_hole_out_of_range() {
+        let verb = EmbeddedObjectVerb::UpdateChart {
+            chart_id: 1,
+            chart_type: None,
+            domain: None,
+            series: Vec::new(),
+            sheet: None,
+            title: None,
+            subtitle: None,
+            legend: None,
+            stacked: None,
+            header_count: None,
+            horizontal_axis_title: None,
+            vertical_axis_title: None,
+            pie_hole: Some(-0.1),
+        };
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(
+            err.contains("--pie-hole must be between 0.0 and 1.0"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2220,6 +2332,25 @@ mod tests {
             apply_to_pivot_tables: None,
         };
         assert!(validate_verb(&verb).is_ok());
+    }
+
+    #[test]
+    fn validate_verb_rejects_update_slicer_clear_criteria_with_hide_values() {
+        let verb = EmbeddedObjectVerb::UpdateSlicer {
+            slicer_id: 1,
+            sheet: None,
+            range: None,
+            column: None,
+            hide_values: vec!["foo".to_string()],
+            clear_criteria: true,
+            title: None,
+            apply_to_pivot_tables: None,
+        };
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(
+            err.contains("--clear-criteria and --hide-values are mutually exclusive"),
+            "{err}"
+        );
     }
 
     // ── existing_chart_kind ──────────────────────────────────────────────
