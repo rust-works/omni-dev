@@ -2298,6 +2298,16 @@ every field this crate doesn't model (styling, `hiddenDimensionStrategy`,
 support is `hiddenValues` only, the same cut `set-basic-filter`/
 `add-filter-view` make.
 
+**`--pie-hole` is validated two ways**, on both `add-chart` and
+`update-chart`: the value must be `0.0`-`1.0` inclusive, and it is refused
+outright on anything but a pie chart (a basic chart's spec has no field for
+it, so silently accepting it would be a no-op write). `update-slicer`'s
+`--clear-criteria` and `--hide-values` are mutually exclusive — unlike
+`update-filter-view`'s `--clear-criteria`/`--hide-values`, which compose
+(clear resets, then the new entries layer on top), a slicer's filter
+criteria is a single value rather than a per-column map, so there is
+nothing for the two to compose *onto*.
+
 **Positioning is add-only.** `--anchor` (an A1 cell, using `--sheet` for its
 prefix when bare) plus optional `--offset-x`/`--offset-y`/`--width`/
 `--height` in pixels; a chart may instead take `--new-sheet` to get a sheet
