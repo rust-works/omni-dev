@@ -479,7 +479,7 @@ mod tests {
             &workbook,
             "'Q1'",
             |detail| detail,
-            |t, a| format!("{t} {a:?}"),
+            |t, a| format!("{t} {a:?}"), // omni-dev: coverage ignore-line reason="a sheet-only composition always fails at the split_sheet_prefix check above; not_found is never reached in this test"
         )
         .unwrap_err();
         assert!(err.contains("--whole-sheet"), "{err}");
