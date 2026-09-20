@@ -627,8 +627,8 @@ operation anywhere in a target's ancestor chain:
 | `create`            | deny    | `create`, `sheets create` |
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range` |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table` |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-pivot-table` (also needs `sheets-write`) |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -2110,6 +2110,89 @@ not reachable, the same documented cut `set-data-validation` names:
 `DATE_NOT_BETWEEN`, `DATE_IS_VALID`. `GradientRule`'s two endpoints are
 always anchored `MIN`/`MAX`; Sheets also allows an endpoint anchored at an
 explicit `NUMBER`/`PERCENT`/`PERCENTILE` value, which is not reachable here.
+
+#### drive sheets add-pivot-table / delete-pivot-table / list-pivot-tables
+
+Pivot tables. Unlike every other capability in this tranche, there is no
+`addPivotTable` request — a pivot table is created by `updateCells`
+carrying a `pivotTable` in a single anchor cell's `CellData`, and the
+server renders the result outward from that anchor, overwriting whatever
+values are already there, with an extent the request itself never states
+([ADR-0081](adrs/adr-0081.md) §5).
+
+**Gate:** `add-pivot-table` requires **both** the `sheets-write` and
+`sheets-structure` write-permission operations to independently resolve
+`Allow` against the same target — the first capability in the crate
+needing more than one operation. An operator must hold both grants (a
+single `allow: ["sheets-write", "sheets-structure"]` folder rule is the
+usual shape). `delete-pivot-table` needs `sheets-write` alone: it only ever
+clears the anchor's own value, no structural effect.
+
+```bash
+# Grant both operations on the folder these spreadsheets live in.
+cat >> ~/.omni-dev/settings.json <<'EOF'
+{"write_permissions": {"rules": [
+  {"folder_id": "<FOLDER_ID>", "allow": ["sheets-write", "sheets-structure"]}
+]}}
+EOF
+
+# Anchor a pivot table at 'Report'!A1, sourced from 'Data'!A1:D1000 (a
+# bounded rectangle is required). --row/--column/--value/--filter name a
+# 0-based column offset *into the source*, not an absolute sheet column.
+omni-dev drive sheets add-pivot-table <ID> --sheet Report --anchor A1 \
+  --source 'Data!A1:D1000' \
+  --row 0:asc --value 3:sum
+
+# Multiple groupings, a filter, and a vertical layout.
+omni-dev drive sheets add-pivot-table <ID> --sheet Report --anchor D1 \
+  --source 'Data!A1:D1000' \
+  --row 0 --column 1:desc --value 3:sum --value 2:counta \
+  --filter 1:East,West --value-layout vertical --no-totals
+
+# Discover existing pivot tables and their anchors — the one way to find
+# the --anchor delete-pivot-table needs.
+omni-dev drive sheets list-pivot-tables <ID>
+
+omni-dev drive sheets delete-pivot-table <ID> --sheet Report --anchor A1
+```
+
+**`--dry-run` names the anchor, the source, the configuration, and the
+anchor's own current content — never the overwritten region.** The server
+computes the rendered extent from the source data at creation time, so it
+cannot be known until the request is sent (the same "cannot be computed
+from the request alone" limitation [ADR-0075](adrs/adr-0075.md) §6 hit for
+dimension-shift previews, one size larger). The one fact that *is*
+computable is what the anchor cell itself holds before the write — always
+overwritten — so `--dry-run` reads and reports it:
+
+```
+Would add a pivot table anchored at 'Report'!A1 in 'Budget'
+  source: 'Data'!A1:D1000
+  rows: col 0 (asc); columns: none; values: SUM of col 3; layout: HORIZONTAL (default); totals: on
+  anchor 'Report'!A1 currently: empty
+  NOTE: the rendered extent is computed by the server from the source data and is
+  not known until the request is sent; cells right of and below the anchor may be
+  overwritten.
+```
+
+**No `update-pivot-table` verb.** On the wire, replacing a pivot table is
+byte-identical to creating one — the field mask simply replaces whatever
+`pivotTable` the anchor already holds. Rather than add a verb
+indistinguishable from `add` on the wire, `add-pivot-table` refuses an
+anchor that already holds a pivot table; delete it first with
+`delete-pivot-table`, or choose a different anchor.
+
+**A curated surface, not full API coverage**, matching the rest of this
+tranche's stance. Not reachable: `PivotValue`'s `CUSTOM` summarize function
+(a formula-driven value rather than a source column); `PivotGroup.groupRule`
+(date/number bucketing) and `.valueBucket`/`.valueMetadata` (sort-by-value
+and collapsed-group state); the deprecated `criteria` filter form (this
+crate always writes the newer `filterSpecs`, and `--filter` only builds its
+`visibleValues` allow-list form, not the condition-based one); data-source
+pivots; and `PivotValue`'s custom display-name/`calculatedDisplayType`
+options beyond the default name. `--value`'s summarize functions are `sum`,
+`counta`, `count`, `countunique`, `average`, `max`, `min`, `median`,
+`product`, `stdev`, `stdevp`, `var`, `varp`.
 
 #### drive sheets protect-range / update-protection / unprotect-range / list-protections
 

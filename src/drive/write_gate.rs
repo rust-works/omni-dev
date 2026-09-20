@@ -86,6 +86,13 @@ pub enum DriveOperation {
     /// retroactively upgrade those rules into cell-write permission with no
     /// config change and no re-consent — the exact silent widening this
     /// gate's default-deny posture exists to prevent.
+    ///
+    /// Since issue #1798 ([ADR-0081](../../docs/adrs/adr-0081.md) §5), also
+    /// required (alongside [`Self::SheetsStructure`]) for `add-pivot-table`
+    /// — a pivot table is created by `updateCells`, writing through the
+    /// grid with a server-computed rendered extent, which is this
+    /// operation's territory by construction. `delete-pivot-table` needs
+    /// this operation alone.
     SheetsWrite,
     /// Structurally edit an existing Google Sheet via `spreadsheets.batchUpdate`
     /// (issue #1613, [ADR-0075](../../docs/adrs/adr-0075.md) §1) — adding,
@@ -120,6 +127,13 @@ pub enum DriveOperation {
     /// `unmerge-cells`/`clear-data-validation`. None of that later set
     /// destroys *grid* data either, which is what earns it the same
     /// operation as the original three rather than one of its own.
+    ///
+    /// Since issue #1798 ([ADR-0081](../../docs/adrs/adr-0081.md) §5), also
+    /// required (alongside [`Self::SheetsWrite`]) for `add-pivot-table` —
+    /// the first capability in the crate resolving **two** operations
+    /// together rather than one. A pivot table is also a named, persistent,
+    /// structural feature of a sheet, which is why it needs this operation
+    /// too and not `SheetsWrite` alone.
     ///
     /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
     /// reason that one is not folded into [`Self::Edit`]. Every existing
