@@ -40,6 +40,7 @@ use crate::drive::lease::check::{
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
+use crate::drive::sheets::date_value::{DateValue, RelativeDate};
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
@@ -49,113 +50,6 @@ use crate::drive::sheets::types::{
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
-
-/// One of Sheets' six `RelativeDate` values.
-///
-/// Usable wherever a date condition takes a single value
-/// (`DATE_AFTER`/`DATE_BEFORE`/`DATE_EQ`); `DATE_BETWEEN` requires two
-/// absolute dates and never accepts one of these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelativeDate {
-    /// The 365 days up to and including today.
-    PastYear,
-    /// The 30 days up to and including today.
-    PastMonth,
-    /// The 7 days up to and including today.
-    PastWeek,
-    /// The day before today.
-    Yesterday,
-    /// Today.
-    Today,
-    /// The day after today.
-    Tomorrow,
-}
-
-impl RelativeDate {
-    /// Every variant, in no particular order. `parse` derives from this (via
-    /// [`Self::as_sheets_str`]) rather than keeping its own hardcoded string
-    /// table, so the two can't drift apart on a typo; the
-    /// `relative_date_all_covers_every_variant` test's exhaustive match
-    /// forces this list to grow alongside the enum.
-    const ALL: [Self; 6] = [
-        Self::PastYear,
-        Self::PastMonth,
-        Self::PastWeek,
-        Self::Yesterday,
-        Self::Today,
-        Self::Tomorrow,
-    ];
-
-    const fn as_sheets_str(self) -> &'static str {
-        match self {
-            Self::PastYear => "PAST_YEAR",
-            Self::PastMonth => "PAST_MONTH",
-            Self::PastWeek => "PAST_WEEK",
-            Self::Yesterday => "YESTERDAY",
-            Self::Today => "TODAY",
-            Self::Tomorrow => "TOMORROW",
-        }
-    }
-
-    /// Matches case- and separator-insensitively (`past-week`, `past_week`,
-    /// `Past Week` all match) so the CLI value doesn't force one style.
-    ///
-    /// Deriving this from [`Self::as_sheets_str`] via [`Self::ALL`] costs a
-    /// per-candidate allocation (up to 6, plus one for `normalized`) instead
-    /// of a single hand-written match — negligible for a one-shot CLI
-    /// parse of 6 short constants, and deliberate: it's what keeps this
-    /// keyword table and `as_sheets_str` from drifting apart on a typo (see
-    /// `relative_date_all_covers_every_variant`). Don't "optimize" this back
-    /// into a second hardcoded match.
-    fn parse(s: &str) -> Option<Self> {
-        let normalized = s.to_ascii_lowercase().replace(['-', '_', ' '], "");
-        Self::ALL
-            .into_iter()
-            .find(|rd| rd.as_sheets_str().to_ascii_lowercase().replace('_', "") == normalized)
-    }
-}
-
-/// A date condition's operand.
-///
-/// Either a literal date string (passed through untouched, the same
-/// trust-the-caller stance as every other numeric/text value in this file —
-/// Sheets parses it at evaluation time) or one of the six [`RelativeDate`]
-/// keywords.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DateValue {
-    /// A literal date string, untouched.
-    Absolute(String),
-    /// One of Sheets' relative-date keywords.
-    Relative(RelativeDate),
-}
-
-impl DateValue {
-    /// Never fails: anything that isn't a recognized relative keyword is
-    /// treated as a literal date string.
-    pub fn parse(raw: String) -> Self {
-        match RelativeDate::parse(&raw) {
-            Some(rd) => Self::Relative(rd),
-            None => Self::Absolute(raw),
-        }
-    }
-
-    fn is_blank(&self) -> bool {
-        matches!(self, Self::Absolute(s) if s.trim().is_empty())
-    }
-
-    fn into_condition_value(self) -> ConditionValue {
-        match self {
-            Self::Absolute(s) => ConditionValue {
-                user_entered_value: Some(s),
-                relative_date: None,
-            },
-            Self::Relative(rd) => ConditionValue {
-                user_entered_value: None,
-                relative_date: Some(rd.as_sheets_str().to_string()),
-            },
-        }
-    }
-}
 
 /// The condition shapes `set-data-validation` builds.
 ///
@@ -1069,40 +963,10 @@ mod tests {
         assert_eq!(built.values[0].relative_date, Some("TODAY".to_string()));
     }
 
-    #[test]
-    fn date_value_parse_is_case_and_separator_insensitive() {
-        for input in ["past-week", "PAST_WEEK", "Past Week"] {
-            assert!(matches!(
-                DateValue::parse(input.to_string()),
-                DateValue::Relative(RelativeDate::PastWeek)
-            ));
-        }
-        assert!(matches!(
-            DateValue::parse("2024-01-01".to_string()),
-            DateValue::Absolute(s) if s == "2024-01-01"
-        ));
-    }
-
-    #[test]
-    fn relative_date_all_covers_every_variant() {
-        // Exhaustive match, no `_` arm: adding a `RelativeDate` variant
-        // without adding it to `RelativeDate::ALL` fails to compile here,
-        // which is what forces `parse` (derived from `ALL`) to cover it too.
-        fn assert_is_a_relative_date(rd: RelativeDate) {
-            match rd {
-                RelativeDate::PastYear
-                | RelativeDate::PastMonth
-                | RelativeDate::PastWeek
-                | RelativeDate::Yesterday
-                | RelativeDate::Today
-                | RelativeDate::Tomorrow => {}
-            }
-        }
-        for rd in RelativeDate::ALL {
-            assert_is_a_relative_date(rd);
-            assert_eq!(RelativeDate::parse(rd.as_sheets_str()), Some(rd));
-        }
-    }
+    // `date_value_parse_is_case_and_separator_insensitive` and
+    // `relative_date_all_covers_every_variant` moved to
+    // `date_value.rs`'s own test module (issue #1793) — `RelativeDate`/
+    // `DateValue` are defined there now.
 
     #[test]
     fn date_between_builds_two_absolute_values() {

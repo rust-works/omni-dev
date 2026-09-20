@@ -24,7 +24,11 @@ use serde::{Deserialize, Serialize};
 /// Always request an explicit `fields` mask when fetching this: the
 /// unmasked response embeds **every cell of every sheet**, which on a large
 /// workbook is an out-of-memory failure rather than a slow request.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `PartialEq`-only, not `Eq` (issue #1793): a [`Sheet`]'s
+/// `conditional_formats` can embed a `Color` (`f32`-based), which has no
+/// meaningful `Eq` — see [`Color`]'s own doc comment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Spreadsheet {
     /// The spreadsheet's id (echoes the one requested).
     #[serde(
@@ -94,7 +98,9 @@ pub struct SpreadsheetProperties {
 }
 
 /// One sheet (tab) within a spreadsheet.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// `PartialEq`-only, not `Eq` (issue #1793) — see [`Spreadsheet`]'s doc
+/// comment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Sheet {
     /// This sheet's properties.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,6 +132,18 @@ pub struct Sheet {
     /// (issue #1794).
     #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "filterViews")]
     pub filter_views: Vec<FilterView>,
+    /// Conditional format rules on this sheet, in their API-defined
+    /// evaluation order — the order `add-conditional-format`'s `--index`/
+    /// `update-conditional-format`'s and `delete-conditional-format`'s
+    /// `--index` address. Empty unless the caller requested a wider
+    /// `fields` mask; only `SheetsApi::get_spreadsheet_with_conditional_formats`
+    /// populates it (issue #1793).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "conditionalFormats"
+    )]
+    pub conditional_formats: Vec<ConditionalFormatRule>,
 }
 
 impl Sheet {
@@ -414,6 +432,19 @@ pub enum BatchUpdateRequestItem {
     /// Remove a filter view (`delete-filter-view`). Same gate as
     /// [`Self::SetBasicFilter`].
     DeleteFilterView(DeleteFilterViewRequest),
+    /// Add a conditional format rule (`add-conditional-format`). Gated by
+    /// `DriveOperation::SheetsStructure` — presentational, destroys no data
+    /// (ADR-0081 §1, issue #1793).
+    AddConditionalFormatRule(AddConditionalFormatRuleRequest),
+    /// Replace an existing conditional format rule at an index
+    /// (`update-conditional-format`). Same gate as
+    /// [`Self::AddConditionalFormatRule`].
+    UpdateConditionalFormatRule(UpdateConditionalFormatRuleRequest),
+    /// Remove a conditional format rule at an index
+    /// (`delete-conditional-format`). Same gate as
+    /// [`Self::AddConditionalFormatRule`] — a presentational removal, not a
+    /// *data* deletion.
+    DeleteConditionalFormatRule(DeleteConditionalFormatRuleRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -636,7 +667,12 @@ pub struct GridRange {
 /// An RGB color, 0.0-1.0 per channel — the Sheets API's own float scale,
 /// not the 0-255 a hex string like `#RRGGBB` suggests. `format.rs`'s hex
 /// parser is the one conversion site.
-#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq)]
+///
+/// Also `Deserialize` (issue #1793): `ConditionalFormatRule` reads existing
+/// rules back via `list-conditional-formats`, so a color nested inside a
+/// `BooleanRule`/`GradientRule` must round-trip, unlike `format-cells`'
+/// purely outbound use of the same type.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct Color {
     /// Red channel, 0.0-1.0.
     pub red: f32,
@@ -654,7 +690,7 @@ pub struct Color {
 /// `ColorStyle` — the modern wrapper Sheets expects around a plain
 /// [`Color`]. Only the `rgbColor` arm is modelled; the API's alternative
 /// `themeColor` arm has no CLI flag surface in this feature.
-#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct ColorStyle {
     /// The explicit RGB color.
     #[serde(rename = "rgbColor")]
@@ -663,7 +699,7 @@ pub struct ColorStyle {
 
 /// The mutable subset of a cell's text formatting this crate can set —
 /// `CellFormat.textFormat`.
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TextFormat {
     /// Bold.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -692,7 +728,7 @@ pub struct TextFormat {
 }
 
 /// A cell's display number format — `CellFormat.numberFormat`.
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NumberFormat {
     /// One of Sheets' type strings (`"TEXT"`, `"NUMBER"`, `"PERCENT"`,
     /// `"CURRENCY"`, `"DATE"`, `"TIME"`, `"DATE_TIME"`, `"SCIENTIFIC"`).
@@ -708,7 +744,7 @@ pub struct NumberFormat {
 /// shape mirrors the API directly, but the engine only ever builds it from
 /// `format::TextRotationFlag`, whose two variants make the "both set" state
 /// unrepresentable one layer up.
-#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TextRotation {
     /// Rotation angle in degrees, -90 to 90.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -719,7 +755,7 @@ pub struct TextRotation {
 }
 
 /// `CellFormat.padding` — each side is independently optional.
-#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Padding {
     /// Top padding, in pixels.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -740,7 +776,10 @@ pub struct Padding {
 /// Every field is optional and `format.rs::build_fields_mask` names exactly
 /// the ones populated — the same discipline `SheetPropertiesUpdate` follows
 /// for `updateSheetProperties`.
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+///
+/// Also `Deserialize` (issue #1793): `BooleanRule.format` reads an existing
+/// conditional-format rule's format back via `list-conditional-formats`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CellFormat {
     /// Text formatting (bold, italic, color, …).
     #[serde(skip_serializing_if = "Option::is_none", rename = "textFormat")]
@@ -1225,6 +1264,130 @@ pub struct DeleteFilterViewRequest {
     pub filter_id: i64,
 }
 
+/// A conditional format rule — one entry of a [`Sheet`]'s
+/// `conditional_formats` (issue #1793).
+///
+/// Index-addressed within that list, not id-addressed like
+/// [`ProtectedRange`]: `add-conditional-format`/`update-conditional-format`/
+/// `delete-conditional-format`'s `--index` refers to this rule's ordinal
+/// position, which shifts when an earlier-indexed rule is deleted —
+/// `list-conditional-formats` exists to make that position discoverable
+/// immediately before acting on it.
+///
+/// Exactly one of `boolean_rule`/`gradient_rule` is ever present, mirroring
+/// the API's own union; this crate never constructs both, but tolerates
+/// reading back a rule with neither modelled field set if a future Sheets
+/// rule type this crate doesn't build is present.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ConditionalFormatRule {
+    /// The range(s) this rule applies to.
+    pub ranges: Vec<GridRange>,
+    /// A condition-triggered format.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "booleanRule"
+    )]
+    pub boolean_rule: Option<BooleanRule>,
+    /// A color-scale format.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "gradientRule"
+    )]
+    pub gradient_rule: Option<GradientRule>,
+}
+
+/// `BooleanRule` — applies `format` to every cell in the rule's ranges for
+/// which `condition` evaluates true.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BooleanRule {
+    /// What triggers the format. The same wire shape as
+    /// [`DataValidationRule::condition`], but built from
+    /// `conditional_format::FormatCondition` rather than `validation::Condition`
+    /// — the two surfaces support an overlapping but different set of
+    /// condition types (see `conditional_format.rs`'s module doc).
+    pub condition: BooleanCondition,
+    /// The format to apply when `condition` is true. Reused verbatim from
+    /// `format-cells`/`format.rs`.
+    pub format: CellFormat,
+}
+
+/// `GradientRule` — a three-point color scale. `midpoint` absent means a
+/// plain two-color (min/max) scale.
+///
+/// A documented cut (issue #1793), mirroring `validation.rs`'s "curate
+/// rather than chase every enum value" stance: the two endpoints are always
+/// anchored `MIN`/`MAX`. Sheets also allows an endpoint to be anchored at an
+/// explicit `NUMBER`/`PERCENT`/`PERCENTILE` value, which this crate doesn't
+/// build — `docs/drive.md` names this gap.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GradientRule {
+    /// The color at the low end of the scale (anchored `MIN`).
+    #[serde(rename = "minColorStyle")]
+    pub min_color_style: ColorStyle,
+    /// The color at an optional midpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midpoint: Option<InterpolationPoint>,
+    /// The color at the high end of the scale (anchored `MAX`).
+    #[serde(rename = "maxColorStyle")]
+    pub max_color_style: ColorStyle,
+}
+
+/// One color/anchor pair of a [`GradientRule`]'s midpoint —
+/// `InterpolationPoint`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct InterpolationPoint {
+    /// The color at this point.
+    #[serde(rename = "colorStyle")]
+    pub color_style: ColorStyle,
+    /// One of Sheets' `NUMBER`/`PERCENT`/`PERCENTILE` (`MIN`/`MAX` are
+    /// reserved for [`GradientRule`]'s fixed endpoints and never appear
+    /// here). A plain string, the same tolerate-unmodelled stance as
+    /// [`BooleanCondition::condition_type`] — a rule read back with a type
+    /// this crate doesn't build still round-trips.
+    #[serde(rename = "type")]
+    pub point_type: String,
+    /// The threshold value, untouched — Sheets parses it at evaluation
+    /// time, the same trust-the-caller stance the rest of this module
+    /// takes.
+    pub value: String,
+}
+
+/// `AddConditionalFormatRuleRequest`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AddConditionalFormatRuleRequest {
+    /// The rule to add.
+    pub rule: ConditionalFormatRule,
+    /// Where to insert it — the sheet's current `conditional_formats.len()`
+    /// appends.
+    pub index: i64,
+}
+
+/// `UpdateConditionalFormatRuleRequest`.
+///
+/// Only the "replace the rule at this index" form is modelled — Sheets also
+/// supports moving a rule from `index` to a `newIndex` without changing its
+/// content, which this crate doesn't build (a documented cut: the issue
+/// asks for position-addressed update/delete, not reordering).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UpdateConditionalFormatRuleRequest {
+    /// The rule's new content.
+    pub rule: ConditionalFormatRule,
+    /// Which rule, by ordinal position, to replace.
+    pub index: i64,
+}
+
+/// `DeleteConditionalFormatRuleRequest`.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct DeleteConditionalFormatRuleRequest {
+    /// Which sheet the rule belongs to.
+    #[serde(rename = "sheetId")]
+    pub sheet_id: i64,
+    /// Which rule, by ordinal position, to remove.
+    pub index: i64,
+}
+
 /// `InsertDimensionRequest`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct InsertDimensionRequest {
@@ -1635,10 +1798,53 @@ mod tests {
         let json = serde_json::json!({
             "spreadsheetId": "s",
             "somethingNew": {"nested": true},
-            "sheets": [{"properties": {"title": "A"}, "conditionalFormats": []}],
+            "sheets": [{"properties": {"title": "A"}, "somethingElseNew": 1}],
         });
         let parsed: Spreadsheet = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.sheet_titles(), vec!["A"]);
+    }
+
+    #[test]
+    fn sheet_conditional_formats_round_trips_a_boolean_and_a_gradient_rule() {
+        // issue #1793 — `conditionalFormats` used to be dropped as an
+        // unmodelled field (see the fixture `spreadsheet_tolerates_unmodelled_fields`
+        // predates this test with); confirm it's now real, in both shapes.
+        let json = serde_json::json!({
+            "sheets": [{
+                "properties": {"title": "A"},
+                "conditionalFormats": [
+                    {
+                        "ranges": [{"sheetId": 0, "startRowIndex": 0, "endRowIndex": 1}],
+                        "booleanRule": {
+                            "condition": {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "10"}]},
+                            "format": {"backgroundColorStyle": {"rgbColor": {"red": 1.0, "green": 0.0, "blue": 0.0}}},
+                        },
+                    },
+                    {
+                        "ranges": [{"sheetId": 0, "startRowIndex": 1, "endRowIndex": 2}],
+                        "gradientRule": {
+                            "minColorStyle": {"rgbColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
+                            "maxColorStyle": {"rgbColor": {"red": 0.0, "green": 1.0, "blue": 0.0}},
+                        },
+                    },
+                ],
+            }],
+        });
+        let parsed: Spreadsheet = serde_json::from_value(json).unwrap();
+        let rules = &parsed.sheets[0].conditional_formats;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0]
+                .boolean_rule
+                .as_ref()
+                .unwrap()
+                .condition
+                .condition_type,
+            "NUMBER_GREATER"
+        );
+        assert!(rules[0].gradient_rule.is_none());
+        assert!(rules[1].boolean_rule.is_none());
+        assert!(rules[1].gradient_rule.as_ref().unwrap().midpoint.is_none());
     }
 
     #[test]

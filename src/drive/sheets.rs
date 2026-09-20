@@ -21,7 +21,9 @@
 pub mod a1;
 pub mod api;
 pub mod client;
+pub mod conditional_format;
 pub mod create;
+pub mod date_value;
 pub mod developer_metadata;
 pub mod filter;
 pub mod format;

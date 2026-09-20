@@ -425,7 +425,10 @@ impl JsonlSerialize for FormatOutcome {
 ///
 /// The one conversion site: the Sheets API's `Color` is three floats
 /// 0.0-1.0, not the 0-255-per-byte a hex string suggests.
-fn parse_hex_color(input: &str) -> Result<crate::drive::sheets::types::Color, String> {
+///
+/// `pub(super)` (issue #1793): `conditional_format.rs`'s `GradientRule`/
+/// `BooleanRule` colors reuse this rather than duplicating hex parsing.
+pub(super) fn parse_hex_color(input: &str) -> Result<crate::drive::sheets::types::Color, String> {
     let hex = input.strip_prefix('#').unwrap_or(input);
     if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!(

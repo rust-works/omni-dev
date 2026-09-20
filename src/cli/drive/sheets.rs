@@ -2,14 +2,16 @@
 //! *cells* of a Google Sheet via the Sheets v4 API (issue #1589), editing
 //! its *structure* via `spreadsheets.batchUpdate` (issue #1613),
 //! *destructively* editing it the same way (issue #1623), and applying
-//! formatting, data validation and protected ranges (issue #1643), and the
-//! basic filter and filter views (issue #1794).
+//! formatting, data validation and protected ranges (issue #1643), the
+//! basic filter and filter views (issue #1794), and conditional formatting
+//! rules (issue #1793).
 //!
 //! Nested under `drive` rather than given its own top-level tree so it
 //! inherits `--account` resolution, the `auth` commands and the write-
 //! permission diagnostics: a Sheet is a Drive file, and the permission gate
 //! is a Drive concept.
 
+pub(crate) mod conditional_format;
 pub(crate) mod create;
 pub(crate) mod developer_metadata;
 pub(crate) mod filter;
@@ -177,6 +179,24 @@ pub enum SheetsSubcommands {
     /// Lists the filter views in a spreadsheet. Read-only and ungated, like
     /// `list-protections` (issue #1794).
     ListFilterViews(filter::ListFilterViewsCommand),
+    /// Adds a conditional format rule to one or more ranges. Gated by the
+    /// folder write-permission rules' `sheets-structure` operation
+    /// (issue #1793, ADR-0081 §1).
+    ///
+    /// Boxed for the same `clippy::large_enum_variant` reason as
+    /// `SetDataValidation` (#1792): the condition/gradient flag set is wide.
+    AddConditionalFormat(Box<conditional_format::AddConditionalFormatCommand>),
+    /// Replaces the conditional format rule at an index. Gated by the
+    /// folder write-permission rules' `sheets-structure` operation
+    /// (issue #1793, ADR-0081 §1).
+    UpdateConditionalFormat(Box<conditional_format::UpdateConditionalFormatCommand>),
+    /// Removes the conditional format rule at an index. Gated by the
+    /// folder write-permission rules' `sheets-structure` operation
+    /// (issue #1793, ADR-0081 §1).
+    DeleteConditionalFormat(conditional_format::DeleteConditionalFormatCommand),
+    /// Lists the conditional format rules in a spreadsheet. Read-only and
+    /// ungated, like `list-protections` (issue #1793).
+    ListConditionalFormats(conditional_format::ListConditionalFormatsCommand),
 }
 
 impl SheetsCommand {
@@ -227,6 +247,10 @@ impl SheetsCommand {
             SheetsSubcommands::UpdateFilterView(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeleteFilterView(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ListFilterViews(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::AddConditionalFormat(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::UpdateConditionalFormat(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteConditionalFormat(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::ListConditionalFormats(cmd) => cmd.execute(client).await,
         }
     }
 }

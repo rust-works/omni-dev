@@ -9,8 +9,9 @@ use crate::cli::drive::helpers;
 use crate::cli::format::sanitize_for_terminal;
 use crate::drive::client::DriveClient;
 use crate::drive::sheets::client::SheetsClient;
+use crate::drive::sheets::date_value::DateValue;
 use crate::drive::sheets::validation::{
-    describe_lines, validation, Condition, DateValue, ValidationOptions, ValidationVerb,
+    describe_lines, validation, Condition, ValidationOptions, ValidationVerb,
 };
 
 /// Sets a data validation rule on a range.

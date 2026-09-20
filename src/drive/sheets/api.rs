@@ -47,6 +47,18 @@ const SPREADSHEET_FIELDS_WITH_FILTER_VIEWS: &str = "spreadsheetId,properties.tit
     sheets.basicFilter(range,sortSpecs,criteria),\
     sheets.filterViews(filterViewId,title,range,sortSpecs,criteria)";
 
+/// `fields` mask for `spreadsheets.get` when conditional format rules are
+/// needed too (issue #1793's `add-conditional-format`/
+/// `update-conditional-format`/`delete-conditional-format`/
+/// `list-conditional-formats`, all four of which share one fetch — see
+/// [`SheetsApi::get_spreadsheet_with_conditional_formats`]'s doc comment for
+/// why `add` uses the same wider mask as the other three despite not
+/// strictly needing it). A superset of [`SPREADSHEET_FIELDS`], kept separate
+/// for the same reason [`SPREADSHEET_FIELDS_WITH_PROTECTIONS`] is.
+const SPREADSHEET_FIELDS_WITH_CONDITIONAL_FORMATS: &str = "spreadsheetId,properties.title,\
+    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.conditionalFormats(ranges,booleanRule,gradientRule)";
+
 /// Maximum ranges sent in a single `values.batchGet`.
 ///
 /// Each range is a percent-encoded, quoted sheet title in the query string,
@@ -178,6 +190,31 @@ impl<'a> SheetsApi<'a> {
             .get_parsed(
                 url.as_str(),
                 "Failed to parse Sheets spreadsheet metadata (with filter views)",
+            )
+            .await
+    }
+
+    /// Fetches a spreadsheet's metadata **including conditional format
+    /// rules** — shared by all four `conditional_format.rs` verbs (issue
+    /// #1793), mirroring [`Self::get_spreadsheet_with_protections`]'s reuse
+    /// across all four protection verbs. `add-conditional-format` doesn't
+    /// strictly need the existing list, but reusing this one fetch instead
+    /// of adding a second, narrower one keeps `Sheet.conditional_formats`
+    /// consistently populated whenever any conditional-format verb runs.
+    /// See [`SPREADSHEET_FIELDS_WITH_CONDITIONAL_FORMATS`].
+    pub async fn get_spreadsheet_with_conditional_formats(
+        &self,
+        spreadsheet_id: &str,
+    ) -> Result<Spreadsheet> {
+        let url = build_spreadsheet_get_with_conditional_formats_url(
+            self.client.base_url(),
+            spreadsheet_id,
+        )?;
+        self.client
+            .transport()
+            .get_parsed(
+                url.as_str(),
+                "Failed to parse Sheets spreadsheet metadata (with conditional formats)",
             )
             .await
     }
@@ -405,6 +442,18 @@ fn build_spreadsheet_get_with_filter_views_url(
     Ok(url)
 }
 
+fn build_spreadsheet_get_with_conditional_formats_url(
+    base_url: &str,
+    spreadsheet_id: &str,
+) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
+    url.query_pairs_mut()
+        .append_pair("fields", SPREADSHEET_FIELDS_WITH_CONDITIONAL_FORMATS);
+    Ok(url)
+}
+
 fn build_values_get_url(
     base_url: &str,
     spreadsheet_id: &str,
@@ -557,6 +606,20 @@ mod tests {
             .expect("fields mask must always be sent");
         assert!(fields.contains("sheets.properties"));
         assert!(fields.contains("title"));
+    }
+
+    #[test]
+    fn spreadsheet_get_with_conditional_formats_url_masks_the_wider_fields() {
+        let url = build_spreadsheet_get_with_conditional_formats_url(BASE, "sheet-1").unwrap();
+        assert_eq!(url.path(), "/v4/spreadsheets/sheet-1");
+        let fields = url
+            .query_pairs()
+            .find(|(k, _)| k == "fields")
+            .map(|(_, v)| v.to_string())
+            .expect("fields mask must always be sent");
+        assert!(fields.contains("sheets.conditionalFormats"));
+        assert!(fields.contains("booleanRule"));
+        assert!(fields.contains("gradientRule"));
     }
 
     // ── values.get: encoding is the whole point ────────────────────────
