@@ -616,13 +616,18 @@ usage: {jev: {input_tokens: 5120, output_tokens: 61}}
 - **`sources`** lists every cited issue merged with the pull requests that
   closed it (named `"#1614 and PR #1629"`), or a standalone cited pull
   request (named `"PR #1629"`) if it did not close any cited issue. A
+  source that resolved but that no statement was attributed to is listed
+  too, so it is distinguishable from a citation that never resolved. A
   source's text is truncated the same way `route`'s issue text is (see
   [route](#route)); an `error` field replaces a source's check when its Jev
-  call failed.
-- **`models`** reports both the Jev model and the AI backend model.
-  **`usage`** reports only Jev's token counts (`usage.jev`): no AI backend
-  in this project reports token counts today, only cost, so there is no
-  `usage.ai` to show.
+  call failed. A source that could not be checked leaves its statements
+  unchecked, which is itself a `needs_review` reason — a partly checked
+  comment is never `accepted`.
+- **`models`** reports the Jev model and the AI backend model. Either is
+  omitted when that model never answered, as happens when the comment
+  cites nothing verifiable and no call is made at all. **`usage`** reports
+  only Jev's token counts (`usage.jev`): no AI backend in this project
+  reports token counts today, only cost, so there is no `usage.ai` to show.
 
 ### What the splitter and Jev see
 
@@ -642,6 +647,14 @@ returned unusable output (`placeholder`, or several statements run together
 into one) in 22 of 50 runs, against 0 of 50 for the same prompt with no
 schema. The reply shape is therefore described in the prompt instead, and
 the parser accepts JSON or YAML, with or without a code fence.
+
+**`verify-decision` is not adversarial-resistant.** The comment's own text
+goes into the splitter's prompt, so a comment written to manipulate that
+prompt could in principle steer how it is split, and a statement the
+splitter never produces is a statement Jev never checks. The coverage
+check makes that harder rather than impossible. Treat the command as a
+guard against honest mistakes and overstatements, not against a
+deliberately hostile comment author.
 
 Each cited source is checked separately. For a cited issue, Jev sees the
 issue's title, body and human comments, followed by the body of every pull
