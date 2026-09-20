@@ -633,10 +633,23 @@ fn validate_pie_hole(pie_hole: Option<f64>) -> Result<(), String> {
 fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
     match verb {
         EmbeddedObjectVerb::AddChart {
-            series, pie_hole, ..
+            chart_type,
+            series,
+            pie_hole,
+            ..
         } => {
             if series.is_empty() {
                 return Err("at least one --series is required".to_string());
+            }
+            // Checked before `validate_pie_hole`'s range check, not after:
+            // `chart_type` is already fully known from user input (unlike
+            // `update-chart`, which only learns the existing chart's kind
+            // after fetching the workbook), so an inapplicable `--pie-hole`
+            // is cheap to catch here rather than letting the range check
+            // mask it — a user fixing an out-of-range value would
+            // otherwise "fix" it only to learn the flag never applied.
+            if pie_hole.is_some() && !matches!(parse_chart_type(chart_type), Ok(ChartKind::Pie)) {
+                return Err("--pie-hole only applies to a pie chart".to_string());
             }
             validate_pie_hole(*pie_hole)?;
             Ok(())
@@ -674,13 +687,18 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            if domain.is_some() == series.is_empty() {
-                return Err(
-                    "--domain and --series must be passed together (Sheets replaces \
-                    both together, never one alone)"
-                        .to_string(),
-                );
-            }
+            // `--domain` and `--series` are deliberately *not* required
+            // together: `merge_basic_chart`/`merge_pie_chart` read the
+            // existing spec and only overwrite the field a flag actually
+            // names, so `--series` alone (e.g. adding a second series to
+            // an existing chart) or `--domain` alone (e.g. the range shifted
+            // after an insert) each fully work on their own. A prior
+            // version of this check required both together on the
+            // mistaken premise that `updateChartSpec` itself couples
+            // them — it doesn't; only the *whole request* has no field
+            // mask (see `UpdateChartSpecRequest`'s doc comment), which is
+            // orthogonal to whether this client-side merge treats the two
+            // fields independently.
             validate_pie_hole(*pie_hole)?;
             Ok(())
         }
@@ -706,6 +724,21 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
                         .to_string(),
                 );
             }
+            // Checked here *and* via `conflicts_with` on the CLI leaf's two
+            // flags: the CLI rejection is what a normal `omni-dev` user
+            // sees, but `validate_verb` is the actual gate — every caller,
+            // not just the CLI, funnels through `embedded_object()` — so
+            // the check belongs here regardless, and duplicating it costs
+            // nothing since it's unreachable through the CLI in practice.
+            //
+            // Unlike `filter.rs`'s `update-filter-view`, where
+            // `--clear-sort`/`--clear-criteria` **compose** with
+            // `--sort-by`/`--hide-values` (clear resets to empty, then the
+            // new entries are layered on top — see `build_update`), a
+            // slicer's `FilterCriteria` is a single value, not a per-column
+            // map: `--clear-criteria` and `--hide-values` would both just
+            // overwrite it wholesale, so "both together" has no sensible
+            // combined meaning to compose, unlike the per-column case.
             if *clear_criteria && !hide_values.is_empty() {
                 return Err("--clear-criteria and --hide-values are mutually exclusive".to_string());
             }
@@ -1385,11 +1418,19 @@ fn merge_basic_chart(
         header_count,
         horizontal_axis_title,
         vertical_axis_title,
+        pie_hole,
         ..
     } = verb
     else {
         unreachable!("merge_basic_chart is only ever called for UpdateChart")
     };
+
+    // The mirror image of `merge_pie_chart`'s basic-only rejections below:
+    // `--pie-hole` has no meaning on a basic chart, and silently dropping
+    // it would report `Changed` while the flag did nothing.
+    if pie_hole.is_some() {
+        return Err(invalid("--pie-hole only applies to a pie chart"));
+    }
 
     let mut basic = spec.basic_chart.clone().unwrap_or_default();
     if let Some(ChartKind::Basic(chart_type)) = requested_kind {
@@ -2188,7 +2229,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_verb_rejects_update_chart_domain_without_series() {
+    fn validate_verb_accepts_update_chart_domain_alone() {
+        // `--domain` with no `--series` is a legitimate independent update
+        // (e.g. the domain range shifted after an insert) — see
+        // `merge_basic_chart`'s doc comment for why the two are not
+        // coupled.
         let verb = EmbeddedObjectVerb::UpdateChart {
             chart_id: 1,
             chart_type: None,
@@ -2204,15 +2249,13 @@ mod tests {
             vertical_axis_title: None,
             pie_hole: None,
         };
-        let err = validate_verb(&verb).unwrap_err();
-        assert!(
-            err.contains("--domain and --series must be passed together"),
-            "{err}"
-        );
+        assert!(validate_verb(&verb).is_ok());
     }
 
     #[test]
-    fn validate_verb_rejects_update_chart_series_without_domain() {
+    fn validate_verb_accepts_update_chart_series_alone() {
+        // `--series` with no `--domain` is likewise legitimate (e.g. adding
+        // a second series to an existing chart).
         let verb = EmbeddedObjectVerb::UpdateChart {
             chart_id: 1,
             chart_type: None,
@@ -2228,11 +2271,7 @@ mod tests {
             vertical_axis_title: None,
             pie_hole: None,
         };
-        let err = validate_verb(&verb).unwrap_err();
-        assert!(
-            err.contains("--domain and --series must be passed together"),
-            "{err}"
-        );
+        assert!(validate_verb(&verb).is_ok());
     }
 
     #[test]
@@ -2258,9 +2297,18 @@ mod tests {
     #[test]
     fn validate_verb_rejects_add_chart_pie_hole_out_of_range() {
         let mut verb = add_chart_verb();
-        let EmbeddedObjectVerb::AddChart { pie_hole, .. } = &mut verb else {
+        let EmbeddedObjectVerb::AddChart {
+            chart_type,
+            pie_hole,
+            ..
+        } = &mut verb
+        else {
             unreachable!()
         };
+        // `chart_type` must be `pie` here, or the applicability check now
+        // fires first (see the ordering test below) and this would assert
+        // the wrong message.
+        *chart_type = "pie".to_string();
         *pie_hole = Some(1.5);
         let err = validate_verb(&verb).unwrap_err();
         assert!(
@@ -2272,11 +2320,88 @@ mod tests {
     #[test]
     fn validate_verb_accepts_add_chart_pie_hole_in_range() {
         let mut verb = add_chart_verb();
+        let EmbeddedObjectVerb::AddChart {
+            chart_type,
+            pie_hole,
+            ..
+        } = &mut verb
+        else {
+            unreachable!()
+        };
+        *chart_type = "pie".to_string();
+        *pie_hole = Some(0.5);
+        assert!(validate_verb(&verb).is_ok());
+    }
+
+    #[test]
+    fn validate_verb_accepts_add_chart_pie_hole_at_each_inclusive_boundary() {
+        for boundary in [0.0, 1.0] {
+            let mut verb = add_chart_verb();
+            let EmbeddedObjectVerb::AddChart {
+                chart_type,
+                pie_hole,
+                ..
+            } = &mut verb
+            else {
+                unreachable!()
+            };
+            *chart_type = "pie".to_string();
+            *pie_hole = Some(boundary);
+            assert!(
+                validate_verb(&verb).is_ok(),
+                "{boundary} should be in range"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_verb_rejects_add_chart_pie_hole_nan_and_infinite() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut verb = add_chart_verb();
+            let EmbeddedObjectVerb::AddChart {
+                chart_type,
+                pie_hole,
+                ..
+            } = &mut verb
+            else {
+                unreachable!()
+            };
+            *chart_type = "pie".to_string();
+            *pie_hole = Some(bad);
+            let err = validate_verb(&verb).unwrap_err();
+            assert!(
+                err.contains("--pie-hole must be between 0.0 and 1.0"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_verb_rejects_add_chart_pie_hole_on_a_non_pie_chart_before_the_range_check() {
+        // `--type column --pie-hole 1.5` is invalid two ways at once
+        // (inapplicable *and* out of range); the applicability error must
+        // win, since the range check alone would tell the user to "fix"
+        // the value only to learn the flag never applied — see
+        // `validate_verb`'s `AddChart` arm doc comment.
+        let mut verb = add_chart_verb();
+        let EmbeddedObjectVerb::AddChart { pie_hole, .. } = &mut verb else {
+            unreachable!()
+        };
+        *pie_hole = Some(1.5);
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("only applies to a pie chart"), "{err}");
+        assert!(!err.contains("must be between"), "{err}");
+    }
+
+    #[test]
+    fn validate_verb_rejects_add_chart_pie_hole_on_a_non_pie_chart_even_in_range() {
+        let mut verb = add_chart_verb();
         let EmbeddedObjectVerb::AddChart { pie_hole, .. } = &mut verb else {
             unreachable!()
         };
         *pie_hole = Some(0.5);
-        assert!(validate_verb(&verb).is_ok());
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("only applies to a pie chart"), "{err}");
     }
 
     #[test]
@@ -2607,6 +2732,110 @@ mod tests {
             err,
             EmbeddedObjectResult::RefusedInvalidRange { .. }
         ));
+    }
+
+    /// A basic chart sheet with both a domain **and** a series already
+    /// set, distinct from `basic_chart_sheet` (domain only) — needed to
+    /// prove that changing one independently leaves the other untouched.
+    fn basic_chart_sheet_with_series(chart_id: i64) -> Sheet {
+        let mut sheet = basic_chart_sheet(chart_id, "COLUMN");
+        let basic = sheet.charts[0]
+            .spec
+            .as_mut()
+            .unwrap()
+            .basic_chart
+            .as_mut()
+            .unwrap();
+        basic.series = vec![BasicChartSeries {
+            series: chart_data(GridRange {
+                sheet_id: 0,
+                start_row_index: Some(0),
+                end_row_index: Some(10),
+                start_column_index: Some(1),
+                end_column_index: Some(2),
+            }),
+            target_axis: None,
+            extra: BTreeMap::new(),
+        }];
+        sheet
+    }
+
+    #[test]
+    fn merge_chart_spec_updates_series_alone_leaving_domain_untouched() {
+        let workbook = workbook_with_sheet(basic_chart_sheet_with_series(1));
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let original_domains = existing.basic_chart.as_ref().unwrap().domains.clone();
+        let mut verb = update_chart_verb(1);
+        let EmbeddedObjectVerb::UpdateChart {
+            title,
+            sheet,
+            series,
+            ..
+        } = &mut verb
+        else {
+            unreachable!()
+        };
+        *title = None;
+        *sheet = Some("Q1".to_string());
+        *series = vec!["C1:C10".to_string()];
+        let (spec, summary) = merge_chart_spec(&workbook, existing, &verb).unwrap();
+        let basic = spec.basic_chart.unwrap();
+        assert_eq!(
+            basic.domains, original_domains,
+            "domain must survive a series-only update"
+        );
+        assert_eq!(basic.series.len(), 1);
+        assert!(summary.contains("series"));
+        assert!(!summary.contains("domain"));
+    }
+
+    #[test]
+    fn merge_chart_spec_updates_domain_alone_leaving_series_untouched() {
+        let workbook = workbook_with_sheet(basic_chart_sheet_with_series(1));
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let original_series = existing.basic_chart.as_ref().unwrap().series.clone();
+        let mut verb = update_chart_verb(1);
+        let EmbeddedObjectVerb::UpdateChart {
+            title,
+            sheet,
+            domain,
+            ..
+        } = &mut verb
+        else {
+            unreachable!()
+        };
+        *title = None;
+        *sheet = Some("Q1".to_string());
+        *domain = Some("B1:B10".to_string());
+        let (spec, summary) = merge_chart_spec(&workbook, existing, &verb).unwrap();
+        let basic = spec.basic_chart.unwrap();
+        assert_eq!(
+            basic.series, original_series,
+            "series must survive a domain-only update"
+        );
+        assert_eq!(basic.domains.len(), 1);
+        assert!(summary.contains("domain"));
+        assert!(!summary.contains("series"));
+    }
+
+    #[test]
+    fn merge_chart_spec_refuses_pie_hole_on_an_existing_basic_chart() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let mut verb = update_chart_verb(1);
+        let EmbeddedObjectVerb::UpdateChart {
+            title, pie_hole, ..
+        } = &mut verb
+        else {
+            unreachable!()
+        };
+        *title = None;
+        *pie_hole = Some(0.4);
+        let err = merge_chart_spec(&workbook, existing, &verb).unwrap_err();
+        assert!(
+            matches!(err, EmbeddedObjectResult::RefusedInvalidRange { .. }),
+            "{err:?}"
+        );
     }
 
     // ── summarise_chart / summarise_slicer / describe_position ──────────

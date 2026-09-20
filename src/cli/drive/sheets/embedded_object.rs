@@ -81,7 +81,13 @@ pub struct AddChartCommand {
 
     /// `0.0`-`1.0` center-hole radius — pie charts only. `0.0` (or absent)
     /// is a solid pie.
-    #[arg(long, value_name = "0.0-1.0")]
+    ///
+    /// `allow_hyphen_values`: without it, a negative value (rejected by
+    /// `validate_pie_hole` with a specific message) never reaches that
+    /// check — clap's own arg parser rejects `--pie-hole -0.1` first with
+    /// a confusing "unexpected argument '-0'" error, matching
+    /// `conditional_format.rs`'s numeric flags for the same reason.
+    #[arg(long, value_name = "0.0-1.0", allow_hyphen_values = true)]
     pub pie_hole: Option<f64>,
 
     /// The anchor cell, e.g. `E2`. Required unless `--new-sheet`.
@@ -216,7 +222,7 @@ pub struct UpdateChartCommand {
     pub vertical_axis_title: Option<String>,
 
     /// Change the pie-hole radius — pie charts only.
-    #[arg(long, value_name = "0.0-1.0")]
+    #[arg(long, value_name = "0.0-1.0", allow_hyphen_values = true)]
     pub pie_hole: Option<f64>,
 
     /// Reports the gate verdict and the change that would be made, without
