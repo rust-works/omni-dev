@@ -1256,6 +1256,17 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
     }
 
+    /// Finds the one recorded request whose path ends in `suffix` and parses
+    /// its body as JSON — the `format.rs::find_batch_update` pattern,
+    /// generalised to also match `developerMetadata:search` requests.
+    fn find_request(requests: &[wiremock::Request], suffix: &str) -> serde_json::Value {
+        let req = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(suffix))
+            .unwrap_or_else(|| panic!("no request ending in {suffix:?} was sent"));
+        serde_json::from_slice(&req.body).unwrap()
+    }
+
     fn set_opts(dry_run: bool) -> DeveloperMetadataOptions {
         let ledger_path = tempfile::tempdir()
             .unwrap()
@@ -1376,6 +1387,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_create_hardcodes_document_visibility_on_every_outgoing_request() {
+        // Pins the module's single highest-stakes property at the wire
+        // level, not just by code inspection: both the search that decides
+        // create-vs-update and the create request it issues must carry
+        // `visibility: "DOCUMENT"` literally, never a caller-supplied value
+        // (there is no `--visibility` flag to supply one) (issue #1795,
+        // ADR-0081 §4).
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+        mount_batch_update(serde_json::json!({"replies": [{}]}))
+            .mount(&server)
+            .await;
+
+        let outcome = developer_metadata(&drive, &sheets, &set_opts(false), &rules).await;
+        assert!(
+            matches!(outcome.result, DeveloperMetadataResult::Created { .. }),
+            "{:?}",
+            outcome.result
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let search_body = find_request(&requests, "developerMetadata:search");
+        assert_eq!(
+            search_body["dataFilters"][0]["developerMetadataLookup"]["visibility"],
+            "DOCUMENT"
+        );
+        let batch_body = find_request(&requests, ":batchUpdate");
+        assert_eq!(
+            batch_body["requests"][0]["createDeveloperMetadata"]["developerMetadata"]["visibility"],
+            "DOCUMENT"
+        );
+    }
+
+    #[tokio::test]
     async fn delete_reports_not_found_when_nothing_matches() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets, rules) = setup(&server).await;
@@ -1420,6 +1468,45 @@ mod tests {
             other => panic!("expected WouldDelete, got {other:?}"),
         }
         // No batchUpdate mock is mounted, so a stray delete call would 404.
+    }
+
+    #[tokio::test]
+    async fn delete_hardcodes_document_visibility_on_every_outgoing_request() {
+        // Same wire-level pin as `set_create_hardcodes_document_visibility_on_every_outgoing_request`,
+        // for the delete path's search-then-`deleteDeveloperMetadata` pair.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": [
+            {"developerMetadata": {
+                "metadataId": 1, "metadataKey": "owner", "metadataValue": "team-a",
+                "location": {"spreadsheet": true}, "visibility": "DOCUMENT",
+            }},
+        ]}))
+        .mount(&server)
+        .await;
+        mount_batch_update(serde_json::json!({"replies": [{}]}))
+            .mount(&server)
+            .await;
+
+        let outcome = developer_metadata(&drive, &sheets, &delete_opts(false), &rules).await;
+        assert!(
+            matches!(outcome.result, DeveloperMetadataResult::Deleted { .. }),
+            "{:?}",
+            outcome.result
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let search_body = find_request(&requests, "developerMetadata:search");
+        assert_eq!(
+            search_body["dataFilters"][0]["developerMetadataLookup"]["visibility"],
+            "DOCUMENT"
+        );
+        let batch_body = find_request(&requests, ":batchUpdate");
+        assert_eq!(
+            batch_body["requests"][0]["deleteDeveloperMetadata"]["dataFilter"]
+                ["developerMetadataLookup"]["visibility"],
+            "DOCUMENT"
+        );
     }
 
     #[tokio::test]
