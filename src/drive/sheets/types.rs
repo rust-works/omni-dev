@@ -1960,19 +1960,6 @@ pub struct DeleteEmbeddedObjectRequest {
     /// Which chart or slicer to remove.
     #[serde(rename = "objectId")]
     pub object_id: i64,
-/// A single cell, addressed absolutely — `GridCoordinate`. Only used as
-/// [`UpdateCellsRequest::start`]; the API extends the write from there
-/// using `rows`' own shape, never a second coordinate.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct GridCoordinate {
-    /// Which sheet.
-    #[serde(rename = "sheetId")]
-    pub sheet_id: i64,
-    /// Zero-based row.
-    pub row_index: i64,
-    /// Zero-based column.
-    pub column_index: i64,
 }
 
 /// `updateCells` — issue #1798's `add-pivot-table`/`delete-pivot-table`,
