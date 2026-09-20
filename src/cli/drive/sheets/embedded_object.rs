@@ -605,3 +605,307 @@ async fn run_embedded_object(
     println!("{}", lines.join("\n"));
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::utils::secret::Secret;
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    async fn client_with_bootstrapped_token(server: &wiremock::MockServer) -> DriveClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+
+        let mut client = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    async fn mount_orphan_sheet(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1", "name": "sheet-1",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": [],
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn lease_arg() -> crate::cli::drive::helpers::LeaseTokenArg {
+        crate::cli::drive::helpers::LeaseTokenArg { lease: None }
+    }
+
+    #[tokio::test]
+    async fn add_chart_command_reports_blocked_with_no_rules() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = AddChartCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            chart_type: "column".to_string(),
+            domain: "A1:A10".to_string(),
+            series: vec!["B1:B10".to_string()],
+            sheet: Some("Sheet1".to_string()),
+            title: None,
+            subtitle: None,
+            legend: None,
+            stacked: None,
+            header_count: None,
+            horizontal_axis_title: None,
+            vertical_axis_title: None,
+            pie_hole: None,
+            anchor: Some("E2".to_string()),
+            offset_x: None,
+            offset_y: None,
+            width: None,
+            height: None,
+            new_sheet: false,
+            dry_run: false,
+            lease: lease_arg(),
+            output: OutputFormat::Table,
+        };
+        // No `write_permissions.rules` configured, so the default-deny
+        // policy blocks it — proves the leaf wires the gate through.
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_chart_command_reports_blocked_with_no_rules() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = UpdateChartCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            chart_id: 1,
+            chart_type: None,
+            domain: None,
+            series: Vec::new(),
+            sheet: None,
+            title: Some("New title".to_string()),
+            subtitle: None,
+            legend: None,
+            stacked: None,
+            header_count: None,
+            horizontal_axis_title: None,
+            vertical_axis_title: None,
+            pie_hole: None,
+            dry_run: false,
+            lease: lease_arg(),
+            output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_chart_command_reports_blocked_with_no_rules() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = DeleteChartCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            chart_id: 1,
+            dry_run: false,
+            lease: lease_arg(),
+            output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_charts_prints_every_chart() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{
+                        "properties": {"sheetId": 0, "title": "Sheet1"},
+                        "charts": [{
+                            "chartId": 1,
+                            "spec": {
+                                "title": "Sales",
+                                "basicChart": {"chartType": "COLUMN"},
+                            },
+                            "position": {
+                                "overlayPosition": {
+                                    "anchorCell": {"sheetId": 0, "rowIndex": 1, "columnIndex": 4},
+                                },
+                            },
+                        }],
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListChartsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn add_slicer_command_reports_blocked_with_no_rules() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = AddSlicerCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: Some("Sheet1".to_string()),
+            range: "A1:D10".to_string(),
+            column: 1,
+            hide_values: vec!["Closed".to_string()],
+            title: None,
+            apply_to_pivot_tables: None,
+            anchor: "F2".to_string(),
+            offset_x: None,
+            offset_y: None,
+            width: None,
+            height: None,
+            dry_run: false,
+            lease: lease_arg(),
+            output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_slicer_command_reports_blocked_with_no_rules() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = UpdateSlicerCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            slicer_id: 1,
+            sheet: None,
+            range: None,
+            column: None,
+            hide_values: Vec::new(),
+            clear_criteria: true,
+            title: None,
+            apply_to_pivot_tables: None,
+            dry_run: false,
+            lease: lease_arg(),
+            output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_slicer_command_reports_blocked_with_no_rules() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = DeleteSlicerCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            slicer_id: 1,
+            dry_run: false,
+            lease: lease_arg(),
+            output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_slicers_prints_every_slicer() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{
+                        "properties": {"sheetId": 0, "title": "Sheet1"},
+                        "slicers": [{
+                            "slicerId": 4,
+                            "spec": {"title": "Region"},
+                            "position": {
+                                "overlayPosition": {
+                                    "anchorCell": {"sheetId": 0, "rowIndex": 0, "columnIndex": 5},
+                                },
+                            },
+                        }],
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListSlicersCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+}
