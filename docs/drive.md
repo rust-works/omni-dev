@@ -1896,15 +1896,16 @@ Cell and border formatting, merging, and row/column sizing. Also gated by
 omni-dev drive sheets format-cells <ID> --sheet Q2 --range A1:D1 \
   --bold true --background '#FFFF00'
 
-# Only a curated CellFormat subset is reachable: bold/italic/strikethrough/
-# underline, font-size, text-color/background (#RRGGBB), horizontal-align/
-# vertical-align, number-format (with --number-format-type), and wrap.
-# Font family, rotation, hyperlink display, padding and text direction are
-# not — use the Sheets UI for those.
+# The CellFormat subset now also reaches font family, text rotation,
+# hyperlink display type, padding and text direction (#1791) — the union
+# --text-rotation-angle/--text-rotation-vertical is mutually exclusive.
 omni-dev drive sheets format-cells <ID> --sheet Q2 --range B2:B100 \
-  --number-format '#,##0.00' --number-format-type currency
+  --number-format '#,##0.00' --number-format-type currency \
+  --font-family Arial --padding-top 4 --padding-bottom 4
 
-# Borders: at least one of --top/--bottom/--left/--right/--all.
+# Borders: at least one of --top/--bottom/--left/--right/--all/
+# --inner-horizontal/--inner-vertical. --all covers only the four outer
+# edges; the two inner-grid-line flags need to be named explicitly.
 omni-dev drive sheets update-borders <ID> --sheet Q2 --range A1:D1 --all \
   --style solid-medium --color '#000000'
 

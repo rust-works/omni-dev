@@ -4670,24 +4670,33 @@ Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
 
 Options:
-      --range <A1>                 A1 range to format, optionally carrying its own `Sheet!` prefix
-      --sheet <NAME>               Sheet (tab) title. Supplies the prefix for a bare `--range`
-      --bold <BOOL>                Bold [possible values: true, false]
-      --italic <BOOL>              Italic [possible values: true, false]
-      --strikethrough <BOOL>       Strikethrough [possible values: true, false]
-      --underline <BOOL>           Underline [possible values: true, false]
-      --font-size <N>              Point size
-      --text-color <HEX>           Text color, `#RRGGBB`
-      --background <HEX>           Cell background color, `#RRGGBB`
-      --horizontal-align <ALIGN>   Horizontal alignment [possible values: left, center, right]
-      --vertical-align <ALIGN>     Vertical alignment [possible values: top, middle, bottom]
-      --number-format <PATTERN>    Display number format pattern, e.g. `"#,##0.00"`. Requires `--number-format-type`
-      --number-format-type <TYPE>  The number format's type. Requires `--number-format` [possible values: text, number, percent, currency, date, time, date-time, scientific]
-      --wrap <WRAP>                Text wrap behavior [possible values: overflow, clip, wrap]
-      --dry-run                    Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
-      --lease <TOKEN>              The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
-  -o, --output <OUTPUT>            Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
-  -h, --help                       Print help (see more with '--help')
+      --range <A1>                     A1 range to format, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>                   Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --bold <BOOL>                    Bold [possible values: true, false]
+      --italic <BOOL>                  Italic [possible values: true, false]
+      --strikethrough <BOOL>           Strikethrough [possible values: true, false]
+      --underline <BOOL>               Underline [possible values: true, false]
+      --font-size <N>                  Point size
+      --text-color <HEX>               Text color, `#RRGGBB`
+      --background <HEX>               Cell background color, `#RRGGBB`
+      --horizontal-align <ALIGN>       Horizontal alignment [possible values: left, center, right]
+      --vertical-align <ALIGN>         Vertical alignment [possible values: top, middle, bottom]
+      --number-format <PATTERN>        Display number format pattern, e.g. `"#,##0.00"`. Requires `--number-format-type`
+      --number-format-type <TYPE>      The number format's type. Requires `--number-format` [possible values: text, number, percent, currency, date, time, date-time, scientific]
+      --wrap <WRAP>                    Text wrap behavior [possible values: overflow, clip, wrap]
+      --font-family <NAME>             Font family name, e.g. `"Arial"`
+      --text-rotation-angle <DEGREES>  Rotation angle in degrees, -90 to 90. Mutually exclusive with `--text-rotation-vertical`
+      --text-rotation-vertical         Stack text vertically instead of rotating it. Mutually exclusive with `--text-rotation-angle`
+      --hyperlink-display-type <TYPE>  How a cell containing a hyperlink is displayed [possible values: linked, plain-text]
+      --padding-top <N>                Top padding, in pixels
+      --padding-right <N>              Right padding, in pixels
+      --padding-bottom <N>             Bottom padding, in pixels
+      --padding-left <N>               Left padding, in pixels
+      --text-direction <DIR>           Text direction [possible values: left-to-right, right-to-left]
+      --dry-run                        Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>                  The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                           Print help (see more with '--help')
 
 
 ================================================================================
@@ -4985,19 +4994,21 @@ Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
 
 Options:
-      --range <A1>       A1 range to border, optionally carrying its own `Sheet!` prefix
-      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
-      --top              Set the top edge
-      --bottom           Set the bottom edge
-      --left             Set the left edge
-      --right            Set the right edge
-      --all              Set all four edges. Equivalent to passing all of `--top`/`--bottom`/`--left`/`--right`
-      --style <STYLE>    Line style, shared by every edge this call sets [default: solid] [possible values: solid, solid-medium, solid-thick, dashed, dotted, double]
-      --color <HEX>      Line color, `#RRGGBB`. Omitted takes solid black
-      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
-      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
-  -h, --help             Print help (see more with '--help')
+      --range <A1>        A1 range to border, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>      Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --top               Set the top edge
+      --bottom            Set the bottom edge
+      --left              Set the left edge
+      --right             Set the right edge
+      --all               Set all four edges. Equivalent to passing all of `--top`/`--bottom`/`--left`/`--right`. Does **not** include `--inner-horizontal`/`--inner-vertical`, which need to be named explicitly
+      --inner-horizontal  Set the horizontal grid lines between rows within the range
+      --inner-vertical    Set the vertical grid lines between columns within the range
+      --style <STYLE>     Line style, shared by every edge this call sets [default: solid] [possible values: solid, solid-medium, solid-thick, dashed, dotted, double]
+      --color <HEX>       Line color, `#RRGGBB`. Omitted takes solid black
+      --dry-run           Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>     The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>   Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help              Print help (see more with '--help')
 
 
 ================================================================================

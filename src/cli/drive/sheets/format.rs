@@ -105,6 +105,38 @@ impl NumberFormatType {
     }
 }
 
+/// `--hyperlink-display-type`'s value set.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum HyperlinkDisplayType {
+    Linked,
+    PlainText,
+}
+
+impl HyperlinkDisplayType {
+    const fn wire(self) -> &'static str {
+        match self {
+            Self::Linked => "LINKED",
+            Self::PlainText => "PLAIN_TEXT",
+        }
+    }
+}
+
+/// `--text-direction`'s value set.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum TextDirection {
+    LeftToRight,
+    RightToLeft,
+}
+
+impl TextDirection {
+    const fn wire(self) -> &'static str {
+        match self {
+            Self::LeftToRight => "LEFT_TO_RIGHT",
+            Self::RightToLeft => "RIGHT_TO_LEFT",
+        }
+    }
+}
+
 /// `--style`'s value set for `update-borders`.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum BorderStyle {
@@ -223,6 +255,39 @@ pub struct FormatCellsCommand {
     /// Text wrap behavior.
     #[arg(long, value_enum, value_name = "WRAP")]
     pub wrap: Option<WrapStrategy>,
+    /// Font family name, e.g. `"Arial"`.
+    #[arg(long, value_name = "NAME")]
+    pub font_family: Option<String>,
+    /// Rotation angle in degrees, -90 to 90. Mutually exclusive with
+    /// `--text-rotation-vertical`.
+    #[arg(
+        long,
+        value_name = "DEGREES",
+        conflicts_with = "text_rotation_vertical"
+    )]
+    pub text_rotation_angle: Option<i64>,
+    /// Stack text vertically instead of rotating it. Mutually exclusive
+    /// with `--text-rotation-angle`.
+    #[arg(long, conflicts_with = "text_rotation_angle")]
+    pub text_rotation_vertical: bool,
+    /// How a cell containing a hyperlink is displayed.
+    #[arg(long, value_enum, value_name = "TYPE")]
+    pub hyperlink_display_type: Option<HyperlinkDisplayType>,
+    /// Top padding, in pixels.
+    #[arg(long, value_name = "N")]
+    pub padding_top: Option<i64>,
+    /// Right padding, in pixels.
+    #[arg(long, value_name = "N")]
+    pub padding_right: Option<i64>,
+    /// Bottom padding, in pixels.
+    #[arg(long, value_name = "N")]
+    pub padding_bottom: Option<i64>,
+    /// Left padding, in pixels.
+    #[arg(long, value_name = "N")]
+    pub padding_left: Option<i64>,
+    /// Text direction.
+    #[arg(long, value_enum, value_name = "DIR")]
+    pub text_direction: Option<TextDirection>,
 
     /// Reports the gate verdict and the change that would be made, without
     /// calling `spreadsheets.batchUpdate`.
@@ -262,13 +327,28 @@ impl FormatCellsCommand {
                 .map(NumberFormatType::wire)
                 .map(str::to_string),
             wrap: self.wrap.map(WrapStrategy::wire).map(str::to_string),
+            font_family: self.font_family,
+            text_rotation_angle: self.text_rotation_angle,
+            text_rotation_vertical: self.text_rotation_vertical.then_some(true),
+            hyperlink_display_type: self
+                .hyperlink_display_type
+                .map(HyperlinkDisplayType::wire)
+                .map(str::to_string),
+            padding_top: self.padding_top,
+            padding_right: self.padding_right,
+            padding_bottom: self.padding_bottom,
+            padding_left: self.padding_left,
+            text_direction: self
+                .text_direction
+                .map(TextDirection::wire)
+                .map(str::to_string),
         };
         let opts = FormatOptions {
             spreadsheet_id: self.spreadsheet_id,
             verb: FormatVerb::FormatCells {
                 sheet: self.sheet,
                 range: self.range,
-                format,
+                format: Box::new(format),
             },
             dry_run: self.dry_run,
             lease_token: self.lease.lease,
@@ -305,9 +385,17 @@ pub struct UpdateBordersCommand {
     #[arg(long)]
     pub right: bool,
     /// Set all four edges. Equivalent to passing all of
-    /// `--top`/`--bottom`/`--left`/`--right`.
+    /// `--top`/`--bottom`/`--left`/`--right`. Does **not** include
+    /// `--inner-horizontal`/`--inner-vertical`, which need to be named
+    /// explicitly.
     #[arg(long)]
     pub all: bool,
+    /// Set the horizontal grid lines between rows within the range.
+    #[arg(long)]
+    pub inner_horizontal: bool,
+    /// Set the vertical grid lines between columns within the range.
+    #[arg(long)]
+    pub inner_vertical: bool,
 
     /// Line style, shared by every edge this call sets.
     #[arg(long, value_enum, default_value_t = BorderStyle::Solid)]
@@ -345,6 +433,8 @@ impl UpdateBordersCommand {
             bottom: self.bottom || self.all,
             left: self.left || self.all,
             right: self.right || self.all,
+            inner_horizontal: self.inner_horizontal,
+            inner_vertical: self.inner_vertical,
         };
         let opts = FormatOptions {
             spreadsheet_id: self.spreadsheet_id,
@@ -609,6 +699,18 @@ mod tests {
         assert_eq!(VerticalAlign::Top.wire(), "TOP");
         assert_eq!(VerticalAlign::Middle.wire(), "MIDDLE");
         assert_eq!(VerticalAlign::Bottom.wire(), "BOTTOM");
+    }
+
+    #[test]
+    fn hyperlink_display_type_wire_maps_every_variant() {
+        assert_eq!(HyperlinkDisplayType::Linked.wire(), "LINKED");
+        assert_eq!(HyperlinkDisplayType::PlainText.wire(), "PLAIN_TEXT");
+    }
+
+    #[test]
+    fn text_direction_wire_maps_every_variant() {
+        assert_eq!(TextDirection::LeftToRight.wire(), "LEFT_TO_RIGHT");
+        assert_eq!(TextDirection::RightToLeft.wire(), "RIGHT_TO_LEFT");
     }
 
     #[test]
