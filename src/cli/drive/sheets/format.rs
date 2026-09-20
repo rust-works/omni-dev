@@ -20,6 +20,7 @@ use crate::drive::client::DriveClient;
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::format::{
     describe_lines, format, BorderSides, CellFormatFlags, FormatOptions, FormatVerb,
+    TextRotationFlag,
 };
 use crate::drive::sheets::types::Dimension;
 
@@ -263,6 +264,7 @@ pub struct FormatCellsCommand {
     #[arg(
         long,
         value_name = "DEGREES",
+        allow_hyphen_values = true,
         conflicts_with = "text_rotation_vertical"
     )]
     pub text_rotation_angle: Option<i64>,
@@ -273,16 +275,16 @@ pub struct FormatCellsCommand {
     /// How a cell containing a hyperlink is displayed.
     #[arg(long, value_enum, value_name = "TYPE")]
     pub hyperlink_display_type: Option<HyperlinkDisplayType>,
-    /// Top padding, in pixels.
+    /// Top padding, in pixels. Must be non-negative.
     #[arg(long, value_name = "N")]
     pub padding_top: Option<i64>,
-    /// Right padding, in pixels.
+    /// Right padding, in pixels. Must be non-negative.
     #[arg(long, value_name = "N")]
     pub padding_right: Option<i64>,
-    /// Bottom padding, in pixels.
+    /// Bottom padding, in pixels. Must be non-negative.
     #[arg(long, value_name = "N")]
     pub padding_bottom: Option<i64>,
-    /// Left padding, in pixels.
+    /// Left padding, in pixels. Must be non-negative.
     #[arg(long, value_name = "N")]
     pub padding_left: Option<i64>,
     /// Text direction.
@@ -328,8 +330,11 @@ impl FormatCellsCommand {
                 .map(str::to_string),
             wrap: self.wrap.map(WrapStrategy::wire).map(str::to_string),
             font_family: self.font_family,
-            text_rotation_angle: self.text_rotation_angle,
-            text_rotation_vertical: self.text_rotation_vertical.then_some(true),
+            text_rotation: match (self.text_rotation_angle, self.text_rotation_vertical) {
+                (Some(angle), _) => Some(TextRotationFlag::Angle(angle)),
+                (None, true) => Some(TextRotationFlag::Vertical),
+                (None, false) => None,
+            },
             hyperlink_display_type: self
                 .hyperlink_display_type
                 .map(HyperlinkDisplayType::wire)

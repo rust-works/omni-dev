@@ -649,10 +649,10 @@ pub struct NumberFormat {
 
 /// `CellFormat.textRotation` — a union.
 ///
-/// Exactly one of `angle`/`vertical` may be set, never both.
-/// `format.rs::build_cell_format` enforces that even though the CLI
-/// already refuses the conflicting flag pair, since this type is also
-/// constructible directly (e.g. in engine tests).
+/// Exactly one of `angle`/`vertical` is ever set, never both: this wire
+/// shape mirrors the API directly, but the engine only ever builds it from
+/// `format::TextRotationFlag`, whose two variants make the "both set" state
+/// unrepresentable one layer up.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct TextRotation {
     /// Rotation angle in degrees, -90 to 90.
