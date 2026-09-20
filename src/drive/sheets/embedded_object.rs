@@ -873,6 +873,7 @@ fn parse_stacked(raw: &str) -> Result<String, String> {
 }
 
 /// Which chart family a `--type` value names.
+#[derive(Debug)]
 enum ChartKind {
     /// A `basicChart`, carrying its wire `chartType` literal.
     Basic(&'static str),
@@ -1178,6 +1179,7 @@ fn summarise_slicer(sheet: &Sheet, slicer: &Slicer) -> Option<EmbeddedObjectSumm
 
 /// The two chart kinds `merge_chart_spec` accepts as the *existing* state
 /// of a chart being updated.
+#[derive(Debug)]
 enum ExistingChartKind {
     Basic,
     Pie,
@@ -1811,5 +1813,1162 @@ pub fn describe_lines(outcome: &EmbeddedObjectOutcome) -> Vec<String> {
             lines
         }
         EmbeddedObjectResult::Failed { detail } => vec![format!("Failed: {detail}")],
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::drive::sheets::types::Sheet;
+    use crate::drive::test_support::seed_lease;
+    use crate::test_support::env::MapEnv;
+    use crate::utils::secret::Secret;
+    use std::collections::HashSet;
+
+    // ── parse_chart_type / parse_legend / parse_stacked ─────────────────
+
+    #[test]
+    fn parse_chart_type_accepts_every_basic_type_and_pie() {
+        for (raw, expect_basic) in [
+            ("column", Some("COLUMN")),
+            ("bar", Some("BAR")),
+            ("line", Some("LINE")),
+            ("area", Some("AREA")),
+            ("scatter", Some("SCATTER")),
+            ("PIE", None),
+        ] {
+            let kind = parse_chart_type(raw).unwrap();
+            match (&kind, expect_basic) {
+                (ChartKind::Basic(t), Some(expected)) => assert_eq!(*t, expected),
+                (ChartKind::Pie, None) => {}
+                _ => panic!("unexpected parse for {raw:?}: {kind:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_chart_type_rejects_combo_and_unknown() {
+        let err = parse_chart_type("combo").unwrap_err();
+        assert!(err.contains("not a supported chart type"), "{err}");
+        let err = parse_chart_type("bogus").unwrap_err();
+        assert!(
+            err.contains("column, bar, line, area, scatter, pie"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_legend_accepts_every_position() {
+        assert_eq!(parse_legend("bottom").unwrap(), "BOTTOM_LEGEND");
+        assert_eq!(parse_legend("TOP").unwrap(), "TOP_LEGEND");
+        assert_eq!(parse_legend("left").unwrap(), "LEFT_LEGEND");
+        assert_eq!(parse_legend("right").unwrap(), "RIGHT_LEGEND");
+        assert_eq!(parse_legend("none").unwrap(), "NO_LEGEND");
+    }
+
+    #[test]
+    fn parse_legend_rejects_unknown() {
+        let err = parse_legend("middle").unwrap_err();
+        assert!(err.contains("not a supported legend position"), "{err}");
+    }
+
+    #[test]
+    fn parse_stacked_accepts_every_mode() {
+        assert_eq!(parse_stacked("none").unwrap(), "NOT_STACKED");
+        assert_eq!(parse_stacked("stacked").unwrap(), "STACKED");
+        assert_eq!(parse_stacked("PERCENT").unwrap(), "PERCENT_STACKED");
+    }
+
+    #[test]
+    fn parse_stacked_rejects_unknown() {
+        let err = parse_stacked("half").unwrap_err();
+        assert!(err.contains("not a supported stacking mode"), "{err}");
+    }
+
+    // ── axis_list / upsert_axis_title ────────────────────────────────────
+
+    #[test]
+    fn axis_list_builds_only_the_named_axes() {
+        assert!(axis_list(None, None).is_empty());
+        let axis = axis_list(Some("Quarter"), None);
+        assert_eq!(axis.len(), 1);
+        assert_eq!(axis[0].position, "BOTTOM_AXIS");
+        assert_eq!(axis[0].title.as_deref(), Some("Quarter"));
+        let axis = axis_list(Some("Quarter"), Some("Revenue"));
+        assert_eq!(axis.len(), 2);
+        assert_eq!(axis[1].position, "LEFT_AXIS");
+    }
+
+    #[test]
+    fn upsert_axis_title_replaces_an_existing_entry_in_place() {
+        let mut axis = vec![
+            BasicChartAxis {
+                position: "BOTTOM_AXIS".to_string(),
+                title: Some("Old".to_string()),
+                extra: BTreeMap::new(),
+            },
+            BasicChartAxis {
+                position: "LEFT_AXIS".to_string(),
+                title: None,
+                extra: BTreeMap::new(),
+            },
+        ];
+        upsert_axis_title(&mut axis, "BOTTOM_AXIS", "New");
+        assert_eq!(axis.len(), 2);
+        assert_eq!(axis[0].title.as_deref(), Some("New"));
+        assert_eq!(axis[1].title, None);
+    }
+
+    #[test]
+    fn upsert_axis_title_appends_when_absent() {
+        let mut axis = Vec::new();
+        upsert_axis_title(&mut axis, "LEFT_AXIS", "Revenue");
+        assert_eq!(axis.len(), 1);
+        assert_eq!(axis[0].position, "LEFT_AXIS");
+    }
+
+    // ── log_operation / label ────────────────────────────────────────────
+
+    #[test]
+    fn every_verb_has_a_distinct_log_operation_and_label() {
+        let verbs = [
+            EmbeddedObjectVerb::AddChart {
+                chart_type: "column".to_string(),
+                domain: String::new(),
+                series: vec![String::new()],
+                sheet: None,
+                title: None,
+                subtitle: None,
+                legend: None,
+                stacked: None,
+                header_count: None,
+                horizontal_axis_title: None,
+                vertical_axis_title: None,
+                pie_hole: None,
+                anchor: Some(String::new()),
+                offset_x: None,
+                offset_y: None,
+                width: None,
+                height: None,
+                new_sheet: false,
+            },
+            EmbeddedObjectVerb::UpdateChart {
+                chart_id: 1,
+                chart_type: None,
+                domain: None,
+                series: Vec::new(),
+                sheet: None,
+                title: None,
+                subtitle: None,
+                legend: None,
+                stacked: None,
+                header_count: None,
+                horizontal_axis_title: None,
+                vertical_axis_title: None,
+                pie_hole: None,
+            },
+            EmbeddedObjectVerb::DeleteChart { chart_id: 1 },
+            EmbeddedObjectVerb::AddSlicer {
+                sheet: None,
+                range: String::new(),
+                column: 0,
+                hide_values: Vec::new(),
+                title: None,
+                apply_to_pivot_tables: None,
+                anchor: String::new(),
+                offset_x: None,
+                offset_y: None,
+                width: None,
+                height: None,
+            },
+            EmbeddedObjectVerb::UpdateSlicer {
+                slicer_id: 1,
+                sheet: None,
+                range: None,
+                column: None,
+                hide_values: Vec::new(),
+                clear_criteria: false,
+                title: None,
+                apply_to_pivot_tables: None,
+            },
+            EmbeddedObjectVerb::DeleteSlicer { slicer_id: 1 },
+        ];
+        let ops: HashSet<&str> = verbs
+            .iter()
+            .map(EmbeddedObjectVerb::log_operation)
+            .collect();
+        let labels: HashSet<&str> = verbs.iter().map(EmbeddedObjectVerb::label).collect();
+        assert_eq!(ops.len(), verbs.len());
+        assert_eq!(labels.len(), verbs.len());
+    }
+
+    // ── validate_verb ────────────────────────────────────────────────────
+
+    fn add_chart_verb() -> EmbeddedObjectVerb {
+        EmbeddedObjectVerb::AddChart {
+            chart_type: "column".to_string(),
+            domain: "A1:A10".to_string(),
+            series: vec!["B1:B10".to_string()],
+            sheet: Some("Sheet1".to_string()),
+            title: None,
+            subtitle: None,
+            legend: None,
+            stacked: None,
+            header_count: None,
+            horizontal_axis_title: None,
+            vertical_axis_title: None,
+            pie_hole: None,
+            anchor: Some("E2".to_string()),
+            offset_x: None,
+            offset_y: None,
+            width: None,
+            height: None,
+            new_sheet: false,
+        }
+    }
+
+    #[test]
+    fn validate_verb_rejects_add_chart_with_no_series() {
+        let mut verb = add_chart_verb();
+        let EmbeddedObjectVerb::AddChart { series, .. } = &mut verb else {
+            unreachable!()
+        };
+        series.clear();
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("at least one --series"), "{err}");
+    }
+
+    #[test]
+    fn validate_verb_rejects_add_chart_with_neither_anchor_nor_new_sheet() {
+        let mut verb = add_chart_verb();
+        let EmbeddedObjectVerb::AddChart { anchor, .. } = &mut verb else {
+            unreachable!()
+        };
+        *anchor = None;
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("--anchor or --new-sheet"), "{err}");
+    }
+
+    #[test]
+    fn validate_verb_rejects_new_sheet_combined_with_anchor() {
+        let mut verb = add_chart_verb();
+        let EmbeddedObjectVerb::AddChart { new_sheet, .. } = &mut verb else {
+            unreachable!()
+        };
+        *new_sheet = true;
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("--new-sheet cannot be combined"), "{err}");
+    }
+
+    #[test]
+    fn validate_verb_accepts_new_sheet_alone() {
+        let mut verb = add_chart_verb();
+        let EmbeddedObjectVerb::AddChart {
+            anchor, new_sheet, ..
+        } = &mut verb
+        else {
+            unreachable!()
+        };
+        *anchor = None;
+        *new_sheet = true;
+        assert!(validate_verb(&verb).is_ok());
+    }
+
+    #[test]
+    fn validate_verb_rejects_update_chart_with_nothing_to_change() {
+        let verb = EmbeddedObjectVerb::UpdateChart {
+            chart_id: 1,
+            chart_type: None,
+            domain: None,
+            series: Vec::new(),
+            sheet: None,
+            title: None,
+            subtitle: None,
+            legend: None,
+            stacked: None,
+            header_count: None,
+            horizontal_axis_title: None,
+            vertical_axis_title: None,
+            pie_hole: None,
+        };
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("nothing to change"), "{err}");
+    }
+
+    #[test]
+    fn validate_verb_rejects_update_chart_domain_without_series() {
+        let verb = EmbeddedObjectVerb::UpdateChart {
+            chart_id: 1,
+            chart_type: None,
+            domain: Some("A1:A10".to_string()),
+            series: Vec::new(),
+            sheet: None,
+            title: None,
+            subtitle: None,
+            legend: None,
+            stacked: None,
+            header_count: None,
+            horizontal_axis_title: None,
+            vertical_axis_title: None,
+            pie_hole: None,
+        };
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("--domain requires --series"), "{err}");
+    }
+
+    #[test]
+    fn validate_verb_rejects_update_slicer_with_nothing_to_change() {
+        let verb = EmbeddedObjectVerb::UpdateSlicer {
+            slicer_id: 1,
+            sheet: None,
+            range: None,
+            column: None,
+            hide_values: Vec::new(),
+            clear_criteria: false,
+            title: None,
+            apply_to_pivot_tables: None,
+        };
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("nothing to change"), "{err}");
+    }
+
+    #[test]
+    fn validate_verb_accepts_update_slicer_with_only_clear_criteria() {
+        let verb = EmbeddedObjectVerb::UpdateSlicer {
+            slicer_id: 1,
+            sheet: None,
+            range: None,
+            column: None,
+            hide_values: Vec::new(),
+            clear_criteria: true,
+            title: None,
+            apply_to_pivot_tables: None,
+        };
+        assert!(validate_verb(&verb).is_ok());
+    }
+
+    // ── existing_chart_kind ──────────────────────────────────────────────
+
+    #[test]
+    fn existing_chart_kind_accepts_a_supported_basic_type() {
+        let spec = ChartSpec {
+            basic_chart: Some(BasicChartSpec {
+                chart_type: "COLUMN".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            existing_chart_kind(&spec),
+            Ok(ExistingChartKind::Basic)
+        ));
+    }
+
+    #[test]
+    fn existing_chart_kind_accepts_pie() {
+        let spec = ChartSpec {
+            pie_chart: Some(PieChartSpec::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            existing_chart_kind(&spec),
+            Ok(ExistingChartKind::Pie)
+        ));
+    }
+
+    #[test]
+    fn existing_chart_kind_refuses_an_unsupported_basic_type() {
+        let spec = ChartSpec {
+            basic_chart: Some(BasicChartSpec {
+                chart_type: "COMBO".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = existing_chart_kind(&spec).unwrap_err();
+        assert_eq!(err, "COMBO");
+    }
+
+    #[test]
+    fn existing_chart_kind_refuses_neither_basic_nor_pie() {
+        let mut extra = BTreeMap::new();
+        extra.insert("histogramChart".to_string(), serde_json::json!({}));
+        let spec = ChartSpec {
+            extra,
+            ..Default::default()
+        };
+        let err = existing_chart_kind(&spec).unwrap_err();
+        assert_eq!(err, "histogramChart");
+    }
+
+    // ── merge_chart_spec ─────────────────────────────────────────────────
+
+    fn workbook_with_sheet(sheet: Sheet) -> Spreadsheet {
+        Spreadsheet {
+            sheets: vec![sheet],
+            ..Default::default()
+        }
+    }
+
+    fn basic_chart_sheet(chart_id: i64, chart_type: &str) -> Sheet {
+        let mut extra = BTreeMap::new();
+        extra.insert("maximized".to_string(), serde_json::json!(true));
+        Sheet {
+            properties: Some(crate::drive::sheets::types::SheetProperties {
+                sheet_id: Some(0),
+                title: "Q1".to_string(),
+                ..Default::default()
+            }),
+            charts: vec![EmbeddedChart {
+                chart_id: Some(chart_id),
+                spec: Some(ChartSpec {
+                    title: Some("Old title".to_string()),
+                    basic_chart: Some(BasicChartSpec {
+                        chart_type: chart_type.to_string(),
+                        domains: vec![BasicChartDomain {
+                            domain: chart_data(GridRange {
+                                sheet_id: 0,
+                                start_row_index: Some(0),
+                                end_row_index: Some(10),
+                                start_column_index: Some(0),
+                                end_column_index: Some(1),
+                            }),
+                            extra: BTreeMap::new(),
+                        }],
+                        ..Default::default()
+                    }),
+                    extra,
+                    ..Default::default()
+                }),
+                position: Some(EmbeddedObjectPosition {
+                    overlay_position: Some(OverlayPosition {
+                        anchor_cell: GridCoordinate {
+                            sheet_id: 0,
+                            row_index: 1,
+                            column_index: 4,
+                        },
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn update_chart_verb(chart_id: i64) -> EmbeddedObjectVerb {
+        EmbeddedObjectVerb::UpdateChart {
+            chart_id,
+            chart_type: None,
+            domain: None,
+            series: Vec::new(),
+            sheet: None,
+            title: Some("New title".to_string()),
+            subtitle: None,
+            legend: None,
+            stacked: None,
+            header_count: None,
+            horizontal_axis_title: None,
+            vertical_axis_title: None,
+            pie_hole: None,
+        }
+    }
+
+    #[test]
+    fn merge_chart_spec_preserves_unmodelled_extra_fields() {
+        let sheet = basic_chart_sheet(1, "COLUMN");
+        let workbook = workbook_with_sheet(sheet);
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let verb = update_chart_verb(1);
+        let (spec, summary) = merge_chart_spec(&workbook, existing, &verb).unwrap();
+        assert_eq!(spec.extra.get("maximized"), Some(&serde_json::json!(true)));
+        assert_eq!(spec.title.as_deref(), Some("New title"));
+        assert!(summary.contains("title"));
+    }
+
+    #[test]
+    fn merge_chart_spec_refuses_an_unsupported_existing_kind() {
+        let sheet = basic_chart_sheet(1, "COMBO");
+        let workbook = workbook_with_sheet(sheet);
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let verb = update_chart_verb(1);
+        let err = merge_chart_spec(&workbook, existing, &verb).unwrap_err();
+        assert!(matches!(
+            err,
+            EmbeddedObjectResult::RefusedUnsupportedChart { chart_id: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn merge_chart_spec_refuses_a_basic_to_pie_switch() {
+        let sheet = basic_chart_sheet(1, "COLUMN");
+        let workbook = workbook_with_sheet(sheet);
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let mut verb = update_chart_verb(1);
+        let EmbeddedObjectVerb::UpdateChart { chart_type, .. } = &mut verb else {
+            unreachable!()
+        };
+        *chart_type = Some("pie".to_string());
+        let err = merge_chart_spec(&workbook, existing, &verb).unwrap_err();
+        assert!(matches!(
+            err,
+            EmbeddedObjectResult::RefusedUnsupportedChart { chart_id: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn merge_chart_spec_allows_changing_type_within_the_basic_family() {
+        let sheet = basic_chart_sheet(1, "COLUMN");
+        let workbook = workbook_with_sheet(sheet);
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let mut verb = update_chart_verb(1);
+        let EmbeddedObjectVerb::UpdateChart { chart_type, .. } = &mut verb else {
+            unreachable!()
+        };
+        *chart_type = Some("bar".to_string());
+        let (spec, _) = merge_chart_spec(&workbook, existing, &verb).unwrap();
+        assert_eq!(spec.basic_chart.unwrap().chart_type, "BAR");
+    }
+
+    // ── summarise_chart / summarise_slicer / describe_position ──────────
+
+    #[test]
+    fn summarise_chart_reports_overlay_position() {
+        let sheet = basic_chart_sheet(7, "LINE");
+        let summary = summarise_chart(&sheet, &sheet.charts[0]).unwrap();
+        assert_eq!(summary.object_id, 7);
+        assert_eq!(summary.kind, "chart");
+        assert_eq!(summary.chart_type.as_deref(), Some("LINE"));
+        assert_eq!(summary.title.as_deref(), Some("Old title"));
+        assert_eq!(summary.position, "Q1!E2");
+    }
+
+    #[test]
+    fn summarise_chart_reports_own_sheet_for_a_new_sheet_chart() {
+        let sheet = Sheet {
+            properties: Some(crate::drive::sheets::types::SheetProperties {
+                sheet_id: Some(9),
+                title: "Charts".to_string(),
+                ..Default::default()
+            }),
+            charts: vec![EmbeddedChart {
+                chart_id: Some(3),
+                spec: Some(ChartSpec {
+                    pie_chart: Some(PieChartSpec::default()),
+                    ..Default::default()
+                }),
+                position: Some(EmbeddedObjectPosition {
+                    sheet_id: Some(9),
+                    new_sheet: Some(true),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let summary = summarise_chart(&sheet, &sheet.charts[0]).unwrap();
+        assert_eq!(summary.chart_type.as_deref(), Some("PIE"));
+        assert_eq!(summary.position, "own sheet (id 9)");
+    }
+
+    #[test]
+    fn summarise_slicer_reports_title_and_position() {
+        let sheet = Sheet {
+            properties: Some(crate::drive::sheets::types::SheetProperties {
+                sheet_id: Some(0),
+                title: "Q1".to_string(),
+                ..Default::default()
+            }),
+            slicers: vec![Slicer {
+                slicer_id: Some(4),
+                spec: Some(SlicerSpec {
+                    title: Some("Region".to_string()),
+                    ..Default::default()
+                }),
+                position: Some(EmbeddedObjectPosition {
+                    overlay_position: Some(OverlayPosition {
+                        anchor_cell: GridCoordinate {
+                            sheet_id: 0,
+                            row_index: 0,
+                            column_index: 5,
+                        },
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let summary = summarise_slicer(&sheet, &sheet.slicers[0]).unwrap();
+        assert_eq!(summary.object_id, 4);
+        assert_eq!(summary.kind, "slicer");
+        assert_eq!(summary.chart_type, None);
+        assert_eq!(summary.title.as_deref(), Some("Region"));
+        assert_eq!(summary.position, "Q1!F1");
+    }
+
+    // ── write_jsonl / log_status ─────────────────────────────────────────
+
+    #[test]
+    fn write_jsonl_emits_one_line_of_json() {
+        let outcome = EmbeddedObjectOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            sheet_id: None,
+            verb: EmbeddedObjectVerb::DeleteChart { chart_id: 3 },
+            result: EmbeddedObjectResult::Changed {
+                summary: "delete chart 3".to_string(),
+                object_id: Some(3),
+                object: None,
+            },
+        };
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(parsed["result"]["status"], "changed");
+    }
+
+    // ── end-to-end via wiremock ──────────────────────────────────────────
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    async fn clients(server: &wiremock::MockServer) -> (DriveClient, SheetsClient) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token", "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+        let mut drive = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut drive,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        let env = MapEnv::new().with(SHEETS_API_URL, &server.uri());
+        let sheets = SheetsClient::from_drive_client_with(&env, &drive).unwrap();
+        (drive, sheets)
+    }
+
+    fn mount_file(id: &str, mime_type: &str, parents: &[&str]) -> wiremock::Mock {
+        let parents: Vec<&str> = parents.to_vec();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/drive/v3/files/{id}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id, "name": id, "mimeType": mime_type, "parents": parents,
+                    "version": "1",
+                })),
+            )
+    }
+
+    fn mount_folder(id: &str) -> wiremock::Mock {
+        mount_file(id, "application/vnd.google-apps.folder", &[])
+    }
+
+    fn mount_workbook(sheets: serde_json::Value) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": sheets,
+                })),
+            )
+    }
+
+    fn leased_opts_for(spreadsheet_id: &str) -> (Option<String>, std::path::PathBuf) {
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, spreadsheet_id, "1");
+        (Some(token), ledger_path)
+    }
+
+    fn allow_rule(folder: &str) -> FolderPermissionRule {
+        FolderPermissionRule {
+            folder_id: Some(folder.to_string()),
+            file_id: None,
+            recursive: true,
+            allow: std::iter::once(DriveOperation::SheetsStructure).collect(),
+            deny: HashSet::default(),
+            require_lease: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denied_gate_blocks_before_any_read_or_batch_update_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_chart_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            EmbeddedObjectResult::Blocked { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_chart_sends_an_add_chart_request_and_reports_the_server_assigned_id() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Sheet1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{"addChart": {"chart": {"chartId": 42}}}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_chart_verb(),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                EmbeddedObjectResult::Changed {
+                    object_id: Some(42),
+                    ..
+                }
+            ),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn add_chart_pie_refuses_more_than_one_series_before_any_batch_update_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Sheet1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let mut verb = add_chart_verb();
+        let EmbeddedObjectVerb::AddChart {
+            chart_type, series, ..
+        } = &mut verb
+        else {
+            unreachable!()
+        };
+        *chart_type = "pie".to_string();
+        series.push("C1:C10".to_string());
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                EmbeddedObjectResult::RefusedInvalidRange { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn update_chart_refuses_an_unsupported_existing_chart_with_no_batch_update_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {
+                "properties": {"sheetId": 0, "title": "Q1", "index": 0},
+                "charts": [{
+                    "chartId": 1,
+                    "spec": {"basicChart": {"chartType": "COMBO"}},
+                }],
+            },
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: update_chart_verb(1),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                EmbeddedObjectResult::RefusedUnsupportedChart { chart_id: 1, .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn update_chart_refuses_an_unknown_id() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: update_chart_verb(99),
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            EmbeddedObjectResult::RefusedObjectNotFound { object_id: 99 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_chart_reports_a_preview_under_dry_run_with_no_batch_update_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {
+                "properties": {"sheetId": 0, "title": "Q1", "index": 0},
+                "charts": [{
+                    "chartId": 5,
+                    "spec": {"title": "Sales", "pieChart": {
+                        "domain": {"sourceRange": {"sources": [{"sheetId": 0}]}},
+                        "series": {"sourceRange": {"sources": [{"sheetId": 0}]}},
+                    }},
+                    "position": {"overlayPosition": {"anchorCell": {"sheetId": 0, "rowIndex": 1, "columnIndex": 2}}},
+                }],
+            },
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: EmbeddedObjectVerb::DeleteChart { chart_id: 5 },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            EmbeddedObjectResult::WouldChange { object, .. } => {
+                let object = object.expect("delete-chart previews the object");
+                assert_eq!(object.object_id, 5);
+                assert_eq!(object.title.as_deref(), Some("Sales"));
+                assert_eq!(object.position, "Q1!C2");
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_slicer_sends_an_add_slicer_request_and_reports_the_server_assigned_id() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{"addSlicer": {"slicer": {"slicerId": 8}}}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: EmbeddedObjectVerb::AddSlicer {
+                sheet: Some("Q1".to_string()),
+                range: "A1:D10".to_string(),
+                column: 1,
+                hide_values: vec!["Closed".to_string()],
+                title: Some("Status".to_string()),
+                apply_to_pivot_tables: None,
+                anchor: "F2".to_string(),
+                offset_x: None,
+                offset_y: None,
+                width: None,
+                height: None,
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                EmbeddedObjectResult::Changed {
+                    object_id: Some(8),
+                    ..
+                }
+            ),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn update_slicer_names_only_the_changed_fields_in_the_mask() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {
+                "properties": {"sheetId": 0, "title": "Q1", "index": 0},
+                "slicers": [{
+                    "slicerId": 4,
+                    "spec": {"title": "Region"},
+                    "position": {"overlayPosition": {"anchorCell": {"sheetId": 0, "rowIndex": 0, "columnIndex": 5}}},
+                }],
+            },
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: EmbeddedObjectVerb::UpdateSlicer {
+                slicer_id: 4,
+                sheet: None,
+                range: None,
+                column: None,
+                hide_values: Vec::new(),
+                clear_criteria: false,
+                title: Some("Territory".to_string()),
+                apply_to_pivot_tables: None,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            EmbeddedObjectResult::WouldChange { summary, .. } => {
+                assert!(summary.contains("title"), "{summary}");
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_slicer_reports_a_preview_under_dry_run() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {
+                "properties": {"sheetId": 0, "title": "Q1", "index": 0},
+                "slicers": [{
+                    "slicerId": 9,
+                    "spec": {"title": "Region"},
+                    "position": {"overlayPosition": {"anchorCell": {"sheetId": 0, "rowIndex": 0, "columnIndex": 5}}},
+                }],
+            },
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: EmbeddedObjectVerb::DeleteSlicer { slicer_id: 9 },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            EmbeddedObjectResult::WouldChange { object, .. } => {
+                let object = object.expect("delete-slicer previews the object");
+                assert_eq!(object.object_id, 9);
+                assert_eq!(object.kind, "slicer");
+                assert_eq!(object.title.as_deref(), Some("Region"));
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_makes_no_batch_update_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Sheet1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        // No batchUpdate mock is registered at all — a call would 404 and
+        // surface as `Failed`, not `WouldChange`.
+        let rules = vec![allow_rule("folder-1")];
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_chart_verb(),
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, EmbeddedObjectResult::WouldChange { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[test]
+    fn charts_from_workbook_and_slicers_from_workbook_report_every_object() {
+        let mut with_slicer = basic_chart_sheet(1, "COLUMN");
+        with_slicer.slicers.push(Slicer {
+            slicer_id: Some(2),
+            spec: Some(SlicerSpec::default()),
+            position: Some(EmbeddedObjectPosition {
+                overlay_position: Some(OverlayPosition {
+                    anchor_cell: GridCoordinate {
+                        sheet_id: 0,
+                        row_index: 0,
+                        column_index: 0,
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        });
+        let workbook = workbook_with_sheet(with_slicer);
+        assert_eq!(charts_from_workbook(&workbook).len(), 1);
+        assert_eq!(slicers_from_workbook(&workbook).len(), 1);
     }
 }
