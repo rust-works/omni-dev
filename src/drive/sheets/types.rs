@@ -1533,10 +1533,12 @@ pub struct DeleteNamedRangeRequest {
 // `BTreeMap`, not `HashMap`, for the same determinism reason `jev`'s wire
 // types use it (STYLE, `src/jev/protocol.rs`).
 //
-// These types are `PartialEq`-only, never `Eq`: `PieChartSpec::pie_hole` is
-// an `f64` and `serde_json::Value` itself has no meaningful `Eq`, the same
-// reason [`Color`] forces `PartialEq`-only up through everything that embeds
-// it.
+// `serde_json::Value` itself derives `Eq` (unlike an `f64` on its own), so
+// most of these types derive `Eq` too. The exception is `PieChartSpec`
+// (its `pie_hole` is a plain `f64`) and everything that transitively embeds
+// it — `ChartSpec`, `EmbeddedChart`, and the requests/replies built from
+// them — which stay `PartialEq`-only, the same reason [`Color`] forces
+// `PartialEq`-only up through everything that embeds *it*.
 
 /// One chart embedded on a sheet — `EmbeddedChart`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -1586,12 +1588,14 @@ pub struct ChartSpec {
 }
 
 /// `BasicChartSpec` — the COLUMN/BAR/LINE/AREA/SCATTER subset this crate
-/// supports (issue #1797's chosen v1 cut). `COMBO` and `STEPPED_AREA` are
-/// also valid wire values for `chartType`, and reading one back is
-/// tolerated (it lands here, not in `extra`, since `chartType` is a named
-/// field) — but `embedded_object.rs::merge_chart_spec` refuses to *update*
-/// one, since `COMBO` needs a per-series `type` this crate doesn't model.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+/// supports (issue #1797's chosen v1 cut).
+///
+/// `COMBO` and `STEPPED_AREA` are also valid wire values for `chartType`,
+/// and reading one back is tolerated (it lands here, not in `extra`, since
+/// `chartType` is a named field) — but
+/// `embedded_object.rs::merge_chart_spec` refuses to *update* one, since
+/// `COMBO` needs a per-series `type` this crate doesn't model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BasicChartSpec {
     /// `"COLUMN"`, `"BAR"`, `"LINE"`, `"AREA"`, `"SCATTER"` (this crate's
     /// supported set), or another wire value read back from an existing
@@ -1636,7 +1640,7 @@ pub struct BasicChartSpec {
 }
 
 /// One axis of a [`BasicChartSpec`] — `BasicChartAxis`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BasicChartAxis {
     /// Which physical axis this is — `"BOTTOM_AXIS"`, `"LEFT_AXIS"`, or
     /// `"RIGHT_AXIS"`. `--horizontal-axis-title`/`--vertical-axis-title`
@@ -1654,7 +1658,7 @@ pub struct BasicChartAxis {
 }
 
 /// One domain of a [`BasicChartSpec`] — `BasicChartDomain`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BasicChartDomain {
     /// The domain's source data.
     pub domain: ChartData,
@@ -1665,7 +1669,7 @@ pub struct BasicChartDomain {
 }
 
 /// One series of a [`BasicChartSpec`] — `BasicChartSeries`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BasicChartSeries {
     /// The series' source data.
     pub series: ChartData,
@@ -1709,7 +1713,7 @@ pub struct PieChartSpec {
 }
 
 /// One chart series or domain's source data — `ChartData`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChartData {
     /// The cell range(s) this series/domain reads from.
     #[serde(rename = "sourceRange")]
@@ -1731,10 +1735,12 @@ pub struct ChartSourceRange {
 }
 
 /// Where an [`EmbeddedChart`] or [`Slicer`] is anchored —
-/// `EmbeddedObjectPosition`. A three-way union on the wire: exactly one of
-/// `overlay_position`/`new_sheet` is set on a chart this crate builds (a
-/// slicer can only ever be `overlay_position` — the API has no
-/// `newSheet`/own-`sheetId` slicer placement).
+/// `EmbeddedObjectPosition`.
+///
+/// A three-way union on the wire: exactly one of `overlay_position`/
+/// `new_sheet` is set on a chart this crate builds (a slicer can only ever
+/// be `overlay_position` — the API has no `newSheet`/own-`sheetId` slicer
+/// placement).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmbeddedObjectPosition {
     /// The chart occupies its own sheet, whose id this names. Read-back
@@ -1808,11 +1814,13 @@ pub struct GridCoordinate {
     pub column_index: i64,
 }
 
-/// A slicer embedded on a sheet — `Slicer`. Filters an existing range or
-/// pivot table interactively, the same `FilterCriteria` vocabulary
-/// `filter.rs` curates (`hiddenValues` only — see that module's doc
-/// comment for the condition-based cut this crate makes uniformly).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+/// A slicer embedded on a sheet — `Slicer`.
+///
+/// Filters an existing range or pivot table interactively, the same
+/// `FilterCriteria` vocabulary `filter.rs` curates (`hiddenValues` only —
+/// see that module's doc comment for the condition-based cut this crate
+/// makes uniformly).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Slicer {
     /// The server-assigned stable id. Absent on an `add-slicer` request
     /// this crate is building; always present on one read back or on an
@@ -1829,7 +1837,7 @@ pub struct Slicer {
 }
 
 /// A slicer's filtering configuration — `SlicerSpec`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SlicerSpec {
     /// The range the slicer filters.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "dataRange")]
@@ -1896,7 +1904,7 @@ pub struct UpdateChartSpecRequest {
 }
 
 /// `AddSlicerRequest`.
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct AddSlicerRequest {
     /// The slicer to create. `slicer_id` is left unset — the server assigns
     /// it, only knowable from the reply.
@@ -1908,7 +1916,7 @@ pub struct AddSlicerRequest {
 /// Unlike [`UpdateChartSpecRequest`], this request **does** carry a field
 /// mask — `updateSlicerSpec` supports partial updates, so
 /// `embedded_object.rs` only ever names the fields the caller actually set.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct UpdateSlicerSpecRequest {
     /// Which slicer to update.
     #[serde(rename = "slicerId")]
@@ -2086,7 +2094,7 @@ pub struct AddChartReply {
 }
 
 /// The `addSlicer` arm of a [`BatchUpdateReply`] (issue #1797).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct AddSlicerReply {
     /// The created slicer, including its assigned `slicerId`.
     #[serde(default)]
