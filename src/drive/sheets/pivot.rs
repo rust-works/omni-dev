@@ -1348,6 +1348,76 @@ mod tests {
         assert!(err.contains("names no values"), "{err}");
     }
 
+    #[test]
+    fn parse_filter_specs_rejects_a_missing_colon() {
+        let err = parse_filter_specs(&["1".to_string()]).unwrap_err();
+        assert!(err.contains("COLUMN:VALUE"), "{err}");
+    }
+
+    // ── to_wire mappings ─────────────────────────────────────────────────
+
+    #[test]
+    fn pivot_group_spec_to_wire_maps_sort_order_and_totals() {
+        let asc = PivotGroupSpec {
+            column: 0,
+            sort_order: Some(SortOrder::Ascending),
+        }
+        .to_wire(true);
+        assert_eq!(asc.sort_order.as_deref(), Some("ASCENDING"));
+        assert!(asc.show_totals);
+
+        let desc = PivotGroupSpec {
+            column: 1,
+            sort_order: Some(SortOrder::Descending),
+        }
+        .to_wire(false);
+        assert_eq!(desc.sort_order.as_deref(), Some("DESCENDING"));
+        assert!(!desc.show_totals);
+
+        let none = PivotGroupSpec {
+            column: 2,
+            sort_order: None,
+        }
+        .to_wire(true);
+        assert_eq!(none.sort_order, None);
+    }
+
+    #[test]
+    fn summarize_function_as_sheets_str_covers_every_variant() {
+        let cases = [
+            (SummarizeFunction::Sum, "SUM"),
+            (SummarizeFunction::Counta, "COUNTA"),
+            (SummarizeFunction::Count, "COUNT"),
+            (SummarizeFunction::CountUnique, "COUNTUNIQUE"),
+            (SummarizeFunction::Average, "AVERAGE"),
+            (SummarizeFunction::Max, "MAX"),
+            (SummarizeFunction::Min, "MIN"),
+            (SummarizeFunction::Median, "MEDIAN"),
+            (SummarizeFunction::Product, "PRODUCT"),
+            (SummarizeFunction::Stdev, "STDEV"),
+            (SummarizeFunction::Stdevp, "STDEVP"),
+            (SummarizeFunction::Var, "VAR"),
+            (SummarizeFunction::Varp, "VARP"),
+        ];
+        for (func, expected) in cases {
+            assert_eq!(func.as_sheets_str(), expected);
+        }
+    }
+
+    #[test]
+    fn pivot_filter_spec_arg_to_wire_maps_fields() {
+        let spec = PivotFilterSpecArg {
+            column: 2,
+            visible_values: vec!["Open".to_string(), "Closed".to_string()],
+        };
+        let wire = spec.to_wire();
+        assert_eq!(wire.column_offset_index, 2);
+        assert_eq!(
+            wire.filter_criteria.visible_values,
+            vec!["Open".to_string(), "Closed".to_string()]
+        );
+    }
+
     // ── describe helpers ─────────────────────────────────────────────────
 
     #[test]
@@ -1395,6 +1465,39 @@ mod tests {
     }
 
     #[test]
+    fn describe_pivot_config_covers_every_sort_order_and_an_explicit_horizontal_layout() {
+        let desc = describe_pivot_config(
+            &[
+                PivotGroupSpec {
+                    column: 0,
+                    sort_order: None,
+                },
+                PivotGroupSpec {
+                    column: 1,
+                    sort_order: Some(SortOrder::Descending),
+                },
+            ],
+            &[PivotGroupSpec {
+                column: 2,
+                sort_order: None,
+            }],
+            &[PivotValueSpec {
+                column: 3,
+                function: SummarizeFunction::Sum,
+            }],
+            &[],
+            Some(ValueLayout::Horizontal),
+            true,
+        );
+        assert!(desc.contains("rows: col 0, col 1 (desc)"), "{desc}");
+        assert!(desc.contains("columns: col 2"), "{desc}");
+        // Explicit `Horizontal`, distinct from the `None` default's
+        // "HORIZONTAL (default)" wording.
+        assert!(desc.contains("layout: HORIZONTAL"), "{desc}");
+        assert!(!desc.contains("(default)"), "{desc}");
+    }
+
+    #[test]
     fn describe_anchor_currently_covers_empty_value_and_pivot() {
         assert_eq!(describe_anchor_currently(None), "empty");
 
@@ -1415,14 +1518,79 @@ mod tests {
             }),
             formatted_value: None,
         };
-        assert!(
-            describe_anchor_currently(Some(&pivot_cell)).contains("a pivot table"),
-            "{}",
-            describe_anchor_currently(Some(&pivot_cell))
-        );
+        let pivot_desc = describe_anchor_currently(Some(&pivot_cell));
+        assert!(pivot_desc.contains("a pivot table"), "{pivot_desc}");
+
+        // A cell present in the response but carrying neither a pivot
+        // table nor a (non-empty) formatted value — the catch-all arm.
+        let blank_cell = CellSnapshot {
+            pivot_table: None,
+            formatted_value: None,
+        };
+        assert_eq!(describe_anchor_currently(Some(&blank_cell)), "empty");
+        let empty_string_cell = CellSnapshot {
+            pivot_table: None,
+            formatted_value: Some(String::new()),
+        };
+        assert_eq!(describe_anchor_currently(Some(&empty_string_cell)), "empty");
     }
 
     // ── verb/result structural sanity ────────────────────────────────────
+
+    #[test]
+    fn pivot_verb_label_names_each_verb() {
+        let add = PivotVerb::AddPivotTable {
+            sheet: String::new(),
+            anchor: String::new(),
+            source: String::new(),
+            rows: vec![],
+            columns: vec![],
+            values: vec![],
+            filters: vec![],
+            value_layout: None,
+            show_totals: true,
+        };
+        assert_eq!(add.label(), "add-pivot-table");
+        let delete = PivotVerb::DeletePivotTable {
+            sheet: String::new(),
+            anchor: String::new(),
+        };
+        assert_eq!(delete.label(), "delete-pivot-table");
+    }
+
+    #[test]
+    fn list_entries_computes_the_real_anchor_from_chunk_offsets() {
+        let workbook: crate::drive::sheets::types::Spreadsheet =
+            serde_json::from_value(serde_json::json!({
+                "sheets": [{
+                    "properties": {"sheetId": 0, "title": "Report"},
+                    "data": [{
+                        "startRow": 2, "startColumn": 1,
+                        "rowData": [
+                            {"values": [{}, {"pivotTable": existing_pivot_json()}]},
+                        ],
+                    }],
+                }],
+            }))
+            .unwrap();
+        let entries = list_entries(&workbook);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sheet, "Report");
+        // `startColumn` 1 + the pivot's own column index 1 = column C;
+        // `startRow` 2 + row index 0, 1-based = row 3.
+        assert_eq!(entries[0].anchor, "C3");
+        let summary = &entries[0].summary;
+        assert!(summary.contains("value(s)"), "{summary}");
+    }
+
+    #[test]
+    fn pivot_outcome_write_jsonl_emits_the_result_status() {
+        let outcome = outcome_with(add_verb(), Some("Budget"), PivotResult::RefusedShortcut);
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("refused-shortcut"), "{text}");
+    }
 
     #[test]
     fn log_operations_are_distinct_and_kebab_cased() {
@@ -1709,6 +1877,7 @@ mod tests {
         };
         let outcome = pivot(&drive, &sheets, &opts, &rules).await;
         let PivotResult::WouldChange(change) = &outcome.result else {
+            // omni-dev: coverage ignore-line reason="dry_run plus a fully-allowing gate always reaches WouldChange here; this branch is a safety net against an unexpected refusal, not a coverage gap"
             panic!("expected WouldChange, got {:?}", outcome.result);
         };
         assert_eq!(change.anchor_currently, "empty");
@@ -2034,6 +2203,1038 @@ mod tests {
             "{:?}",
             outcome.result
         );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_when_sheet_and_anchor_conflict_on_the_sheet_name() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // No mocks at all: the ambiguity is caught by `a1::compose` before
+        // any HTTP request is ever sent.
+        let mut verb = add_verb();
+        if let PivotVerb::AddPivotTable { anchor, .. } = &mut verb {
+            *anchor = "Other!A1".to_string();
+        }
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &[]).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedInvalidRange { .. }),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.file_name, None);
+    }
+
+    #[tokio::test]
+    async fn pivot_reports_failed_on_a_metadata_fetch_failure() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/missing"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let opts = PivotOptions {
+            spreadsheet_id: "missing".to_string(),
+            verb: add_verb(),
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &[]).await;
+        assert!(
+            matches!(outcome.result, PivotResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn pivot_refuses_a_shortcut_target() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.shortcut",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        // No mock for folder-1: proves the gate never runs.
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedShortcut),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn pivot_refuses_a_non_spreadsheet_target() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", "text/plain", &["folder-1"])
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedNotASpreadsheet { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn pivot_refuses_a_target_with_no_visible_parents() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", crate::drive::types::GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &[]).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedNoVisibleParents),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn pivot_reports_failed_on_a_gate_ancestor_fetch_failure() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn add_reports_failed_when_the_workbook_fetch_fails() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn pivot_reports_failed_when_the_cell_pivot_fetch_fails() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        // A more specific mock, matched only by the `ranges`-scoped
+        // `get_cell_pivot` call. wiremock checks equal-priority mocks in
+        // mount order, so a higher priority (a *lower* number) is needed
+        // for this one to be checked before the general workbook mock
+        // above — which otherwise matches first and would serve `200` to
+        // every `GET`, `ranges` or not. `get_spreadsheet` (which never
+        // sends `ranges`) still falls through to that general mock.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .and(wiremock::matchers::query_param("ranges", "'Report'!A1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_anchor_sheet_that_does_not_exist() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let mut verb = add_verb();
+        if let PivotVerb::AddPivotTable { sheet, .. } = &mut verb {
+            *sheet = "Nope".to_string();
+        }
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedSheetNotFound { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_anchor_with_invalid_range_syntax() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let mut verb = add_verb();
+        if let PivotVerb::AddPivotTable { anchor, .. } = &mut verb {
+            // Row 0 does not exist (rows are 1-based) — a genuinely
+            // malformed range, distinct from the multi-cell case above.
+            *anchor = "A0".to_string();
+        }
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedInvalidRange { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_invalid_source_composed_from_sheet_and_bare_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let mut verb = add_verb();
+        if let PivotVerb::AddPivotTable { source, .. } = &mut verb {
+            // No `Sheet!` prefix — falls back to composing with `--sheet`.
+            // The newline sits *inside* the range (not at either edge, so
+            // `compose`'s own `str::trim` can't remove it) and fails
+            // `a1::validate_range` inside `compose`.
+            *source = "A1\n:D100".to_string();
+        }
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedInvalidRange { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_a_source_sheet_that_does_not_exist() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let mut verb = add_verb();
+        if let PivotVerb::AddPivotTable { source, .. } = &mut verb {
+            *source = "Nope!A1:D10".to_string();
+        }
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedSheetNotFound { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_a_source_with_invalid_range_syntax() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let mut verb = add_verb();
+        if let PivotVerb::AddPivotTable { source, .. } = &mut verb {
+            *source = "Data!A0:D10".to_string();
+        }
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedInvalidRange { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_unbounded_source_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let mut verb = add_verb();
+        if let PivotVerb::AddPivotTable { source, .. } = &mut verb {
+            // A whole-column span: bounded in columns but not in rows.
+            *source = "Data!A:D".to_string();
+        }
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            PivotResult::RefusedInvalidSource { detail } => {
+                assert!(detail.contains("bounded range"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidSource, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_unparseable_row_spec() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let mut verb = add_verb();
+        if let PivotVerb::AddPivotTable { rows, .. } = &mut verb {
+            *rows = vec!["bad".to_string()];
+        }
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedInvalidSource { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_unparseable_column_spec() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let mut verb = add_verb();
+        if let PivotVerb::AddPivotTable { columns, .. } = &mut verb {
+            *columns = vec!["bad".to_string()];
+        }
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedInvalidSource { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_unparseable_value_spec() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let mut verb = add_verb();
+        if let PivotVerb::AddPivotTable { values, .. } = &mut verb {
+            *values = vec!["bad".to_string()];
+        }
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedInvalidSource { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_unparseable_filter_spec() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let mut verb = add_verb();
+        if let PivotVerb::AddPivotTable { filters, .. } = &mut verb {
+            *filters = vec!["bad".to_string()];
+        }
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::RefusedInvalidSource { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn add_reports_failed_when_batch_update_fails() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    // ── the Drive write lease (ADR-0080 §9) ─────────────────────────────
+
+    #[tokio::test]
+    async fn add_refuses_without_a_lease_when_the_rule_requires_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, PivotResult::RefusedNoLease));
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_unknown_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: Some("bogus-token".to_string()),
+            ledger_path,
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, PivotResult::RefusedLeaseExpired));
+    }
+
+    #[tokio::test]
+    async fn add_refuses_a_lease_bound_to_a_different_file() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "some-other-sheet", "1");
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, PivotResult::RefusedLeaseWrongFile));
+    }
+
+    #[tokio::test]
+    async fn add_refuses_a_stale_lease_when_the_file_has_moved() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, PivotResult::RefusedLeaseStale));
+    }
+
+    #[tokio::test]
+    async fn add_reports_failed_when_the_lease_checks_live_version_refetch_fails() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // The gate's own metadata fetch consumes this mock (it fetches the
+        // target's metadata exactly once); the lease check's *separate*
+        // live-version refetch (`gate_leased_write`) is a second
+        // `files.get` call, served by the always-on 500 mock below.
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    // ── describe_lines / describe ────────────────────────────────────────
+
+    fn outcome_with(verb: PivotVerb, file_name: Option<&str>, result: PivotResult) -> PivotOutcome {
+        PivotOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: file_name.map(str::to_string),
+            resolved_folder_id: None,
+            verb,
+            result,
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_book_fallback_when_file_name_is_absent() {
+        let out = outcome_with(add_verb(), None, PivotResult::RefusedShortcut);
+        let text = describe(&out);
+        assert!(text.contains("'sheet-1'"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_not_a_spreadsheet_and_shortcut() {
+        let not_a_sheet = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            PivotResult::RefusedNotASpreadsheet {
+                mime_type: "text/plain".to_string(),
+            },
+        );
+        let text = describe(&not_a_sheet);
+        assert!(text.contains("not a Google Sheet"), "{text}");
+        assert!(text.contains("add-pivot-table"), "{text}");
+
+        let shortcut = outcome_with(delete_verb(), Some("Budget"), PivotResult::RefusedShortcut);
+        let text = describe(&shortcut);
+        assert!(text.contains("shortcut"), "{text}");
+        assert!(text.contains("delete-pivot-table"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_no_visible_parents_naming_each_verbs_operations() {
+        let add = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            PivotResult::RefusedNoVisibleParents,
+        );
+        let text = describe(&add);
+        assert!(text.contains("\"sheets-write\""), "{text}");
+        assert!(text.contains("\"sheets-structure\""), "{text}");
+
+        let delete = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            PivotResult::RefusedNoVisibleParents,
+        );
+        let text = describe(&delete);
+        assert!(text.contains("\"sheets-write\""), "{text}");
+        assert!(!text.contains("sheets-structure"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_sheet_not_found_with_and_without_available_titles() {
+        let none_available = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            PivotResult::RefusedSheetNotFound {
+                title: "Nope".to_string(),
+                available: vec![],
+            },
+        );
+        let text = describe(&none_available);
+        assert!(text.contains("Available: none"), "{text}");
+
+        let some_available = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            PivotResult::RefusedSheetNotFound {
+                title: "Nope".to_string(),
+                available: vec!["Report".to_string(), "Data".to_string()],
+            },
+        );
+        let text = describe(&some_available);
+        assert!(text.contains("'Report', 'Data'"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_invalid_range_anchor_and_source() {
+        for result in [
+            PivotResult::RefusedInvalidRange {
+                detail: "bad range".to_string(),
+            },
+            PivotResult::RefusedInvalidAnchor {
+                detail: "bad anchor".to_string(),
+            },
+            PivotResult::RefusedInvalidSource {
+                detail: "bad source".to_string(),
+            },
+        ] {
+            let out = outcome_with(add_verb(), Some("Budget"), result);
+            let text = describe(&out);
+            assert!(text.starts_with("Refused: bad "), "{text}");
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_anchor_has_pivot_table_and_no_pivot_at_anchor() {
+        let occupied = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            PivotResult::RefusedAnchorHasPivotTable {
+                anchor: "'Report'!A1".to_string(),
+                existing_summary: "1 row group(s), 0 column group(s), 1 value(s)".to_string(),
+            },
+        );
+        let text = describe(&occupied);
+        assert!(text.contains("already holds a pivot table"), "{text}");
+        assert!(text.contains("delete-pivot-table"), "{text}");
+
+        let missing = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            PivotResult::RefusedNoPivotTableAtAnchor {
+                anchor: "'Report'!A1".to_string(),
+            },
+        );
+        let text = describe(&missing);
+        assert!(text.contains("no pivot table anchored"), "{text}");
+        assert!(text.contains("list-pivot-tables"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_blocked_with_and_without_a_deciding_rule() {
+        let folder_rule = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            PivotResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 2,
+                }),
+            },
+        );
+        let text = describe(&folder_rule);
+        assert!(text.contains("add-pivot-table"), "{text}");
+        assert!(text.contains("folder folder-1 (depth 2)"), "{text}");
+
+        let default_policy = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            PivotResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: None,
+            },
+        );
+        let text = describe(&default_policy);
+        assert!(text.contains("default policy"), "{text}");
+        assert!(text.contains("sheets-write"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_every_lease_refusal() {
+        for (result, needle) in [
+            (PivotResult::RefusedNoLease, "requires a Drive write lease"),
+            (
+                PivotResult::RefusedLeaseExpired,
+                "expired, released, or unknown",
+            ),
+            (
+                PivotResult::RefusedLeaseWrongFile,
+                "acquired for a different file",
+            ),
+            (
+                PivotResult::RefusedLeaseStale,
+                "changed since the lease was acquired",
+            ),
+        ] {
+            let out = outcome_with(add_verb(), Some("Budget"), result);
+            let text = describe(&out);
+            assert!(text.contains(needle), "{text}");
+            assert!(text.contains("drive lease acquire sheet-1"), "{text}");
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_changed_for_delete_and_failed() {
+        let change = PivotChange {
+            anchor: "'Report'!A1".to_string(),
+            source: None,
+            config: None,
+            anchor_currently: "a pivot table (1 row group(s), 0 column group(s), 1 value(s))"
+                .to_string(),
+        };
+        let changed = outcome_with(delete_verb(), Some("Budget"), PivotResult::Changed(change));
+        let text = describe(&changed);
+        assert!(text.contains("Applied: delete the pivot table"), "{text}");
+
+        let failed = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            PivotResult::Failed {
+                detail: "boom".to_string(),
+            },
+        );
+        assert_eq!(describe(&failed), "Failed: boom");
     }
 
     #[test]

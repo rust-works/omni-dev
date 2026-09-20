@@ -547,6 +547,7 @@ mod tests {
             verdict, denied, ..
         } = outcome
         else {
+            // omni-dev: coverage ignore-line reason="every operation is granted by the mounted rule, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
             panic!("expected Gated");
         };
         assert_eq!(verdict, Verdict::Allow);
@@ -578,6 +579,7 @@ mod tests {
             verdict, denied, ..
         } = outcome
         else {
+            // omni-dev: coverage ignore-line reason="the target has a visible parent with a matching folder rule, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
             panic!("expected Gated");
         };
         assert_eq!(verdict, Verdict::Deny);
@@ -606,6 +608,7 @@ mod tests {
             verdict, denied, ..
         } = outcome
         else {
+            // omni-dev: coverage ignore-line reason="the target has a visible parent with a matching folder rule, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
             panic!("expected Gated");
         };
         assert_eq!(verdict, Verdict::Deny);
@@ -642,6 +645,7 @@ mod tests {
         )
         .await;
         let TargetGateUnionOutcome::Gated { requires_lease, .. } = outcome else {
+            // omni-dev: coverage ignore-line reason="every operation is granted by a mounted rule, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
             panic!("expected Gated");
         };
         assert!(requires_lease);
@@ -719,6 +723,7 @@ mod tests {
             verdict, denied, ..
         } = outcome
         else {
+            // omni-dev: coverage ignore-line reason="the file rule gives sheets-structure something to deny rather than find nothing, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
             panic!("expected Gated, got a Refused fold");
         };
         assert_eq!(verdict, Verdict::Deny);
@@ -726,5 +731,82 @@ mod tests {
             denied.map(|(op, _)| op),
             Some(DriveOperation::SheetsStructure)
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_all_reports_a_metadata_fetch_failure_distinctly() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/missing"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let outcome = resolve_all(
+            &client,
+            "missing",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+            &[],
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            TargetGateUnionOutcome::MetadataFetchFailed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_all_refuses_a_shortcut_before_the_gate_runs() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.shortcut",
+            &["parent-1"],
+        )
+        .mount(&server)
+        .await;
+        // No mock for parent-1: proves the gate never runs.
+        let outcome = resolve_all(
+            &client,
+            "sheet-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            TargetGateUnionOutcome::Refused {
+                refusal: SheetTargetRefusal::Shortcut,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_all_reports_a_gate_ancestor_fetch_failure_distinctly() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/parent-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let outcome = resolve_all(
+            &client,
+            "sheet-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            TargetGateUnionOutcome::GateFetchFailed { .. }
+        ));
     }
 }

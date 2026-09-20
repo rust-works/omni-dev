@@ -676,4 +676,104 @@ mod tests {
         .await
         .is_ok());
     }
+
+    #[tokio::test]
+    async fn the_pivot_table_dispatch_arms_reach_their_leaf_commands() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        // No write-permission rules are configured (an unconfigured
+        // account), so both mutating leaves below are `Blocked` by default
+        // policy — enough to reach and return from the leaf without a
+        // lease or a workbook fetch. `list-pivot-tables` is ungated, so it
+        // goes further and actually fetches the (pivot-table-free)
+        // workbook.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1",
+                    "name": "Budget",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": ["folder-1"],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1",
+                    "name": "folder-1",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1"}}],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        fn no_lease() -> crate::cli::drive::helpers::LeaseTokenArg {
+            crate::cli::drive::helpers::LeaseTokenArg { lease: None }
+        }
+
+        assert!(dispatch(
+            SheetsSubcommands::AddPivotTable(pivot::AddPivotTableCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: "Q1".to_string(),
+                anchor: "A1".to_string(),
+                source: "A1:B10".to_string(),
+                rows: vec!["0".to_string()],
+                columns: Vec::new(),
+                values: vec!["1:sum".to_string()],
+                filters: Vec::new(),
+                value_layout: None,
+                no_totals: false,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::DeletePivotTable(pivot::DeletePivotTableCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: "Q1".to_string(),
+                anchor: "A1".to_string(),
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::ListPivotTables(pivot::ListPivotTablesCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+    }
 }

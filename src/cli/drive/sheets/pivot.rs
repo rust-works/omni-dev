@@ -239,3 +239,220 @@ async fn run_pivot(client: &DriveClient, opts: &PivotOptions, output: &OutputFor
     println!("{}", lines.join("\n"));
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::utils::secret::Secret;
+
+    #[test]
+    fn value_layout_arg_converts_to_the_engine_type() {
+        assert!(matches!(
+            ValueLayout::from(ValueLayoutArg::Horizontal),
+            ValueLayout::Horizontal
+        ));
+        assert!(matches!(
+            ValueLayout::from(ValueLayoutArg::Vertical),
+            ValueLayout::Vertical
+        ));
+    }
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    async fn client_with_bootstrapped_token(server: &wiremock::MockServer) -> DriveClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+
+        let mut client = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    async fn mount_orphan_sheet(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1", "name": "sheet-1",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": [],
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn no_lease() -> crate::cli::drive::helpers::LeaseTokenArg {
+        crate::cli::drive::helpers::LeaseTokenArg { lease: None }
+    }
+
+    #[tokio::test]
+    async fn add_pivot_table_command_wires_the_gate_through() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        // No parent folder is visible to this account, so the gate
+        // refuses before any workbook fetch — enough to reach and return
+        // from the leaf, proving it threads every field (including
+        // `--value-layout`/`--no-totals`/`--filter`) through to the
+        // engine without erroring.
+        let cmd = AddPivotTableCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: "Report".to_string(),
+            anchor: "A1".to_string(),
+            source: "Data!A1:D100".to_string(),
+            rows: vec!["0:asc".to_string()],
+            columns: Vec::new(),
+            values: vec!["3:sum".to_string()],
+            filters: vec!["1:Foo".to_string()],
+            value_layout: Some(ValueLayoutArg::Vertical),
+            no_totals: true,
+            dry_run: false,
+            lease: no_lease(),
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn add_pivot_table_command_json_output_skips_the_table() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = AddPivotTableCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: "Report".to_string(),
+            anchor: "A1".to_string(),
+            source: "Data!A1:D100".to_string(),
+            rows: Vec::new(),
+            columns: Vec::new(),
+            values: vec!["0:sum".to_string()],
+            filters: Vec::new(),
+            value_layout: None,
+            no_totals: false,
+            dry_run: true,
+            lease: no_lease(),
+            output: crate::cli::drive::format::OutputFormat::Json,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_pivot_table_command_wires_the_gate_through() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        let cmd = DeletePivotTableCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: "Report".to_string(),
+            anchor: "A1".to_string(),
+            dry_run: false,
+            lease: no_lease(),
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_pivot_tables_prints_every_entry() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{
+                        "properties": {"sheetId": 0, "title": "Report"},
+                        "data": [{
+                            "startRow": 0, "startColumn": 0,
+                            "rowData": [{"values": [{"pivotTable": {
+                                "source": {
+                                    "sheetId": 1, "startRowIndex": 0, "endRowIndex": 100,
+                                    "startColumnIndex": 0, "endColumnIndex": 4,
+                                },
+                                "values": [{"sourceColumnOffset": 2, "summarizeFunction": "SUM"}],
+                            }}]}],
+                        }],
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListPivotTablesCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_pivot_tables_json_output_skips_the_table() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{"properties": {"sheetId": 0, "title": "Report"}}],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListPivotTablesCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: crate::cli::drive::format::OutputFormat::Json,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+}
