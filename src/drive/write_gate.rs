@@ -97,12 +97,10 @@ pub enum DriveOperation {
     /// management (`set-developer-metadata`/`delete-developer-metadata`),
     /// restricted to `DOCUMENT` visibility — `PROJECT`-visibility metadata,
     /// which belongs to a different OAuth client, is never reachable
-    /// through this surface; and, since issue #1793
+    /// through this surface; since issue #1793
     /// ([ADR-0081](../../docs/adrs/adr-0081.md) §1), conditional formatting
     /// (`add-conditional-format`/`update-conditional-format`/
-    /// `delete-conditional-format`). None of that later set destroys data
-    /// either, which is what earns it the same operation as the original
-    /// three rather than one of its own. Since issue #1796
+    /// `delete-conditional-format`); since issue #1796
     /// ([ADR-0081](../../docs/adrs/adr-0081.md) §2), also named-range
     /// add/update/delete: a named range is a label over a region, not grid
     /// data, so removing one leaves every cell's stored value and formula
@@ -112,7 +110,16 @@ pub enum DriveOperation {
     /// gate, but by `delete-named-range` scanning the workbook's cell
     /// formulas for the name and reporting the count and A1 locations of
     /// every reference before it deletes, in both `--dry-run` and the real
-    /// run.
+    /// run; and, since issue #1797
+    /// ([ADR-0081](../../docs/adrs/adr-0081.md) §3), charts and slicers
+    /// (`add-chart`/`update-chart`/`delete-chart`/`add-slicer`/
+    /// `update-slicer`/`delete-slicer`) — including the two deletes, which
+    /// destroy an unrecoverable embedded object rather than grid data, and
+    /// so join this operation (not [`Self::SheetsDelete`]) on the same
+    /// "property of the sheet, not the sheet's data" reasoning as
+    /// `unmerge-cells`/`clear-data-validation`. None of that later set
+    /// destroys *grid* data either, which is what earns it the same
+    /// operation as the original three rather than one of its own.
     ///
     /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
     /// reason that one is not folded into [`Self::Edit`]. Every existing

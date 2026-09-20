@@ -1551,6 +1551,15 @@ pub struct DriveMutationOutcome {
     /// [`Self::discarded_cells`]'s no-content-exposure line. Empty when
     /// nothing references the name, and for every other named-range verb.
     pub referencing_formula_locations: Vec<String>,
+    /// The stable numeric id of a chart or slicer an `add-chart`/
+    /// `update-chart`/`delete-chart`/`add-slicer`/`update-slicer`/
+    /// `delete-slicer` acted on (issue #1797). Set from the `addChart`/
+    /// `addSlicer` reply for the two adds (the id is server-assigned, like
+    /// [`Self::filter_view_id`] for `add-filter-view`) and from the id
+    /// resolved against otherwise. One key for both kinds — Sheets'
+    /// `deleteEmbeddedObject` itself addresses a chart or a slicer by the
+    /// same `objectId` with no discriminator naming which.
+    pub embedded_object_id: Option<i64>,
     /// The API/validation error, when the attempt failed.
     pub error: Option<String>,
     /// Wall time of the attempt.
@@ -1705,6 +1714,12 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
         context.insert(
             "referencing_formula_locations".to_string(),
             outcome.referencing_formula_locations.join("; "),
+        );
+    }
+    if let Some(embedded_object_id) = outcome.embedded_object_id {
+        context.insert(
+            "embedded_object_id".to_string(),
+            embedded_object_id.to_string(),
         );
     }
     rec.context = context;
