@@ -157,6 +157,23 @@ fn resolve_cites_index(cites: &str, default_project: &str, sources: &[Source]) -
         .position(|s| s.keys.contains(&(project.clone(), number)))
 }
 
+/// Whether a split statement's `cites` names the judged issue itself.
+///
+/// Rule 6 of the splitter prompt asks for `cites: null` on a statement
+/// about the judged issue, and a live run showed the splitter sometimes
+/// names it anyway. The judged issue is never a [`Source`] (a
+/// self-citation is dropped by [`find_citations`]), so without this the
+/// statement would be reported as an unresolved citation and drag the
+/// verdict to `needs_review` — for obeying the rule in substance.
+fn cites_judged_issue(cites: &str, judged: &IssueDoc) -> bool {
+    citation_regex()
+        .captures(cites)
+        .and_then(|caps| citation_from_captures(&caps, &judged.project))
+        .is_some_and(|(project, _kind, number)| {
+            project == judged.project && number == judged.number
+        })
+}
+
 // ── Comment selection ──────────────────────────────────────────────────
 
 /// Which decision comment `verify-decision` should check.
@@ -713,11 +730,19 @@ pub struct SourceReport {
 }
 
 /// The models that answered.
+///
+/// Either field is omitted when that model never answered: a comment
+/// citing nothing verifiable returns before any call is made, and naming
+/// a model there would claim a request that never happened. `jev` is the
+/// concrete version the API reports (`jev-1.13.0`), not the requested
+/// alias.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ReportModels {
-    /// The Jev model.
+    /// The Jev model that answered.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub jev: String,
-    /// The AI backend model used to split the comment.
+    /// The AI backend model that split the comment.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub ai: String,
 }
 
@@ -859,10 +884,19 @@ pub async fn run_verify(
 
     for (idx, source) in sources.iter().enumerate() {
         let indices = &by_source[idx];
+        let (state, truncated) = truncate_middle(&source.text, opts.max_input_chars);
         if indices.is_empty() {
+            // Fetched and grouped, but the splitter attributed nothing to it.
+            // Still reported, so it is distinguishable from a citation that
+            // never resolved at all.
+            source_reports.push(SourceReport {
+                source: source.name.clone(),
+                items: source.items.clone(),
+                truncated,
+                error: None,
+            });
             continue;
         }
-        let (state, truncated) = truncate_middle(&source.text, opts.max_input_chars);
         let questions = indices
             .iter()
             .map(|&i| (format!("s{}", i + 1), statement_question(&split[i].text)))
@@ -948,11 +982,18 @@ pub async fn run_verify(
                 let src = &sources[idx];
                 let score = supported.get(&i).copied();
                 let reason = match score {
-                    None => Some(format!(
-                        "statement {} has no answer against {}",
-                        i + 1,
-                        src.label
-                    )),
+                    None => {
+                        // The source's call failed, or its answer skipped this
+                        // key. Either way the statement is unchecked, which
+                        // must not read as verified: without this, one failed
+                        // source among several still produced `accepted`.
+                        any_review = true;
+                        Some(format!(
+                            "statement {} has no answer against {}",
+                            i + 1,
+                            src.label
+                        ))
+                    }
                     Some(s) if s < opts.reject_below => {
                         any_rejected = true;
                         Some(format!(
@@ -976,6 +1017,9 @@ pub async fn run_verify(
             }
             None => match &statement.cites {
                 None => (None, None, None),
+                // A statement about the judged issue, named rather than left
+                // null: rule 6's intent, so treated as rule 6 asks.
+                Some(raw) if cites_judged_issue(raw, issue) => (None, None, None),
                 Some(raw) => {
                     any_review = true;
                     (
@@ -1634,6 +1678,133 @@ mod tests {
 
         assert_eq!(report.verdict, Verdict::NeedsReview);
         assert_eq!(report.reasons, ["the comment cites nothing verifiable"]);
+    }
+
+    /// A statement whose source never answered is unchecked, and an
+    /// unchecked statement must not ride along inside an `accepted`
+    /// verdict. Before this, one failed source among several still
+    /// produced `accepted` — with the unanswered statement listed in
+    /// `reasons`, which `accepted` is documented never to carry.
+    #[tokio::test]
+    async fn run_verify_needs_review_when_only_one_of_two_sources_answers() {
+        let server = wiremock::MockServer::start().await;
+        // The #1614 source answers; the #1237 source fails outright.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("SOURCE: #1614"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "jev-1.13.0",
+                    "answers": {"s1": noul_json(0.95)},
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("SOURCE: #1237"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("## COMMENT"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "jev-1.13.0",
+                    "answers": {"coverage": noul_json(0.9)},
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
+            .mount(&server)
+            .await;
+        let jev = JevClient::new(&server.uri(), "key").unwrap();
+        let ai = ai_client(vec![Ok(split_response_json(&[
+            ("A claim about #1614.", Some("#1614")),
+            ("A claim about #1237.", Some("#1237")),
+        ]))]);
+
+        let issue = doc_with_comments(vec![comment(1, "newhoggy", "see #1614 and #1237")]);
+        let comment = comment(1, "newhoggy", "see #1614 and #1237");
+        let citations = find_citations(&comment.body, "rust-works/omni-dev", &judged(1779));
+        let fetched = BTreeMap::from([
+            (
+                ("rust-works/omni-dev".to_string(), 1614),
+                issue_doc(1614, "One", "Body one.", vec![], vec![]),
+            ),
+            (
+                ("rust-works/omni-dev".to_string(), 1237),
+                issue_doc(1237, "Two", "Body two.", vec![], vec![]),
+            ),
+        ]);
+        let sources = group_sources(&citations, "rust-works/omni-dev", &fetched);
+        assert_eq!(sources.len(), 2);
+
+        let report = run_verify(&jev, &ai, &issue, &comment, &citations, &sources, &opts())
+            .await
+            .unwrap();
+
+        assert_eq!(report.verdict, Verdict::NeedsReview);
+        assert_eq!(report.statements[0].supported, Some(0.95));
+        assert!(report.statements[1].supported.is_none());
+        assert!(
+            report.reasons.iter().any(|r| r.contains("has no answer")),
+            "{:?}",
+            report.reasons
+        );
+        // The failed source is still reported, carrying its error.
+        assert!(report.sources.iter().any(|s| s.error.is_some()));
+    }
+
+    /// A source that resolved but that the splitter attributed nothing to
+    /// is still listed, so it is distinguishable from a citation that
+    /// never resolved.
+    #[tokio::test]
+    async fn run_verify_reports_a_source_with_no_attributed_statements() {
+        let server = source_and_coverage_server(serde_json::json!({}), 0.9).await;
+        let jev = JevClient::new(&server.uri(), "key").unwrap();
+        let ai = ai_client(vec![Ok(split_response_json(&[(
+            "A decision about this issue.",
+            None,
+        )]))]);
+        let (issue, comment, citations, sources) = issue_and_source();
+
+        let report = run_verify(&jev, &ai, &issue, &comment, &citations, &sources, &opts())
+            .await
+            .unwrap();
+
+        assert_eq!(report.sources.len(), 1);
+        assert_eq!(report.sources[0].source, "#1614");
+        assert!(report.sources[0].error.is_none());
+    }
+
+    /// Rule 6 asks the splitter to leave `cites` null for a statement about
+    /// the judged issue. When it names the judged issue instead, that is
+    /// the rule's intent, not an unresolved citation.
+    #[tokio::test]
+    async fn run_verify_treats_a_self_citation_as_a_judged_issue_statement() {
+        let server =
+            source_and_coverage_server(serde_json::json!({"s1": noul_json(0.95)}), 0.9).await;
+        let jev = JevClient::new(&server.uri(), "key").unwrap();
+        let ai = ai_client(vec![Ok(split_response_json(&[
+            ("A claim about #1614.", Some("#1614")),
+            ("This issue's question is settled.", Some("#1779")),
+        ]))]);
+        let (issue, comment, citations, sources) = issue_and_source();
+
+        let report = run_verify(&jev, &ai, &issue, &comment, &citations, &sources, &opts())
+            .await
+            .unwrap();
+
+        assert_eq!(report.verdict, Verdict::Accepted);
+        assert!(report.statements[1].source.is_none());
+        assert!(report.statements[1].reason.is_none());
+        assert!(report.reasons.is_empty(), "{:?}", report.reasons);
+    }
+
+    /// With no call made, no model answered, so neither is named.
+    #[test]
+    fn report_models_omit_the_models_that_never_answered() {
+        let value = serde_json::to_value(ReportModels::default()).unwrap();
+        assert_eq!(value, serde_json::json!({}));
     }
 
     #[tokio::test]
