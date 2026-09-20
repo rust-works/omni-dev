@@ -142,12 +142,8 @@ fn render_read_table(outcome: &ReadOutcome, out: &mut dyn std::io::Write) -> Res
 
         render_elements(&tab.elements, out)?;
 
-        for (label, segments) in [
-            ("header", &tab.headers),
-            ("footer", &tab.footers),
-            ("footnote", &tab.footnotes),
-        ] {
-            render_segments(label, segments, out)?;
+        for (kind, segments) in tab.segments_by_kind() {
+            render_segments(kind.as_str(), segments, out)?;
         }
     }
     Ok(())
