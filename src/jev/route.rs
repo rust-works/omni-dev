@@ -1,18 +1,22 @@
-//! Stage routing for `omni-dev ai jev route` (#1779).
+//! Stage routing for `omni-dev ai jev route` (#1779, #1820).
 //!
 //! Asks Jev, in one `system_one` call per issue, which model class should do
 //! each stage of the work — **design**, **implement** and **review** — and
 //! derives the issue's overall class as the higher of design and implement.
+//! The three questions are asked once per requested [`Ladder`] (one per AI
+//! provider), keyed `<provider>.stage_<stage>`, all in that same single call.
 //!
 //! Everything here consumes only the provider-neutral [`IssueDoc`], so a
 //! GitLab fetcher slots in without touching it. The question wording, the
-//! tier descriptions and the input format are the ones validated against
-//! `jev-1.13.0` in #1779; see `docs/jev.md` for the evidence and its limits.
+//! `anthropic` tier descriptions and the input format are the ones validated
+//! against `jev-1.13.0` in #1779; see `docs/jev.md` for the evidence and its
+//! limits.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -25,15 +29,69 @@ use crate::provider::{IssueDoc, ItemState};
 
 pub use crate::jev::input::TRUNCATION_MARKER;
 
-/// The default tiers, shipped as the default for `--tiers`.
-const DEFAULT_TIERS_YAML: &str = include_str!("../templates/jev-route-tiers.yaml");
-
 /// The three stage questions, each missing its per-tier criteria.
 const STAGE_QUESTIONS_YAML: &str = include_str!("../templates/jev-route-questions.yaml");
 
 /// The design-stage option meaning "no design work remains". Reserved: no
 /// tier may use this name.
 pub const NO_DESIGN: &str = "none";
+
+/// The provider name a `--tiers FILE` ladder is reported under: a custom
+/// file names no provider, and the output nests every ladder under one.
+pub const CUSTOM_PROVIDER: &str = "custom";
+
+/// An AI provider with an embedded model ladder (#1820).
+///
+/// Each variant's ladder lives in `src/templates/jev-route-tiers-<name>.yaml`,
+/// three rungs, least capable first, named by the abbreviated model name so
+/// the consumer gets a model to hand the work to rather than a rung to
+/// translate. Only `anthropic`'s text was validated against Jev (#1779); the
+/// other ladders reuse its descriptions rung for rung, differing only in
+/// the tier names Jev sees as criterion keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Provider {
+    /// `sonnet` / `opus` / `fable`.
+    #[value(name = "anthropic")]
+    Anthropic,
+    /// `terra` / `sol` / `astra` (gpt-5.6-terra / gpt-5.6-sol / gpt-6-astra).
+    #[value(name = "openai")]
+    OpenAi,
+    /// `flash` / `pro` / `deep-think` (gemini-3-flash-preview /
+    /// gemini-3.1-pro-preview / Gemini 3 Deep Think).
+    #[value(name = "gemini")]
+    Gemini,
+}
+
+impl Provider {
+    /// Every provider, in the order the docs list them.
+    pub const ALL: [Self; 3] = [Self::Anthropic, Self::OpenAi, Self::Gemini];
+
+    /// The provider's name: its clap value, its output key and its question
+    /// key prefix.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    /// The provider's embedded ladder file.
+    const fn tiers_yaml(self) -> &'static str {
+        match self {
+            Self::Anthropic => include_str!("../templates/jev-route-tiers-anthropic.yaml"),
+            Self::OpenAi => include_str!("../templates/jev-route-tiers-openai.yaml"),
+            Self::Gemini => include_str!("../templates/jev-route-tiers-gemini.yaml"),
+        }
+    }
+
+    /// The provider's embedded ladder, parsed and validated.
+    pub fn tiers(self) -> Result<Tiers> {
+        Tiers::parse(self.tiers_yaml())
+            .with_context(|| format!("Invalid embedded tiers for provider {}", self.name()))
+    }
+}
 
 /// Default confidence below which a stage is reported as a close call. A
 /// working heuristic from the #1779 backlog run, not a validated threshold.
@@ -70,13 +128,19 @@ impl Stage {
     /// Every stage, in the order they happen.
     const ALL: [Self; 3] = [Self::Design, Self::Implement, Self::Review];
 
-    /// The key of this stage's question in the Jev request and response.
-    const fn question_key(self) -> &'static str {
+    /// The key of this stage's question in the embedded questions file.
+    const fn template_key(self) -> &'static str {
         match self {
             Self::Design => "stage_design",
             Self::Implement => "stage_implement",
             Self::Review => "stage_review",
         }
+    }
+
+    /// The key of this stage's question for `provider` in the Jev request
+    /// and response, e.g. `anthropic.stage_design`.
+    fn question_key(self, provider: &str) -> String {
+        format!("{provider}.{}", self.template_key())
     }
 }
 
@@ -127,11 +191,8 @@ impl Tiers {
         Ok(Self(file.tiers))
     }
 
-    /// Loads the tiers from `path`, or the embedded defaults when `None`.
-    pub fn load(path: Option<&Path>) -> Result<Self> {
-        let Some(path) = path else {
-            return Self::parse(DEFAULT_TIERS_YAML);
-        };
+    /// Loads a custom tiers file.
+    pub fn load_file(path: &Path) -> Result<Self> {
         let yaml = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read tiers file {}", path.display()))?;
         Self::parse(&yaml).with_context(|| format!("Invalid tiers file {}", path.display()))
@@ -153,36 +214,72 @@ impl Tiers {
     }
 }
 
-/// Builds the three stage questions: the embedded wording, with one
-/// criterion per tier added to each.
-pub fn build_route_questions(tiers: &Tiers) -> Result<BTreeMap<String, Question>> {
-    let mut questions: BTreeMap<String, Question> = serde_yaml::from_str(STAGE_QUESTIONS_YAML)
-        .context("Failed to parse the embedded stage questions")?;
-    for (key, question) in &mut questions {
-        let Question::Choice { criteria, .. } = question else {
-            bail!("embedded stage question {key:?} is not a choice question");
-        };
-        for tier in tiers.as_slice() {
-            if criteria
-                .insert(tier.name.clone(), tier.description.clone())
-                .is_some()
-            {
-                bail!(
-                    "tier {:?} collides with a fixed option of {key:?}",
-                    tier.name
-                );
-            }
-        }
-        question
-            .validate()
-            .with_context(|| format!("stage question {key:?}"))?;
+/// One provider's model ladder: the name its answers are reported under and
+/// the tiers Jev chooses between (#1820).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ladder {
+    /// The provider name: the output key and the question-key prefix.
+    pub provider: String,
+    /// The tiers, least capable first.
+    pub tiers: Tiers,
+}
+
+impl Ladder {
+    /// A built-in provider's embedded ladder.
+    pub fn builtin(provider: Provider) -> Result<Self> {
+        Ok(Self {
+            provider: provider.name().to_string(),
+            tiers: provider.tiers()?,
+        })
     }
+
+    /// A `--tiers FILE` ladder, reported under [`CUSTOM_PROVIDER`].
+    #[must_use]
+    pub fn custom(tiers: Tiers) -> Self {
+        Self {
+            provider: CUSTOM_PROVIDER.to_string(),
+            tiers,
+        }
+    }
+}
+
+/// Builds the stage questions for every ladder: the embedded wording, with
+/// one criterion per tier added, keyed `<provider>.stage_<stage>` so one
+/// request carries every ladder's three questions.
+pub fn build_route_questions(ladders: &[Ladder]) -> Result<BTreeMap<String, Question>> {
+    let templates: BTreeMap<String, Question> = serde_yaml::from_str(STAGE_QUESTIONS_YAML)
+        .context("Failed to parse the embedded stage questions")?;
     for stage in Stage::ALL {
-        if !questions.contains_key(stage.question_key()) {
+        if !templates.contains_key(stage.template_key()) {
             bail!(
                 "the embedded stage questions have no {:?}",
-                stage.question_key()
+                stage.template_key()
             );
+        }
+    }
+    let mut questions = BTreeMap::new();
+    for ladder in ladders {
+        for (key, template) in &templates {
+            let mut question = template.clone();
+            let Question::Choice { criteria, .. } = &mut question else {
+                bail!("embedded stage question {key:?} is not a choice question");
+            };
+            for tier in ladder.tiers.as_slice() {
+                if criteria
+                    .insert(tier.name.clone(), tier.description.clone())
+                    .is_some()
+                {
+                    bail!(
+                        "tier {:?} of provider {:?} collides with a fixed option of {key:?}",
+                        tier.name,
+                        ladder.provider
+                    );
+                }
+            }
+            question
+                .validate()
+                .with_context(|| format!("stage question {key:?} for {:?}", ladder.provider))?;
+            questions.insert(format!("{}.{key}", ladder.provider), question);
         }
     }
     Ok(questions)
@@ -288,22 +385,29 @@ pub struct IssueRoute {
     pub truncated: bool,
 }
 
+/// One provider's routing of an issue (#1820).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProviderRoute {
+    /// Jev's answer per stage.
+    pub stages: StageAnswers,
+    /// The issue's class: the higher of the design and implement choices.
+    pub class: String,
+    /// Stages whose confidence is below the close-call threshold.
+    pub close_calls: Vec<Stage>,
+}
+
 /// What routing one issue produced. Serialised untagged and flattened into
-/// [`IssueRoute`], so a routed issue carries `stages`/`class`/`close_calls`
-/// and a failed one carries only `error`.
+/// [`IssueRoute`], so a routed issue carries `providers`/`depends_on` and a
+/// failed one carries only `error`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum RouteOutcome {
-    /// Jev answered every stage.
+    /// Jev answered every stage for every ladder.
     Routed {
-        /// Jev's answer per stage. Boxed: `Failed` is otherwise ten times
-        /// smaller, and `Vec<IssueRoute>` pays that gap on every element.
-        stages: Box<StageAnswers>,
-        /// The issue's class: the higher of the design and implement choices.
-        class: String,
-        /// Stages whose confidence is below the close-call threshold.
-        close_calls: Vec<Stage>,
-        /// Open issues/PRs this issue's text cites (#1812).
+        /// Each requested ladder's routing, keyed by provider name.
+        providers: BTreeMap<String, ProviderRoute>,
+        /// Open issues/PRs this issue's text cites (#1812). About the issue,
+        /// not a provider, so it sits beside `providers` rather than inside.
         depends_on: Vec<DependencyEntry>,
     },
     /// The Jev call for this issue failed, or its answer was unusable. The
@@ -349,6 +453,10 @@ pub struct RouteOptions {
 
 /// Routes every issue in `docs`, one Jev call each, in order.
 ///
+/// Every ladder in `ladders` is routed in that same call: Jev takes a map of
+/// questions over one state, so the three stage questions are keyed per
+/// provider and share the issue text (#1820).
+///
 /// Refuses closed issues unless [`RouteOptions::allow_closed`]: their comments
 /// often describe how the work was actually done, which leaks the answer.
 ///
@@ -365,12 +473,12 @@ pub struct RouteOptions {
 pub async fn run_route(
     jev: &JevClient,
     docs: &[IssueDoc],
-    tiers: &Tiers,
+    ladders: &[Ladder],
     opts: &RouteOptions,
     dependencies: &OpenDependencies,
 ) -> Result<RouteReport> {
-    validate_options(docs, opts)?;
-    let questions = build_route_questions(tiers)?;
+    validate_options(docs, ladders, opts)?;
+    let questions = build_route_questions(ladders)?;
 
     let mut models = BTreeSet::new();
     let mut usage = Usage::default();
@@ -408,12 +516,10 @@ pub async fn run_route(
                 models.insert(response.model);
                 usage.input_tokens += response.usage.input_tokens;
                 usage.output_tokens += response.usage.output_tokens;
-                match stage_answers(&response.answers, tiers) {
-                    Ok(stages) => RouteOutcome::Routed {
-                        class: issue_class(&stages, tiers),
-                        close_calls: close_calls(&stages, opts.close_call),
+                match provider_routes(&response.answers, ladders, opts.close_call) {
+                    Ok(providers) => RouteOutcome::Routed {
+                        providers,
                         depends_on: dependency_entries(&item_ref, citations, &response.answers),
-                        stages: Box::new(stages),
                     },
                     Err(err) => failed(&item_ref, &err.context("Unexpected Jev answer")),
                 }
@@ -443,11 +549,20 @@ fn failed(item_ref: &str, err: &anyhow::Error) -> RouteOutcome {
     RouteOutcome::Failed { error }
 }
 
-/// Rejects an empty run, out-of-range knobs, and (by default) closed issues,
-/// before any paid request is sent.
-fn validate_options(docs: &[IssueDoc], opts: &RouteOptions) -> Result<()> {
+/// Rejects an empty run, an empty or repeated ladder list, out-of-range
+/// knobs, and (by default) closed issues, before any paid request is sent.
+fn validate_options(docs: &[IssueDoc], ladders: &[Ladder], opts: &RouteOptions) -> Result<()> {
     if docs.is_empty() {
         bail!("no issues to route");
+    }
+    if ladders.is_empty() {
+        bail!("no providers to route against");
+    }
+    let mut seen = BTreeSet::new();
+    for ladder in ladders {
+        if !seen.insert(ladder.provider.as_str()) {
+            bail!("provider {:?} is listed more than once", ladder.provider);
+        }
     }
     if !(0.0..=1.0).contains(&opts.close_call) {
         bail!(
@@ -475,16 +590,39 @@ fn validate_options(docs: &[IssueDoc], opts: &RouteOptions) -> Result<()> {
     Ok(())
 }
 
-/// Reads the three stage answers out of a response, checking each is a
-/// `choice` naming an option that was offered.
-fn stage_answers(answers: &BTreeMap<String, Answer>, tiers: &Tiers) -> Result<StageAnswers> {
+/// Reads every ladder's routing out of one response. Any ladder whose
+/// answers are missing or malformed fails the whole issue, as a single
+/// ladder's did before #1820.
+fn provider_routes(
+    answers: &BTreeMap<String, Answer>,
+    ladders: &[Ladder],
+    close_call: f64,
+) -> Result<BTreeMap<String, ProviderRoute>> {
+    ladders
+        .iter()
+        .map(|ladder| {
+            let stages = stage_answers(answers, ladder)?;
+            let route = ProviderRoute {
+                class: issue_class(&stages, &ladder.tiers),
+                close_calls: close_calls(&stages, close_call),
+                stages,
+            };
+            Ok((ladder.provider.clone(), route))
+        })
+        .collect()
+}
+
+/// Reads one ladder's three stage answers out of a response, checking each
+/// is a `choice` naming an option that was offered.
+fn stage_answers(answers: &BTreeMap<String, Answer>, ladder: &Ladder) -> Result<StageAnswers> {
+    let tiers = &ladder.tiers;
     let read = |stage: Stage| -> Result<StageAnswer> {
-        let key = stage.question_key();
+        let key = stage.question_key(&ladder.provider);
         let Some(Answer::Choice {
             choice,
             confidence,
             probabilities,
-        }) = answers.get(key)
+        }) = answers.get(&key)
         else {
             bail!("no choice answer for {key:?}");
         };
@@ -613,20 +751,26 @@ mod tests {
     }
 
     fn default_tiers() -> Tiers {
-        Tiers::load(None).unwrap()
+        Provider::Anthropic.tiers().unwrap()
     }
 
-    // ── Tiers ────────────────────────────────────────────────────────
+    fn anthropic() -> Vec<Ladder> {
+        vec![Ladder::builtin(Provider::Anthropic).unwrap()]
+    }
+
+    fn tier_names(tiers: &Tiers) -> Vec<&str> {
+        tiers.as_slice().iter().map(|t| t.name.as_str()).collect()
+    }
+
+    // ── Tiers and providers ──────────────────────────────────────────
 
     #[test]
-    fn default_tiers_are_sonnet_opus_fable_in_order() {
-        let tiers = default_tiers();
-        let names: Vec<&str> = tiers.as_slice().iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["sonnet", "opus", "fable"]);
+    fn anthropic_tiers_are_sonnet_opus_fable_in_order() {
+        assert_eq!(tier_names(&default_tiers()), ["sonnet", "opus", "fable"]);
     }
 
     #[test]
-    fn default_tier_descriptions_are_the_tested_text() {
+    fn anthropic_tier_descriptions_are_the_tested_text() {
         let tiers = default_tiers();
         let fable = &tiers.as_slice()[2];
         assert_eq!(
@@ -635,6 +779,59 @@ mod tests {
              working in unfamiliar territory with no precedent in the codebase, anticipating \
              failure modes, and security-critical judgement."
         );
+    }
+
+    #[test]
+    fn provider_names_are_the_documented_abbreviations() {
+        assert_eq!(
+            tier_names(&Provider::OpenAi.tiers().unwrap()),
+            ["terra", "sol", "astra"]
+        );
+        assert_eq!(
+            tier_names(&Provider::Gemini.tiers().unwrap()),
+            ["flash", "pro", "deep-think"]
+        );
+        assert_eq!(
+            Provider::ALL.map(Provider::name),
+            ["anthropic", "openai", "gemini"]
+        );
+        for provider in Provider::ALL {
+            assert_eq!(
+                provider.to_possible_value().unwrap().get_name(),
+                provider.name()
+            );
+        }
+    }
+
+    /// Only the anthropic text was validated (#1779), and rewording shifts
+    /// answers, so the other ladders copy it rung for rung. A ladder that
+    /// diverges must do so deliberately, by editing this test too.
+    #[test]
+    fn openai_and_gemini_ladders_reuse_the_anthropic_descriptions_rung_for_rung() {
+        let anthropic = default_tiers();
+        for provider in [Provider::OpenAi, Provider::Gemini] {
+            let tiers = provider.tiers().unwrap();
+            assert_eq!(tiers.as_slice().len(), anthropic.as_slice().len());
+            for (rung, reference) in tiers.as_slice().iter().zip(anthropic.as_slice()) {
+                assert_eq!(
+                    rung.description,
+                    reference.description,
+                    "{}: {} differs from {}",
+                    provider.name(),
+                    rung.name,
+                    reference.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ladders_are_named_by_provider_or_custom() {
+        let ladder = Ladder::builtin(Provider::Gemini).unwrap();
+        assert_eq!(ladder.provider, "gemini");
+        let custom = Ladder::custom(default_tiers());
+        assert_eq!(custom.provider, CUSTOM_PROVIDER);
+        assert_eq!(custom.tiers, default_tiers());
     }
 
     #[test]
@@ -686,13 +883,13 @@ mod tests {
             "tiers:\n  - {name: small, description: S}\n  - {name: big, description: B}\n",
         )
         .unwrap();
-        let tiers = Tiers::load(Some(&path)).unwrap();
+        let tiers = Tiers::load_file(&path).unwrap();
         assert_eq!(tiers.as_slice()[1].name, "big");
     }
 
     #[test]
     fn tiers_load_names_a_missing_file() {
-        let err = Tiers::load(Some(Path::new("/no/such/tiers.yaml"))).unwrap_err();
+        let err = Tiers::load_file(Path::new("/no/such/tiers.yaml")).unwrap_err();
         assert!(err.to_string().contains("Failed to read tiers file"));
     }
 
@@ -720,23 +917,23 @@ mod tests {
     /// to the template must also be a deliberate edit here.
     #[test]
     fn stage_questions_are_the_tested_wording() {
-        let questions = build_route_questions(&default_tiers()).unwrap();
+        let questions = build_route_questions(&anthropic()).unwrap();
         assert_eq!(
-            instructions(&questions, "stage_design"),
+            instructions(&questions, "anthropic.stage_design"),
             format!(
                 "Which class should do the design work that remains before implementation can \
                  start: choosing the approach, settling open questions, and writing a plan?{BAR}"
             )
         );
         assert_eq!(
-            instructions(&questions, "stage_implement"),
+            instructions(&questions, "anthropic.stage_implement"),
             format!(
                 "Assume any remaining design work has been completed well. Which class should \
                  write the code, tests and docs?{BAR}"
             )
         );
         assert_eq!(
-            instructions(&questions, "stage_review"),
+            instructions(&questions, "anthropic.stage_review"),
             format!(
                 "Which class should review the finished change before merge, so that mistakes \
                  the automated tests would miss are caught?{BAR}"
@@ -746,20 +943,20 @@ mod tests {
 
     #[test]
     fn only_the_design_stage_offers_none() {
-        let questions = build_route_questions(&default_tiers()).unwrap();
+        let questions = build_route_questions(&anthropic()).unwrap();
         assert_eq!(
-            options(&questions, "stage_design"),
+            options(&questions, "anthropic.stage_design"),
             ["fable", "none", "opus", "sonnet"]
         );
         assert_eq!(
-            options(&questions, "stage_implement"),
+            options(&questions, "anthropic.stage_implement"),
             ["fable", "opus", "sonnet"]
         );
         assert_eq!(
-            options(&questions, "stage_review"),
+            options(&questions, "anthropic.stage_review"),
             ["fable", "opus", "sonnet"]
         );
-        let Question::Choice { criteria, .. } = &questions["stage_design"] else {
+        let Question::Choice { criteria, .. } = &questions["anthropic.stage_design"] else {
             panic!();
         };
         assert_eq!(
@@ -767,6 +964,47 @@ mod tests {
             "No design work remains: the text already settles the approach and the open \
              questions."
         );
+    }
+
+    /// Several ladders share one request: the same wording under each
+    /// provider's prefix, with that provider's tiers as the options.
+    #[test]
+    fn questions_are_keyed_per_provider_in_one_map() {
+        let ladders = [
+            Ladder::builtin(Provider::Anthropic).unwrap(),
+            Ladder::builtin(Provider::OpenAi).unwrap(),
+        ];
+        let questions = build_route_questions(&ladders).unwrap();
+        let keys: Vec<&String> = questions.keys().collect();
+        assert_eq!(
+            keys,
+            [
+                "anthropic.stage_design",
+                "anthropic.stage_implement",
+                "anthropic.stage_review",
+                "openai.stage_design",
+                "openai.stage_implement",
+                "openai.stage_review",
+            ]
+        );
+        assert_eq!(
+            options(&questions, "openai.stage_design"),
+            ["astra", "none", "sol", "terra"]
+        );
+        assert_eq!(
+            instructions(&questions, "openai.stage_review"),
+            instructions(&questions, "anthropic.stage_review")
+        );
+    }
+
+    #[test]
+    fn a_custom_ladder_is_keyed_custom() {
+        let ladders = [Ladder::custom(
+            Tiers::parse("tiers:\n  - {name: a, description: A}\n  - {name: b, description: B}\n")
+                .unwrap(),
+        )];
+        let questions = build_route_questions(&ladders).unwrap();
+        assert_eq!(options(&questions, "custom.stage_implement"), ["a", "b"]);
     }
 
     // ── build_route_state ────────────────────────────────────────────
@@ -966,26 +1204,49 @@ mod tests {
             probabilities: BTreeMap::new(),
         };
         let answers = BTreeMap::from([
-            ("stage_design".to_string(), choice("none")),
-            ("stage_implement".to_string(), choice("none")),
-            ("stage_review".to_string(), choice("opus")),
+            ("anthropic.stage_design".to_string(), choice("none")),
+            ("anthropic.stage_implement".to_string(), choice("none")),
+            ("anthropic.stage_review".to_string(), choice("opus")),
         ]);
-        let err = stage_answers(&answers, &default_tiers()).unwrap_err();
+        let err = stage_answers(&answers, &anthropic()[0]).unwrap_err();
         assert!(err.to_string().contains("not offered"), "{err}");
     }
 
     #[test]
     fn stage_answers_require_a_choice_per_stage() {
-        let answers = BTreeMap::from([("stage_design".to_string(), Answer::Noul { noul: 0.5 })]);
-        let err = stage_answers(&answers, &default_tiers()).unwrap_err();
+        let answers = BTreeMap::from([(
+            "anthropic.stage_design".to_string(),
+            Answer::Noul { noul: 0.5 },
+        )]);
+        let err = stage_answers(&answers, &anthropic()[0]).unwrap_err();
         assert!(err.to_string().contains("no choice answer"), "{err}");
+        assert!(err.to_string().contains("anthropic.stage_design"), "{err}");
+    }
+
+    /// A ladder's answers are read under its own prefix, so one provider's
+    /// answers can never satisfy another's questions.
+    #[test]
+    fn stage_answers_are_read_under_the_ladders_prefix() {
+        let choice = |c: &str| Answer::Choice {
+            choice: c.to_string(),
+            confidence: 0.5,
+            probabilities: BTreeMap::new(),
+        };
+        let answers = BTreeMap::from([
+            ("anthropic.stage_design".to_string(), choice("none")),
+            ("anthropic.stage_implement".to_string(), choice("sonnet")),
+            ("anthropic.stage_review".to_string(), choice("opus")),
+        ]);
+        let err = stage_answers(&answers, &Ladder::builtin(Provider::OpenAi).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("openai.stage_design"), "{err}");
     }
 
     // ── validate_options ─────────────────────────────────────────────
 
     #[test]
     fn closed_issues_are_refused_by_default() {
-        let err = validate_options(&[doc(1, ItemState::Closed)], &opts()).unwrap_err();
+        let err =
+            validate_options(&[doc(1, ItemState::Closed)], &anthropic(), &opts()).unwrap_err();
         assert!(err.to_string().contains("rust-works/omni-dev#1"), "{err}");
         assert!(err.to_string().contains("--allow-closed"), "{err}");
     }
@@ -994,18 +1255,34 @@ mod tests {
     fn closed_issues_are_allowed_on_request() {
         let mut o = opts();
         o.allow_closed = true;
-        validate_options(&[doc(1, ItemState::Closed)], &o).unwrap();
+        validate_options(&[doc(1, ItemState::Closed)], &anthropic(), &o).unwrap();
     }
 
     #[test]
     fn empty_runs_and_bad_knobs_are_rejected() {
-        assert!(validate_options(&[], &opts()).is_err());
+        assert!(validate_options(&[], &anthropic(), &opts()).is_err());
         let mut o = opts();
         o.close_call = 1.5;
-        assert!(validate_options(&[doc(1, ItemState::Open)], &o).is_err());
+        assert!(validate_options(&[doc(1, ItemState::Open)], &anthropic(), &o).is_err());
         let mut o = opts();
         o.max_input_chars = 0;
-        assert!(validate_options(&[doc(1, ItemState::Open)], &o).is_err());
+        assert!(validate_options(&[doc(1, ItemState::Open)], &anthropic(), &o).is_err());
+    }
+
+    #[test]
+    fn empty_and_duplicate_providers_are_rejected() {
+        let err = validate_options(&[doc(1, ItemState::Open)], &[], &opts()).unwrap_err();
+        assert!(err.to_string().contains("no providers"), "{err}");
+        let twice = [
+            Ladder::builtin(Provider::Gemini).unwrap(),
+            Ladder::builtin(Provider::Gemini).unwrap(),
+        ];
+        let err = validate_options(&[doc(1, ItemState::Open)], &twice, &opts()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("\"gemini\" is listed more than once"),
+            "{err}"
+        );
     }
 
     // ── run_route (wiremock) ─────────────────────────────────────────
@@ -1015,6 +1292,13 @@ mod tests {
             "type": "choice", "choice": choice, "confidence": confidence,
             "probabilities": {choice: confidence}
         })
+    }
+
+    fn provider<'a>(outcome: &'a RouteOutcome, name: &str) -> &'a ProviderRoute {
+        let RouteOutcome::Routed { providers, .. } = outcome else {
+            panic!("expected a routed issue: {outcome:?}");
+        };
+        &providers[name]
     }
 
     #[tokio::test]
@@ -1030,9 +1314,9 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "model": "jev-1.13.0",
                     "answers": {
-                        "stage_design": choice_json("fable", 0.52),
-                        "stage_implement": choice_json("sonnet", 0.83),
-                        "stage_review": choice_json("opus", 0.21),
+                        "anthropic.stage_design": choice_json("fable", 0.52),
+                        "anthropic.stage_implement": choice_json("sonnet", 0.83),
+                        "anthropic.stage_review": choice_json("opus", 0.21),
                     },
                     "usage": {"input_tokens": 100, "output_tokens": 10}
                 })),
@@ -1045,7 +1329,7 @@ mod tests {
         let report = run_route(
             &client,
             &[doc(7, ItemState::Open), doc(7, ItemState::Open)],
-            &default_tiers(),
+            &anthropic(),
             &opts(),
             &OpenDependencies::new(),
         )
@@ -1057,29 +1341,139 @@ mod tests {
         assert_eq!(report.usage.output_tokens, 20);
         let issue = &report.issues[0];
         assert_eq!(issue.item_ref, "rust-works/omni-dev#7");
-        let RouteOutcome::Routed {
-            class, close_calls, ..
-        } = &issue.outcome
-        else {
-            panic!("expected a routed issue: {issue:?}");
-        };
-        assert_eq!(class, "fable");
-        assert_eq!(close_calls, &[Stage::Review]);
+        let route = provider(&issue.outcome, "anthropic");
+        assert_eq!(route.class, "fable");
+        assert_eq!(route.close_calls, [Stage::Review]);
         assert!(!issue.truncated);
 
         let requests = server.received_requests().await.unwrap();
         let body: serde_json::Value = requests[0].body_json().unwrap();
         let keys: Vec<&String> = body["questions"].as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["stage_design", "stage_implement", "stage_review"]);
+        assert_eq!(
+            keys,
+            [
+                "anthropic.stage_design",
+                "anthropic.stage_implement",
+                "anthropic.stage_review"
+            ]
+        );
+    }
+
+    /// Two ladders ride one request and come back as two independent
+    /// routings; `depends_on` stays issue-level, asked once.
+    #[tokio::test]
+    async fn run_route_routes_every_provider_in_one_call() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "jev-1.13.0",
+                    "answers": {
+                        "anthropic.stage_design": choice_json("fable", 0.52),
+                        "anthropic.stage_implement": choice_json("sonnet", 0.83),
+                        "anthropic.stage_review": choice_json("opus", 0.9),
+                        "openai.stage_design": choice_json("none", 0.9),
+                        "openai.stage_implement": choice_json("sol", 0.2),
+                        "openai.stage_review": choice_json("astra", 0.9),
+                        "could_be_cheaper_0": {"type": "noul", "noul": 0.4},
+                    },
+                    "usage": {"input_tokens": 10, "output_tokens": 1}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = JevClient::new(&server.uri(), "key").unwrap();
+        let ladders = [
+            Ladder::builtin(Provider::Anthropic).unwrap(),
+            Ladder::builtin(Provider::OpenAi).unwrap(),
+        ];
+        let dependencies = OpenDependencies::from([(
+            ("rust-works/omni-dev".to_string(), 7),
+            vec![citation("#1129", 1129)],
+        )]);
+
+        let report = run_route(
+            &client,
+            &[doc(7, ItemState::Open)],
+            &ladders,
+            &opts(),
+            &dependencies,
+        )
+        .await
+        .unwrap();
+
+        let outcome = &report.issues[0].outcome;
+        let RouteOutcome::Routed {
+            providers,
+            depends_on,
+        } = outcome
+        else {
+            panic!("expected a routed issue: {outcome:?}");
+        };
+        assert_eq!(
+            providers.keys().collect::<Vec<_>>(),
+            ["anthropic", "openai"]
+        );
+        assert_eq!(provider(outcome, "anthropic").class, "fable");
+        assert!(provider(outcome, "anthropic").close_calls.is_empty());
+        assert_eq!(provider(outcome, "openai").class, "sol");
+        assert_eq!(provider(outcome, "openai").close_calls, [Stage::Implement]);
+        assert_eq!(depends_on.len(), 1);
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        let keys: Vec<&String> = body["questions"].as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            [
+                "anthropic.stage_design",
+                "anthropic.stage_implement",
+                "anthropic.stage_review",
+                "could_be_cheaper_0",
+                "openai.stage_design",
+                "openai.stage_implement",
+                "openai.stage_review",
+            ]
+        );
+    }
+
+    /// A ladder whose answers are missing fails the issue, so a partly
+    /// routed issue is never reported as routed.
+    #[tokio::test]
+    async fn run_route_fails_the_issue_when_one_provider_is_unanswered() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(routed_json()))
+            .mount(&server)
+            .await;
+        let client = JevClient::new(&server.uri(), "key").unwrap();
+        let ladders = [
+            Ladder::builtin(Provider::Anthropic).unwrap(),
+            Ladder::builtin(Provider::Gemini).unwrap(),
+        ];
+        let report = run_route(
+            &client,
+            &[doc(7, ItemState::Open)],
+            &ladders,
+            &opts(),
+            &OpenDependencies::new(),
+        )
+        .await
+        .unwrap();
+        let RouteOutcome::Failed { error } = &report.issues[0].outcome else {
+            panic!("expected a failed issue: {:?}", report.issues[0]);
+        };
+        assert!(error.contains("gemini.stage_design"), "{error}");
     }
 
     fn routed_json() -> serde_json::Value {
         serde_json::json!({
             "model": "jev-1.13.0",
             "answers": {
-                "stage_design": choice_json("none", 0.9),
-                "stage_implement": choice_json("sonnet", 0.9),
-                "stage_review": choice_json("opus", 0.9),
+                "anthropic.stage_design": choice_json("none", 0.9),
+                "anthropic.stage_implement": choice_json("sonnet", 0.9),
+                "anthropic.stage_review": choice_json("opus", 0.9),
             },
             "usage": {"input_tokens": 5, "output_tokens": 1}
         })
@@ -1104,7 +1498,7 @@ mod tests {
         let report = run_route(
             &client,
             &[doc(1, ItemState::Open), doc(2, ItemState::Open)],
-            &default_tiers(),
+            &anthropic(),
             &opts(),
             &OpenDependencies::new(),
         )
@@ -1132,7 +1526,7 @@ mod tests {
         let err = run_route(
             &client,
             &[doc(3, ItemState::Open), doc(4, ItemState::Open)],
-            &default_tiers(),
+            &anthropic(),
             &opts(),
             &OpenDependencies::new(),
         )
@@ -1149,9 +1543,9 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "model": "jev-1.13.0",
                     "answers": {
-                        "stage_design": choice_json("haiku", 0.9),
-                        "stage_implement": choice_json("sonnet", 0.9),
-                        "stage_review": choice_json("opus", 0.9),
+                        "anthropic.stage_design": choice_json("haiku", 0.9),
+                        "anthropic.stage_implement": choice_json("sonnet", 0.9),
+                        "anthropic.stage_review": choice_json("opus", 0.9),
                     },
                 })),
             )
@@ -1161,7 +1555,7 @@ mod tests {
         let report = run_route(
             &client,
             &[doc(9, ItemState::Open)],
-            &default_tiers(),
+            &anthropic(),
             &opts(),
             &OpenDependencies::new(),
         )
@@ -1194,9 +1588,9 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "model": "jev-1.13.0",
                     "answers": {
-                        "stage_design": choice_json("opus", 0.2),
-                        "stage_implement": choice_json("sonnet", 0.61),
-                        "stage_review": choice_json("opus", 0.9),
+                        "anthropic.stage_design": choice_json("opus", 0.2),
+                        "anthropic.stage_implement": choice_json("sonnet", 0.61),
+                        "anthropic.stage_review": choice_json("opus", 0.9),
                         "could_be_cheaper_0": {"type": "noul", "noul": 0.75},
                     },
                     "usage": {"input_tokens": 10, "output_tokens": 1}
@@ -1213,7 +1607,7 @@ mod tests {
         let report = run_route(
             &client,
             &[doc(7, ItemState::Open)],
-            &default_tiers(),
+            &anthropic(),
             &opts(),
             &dependencies,
         )
@@ -1234,10 +1628,10 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "anthropic.stage_design",
+                "anthropic.stage_implement",
+                "anthropic.stage_review",
                 "could_be_cheaper_0",
-                "stage_design",
-                "stage_implement",
-                "stage_review"
             ]
         );
     }
@@ -1258,7 +1652,7 @@ mod tests {
         let report = run_route(
             &client,
             &[doc(7, ItemState::Open)],
-            &default_tiers(),
+            &anthropic(),
             &opts(),
             &dependencies,
         )
@@ -1282,9 +1676,14 @@ mod tests {
                 url: "u".to_string(),
                 title: "t".to_string(),
                 outcome: RouteOutcome::Routed {
-                    stages: Box::new(stages("none", "sonnet", "opus")),
-                    class: "sonnet".to_string(),
-                    close_calls: vec![],
+                    providers: BTreeMap::from([(
+                        "anthropic".to_string(),
+                        ProviderRoute {
+                            stages: stages("none", "sonnet", "opus"),
+                            class: "sonnet".to_string(),
+                            close_calls: vec![],
+                        },
+                    )]),
                     depends_on: vec![],
                 },
                 truncated: false,
@@ -1294,7 +1693,13 @@ mod tests {
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["issues"][0]["ref"], "o/r#1");
         assert!(value["issues"][0].get("truncated").is_none());
-        assert_eq!(value["issues"][0]["stages"]["design"]["choice"], "none");
+        let anthropic = &value["issues"][0]["providers"]["anthropic"];
+        assert_eq!(anthropic["stages"]["design"]["choice"], "none");
+        assert_eq!(anthropic["class"], "sonnet");
+        assert_eq!(anthropic["close_calls"], serde_json::json!([]));
+        assert!(value["issues"][0].get("stages").is_none());
+        assert!(value["issues"][0].get("class").is_none());
+        assert_eq!(value["issues"][0]["depends_on"], serde_json::json!([]));
         assert!(value["issues"][0].get("error").is_none());
     }
 
@@ -1311,7 +1716,7 @@ mod tests {
         };
         let value = serde_json::to_value(&route).unwrap();
         assert_eq!(value["error"], "HTTP 529");
-        assert!(value.get("stages").is_none());
-        assert!(value.get("class").is_none());
+        assert!(value.get("providers").is_none());
+        assert!(value.get("depends_on").is_none());
     }
 }

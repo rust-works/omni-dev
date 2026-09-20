@@ -14,8 +14,8 @@ use crate::jev::citations::{find_citations, Citation};
 use crate::jev::client::JevClient;
 use crate::jev::config::JevConfig;
 use crate::jev::route::{
-    build_route_state, run_route, OpenDependencies, RouteOptions, RouteReport, Tiers,
-    DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
+    build_route_state, run_route, Ladder, OpenDependencies, Provider, RouteOptions, RouteReport,
+    Tiers, DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
 };
 use crate::provider::{GitProvider, IssueDoc, ItemKind, ItemRef, ItemState};
 
@@ -29,14 +29,19 @@ stages.\n\nMakes one Jev call per issue. Jev judges the issue's title, body and 
 comments (never the issues or pull requests it references) and picks, for each stage, the \
 least capable class likely to do it correctly with no rework. The issue's class is the \
 higher of its design and implement choices, and a stage whose confidence is below \
---close-call is listed under close_calls.\n\nEach open issue or pull request the text cites \
-is reported under depends_on, with a could_be_cheaper.design probability: how likely it is \
-that resolving that dependency would leave less design work remaining than the text implies. \
-One extra Jev call is made per open citation; a closed citation is settled and is not \
-reported.\n\nClosed issues are refused unless --allow-closed is given: their comments often \
-describe how the work was done, which leaks the answer.\n\nAn issue whose Jev call fails is \
-reported with an `error` field instead of stages, and the rest are still routed; the command \
-then exits non-zero. An authentication failure stops the run at once."
+--close-call is listed under close_calls.\n\nThe classes are one AI provider's model ladder, \
+named by abbreviated model name: anthropic (sonnet/opus/fable, the default), openai \
+(terra/sol/astra) and gemini (flash/pro/deep-think). --providers routes against several at \
+once, still in one Jev call per issue, and the output nests stages, class and close_calls \
+under each provider's name. --tiers FILE swaps in a custom ladder instead, reported under \
+`custom`; it cannot be combined with --providers.\n\nEach open issue or pull request the text \
+cites is reported under depends_on, with a could_be_cheaper.design probability: how likely it \
+is that resolving that dependency would leave less design work remaining than the text \
+implies. One extra Jev question is asked per open citation; a closed citation is settled and \
+is not reported.\n\nClosed issues are refused unless --allow-closed is given: their comments \
+often describe how the work was done, which leaks the answer.\n\nAn issue whose Jev call \
+fails is reported with an `error` field instead of providers, and the rest are still routed; \
+the command then exits non-zero. An authentication failure stops the run at once."
 )]
 pub struct RouteCommand {
     /// Issues to route: `#N` or `N` (in the current repository), `owner/repo#N`, or an
@@ -52,7 +57,18 @@ pub struct RouteCommand {
     #[arg(long)]
     pub all_open: bool,
 
-    /// YAML file of model-class tiers, least capable first, replacing the defaults.
+    /// AI providers whose model ladders to route against (comma-separated).
+    #[arg(
+        long,
+        value_name = "NAMES",
+        value_enum,
+        value_delimiter = ',',
+        default_value = "anthropic",
+        conflicts_with = "tiers"
+    )]
+    pub providers: Vec<Provider>,
+
+    /// YAML file of model-class tiers, least capable first, replacing the provider ladders.
     #[arg(long, value_name = "FILE")]
     pub tiers: Option<PathBuf>,
 
@@ -88,7 +104,14 @@ impl RouteCommand {
         if let Some(model) = self.jev_model {
             config.model = model;
         }
-        let tiers = Tiers::load(self.tiers.as_deref())?;
+        let ladders = match self.tiers {
+            Some(path) => vec![Ladder::custom(Tiers::load_file(&path)?)],
+            None => self
+                .providers
+                .iter()
+                .map(|&p| Ladder::builtin(p))
+                .collect::<Result<Vec<_>>>()?,
+        };
         let client = JevClient::from_config(&config)?;
 
         let bin = crate::pr_status::resolve_gh_binary();
@@ -110,7 +133,7 @@ impl RouteCommand {
             max_input_chars: self.max_input_chars,
             allow_closed: self.allow_closed,
         };
-        let report = run_route(&client, &docs, &tiers, &opts, &dependencies).await?;
+        let report = run_route(&client, &docs, &ladders, &opts, &dependencies).await?;
         print!("{}", format_output(&report, self.output)?);
         failure_summary(&report).map_or(Ok(()), |msg| bail!(msg))
     }
@@ -270,6 +293,40 @@ mod tests {
         assert_eq!(cmd.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
         assert!(!cmd.allow_closed);
         assert_eq!(cmd.output, JevFormat::Json);
+        assert_eq!(cmd.providers, [Provider::Anthropic]);
+        assert!(cmd.tiers.is_none());
+    }
+
+    #[test]
+    fn route_parses_providers_in_order() {
+        let cmd = parse(&["#1", "--providers", "openai,gemini"]).unwrap();
+        assert_eq!(cmd.providers, [Provider::OpenAi, Provider::Gemini]);
+        let cmd = parse(&["#1", "--providers", "gemini", "--providers", "anthropic"]).unwrap();
+        assert_eq!(cmd.providers, [Provider::Gemini, Provider::Anthropic]);
+    }
+
+    #[test]
+    fn route_rejects_an_unknown_or_empty_provider() {
+        let Err(err) = parse(&["#1", "--providers", "nope"]) else {
+            panic!("an unknown provider parsed");
+        };
+        let text = err.to_string();
+        assert!(text.contains("anthropic"), "{text}");
+        assert!(text.contains("openai"), "{text}");
+        assert!(text.contains("gemini"), "{text}");
+        assert!(parse(&["#1", "--providers", ""]).is_err());
+        assert!(parse(&["#1", "--providers"]).is_err());
+    }
+
+    /// A defaulted `--providers` does not conflict, so `--tiers` alone is
+    /// fine; naming both is an error rather than one silently winning.
+    #[test]
+    fn route_tiers_conflicts_with_an_explicit_providers() {
+        assert!(parse(&["#1", "--tiers", "t.yaml"]).is_ok());
+        let Err(err) = parse(&["#1", "--tiers", "t.yaml", "--providers", "openai"]) else {
+            panic!("--tiers with --providers parsed");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
@@ -294,11 +351,13 @@ mod tests {
     #[test]
     fn failure_summary_counts_only_failed_issues() {
         use crate::jev::protocol::Usage;
-        use crate::jev::route::{IssueRoute, RouteOutcome, StageAnswer, StageAnswers};
+        use crate::jev::route::{
+            IssueRoute, ProviderRoute, RouteOutcome, StageAnswer, StageAnswers,
+        };
         let answer = || StageAnswer {
             choice: "sonnet".to_string(),
             confidence: 0.9,
-            probabilities: std::collections::BTreeMap::new(),
+            probabilities: BTreeMap::new(),
         };
         let issue = |outcome| IssueRoute {
             item_ref: "o/r#1".to_string(),
@@ -309,13 +368,18 @@ mod tests {
         };
         let routed = || {
             issue(RouteOutcome::Routed {
-                stages: Box::new(StageAnswers {
-                    design: answer(),
-                    implement: answer(),
-                    review: answer(),
-                }),
-                class: "sonnet".to_string(),
-                close_calls: vec![],
+                providers: BTreeMap::from([(
+                    "anthropic".to_string(),
+                    ProviderRoute {
+                        stages: StageAnswers {
+                            design: answer(),
+                            implement: answer(),
+                            review: answer(),
+                        },
+                        class: "sonnet".to_string(),
+                        close_calls: vec![],
+                    },
+                )]),
                 depends_on: vec![],
             })
         };
