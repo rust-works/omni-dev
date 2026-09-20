@@ -59,6 +59,7 @@ fn citation_regex() -> &'static Regex {
         Regex::new(
             r"(?ix)
               https://github\.com/(?P<url_owner>[A-Za-z0-9_.-]+)/(?P<url_repo>[A-Za-z0-9_.-]+)/(?P<url_kind>issues|pull)/(?P<url_num>[0-9]+)
+            | (?P<other_url>https?://\S+)
             | (?P<or_owner>[A-Za-z0-9_.-]+)/(?P<or_repo>[A-Za-z0-9_.-]+)\#(?P<or_num>[0-9]+)
             | (?:pr|pull\ request)\s*\#(?P<pr_num>[0-9]+)
             | \#(?P<issue_num>[0-9]+)
@@ -66,6 +67,32 @@ fn citation_regex() -> &'static Regex {
         )
         .expect("citation regex must compile")
     })
+}
+
+/// The byte offset just past the matched number, whichever alternative
+/// matched, or `None` for the `other_url` alternative (which matches no
+/// number by design).
+fn number_end(caps: &Captures<'_>) -> Option<usize> {
+    ["url_num", "or_num", "pr_num", "issue_num"]
+        .iter()
+        .find_map(|name| caps.name(name))
+        .map(|m| m.end())
+}
+
+/// Whether the character following a match ending at byte `end` really ends
+/// the reference.
+///
+/// The number must not run straight into a word character. Without this a
+/// hex colour (`#1f77b4`) or a heading anchor (`#1-overview`) parses as
+/// issue `#1` in the current repository — which resolves to a real,
+/// unrelated issue and becomes a source — and a doc link
+/// (`docs/jev.md#4-state-input`) invents the repository `docs/jev.md`,
+/// whose repository-level `NOT_FOUND` fails the whole run.
+fn ends_at_boundary(body: &str, end: usize) -> bool {
+    body[end..]
+        .chars()
+        .next()
+        .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
 }
 
 /// Reads one regex match into `(project, kind hint, number)`. The kind is
@@ -112,6 +139,18 @@ fn citation_from_captures(
     }
 }
 
+/// Reads the first citation in `text`, skipping a match that does not end
+/// at a boundary (see [`ends_at_boundary`]) or that is a non-issue URL.
+fn first_citation(text: &str, default_project: &str) -> Option<(String, ItemKind, u64)> {
+    citation_regex().captures_iter(text).find_map(|caps| {
+        let end = number_end(&caps)?;
+        if !ends_at_boundary(text, end) {
+            return None;
+        }
+        citation_from_captures(&caps, default_project)
+    })
+}
+
 /// Finds every issue/pull-request reference in `body`.
 ///
 /// Recognises `#N`, `PR #N` / `pull request #N` (case-insensitive),
@@ -123,6 +162,12 @@ pub fn find_citations(body: &str, default_project: &str, judged: &ItemRef) -> Ve
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for caps in citation_regex().captures_iter(body) {
+        let Some(end) = number_end(&caps) else {
+            continue; // a non-issue URL, matched only so it cannot be mis-read
+        };
+        if !ends_at_boundary(body, end) {
+            continue;
+        }
         let Some((project, kind, number)) = citation_from_captures(&caps, default_project) else {
             continue;
         };
@@ -150,8 +195,7 @@ pub fn find_citations(body: &str, default_project: &str, judged: &ItemRef) -> Ve
 /// [`Source::keys`], not by comparing display strings (which the splitter
 /// might not reproduce with identical spacing or case).
 fn resolve_cites_index(cites: &str, default_project: &str, sources: &[Source]) -> Option<usize> {
-    let caps = citation_regex().captures(cites)?;
-    let (project, _kind, number) = citation_from_captures(&caps, default_project)?;
+    let (project, _kind, number) = first_citation(cites, default_project)?;
     sources
         .iter()
         .position(|s| s.keys.contains(&(project.clone(), number)))
@@ -166,12 +210,9 @@ fn resolve_cites_index(cites: &str, default_project: &str, sources: &[Source]) -
 /// statement would be reported as an unresolved citation and drag the
 /// verdict to `needs_review` — for obeying the rule in substance.
 fn cites_judged_issue(cites: &str, judged: &IssueDoc) -> bool {
-    citation_regex()
-        .captures(cites)
-        .and_then(|caps| citation_from_captures(&caps, &judged.project))
-        .is_some_and(|(project, _kind, number)| {
-            project == judged.project && number == judged.number
-        })
+    first_citation(cites, &judged.project).is_some_and(|(project, _kind, number)| {
+        project == judged.project && number == judged.number
+    })
 }
 
 // ── Comment selection ──────────────────────────────────────────────────
@@ -674,8 +715,8 @@ fn build_coverage_state(comment_body: &str, statements: &[SplitStatement]) -> St
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
-    /// Every statement scored at least the supported threshold and
-    /// coverage passed (or was unavailable).
+    /// Every statement was checked, scored at least the supported
+    /// threshold, and the coverage check ran and passed.
     Accepted,
     /// At least one statement scored below the reject threshold.
     Rejected,
@@ -966,6 +1007,15 @@ pub async fn run_verify(
                 usage.output_tokens += response.usage.output_tokens;
                 if let Some(Answer::Noul { noul }) = response.answers.get("coverage") {
                     coverage = Some(*noul);
+                } else {
+                    // Answered, but not with the `coverage` noul we asked
+                    // for. The guard did not run, and an unrun guard must
+                    // not read as a guard that passed — the same rule the
+                    // per-statement path applies to an unanswered statement.
+                    warn!("The coverage call returned no usable `coverage` answer");
+                    coverage_reason = Some(
+                        "coverage unavailable: the reply carried no `coverage` answer".to_string(),
+                    );
                 }
             }
         }
@@ -1145,6 +1195,61 @@ mod tests {
     #[test]
     fn returns_nothing_for_a_comment_with_no_citations() {
         assert!(find_citations("Looks good to me!", "o/r", &judged(1)).is_empty());
+    }
+
+    /// A number that runs into a word character is not a citation. Without
+    /// the boundary check a hex colour or a heading anchor resolved to a
+    /// real, unrelated issue and became a source Jev was asked about.
+    #[test]
+    fn a_number_running_into_a_word_character_is_not_a_citation() {
+        for body in [
+            "the colour #1f77b4 is used",
+            "see the anchor #1-overview below",
+        ] {
+            assert!(
+                find_citations(body, "rust-works/omni-dev", &judged(1779)).is_empty(),
+                "{body}"
+            );
+        }
+    }
+
+    /// A relative doc link is not `owner/repo#N`. Without this the invented
+    /// project `docs/jev.md` reached `gh`, whose repository-level
+    /// `NOT_FOUND` fails the whole run rather than one citation.
+    #[test]
+    fn a_doc_anchor_link_does_not_invent_a_repository() {
+        let cites = find_citations(
+            "see [state input](docs/jev.md#4-state-input) and #1614",
+            "rust-works/omni-dev",
+            &judged(1779),
+        );
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0].item_ref.project, "rust-works/omni-dev");
+        assert_eq!(cites[0].item_ref.number, 1614);
+    }
+
+    /// A URL that is not a GitHub issue/pull link is swallowed whole, so
+    /// neither its path nor its fragment can be read as a citation.
+    #[test]
+    fn a_non_issue_url_yields_no_citation() {
+        for body in [
+            "see https://github.com/rust-works/omni-dev/blob/main/README.md#12",
+            "see https://example.com/browse/X#1614",
+        ] {
+            assert!(
+                find_citations(body, "rust-works/omni-dev", &judged(1779)).is_empty(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_citation_followed_by_punctuation_is_still_found() {
+        for body in ["fixed by #1614.", "fixed by #1614", "fixed by (#1614)"] {
+            let cites = find_citations(body, "rust-works/omni-dev", &judged(1779));
+            assert_eq!(cites.len(), 1, "{body}");
+            assert_eq!(cites[0].raw, "#1614", "{body}");
+        }
     }
 
     // ── parse_comment_selector / select_comment ───────────────────────
