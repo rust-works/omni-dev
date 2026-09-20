@@ -146,6 +146,7 @@ mod tests {
                 sheet("Q1", false, Some((1000, 26))),
                 sheet("Notes", true, None),
             ],
+            ..Default::default()
         };
         let mut buf = Vec::new();
         render_info_table(&spreadsheet, &mut buf).unwrap();
@@ -166,6 +167,7 @@ mod tests {
                 title: "evil\x1b[31mbook".to_string(),
             }),
             sheets: vec![sheet("tab\x1b[0mname", false, None)],
+            ..Default::default()
         };
         let mut buf = Vec::new();
         render_info_table(&spreadsheet, &mut buf).unwrap();

@@ -43,6 +43,15 @@ pub struct Spreadsheet {
     /// The sheets (tabs) it contains, in workbook order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sheets: Vec<Sheet>,
+    /// Named ranges defined anywhere in the workbook. A named range is
+    /// workbook-scoped, not sheet-scoped (unlike [`ProtectedRange`], which
+    /// nests under the [`Sheet`] it protects), so this lives here rather
+    /// than on `Sheet`. Empty unless the caller requested it with a wider
+    /// `fields` mask — `SPREADSHEET_FIELDS` (the mask every other call uses)
+    /// omits this; only `SheetsApi::get_spreadsheet_with_named_ranges`
+    /// populates it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "namedRanges")]
+    pub named_ranges: Vec<NamedRange>,
 }
 
 impl Spreadsheet {
@@ -339,8 +348,10 @@ pub struct ClearValuesResponse {
 /// [ADR-0078](../../../docs/adrs/adr-0078.md), with formatting, data
 /// validation, `duplicateSheet`, reorder/hide and, since issue #1795
 /// ([ADR-0081](../../../docs/adrs/adr-0081.md) §4), developer-metadata
-/// management), the destructive ones behind `DriveOperation::SheetsDelete`
-/// (issue #1623,
+/// management, and extended again by issue #1796,
+/// [ADR-0081](../../../docs/adrs/adr-0081.md) §2, with named-range
+/// add/update/delete), the destructive ones behind
+/// `DriveOperation::SheetsDelete` (issue #1623,
 /// [ADR-0077](../../../docs/adrs/adr-0077-sheets-deletion-via-batchupdate.md)),
 /// and the protected-range ones behind `DriveOperation::SheetsProtection`
 /// (issue #1643, [ADR-0078](../../../docs/adrs/adr-0078.md) §2) — there is
@@ -445,6 +456,20 @@ pub enum BatchUpdateRequestItem {
     /// [`Self::AddConditionalFormatRule`] — a presentational removal, not a
     /// *data* deletion.
     DeleteConditionalFormatRule(DeleteConditionalFormatRuleRequest),
+    /// Add a named range (`add-named-range`). Gated
+    /// `DriveOperation::SheetsStructure` — a label over a region, created
+    /// without touching any cell's value.
+    AddNamedRange(AddNamedRangeRequest),
+    /// Change an existing named range's name and/or range
+    /// (`update-named-range`). Same gate as [`Self::AddNamedRange`].
+    UpdateNamedRange(UpdateNamedRangeRequest),
+    /// Remove a named range (`delete-named-range`). Same gate as
+    /// [`Self::AddNamedRange`] — it removes a label, not grid data; see
+    /// [ADR-0081](../../../docs/adrs/adr-0081.md) §2 for why this stays
+    /// `SheetsStructure` rather than `SheetsDelete`, and for the mandatory
+    /// referencing-formula preview that mitigates the resulting `#NAME?`
+    /// errors.
+    DeleteNamedRange(DeleteNamedRangeRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -1388,6 +1413,66 @@ pub struct DeleteConditionalFormatRuleRequest {
     pub index: i64,
 }
 
+/// A named range, as `addNamedRange` builds one and `spreadsheets.get` (with
+/// the wider named-ranges `fields` mask) reads one back.
+///
+/// Unlike [`ProtectedRange::protected_range_id`] (an `i64`), Sheets assigns
+/// `namedRangeId` as a **string** — don't copy the protected-range id type
+/// here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamedRange {
+    /// The server-assigned stable id. Absent on a request this crate is
+    /// building (the server assigns it); always present on one read back.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "namedRangeId"
+    )]
+    pub named_range_id: Option<String>,
+    /// The name, unique workbook-wide.
+    #[serde(default)]
+    pub name: String,
+    /// The range the name refers to. Always present — unlike
+    /// [`ProtectedRange::range`], a named range has no "whole workbook"
+    /// case, though `range` with every bound unset still covers a whole
+    /// sheet.
+    #[serde(default)]
+    pub range: GridRange,
+}
+
+/// `AddNamedRangeRequest`.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct AddNamedRangeRequest {
+    /// The name and range to add. `named_range_id` is left unset — the
+    /// server assigns it, only knowable from the reply.
+    #[serde(rename = "namedRange")]
+    pub named_range: NamedRange,
+}
+
+/// `UpdateNamedRangeRequest`.
+///
+/// Reuses [`NamedRange`] directly, unlike `update-protection`'s
+/// [`ProtectedRangeUpdate`]: a named range has no field `update-named-range`
+/// must exclude — both `name` and `range` are freely re-settable, so there
+/// is no risk of a caller accidentally attempting to change something the
+/// API forbids changing this way.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct UpdateNamedRangeRequest {
+    /// The properties to write. `named_range_id` selects the target.
+    #[serde(rename = "namedRange")]
+    pub named_range: NamedRange,
+    /// The field mask limiting what this request may change.
+    pub fields: String,
+}
+
+/// `DeleteNamedRangeRequest`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DeleteNamedRangeRequest {
+    /// Which named range to remove.
+    #[serde(rename = "namedRangeId")]
+    pub named_range_id: String,
+}
+
 /// `InsertDimensionRequest`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct InsertDimensionRequest {
@@ -1487,6 +1572,10 @@ pub struct BatchUpdateReply {
     /// (issue #1794).
     #[serde(default, rename = "addFilterView")]
     pub add_filter_view: Option<AddFilterViewReply>,
+    /// Present only for an `addNamedRange` request — carries the
+    /// server-assigned `namedRangeId`, only knowable from the reply.
+    #[serde(default, rename = "addNamedRange")]
+    pub add_named_range: Option<AddNamedRangeReply>,
 }
 
 /// The `addProtectedRange` arm of a [`BatchUpdateReply`].
@@ -1503,6 +1592,14 @@ pub struct AddFilterViewReply {
     /// The created view, including its assigned `filterViewId`.
     #[serde(default)]
     pub filter: Option<FilterView>,
+}
+
+/// The `addNamedRange` arm of a [`BatchUpdateReply`].
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct AddNamedRangeReply {
+    /// The created named range, including its assigned `namedRangeId`.
+    #[serde(default, rename = "namedRange")]
+    pub named_range: Option<NamedRange>,
 }
 
 /// The `addSheet`/`duplicateSheet` arm of a [`BatchUpdateReply`].

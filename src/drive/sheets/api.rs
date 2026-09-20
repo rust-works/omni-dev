@@ -59,6 +59,19 @@ const SPREADSHEET_FIELDS_WITH_CONDITIONAL_FORMATS: &str = "spreadsheetId,propert
     sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
     sheets.conditionalFormats(ranges,booleanRule,gradientRule)";
 
+/// `fields` mask for `spreadsheets.get` when named ranges are needed too
+/// (issue #1796's `list-named-ranges`/`update-named-range`/
+/// `delete-named-range`, which must resolve an *existing* named range by
+/// name before they can act on one). A superset of [`SPREADSHEET_FIELDS`],
+/// kept separate for the same reason as
+/// [`SPREADSHEET_FIELDS_WITH_PROTECTIONS`]: every other caller never pays
+/// for data it doesn't use. Named ranges are workbook-scoped, so
+/// `namedRanges` sits at the top level, not nested under `sheets` the way
+/// `protectedRanges` is.
+const SPREADSHEET_FIELDS_WITH_NAMED_RANGES: &str = "spreadsheetId,properties.title,\
+    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    namedRanges(namedRangeId,name,range)";
+
 /// Maximum ranges sent in a single `values.batchGet`.
 ///
 /// Each range is a percent-encoded, quoted sheet title in the query string,
@@ -215,6 +228,24 @@ impl<'a> SheetsApi<'a> {
             .get_parsed(
                 url.as_str(),
                 "Failed to parse Sheets spreadsheet metadata (with conditional formats)",
+            )
+            .await
+    }
+
+    /// Fetches a spreadsheet's metadata **including named ranges** — the
+    /// one read the named-range verbs need that no other caller does. See
+    /// [`SPREADSHEET_FIELDS_WITH_NAMED_RANGES`].
+    pub async fn get_spreadsheet_with_named_ranges(
+        &self,
+        spreadsheet_id: &str,
+    ) -> Result<Spreadsheet> {
+        let url =
+            build_spreadsheet_get_with_named_ranges_url(self.client.base_url(), spreadsheet_id)?;
+        self.client
+            .transport()
+            .get_parsed(
+                url.as_str(),
+                "Failed to parse Sheets spreadsheet metadata (with named ranges)",
             )
             .await
     }
@@ -451,6 +482,18 @@ fn build_spreadsheet_get_with_conditional_formats_url(
     GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
     url.query_pairs_mut()
         .append_pair("fields", SPREADSHEET_FIELDS_WITH_CONDITIONAL_FORMATS);
+    Ok(url)
+}
+
+fn build_spreadsheet_get_with_named_ranges_url(
+    base_url: &str,
+    spreadsheet_id: &str,
+) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
+    url.query_pairs_mut()
+        .append_pair("fields", SPREADSHEET_FIELDS_WITH_NAMED_RANGES);
     Ok(url)
 }
 
