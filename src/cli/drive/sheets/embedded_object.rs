@@ -451,11 +451,16 @@ pub struct UpdateSlicerCommand {
     pub column: Option<i64>,
 
     /// Replace the hidden-value criteria. Repeatable.
-    #[arg(long = "hide-values", value_name = "VALUES", value_delimiter = ',')]
+    #[arg(
+        long = "hide-values",
+        value_name = "VALUES",
+        value_delimiter = ',',
+        conflicts_with = "clear_criteria"
+    )]
     pub hide_values: Vec<String>,
 
     /// Reset the filter criteria to empty.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "hide_values")]
     pub clear_criteria: bool,
 
     /// Change the title.
