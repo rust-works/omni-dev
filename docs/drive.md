@@ -621,17 +621,17 @@ scope would technically permit.
 **Default policy** — what applies when no configured rule names an
 operation anywhere in a target's ancestor chain:
 
-| Operation           | Default | Granted to                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-|---------------------|---------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `read`              | allow   | `search`, `read`, `dedupe` (not yet enforced)                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `create`            | deny    | `create`, `sheets create`                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `upload`            | deny    | `upload`                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `edit`              | deny    | `edit` — raw file content only                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view` |
-| `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range`                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `docs-write`        | deny    | `docs replace`, `docs append`                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Operation           | Default | Granted to |
+|---------------------|---------|------------|
+| `read`              | allow   | `search`, `read`, `dedupe` (not yet enforced) |
+| `create`            | deny    | `create`, `sheets create` |
+| `upload`            | deny    | `upload` |
+| `edit`              | deny    | `edit` — raw file content only |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format` |
+| `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
+| `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
+| `docs-write`        | deny    | `docs replace`, `docs append` |
 
 There is no "enabled: true" flag — an absent or empty rule list already
 means "deny every write everywhere," via this table alone, which *is* the
@@ -680,6 +680,11 @@ reads back and reports the key, value and location of every entry it would
 remove before deleting it, the same preview pattern as `merge-cells`.
 `search-developer-metadata` is read-only and ungated, like
 `list-protections` below.
+
+**Conditional formatting joins `sheets-structure` too** (issue #1793,
+[ADR-0081](adrs/adr-0081.md) §1) — presentational, destroys no data, exactly
+like `format-cells`/`set-data-validation`. `list-conditional-formats` is a
+plain read and needs no grant, the same as `list-protections`.
 
 **`sheets-protection` is separate from `sheets-structure`, and the reason is
 different in kind from every split above.** A protected range is a
@@ -2039,6 +2044,60 @@ to reach a `PROJECT`-visibility entry through `drive sheets`.
 `delete-developer-metadata` bulk-removes: since a key/location filter can
 match more than one entry, the preview (and the real run) lists every entry
 it applies to, not just one.
+
+#### drive sheets add-conditional-format / update-conditional-format / delete-conditional-format / list-conditional-formats
+
+Conditional formatting rules — a `BooleanRule` (a condition-triggered
+format) or a `GradientRule` (a color scale). Also gated by
+`sheets-structure` (issue #1793, [ADR-0081](adrs/adr-0081.md) §1).
+
+Rules are an **ordered list per sheet, addressed by index** — deleting a
+rule shifts every later index. `update-conditional-format`/
+`delete-conditional-format`'s `--index` is only valid against a snapshot
+just read, so run `list-conditional-formats` (a plain, ungated read, like
+`list-protections`) immediately before acting to confirm the index is still
+current. `--dry-run` on `update`/`delete` echoes the rule *currently* at the
+given index alongside the change that would be made, so a stale index is
+visible before it's acted on.
+
+```bash
+# A BooleanRule: exactly one condition flag, plus at least one of
+# --background/--text-color/--bold.
+omni-dev drive sheets add-conditional-format <ID> --sheet Q2 --range C2:C100 \
+  --number-greater 100 --background '#FF0000' --bold true
+
+# A GradientRule: --gradient-min-color/--gradient-max-color, plus an
+# optional --gradient-mid-color/--gradient-mid-type/--gradient-mid-value.
+omni-dev drive sheets add-conditional-format <ID> --sheet Q2 --range D2:D100 \
+  --gradient-min-color '#FFFFFF' --gradient-max-color '#00FF00' \
+  --gradient-mid-color '#FFFF00' --gradient-mid-type percent --gradient-mid-value 50
+
+# A rule can span more than one range — repeat --range.
+omni-dev drive sheets add-conditional-format <ID> --sheet Q2 \
+  --range C2:C100 --range D2:D100 --cell-empty --background '#CCCCCC'
+
+# See what exists, and at what index — a plain, ungated read.
+omni-dev drive sheets list-conditional-formats <ID>
+
+# update-conditional-format replaces the whole rule at --index, ranges
+# included; it does not move a rule to a different index.
+omni-dev drive sheets update-conditional-format <ID> --sheet Q2 --index 0 \
+  --range C2:C100 --number-greater 200 --background '#FF0000'
+
+omni-dev drive sheets delete-conditional-format <ID> --sheet Q2 --index 1
+```
+
+Unlike `set-data-validation`, `--sheet` is required on `add`/`update` (a
+rule's ranges must all share one sheet). The condition set is curated the
+same way `set-data-validation`'s is, cut to a different boundary: dropdown
+types (`ONE_OF_LIST`/`ONE_OF_RANGE`/`CHECKBOX`) don't apply to a format
+trigger, so they're absent here; `--cell-empty`/`--cell-not-empty` are
+present instead, since they're meaningful only as a format trigger. Still
+not reachable, the same documented cut `set-data-validation` names:
+`TEXT_IS_EMAIL`, `TEXT_IS_URL`, `DATE_ON_OR_BEFORE`, `DATE_ON_OR_AFTER`,
+`DATE_NOT_BETWEEN`, `DATE_IS_VALID`. `GradientRule`'s two endpoints are
+always anchored `MIN`/`MAX`; Sheets also allows an endpoint anchored at an
+explicit `NUMBER`/`PERCENT`/`PERCENTILE` value, which is not reachable here.
 
 #### drive sheets protect-range / update-protection / unprotect-range / list-protections
 

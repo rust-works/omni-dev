@@ -4478,10 +4478,63 @@ Commands:
   update-filter-view           Changes an existing filter view's title, range, sort order, or hidden values. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
   delete-filter-view           Removes a filter view. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
   list-filter-views            Lists the filter views in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1794)
+  add-conditional-format       Adds a conditional format rule to one or more ranges. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1793, ADR-0081 §1)
+  update-conditional-format    Replaces the conditional format rule at an index. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1793, ADR-0081 §1)
+  delete-conditional-format    Removes the conditional format rule at an index. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1793, ADR-0081 §1)
+  list-conditional-formats     Lists the conditional format rules in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1793)
   help                         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev drive sheets add-conditional-format - Adds a conditional format rule to one or more ranges. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1793, ADR-0081 §1)
+
+Adds a conditional format rule to one or more ranges. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1793, ADR-0081 §1)
+
+Usage: add-conditional-format [OPTIONS] --sheet <NAME> --range <A1> <--number-between <MIN> <MAX>|--number-not-between <MIN> <MAX>|--number-greater <N>|--number-greater-eq <N>|--number-less <N>|--number-less-eq <N>|--number-eq <N>|--number-not-eq <N>|--text-contains <TEXT>|--text-not-contains <TEXT>|--text-starts-with <TEXT>|--text-ends-with <TEXT>|--text-eq <TEXT>|--date-after <DATE>|--date-before <DATE>|--date-on <DATE>|--date-between <START> <END>|--cell-empty|--cell-not-empty|--custom-formula <FORMULA>|--gradient-min-color <HEX>> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>                    Sheet (tab) title every `--range` belongs to
+      --range <A1>                      An A1 range (no `Sheet!` prefix — `--sheet` supplies it) the rule applies to. Repeatable; at least one is required
+      --index <N>                       Where to insert the rule, 0-based. Omit to append (the sheet's current rule count)
+      --number-between <MIN> <MAX>      Restrict the trigger to a number in this inclusive range
+      --number-not-between <MIN> <MAX>  Restrict the trigger to a number outside this inclusive range
+      --number-greater <N>              Restrict the trigger to a number strictly greater than this
+      --number-greater-eq <N>           Restrict the trigger to a number greater than or equal to this
+      --number-less <N>                 Restrict the trigger to a number strictly less than this
+      --number-less-eq <N>              Restrict the trigger to a number less than or equal to this
+      --number-eq <N>                   Restrict the trigger to a number equal to this
+      --number-not-eq <N>               Restrict the trigger to a number not equal to this
+      --text-contains <TEXT>            Restrict the trigger to text containing this substring
+      --text-not-contains <TEXT>        Restrict the trigger to text not containing this substring
+      --text-starts-with <TEXT>         Restrict the trigger to text starting with this substring
+      --text-ends-with <TEXT>           Restrict the trigger to text ending with this substring
+      --text-eq <TEXT>                  Restrict the trigger to text equal to this
+      --date-after <DATE>               Restrict the trigger to a date after this one. Accepts an absolute date or a relative keyword (`today`, `tomorrow`, `yesterday`, `past-week`, `past-month`, `past-year`)
+      --date-before <DATE>              Restrict the trigger to a date before this one. Accepts an absolute date or a relative keyword (see `--date-after`)
+      --date-on <DATE>                  Restrict the trigger to a date equal to this one. Accepts an absolute date or a relative keyword (see `--date-after`)
+      --date-between <START> <END>      Restrict the trigger to a date in this inclusive range (absolute dates only; relative keywords are not accepted here)
+      --cell-empty                      Trigger when the cell is empty
+      --cell-not-empty                  Trigger when the cell is not empty
+      --custom-formula <FORMULA>        Trigger when this formula evaluates truthy
+      --background <HEX>                Cell background color to apply, `#RRGGBB`. Companion to a condition flag above, not part of the `rule_kind` group itself
+      --text-color <HEX>                Text color to apply, `#RRGGBB`
+      --bold <BOOL>                     Bold text [possible values: true, false]
+      --gradient-min-color <HEX>        Build a gradient instead: the color at the low end of the scale (anchored `MIN`), `#RRGGBB`. Requires `--gradient-max-color`
+      --gradient-max-color <HEX>        The color at the high end of the scale (anchored `MAX`), `#RRGGBB`
+      --gradient-mid-color <HEX>        An optional midpoint's color, `#RRGGBB`. Requires `--gradient-mid-type`/`--gradient-mid-value`
+      --gradient-mid-type <TYPE>        What kind of value the midpoint is anchored to [possible values: number, percent, percentile]
+      --gradient-mid-value <VALUE>      The midpoint's threshold value, untouched — Sheets parses it at evaluation time
+      --dry-run                         Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>                   The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>                 Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                            Print help (see more with '--help')
 
 
 ================================================================================
@@ -4668,6 +4721,26 @@ Options:
       --at <COLUMN>      First column to delete, 1-based inclusive (column A is 1)
       --count <N>        How many columns to delete [default: 1]
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets delete-conditional-format - Removes the conditional format rule at an index. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1793, ADR-0081 §1)
+
+Removes the conditional format rule at an index. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1793, ADR-0081 §1)
+
+Usage: delete-conditional-format [OPTIONS] --sheet <NAME> --index <N> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Sheet (tab) title the rule belongs to
+      --index <N>        Which rule, by 0-based ordinal position, to remove. See `list-conditional-formats`
+      --dry-run          Reports the gate verdict and the rule currently at `--index`, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
@@ -4914,6 +4987,22 @@ Options:
       --count <N>        How many rows to insert [default: 1]
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets list-conditional-formats - Lists the conditional format rules in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1793)
+
+Lists the conditional format rules in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1793)
+
+Usage: list-conditional-formats [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -5253,6 +5342,55 @@ Options:
       --lease <TOKEN>     The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>   Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help              Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets update-conditional-format - Replaces the conditional format rule at an index. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1793, ADR-0081 §1)
+
+Replaces the conditional format rule at an index. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1793, ADR-0081 §1)
+
+Usage: update-conditional-format [OPTIONS] --sheet <NAME> --index <N> --range <A1> <--number-between <MIN> <MAX>|--number-not-between <MIN> <MAX>|--number-greater <N>|--number-greater-eq <N>|--number-less <N>|--number-less-eq <N>|--number-eq <N>|--number-not-eq <N>|--text-contains <TEXT>|--text-not-contains <TEXT>|--text-starts-with <TEXT>|--text-ends-with <TEXT>|--text-eq <TEXT>|--date-after <DATE>|--date-before <DATE>|--date-on <DATE>|--date-between <START> <END>|--cell-empty|--cell-not-empty|--custom-formula <FORMULA>|--gradient-min-color <HEX>> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>                    Sheet (tab) title the rule belongs to
+      --index <N>                       Which rule, by 0-based ordinal position, to replace. See `list-conditional-formats`
+      --range <A1>                      The rule's new range(s) (no `Sheet!` prefix — `--sheet` supplies it). Repeatable; at least one is required. The whole rule is replaced, ranges included — this is not an incremental edit
+      --number-between <MIN> <MAX>      Restrict the trigger to a number in this inclusive range
+      --number-not-between <MIN> <MAX>  Restrict the trigger to a number outside this inclusive range
+      --number-greater <N>              Restrict the trigger to a number strictly greater than this
+      --number-greater-eq <N>           Restrict the trigger to a number greater than or equal to this
+      --number-less <N>                 Restrict the trigger to a number strictly less than this
+      --number-less-eq <N>              Restrict the trigger to a number less than or equal to this
+      --number-eq <N>                   Restrict the trigger to a number equal to this
+      --number-not-eq <N>               Restrict the trigger to a number not equal to this
+      --text-contains <TEXT>            Restrict the trigger to text containing this substring
+      --text-not-contains <TEXT>        Restrict the trigger to text not containing this substring
+      --text-starts-with <TEXT>         Restrict the trigger to text starting with this substring
+      --text-ends-with <TEXT>           Restrict the trigger to text ending with this substring
+      --text-eq <TEXT>                  Restrict the trigger to text equal to this
+      --date-after <DATE>               Restrict the trigger to a date after this one. Accepts an absolute date or a relative keyword (`today`, `tomorrow`, `yesterday`, `past-week`, `past-month`, `past-year`)
+      --date-before <DATE>              Restrict the trigger to a date before this one. Accepts an absolute date or a relative keyword (see `--date-after`)
+      --date-on <DATE>                  Restrict the trigger to a date equal to this one. Accepts an absolute date or a relative keyword (see `--date-after`)
+      --date-between <START> <END>      Restrict the trigger to a date in this inclusive range (absolute dates only; relative keywords are not accepted here)
+      --cell-empty                      Trigger when the cell is empty
+      --cell-not-empty                  Trigger when the cell is not empty
+      --custom-formula <FORMULA>        Trigger when this formula evaluates truthy
+      --background <HEX>                Cell background color to apply, `#RRGGBB`. Companion to a condition flag above, not part of the `rule_kind` group itself
+      --text-color <HEX>                Text color to apply, `#RRGGBB`
+      --bold <BOOL>                     Bold text [possible values: true, false]
+      --gradient-min-color <HEX>        Build a gradient instead: the color at the low end of the scale (anchored `MIN`), `#RRGGBB`. Requires `--gradient-max-color`
+      --gradient-max-color <HEX>        The color at the high end of the scale (anchored `MAX`), `#RRGGBB`
+      --gradient-mid-color <HEX>        An optional midpoint's color, `#RRGGBB`. Requires `--gradient-mid-type`/`--gradient-mid-value`
+      --gradient-mid-type <TYPE>        What kind of value the midpoint is anchored to [possible values: number, percent, percentile]
+      --gradient-mid-value <VALUE>      The midpoint's threshold value, untouched — Sheets parses it at evaluation time
+      --dry-run                         Reports the gate verdict and the change that would be made (including the rule currently at `--index`), without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>                   The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>                 Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                            Print help (see more with '--help')
 
 
 ================================================================================
