@@ -72,6 +72,20 @@ pub enum RelativeDate {
 }
 
 impl RelativeDate {
+    /// Every variant, in no particular order. `parse` derives from this (via
+    /// [`Self::as_sheets_str`]) rather than keeping its own hardcoded string
+    /// table, so the two can't drift apart on a typo; the
+    /// `relative_date_all_covers_every_variant` test's exhaustive match
+    /// forces this list to grow alongside the enum.
+    const ALL: [Self; 6] = [
+        Self::PastYear,
+        Self::PastMonth,
+        Self::PastWeek,
+        Self::Yesterday,
+        Self::Today,
+        Self::Tomorrow,
+    ];
+
     const fn as_sheets_str(self) -> &'static str {
         match self {
             Self::PastYear => "PAST_YEAR",
@@ -86,15 +100,10 @@ impl RelativeDate {
     /// Matches case- and separator-insensitively (`past-week`, `past_week`,
     /// `Past Week` all match) so the CLI value doesn't force one style.
     fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
-            "pastyear" => Some(Self::PastYear),
-            "pastmonth" => Some(Self::PastMonth),
-            "pastweek" => Some(Self::PastWeek),
-            "yesterday" => Some(Self::Yesterday),
-            "today" => Some(Self::Today),
-            "tomorrow" => Some(Self::Tomorrow),
-            _ => None,
-        }
+        let normalized = s.to_ascii_lowercase().replace(['-', '_', ' '], "");
+        Self::ALL
+            .into_iter()
+            .find(|rd| rd.as_sheets_str().to_ascii_lowercase().replace('_', "") == normalized)
     }
 }
 
@@ -196,56 +205,11 @@ pub enum Condition {
 }
 
 impl Condition {
-    fn into_boolean_condition(self) -> BooleanCondition {
-        let value = |s: String| ConditionValue {
-            user_entered_value: Some(s),
-            relative_date: None,
-        };
-        let condition = |condition_type: &str, values: Vec<ConditionValue>| BooleanCondition {
-            condition_type: condition_type.to_string(),
-            values,
-        };
-        match self {
-            Self::OneOfList(items) => {
-                condition("ONE_OF_LIST", items.into_iter().map(value).collect())
-            }
-            Self::OneOfRange(range) => condition("ONE_OF_RANGE", vec![value(range)]),
-            Self::NumberBetween(min, max) => condition(
-                "NUMBER_BETWEEN",
-                vec![value(min.to_string()), value(max.to_string())],
-            ),
-            Self::NumberNotBetween(min, max) => condition(
-                "NUMBER_NOT_BETWEEN",
-                vec![value(min.to_string()), value(max.to_string())],
-            ),
-            Self::NumberGreater(n) => condition("NUMBER_GREATER", vec![value(n.to_string())]),
-            Self::NumberGreaterEq(n) => {
-                condition("NUMBER_GREATER_THAN_EQ", vec![value(n.to_string())])
-            }
-            Self::NumberLess(n) => condition("NUMBER_LESS", vec![value(n.to_string())]),
-            Self::NumberLessEq(n) => condition("NUMBER_LESS_THAN_EQ", vec![value(n.to_string())]),
-            Self::NumberEq(n) => condition("NUMBER_EQ", vec![value(n.to_string())]),
-            Self::NumberNotEq(n) => condition("NUMBER_NOT_EQ", vec![value(n.to_string())]),
-            Self::TextContains(text) => condition("TEXT_CONTAINS", vec![value(text)]),
-            Self::TextNotContains(text) => condition("TEXT_NOT_CONTAINS", vec![value(text)]),
-            Self::TextStartsWith(text) => condition("TEXT_STARTS_WITH", vec![value(text)]),
-            Self::TextEndsWith(text) => condition("TEXT_ENDS_WITH", vec![value(text)]),
-            Self::TextEq(text) => condition("TEXT_EQ", vec![value(text)]),
-            Self::DateAfter(date) => condition("DATE_AFTER", vec![date.into_condition_value()]),
-            Self::DateBefore(date) => condition("DATE_BEFORE", vec![date.into_condition_value()]),
-            Self::DateOn(date) => condition("DATE_EQ", vec![date.into_condition_value()]),
-            Self::DateBetween(start, end) => {
-                condition("DATE_BETWEEN", vec![value(start), value(end)])
-            }
-            Self::Blank => condition("BLANK", Vec::new()),
-            Self::NotBlank => condition("NOT_BLANK", Vec::new()),
-            Self::Checkbox => condition("BOOLEAN", Vec::new()),
-            Self::CustomFormula(formula) => condition("CUSTOM_FORMULA", vec![value(formula)]),
-        }
-    }
-
-    /// The `validation_type` the request log records.
-    const fn log_type(&self) -> &'static str {
+    /// The Sheets API `condition_type` string, and the `validation_type` the
+    /// request log records — one source of truth shared by
+    /// [`Self::into_boolean_condition`] and [`Self::log_type`], so a typo
+    /// fixed in one can't drift from the other.
+    const fn condition_type_str(&self) -> &'static str {
         match self {
             Self::OneOfList(_) => "ONE_OF_LIST",
             Self::OneOfRange(_) => "ONE_OF_RANGE",
@@ -271,6 +235,47 @@ impl Condition {
             Self::Checkbox => "BOOLEAN",
             Self::CustomFormula(_) => "CUSTOM_FORMULA",
         }
+    }
+
+    fn into_boolean_condition(self) -> BooleanCondition {
+        let value = |s: String| ConditionValue {
+            user_entered_value: Some(s),
+            relative_date: None,
+        };
+        let condition_type = self.condition_type_str().to_string();
+        let values = match self {
+            Self::OneOfList(items) => items.into_iter().map(value).collect(),
+            Self::OneOfRange(range) => vec![value(range)],
+            Self::NumberBetween(min, max) | Self::NumberNotBetween(min, max) => {
+                vec![value(min.to_string()), value(max.to_string())]
+            }
+            Self::NumberGreater(n)
+            | Self::NumberGreaterEq(n)
+            | Self::NumberLess(n)
+            | Self::NumberLessEq(n)
+            | Self::NumberEq(n)
+            | Self::NumberNotEq(n) => vec![value(n.to_string())],
+            Self::TextContains(text)
+            | Self::TextNotContains(text)
+            | Self::TextStartsWith(text)
+            | Self::TextEndsWith(text)
+            | Self::TextEq(text) => vec![value(text)],
+            Self::DateAfter(date) | Self::DateBefore(date) | Self::DateOn(date) => {
+                vec![date.into_condition_value()]
+            }
+            Self::DateBetween(start, end) => vec![value(start), value(end)],
+            Self::Blank | Self::NotBlank | Self::Checkbox => Vec::new(),
+            Self::CustomFormula(formula) => vec![value(formula)],
+        };
+        BooleanCondition {
+            condition_type,
+            values,
+        }
+    }
+
+    /// The `validation_type` the request log records.
+    const fn log_type(&self) -> &'static str {
+        self.condition_type_str()
     }
 }
 
@@ -657,9 +662,9 @@ fn validate_condition(condition: &Condition) -> Result<(), String> {
     // compile time, rather than silently falling through unvalidated.
     match condition {
         Condition::OneOfList(items) => reject_empty_list(items, "--one-of-list"),
-        Condition::OneOfRange(range) => a1::compose(None, Some(range))
-            .map(|_| ())
-            .map_err(|err| format!("--one-of-range: {err:#}")),
+        Condition::OneOfRange(range) => {
+            a1::validate_range(range).map_err(|err| format!("--one-of-range: {err:#}"))
+        }
         Condition::NumberBetween(min, max) => reject_reversed_range(*min, *max, "--number-between"),
         Condition::NumberNotBetween(min, max) => {
             reject_reversed_range(*min, *max, "--number-not-between")
@@ -670,21 +675,18 @@ fn validate_condition(condition: &Condition) -> Result<(), String> {
         Condition::NumberLessEq(n) => reject_nan(*n, "--number-less-eq"),
         Condition::NumberEq(n) => reject_nan(*n, "--number-eq"),
         Condition::NumberNotEq(n) => reject_nan(*n, "--number-not-eq"),
-        Condition::TextContains(text) => reject_blank(text, "--text-contains"),
-        Condition::TextNotContains(text) => reject_blank(text, "--text-not-contains"),
-        Condition::TextStartsWith(text) => reject_blank(text, "--text-starts-with"),
-        Condition::TextEndsWith(text) => reject_blank(text, "--text-ends-with"),
-        Condition::TextEq(text) => reject_blank(text, "--text-eq"),
+        // Unlike `reject_blank`, a whitespace-only search value is a
+        // legitimate thing to search for (e.g. `--text-contains ' '`), so
+        // only a truly empty string is rejected.
+        Condition::TextContains(text) => reject_empty(text, "--text-contains"),
+        Condition::TextNotContains(text) => reject_empty(text, "--text-not-contains"),
+        Condition::TextStartsWith(text) => reject_empty(text, "--text-starts-with"),
+        Condition::TextEndsWith(text) => reject_empty(text, "--text-ends-with"),
+        Condition::TextEq(text) => reject_empty(text, "--text-eq"),
         Condition::DateAfter(date) => reject_blank_date(date, "--date-after"),
         Condition::DateBefore(date) => reject_blank_date(date, "--date-before"),
         Condition::DateOn(date) => reject_blank_date(date, "--date-on"),
-        Condition::DateBetween(start, end) => {
-            if start.trim().is_empty() || end.trim().is_empty() {
-                Err("--date-between's values must not be empty".to_string())
-            } else {
-                Ok(())
-            }
-        }
+        Condition::DateBetween(start, end) => reject_invalid_date_between(start, end),
         Condition::Blank | Condition::NotBlank | Condition::Checkbox => Ok(()),
         Condition::CustomFormula(formula) => reject_blank(formula, "--custom-formula"),
     }
@@ -726,12 +728,56 @@ fn reject_blank(text: &str, flag: &str) -> Result<(), String> {
     }
 }
 
+/// Like [`reject_blank`], but only a zero-length string counts as empty — a
+/// whitespace-only value is a meaningful thing to search for.
+fn reject_empty(text: &str, flag: &str) -> Result<(), String> {
+    if text.is_empty() {
+        Err(format!("{flag} must not be empty"))
+    } else {
+        Ok(())
+    }
+}
+
 fn reject_blank_date(date: &DateValue, flag: &str) -> Result<(), String> {
     if date.is_blank() {
         Err(format!("{flag} must not be empty"))
     } else {
         Ok(())
     }
+}
+
+/// `--date-between` takes two absolute dates only (see its own doc comment):
+/// unlike the three single-value date flags it never accepts a relative
+/// keyword, so one must be rejected loudly here rather than silently
+/// reaching the API as a literal `userEnteredValue` string. Also mirrors
+/// `reject_reversed_range`'s ordering check for the numeric family, on a
+/// best-effort basis: a bound that doesn't parse as an ISO `YYYY-MM-DD` date
+/// is trusted through untouched, the same trust-the-caller stance the rest
+/// of this file takes for formats Sheets itself will parse at evaluation
+/// time.
+fn reject_invalid_date_between(start: &str, end: &str) -> Result<(), String> {
+    if start.trim().is_empty() || end.trim().is_empty() {
+        return Err("--date-between's values must not be empty".to_string());
+    }
+    if RelativeDate::parse(start).is_some() || RelativeDate::parse(end).is_some() {
+        return Err(
+            "--date-between only accepts absolute dates, not a relative keyword like 'today' \
+             (use --date-after/--date-before/--date-on for those)"
+                .to_string(),
+        );
+    }
+    if let (Some(start_date), Some(end_date)) = (parse_iso_date(start), parse_iso_date(end)) {
+        if start_date > end_date {
+            return Err(format!(
+                "--date-between's first value ({start}) must not be after the second ({end})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_iso_date(s: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()
 }
 
 fn describe_effect(verb: &ValidationVerb) -> String {
@@ -1032,6 +1078,27 @@ mod tests {
     }
 
     #[test]
+    fn relative_date_all_covers_every_variant() {
+        // Exhaustive match, no `_` arm: adding a `RelativeDate` variant
+        // without adding it to `RelativeDate::ALL` fails to compile here,
+        // which is what forces `parse` (derived from `ALL`) to cover it too.
+        fn assert_is_a_relative_date(rd: RelativeDate) {
+            match rd {
+                RelativeDate::PastYear
+                | RelativeDate::PastMonth
+                | RelativeDate::PastWeek
+                | RelativeDate::Yesterday
+                | RelativeDate::Today
+                | RelativeDate::Tomorrow => {}
+            }
+        }
+        for rd in RelativeDate::ALL {
+            assert_is_a_relative_date(rd);
+            assert_eq!(RelativeDate::parse(rd.as_sheets_str()), Some(rd));
+        }
+    }
+
+    #[test]
     fn date_between_builds_two_absolute_values() {
         let condition = Condition::DateBetween("2024-01-01".to_string(), "2024-12-31".to_string());
         let built = condition.into_boolean_condition();
@@ -1203,7 +1270,11 @@ mod tests {
 
     #[test]
     fn validate_condition_rejects_a_blank_one_of_range() {
-        validate_condition(&Condition::OneOfRange(String::new())).unwrap_err();
+        let err = validate_condition(&Condition::OneOfRange(String::new())).unwrap_err();
+        // Not the generic `a1::compose` "pass --range, --sheet, or both"
+        // message — `--one-of-range` has no `--sheet` escape hatch.
+        assert!(err.contains("must not be empty"), "{err}");
+        assert!(!err.contains("--sheet"), "{err}");
     }
 
     #[test]
@@ -1229,14 +1300,21 @@ mod tests {
     }
 
     #[test]
-    fn validate_condition_rejects_blank_text() {
-        let err = validate_condition(&Condition::TextContains("  ".to_string())).unwrap_err();
+    fn validate_condition_rejects_empty_text() {
+        let err = validate_condition(&Condition::TextContains(String::new())).unwrap_err();
         assert!(err.contains("must not be empty"), "{err}");
     }
 
     #[test]
     fn validate_condition_accepts_non_blank_text() {
         validate_condition(&Condition::TextEq("x".to_string())).unwrap();
+    }
+
+    #[test]
+    fn validate_condition_accepts_whitespace_only_text() {
+        // A whitespace-only value is a legitimate thing to search for, unlike
+        // the flags that use `reject_blank` (e.g. `--custom-formula`).
+        validate_condition(&Condition::TextContains(" ".to_string())).unwrap();
     }
 
     #[test]
@@ -1268,6 +1346,45 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_condition_rejects_a_relative_keyword_in_date_between() {
+        let err = validate_condition(&Condition::DateBetween(
+            "today".to_string(),
+            "2024-12-31".to_string(),
+        ))
+        .unwrap_err();
+        assert!(err.contains("absolute dates"), "{err}");
+
+        let err = validate_condition(&Condition::DateBetween(
+            "2024-01-01".to_string(),
+            "tomorrow".to_string(),
+        ))
+        .unwrap_err();
+        assert!(err.contains("absolute dates"), "{err}");
+    }
+
+    #[test]
+    fn validate_condition_rejects_a_reversed_date_between() {
+        let err = validate_condition(&Condition::DateBetween(
+            "2024-12-31".to_string(),
+            "2024-01-01".to_string(),
+        ))
+        .unwrap_err();
+        assert!(err.contains("must not be after"), "{err}");
+    }
+
+    #[test]
+    fn validate_condition_trusts_a_non_iso_date_between_through_untouched() {
+        // Neither bound parses as `YYYY-MM-DD`, so the ordering check is
+        // skipped and the value reaches the API as-is — the same
+        // trust-the-caller stance as every other free-form date string here.
+        validate_condition(&Condition::DateBetween(
+            "12/31/2024".to_string(),
+            "01/01/2024".to_string(),
+        ))
+        .unwrap();
     }
 
     #[test]
