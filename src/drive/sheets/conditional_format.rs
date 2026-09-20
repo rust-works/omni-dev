@@ -51,7 +51,10 @@ use crate::drive::lease::check::{
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
-use crate::drive::sheets::date_value::{DateValue, RelativeDate};
+use crate::drive::sheets::date_value::{
+    reject_blank, reject_blank_date, reject_empty, reject_invalid_date_between, reject_nan,
+    reject_reversed_range, DateValue,
+};
 use crate::drive::sheets::format::parse_hex_color;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
@@ -447,15 +450,19 @@ pub enum ConditionalFormatResult {
         /// What was wrong and why.
         detail: String,
     },
+    /// `--index` does not name a valid position on this sheet:
     /// `update-conditional-format`/`delete-conditional-format`'s `--index`
-    /// does not name an existing rule on this sheet.
+    /// doesn't name an existing rule (valid range `0..count`), or
+    /// `add-conditional-format`'s explicit `--index` is negative or greater
+    /// than the sheet's current rule count (valid range `0..=count`).
     RefusedIndexOutOfBounds {
         /// The sheet the index was checked against.
         sheet: String,
-        /// The index that was out of bounds.
-        index: usize,
-        /// How many rules the sheet actually has (valid indices are
-        /// `0..count`).
+        /// The index that was out of bounds. `i64`, not `usize`, since
+        /// `add-conditional-format`'s `--index` accepts (and must be able to
+        /// report) a negative value.
+        index: i64,
+        /// How many rules the sheet actually has.
         count: usize,
     },
     /// The folder write-permission gate refused it.
@@ -698,19 +705,33 @@ async fn conditional_format_inner(
         }
     }
 
-    let existing_count =
-        find_sheet_by_id(&workbook, sheet_id).map_or(0, |s| s.conditional_formats.len());
+    let sheet = find_sheet_by_id(&workbook, sheet_id);
+    let existing_count = sheet.map_or(0, |s| s.conditional_formats.len());
 
     let (resolved_index, existing_summary) = match &opts.verb {
-        ConditionalFormatVerb::AddConditionalFormat { index, .. } => {
-            let idx = index.unwrap_or(i64::try_from(existing_count).unwrap_or(i64::MAX));
-            (idx, None)
-        }
+        ConditionalFormatVerb::AddConditionalFormat { index, .. } => match index {
+            Some(explicit) => {
+                // Valid positions are `0..=existing_count` inclusive — unlike
+                // update/delete, `existing_count` itself is valid here (it
+                // appends). A negative or too-large explicit `--index`
+                // reaches the same friendly refusal update/delete give for
+                // an out-of-bounds index, instead of an opaque API error.
+                let in_bounds = usize::try_from(*explicit).is_ok_and(|i| i <= existing_count);
+                if !in_bounds {
+                    return gated(ConditionalFormatResult::RefusedIndexOutOfBounds {
+                        sheet: opts.verb.sheet().to_string(),
+                        index: *explicit,
+                        count: existing_count,
+                    });
+                }
+                (*explicit, None)
+            }
+            None => (i64::try_from(existing_count).unwrap_or(i64::MAX), None),
+        },
         ConditionalFormatVerb::UpdateConditionalFormat { index, .. }
         | ConditionalFormatVerb::DeleteConditionalFormat { index, .. } => {
             let idx = *index;
-            match find_sheet_by_id(&workbook, sheet_id).and_then(|s| s.conditional_formats.get(idx))
-            {
+            match sheet.and_then(|s| s.conditional_formats.get(idx)) {
                 Some(existing) => (
                     i64::try_from(idx).unwrap_or(i64::MAX),
                     Some(describe_existing_rule(existing)),
@@ -718,7 +739,7 @@ async fn conditional_format_inner(
                 None => {
                     return gated(ConditionalFormatResult::RefusedIndexOutOfBounds {
                         sheet: opts.verb.sheet().to_string(),
-                        index: idx,
+                        index: i64::try_from(idx).unwrap_or(i64::MAX),
                         count: existing_count,
                     })
                 }
@@ -732,56 +753,72 @@ async fn conditional_format_inner(
     // that one, converting a `FormatRule` to the wire shape IS fallible
     // (hex-color parsing), so it must happen here, before
     // `gate_optional_leased_write`, not after.
-    let new_rule = match opts.verb.rule() {
-        Some(rule) => match rule.clone().into_conditional_format_rule(grids) {
-            Ok(built) => Some(built),
-            Err(detail) => return gated(ConditionalFormatResult::RefusedInvalidRange { detail }),
-        },
-        None => None,
-    };
-
-    let summary = describe_effect(
-        &opts.verb,
-        resolved_index,
-        new_rule.as_ref(),
-        existing_summary.as_deref(),
-    );
-
-    if opts.dry_run {
-        return gated(ConditionalFormatResult::WouldChange { summary });
-    }
-
-    let request = match (&opts.verb, new_rule) {
-        (ConditionalFormatVerb::AddConditionalFormat { .. }, Some(rule)) => {
-            BatchUpdateRequestItem::AddConditionalFormatRule(AddConditionalFormatRuleRequest {
-                rule,
-                index: resolved_index,
-            })
+    //
+    // The description and the wire request are built together, per verb, in
+    // one match rather than via a separate `Option<ConditionalFormatRule>`
+    // matched a second time below — that shape needed a `(verb, new_rule)`
+    // tuple match with an `unreachable!()` arm for the impossible
+    // (Add/Update, None) case, relying on a runtime invariant instead of the
+    // type system.
+    let (summary, request) = match &opts.verb {
+        ConditionalFormatVerb::AddConditionalFormat { rule, .. } => {
+            let built = match rule.clone().into_conditional_format_rule(grids) {
+                Ok(built) => built,
+                Err(detail) => {
+                    return gated(ConditionalFormatResult::RefusedInvalidRange { detail })
+                }
+            };
+            let summary = format!(
+                "add conditional format ({})",
+                describe_existing_rule(&built)
+            );
+            let request =
+                BatchUpdateRequestItem::AddConditionalFormatRule(AddConditionalFormatRuleRequest {
+                    rule: built,
+                    index: resolved_index,
+                });
+            (summary, request)
         }
-        (ConditionalFormatVerb::UpdateConditionalFormat { .. }, Some(rule)) => {
-            BatchUpdateRequestItem::UpdateConditionalFormatRule(
+        ConditionalFormatVerb::UpdateConditionalFormat { rule, .. } => {
+            let built = match rule.clone().into_conditional_format_rule(grids) {
+                Ok(built) => built,
+                Err(detail) => {
+                    return gated(ConditionalFormatResult::RefusedInvalidRange { detail })
+                }
+            };
+            let current = existing_summary.as_deref().unwrap_or("unknown");
+            let summary = format!(
+                "update conditional format rule at index {resolved_index} (currently: \
+                 {current}) to ({})",
+                describe_existing_rule(&built)
+            );
+            let request = BatchUpdateRequestItem::UpdateConditionalFormatRule(
                 UpdateConditionalFormatRuleRequest {
-                    rule,
+                    rule: built,
                     index: resolved_index,
                 },
-            )
+            );
+            (summary, request)
         }
-        (
-            ConditionalFormatVerb::AddConditionalFormat { .. }
-            | ConditionalFormatVerb::UpdateConditionalFormat { .. },
-            None,
-        ) => {
-            unreachable!("new_rule is built above for Add/Update")
-        }
-        (ConditionalFormatVerb::DeleteConditionalFormat { .. }, _) => {
-            BatchUpdateRequestItem::DeleteConditionalFormatRule(
+        ConditionalFormatVerb::DeleteConditionalFormat { .. } => {
+            let current = existing_summary.as_deref().unwrap_or("unknown");
+            let summary = format!(
+                "delete conditional format rule at index {resolved_index} (currently: \
+                 {current})"
+            );
+            let request = BatchUpdateRequestItem::DeleteConditionalFormatRule(
                 DeleteConditionalFormatRuleRequest {
                     sheet_id,
                     index: resolved_index,
                 },
-            )
+            );
+            (summary, request)
         }
     };
+
+    if opts.dry_run {
+        return gated(ConditionalFormatResult::WouldChange { summary });
+    }
 
     // The lease check sits here: after the permission gate and the
     // `--dry-run` branch, before the mutating call — see
@@ -900,120 +937,13 @@ fn validate_gradient(spec: &GradientSpec) -> Result<(), String> {
     Ok(())
 }
 
-fn reject_reversed_range(min: f64, max: f64, flag: &str) -> Result<(), String> {
-    if min.is_nan() || max.is_nan() || min > max {
-        Err(format!(
-            "{flag}'s first value ({min}) must not exceed the second ({max})"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_nan(n: f64, flag: &str) -> Result<(), String> {
-    if n.is_nan() {
-        Err(format!("{flag} must not be NaN"))
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_blank(text: &str, flag: &str) -> Result<(), String> {
-    if text.trim().is_empty() {
-        Err(format!("{flag} must not be empty"))
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_empty(text: &str, flag: &str) -> Result<(), String> {
-    if text.is_empty() {
-        Err(format!("{flag} must not be empty"))
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_blank_date(date: &DateValue, flag: &str) -> Result<(), String> {
-    if date.is_blank() {
-        Err(format!("{flag} must not be empty"))
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_invalid_date_between(start: &str, end: &str) -> Result<(), String> {
-    reject_blank(start, "--date-between")?;
-    reject_blank(end, "--date-between")?;
-    if RelativeDate::parse(start).is_some() || RelativeDate::parse(end).is_some() {
-        return Err(
-            "--date-between only accepts absolute dates, not a relative keyword like 'today' \
-             (use --date-after/--date-before/--date-on for those)"
-                .to_string(),
-        );
-    }
-    if let (Some(start_date), Some(end_date)) = (parse_iso_date(start), parse_iso_date(end)) {
-        if start_date > end_date {
-            return Err(format!(
-                "--date-between's first value ({start}) must not be after the second ({end})"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn parse_iso_date(s: &str) -> Option<chrono::NaiveDate> {
-    chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()
-}
-
-/// Describes a not-yet-built [`FormatRule`] — the "new" side of a summary.
-fn describe_format_rule(rule: &FormatRule) -> String {
-    match rule {
-        FormatRule::Boolean { condition, format } => {
-            let cond = condition
-                .condition_type_str()
-                .to_ascii_lowercase()
-                .replace('_', " ");
-            format!(
-                "boolean rule ({cond} -> {})",
-                describe_format_effect(format)
-            )
-        }
-        FormatRule::Gradient(spec) => {
-            let mid = spec.mid.as_ref().map_or_else(String::new, |m| {
-                format!(
-                    ", mid {} at {}",
-                    m.point_type.as_sheets_str().to_ascii_lowercase(),
-                    m.value
-                )
-            });
-            format!("gradient rule (min/max colors{mid})")
-        }
-    }
-}
-
-fn describe_format_effect(effect: &FormatEffect) -> String {
-    let mut parts = Vec::new();
-    if effect.background.is_some() {
-        parts.push("background");
-    }
-    if effect.text_color.is_some() {
-        parts.push("text color");
-    }
-    if effect.bold == Some(true) {
-        parts.push("bold");
-    }
-    if parts.is_empty() {
-        "format".to_string()
-    } else {
-        parts.join("+")
-    }
-}
-
-/// Describes an existing [`ConditionalFormatRule`] read back from the API —
-/// the "currently" side of `update`/`delete`'s dry-run echo, and reused
-/// verbatim by `list-conditional-formats`' CLI rendering (issue #1793) so
-/// the two surfaces never describe the same rule differently.
+/// Describes a [`ConditionalFormatRule`] in its wire shape — the "currently"
+/// side of `update`/`delete`'s dry-run echo, the "to"/new-rule side of
+/// `add`/`update`'s own summary (built from the same wire shape right after
+/// [`FormatRule::into_conditional_format_rule`] converts it), and reused
+/// verbatim by `list-conditional-formats`' CLI rendering (issue #1793) — one
+/// function for every surface that describes a rule, so none of them can
+/// describe the same rule differently.
 pub(crate) fn describe_existing_rule(rule: &ConditionalFormatRule) -> String {
     if let Some(boolean_rule) = &rule.boolean_rule {
         let cond = boolean_rule
@@ -1049,32 +979,6 @@ pub(crate) fn describe_existing_rule(rule: &ConditionalFormatRule) -> String {
         format!("gradient rule (min/max colors{mid})")
     } else {
         "rule (unrecognized type)".to_string()
-    }
-}
-
-fn describe_effect(
-    verb: &ConditionalFormatVerb,
-    index: i64,
-    new_rule: Option<&ConditionalFormatRule>,
-    existing_summary: Option<&str>,
-) -> String {
-    match verb {
-        ConditionalFormatVerb::AddConditionalFormat { rule, .. } => {
-            format!("add conditional format ({})", describe_format_rule(rule))
-        }
-        ConditionalFormatVerb::UpdateConditionalFormat { rule, .. } => {
-            let current = existing_summary.unwrap_or("unknown");
-            format!(
-                "update conditional format rule at index {index} (currently: {current}) to \
-                 ({})",
-                describe_format_rule(rule)
-            )
-        }
-        ConditionalFormatVerb::DeleteConditionalFormat { .. } => {
-            let _ = new_rule;
-            let current = existing_summary.unwrap_or("unknown");
-            format!("delete conditional format rule at index {index} (currently: {current})")
-        }
     }
 }
 
@@ -1163,11 +1067,18 @@ pub fn describe_lines(outcome: &ConditionalFormatOutcome) -> Vec<String> {
             index,
             count,
         } => {
+            // `add-conditional-format` may append at `count` (valid range
+            // `0..=count`); `update`/`delete` may only replace/remove an
+            // existing rule (valid range `0..count`).
+            let max_valid = match verb {
+                ConditionalFormatVerb::AddConditionalFormat { .. } => *count,
+                ConditionalFormatVerb::UpdateConditionalFormat { .. }
+                | ConditionalFormatVerb::DeleteConditionalFormat { .. } => count.saturating_sub(1),
+            };
             vec![format!(
-                "Refused: sheet '{sheet}' has {count} conditional format rule(s) (indices \
-                 0-{}); index {index} is out of bounds. Run `drive sheets \
-                 list-conditional-formats` to see the current indices.",
-                count.saturating_sub(1)
+                "Refused: sheet '{sheet}' has {count} conditional format rule(s) (valid \
+                 indices 0-{max_valid}); index {index} is out of bounds. Run `drive sheets \
+                 list-conditional-formats` to see the current indices."
             )]
         }
         ConditionalFormatResult::Blocked { decided_by } => vec![match decided_by {
@@ -1356,31 +1267,6 @@ mod tests {
     }
 
     // ── describe ──────────────────────────────────────────────────────
-
-    #[test]
-    fn describe_format_rule_covers_boolean_and_gradient() {
-        let boolean = describe_format_rule(&FormatRule::Boolean {
-            condition: FormatCondition::CellEmpty,
-            format: FormatEffect {
-                background: Some("#FF0000".to_string()),
-                text_color: None,
-                bold: None,
-            },
-        });
-        assert!(boolean.contains("cell empty"), "{boolean}");
-        assert!(boolean.contains("background"), "{boolean}");
-
-        let gradient = describe_format_rule(&FormatRule::Gradient(GradientSpec {
-            min_color: "#FFFFFF".to_string(),
-            max_color: "#00FF00".to_string(),
-            mid: Some(GradientMidpoint {
-                color: "#000000".to_string(),
-                point_type: GradientPointType::Percent,
-                value: "50".to_string(),
-            }),
-        }));
-        assert!(gradient.contains("mid percent at 50"), "{gradient}");
-    }
 
     #[test]
     fn describe_existing_rule_covers_boolean_and_gradient() {
@@ -1637,6 +1523,68 @@ mod tests {
             added["rule"]["booleanRule"]["condition"]["type"],
             "NUMBER_GREATER"
         );
+    }
+
+    #[tokio::test]
+    async fn add_refuses_an_explicit_out_of_bounds_or_negative_index() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+
+        for bad_index in [-1, 3] {
+            let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+            let verb = match add_verb() {
+                ConditionalFormatVerb::AddConditionalFormat {
+                    sheet,
+                    ranges,
+                    rule,
+                    ..
+                } => ConditionalFormatVerb::AddConditionalFormat {
+                    sheet,
+                    ranges,
+                    index: Some(bad_index),
+                    rule,
+                },
+                other => other,
+            };
+            let opts = ConditionalFormatOptions {
+                spreadsheet_id: "sheet-1".to_string(),
+                verb,
+                dry_run: false,
+                lease_token,
+                ledger_path,
+            };
+            let outcome = conditional_format(&drive, &sheets, &opts, &rules).await;
+            match outcome.result {
+                ConditionalFormatResult::RefusedIndexOutOfBounds {
+                    sheet,
+                    index,
+                    count,
+                } => {
+                    assert_eq!(sheet, "Q1");
+                    assert_eq!(index, bad_index);
+                    // The mocked workbook has 2 existing rules; valid
+                    // explicit indices for add are 0..=2.
+                    assert_eq!(count, 2);
+                }
+                other => panic!("expected RefusedIndexOutOfBounds, got {other:?}"),
+            }
+        }
+
+        // Neither attempt reached the API.
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests
+            .iter()
+            .any(|r| r.url.path().ends_with(":batchUpdate")));
     }
 
     #[tokio::test]
