@@ -484,12 +484,13 @@ async fn filter_inner(
     // view's `sort_specs`/`criteria`. Every branch here reuses
     // `resolved_target` rather than re-parsing `composed_range` a second
     // time; `resolve_sheet_target` already did that work once, above.
-    let built = match &opts.verb {
+    let (request, existing_id) = match &opts.verb {
         FilterVerb::SetBasicFilter { .. } => {
             let Some(grid) = resolved_target else {
+                // omni-dev: coverage ignore-line reason="resolve_sheet_target returns Some for SetBasicFilter or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
                 unreachable!("resolved_target is resolved for SetBasicFilter above")
             };
-            Ok((
+            (
                 BatchUpdateRequestItem::SetBasicFilter(SetBasicFilterRequest {
                     filter: BasicFilter {
                         range: Some(grid),
@@ -498,22 +499,24 @@ async fn filter_inner(
                     },
                 }),
                 None,
-            ))
+            )
         }
         FilterVerb::ClearBasicFilter { .. } => {
             let Some(sheet_id) = sheet_id else {
+                // omni-dev: coverage ignore-line reason="resolve_sheet_target returns Some for ClearBasicFilter or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
                 unreachable!("sheet_id is resolved for ClearBasicFilter above")
             };
-            Ok((
+            (
                 BatchUpdateRequestItem::ClearBasicFilter(ClearBasicFilterRequest { sheet_id }),
                 None,
-            ))
+            )
         }
         FilterVerb::AddFilterView { title, .. } => {
             let Some(grid) = resolved_target else {
+                // omni-dev: coverage ignore-line reason="resolve_sheet_target returns Some for AddFilterView or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
                 unreachable!("resolved_target is resolved for AddFilterView above")
             };
-            Ok((
+            (
                 BatchUpdateRequestItem::AddFilterView(AddFilterViewRequest {
                     filter: FilterView {
                         filter_view_id: None,
@@ -524,7 +527,7 @@ async fn filter_inner(
                     },
                 }),
                 None,
-            ))
+            )
         }
         FilterVerb::UpdateFilterView {
             filter_view_id,
@@ -534,9 +537,10 @@ async fn filter_inner(
             ..
         } => {
             let Some(existing) = existing else {
+                // omni-dev: coverage ignore-line reason="find_existing_filter_view returns Some for UpdateFilterView or has already returned RefusedFilterViewNotFound; this else-arm exists only to unwrap the shared Option"
                 unreachable!("existing is resolved for UpdateFilterView above")
             };
-            build_update(
+            let update = build_update(
                 existing,
                 *filter_view_id,
                 title,
@@ -545,24 +549,18 @@ async fn filter_inner(
                 criteria,
                 *clear_sort,
                 *clear_criteria,
+            );
+            (
+                BatchUpdateRequestItem::UpdateFilterView(update),
+                Some(*filter_view_id),
             )
-            .map(|update| {
-                (
-                    BatchUpdateRequestItem::UpdateFilterView(update),
-                    Some(*filter_view_id),
-                )
-            })
         }
-        FilterVerb::DeleteFilterView { filter_view_id } => Ok((
+        FilterVerb::DeleteFilterView { filter_view_id } => (
             BatchUpdateRequestItem::DeleteFilterView(DeleteFilterViewRequest {
                 filter_id: *filter_view_id,
             }),
             Some(*filter_view_id),
-        )),
-    };
-    let (request, existing_id) = match built {
-        Ok(built) => built,
-        Err(detail) => return gated(FilterResult::RefusedInvalidRange { detail }),
+        ),
     };
 
     // The lease check (ADR-0080 §9) sits here: after the permission gate
@@ -822,7 +820,7 @@ fn build_update(
     hide_values: BTreeMap<String, FilterCriteria>,
     clear_sort: bool,
     clear_criteria: bool,
-) -> Result<UpdateFilterViewRequest, String> {
+) -> UpdateFilterViewRequest {
     let mut fields = Vec::new();
     let mut update = FilterView {
         filter_view_id: Some(filter_view_id),
@@ -867,10 +865,10 @@ fn build_update(
         update.criteria = resulting;
         fields.push("criteria");
     }
-    Ok(UpdateFilterViewRequest {
+    UpdateFilterViewRequest {
         filter: update,
         fields: fields.join(","),
-    })
+    }
 }
 
 fn added_filter_view_id(
@@ -1260,8 +1258,7 @@ mod tests {
             hide_values,
             false,
             false,
-        )
-        .unwrap();
+        );
         assert_eq!(
             request.filter.criteria.get("0").unwrap().hidden_values,
             vec!["Keep".to_string()]
@@ -1291,8 +1288,7 @@ mod tests {
             BTreeMap::new(),
             false,
             true,
-        )
-        .unwrap();
+        );
         assert!(request.filter.criteria.is_empty());
         assert_eq!(request.fields, "criteria");
     }
@@ -1328,8 +1324,7 @@ mod tests {
             BTreeMap::new(),
             false,
             false,
-        )
-        .unwrap();
+        );
         assert_eq!(
             request.filter.sort_specs,
             vec![
@@ -1361,8 +1356,7 @@ mod tests {
             BTreeMap::new(),
             false,
             false,
-        )
-        .unwrap();
+        );
         assert_eq!(request.filter.title, Some("New title".to_string()));
         assert_eq!(request.fields, "title");
     }
@@ -1823,5 +1817,958 @@ mod tests {
         };
         let outcome = filter(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, FilterResult::WouldChange { .. }));
+    }
+
+    // ── refusals before any call ─────────────────────────────────────────
+
+    fn set_verb(sort_by: Vec<String>, hide_values: Vec<String>) -> FilterVerb {
+        FilterVerb::SetBasicFilter {
+            sheet: "Q1".to_string(),
+            range: "A1:D10".to_string(),
+            sort_by,
+            hide_values,
+        }
+    }
+
+    fn update_verb() -> FilterVerb {
+        FilterVerb::UpdateFilterView {
+            filter_view_id: 7,
+            sheet: None,
+            range: None,
+            title: Some("Renamed".to_string()),
+            sort_by: Vec::new(),
+            hide_values: Vec::new(),
+            clear_sort: false,
+            clear_criteria: false,
+        }
+    }
+
+    fn unleased_opts(verb: FilterVerb) -> FilterOptions {
+        FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        }
+    }
+
+    /// A refusal decided from the flags alone must make no HTTP call at
+    /// all: the mock server has nothing mounted, so any request would fail
+    /// the outcome as `Failed` rather than the refusal asserted here.
+    async fn refused_from_flags_alone(verb: FilterVerb) -> FilterOutcome {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let outcome = filter(&drive, &sheets, &unleased_opts(verb), &rules).await;
+        assert_eq!(outcome.file_name, None);
+        outcome
+    }
+
+    #[tokio::test]
+    async fn an_invalid_sort_spec_is_refused_before_any_call() {
+        let outcome =
+            refused_from_flags_alone(set_verb(vec!["0:sideways".to_string()], Vec::new())).await;
+        match outcome.result {
+            FilterResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("not 'asc' or 'desc'"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_hidden_values_flag_is_refused_before_any_call() {
+        let outcome = refused_from_flags_alone(set_verb(Vec::new(), vec!["1:".to_string()])).await;
+        match outcome.result {
+            FilterResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("names no values"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sheet_beside_a_prefixed_range_is_refused_before_any_call() {
+        let verb = FilterVerb::AddFilterView {
+            sheet: "Q1".to_string(),
+            range: "Q2!A1:D10".to_string(),
+            title: None,
+            sort_by: Vec::new(),
+            hide_values: Vec::new(),
+        };
+        let outcome = refused_from_flags_alone(verb).await;
+        match outcome.result {
+            FilterResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("already names a sheet"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_filter_view_with_nothing_to_change_is_refused_before_any_call() {
+        let verb = FilterVerb::UpdateFilterView {
+            filter_view_id: 7,
+            sheet: None,
+            range: None,
+            title: None,
+            sort_by: Vec::new(),
+            hide_values: Vec::new(),
+            clear_sort: false,
+            clear_criteria: false,
+        };
+        let outcome = refused_from_flags_alone(verb).await;
+        match outcome.result {
+            FilterResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("nothing to change"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    // ── the target gate ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_metadata_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = unleased_opts(set_verb(Vec::new(), Vec::new()));
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FilterResult::Failed { .. }));
+        assert_eq!(outcome.file_name, None);
+    }
+
+    #[tokio::test]
+    async fn a_shortcut_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.shortcut",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = unleased_opts(set_verb(Vec::new(), Vec::new()));
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FilterResult::RefusedShortcut));
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn a_non_spreadsheet_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.document",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = unleased_opts(FilterVerb::DeleteFilterView { filter_view_id: 7 });
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            FilterResult::RefusedNotASpreadsheet { mime_type } => {
+                assert_eq!(mime_type, "application/vnd.google-apps.document");
+            }
+            other => panic!("expected RefusedNotASpreadsheet, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_target_with_no_visible_parents_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", crate::drive::types::GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = unleased_opts(set_verb(Vec::new(), Vec::new()));
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            FilterResult::RefusedNoVisibleParents
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gate_ancestor_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = unleased_opts(set_verb(Vec::new(), Vec::new()));
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FilterResult::Failed { .. }));
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn a_workbook_fetch_failure_after_a_granted_gate_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = unleased_opts(set_verb(Vec::new(), Vec::new()));
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FilterResult::Failed { .. }));
+        assert_eq!(outcome.sheet_id, None);
+    }
+
+    #[tokio::test]
+    async fn set_basic_filter_refuses_an_unknown_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q2", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = unleased_opts(set_verb(Vec::new(), Vec::new()));
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            FilterResult::RefusedSheetNotFound { title, available } => {
+                assert_eq!(title, "Q1");
+                assert_eq!(available, vec!["Q2".to_string()]);
+            }
+            other => panic!("expected RefusedSheetNotFound, got {other:?}"),
+        }
+    }
+
+    // ── update-filter-view end to end ────────────────────────────────────
+
+    fn mount_workbook_with_view_seven() -> wiremock::Mock {
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0},
+             "filterViews": [{
+                 "filterViewId": 7,
+                 "title": "Old",
+                 "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 10,
+                           "startColumnIndex": 0, "endColumnIndex": 4},
+                 "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "ASCENDING"}],
+                 "criteria": {"0": {"hiddenValues": ["Old"]}},
+             }]},
+        ]))
+    }
+
+    #[tokio::test]
+    async fn update_filter_view_merges_onto_the_existing_view_and_reports_its_id() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook_with_view_seven().mount(&server).await;
+        // The `fields` mask names every changed field, and the merged
+        // `sortSpecs`/`criteria` carry the existing entries alongside the
+        // new ones — a partial body that would 404 (and so fail the
+        // outcome) if the merge dropped either.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "requests": [{"updateFilterView": {
+                    "fields": "title,range,sortSpecs,criteria",
+                    "filter": {
+                        "filterViewId": 7,
+                        "title": "Renamed",
+                        "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 20,
+                                  "startColumnIndex": 0, "endColumnIndex": 4},
+                        "sortSpecs": [
+                            {"dimensionIndex": 0, "sortOrder": "ASCENDING"},
+                            {"dimensionIndex": 2, "sortOrder": "DESCENDING"},
+                        ],
+                        "criteria": {
+                            "0": {"hiddenValues": ["Old"]},
+                            "1": {"hiddenValues": ["Closed"]},
+                        },
+                    },
+                }}]
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: FilterVerb::UpdateFilterView {
+                filter_view_id: 7,
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:D20".to_string()),
+                title: Some("Renamed".to_string()),
+                sort_by: vec!["2:desc".to_string()],
+                hide_values: vec!["1:Closed".to_string()],
+                clear_sort: false,
+                clear_criteria: false,
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            FilterResult::Changed {
+                filter_view_id,
+                summary,
+            } => {
+                assert_eq!(filter_view_id, Some(7));
+                assert_eq!(
+                    summary,
+                    "update filter view (title='Renamed' sort 2:desc hide 1:Closed)"
+                );
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+        // A filter view is identified by its own id, so `sheet_id` stays
+        // unset even though a range was resolved to build the request.
+        assert_eq!(outcome.sheet_id, None);
+    }
+
+    #[tokio::test]
+    async fn update_filter_view_with_only_a_range_change_is_described_bare() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook_with_view_seven().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: FilterVerb::UpdateFilterView {
+                filter_view_id: 7,
+                sheet: None,
+                range: Some("Q1!A1:D20".to_string()),
+                title: None,
+                sort_by: Vec::new(),
+                hide_values: Vec::new(),
+                clear_sort: false,
+                clear_criteria: false,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            FilterResult::WouldChange { summary } => {
+                assert_eq!(summary, "update filter view");
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_update_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook_with_view_seven().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: update_verb(),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            FilterResult::Failed { detail } => assert!(detail.contains("500"), "{detail}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    // ── the Drive write lease (ADR-0080 §9) ──────────────────────────────
+
+    #[tokio::test]
+    async fn refuses_without_a_lease_when_the_rule_requires_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook_with_view_seven().mount(&server).await;
+        // No batchUpdate mock mounted — a refusal must make zero mutating
+        // calls.
+        let rules = vec![allow_rule("folder-1")];
+        let opts = unleased_opts(FilterVerb::DeleteFilterView { filter_view_id: 7 });
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FilterResult::RefusedNoLease));
+        assert_eq!(outcome.result.log_status(), "refused-no-lease");
+    }
+
+    // ── describe_effect ──────────────────────────────────────────────────
+
+    #[test]
+    fn describe_effect_names_the_view_and_its_sort_and_hidden_values() {
+        let verb = FilterVerb::AddFilterView {
+            sheet: "Q1".to_string(),
+            range: "A1:D10".to_string(),
+            title: Some("Open only".to_string()),
+            sort_by: vec!["0:asc".to_string()],
+            hide_values: vec!["1:Closed".to_string()],
+        };
+        assert_eq!(
+            describe_effect(&verb),
+            "add filter view 'Open only' (sort 0:asc hide 1:Closed)"
+        );
+        assert_eq!(
+            describe_effect(&set_verb(Vec::new(), Vec::new())),
+            "set basic filter"
+        );
+    }
+
+    #[test]
+    fn describe_effect_lists_every_update_filter_view_part_in_order() {
+        let verb = FilterVerb::UpdateFilterView {
+            filter_view_id: 7,
+            sheet: None,
+            range: None,
+            title: Some("Renamed".to_string()),
+            sort_by: vec!["0:asc".to_string()],
+            hide_values: vec!["1:Closed".to_string()],
+            clear_sort: true,
+            clear_criteria: true,
+        };
+        assert_eq!(
+            describe_effect(&verb),
+            "update filter view (title='Renamed' clear sort sort 0:asc clear criteria hide 1:Closed)"
+        );
+    }
+
+    // ── describe / describe_lines ────────────────────────────────────────
+
+    fn outcome_with(
+        verb: FilterVerb,
+        file_name: Option<&str>,
+        result: FilterResult,
+    ) -> FilterOutcome {
+        FilterOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: file_name.map(str::to_string),
+            resolved_folder_id: None,
+            sheet_id: None,
+            verb,
+            result,
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_would_change() {
+        let out = outcome_with(
+            set_verb(Vec::new(), Vec::new()),
+            Some("Budget"),
+            FilterResult::WouldChange {
+                summary: "set basic filter".to_string(),
+            },
+        );
+        assert_eq!(describe(&out), "Would set basic filter in 'Budget'");
+    }
+
+    #[test]
+    fn describe_lines_renders_not_a_spreadsheet_with_no_file_name() {
+        let out = outcome_with(
+            set_verb(Vec::new(), Vec::new()),
+            None,
+            FilterResult::RefusedNotASpreadsheet {
+                mime_type: "text/plain".to_string(),
+            },
+        );
+        let text = describe(&out);
+        assert!(text.contains("'sheet-1'"), "{text}");
+        assert!(text.contains("set-basic-filter"), "{text}");
+        assert!(text.contains("text/plain"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_shortcut_and_no_visible_parents() {
+        let shortcut = outcome_with(
+            FilterVerb::DeleteFilterView { filter_view_id: 7 },
+            Some("Budget"),
+            FilterResult::RefusedShortcut,
+        );
+        let text = describe(&shortcut);
+        assert!(text.contains("shortcut"), "{text}");
+        assert!(text.contains("delete-filter-view"), "{text}");
+
+        let orphan = outcome_with(
+            set_verb(Vec::new(), Vec::new()),
+            Some("Budget"),
+            FilterResult::RefusedNoVisibleParents,
+        );
+        assert!(describe(&orphan).contains("sheets-structure"));
+    }
+
+    #[test]
+    fn describe_lines_renders_sheet_not_found_with_and_without_available_titles() {
+        let none = outcome_with(
+            set_verb(Vec::new(), Vec::new()),
+            Some("Budget"),
+            FilterResult::RefusedSheetNotFound {
+                title: "Q1".to_string(),
+                available: Vec::new(),
+            },
+        );
+        assert!(describe(&none).contains("Available: none"));
+
+        let some = outcome_with(
+            set_verb(Vec::new(), Vec::new()),
+            Some("Budget"),
+            FilterResult::RefusedSheetNotFound {
+                title: "Q1".to_string(),
+                available: vec!["Q2".to_string(), "Q3".to_string()],
+            },
+        );
+        assert!(describe(&some).contains("Available: 'Q2', 'Q3'"));
+    }
+
+    #[test]
+    fn describe_lines_renders_invalid_range_and_filter_view_not_found() {
+        let invalid = outcome_with(
+            set_verb(Vec::new(), Vec::new()),
+            Some("Budget"),
+            FilterResult::RefusedInvalidRange {
+                detail: "bad range".to_string(),
+            },
+        );
+        assert_eq!(describe(&invalid), "Refused: bad range");
+
+        let missing = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            FilterResult::RefusedFilterViewNotFound { filter_view_id: 7 },
+        );
+        let text = describe(&missing);
+        assert!(text.contains("no filter view with id 7"), "{text}");
+        assert!(text.contains("list-filter-views"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_blocked_with_and_without_a_deciding_rule() {
+        let folder_rule = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            FilterResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 2,
+                }),
+            },
+        );
+        let text = describe(&folder_rule);
+        assert!(text.contains("update-filter-view"), "{text}");
+        assert!(text.contains("folder folder-1 (depth 2)"), "{text}");
+
+        let default_policy = outcome_with(
+            FilterVerb::ClearBasicFilter {
+                sheet: "Q1".to_string(),
+            },
+            Some("Budget"),
+            FilterResult::Blocked { decided_by: None },
+        );
+        let text = describe(&default_policy);
+        assert!(text.contains("default policy"), "{text}");
+        assert!(text.contains("sheets-structure"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_every_lease_refusal_with_the_lease_acquire_hint() {
+        for (result, phrase) in [
+            (FilterResult::RefusedNoLease, "requires a Drive write lease"),
+            (
+                FilterResult::RefusedLeaseExpired,
+                "expired, released, or unknown",
+            ),
+            (
+                FilterResult::RefusedLeaseWrongFile,
+                "acquired for a different file",
+            ),
+            (
+                FilterResult::RefusedLeaseStale,
+                "changed since the lease was acquired",
+            ),
+        ] {
+            let out = outcome_with(update_verb(), Some("Budget"), result);
+            let text = describe(&out);
+            assert!(text.contains(phrase), "{text}");
+            assert!(text.contains("drive lease acquire sheet-1"), "{text}");
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_changed_with_and_without_an_id() {
+        let with_id = outcome_with(
+            FilterVerb::DeleteFilterView { filter_view_id: 7 },
+            Some("Budget"),
+            FilterResult::Changed {
+                summary: "delete filter view".to_string(),
+                filter_view_id: Some(7),
+            },
+        );
+        assert_eq!(
+            describe(&with_id),
+            "Applied: delete filter view (id 7) in 'Budget'"
+        );
+
+        let without_id = outcome_with(
+            set_verb(Vec::new(), Vec::new()),
+            Some("Budget"),
+            FilterResult::Changed {
+                summary: "set basic filter".to_string(),
+                filter_view_id: None,
+            },
+        );
+        assert_eq!(
+            describe(&without_id),
+            "Applied: set basic filter in 'Budget'"
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_failed() {
+        let out = outcome_with(
+            set_verb(Vec::new(), Vec::new()),
+            Some("Budget"),
+            FilterResult::Failed {
+                detail: "boom".to_string(),
+            },
+        );
+        assert_eq!(describe(&out), "Failed: boom");
+    }
+
+    // ── the other lease refusals ─────────────────────────────────────────
+
+    /// Mounts a granted gate and a workbook holding filter view 7, so the
+    /// only thing left to decide the outcome is the lease.
+    async fn mount_granted_gate_with_view_seven(server: &wiremock::MockServer) {
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(server)
+        .await;
+        mount_folder("folder-1").mount(server).await;
+        mount_workbook_with_view_seven().mount(server).await;
+    }
+
+    fn fresh_ledger_path() -> std::path::PathBuf {
+        tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl")
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_view_seven(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        // Never seeded — the ledger knows nothing of this token.
+        let opts = FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: update_verb(),
+            dry_run: false,
+            lease_token: Some("bogus-token".to_string()),
+            ledger_path: fresh_ledger_path(),
+        };
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FilterResult::RefusedLeaseExpired));
+        assert_eq!(outcome.result.log_status(), "refused-lease-expired");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_lease_bound_to_a_different_file() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_view_seven(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = fresh_ledger_path();
+        // Seeded for a *different* spreadsheet id.
+        let token = seed_lease(&ledger_path, "some-other-sheet", "1");
+        let opts = FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: update_verb(),
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            FilterResult::RefusedLeaseWrongFile
+        ));
+        assert_eq!(outcome.result.log_status(), "refused-lease-wrong-file");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_stale_lease_when_the_file_has_moved() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // `mount_file` always returns version "1"; the lease below was
+        // acquired against version "0" — a foreign edit landed since.
+        mount_granted_gate_with_view_seven(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = fresh_ledger_path();
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let opts = FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: update_verb(),
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FilterResult::RefusedLeaseStale));
+        assert_eq!(outcome.result.log_status(), "refused-lease-stale");
+    }
+
+    // ── sheet resolution per verb ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn clear_basic_filter_refuses_an_unknown_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_view_seven(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = unleased_opts(FilterVerb::ClearBasicFilter {
+            sheet: "Nope".to_string(),
+        });
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            FilterResult::RefusedSheetNotFound { title, available } => {
+                assert_eq!(title, "Nope");
+                assert_eq!(available, vec!["Q1".to_string()]);
+            }
+            other => panic!("expected RefusedSheetNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_filter_view_refuses_a_range_on_an_unknown_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_view_seven(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = unleased_opts(FilterVerb::UpdateFilterView {
+            filter_view_id: 7,
+            sheet: Some("Nope".to_string()),
+            range: Some("A1:D20".to_string()),
+            title: None,
+            sort_by: Vec::new(),
+            hide_values: Vec::new(),
+            clear_sort: false,
+            clear_criteria: false,
+        });
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            FilterResult::RefusedSheetNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn build_update_clear_sort_discards_the_existing_order_before_merging() {
+        let mut existing = filter_view(3);
+        existing.sort_specs = vec![SortSpec {
+            dimension_index: 0,
+            sort_order: SortOrder::Ascending,
+        }];
+        let request = build_update(
+            &existing,
+            3,
+            &None,
+            None,
+            vec![SortSpec {
+                dimension_index: 2,
+                sort_order: SortOrder::Descending,
+            }],
+            BTreeMap::new(),
+            true,
+            false,
+        );
+        assert_eq!(
+            request.filter.sort_specs,
+            vec![SortSpec {
+                dimension_index: 2,
+                sort_order: SortOrder::Descending,
+            }]
+        );
+        assert_eq!(request.fields, "sortSpecs");
+    }
+
+    #[tokio::test]
+    async fn set_basic_filter_refuses_an_unparseable_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_view_seven(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        // `A1:B` mixes a cell with a whole column on a *different* column,
+        // which no supported A1 form spells — so it passes the flag-level
+        // `a1::compose` check and only fails once the workbook's sheet is
+        // known and the grid is parsed against it.
+        let opts = unleased_opts(FilterVerb::SetBasicFilter {
+            sheet: "Q1".to_string(),
+            range: "A1:B".to_string(),
+            sort_by: Vec::new(),
+            hide_values: Vec::new(),
+        });
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            FilterResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("not a recognised A1 range"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn update_filter_view_refuses_an_unparseable_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_view_seven(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = unleased_opts(FilterVerb::UpdateFilterView {
+            filter_view_id: 7,
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:B".to_string()),
+            title: None,
+            sort_by: Vec::new(),
+            hide_values: Vec::new(),
+            clear_sort: false,
+            clear_criteria: false,
+        });
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            FilterResult::RefusedInvalidRange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_pre_lease_refetch_is_reported_as_failed_with_no_batch_update_call() {
+        // The gate's own resolve step succeeds off the first `files.get`,
+        // but the fresh re-fetch feeding the staleness check (ADR-0080 §6)
+        // fails — the change must report `Failed` and never reach
+        // `batchUpdate`.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook_with_view_seven().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: FilterVerb::DeleteFilterView { filter_view_id: 7 },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, FilterResult::Failed { .. }));
     }
 }
