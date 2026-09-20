@@ -321,8 +321,10 @@ impl JsonlSerialize for WriteOutcome {
 /// sends the `batchUpdate`. It is an estimate over the body text this
 /// command read, while the server matches over its own view — a match may
 /// span a `textRun` boundary, or sit in a segment (a header, a footer, a
-/// footnote) this crate does not fetch. Acting on it would let `omni-dev`
-/// report "nothing to do" for a document that does have matches.
+/// footnote) that `document_text` does not include in this count (issue
+/// #1799 made those segments fetchable; folding them into this estimate is
+/// separate follow-up work). Acting on the count would let `omni-dev` report
+/// "nothing to do" for a document that does have matches.
 #[must_use]
 pub fn count_occurrences(haystack: &str, needle: &str, match_case: bool) -> usize {
     if needle.is_empty() {

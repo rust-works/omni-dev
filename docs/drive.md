@@ -2104,9 +2104,25 @@ carries every field. **`-o jsonl`** emits **one line per element**, with the
 document id, revision and tab id repeated on each, so a single line is
 self-describing to `jq`.
 
-**Known gap.** Only the document **body** is read. Headers, footers and
-footnotes live in their own index segments and do not appear — the Docs
-counterpart of "export gives you the first sheet only".
+**Headers, footers and footnotes.** These live in their own segments,
+addressed by `segmentId` rather than an index range, and are always included
+whenever a tab has any — there is no flag to opt in or out, the same "always
+fetch, never mask" precedent tabs use above. In `-o table` each one renders
+as its own block, after the tab's body:
+
+```
+## header kix.abc123
+   0   12  paragraph      NORMAL_TEXT  Confidential draft
+## footnote kix.def456
+   0    9  paragraph      NORMAL_TEXT  See intro.
+```
+
+In `-o json`/`-o yaml` they appear as `headers`/`footers`/`footnotes` arrays
+on each tab, each entry carrying its `segment_id` and `elements`; a tab with
+none of a given kind omits that array entirely rather than sending `[]`. In
+`-o jsonl` each segment's elements ride the same flat record stream as the
+body, with an added `segment: {kind, segment_id}` field (absent for a body
+element).
 
 ### Editing a document
 
@@ -2162,11 +2178,12 @@ entirely, and the edit is refused up front rather than attempted unleased.
   no undo. Use `--ignore-case` when you want that.
 - **`--dry-run`'s occurrence count is an estimate.** It is counted over the
   body text this command read, while the server matches over its own view —
-  a match can span a styling boundary, or sit in a header or footnote that
-  is not fetched. The count never decides anything: a count of zero still
-  sends the request, because reporting "nothing to do" from an estimate
-  would be wrong exactly when the estimate is. The real run reports the
-  server's own number.
+  a match can span a styling boundary, or sit in a header, footer or
+  footnote, which `drive docs read` now fetches (see above) but this count
+  does not yet include. The count never decides anything: a count of zero
+  still sends the request, because reporting "nothing to do" from an
+  estimate would be wrong exactly when the estimate is. The real run
+  reports the server's own number.
 - **`replace` spans every tab; `append` lands in the first.** That asymmetry
   is the Docs API's, confirmed against it directly, and it is why the preview
   counts across all tabs.

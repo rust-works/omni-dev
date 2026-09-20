@@ -7,7 +7,8 @@ use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::drive::client::DriveClient;
 use crate::drive::docs::api::{DocsApi, SuggestionsViewMode};
 use crate::drive::docs::client::DocsClient;
-use crate::drive::docs::read::{read, ReadOptions, ReadOutcome};
+use crate::drive::docs::read::{read, ReadOptions, ReadOutcome, SegmentContent};
+use crate::drive::docs::structure::DocElement;
 use crate::drive::docs::target;
 use crate::drive::files_api::FilesApi;
 
@@ -139,70 +140,111 @@ fn render_read_table(outcome: &ReadOutcome, out: &mut dyn std::io::Write) -> Res
             .context(ctx)?;
         }
 
-        if tab.elements.is_empty() {
-            writeln!(out, "(empty)").context(ctx)?;
-            continue;
+        render_elements(&tab.elements, out)?;
+
+        for (label, segments) in [
+            ("header", &tab.headers),
+            ("footer", &tab.footers),
+            ("footnote", &tab.footnotes),
+        ] {
+            render_segments(label, segments, out)?;
         }
+    }
+    Ok(())
+}
 
-        // Widths come from the data so the columns line up for this
-        // document rather than for a hypothetical worst case.
-        let start_w = tab
-            .elements
-            .iter()
-            .map(|e| e.start_index.to_string().len())
-            .max()
-            .unwrap_or(5)
-            .max(5);
-        let end_w = tab
-            .elements
-            .iter()
-            .map(|e| e.end_index.to_string().len())
-            .max()
-            .unwrap_or(3)
-            .max(3);
-        let kind_w = tab
-            .elements
-            .iter()
-            .map(|e| e.kind.as_str().len() + e.depth() * 2)
-            .max()
-            .unwrap_or(4)
-            .max(4);
-        let style_w = tab
-            .elements
-            .iter()
-            .filter_map(|e| e.style.as_ref().map(String::len))
-            .max()
-            .unwrap_or(5)
-            .max(5);
-
+/// Renders every header, footer or footnote segment of one kind, each under
+/// its own `## <label> <segmentId>` block.
+fn render_segments(
+    label: &str,
+    segments: &[SegmentContent],
+    out: &mut dyn std::io::Write,
+) -> Result<()> {
+    let ctx = "Failed to write docs read output";
+    for segment in segments {
         writeln!(
             out,
-            "{:>start_w$}  {:>end_w$}  {:<kind_w$}  {:<style_w$}  TEXT",
-            "START", "END", "KIND", "STYLE"
+            "## {label} {}",
+            sanitize_for_terminal(&segment.segment_id)
         )
         .context(ctx)?;
+        render_elements(&segment.elements, out)?;
+    }
+    Ok(())
+}
 
-        for element in &tab.elements {
-            let kind = format!("{}{}", "  ".repeat(element.depth()), element.kind.as_str());
-            // A table's dimensions belong on its container row: it is the
-            // one element kind whose text is empty by construction, so the
-            // column would otherwise be dead space on exactly the row a
-            // reader most wants to identify.
-            let text = match (element.rows, element.columns) {
-                (Some(rows), Some(cols)) => format!("{rows}x{cols}"),
-                _ => sanitize_for_terminal(&element.text),
-            };
-            writeln!(
-                out,
-                "{:>start_w$}  {:>end_w$}  {:<kind_w$}  {:<style_w$}  {}",
-                element.start_index,
-                element.end_index,
-                kind,
-                element.style.as_deref().unwrap_or(""),
-                text
-            )
-            .context(ctx)?;
-        }
+/// Renders one line per element, index-first, indented by nesting depth.
+///
+/// Element text is passed through `sanitize_for_terminal`, which is a
+/// deliberate divergence from `sheets read`'s verbatim CSV. CSV is an
+/// interchange format that must round-trip, so stripping control characters
+/// there would corrupt real data; this is an *orientation* view whose whole
+/// value is column alignment, and a soft line break (`\v`, which really does
+/// occur inside Docs paragraph text) or an escape sequence in
+/// server-controlled text would destroy it. `-o json` is the unsanitised
+/// channel and is the one to use for content.
+fn render_elements(elements: &[DocElement], out: &mut dyn std::io::Write) -> Result<()> {
+    let ctx = "Failed to write docs read output";
+
+    if elements.is_empty() {
+        writeln!(out, "(empty)").context(ctx)?;
+        return Ok(());
+    }
+
+    // Widths come from the data so the columns line up for this document
+    // rather than for a hypothetical worst case.
+    let start_w = elements
+        .iter()
+        .map(|e| e.start_index.to_string().len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let end_w = elements
+        .iter()
+        .map(|e| e.end_index.to_string().len())
+        .max()
+        .unwrap_or(3)
+        .max(3);
+    let kind_w = elements
+        .iter()
+        .map(|e| e.kind.as_str().len() + e.depth() * 2)
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let style_w = elements
+        .iter()
+        .filter_map(|e| e.style.as_ref().map(String::len))
+        .max()
+        .unwrap_or(5)
+        .max(5);
+
+    writeln!(
+        out,
+        "{:>start_w$}  {:>end_w$}  {:<kind_w$}  {:<style_w$}  TEXT",
+        "START", "END", "KIND", "STYLE"
+    )
+    .context(ctx)?;
+
+    for element in elements {
+        let kind = format!("{}{}", "  ".repeat(element.depth()), element.kind.as_str());
+        // A table's dimensions belong on its container row: it is the one
+        // element kind whose text is empty by construction, so the column
+        // would otherwise be dead space on exactly the row a reader most
+        // wants to identify.
+        let text = match (element.rows, element.columns) {
+            (Some(rows), Some(cols)) => format!("{rows}x{cols}"),
+            _ => sanitize_for_terminal(&element.text),
+        };
+        writeln!(
+            out,
+            "{:>start_w$}  {:>end_w$}  {:<kind_w$}  {:<style_w$}  {}",
+            element.start_index,
+            element.end_index,
+            kind,
+            element.style.as_deref().unwrap_or(""),
+            text
+        )
+        .context(ctx)?;
     }
     Ok(())
 }
@@ -249,6 +291,16 @@ mod tests {
             tab_id: id.map(str::to_string),
             title: title.map(str::to_string),
             nesting_level: 0,
+            elements,
+            headers: Vec::new(),
+            footers: Vec::new(),
+            footnotes: Vec::new(),
+        }
+    }
+
+    fn segment(id: &str, elements: Vec<DocElement>) -> SegmentContent {
+        SegmentContent {
+            segment_id: id.to_string(),
             elements,
         }
     }
@@ -376,6 +428,64 @@ mod tests {
     fn an_empty_tab_says_so_rather_than_printing_a_bare_header() {
         let text = render(&outcome(vec![tab(None, None, vec![])]));
         assert!(text.contains("(empty)"), "{text}");
+    }
+
+    /// A document with no segments renders identically to today — no stray
+    /// blocks for a tab that has none.
+    #[test]
+    fn a_tab_with_no_segments_renders_no_segment_blocks() {
+        let text = render(&outcome(vec![tab(
+            None,
+            None,
+            vec![element(1, 5, ElementKind::Paragraph, vec![0], None, "a")],
+        )]));
+        assert!(!text.contains("## header"), "{text}");
+        assert!(!text.contains("## footer"), "{text}");
+        assert!(!text.contains("## footnote"), "{text}");
+    }
+
+    #[test]
+    fn headers_footers_and_footnotes_render_as_labeled_blocks_after_the_body() {
+        let mut content = tab(
+            None,
+            None,
+            vec![element(1, 5, ElementKind::Paragraph, vec![0], None, "body")],
+        );
+        content.headers = vec![segment(
+            "h1",
+            vec![element(
+                0,
+                8,
+                ElementKind::Paragraph,
+                vec![0],
+                None,
+                "Header",
+            )],
+        )];
+        content.footers = vec![segment(
+            "f1",
+            vec![element(
+                0,
+                8,
+                ElementKind::Paragraph,
+                vec![0],
+                None,
+                "Footer",
+            )],
+        )];
+        content.footnotes = vec![segment(
+            "n1",
+            vec![element(0, 5, ElementKind::Paragraph, vec![0], None, "Note")],
+        )];
+        let text = render(&outcome(vec![content]));
+
+        assert!(text.contains("## header h1"), "{text}");
+        assert!(text.contains("## footer f1"), "{text}");
+        assert!(text.contains("## footnote n1"), "{text}");
+        // Body block precedes the segment blocks.
+        let body_pos = text.find("body").unwrap();
+        let header_pos = text.find("## header").unwrap();
+        assert!(body_pos < header_pos, "{text}");
     }
 
     #[test]
