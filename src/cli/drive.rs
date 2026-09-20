@@ -946,6 +946,66 @@ mod tests {
         assert!(cmd.dispatch(&dead_client()).await.is_ok());
     }
 
+    fn base_format_cells_command() -> sheets::format::FormatCellsCommand {
+        sheets::format::FormatCellsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            range: Some("A1:B2".to_string()),
+            sheet: None,
+            bold: None,
+            italic: None,
+            strikethrough: None,
+            underline: None,
+            font_size: None,
+            text_color: None,
+            background: None,
+            horizontal_align: None,
+            vertical_align: None,
+            number_format: None,
+            number_format_type: None,
+            wrap: None,
+            font_family: None,
+            text_rotation_angle: None,
+            text_rotation_vertical: false,
+            hyperlink_display_type: None,
+            padding_top: None,
+            padding_right: None,
+            padding_bottom: None,
+            padding_left: None,
+            text_direction: None,
+            dry_run: false,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: OutputFormat::Table,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_format_cells_text_rotation_angle() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::FormatCells(sheets::format::FormatCellsCommand {
+                text_rotation_angle: Some(45),
+                ..base_format_cells_command()
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_format_cells_text_rotation_vertical() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::FormatCells(sheets::format::FormatCellsCommand {
+                text_rotation_vertical: true,
+                ..base_format_cells_command()
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
     #[tokio::test]
     async fn dispatch_routes_sheets_update_borders() {
         let guard = crate::drive::test_support::EnvGuard::take();
