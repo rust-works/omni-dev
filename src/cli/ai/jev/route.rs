@@ -104,14 +104,7 @@ impl RouteCommand {
         if let Some(model) = self.jev_model {
             config.model = model;
         }
-        let ladders = match self.tiers {
-            Some(path) => vec![Ladder::custom(Tiers::load_file(&path)?)],
-            None => self
-                .providers
-                .iter()
-                .map(|&p| Ladder::builtin(p))
-                .collect::<Result<Vec<_>>>()?,
-        };
+        let ladders = build_ladders(self.tiers.as_deref(), &self.providers)?;
         let client = JevClient::from_config(&config)?;
 
         let bin = crate::pr_status::resolve_gh_binary();
@@ -136,6 +129,17 @@ impl RouteCommand {
         let report = run_route(&client, &docs, &ladders, &opts, &dependencies).await?;
         print!("{}", format_output(&report, self.output)?);
         failure_summary(&report).map_or(Ok(()), |msg| bail!(msg))
+    }
+}
+
+/// Resolves `--tiers`/`--providers` to the ladders to route against: a
+/// single custom ladder for `--tiers`, or one builtin ladder per
+/// `--providers` entry (in the order given) otherwise. Clap's
+/// `conflicts_with` already rules out both being set.
+fn build_ladders(tiers: Option<&Path>, providers: &[Provider]) -> Result<Vec<Ladder>> {
+    match tiers {
+        Some(path) => Ok(vec![Ladder::custom(Tiers::load_file(path)?)]),
+        None => providers.iter().map(|&p| Ladder::builtin(p)).collect(),
     }
 }
 
@@ -308,6 +312,7 @@ mod tests {
     #[test]
     fn route_rejects_an_unknown_or_empty_provider() {
         let Err(err) = parse(&["#1", "--providers", "nope"]) else {
+            // omni-dev: coverage ignore-line reason="guards this test's assumption; the parse above always fails on an unknown provider"
             panic!("an unknown provider parsed");
         };
         let text = err.to_string();
@@ -324,9 +329,31 @@ mod tests {
     fn route_tiers_conflicts_with_an_explicit_providers() {
         assert!(parse(&["#1", "--tiers", "t.yaml"]).is_ok());
         let Err(err) = parse(&["#1", "--tiers", "t.yaml", "--providers", "openai"]) else {
+            // omni-dev: coverage ignore-line reason="guards this test's assumption; clap's conflicts_with always rejects --tiers with --providers"
             panic!("--tiers with --providers parsed");
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn build_ladders_from_providers_preserves_order() {
+        let ladders = build_ladders(None, &[Provider::Gemini, Provider::Anthropic]).unwrap();
+        let names: Vec<&str> = ladders.iter().map(|l| l.provider.as_str()).collect();
+        assert_eq!(names, ["gemini", "anthropic"]);
+    }
+
+    #[test]
+    fn build_ladders_from_tiers_file_ignores_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiers.yaml");
+        std::fs::write(
+            &path,
+            "tiers:\n  - {name: small, description: S}\n  - {name: big, description: B}\n",
+        )
+        .unwrap();
+        let ladders = build_ladders(Some(&path), &[Provider::OpenAi]).unwrap();
+        assert_eq!(ladders.len(), 1);
+        assert_eq!(ladders[0].provider, crate::jev::route::CUSTOM_PROVIDER);
     }
 
     #[test]
