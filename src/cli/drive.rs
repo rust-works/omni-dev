@@ -1345,6 +1345,128 @@ mod tests {
         assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
+    /// A minimal `--cell-empty`-only rule (no `--background`/`--text-color`/
+    /// `--bold`) so this stays a plain routing test: `conditional_format`'s
+    /// own validation refuses it before any network call, and — like
+    /// `ProtectRange` above — the mutating verb still reports that refusal
+    /// as an `Ok` outcome rather than propagating an error, since it never
+    /// reaches a dead-port network call at all.
+    fn cell_empty_only_rule_args() -> sheets::conditional_format::ConditionalFormatRuleArgs {
+        sheets::conditional_format::ConditionalFormatRuleArgs {
+            number_between: None,
+            number_not_between: None,
+            number_greater: None,
+            number_greater_eq: None,
+            number_less: None,
+            number_less_eq: None,
+            number_eq: None,
+            number_not_eq: None,
+            text_contains: None,
+            text_not_contains: None,
+            text_starts_with: None,
+            text_ends_with: None,
+            text_eq: None,
+            date_after: None,
+            date_before: None,
+            date_on: None,
+            date_between: None,
+            cell_empty: true,
+            cell_not_empty: false,
+            custom_formula: None,
+            background: None,
+            text_color: None,
+            bold: None,
+            gradient_min_color: None,
+            gradient_max_color: None,
+            gradient_mid_color: None,
+            gradient_mid_type: None,
+            gradient_mid_value: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_add_conditional_format() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::AddConditionalFormat(Box::new(
+                sheets::conditional_format::AddConditionalFormatCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q1".to_string(),
+                    ranges: vec!["A1:A10".to_string()],
+                    index: None,
+                    rule: cell_empty_only_rule_args(),
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            )),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_update_conditional_format() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::UpdateConditionalFormat(Box::new(
+                sheets::conditional_format::UpdateConditionalFormatCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q1".to_string(),
+                    index: 0,
+                    ranges: vec!["A1:A10".to_string()],
+                    rule: cell_empty_only_rule_args(),
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            )),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_delete_conditional_format() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::DeleteConditionalFormat(
+                sheets::conditional_format::DeleteConditionalFormatCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q1".to_string(),
+                    index: 0,
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_list_conditional_formats() {
+        // Read-only and ungated, like `list-protections` — needs the host
+        // redirect so it fails fast against a dead port instead of trying
+        // the real Sheets API.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::ListConditionalFormats(
+                sheets::conditional_format::ListConditionalFormatsCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
     #[tokio::test]
     async fn dispatch_routes_sheets_set_basic_filter() {
         let guard = crate::drive::test_support::EnvGuard::take();

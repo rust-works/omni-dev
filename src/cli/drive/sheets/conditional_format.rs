@@ -533,10 +533,33 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::drive::types::GOOGLE_SHEET_MIME_TYPE;
+    use crate::utils::secret::Secret;
+    use crate::utils::settings::Settings;
+
     fn parse_add(args: &[&str]) -> AddConditionalFormatCommand {
         let mut full = vec!["add-conditional-format"];
         full.extend_from_slice(args);
         AddConditionalFormatCommand::parse_from(full)
+    }
+
+    fn parse_update(args: &[&str]) -> UpdateConditionalFormatCommand {
+        let mut full = vec!["update-conditional-format"];
+        full.extend_from_slice(args);
+        UpdateConditionalFormatCommand::parse_from(full)
+    }
+
+    /// Unwraps a [`FormatRule::Boolean`]'s condition, panicking (with the
+    /// unexpected variant named) on a [`FormatRule::Gradient`] — the
+    /// `select_rule_picks_a_boolean_condition`/`select_rule_picks_cell_empty`
+    /// match idiom, factored out for the table-driven tests below.
+    fn boolean_condition(rule: FormatRule) -> FormatCondition {
+        match rule {
+            FormatRule::Boolean { condition, .. } => condition,
+            other @ FormatRule::Gradient(_) => panic!("expected Boolean, got {other:?}"),
+        }
     }
 
     #[test]
@@ -591,6 +614,143 @@ mod tests {
             }
             other @ FormatRule::Gradient(_) => panic!("expected Boolean, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn select_rule_picks_number_conditions() {
+        let cases: Vec<(Vec<&str>, FormatCondition)> = vec![
+            (
+                vec!["--number-between", "1", "10"],
+                FormatCondition::NumberBetween(1.0, 10.0),
+            ),
+            (
+                vec!["--number-not-between", "1", "10"],
+                FormatCondition::NumberNotBetween(1.0, 10.0),
+            ),
+            (
+                vec!["--number-greater-eq", "5"],
+                FormatCondition::NumberGreaterEq(5.0),
+            ),
+            (vec!["--number-less", "5"], FormatCondition::NumberLess(5.0)),
+            (
+                vec!["--number-less-eq", "5"],
+                FormatCondition::NumberLessEq(5.0),
+            ),
+            (vec!["--number-eq", "5"], FormatCondition::NumberEq(5.0)),
+            (
+                vec!["--number-not-eq", "5"],
+                FormatCondition::NumberNotEq(5.0),
+            ),
+        ];
+        for (flags, expected) in cases {
+            let mut args = vec!["sheet-1", "--sheet", "Q1", "--range", "A1:A10"];
+            args.extend(flags);
+            args.extend(["--background", "#00FF00"]);
+            let cmd = parse_add(&args);
+            assert_eq!(boolean_condition(cmd.rule.select_rule()), expected);
+        }
+    }
+
+    #[test]
+    fn select_rule_picks_text_conditions() {
+        let cases: Vec<(Vec<&str>, FormatCondition)> = vec![
+            (
+                vec!["--text-contains", "abc"],
+                FormatCondition::TextContains("abc".to_string()),
+            ),
+            (
+                vec!["--text-not-contains", "abc"],
+                FormatCondition::TextNotContains("abc".to_string()),
+            ),
+            (
+                vec!["--text-starts-with", "abc"],
+                FormatCondition::TextStartsWith("abc".to_string()),
+            ),
+            (
+                vec!["--text-ends-with", "abc"],
+                FormatCondition::TextEndsWith("abc".to_string()),
+            ),
+            (
+                vec!["--text-eq", "abc"],
+                FormatCondition::TextEq("abc".to_string()),
+            ),
+        ];
+        for (flags, expected) in cases {
+            let mut args = vec!["sheet-1", "--sheet", "Q1", "--range", "A1:A10"];
+            args.extend(flags);
+            args.extend(["--background", "#00FF00"]);
+            let cmd = parse_add(&args);
+            assert_eq!(boolean_condition(cmd.rule.select_rule()), expected);
+        }
+    }
+
+    #[test]
+    fn select_rule_picks_date_conditions() {
+        let cases: Vec<(Vec<&str>, FormatCondition)> = vec![
+            (
+                vec!["--date-after", "2024-01-01"],
+                FormatCondition::DateAfter(DateValue::parse("2024-01-01".to_string())),
+            ),
+            (
+                vec!["--date-before", "2024-01-01"],
+                FormatCondition::DateBefore(DateValue::parse("2024-01-01".to_string())),
+            ),
+            (
+                vec!["--date-on", "2024-01-01"],
+                FormatCondition::DateOn(DateValue::parse("2024-01-01".to_string())),
+            ),
+            (
+                vec!["--date-between", "2024-01-01", "2024-01-31"],
+                FormatCondition::DateBetween("2024-01-01".to_string(), "2024-01-31".to_string()),
+            ),
+        ];
+        for (flags, expected) in cases {
+            let mut args = vec!["sheet-1", "--sheet", "Q1", "--range", "A1:A10"];
+            args.extend(flags);
+            args.extend(["--background", "#00FF00"]);
+            let cmd = parse_add(&args);
+            assert_eq!(boolean_condition(cmd.rule.select_rule()), expected);
+        }
+    }
+
+    #[test]
+    fn select_rule_picks_cell_not_empty_and_falls_back_to_custom_formula() {
+        let cmd = parse_add(&[
+            "sheet-1",
+            "--sheet",
+            "Q1",
+            "--range",
+            "A1:A10",
+            "--cell-not-empty",
+            "--bold",
+            "true",
+        ]);
+        match cmd.rule.select_rule() {
+            FormatRule::Boolean { condition, format } => {
+                assert!(matches!(condition, FormatCondition::CellNotEmpty));
+                assert_eq!(format.bold, Some(true));
+            }
+            other @ FormatRule::Gradient(_) => panic!("expected Boolean, got {other:?}"),
+        }
+
+        // `--custom-formula` is itself one of `RULE_KIND_ARGS`, so it must
+        // be passed explicitly to satisfy the `rule_kind` group — this
+        // exercises `select_rule`'s unconditional final `else` fallback.
+        let cmd = parse_add(&[
+            "sheet-1",
+            "--sheet",
+            "Q1",
+            "--range",
+            "A1:A10",
+            "--custom-formula",
+            "=A1>0",
+            "--background",
+            "#00FF00",
+        ]);
+        assert_eq!(
+            boolean_condition(cmd.rule.select_rule()),
+            FormatCondition::CustomFormula("=A1>0".to_string())
+        );
     }
 
     #[test]
@@ -703,5 +863,286 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cmd.index, 0);
+    }
+
+    // ── execute() (wiremock) ─────────────────────────────────────────
+    //
+    // Local helpers mirroring `src/drive/sheets/conditional_format.rs`'s own
+    // test module and `protection.rs`'s CLI test — not imported from either
+    // (the engine module's are private to its own `mod tests`).
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    async fn client_with_bootstrapped_token(server: &wiremock::MockServer) -> DriveClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+
+        let mut client = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    fn mount_file(id: &str, mime_type: &str, parents: &[&str]) -> wiremock::Mock {
+        let parents: Vec<&str> = parents.to_vec();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/drive/v3/files/{id}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id, "name": id, "mimeType": mime_type, "parents": parents,
+                    "version": "1",
+                })),
+            )
+    }
+
+    fn mount_folder(id: &str) -> wiremock::Mock {
+        mount_file(id, "application/vnd.google-apps.folder", &[])
+    }
+
+    /// A workbook with one sheet ("Q1", `sheetId` 0) holding two existing
+    /// conditional format rules at indices 0 and 1 — mirrors the engine
+    /// module's own `mount_workbook`.
+    fn mount_workbook() -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {
+                            "properties": {"sheetId": 0, "title": "Q1", "index": 0},
+                            "conditionalFormats": [
+                                {
+                                    "ranges": [{"sheetId": 0, "startRowIndex": 0, "endRowIndex": 1}],
+                                    "booleanRule": {
+                                        "condition": {"type": "CELL_EMPTY", "values": []},
+                                        "format": {"backgroundColorStyle": {"rgbColor": {"red": 1.0, "green": 0.0, "blue": 0.0}}},
+                                    },
+                                },
+                                {
+                                    "ranges": [{"sheetId": 0, "startRowIndex": 1, "endRowIndex": 2}],
+                                    "gradientRule": {
+                                        "minColorStyle": {"rgbColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
+                                        "maxColorStyle": {"rgbColor": {"red": 0.0, "green": 1.0, "blue": 0.0}},
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                })),
+            )
+    }
+
+    fn mount_batch_update() -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"replies": [{}]})),
+            )
+    }
+
+    /// Writes a `write_permissions` rule to `dir`'s `settings.json` that
+    /// allows `sheets-structure` on `folder-1`, with `require_lease: false`
+    /// so these `execute()` tests need no lease ledger/token — only the
+    /// gate verdict matters here, not the lease machinery (covered
+    /// separately by ADR-0080's own tests).
+    fn allow_sheets_structure_on_folder_1(dir: &tempfile::TempDir) {
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_drive_account(
+            &settings_path,
+            "work",
+            &[(
+                "write_permissions",
+                serde_json::json!({
+                    "rules": [{
+                        "folder_id": "folder-1",
+                        "recursive": true,
+                        "allow": ["sheets-structure"],
+                        "require_lease": false,
+                    }],
+                }),
+            )],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_add_conditional_format_reaches_batch_update() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        allow_sheets_structure_on_folder_1(&dir);
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update().mount(&server).await;
+
+        let cmd = parse_add(&[
+            "sheet-1",
+            "--sheet",
+            "Q1",
+            "--range",
+            "A1:A10",
+            "--number-greater",
+            "100",
+            "--background",
+            "#00FF00",
+        ]);
+        assert!(cmd.execute(&client).await.is_ok());
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests
+            .iter()
+            .any(|r| r.url.path().ends_with(":batchUpdate")));
+    }
+
+    #[tokio::test]
+    async fn execute_update_conditional_format_reaches_batch_update() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        allow_sheets_structure_on_folder_1(&dir);
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update().mount(&server).await;
+
+        let cmd = parse_update(&[
+            "sheet-1",
+            "--sheet",
+            "Q1",
+            "--index",
+            "0",
+            "--range",
+            "A1:A10",
+            "--cell-not-empty",
+            "--text-color",
+            "#112233",
+        ]);
+        assert!(cmd.execute(&client).await.is_ok());
+
+        let requests = server.received_requests().await.unwrap();
+        let batch = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+        assert_eq!(
+            body["requests"][0]["updateConditionalFormatRule"]["index"],
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_delete_conditional_format_reaches_batch_update() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        allow_sheets_structure_on_folder_1(&dir);
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["folder-1"])
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update().mount(&server).await;
+
+        // `-o json` here (rather than the default table) exercises
+        // `run_conditional_format`'s JSON short-circuit branch, while the
+        // add/update tests above exercise its human-readable `println!`
+        // loop.
+        let cmd = DeleteConditionalFormatCommand::try_parse_from([
+            "delete-conditional-format",
+            "sheet-1",
+            "--sheet",
+            "Q1",
+            "--index",
+            "1",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        assert!(cmd.execute(&client).await.is_ok());
+
+        let requests = server.received_requests().await.unwrap();
+        let batch = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+        let deleted = &body["requests"][0]["deleteConditionalFormatRule"];
+        assert_eq!(deleted["sheetId"], 0);
+        assert_eq!(deleted["index"], 1);
+    }
+
+    #[tokio::test]
+    async fn execute_list_conditional_formats_prints_the_human_readable_table() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_workbook().mount(&server).await;
+
+        let cmd = ListConditionalFormatsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_list_conditional_formats_json_output_short_circuits() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_workbook().mount(&server).await;
+
+        let cmd = ListConditionalFormatsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: OutputFormat::Json,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
     }
 }
