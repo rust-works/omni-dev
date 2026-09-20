@@ -310,9 +310,11 @@ pub struct ClearValuesResponse {
 /// (issue #1643, [ADR-0078](../../../docs/adrs/adr-0078.md) §2) — there is
 /// still no raw `--requests` passthrough that could construct one of these
 /// outside its gate. `structure.rs`'s `every_delete_verb_gates_on_sheets_delete_not_sheets_structure`/
-/// `every_additive_verb_still_gates_on_sheets_structure` tests, and
-/// `developer_metadata.rs`'s own analogous test, pin that every verb reaches
-/// exactly one gate, never the other.
+/// `every_additive_verb_still_gates_on_sheets_structure` tests pin that every
+/// verb reaches exactly one gate, never the other; `developer_metadata.rs`
+/// has no dispatch table to get wrong in the first place — its `Set`/`Delete`
+/// verbs share the single hardcoded `DriveOperation::SheetsStructure` call
+/// site in `developer_metadata_inner`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum BatchUpdateRequestItem {
