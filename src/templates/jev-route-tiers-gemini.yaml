@@ -1,0 +1,24 @@
+# The `gemini` model ladder for `omni-dev ai jev route` (#1820):
+# flash (gemini-3-flash-preview) / pro (gemini-3.1-pro-preview) /
+# deep-think (Gemini 3 Deep Think).
+#
+# Tiers are listed from least to most capable; `route` ranks them by position.
+# The descriptions are the anthropic ladder's, rung for rung, byte-identical:
+# that text is the only text validated against jev-1.13.0 (#1779), and
+# rewording shifts every answer. Only the tier names differ. This ladder has
+# not itself been evaluated, so treat its answers as a starting point.
+tiers:
+  - name: flash
+    description: >-
+      Reliable at executing a clear specification and following patterns that already exist in the
+      codebase. Tends to miss non-obvious interactions between parts and does not question the
+      specification.
+  - name: pro
+    description: >-
+      Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
+      ordering, once the overall direction is set. Can under-explore a genuinely open design space.
+  - name: deep-think
+    description: >-
+      Strongest at open-ended design and research: choosing between architectures, working in
+      unfamiliar territory with no precedent in the codebase, anticipating failure modes, and
+      security-critical judgement.

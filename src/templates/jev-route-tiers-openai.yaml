@@ -1,21 +1,22 @@
-# Default model-class tiers for `omni-dev ai jev route` (#1779).
+# The `openai` model ladder for `omni-dev ai jev route` (#1820):
+# terra (gpt-5.6-terra) / sol (gpt-5.6-sol) / astra (gpt-6-astra).
 #
 # Tiers are listed from least to most capable; `route` ranks them by position.
-# The descriptions are the text validated against jev-1.13.0 — rewording them
-# shifts every answer, so re-run the evaluation before changing a word.
-# `--tiers FILE` replaces this list (at least two tiers, unique names; `none`
-# is reserved for the design stage).
+# The descriptions are the anthropic ladder's, rung for rung, byte-identical:
+# that text is the only text validated against jev-1.13.0 (#1779), and
+# rewording shifts every answer. Only the tier names differ. This ladder has
+# not itself been evaluated, so treat its answers as a starting point.
 tiers:
-  - name: sonnet
+  - name: terra
     description: >-
       Reliable at executing a clear specification and following patterns that already exist in the
       codebase. Tends to miss non-obvious interactions between parts and does not question the
       specification.
-  - name: opus
+  - name: sol
     description: >-
       Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
       ordering, once the overall direction is set. Can under-explore a genuinely open design space.
-  - name: fable
+  - name: astra
     description: >-
       Strongest at open-ended design and research: choosing between architectures, working in
       unfamiliar territory with no precedent in the codebase, anticipating failure modes, and

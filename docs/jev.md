@@ -395,14 +395,17 @@ usually means the spec was mistyped.
 
 Asks which **model class** should handle each stage of the work on a GitHub
 issue: the **design** (choosing the approach and settling open questions), the
-**implementation** and the **review**. It makes one Jev call per issue, with
-three `choice` questions plus one `noul` question per open issue/PR the text
+**implementation** and the **review**. The classes are one AI provider's
+model ladder (see [Providers](#providers)); `--providers` routes against
+several at once. It makes one Jev call per issue, with three `choice`
+questions per provider plus one `noul` question per open issue/PR the text
 cites, and fetches the issues through `gh`.
 
 ```bash
 omni-dev ai jev route '#1779' rust-works/omni-dev#1641 -o yaml
 omni-dev ai jev route https://github.com/rust-works/omni-dev/issues/1779
 omni-dev ai jev route --all-open -C ~/src/omni-dev
+omni-dev ai jev route '#1820' --providers anthropic,openai,gemini
 ```
 
 `<ISSUE>` is `#N` or `N` (in the current repository, which `-C/--repo`
@@ -416,12 +419,21 @@ issues:
 - ref: rust-works/omni-dev#1641
   url: https://github.com/rust-works/omni-dev/issues/1641
   title: ...
-  stages:
-    design:    {choice: fable,  confidence: 0.52, probabilities: {fable: 0.74, none: 0.01, opus: 0.24, sonnet: 0.01}}
-    implement: {choice: sonnet, confidence: 0.83, probabilities: {fable: 0.0, opus: 0.12, sonnet: 0.88}}
-    review:    {choice: opus,   confidence: 0.41, probabilities: {fable: 0.02, opus: 0.57, sonnet: 0.41}}
-  class: fable
-  close_calls: []
+  providers:
+    anthropic:
+      stages:
+        design:    {choice: fable,  confidence: 0.52, probabilities: {fable: 0.74, none: 0.01, opus: 0.24, sonnet: 0.01}}
+        implement: {choice: sonnet, confidence: 0.83, probabilities: {fable: 0.0, opus: 0.12, sonnet: 0.88}}
+        review:    {choice: opus,   confidence: 0.41, probabilities: {fable: 0.02, opus: 0.57, sonnet: 0.41}}
+      class: fable
+      close_calls: []
+    openai:
+      stages:
+        design:    {choice: astra, confidence: 0.49, probabilities: {astra: 0.71, none: 0.01, sol: 0.27, terra: 0.01}}
+        implement: {choice: terra, confidence: 0.80, probabilities: {astra: 0.0, sol: 0.14, terra: 0.86}}
+        review:    {choice: sol,   confidence: 0.22, probabilities: {astra: 0.02, sol: 0.53, terra: 0.45}}
+      class: astra
+      close_calls: [review]
   depends_on:
   - ref: "#1129"
     state: open
@@ -429,6 +441,9 @@ issues:
 usage: {input_tokens: 1432, output_tokens: 61}
 ```
 
+- **`providers`** holds one entry per requested provider (default
+  `anthropic`), each with its own `stages`, `class` and `close_calls`. A
+  `--tiers FILE` ladder is reported under `custom`.
 - **`class`** is the higher of the design and implement choices. The most
   capable class earns its cost in the design stage; once a plan exists, the
   design answer usually becomes `none` and implementation drops to a cheaper
@@ -459,9 +474,9 @@ usage: {input_tokens: 1432, output_tokens: 61}
   input was ever cut and this policy is itself untested; Jev's own input limit
   is undocumented.
 - **`model`** and **`usage`** are summed over every call and never stripped.
-- **`error`** replaces `stages`, `class` and `close_calls` on an issue whose
-  Jev call failed (after the usual 429/529 retries) or whose answer was
-  unusable. The other issues are still routed, so a long `--all-open` run
+- **`error`** replaces `providers` and `depends_on` on an issue whose Jev
+  call failed (after the usual 429/529 retries) or whose answer was unusable
+  for any requested provider. The other issues are still routed, so a long `--all-open` run
   keeps the answers already paid for; the command prints the whole report and
   then exits non-zero, naming how many issues failed. An authentication
   failure (HTTP 401 or 403) would fail every issue, so it stops the run at
@@ -509,11 +524,49 @@ comments often describe how the work was actually done, which leaks the
 answer. `--allow-closed` is for evaluation runs against issues whose outcome
 you already know.
 
+### Providers
+
+`--providers <NAMES>` is a comma-separated list of the providers to route
+against (default `anthropic`; an unknown name is an error listing the known
+ones). Each provider has an embedded three-rung ladder, least capable first,
+named by the **abbreviated model name** so a consumer that drives that
+provider's agents gets a model to hand the work to rather than a rung it has
+to translate. There is deliberately no provider-neutral rung name.
+
+| Provider    | Rungs, least capable first          | Expansions                                                          |
+|-------------|-------------------------------------|---------------------------------------------------------------------|
+| `anthropic` | `sonnet` / `opus` / `fable`         | Claude Sonnet / Claude Opus / Claude Fable                          |
+| `openai`    | `terra` / `sol` / `astra`           | gpt-5.6-terra / gpt-5.6-sol / gpt-6-astra                           |
+| `gemini`    | `flash` / `pro` / `deep-think`      | gemini-3-flash-preview / gemini-3.1-pro-preview / Gemini 3 Deep Think |
+
+The ladders live in `src/templates/jev-route-tiers-<provider>.yaml`. Several
+providers still cost **one Jev call per issue**: Jev takes a map of questions
+over one state, so the three stage questions are keyed per provider
+(`openai.stage_design`, …) and share the issue text. `depends_on` is about
+the issue, not a provider, so its `could_be_cheaper` question is asked once
+per open citation, not once per provider.
+
+Only the `anthropic` ladder was validated (see
+[Evidence and its limits](#evidence-and-its-limits)). Because rewording a
+description shifts answers across the board, the `openai` and `gemini`
+ladders reuse the `anthropic` descriptions **rung for rung, byte for byte**;
+only the tier names differ, and a test pins the equality. Two things are
+therefore untested: the effect of the new tier names, which Jev sees as
+criterion keys, and keying several providers' questions into one call. Treat
+a non-`anthropic` answer as a starting point until an evaluation like
+#1779's is repeated for it, and if `anthropic`'s answers in a multi-provider
+run drift from a single-provider run, route one provider per run instead.
+
+A fourth, cheapest rung (Haiku 4.5, gpt-5.6-luna, gemini-3.1-flash-lite), an
+effort/reasoning-level knob, and the Chinese-lab and open-weight providers are
+out of scope: each changes the validated `anthropic` question or needs its own
+validation.
+
 ### Tiers
 
-The default tiers, least capable first, are `sonnet`, `opus` and `fable`, each
-described by what that class is reliable at. `--tiers FILE` replaces them, so
-other providers' model names work too:
+`--tiers FILE` replaces the provider ladders with a fully custom one, reported
+under the provider name `custom`. It **conflicts with `--providers`**:
+passing both is an error rather than one silently winning.
 
 ```yaml
 tiers:
@@ -527,7 +580,7 @@ A tiers file needs at least two tiers, unique non-empty names and
 descriptions, and no tier named `none`, which is reserved for "no design work
 remains". Rank comes from the order in the file.
 
-The default descriptions and the three stage questions are the exact text
+The `anthropic` descriptions and the three stage questions are the exact text
 the evidence was gathered with. Every question ends with the same bar:
 *"Choose the least capable class likely to complete this stage correctly with
 no rework, about 9 times in 10. Judge the work that remains given the text, not
