@@ -10,16 +10,33 @@ use crate::cli::format::sanitize_for_terminal;
 use crate::drive::client::DriveClient;
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::validation::{
-    describe_lines, validation, Condition, ValidationOptions, ValidationVerb,
+    describe_lines, validation, Condition, DateValue, ValidationOptions, ValidationVerb,
 };
 
 /// Sets a data validation rule on a range.
 ///
-/// Exactly one condition flag is required: `--one-of-list`,
-/// `--number-between`, `--checkbox`, or `--custom-formula`.
+/// Exactly one condition flag is required, from five families: `--one-of-list`/
+/// `--one-of-range`; the numeric comparators (`--number-between`,
+/// `--number-not-between`, `--number-greater(-eq)`, `--number-less(-eq)`,
+/// `--number-eq`, `--number-not-eq`); the text conditions
+/// (`--text-contains`, `--text-not-contains`, `--text-starts-with`,
+/// `--text-ends-with`, `--text-eq`); the date conditions (`--date-after`,
+/// `--date-before`, `--date-on`, `--date-between` — the single-value forms
+/// also accept a relative keyword: `today`, `tomorrow`, `yesterday`,
+/// `past-week`, `past-month`, `past-year`); `--blank`/`--not-blank`;
+/// `--checkbox`; or `--custom-formula`.
 #[derive(Parser)]
 #[command(group(clap::ArgGroup::new("condition")
-    .args(["one_of_list", "number_between", "checkbox", "custom_formula"])
+    .args([
+        "one_of_list", "one_of_range",
+        "number_between", "number_not_between",
+        "number_greater", "number_greater_eq", "number_less", "number_less_eq",
+        "number_eq", "number_not_eq",
+        "text_contains", "text_not_contains", "text_starts_with", "text_ends_with", "text_eq",
+        "date_after", "date_before", "date_on", "date_between",
+        "blank", "not_blank",
+        "checkbox", "custom_formula",
+    ])
     .required(true)))]
 pub struct SetDataValidationCommand {
     /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
@@ -38,9 +55,90 @@ pub struct SetDataValidationCommand {
     #[arg(long, value_name = "A,B,C", value_delimiter = ',')]
     pub one_of_list: Option<Vec<String>>,
 
+    /// Restrict entries to a dropdown sourced from this range.
+    #[arg(long, value_name = "A1_RANGE")]
+    pub one_of_range: Option<String>,
+
     /// Restrict entries to a number in this inclusive range.
     #[arg(long, num_args = 2, value_names = ["MIN", "MAX"])]
     pub number_between: Option<Vec<f64>>,
+
+    /// Restrict entries to a number outside this inclusive range.
+    #[arg(long, num_args = 2, value_names = ["MIN", "MAX"])]
+    pub number_not_between: Option<Vec<f64>>,
+
+    /// Restrict entries to a number strictly greater than this.
+    #[arg(long, value_name = "N")]
+    pub number_greater: Option<f64>,
+
+    /// Restrict entries to a number greater than or equal to this.
+    #[arg(long, value_name = "N")]
+    pub number_greater_eq: Option<f64>,
+
+    /// Restrict entries to a number strictly less than this.
+    #[arg(long, value_name = "N")]
+    pub number_less: Option<f64>,
+
+    /// Restrict entries to a number less than or equal to this.
+    #[arg(long, value_name = "N")]
+    pub number_less_eq: Option<f64>,
+
+    /// Restrict entries to a number equal to this.
+    #[arg(long, value_name = "N")]
+    pub number_eq: Option<f64>,
+
+    /// Restrict entries to a number not equal to this.
+    #[arg(long, value_name = "N")]
+    pub number_not_eq: Option<f64>,
+
+    /// Restrict entries to text containing this substring.
+    #[arg(long, value_name = "TEXT")]
+    pub text_contains: Option<String>,
+
+    /// Restrict entries to text not containing this substring.
+    #[arg(long, value_name = "TEXT")]
+    pub text_not_contains: Option<String>,
+
+    /// Restrict entries to text starting with this substring.
+    #[arg(long, value_name = "TEXT")]
+    pub text_starts_with: Option<String>,
+
+    /// Restrict entries to text ending with this substring.
+    #[arg(long, value_name = "TEXT")]
+    pub text_ends_with: Option<String>,
+
+    /// Restrict entries to text equal to this.
+    #[arg(long, value_name = "TEXT")]
+    pub text_eq: Option<String>,
+
+    /// Restrict entries to a date after this one. Accepts an absolute date
+    /// or a relative keyword (`today`, `tomorrow`, `yesterday`,
+    /// `past-week`, `past-month`, `past-year`).
+    #[arg(long, value_name = "DATE")]
+    pub date_after: Option<String>,
+
+    /// Restrict entries to a date before this one. Accepts an absolute
+    /// date or a relative keyword (see `--date-after`).
+    #[arg(long, value_name = "DATE")]
+    pub date_before: Option<String>,
+
+    /// Restrict entries to a date equal to this one. Accepts an absolute
+    /// date or a relative keyword (see `--date-after`).
+    #[arg(long, value_name = "DATE")]
+    pub date_on: Option<String>,
+
+    /// Restrict entries to a date in this inclusive range (absolute dates
+    /// only; relative keywords are not accepted here).
+    #[arg(long, num_args = 2, value_names = ["START", "END"])]
+    pub date_between: Option<Vec<String>>,
+
+    /// Restrict entries to an empty cell.
+    #[arg(long)]
+    pub blank: bool,
+
+    /// Restrict entries to a non-empty cell.
+    #[arg(long)]
+    pub not_blank: bool,
 
     /// Restrict entries to `TRUE`/`FALSE`, rendered as a checkbox.
     #[arg(long)]
@@ -72,19 +170,88 @@ pub struct SetDataValidationCommand {
     pub output: OutputFormat,
 }
 
+/// The numeric-comparator family: `--number-between` through
+/// `--number-not-eq`.
+fn numeric_condition(cmd: &SetDataValidationCommand) -> Option<Condition> {
+    if let Some(v) = &cmd.number_between {
+        Some(Condition::NumberBetween(v[0], v[1]))
+    } else if let Some(v) = &cmd.number_not_between {
+        Some(Condition::NumberNotBetween(v[0], v[1]))
+    } else if let Some(n) = cmd.number_greater {
+        Some(Condition::NumberGreater(n))
+    } else if let Some(n) = cmd.number_greater_eq {
+        Some(Condition::NumberGreaterEq(n))
+    } else if let Some(n) = cmd.number_less {
+        Some(Condition::NumberLess(n))
+    } else if let Some(n) = cmd.number_less_eq {
+        Some(Condition::NumberLessEq(n))
+    } else if let Some(n) = cmd.number_eq {
+        Some(Condition::NumberEq(n))
+    } else {
+        cmd.number_not_eq.map(Condition::NumberNotEq)
+    }
+}
+
+/// The text family: `--text-contains` through `--text-eq`.
+fn text_condition(cmd: &SetDataValidationCommand) -> Option<Condition> {
+    if let Some(text) = &cmd.text_contains {
+        Some(Condition::TextContains(text.clone()))
+    } else if let Some(text) = &cmd.text_not_contains {
+        Some(Condition::TextNotContains(text.clone()))
+    } else if let Some(text) = &cmd.text_starts_with {
+        Some(Condition::TextStartsWith(text.clone()))
+    } else if let Some(text) = &cmd.text_ends_with {
+        Some(Condition::TextEndsWith(text.clone()))
+    } else {
+        cmd.text_eq.clone().map(Condition::TextEq)
+    }
+}
+
+/// The date family: `--date-after`/`--date-before`/`--date-on` (absolute or
+/// relative) and `--date-between` (absolute only).
+fn date_condition(cmd: &SetDataValidationCommand) -> Option<Condition> {
+    if let Some(raw) = &cmd.date_after {
+        Some(Condition::DateAfter(DateValue::parse(raw.clone())))
+    } else if let Some(raw) = &cmd.date_before {
+        Some(Condition::DateBefore(DateValue::parse(raw.clone())))
+    } else if let Some(raw) = &cmd.date_on {
+        Some(Condition::DateOn(DateValue::parse(raw.clone())))
+    } else {
+        cmd.date_between
+            .as_ref()
+            .map(|v| Condition::DateBetween(v[0].clone(), v[1].clone()))
+    }
+}
+
+/// Everything else: the two dropdown flags, the two blank flags, the
+/// checkbox flag, and `--custom-formula` as the unconditional final
+/// fallback — the `ArgGroup` on [`SetDataValidationCommand`] guarantees
+/// exactly one condition flag is set, so if nothing else in this chain
+/// matched, `--custom-formula` must be it.
+fn misc_condition(cmd: &SetDataValidationCommand) -> Condition {
+    if let Some(items) = &cmd.one_of_list {
+        Condition::OneOfList(items.clone())
+    } else if let Some(range) = &cmd.one_of_range {
+        Condition::OneOfRange(range.clone())
+    } else if cmd.checkbox {
+        Condition::Checkbox
+    } else if cmd.blank {
+        Condition::Blank
+    } else if cmd.not_blank {
+        Condition::NotBlank
+    } else {
+        Condition::CustomFormula(cmd.custom_formula.clone().unwrap_or_default())
+    }
+}
+
 impl SetDataValidationCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        // The `ArgGroup` above guarantees exactly one of these is set.
-        let condition = if let Some(items) = self.one_of_list {
-            Condition::OneOfList(items)
-        } else if let Some(bounds) = self.number_between {
-            Condition::NumberBetween(bounds[0], bounds[1])
-        } else if self.checkbox {
-            Condition::Checkbox
-        } else {
-            Condition::CustomFormula(self.custom_formula.unwrap_or_default())
-        };
+        // The `ArgGroup` above guarantees exactly one condition flag is set.
+        let condition = numeric_condition(&self)
+            .or_else(|| text_condition(&self))
+            .or_else(|| date_condition(&self))
+            .unwrap_or_else(|| misc_condition(&self));
         let opts = ValidationOptions {
             spreadsheet_id: self.spreadsheet_id,
             verb: ValidationVerb::SetDataValidation {
@@ -192,7 +359,26 @@ mod tests {
             range: Some("A1:A10".to_string()),
             sheet: None,
             one_of_list: None,
+            one_of_range: None,
             number_between: None,
+            number_not_between: None,
+            number_greater: None,
+            number_greater_eq: None,
+            number_less: None,
+            number_less_eq: None,
+            number_eq: None,
+            number_not_eq: None,
+            text_contains: None,
+            text_not_contains: None,
+            text_starts_with: None,
+            text_ends_with: None,
+            text_eq: None,
+            date_after: None,
+            date_before: None,
+            date_on: None,
+            date_between: None,
+            blank: false,
+            not_blank: false,
             checkbox: false,
             custom_formula: None,
             input_message: None,
@@ -234,6 +420,102 @@ mod tests {
 
         let cmd = SetDataValidationCommand {
             custom_formula: Some("=A1>0".to_string()),
+            ..base_cmd()
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_selects_one_of_range_condition() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDataValidationCommand {
+            one_of_range: Some("Sheet2!A1:A10".to_string()),
+            ..base_cmd()
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_selects_a_numeric_comparator_condition() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDataValidationCommand {
+            number_greater: Some(0.0),
+            ..base_cmd()
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_selects_a_text_condition() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDataValidationCommand {
+            text_contains: Some("x".to_string()),
+            ..base_cmd()
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_selects_an_absolute_date_condition() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDataValidationCommand {
+            date_after: Some("2024-01-01".to_string()),
+            ..base_cmd()
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_selects_a_relative_date_condition() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDataValidationCommand {
+            date_before: Some("tomorrow".to_string()),
+            ..base_cmd()
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_selects_a_date_between_condition() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDataValidationCommand {
+            date_between: Some(vec!["2024-01-01".to_string(), "2024-12-31".to_string()]),
+            ..base_cmd()
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_selects_a_blank_condition() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDataValidationCommand {
+            blank: true,
+            ..base_cmd()
+        };
+        assert!(cmd.execute(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_selects_a_not_blank_condition() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let cmd = SetDataValidationCommand {
+            not_blank: true,
             ..base_cmd()
         };
         assert!(cmd.execute(&dead_client()).await.is_ok());

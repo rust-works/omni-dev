@@ -11,12 +11,19 @@
 //! a numeric [`GridRange`] via `grid_range::parse_grid_range`.
 //!
 //! **A curated condition surface, not full `BooleanCondition` coverage.**
-//! Sheets models a couple dozen condition types (`NUMBER_GREATER`,
-//! `TEXT_IS_EMAIL`, per-type date conditions, …); this ships the four with
-//! the broadest use: `--one-of-list` (dropdown), `--number-between`,
-//! `--checkbox`, `--custom-formula`. Everything else is a documented cut —
-//! `docs/drive.md` names it — rather than a silent gap, matching this
-//! issue's general stance on `CellFormat`.
+//! Sheets models a couple dozen condition types. Tranche 1 (#1643) shipped
+//! the four with the broadest use: `--one-of-list` (dropdown),
+//! `--number-between`, `--checkbox`, `--custom-formula`. Tranche 2 (#1792)
+//! adds every remaining type addressable with a flat flag: `ONE_OF_RANGE`,
+//! the numeric comparators and `NUMBER_NOT_BETWEEN`, the `TEXT_*`
+//! contains/starts/ends/eq family, the `DATE_*` after/before/on/between
+//! family (with relative-date support for the three single-value forms),
+//! and `BLANK`/`NOT_BLANK`. Still excluded, a documented cut rather than a
+//! silent gap: `TEXT_IS_EMAIL`, `TEXT_IS_URL`, `DATE_ON_OR_BEFORE`,
+//! `DATE_ON_OR_AFTER`, `DATE_NOT_BETWEEN`, `DATE_IS_VALID`, and every
+//! condition type meaningful only inside a conditional-format rule —
+//! `docs/drive.md` names the boundary, matching this issue's general stance
+//! on `CellFormat`.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -43,7 +50,97 @@ use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
 
-/// One of the four condition shapes `set-data-validation` builds.
+/// One of Sheets' six `RelativeDate` values.
+///
+/// Usable wherever a date condition takes a single value
+/// (`DATE_AFTER`/`DATE_BEFORE`/`DATE_EQ`); `DATE_BETWEEN` requires two
+/// absolute dates and never accepts one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelativeDate {
+    /// The 365 days up to and including today.
+    PastYear,
+    /// The 30 days up to and including today.
+    PastMonth,
+    /// The 7 days up to and including today.
+    PastWeek,
+    /// The day before today.
+    Yesterday,
+    /// Today.
+    Today,
+    /// The day after today.
+    Tomorrow,
+}
+
+impl RelativeDate {
+    const fn as_sheets_str(self) -> &'static str {
+        match self {
+            Self::PastYear => "PAST_YEAR",
+            Self::PastMonth => "PAST_MONTH",
+            Self::PastWeek => "PAST_WEEK",
+            Self::Yesterday => "YESTERDAY",
+            Self::Today => "TODAY",
+            Self::Tomorrow => "TOMORROW",
+        }
+    }
+
+    /// Matches case- and separator-insensitively (`past-week`, `past_week`,
+    /// `Past Week` all match) so the CLI value doesn't force one style.
+    fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
+            "pastyear" => Some(Self::PastYear),
+            "pastmonth" => Some(Self::PastMonth),
+            "pastweek" => Some(Self::PastWeek),
+            "yesterday" => Some(Self::Yesterday),
+            "today" => Some(Self::Today),
+            "tomorrow" => Some(Self::Tomorrow),
+            _ => None,
+        }
+    }
+}
+
+/// A date condition's operand.
+///
+/// Either a literal date string (passed through untouched, the same
+/// trust-the-caller stance as every other numeric/text value in this file —
+/// Sheets parses it at evaluation time) or one of the six [`RelativeDate`]
+/// keywords.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DateValue {
+    /// A literal date string, untouched.
+    Absolute(String),
+    /// One of Sheets' relative-date keywords.
+    Relative(RelativeDate),
+}
+
+impl DateValue {
+    /// Never fails: anything that isn't a recognized relative keyword is
+    /// treated as a literal date string.
+    pub fn parse(raw: String) -> Self {
+        match RelativeDate::parse(&raw) {
+            Some(rd) => Self::Relative(rd),
+            None => Self::Absolute(raw),
+        }
+    }
+
+    fn is_blank(&self) -> bool {
+        matches!(self, Self::Absolute(s) if s.trim().is_empty())
+    }
+
+    fn into_condition_value(self) -> ConditionValue {
+        match self {
+            Self::Absolute(s) => ConditionValue {
+                user_entered_value: Some(s),
+                relative_date: None,
+            },
+            Self::Relative(rd) => ConditionValue {
+                user_entered_value: None,
+                relative_date: Some(rd.as_sheets_str().to_string()),
+            },
+        }
+    }
+}
+
+/// The condition shapes `set-data-validation` builds.
 ///
 /// Each variant carries exactly what its condition needs; there is no "raw
 /// condition type + values" escape hatch, following the same
@@ -52,8 +149,46 @@ use crate::request_log::{self, DriveMutationOutcome};
 pub enum Condition {
     /// A dropdown restricted to these exact values.
     OneOfList(Vec<String>),
+    /// A dropdown sourced from a range of cells.
+    OneOfRange(String),
     /// A number in `[min, max]` inclusive.
     NumberBetween(f64, f64),
+    /// A number outside `[min, max]`.
+    NumberNotBetween(f64, f64),
+    /// A number strictly greater than this.
+    NumberGreater(f64),
+    /// A number greater than or equal to this.
+    NumberGreaterEq(f64),
+    /// A number strictly less than this.
+    NumberLess(f64),
+    /// A number less than or equal to this.
+    NumberLessEq(f64),
+    /// A number equal to this.
+    NumberEq(f64),
+    /// A number not equal to this.
+    NumberNotEq(f64),
+    /// Text containing this substring.
+    TextContains(String),
+    /// Text not containing this substring.
+    TextNotContains(String),
+    /// Text starting with this substring.
+    TextStartsWith(String),
+    /// Text ending with this substring.
+    TextEndsWith(String),
+    /// Text equal to this.
+    TextEq(String),
+    /// A date after this one.
+    DateAfter(DateValue),
+    /// A date before this one.
+    DateBefore(DateValue),
+    /// A date equal to this one.
+    DateOn(DateValue),
+    /// A date in `[start, end]` inclusive (absolute dates only).
+    DateBetween(String, String),
+    /// The cell must be empty.
+    Blank,
+    /// The cell must not be empty.
+    NotBlank,
     /// `TRUE`/`FALSE` only.
     Checkbox,
     /// A custom formula that must evaluate truthy.
@@ -63,25 +198,49 @@ pub enum Condition {
 impl Condition {
     fn into_boolean_condition(self) -> BooleanCondition {
         let value = |s: String| ConditionValue {
-            user_entered_value: s,
+            user_entered_value: Some(s),
+            relative_date: None,
+        };
+        let condition = |condition_type: &str, values: Vec<ConditionValue>| BooleanCondition {
+            condition_type: condition_type.to_string(),
+            values,
         };
         match self {
-            Self::OneOfList(items) => BooleanCondition {
-                condition_type: "ONE_OF_LIST".to_string(),
-                values: items.into_iter().map(value).collect(),
-            },
-            Self::NumberBetween(min, max) => BooleanCondition {
-                condition_type: "NUMBER_BETWEEN".to_string(),
-                values: vec![value(min.to_string()), value(max.to_string())],
-            },
-            Self::Checkbox => BooleanCondition {
-                condition_type: "BOOLEAN".to_string(),
-                values: Vec::new(),
-            },
-            Self::CustomFormula(formula) => BooleanCondition {
-                condition_type: "CUSTOM_FORMULA".to_string(),
-                values: vec![value(formula)],
-            },
+            Self::OneOfList(items) => {
+                condition("ONE_OF_LIST", items.into_iter().map(value).collect())
+            }
+            Self::OneOfRange(range) => condition("ONE_OF_RANGE", vec![value(range)]),
+            Self::NumberBetween(min, max) => condition(
+                "NUMBER_BETWEEN",
+                vec![value(min.to_string()), value(max.to_string())],
+            ),
+            Self::NumberNotBetween(min, max) => condition(
+                "NUMBER_NOT_BETWEEN",
+                vec![value(min.to_string()), value(max.to_string())],
+            ),
+            Self::NumberGreater(n) => condition("NUMBER_GREATER", vec![value(n.to_string())]),
+            Self::NumberGreaterEq(n) => {
+                condition("NUMBER_GREATER_THAN_EQ", vec![value(n.to_string())])
+            }
+            Self::NumberLess(n) => condition("NUMBER_LESS", vec![value(n.to_string())]),
+            Self::NumberLessEq(n) => condition("NUMBER_LESS_THAN_EQ", vec![value(n.to_string())]),
+            Self::NumberEq(n) => condition("NUMBER_EQ", vec![value(n.to_string())]),
+            Self::NumberNotEq(n) => condition("NUMBER_NOT_EQ", vec![value(n.to_string())]),
+            Self::TextContains(text) => condition("TEXT_CONTAINS", vec![value(text)]),
+            Self::TextNotContains(text) => condition("TEXT_NOT_CONTAINS", vec![value(text)]),
+            Self::TextStartsWith(text) => condition("TEXT_STARTS_WITH", vec![value(text)]),
+            Self::TextEndsWith(text) => condition("TEXT_ENDS_WITH", vec![value(text)]),
+            Self::TextEq(text) => condition("TEXT_EQ", vec![value(text)]),
+            Self::DateAfter(date) => condition("DATE_AFTER", vec![date.into_condition_value()]),
+            Self::DateBefore(date) => condition("DATE_BEFORE", vec![date.into_condition_value()]),
+            Self::DateOn(date) => condition("DATE_EQ", vec![date.into_condition_value()]),
+            Self::DateBetween(start, end) => {
+                condition("DATE_BETWEEN", vec![value(start), value(end)])
+            }
+            Self::Blank => condition("BLANK", Vec::new()),
+            Self::NotBlank => condition("NOT_BLANK", Vec::new()),
+            Self::Checkbox => condition("BOOLEAN", Vec::new()),
+            Self::CustomFormula(formula) => condition("CUSTOM_FORMULA", vec![value(formula)]),
         }
     }
 
@@ -89,7 +248,26 @@ impl Condition {
     const fn log_type(&self) -> &'static str {
         match self {
             Self::OneOfList(_) => "ONE_OF_LIST",
+            Self::OneOfRange(_) => "ONE_OF_RANGE",
             Self::NumberBetween(..) => "NUMBER_BETWEEN",
+            Self::NumberNotBetween(..) => "NUMBER_NOT_BETWEEN",
+            Self::NumberGreater(_) => "NUMBER_GREATER",
+            Self::NumberGreaterEq(_) => "NUMBER_GREATER_THAN_EQ",
+            Self::NumberLess(_) => "NUMBER_LESS",
+            Self::NumberLessEq(_) => "NUMBER_LESS_THAN_EQ",
+            Self::NumberEq(_) => "NUMBER_EQ",
+            Self::NumberNotEq(_) => "NUMBER_NOT_EQ",
+            Self::TextContains(_) => "TEXT_CONTAINS",
+            Self::TextNotContains(_) => "TEXT_NOT_CONTAINS",
+            Self::TextStartsWith(_) => "TEXT_STARTS_WITH",
+            Self::TextEndsWith(_) => "TEXT_ENDS_WITH",
+            Self::TextEq(_) => "TEXT_EQ",
+            Self::DateAfter(_) => "DATE_AFTER",
+            Self::DateBefore(_) => "DATE_BEFORE",
+            Self::DateOn(_) => "DATE_EQ",
+            Self::DateBetween(..) => "DATE_BETWEEN",
+            Self::Blank => "BLANK",
+            Self::NotBlank => "NOT_BLANK",
             Self::Checkbox => "BOOLEAN",
             Self::CustomFormula(_) => "CUSTOM_FORMULA",
         }
@@ -478,32 +656,81 @@ fn validate_condition(condition: &Condition) -> Result<(), String> {
     // Exhaustive over `Condition`: a new variant forces a new arm here at
     // compile time, rather than silently falling through unvalidated.
     match condition {
-        Condition::OneOfList(items) => {
-            if items.is_empty() {
-                Err("--one-of-list needs at least one value".to_string())
+        Condition::OneOfList(items) => reject_empty_list(items, "--one-of-list"),
+        Condition::OneOfRange(range) => a1::compose(None, Some(range))
+            .map(|_| ())
+            .map_err(|err| format!("--one-of-range: {err:#}")),
+        Condition::NumberBetween(min, max) => reject_reversed_range(*min, *max, "--number-between"),
+        Condition::NumberNotBetween(min, max) => {
+            reject_reversed_range(*min, *max, "--number-not-between")
+        }
+        Condition::NumberGreater(n) => reject_nan(*n, "--number-greater"),
+        Condition::NumberGreaterEq(n) => reject_nan(*n, "--number-greater-eq"),
+        Condition::NumberLess(n) => reject_nan(*n, "--number-less"),
+        Condition::NumberLessEq(n) => reject_nan(*n, "--number-less-eq"),
+        Condition::NumberEq(n) => reject_nan(*n, "--number-eq"),
+        Condition::NumberNotEq(n) => reject_nan(*n, "--number-not-eq"),
+        Condition::TextContains(text) => reject_blank(text, "--text-contains"),
+        Condition::TextNotContains(text) => reject_blank(text, "--text-not-contains"),
+        Condition::TextStartsWith(text) => reject_blank(text, "--text-starts-with"),
+        Condition::TextEndsWith(text) => reject_blank(text, "--text-ends-with"),
+        Condition::TextEq(text) => reject_blank(text, "--text-eq"),
+        Condition::DateAfter(date) => reject_blank_date(date, "--date-after"),
+        Condition::DateBefore(date) => reject_blank_date(date, "--date-before"),
+        Condition::DateOn(date) => reject_blank_date(date, "--date-on"),
+        Condition::DateBetween(start, end) => {
+            if start.trim().is_empty() || end.trim().is_empty() {
+                Err("--date-between's values must not be empty".to_string())
             } else {
                 Ok(())
             }
         }
-        Condition::NumberBetween(min, max) => {
-            // `NaN > x` and `x > NaN` are both `false`, so a NaN bound must
-            // be checked explicitly or it silently reaches the API.
-            if min.is_nan() || max.is_nan() || min > max {
-                Err(format!(
-                    "--number-between's first value ({min}) must not exceed the second ({max})"
-                ))
-            } else {
-                Ok(())
-            }
-        }
-        Condition::Checkbox => Ok(()),
-        Condition::CustomFormula(formula) => {
-            if formula.trim().is_empty() {
-                Err("--custom-formula must not be empty".to_string())
-            } else {
-                Ok(())
-            }
-        }
+        Condition::Blank | Condition::NotBlank | Condition::Checkbox => Ok(()),
+        Condition::CustomFormula(formula) => reject_blank(formula, "--custom-formula"),
+    }
+}
+
+fn reject_empty_list(items: &[String], flag: &str) -> Result<(), String> {
+    if items.is_empty() {
+        Err(format!("{flag} needs at least one value"))
+    } else {
+        Ok(())
+    }
+}
+
+/// `NaN > x` and `x > NaN` are both `false`, so a NaN bound must be checked
+/// explicitly or it silently reaches the API.
+fn reject_reversed_range(min: f64, max: f64, flag: &str) -> Result<(), String> {
+    if min.is_nan() || max.is_nan() || min > max {
+        Err(format!(
+            "{flag}'s first value ({min}) must not exceed the second ({max})"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_nan(n: f64, flag: &str) -> Result<(), String> {
+    if n.is_nan() {
+        Err(format!("{flag} must not be NaN"))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_blank(text: &str, flag: &str) -> Result<(), String> {
+    if text.trim().is_empty() {
+        Err(format!("{flag} must not be empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_blank_date(date: &DateValue, flag: &str) -> Result<(), String> {
+    if date.is_blank() {
+        Err(format!("{flag} must not be empty"))
+    } else {
+        Ok(())
     }
 }
 
@@ -678,7 +905,18 @@ mod tests {
         let built = condition.into_boolean_condition();
         assert_eq!(built.condition_type, "ONE_OF_LIST");
         assert_eq!(built.values.len(), 2);
-        assert_eq!(built.values[0].user_entered_value, "a");
+        assert_eq!(built.values[0].user_entered_value, Some("a".to_string()));
+    }
+
+    #[test]
+    fn one_of_range_builds_a_single_value() {
+        let condition = Condition::OneOfRange("Sheet2!A1:A10".to_string());
+        let built = condition.into_boolean_condition();
+        assert_eq!(built.condition_type, "ONE_OF_RANGE");
+        assert_eq!(
+            built.values[0].user_entered_value,
+            Some("Sheet2!A1:A10".to_string())
+        );
     }
 
     #[test]
@@ -686,8 +924,136 @@ mod tests {
         let condition = Condition::NumberBetween(1.0, 10.0);
         let built = condition.into_boolean_condition();
         assert_eq!(built.condition_type, "NUMBER_BETWEEN");
-        assert_eq!(built.values[0].user_entered_value, "1");
-        assert_eq!(built.values[1].user_entered_value, "10");
+        assert_eq!(built.values[0].user_entered_value, Some("1".to_string()));
+        assert_eq!(built.values[1].user_entered_value, Some("10".to_string()));
+    }
+
+    #[test]
+    fn number_not_between_builds_two_values() {
+        let condition = Condition::NumberNotBetween(1.0, 10.0);
+        let built = condition.into_boolean_condition();
+        assert_eq!(built.condition_type, "NUMBER_NOT_BETWEEN");
+        assert_eq!(built.values.len(), 2);
+    }
+
+    #[test]
+    fn numeric_comparators_build_a_single_value_each() {
+        let cases = [
+            (Condition::NumberGreater(1.0), "NUMBER_GREATER"),
+            (Condition::NumberGreaterEq(1.0), "NUMBER_GREATER_THAN_EQ"),
+            (Condition::NumberLess(1.0), "NUMBER_LESS"),
+            (Condition::NumberLessEq(1.0), "NUMBER_LESS_THAN_EQ"),
+            (Condition::NumberEq(1.0), "NUMBER_EQ"),
+            (Condition::NumberNotEq(1.0), "NUMBER_NOT_EQ"),
+        ];
+        for (condition, expected_type) in cases {
+            let built = condition.into_boolean_condition();
+            assert_eq!(built.condition_type, expected_type);
+            assert_eq!(
+                built.values,
+                vec![ConditionValue {
+                    user_entered_value: Some("1".to_string()),
+                    relative_date: None,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn text_conditions_build_a_single_value_each() {
+        let cases = [
+            (Condition::TextContains("x".to_string()), "TEXT_CONTAINS"),
+            (
+                Condition::TextNotContains("x".to_string()),
+                "TEXT_NOT_CONTAINS",
+            ),
+            (
+                Condition::TextStartsWith("x".to_string()),
+                "TEXT_STARTS_WITH",
+            ),
+            (Condition::TextEndsWith("x".to_string()), "TEXT_ENDS_WITH"),
+            (Condition::TextEq("x".to_string()), "TEXT_EQ"),
+        ];
+        for (condition, expected_type) in cases {
+            let built = condition.into_boolean_condition();
+            assert_eq!(built.condition_type, expected_type);
+            assert_eq!(built.values[0].user_entered_value, Some("x".to_string()));
+        }
+    }
+
+    #[test]
+    fn date_conditions_build_an_absolute_value() {
+        let cases = [
+            (
+                Condition::DateAfter(DateValue::Absolute("2024-01-01".to_string())),
+                "DATE_AFTER",
+            ),
+            (
+                Condition::DateBefore(DateValue::Absolute("2024-01-01".to_string())),
+                "DATE_BEFORE",
+            ),
+            (
+                Condition::DateOn(DateValue::Absolute("2024-01-01".to_string())),
+                "DATE_EQ",
+            ),
+        ];
+        for (condition, expected_type) in cases {
+            let built = condition.into_boolean_condition();
+            assert_eq!(built.condition_type, expected_type);
+            assert_eq!(
+                built.values[0].user_entered_value,
+                Some("2024-01-01".to_string())
+            );
+            assert_eq!(built.values[0].relative_date, None);
+        }
+    }
+
+    #[test]
+    fn date_condition_builds_a_relative_value() {
+        let condition = Condition::DateAfter(DateValue::parse("today".to_string()));
+        let built = condition.into_boolean_condition();
+        assert_eq!(built.condition_type, "DATE_AFTER");
+        assert_eq!(built.values[0].user_entered_value, None);
+        assert_eq!(built.values[0].relative_date, Some("TODAY".to_string()));
+    }
+
+    #[test]
+    fn date_value_parse_is_case_and_separator_insensitive() {
+        for input in ["past-week", "PAST_WEEK", "Past Week"] {
+            assert!(matches!(
+                DateValue::parse(input.to_string()),
+                DateValue::Relative(RelativeDate::PastWeek)
+            ));
+        }
+        assert!(matches!(
+            DateValue::parse("2024-01-01".to_string()),
+            DateValue::Absolute(s) if s == "2024-01-01"
+        ));
+    }
+
+    #[test]
+    fn date_between_builds_two_absolute_values() {
+        let condition = Condition::DateBetween("2024-01-01".to_string(), "2024-12-31".to_string());
+        let built = condition.into_boolean_condition();
+        assert_eq!(built.condition_type, "DATE_BETWEEN");
+        assert_eq!(built.values.len(), 2);
+    }
+
+    #[test]
+    fn blank_and_not_blank_have_no_values() {
+        assert_eq!(
+            Condition::Blank.into_boolean_condition().condition_type,
+            "BLANK"
+        );
+        assert!(Condition::Blank.into_boolean_condition().values.is_empty());
+        assert_eq!(
+            Condition::NotBlank.into_boolean_condition().condition_type,
+            "NOT_BLANK"
+        );
+        assert!(Condition::NotBlank
+            .into_boolean_condition()
+            .values
+            .is_empty());
     }
 
     #[test]
@@ -703,14 +1069,36 @@ mod tests {
         let built = condition.into_boolean_condition();
         assert_eq!(built.condition_type, "CUSTOM_FORMULA");
         assert_eq!(built.values.len(), 1);
-        assert_eq!(built.values[0].user_entered_value, "=A1>0");
+        assert_eq!(
+            built.values[0].user_entered_value,
+            Some("=A1>0".to_string())
+        );
     }
 
     #[test]
     fn log_type_covers_every_condition() {
         let types = [
             Condition::OneOfList(vec!["a".to_string()]).log_type(),
+            Condition::OneOfRange("A1:A10".to_string()).log_type(),
             Condition::NumberBetween(1.0, 2.0).log_type(),
+            Condition::NumberNotBetween(1.0, 2.0).log_type(),
+            Condition::NumberGreater(1.0).log_type(),
+            Condition::NumberGreaterEq(1.0).log_type(),
+            Condition::NumberLess(1.0).log_type(),
+            Condition::NumberLessEq(1.0).log_type(),
+            Condition::NumberEq(1.0).log_type(),
+            Condition::NumberNotEq(1.0).log_type(),
+            Condition::TextContains("x".to_string()).log_type(),
+            Condition::TextNotContains("x".to_string()).log_type(),
+            Condition::TextStartsWith("x".to_string()).log_type(),
+            Condition::TextEndsWith("x".to_string()).log_type(),
+            Condition::TextEq("x".to_string()).log_type(),
+            Condition::DateAfter(DateValue::Absolute("d".to_string())).log_type(),
+            Condition::DateBefore(DateValue::Absolute("d".to_string())).log_type(),
+            Condition::DateOn(DateValue::Absolute("d".to_string())).log_type(),
+            Condition::DateBetween("a".to_string(), "b".to_string()).log_type(),
+            Condition::Blank.log_type(),
+            Condition::NotBlank.log_type(),
             Condition::Checkbox.log_type(),
             Condition::CustomFormula("=TRUE".to_string()).log_type(),
         ];
@@ -806,6 +1194,86 @@ mod tests {
     fn validate_condition_rejects_a_blank_custom_formula() {
         let err = validate_condition(&Condition::CustomFormula("   ".to_string())).unwrap_err();
         assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_condition_accepts_a_valid_one_of_range() {
+        validate_condition(&Condition::OneOfRange("Sheet2!A1:A10".to_string())).unwrap();
+    }
+
+    #[test]
+    fn validate_condition_rejects_a_blank_one_of_range() {
+        validate_condition(&Condition::OneOfRange(String::new())).unwrap_err();
+    }
+
+    #[test]
+    fn validate_condition_accepts_a_valid_number_not_between() {
+        validate_condition(&Condition::NumberNotBetween(1.0, 10.0)).unwrap();
+    }
+
+    #[test]
+    fn validate_condition_rejects_a_reversed_number_not_between() {
+        let err = validate_condition(&Condition::NumberNotBetween(10.0, 1.0)).unwrap_err();
+        assert!(err.contains("must not exceed"), "{err}");
+    }
+
+    #[test]
+    fn validate_condition_rejects_a_nan_comparator() {
+        let err = validate_condition(&Condition::NumberGreater(f64::NAN)).unwrap_err();
+        assert!(err.contains("must not be NaN"), "{err}");
+    }
+
+    #[test]
+    fn validate_condition_accepts_a_numeric_comparator() {
+        validate_condition(&Condition::NumberEq(1.0)).unwrap();
+    }
+
+    #[test]
+    fn validate_condition_rejects_blank_text() {
+        let err = validate_condition(&Condition::TextContains("  ".to_string())).unwrap_err();
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_condition_accepts_non_blank_text() {
+        validate_condition(&Condition::TextEq("x".to_string())).unwrap();
+    }
+
+    #[test]
+    fn validate_condition_rejects_a_blank_absolute_date() {
+        let err = validate_condition(&Condition::DateAfter(DateValue::Absolute("  ".to_string())))
+            .unwrap_err();
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_condition_accepts_a_relative_date() {
+        validate_condition(&Condition::DateAfter(DateValue::parse("today".to_string()))).unwrap();
+    }
+
+    #[test]
+    fn validate_condition_accepts_a_valid_date_between() {
+        validate_condition(&Condition::DateBetween(
+            "2024-01-01".to_string(),
+            "2024-12-31".to_string(),
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_condition_rejects_a_blank_date_between_bound() {
+        let err = validate_condition(&Condition::DateBetween(
+            "2024-01-01".to_string(),
+            "  ".to_string(),
+        ))
+        .unwrap_err();
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_condition_accepts_blank_and_not_blank() {
+        validate_condition(&Condition::Blank).unwrap();
+        validate_condition(&Condition::NotBlank).unwrap();
     }
 
     #[test]
@@ -992,6 +1460,112 @@ mod tests {
         let rule = &body["requests"][0]["setDataValidation"]["rule"];
         assert_eq!(rule["condition"]["type"], "ONE_OF_LIST");
         assert_eq!(rule["strict"], true);
+    }
+
+    #[tokio::test]
+    async fn set_data_validation_sends_a_tranche_2_comparator_and_relative_date() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"replies": [{}]})),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ValidationVerb::SetDataValidation {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A10".to_string()),
+                condition: Condition::NumberGreater(0.0),
+                input_message: None,
+                show_warning: false,
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ValidationResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let batch = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+        let rule = &body["requests"][0]["setDataValidation"]["rule"];
+        assert_eq!(rule["condition"]["type"], "NUMBER_GREATER");
+        assert_eq!(rule["condition"]["values"][0]["userEnteredValue"], "0");
+        assert!(rule["condition"]["values"][0]["relativeDate"].is_null());
+    }
+
+    #[tokio::test]
+    async fn set_data_validation_sends_a_relative_date_condition_without_user_entered_value() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"replies": [{}]})),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ValidationVerb::SetDataValidation {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A10".to_string()),
+                condition: Condition::DateAfter(DateValue::parse("today".to_string())),
+                input_message: None,
+                show_warning: false,
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, ValidationResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let batch = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+        let rule = &body["requests"][0]["setDataValidation"]["rule"];
+        assert_eq!(rule["condition"]["type"], "DATE_AFTER");
+        assert_eq!(rule["condition"]["values"][0]["relativeDate"], "TODAY");
+        assert!(rule["condition"]["values"][0]["userEnteredValue"].is_null());
     }
 
     #[tokio::test]
