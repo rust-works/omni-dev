@@ -333,4 +333,135 @@ mod tests {
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
+
+    #[tokio::test]
+    async fn list_named_ranges_yaml_output_short_circuits_before_printing_lines() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1"}}],
+                    "namedRanges": [],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListNamedRangesCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: crate::cli::drive::format::OutputFormat::Yaml,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    /// Mounts a Drive-file/parent-folder pair with no write-permission rules
+    /// configured (`active_account_rules()` reads an unconfigured account —
+    /// see `client_with_bootstrapped_token`'s `EnvGuard::clear_credentials`
+    /// caller), so the gate refuses by default policy. That's enough to
+    /// drive `Add`/`Update`/`DeleteNamedRangeCommand::execute` (and thus
+    /// `run_named_range`) through their full CLI-level path — building
+    /// `NamedRangeOptions`, calling `named_range`, and rendering the
+    /// `describe_lines` output — without needing a lease or a workbook
+    /// fetch, which a `Blocked` verdict never reaches.
+    async fn mount_ungated_target(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1",
+                    "name": "Budget",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": ["folder-1"],
+                })),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1",
+                    "name": "folder-1",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [],
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn add_named_range_command_runs_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let cmd = AddNamedRangeCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            name: "Foo".to_string(),
+            range: Some("A1:A5".to_string()),
+            sheet: Some("Q1".to_string()),
+            whole_sheet: false,
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_named_range_command_runs_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let cmd = UpdateNamedRangeCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            name: "Foo".to_string(),
+            new_name: Some("Bar".to_string()),
+            range: None,
+            sheet: None,
+            whole_sheet: false,
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_named_range_command_runs_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let cmd = DeleteNamedRangeCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            name: "Foo".to_string(),
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Yaml,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
 }

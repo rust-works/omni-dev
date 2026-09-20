@@ -457,6 +457,7 @@ async fn named_range_inner(
     let (request, existing_id) = match &opts.verb {
         NamedRangeVerb::AddNamedRange { name, .. } => {
             let Some(grid) = new_grid else {
+                // omni-dev: coverage ignore-line reason="new_grid is always Some for AddNamedRange: resolve_grid above either returns it or refuses and returns early"
                 unreachable!("new_grid is resolved for AddNamedRange above")
             };
             (
@@ -472,6 +473,7 @@ async fn named_range_inner(
         }
         NamedRangeVerb::UpdateNamedRange { new_name, .. } => {
             let Some(existing) = existing else {
+                // omni-dev: coverage ignore-line reason="existing is always Some for UpdateNamedRange: find_existing_named_range above either returns it or refuses and returns early"
                 unreachable!("existing is resolved for UpdateNamedRange above")
             };
             (
@@ -483,6 +485,7 @@ async fn named_range_inner(
         }
         NamedRangeVerb::DeleteNamedRange { .. } => {
             let Some(existing) = existing else {
+                // omni-dev: coverage ignore-line reason="existing is always Some for DeleteNamedRange: find_existing_named_range above either returns it or refuses and returns early"
                 unreachable!("existing is resolved for DeleteNamedRange above")
             };
             let id = existing.named_range_id.clone();
@@ -1427,5 +1430,731 @@ mod tests {
             }
             other => panic!("expected Changed, got {other:?}"),
         }
+    }
+
+    // ── describe/describe_lines/describe_effect (pure) ─────────────────
+
+    fn outcome_with(
+        verb: NamedRangeVerb,
+        file_name: Option<&str>,
+        result: NamedRangeResult,
+    ) -> NamedRangeOutcome {
+        NamedRangeOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: file_name.map(str::to_string),
+            resolved_folder_id: None,
+            verb,
+            result,
+        }
+    }
+
+    fn add_verb() -> NamedRangeVerb {
+        NamedRangeVerb::AddNamedRange {
+            name: "Foo".to_string(),
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:A5".to_string()),
+            whole_sheet: false,
+        }
+    }
+
+    fn update_verb() -> NamedRangeVerb {
+        NamedRangeVerb::UpdateNamedRange {
+            name: "Foo".to_string(),
+            new_name: Some("Bar".to_string()),
+            sheet: None,
+            range: None,
+            whole_sheet: false,
+        }
+    }
+
+    fn delete_verb() -> NamedRangeVerb {
+        NamedRangeVerb::DeleteNamedRange {
+            name: "Foo".to_string(),
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_would_change_with_and_without_referencing_formulas() {
+        let none = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            NamedRangeResult::WouldChange {
+                summary: "add named range 'Foo'".to_string(),
+                referencing_formulas: Vec::new(),
+            },
+        );
+        assert_eq!(describe(&none), "Would add named range 'Foo' in 'Budget'");
+
+        let some = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            NamedRangeResult::WouldChange {
+                summary: "delete named range 'Foo'".to_string(),
+                referencing_formulas: vec!["'Q1'!A1".to_string(), "'Q2'!B2".to_string()],
+            },
+        );
+        let text = describe(&some);
+        assert!(
+            text.contains("2 cell formula(s) reference this name"),
+            "{text}"
+        );
+        assert!(text.contains("  'Q1'!A1"), "{text}");
+        assert!(text.contains("  'Q2'!B2"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_not_a_spreadsheet_with_no_file_name() {
+        let out = outcome_with(
+            add_verb(),
+            None,
+            NamedRangeResult::RefusedNotASpreadsheet {
+                mime_type: "text/plain".to_string(),
+            },
+        );
+        let text = describe(&out);
+        assert!(text.contains("'sheet-1'"), "{text}");
+        assert!(text.contains("add-named-range"), "{text}");
+        assert!(text.contains("text/plain"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_shortcut() {
+        let out = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            NamedRangeResult::RefusedShortcut,
+        );
+        let text = describe(&out);
+        assert!(text.contains("shortcut"), "{text}");
+        assert!(text.contains("delete-named-range"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_no_visible_parents() {
+        let out = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            NamedRangeResult::RefusedNoVisibleParents,
+        );
+        assert!(describe(&out).contains("sheets-structure"));
+    }
+
+    #[test]
+    fn describe_lines_renders_sheet_not_found_with_and_without_available_titles() {
+        let none = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            NamedRangeResult::RefusedSheetNotFound {
+                title: "Q2".to_string(),
+                available: Vec::new(),
+            },
+        );
+        assert!(describe(&none).contains("Available: none"));
+
+        let some = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            NamedRangeResult::RefusedSheetNotFound {
+                title: "Q2".to_string(),
+                available: vec!["Q1".to_string(), "Q3".to_string()],
+            },
+        );
+        assert!(describe(&some).contains("'Q1', 'Q3'"));
+    }
+
+    #[test]
+    fn describe_lines_renders_invalid_range_and_not_found() {
+        let invalid = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            NamedRangeResult::RefusedInvalidRange {
+                detail: "bad range".to_string(),
+            },
+        );
+        assert_eq!(describe(&invalid), "Refused: bad range");
+
+        let not_found = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            NamedRangeResult::RefusedNotFound {
+                name: "Foo".to_string(),
+            },
+        );
+        let text = describe(&not_found);
+        assert!(text.contains("no named range 'Foo'"), "{text}");
+        assert!(text.contains("list-named-ranges"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_blocked_with_and_without_a_deciding_rule() {
+        let folder_rule = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            NamedRangeResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 2,
+                }),
+            },
+        );
+        let text = describe(&folder_rule);
+        assert!(text.contains("update-named-range"), "{text}");
+        assert!(text.contains("folder folder-1 (depth 2)"), "{text}");
+
+        let default_policy = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            NamedRangeResult::Blocked { decided_by: None },
+        );
+        assert!(describe(&default_policy).contains("default policy"));
+    }
+
+    #[test]
+    fn describe_lines_renders_every_lease_refusal() {
+        for (result, needle) in [
+            (
+                NamedRangeResult::RefusedNoLease,
+                "requires a Drive write lease",
+            ),
+            (
+                NamedRangeResult::RefusedLeaseExpired,
+                "expired, released, or unknown",
+            ),
+            (
+                NamedRangeResult::RefusedLeaseWrongFile,
+                "acquired for a different file",
+            ),
+            (
+                NamedRangeResult::RefusedLeaseStale,
+                "changed since the lease was acquired",
+            ),
+        ] {
+            let out = outcome_with(add_verb(), Some("Budget"), result);
+            let text = describe(&out);
+            assert!(text.contains(needle), "{text}");
+            assert!(text.contains("drive lease acquire sheet-1"), "{text}");
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_changed_with_and_without_an_id_and_formulas() {
+        let with_id = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            NamedRangeResult::Changed {
+                summary: "add named range 'Foo'".to_string(),
+                named_range_id: Some("id-7".to_string()),
+                referencing_formulas: Vec::new(),
+            },
+        );
+        assert!(describe(&with_id).contains("(id id-7)"));
+
+        let without_id = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            NamedRangeResult::Changed {
+                summary: "delete named range 'Foo'".to_string(),
+                named_range_id: None,
+                referencing_formulas: vec!["'Q1'!A1".to_string()],
+            },
+        );
+        let text = describe(&without_id);
+        assert!(!text.contains("(id"), "{text}");
+        assert!(text.contains("1 cell formula(s)"), "{text}");
+        assert!(text.contains("  'Q1'!A1"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_failed() {
+        let out = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            NamedRangeResult::Failed {
+                detail: "boom".to_string(),
+            },
+        );
+        assert_eq!(describe(&out), "Failed: boom");
+    }
+
+    #[test]
+    fn describe_effect_update_without_a_new_name_says_update_not_rename() {
+        let verb = NamedRangeVerb::UpdateNamedRange {
+            name: "Foo".to_string(),
+            new_name: None,
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:A5".to_string()),
+            whole_sheet: false,
+        };
+        assert_eq!(describe_effect(&verb), "update named range 'Foo'");
+    }
+
+    // ── resolve_grid/resolve_optional_grid error branches ──────────────
+
+    #[test]
+    fn resolve_grid_rejects_a_bare_range_with_no_sheet_prefix() {
+        let workbook = workbook_with(Vec::new());
+        let err = resolve_grid(&workbook, None, Some("A1:B2"), false).unwrap_err();
+        assert!(matches!(err, NamedRangeResult::RefusedInvalidRange { .. }));
+    }
+
+    #[test]
+    fn resolve_grid_rejects_neither_sheet_nor_range() {
+        let workbook = workbook_with(Vec::new());
+        let err = resolve_grid(&workbook, None, None, false).unwrap_err();
+        assert!(matches!(err, NamedRangeResult::RefusedInvalidRange { .. }));
+    }
+
+    #[test]
+    fn resolve_grid_reports_sheet_not_found_for_a_prefixed_range() {
+        let workbook = workbook_with(Vec::new());
+        let err = resolve_grid(&workbook, Some("Nope"), Some("A1:B2"), false).unwrap_err();
+        assert!(
+            matches!(err, NamedRangeResult::RefusedSheetNotFound { title, .. } if title == "Nope")
+        );
+    }
+
+    #[test]
+    fn resolve_grid_reports_sheet_not_found_for_whole_sheet() {
+        let workbook = workbook_with(Vec::new());
+        let err = resolve_grid(&workbook, Some("Nope"), None, true).unwrap_err();
+        assert!(
+            matches!(err, NamedRangeResult::RefusedSheetNotFound { title, .. } if title == "Nope")
+        );
+    }
+
+    // ── scan_referencing_formulas edge cases ───────────────────────────
+
+    #[tokio::test]
+    async fn scan_referencing_formulas_with_no_sheets_makes_no_api_call() {
+        let server = wiremock::MockServer::start().await;
+        let (_drive, sheets) = clients(&server).await;
+        let api = SheetsApi::new(&sheets);
+        let workbook = Spreadsheet::default();
+        let locations = scan_referencing_formulas(&api, "sheet-1", &workbook, "Foo")
+            .await
+            .unwrap();
+        assert!(locations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_referencing_formulas_skips_untitled_ranges_and_non_string_cells() {
+        let server = wiremock::MockServer::start().await;
+        let (_drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values:batchGet",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "valueRanges": [
+                        // No sheet prefix at all: `sheet_title_of` resolves
+                        // to `None` and this range must be skipped rather
+                        // than panicking on the missing title.
+                        {"range": "A1:Z1000", "values": [["=SUM(Foo)"]]},
+                        {"range": "Q1!A1:Z1000", "values": [[42, "=SUM(Foo)"]]},
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let api = SheetsApi::new(&sheets);
+        let workbook = workbook_with(Vec::new());
+        let locations = scan_referencing_formulas(&api, "sheet-1", &workbook, "Foo")
+            .await
+            .unwrap();
+        assert_eq!(locations, vec!["'Q1'!B1".to_string()]);
+    }
+
+    // ── target-gate refusals reached through named_range() ─────────────
+
+    #[tokio::test]
+    async fn a_metadata_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, NamedRangeResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_shortcut_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.shortcut",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, NamedRangeResult::RefusedShortcut));
+    }
+
+    #[tokio::test]
+    async fn a_non_spreadsheet_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.document",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            NamedRangeResult::RefusedNotASpreadsheet { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_target_with_no_visible_parents_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", crate::drive::types::GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            NamedRangeResult::RefusedNoVisibleParents
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gate_ancestor_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, NamedRangeResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_workbook_fetch_failure_after_a_granted_gate_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, NamedRangeResult::Failed { .. }));
+    }
+
+    // ── the Drive write lease (ADR-0080 §9) ────────────────────────────
+
+    #[tokio::test]
+    async fn refuses_without_a_lease_when_the_rule_requires_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, NamedRangeResult::RefusedNoLease));
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: Some("bogus-token".to_string()),
+            ledger_path,
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            NamedRangeResult::RefusedLeaseExpired
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_lease_bound_to_a_different_file() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "some-other-sheet", "1");
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            NamedRangeResult::RefusedLeaseWrongFile
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_stale_lease_when_the_file_has_moved() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            NamedRangeResult::RefusedLeaseStale
+        ));
+    }
+
+    // ── update-named-range: nothing-to-change and re-pointing errors ───
+
+    #[tokio::test]
+    async fn update_named_range_refuses_when_nothing_is_named_to_change() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([{
+            "namedRangeId": "id-1",
+            "name": "Foo",
+            "range": {"sheetId": 0},
+        }]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: NamedRangeVerb::UpdateNamedRange {
+                name: "Foo".to_string(),
+                new_name: None,
+                sheet: None,
+                range: None,
+                whole_sheet: false,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            NamedRangeResult::RefusedInvalidRange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_named_range_reports_sheet_not_found_when_re_pointing() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([{
+            "namedRangeId": "id-1",
+            "name": "Foo",
+            "range": {"sheetId": 0},
+        }]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: NamedRangeVerb::UpdateNamedRange {
+                name: "Foo".to_string(),
+                new_name: None,
+                sheet: Some("Missing".to_string()),
+                range: None,
+                whole_sheet: true,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            NamedRangeResult::RefusedSheetNotFound { .. }
+        ));
+    }
+
+    // ── a real batchUpdate rejection surfaces as Failed ────────────────
+
+    #[tokio::test]
+    async fn a_batch_update_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, NamedRangeResult::Failed { .. }));
     }
 }
