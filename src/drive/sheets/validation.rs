@@ -40,7 +40,10 @@ use crate::drive::lease::check::{
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
-use crate::drive::sheets::date_value::{DateValue, RelativeDate};
+use crate::drive::sheets::date_value::{
+    reject_blank, reject_blank_date, reject_empty, reject_invalid_date_between, reject_nan,
+    reject_reversed_range, DateValue,
+};
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
@@ -596,85 +599,6 @@ fn reject_empty_list(items: &[String], flag: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
-}
-
-/// `NaN > x` and `x > NaN` are both `false`, so a NaN bound must be checked
-/// explicitly or it silently reaches the API.
-fn reject_reversed_range(min: f64, max: f64, flag: &str) -> Result<(), String> {
-    if min.is_nan() || max.is_nan() || min > max {
-        Err(format!(
-            "{flag}'s first value ({min}) must not exceed the second ({max})"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_nan(n: f64, flag: &str) -> Result<(), String> {
-    if n.is_nan() {
-        Err(format!("{flag} must not be NaN"))
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_blank(text: &str, flag: &str) -> Result<(), String> {
-    if text.trim().is_empty() {
-        Err(format!("{flag} must not be empty"))
-    } else {
-        Ok(())
-    }
-}
-
-/// Like [`reject_blank`], but only a zero-length string counts as empty — a
-/// whitespace-only value is a meaningful thing to search for.
-fn reject_empty(text: &str, flag: &str) -> Result<(), String> {
-    if text.is_empty() {
-        Err(format!("{flag} must not be empty"))
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_blank_date(date: &DateValue, flag: &str) -> Result<(), String> {
-    if date.is_blank() {
-        Err(format!("{flag} must not be empty"))
-    } else {
-        Ok(())
-    }
-}
-
-/// `--date-between` takes two absolute dates only (see its own doc comment):
-/// unlike the three single-value date flags it never accepts a relative
-/// keyword, so one must be rejected loudly here rather than silently
-/// reaching the API as a literal `userEnteredValue` string. Also mirrors
-/// `reject_reversed_range`'s ordering check for the numeric family, on a
-/// best-effort basis: a bound that doesn't parse as an ISO `YYYY-MM-DD` date
-/// is trusted through untouched, the same trust-the-caller stance the rest
-/// of this file takes for formats Sheets itself will parse at evaluation
-/// time.
-fn reject_invalid_date_between(start: &str, end: &str) -> Result<(), String> {
-    reject_blank(start, "--date-between")?;
-    reject_blank(end, "--date-between")?;
-    if RelativeDate::parse(start).is_some() || RelativeDate::parse(end).is_some() {
-        return Err(
-            "--date-between only accepts absolute dates, not a relative keyword like 'today' \
-             (use --date-after/--date-before/--date-on for those)"
-                .to_string(),
-        );
-    }
-    if let (Some(start_date), Some(end_date)) = (parse_iso_date(start), parse_iso_date(end)) {
-        if start_date > end_date {
-            return Err(format!(
-                "--date-between's first value ({start}) must not be after the second ({end})"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn parse_iso_date(s: &str) -> Option<chrono::NaiveDate> {
-    chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()
 }
 
 fn describe_effect(verb: &ValidationVerb) -> String {
