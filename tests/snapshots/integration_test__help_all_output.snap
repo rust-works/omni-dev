@@ -4737,10 +4737,10 @@ Options:
       --text-rotation-angle <DEGREES>  Rotation angle in degrees, -90 to 90. Mutually exclusive with `--text-rotation-vertical`
       --text-rotation-vertical         Stack text vertically instead of rotating it. Mutually exclusive with `--text-rotation-angle`
       --hyperlink-display-type <TYPE>  How a cell containing a hyperlink is displayed [possible values: linked, plain-text]
-      --padding-top <N>                Top padding, in pixels
-      --padding-right <N>              Right padding, in pixels
-      --padding-bottom <N>             Bottom padding, in pixels
-      --padding-left <N>               Left padding, in pixels
+      --padding-top <N>                Top padding, in pixels. Must be non-negative
+      --padding-right <N>              Right padding, in pixels. Must be non-negative
+      --padding-bottom <N>             Bottom padding, in pixels. Must be non-negative
+      --padding-left <N>               Left padding, in pixels. Must be non-negative
       --text-direction <DIR>           Text direction [possible values: left-to-right, right-to-left]
       --dry-run                        Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>                  The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`

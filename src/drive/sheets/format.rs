@@ -59,6 +59,22 @@ use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
 
+/// The `--text-rotation-angle`/`--text-rotation-vertical` choice.
+///
+/// Unlike two independent `Option` fields, this makes "both set" — the one
+/// invalid state for `CellFormat.textRotation` — unrepresentable, rather
+/// than relying on a runtime check to reject it after the fact. The CLI's
+/// `conflicts_with` on the two flags is what keeps user input flowing into
+/// exactly one variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextRotationFlag {
+    /// Rotation angle in degrees, -90 to 90 ([`build_cell_format`] refuses
+    /// anything outside that range).
+    Angle(i64),
+    /// Stack text vertically instead of rotating it.
+    Vertical,
+}
+
 /// The `CellFormat` flags `format-cells` exposes.
 ///
 /// Every field optional; [`build_cell_format`] refuses an all-`None` set
@@ -96,12 +112,8 @@ pub struct CellFormatFlags {
     pub wrap: Option<String>,
     /// Font family name, e.g. `"Arial"`.
     pub font_family: Option<String>,
-    /// Rotation angle in degrees, -90 to 90. Mutually exclusive with
-    /// `text_rotation_vertical` — [`build_cell_format`] refuses both set.
-    pub text_rotation_angle: Option<i64>,
-    /// Stack text vertically instead of rotating it. Mutually exclusive
-    /// with `text_rotation_angle`.
-    pub text_rotation_vertical: Option<bool>,
+    /// The rotation angle/vertical-stacking choice, if any.
+    pub text_rotation: Option<TextRotationFlag>,
     /// Already wire-shaped (`"LINKED"`/`"PLAIN_TEXT"`).
     pub hyperlink_display_type: Option<String>,
     /// Top padding, in pixels.
@@ -430,6 +442,17 @@ fn parse_hex_color(input: &str) -> Result<crate::drive::sheets::types::Color, St
     })
 }
 
+/// Converts a padding value to the wire's `i32`, rejecting anything that
+/// doesn't fit or is negative — a pixel padding can be neither.
+fn to_padding_i32(value: i64, flag: &str) -> Result<i32, String> {
+    match i32::try_from(value) {
+        Ok(n) if n >= 0 => Ok(n),
+        _ => Err(format!(
+            "{flag} must be a non-negative number that fits in 32 bits, got {value}"
+        )),
+    }
+}
+
 /// Builds the `CellFormat` and its `fields` mask (relative to
 /// `cell.userEnteredFormat`, per `repeatCell`'s own convention) from
 /// exactly the flags populated. Errors if none are, or if only one of
@@ -512,28 +535,25 @@ fn build_cell_format(flags: &CellFormatFlags) -> Result<(CellFormat, String), St
         format.wrap_strategy = Some(wrap.clone());
         fields.push("userEnteredFormat.wrapStrategy");
     }
-    match (flags.text_rotation_angle, flags.text_rotation_vertical) {
-        (Some(_), Some(_)) => {
-            return Err(
-                "--text-rotation-angle and --text-rotation-vertical are mutually exclusive"
-                    .to_string(),
-            )
-        }
-        (Some(angle), None) => {
-            format.text_rotation = Some(TextRotation {
-                angle: Some(angle as i32),
-                vertical: None,
-            });
-            fields.push("userEnteredFormat.textRotation");
-        }
-        (None, Some(vertical)) => {
-            format.text_rotation = Some(TextRotation {
+    if let Some(rotation) = flags.text_rotation {
+        format.text_rotation = Some(match rotation {
+            TextRotationFlag::Angle(angle) => {
+                if !(-90..=90).contains(&angle) {
+                    return Err(format!(
+                        "--text-rotation-angle must be between -90 and 90, got {angle}"
+                    ));
+                }
+                TextRotation {
+                    angle: Some(angle as i32),
+                    vertical: None,
+                }
+            }
+            TextRotationFlag::Vertical => TextRotation {
                 angle: None,
-                vertical: Some(vertical),
-            });
-            fields.push("userEnteredFormat.textRotation");
-        }
-        (None, None) => {}
+                vertical: Some(true),
+            },
+        });
+        fields.push("userEnteredFormat.textRotation");
     }
     if let Some(hyperlink_display_type) = &flags.hyperlink_display_type {
         format.hyperlink_display_type = Some(hyperlink_display_type.clone());
@@ -545,10 +565,22 @@ fn build_cell_format(flags: &CellFormatFlags) -> Result<(CellFormat, String), St
         || flags.padding_left.is_some()
     {
         format.padding = Some(Padding {
-            top: flags.padding_top.map(|n| n as i32),
-            right: flags.padding_right.map(|n| n as i32),
-            bottom: flags.padding_bottom.map(|n| n as i32),
-            left: flags.padding_left.map(|n| n as i32),
+            top: flags
+                .padding_top
+                .map(|n| to_padding_i32(n, "--padding-top"))
+                .transpose()?,
+            right: flags
+                .padding_right
+                .map(|n| to_padding_i32(n, "--padding-right"))
+                .transpose()?,
+            bottom: flags
+                .padding_bottom
+                .map(|n| to_padding_i32(n, "--padding-bottom"))
+                .transpose()?,
+            left: flags
+                .padding_left
+                .map(|n| to_padding_i32(n, "--padding-left"))
+                .transpose()?,
         });
         fields.push("userEnteredFormat.padding");
     }
@@ -839,6 +871,38 @@ fn resolve_target(
                             .map_or(composed, |(_, bare_range)| bare_range)
                     ),
                 });
+            }
+            // Inner grid lines only exist *between* rows/columns within the
+            // range — refuse when the range is positively known (bounded on
+            // that axis) to be too narrow to have one, rather than send a
+            // request that can have no visible effect. An axis left
+            // open-ended (e.g. `A1:A`) almost certainly spans more than one
+            // row/column, so it is let through rather than guessed at.
+            if let FormatVerb::UpdateBorders { sides, .. } = verb {
+                if sides.inner_horizontal
+                    && matches!(
+                        (grid.start_row_index, grid.end_row_index),
+                        (Some(start), Some(end)) if end - start <= 1
+                    )
+                {
+                    return Err(FormatResult::RefusedInvalidRange {
+                        detail: "--inner-horizontal needs a range spanning more than one row; \
+                                 a single row has no interior horizontal grid line"
+                            .to_string(),
+                    });
+                }
+                if sides.inner_vertical
+                    && matches!(
+                        (grid.start_column_index, grid.end_column_index),
+                        (Some(start), Some(end)) if end - start <= 1
+                    )
+                {
+                    return Err(FormatResult::RefusedInvalidRange {
+                        detail: "--inner-vertical needs a range spanning more than one column; \
+                                 a single column has no interior vertical grid line"
+                            .to_string(),
+                    });
+                }
             }
             Ok(ResolvedTarget::Range {
                 sheet_title: title,
@@ -1877,7 +1941,7 @@ mod tests {
             number_format_type: Some("NUMBER".to_string()),
             wrap: Some("WRAP".to_string()),
             font_family: Some("Arial".to_string()),
-            text_rotation_angle: Some(45),
+            text_rotation: Some(TextRotationFlag::Angle(45)),
             hyperlink_display_type: Some("PLAIN_TEXT".to_string()),
             padding_top: Some(1),
             padding_right: Some(2),
@@ -1931,7 +1995,7 @@ mod tests {
     #[test]
     fn build_cell_format_sets_text_rotation_vertical() {
         let flags = CellFormatFlags {
-            text_rotation_vertical: Some(true),
+            text_rotation: Some(TextRotationFlag::Vertical),
             ..Default::default()
         };
         let (format, fields) = build_cell_format(&flags).unwrap();
@@ -1942,14 +2006,43 @@ mod tests {
     }
 
     #[test]
-    fn build_cell_format_rejects_conflicting_text_rotation() {
+    fn build_cell_format_accepts_negative_text_rotation_angle() {
         let flags = CellFormatFlags {
-            text_rotation_angle: Some(45),
-            text_rotation_vertical: Some(true),
+            text_rotation: Some(TextRotationFlag::Angle(-45)),
             ..Default::default()
         };
-        let err = build_cell_format(&flags).unwrap_err();
-        assert!(err.contains("mutually exclusive"), "{err}");
+        let (format, _fields) = build_cell_format(&flags).unwrap();
+        let text_rotation = format.text_rotation.unwrap();
+        assert_eq!(text_rotation.angle, Some(-45));
+    }
+
+    #[test]
+    fn build_cell_format_rejects_out_of_range_text_rotation_angle() {
+        for angle in [91, -91, i64::MAX, i64::MIN] {
+            let flags = CellFormatFlags {
+                text_rotation: Some(TextRotationFlag::Angle(angle)),
+                ..Default::default()
+            };
+            let err = build_cell_format(&flags).unwrap_err();
+            assert!(err.contains("-90 and 90"), "{angle}: {err}");
+        }
+    }
+
+    #[test]
+    fn build_cell_format_rejects_out_of_range_padding() {
+        for flags in [
+            CellFormatFlags {
+                padding_top: Some(-1),
+                ..Default::default()
+            },
+            CellFormatFlags {
+                padding_top: Some(i64::from(i32::MAX) + 1),
+                ..Default::default()
+            },
+        ] {
+            let err = build_cell_format(&flags).unwrap_err();
+            assert!(err.contains("--padding-top"), "{err}");
+        }
     }
 
     // ── build_request: defensive unreachable branches ────────────────────
@@ -2441,6 +2534,76 @@ mod tests {
         match outcome.result {
             FormatResult::RefusedInvalidRange { detail } => {
                 assert!(detail.contains("at least one side"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_borders_refuses_inner_horizontal_on_a_single_row() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let verb = FormatVerb::UpdateBorders {
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:B1".to_string()),
+            sides: BorderSides {
+                inner_horizontal: true,
+                ..Default::default()
+            },
+            style: "SOLID".to_string(),
+            color: None,
+        };
+
+        let outcome = format(&drive, &sheets, &opts(verb, false), &rules).await;
+        match outcome.result {
+            FormatResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("--inner-horizontal"), "{detail}");
+                assert!(detail.contains("more than one row"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_borders_refuses_inner_vertical_on_a_single_column() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let verb = FormatVerb::UpdateBorders {
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:A2".to_string()),
+            sides: BorderSides {
+                inner_vertical: true,
+                ..Default::default()
+            },
+            style: "SOLID".to_string(),
+            color: None,
+        };
+
+        let outcome = format(&drive, &sheets, &opts(verb, false), &rules).await;
+        match outcome.result {
+            FormatResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("--inner-vertical"), "{detail}");
+                assert!(detail.contains("more than one column"), "{detail}");
             }
             other => panic!("expected RefusedInvalidRange, got {other:?}"),
         }
