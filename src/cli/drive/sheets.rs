@@ -3,8 +3,8 @@
 //! its *structure* via `spreadsheets.batchUpdate` (issue #1613),
 //! *destructively* editing it the same way (issue #1623), and applying
 //! formatting, data validation and protected ranges (issue #1643), the
-//! basic filter and filter views (issue #1794), and conditional formatting
-//! rules (issue #1793).
+//! basic filter and filter views (issue #1794), conditional formatting
+//! rules (issue #1793), and charts and slicers (issue #1797).
 //!
 //! Nested under `drive` rather than given its own top-level tree so it
 //! inherits `--account` resolution, the `auth` commands and the write-
@@ -14,6 +14,7 @@
 pub(crate) mod conditional_format;
 pub(crate) mod create;
 pub(crate) mod developer_metadata;
+pub(crate) mod embedded_object;
 pub(crate) mod filter;
 pub(crate) mod format;
 pub(crate) mod info;
@@ -213,6 +214,40 @@ pub enum SheetsSubcommands {
     /// Lists the named ranges in a spreadsheet. Read-only and ungated, like
     /// `sheets list-protections` (issue #1796).
     ListNamedRanges(named_range::ListNamedRangesCommand),
+    /// Adds a chart. Gated by the folder write-permission rules'
+    /// `sheets-structure` operation (issue #1797, ADR-0081 §3).
+    ///
+    /// Boxed for the same `clippy::large_enum_variant` reason as
+    /// `SetDataValidation` (#1792): the chart-spec flag set is wide.
+    AddChart(Box<embedded_object::AddChartCommand>),
+    /// Replaces an existing chart's spec wholesale — `updateChartSpec`
+    /// carries no field mask. Gated by the folder write-permission rules'
+    /// `sheets-structure` operation (issue #1797, ADR-0081 §3).
+    UpdateChart(Box<embedded_object::UpdateChartCommand>),
+    /// Removes a chart, after reporting its spec (type, title, anchor).
+    /// Gated by the folder write-permission rules' `sheets-structure`
+    /// operation (issue #1797, ADR-0081 §3) — not `sheets-delete`; see that
+    /// ADR section for why an unrecoverable embedded-object removal still
+    /// sits here. Cannot be undone through omni-dev.
+    DeleteChart(embedded_object::DeleteChartCommand),
+    /// Lists the charts in a spreadsheet. Read-only and ungated, like
+    /// `list-protections` (issue #1797).
+    ListCharts(embedded_object::ListChartsCommand),
+    /// Adds a slicer. Gated by the folder write-permission rules'
+    /// `sheets-structure` operation (issue #1797, ADR-0081 §3).
+    AddSlicer(embedded_object::AddSlicerCommand),
+    /// Changes an existing slicer's range, filter column/criteria, title,
+    /// or pivot-table linkage. Gated by the folder write-permission rules'
+    /// `sheets-structure` operation (issue #1797, ADR-0081 §3).
+    UpdateSlicer(embedded_object::UpdateSlicerCommand),
+    /// Removes a slicer, after reporting its spec. Gated by the folder
+    /// write-permission rules' `sheets-structure` operation (issue #1797,
+    /// ADR-0081 §3) — not `sheets-delete`. Cannot be undone through
+    /// omni-dev.
+    DeleteSlicer(embedded_object::DeleteSlicerCommand),
+    /// Lists the slicers in a spreadsheet. Read-only and ungated, like
+    /// `list-protections` (issue #1797).
+    ListSlicers(embedded_object::ListSlicersCommand),
 }
 
 impl SheetsCommand {
@@ -271,6 +306,14 @@ impl SheetsCommand {
             SheetsSubcommands::UpdateNamedRange(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeleteNamedRange(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ListNamedRanges(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::AddChart(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::UpdateChart(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteChart(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::ListCharts(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::AddSlicer(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::UpdateSlicer(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteSlicer(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::ListSlicers(cmd) => cmd.execute(client).await,
         }
     }
 }

@@ -4487,10 +4487,76 @@ Commands:
   update-named-range           Changes an existing named range's name and/or the range it covers. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1796)
   delete-named-range           Removes a named range. Gated by the folder write-permission rules' `sheets-structure` operation — not `sheets-delete`, since a named range is a label, not grid data (issue #1796, ADR-0081 §2). Reports every cell formula that referenced the name before removing it
   list-named-ranges            Lists the named ranges in a spreadsheet. Read-only and ungated, like `sheets list-protections` (issue #1796)
+  add-chart                    Adds a chart. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
+  update-chart                 Replaces an existing chart's spec wholesale — `updateChartSpec` carries no field mask. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
+  delete-chart                 Removes a chart, after reporting its spec (type, title, anchor). Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3) — not `sheets-delete`; see that ADR section for why an unrecoverable embedded-object removal still sits here. Cannot be undone through omni-dev
+  list-charts                  Lists the charts in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1797)
+  add-slicer                   Adds a slicer. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
+  update-slicer                Changes an existing slicer's range, filter column/criteria, title, or pivot-table linkage. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
+  delete-slicer                Removes a slicer, after reporting its spec. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3) — not `sheets-delete`. Cannot be undone through omni-dev
+  list-slicers                 Lists the slicers in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1797)
   help                         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev drive sheets add-chart - Adds a chart. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
+
+Adds a chart. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
+
+Usage: add-chart [OPTIONS] --type <TYPE> --domain <A1> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --type <TYPE>
+          `column`, `bar`, `line`, `area`, `scatter`, or `pie`
+      --domain <A1>
+          The domain (category/x-axis) range, e.g. `A2:A10`. Must carry its own `Sheet!` prefix unless `--sheet` is given
+      --series <A1>
+          A data series range. Repeatable for a basic chart; a pie chart takes exactly one
+      --sheet <NAME>
+          Sheet title, supplying the prefix for `--domain`/`--series`/ `--anchor` when they don't carry their own
+      --title <TITLE>
+          The chart's title
+      --subtitle <SUBTITLE>
+          The chart's subtitle
+      --legend <POSITION>
+          `bottom`, `top`, `left`, `right`, or `none`
+      --stacked <MODE>
+          `none`, `stacked`, or `percent` — column/bar/area charts only
+      --header-count <N>
+          How many leading rows/columns of the source range are headers — basic charts only
+      --horizontal-axis-title <HORIZONTAL_AXIS_TITLE>
+          The horizontal axis title — basic charts only
+      --vertical-axis-title <VERTICAL_AXIS_TITLE>
+          The vertical axis title — basic charts only
+      --pie-hole <0.0-1.0>
+          `0.0`-`1.0` center-hole radius — pie charts only. `0.0` (or absent) is a solid pie
+      --anchor <A1>
+          The anchor cell, e.g. `E2`. Required unless `--new-sheet`
+      --offset-x <PX>
+          Additional horizontal offset from the anchor cell, in pixels
+      --offset-y <PX>
+          Additional vertical offset from the anchor cell, in pixels
+      --width <PX>
+          The chart's width in pixels
+      --height <PX>
+          The chart's height in pixels
+      --new-sheet
+          Put the chart on a brand-new sheet of its own, instead of anchoring it to an existing one. Cannot move or resize an existing chart — see the module docs' documented cuts
+      --dry-run
+          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>
+          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>
+          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help
+          Print help (see more with '--help')
 
 
 ================================================================================
@@ -4607,6 +4673,35 @@ Options:
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets add-slicer - Adds a slicer. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
+
+Adds a slicer. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
+
+Usage: add-slicer [OPTIONS] --range <A1> --column <N> --anchor <A1> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>                  Sheet title, supplying the prefix for `--range`/`--anchor` when they don't carry their own
+      --range <A1>                    The range the slicer filters
+      --column <N>                    The 0-based column within `--range` the filter criteria apply to — not an A1 letter, the same indexing `--hide-values`/`--sort-by` use on `set-basic-filter`
+      --hide-values <VALUES>          A value to hide in `--column`. Repeatable
+      --title <TITLE>                 A human-readable name for the slicer
+      --apply-to-pivot-tables <BOOL>  Whether this slicer also filters pivot tables built from `--range` [possible values: true, false]
+      --anchor <A1>                   The anchor cell, e.g. `F2`
+      --offset-x <PX>                 Additional horizontal offset from the anchor cell, in pixels
+      --offset-y <PX>                 Additional vertical offset from the anchor cell, in pixels
+      --width <PX>                    The slicer's width in pixels
+      --height <PX>                   The slicer's height in pixels
+      --dry-run                       Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>                 The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>               Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                          Print help (see more with '--help')
 
 
 ================================================================================
@@ -4730,6 +4825,25 @@ Options:
       --dry-run                        Reports the gate verdict without creating anything
   -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                           Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets delete-chart - Removes a chart, after reporting its spec (type, title, anchor). Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3) — not `sheets-delete`; see that ADR section for why an unrecoverable embedded-object removal still sits here. Cannot be undone through omni-dev
+
+Removes a chart, after reporting its spec (type, title, anchor). Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3) — not `sheets-delete`; see that ADR section for why an unrecoverable embedded-object removal still sits here. Cannot be undone through omni-dev
+
+Usage: delete-chart [OPTIONS] --chart-id <ID> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --chart-id <ID>    Which chart to remove, discovered via `list-charts`
+      --dry-run          Reports the gate verdict and what would be removed, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -4900,6 +5014,25 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets delete-slicer - Removes a slicer, after reporting its spec. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3) — not `sheets-delete`. Cannot be undone through omni-dev
+
+Removes a slicer, after reporting its spec. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3) — not `sheets-delete`. Cannot be undone through omni-dev
+
+Usage: delete-slicer [OPTIONS] --slicer-id <ID> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --slicer-id <ID>   Which slicer to remove, discovered via `list-slicers`
+      --dry-run          Reports the gate verdict and what would be removed, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets duplicate-sheet - Copies an existing sheet within the same workbook. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
 
 Copies an existing sheet within the same workbook. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
@@ -5039,6 +5172,22 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets list-charts - Lists the charts in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1797)
+
+Lists the charts in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1797)
+
+Usage: list-charts [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets list-conditional-formats - Lists the conditional format rules in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1793)
 
 Lists the conditional format rules in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1793)
@@ -5092,6 +5241,22 @@ omni-dev drive sheets list-protections - Lists the protected ranges in a spreads
 Lists the protected ranges in a spreadsheet. Read-only and ungated, like `sheets info` (issue #1643)
 
 Usage: list-protections [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets list-slicers - Lists the slicers in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1797)
+
+Lists the slicers in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1797)
+
+Usage: list-slicers [OPTIONS] <SPREADSHEET_ID>
 
 Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
@@ -5408,6 +5573,54 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets update-chart - Replaces an existing chart's spec wholesale — `updateChartSpec` carries no field mask. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
+
+Replaces an existing chart's spec wholesale — `updateChartSpec` carries no field mask. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
+
+Usage: update-chart [OPTIONS] --chart-id <ID> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --chart-id <ID>
+          Which chart to update, discovered via `list-charts`
+      --type <TYPE>
+          Change the chart's type. Refused if it would switch between a basic chart and a pie chart — delete and re-add instead
+      --domain <A1>
+          Replace the domain range (requires `--series` too)
+      --series <A1>
+          Replace every series wholesale. Repeatable
+      --sheet <NAME>
+          Sheet title, supplying the prefix for `--domain`/`--series` when they don't carry their own
+      --title <TITLE>
+          Change the title
+      --subtitle <SUBTITLE>
+          Change the subtitle
+      --legend <POSITION>
+          Change the legend position
+      --stacked <MODE>
+          Change the stacking mode — basic charts only
+      --header-count <N>
+          Change the header row/column count — basic charts only
+      --horizontal-axis-title <HORIZONTAL_AXIS_TITLE>
+          Change the horizontal axis title — basic charts only
+      --vertical-axis-title <VERTICAL_AXIS_TITLE>
+          Change the vertical axis title — basic charts only
+      --pie-hole <0.0-1.0>
+          Change the pie-hole radius — pie charts only
+      --dry-run
+          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>
+          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>
+          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help
+          Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets update-conditional-format - Replaces the conditional format rule at an index. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1793, ADR-0081 §1)
 
 Replaces the conditional format rule at an index. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1793, ADR-0081 §1)
@@ -5550,6 +5763,32 @@ Options:
       --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets update-slicer - Changes an existing slicer's range, filter column/criteria, title, or pivot-table linkage. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
+
+Changes an existing slicer's range, filter column/criteria, title, or pivot-table linkage. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
+
+Usage: update-slicer [OPTIONS] --slicer-id <ID> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --slicer-id <ID>                Which slicer to change, discovered via `list-slicers`
+      --sheet <NAME>                  Sheet title, supplying the prefix for `--range` when it doesn't carry its own
+      --range <A1>                    Replace the filtered range
+      --column <N>                    Replace the filtered column
+      --hide-values <VALUES>          Replace the hidden-value criteria. Repeatable
+      --clear-criteria                Reset the filter criteria to empty
+      --title <TITLE>                 Change the title
+      --apply-to-pivot-tables <BOOL>  Change the pivot-table linkage [possible values: true, false]
+      --dry-run                       Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>                 The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>               Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                          Print help (see more with '--help')
 
 
 ================================================================================
