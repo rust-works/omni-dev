@@ -208,7 +208,7 @@ pub enum SheetsSubcommands {
     /// Removes a named range. Gated by the folder write-permission rules'
     /// `sheets-structure` operation — not `sheets-delete`, since a named
     /// range is a label, not grid data (issue #1796, ADR-0081 §2). Reports
-    /// every formula that referenced the name before removing it.
+    /// every cell formula that referenced the name before removing it.
     DeleteNamedRange(named_range::DeleteNamedRangeCommand),
     /// Lists the named ranges in a spreadsheet. Read-only and ungated, like
     /// `sheets list-protections` (issue #1796).

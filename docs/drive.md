@@ -689,13 +689,14 @@ plain read and needs no grant, the same as `list-protections`.
 **`sheets-structure` also covers named-range add/update/delete** (issue
 #1796, [ADR-0081](adrs/adr-0081.md) §2). A named range is a label over a
 region, not grid data, so `delete-named-range` leaves every cell's stored
-value and formula text untouched — even though a formula referencing the
-removed name starts evaluating to `#NAME?`. That effect is mitigated the
-same way `merge-cells`' data loss is: `delete-named-range`'s `--dry-run`
-(and real run) scans the workbook's formulas for the name and reports the
-count and A1 locations of every reference before it deletes.
-`drive sheets list-named-ranges` is a plain read and needs no grant, the
-same as `list-protections`.
+value and formula text untouched — even though a cell formula referencing
+the removed name starts evaluating to `#NAME?` (conditional formatting,
+data validation and chart references are not scanned). That effect is
+mitigated the same way `merge-cells`' data loss is: `delete-named-range`'s
+`--dry-run` (and real run) scans the workbook's cell formulas for the name
+and reports the count and A1 locations of every reference before it
+deletes. `drive sheets list-named-ranges` is a plain read and needs no
+grant, the same as `list-protections`.
 
 **`sheets-protection` is separate from `sheets-structure`, and the reason is
 different in kind from every split above.** A protected range is a
@@ -2196,8 +2197,9 @@ exposed. Both are documented cuts, not silent gaps.
 Named ranges, gated by `sheets-structure` — including `delete-named-range`.
 See [ADR-0081](adrs/adr-0081.md) §2 for why: a named range is a label over a
 region, not grid data, so removing one leaves every cell's stored value and
-formula text untouched, even though every formula referencing the removed
-name starts evaluating to `#NAME?`.
+formula text untouched, even though every cell formula referencing the
+removed name starts evaluating to `#NAME?` (conditional formatting, data
+validation and chart references are not scanned by the preview below).
 
 ```bash
 # Add a named range, or one covering an entire sheet with --whole-sheet.
@@ -2216,20 +2218,22 @@ omni-dev drive sheets delete-named-range <ID> --name Prices --dry-run
 omni-dev drive sheets delete-named-range <ID> --name Prices
 ```
 
-`update-named-range`/`delete-named-range` resolve their target by the
-*exact* name — `list-named-ranges` is how you find it. Unlike
-`update-protection`/`unprotect-range`'s range-based lookup, this can never
-be ambiguous: Sheets enforces unique names workbook-wide, so a name either
-matches one named range or none. `update-named-range` may rename only,
-re-point only, or both — passing neither `--new-name` nor a new range is
-refused as nothing to change.
+`update-named-range`/`delete-named-range` resolve their target by a
+case-insensitive *exact* name match — `list-named-ranges` is how you find
+it. Sheets enforces unique names workbook-wide, so a name matches one named
+range or none. `update-named-range` may rename only, re-point only, or
+both — passing neither `--new-name` nor a new range is refused as nothing
+to change.
 
 `delete-named-range --dry-run` (and the real run, before mutating) scans
-every sheet's formulas for the name being removed and reports the count and
-A1 locations of every reference — never the formula text or a cell's value
-— so read it before running for real. The break is also recoverable:
-re-adding a named range with the same name over the same range restores
-every dependent formula to working order, since the name is what changed,
+every sheet's *cell* formulas for the name being removed and reports the
+count and A1 locations of every reference — never the formula text or a
+cell's value — so read it before running for real. It does not scan
+conditional-formatting rules, data-validation custom formulas, or chart
+source references, which can also name a named range. The break is also
+recoverable: re-adding a named range with the same name over the same range
+restores every dependent formula to working order, since the name is what
+changed,
 not the formula text.
 
 ## Docs

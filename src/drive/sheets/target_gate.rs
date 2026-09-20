@@ -2,7 +2,7 @@
 //! (`write.rs`'s `write`/`append`/`clear`, `structure.rs`'s
 //! `add-sheet`/`rename-sheet`/`insert-rows`/`insert-columns`, and —
 //! since ADR-0080's Phase 3 — `format.rs`, `protection.rs` and
-//! `validation.rs`'s own verbs).
+//! `validation.rs`'s own verbs; since issue #1796, `named_range.rs`'s too).
 //!
 //! Every one of these engines follows the identical linear shape up to this
 //! point: fetch the target's Drive metadata, refuse a shortcut/non-
@@ -10,7 +10,7 @@
 //! write-permission gate — a `file_id` rule first, then the target's
 //! current parents, then "no visible parents" if neither decided it (issue
 //! #1612). [`resolve`] is that shape, factored out once so it cannot
-//! quietly drift between the five engines the way copied-by-hand code
+//! quietly drift between the six engines the way copied-by-hand code
 //! eventually does.
 //!
 //! What is deliberately *not* shared: building the engine's own `Outcome`

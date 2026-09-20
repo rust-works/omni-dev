@@ -5,27 +5,35 @@
 //! Sheets verb — a named range is a label over a region, and adding,
 //! renaming/re-pointing, or removing one never touches a cell's stored
 //! value or formula text. `delete-named-range` is the one verb with a
-//! visible consequence: every formula referencing the removed name starts
-//! evaluating to `#NAME?`. ADR-0081 §2 mitigates this the way ADR-0078 §8
-//! mitigates `merge-cells`'s data loss (`format.rs`'s `discarded_cells`):
-//! before deleting, in both `--dry-run` and the real run, this module scans
-//! the workbook's formulas for the name and reports the count and A1
-//! locations of every reference — **never** the formula text or a cell's
-//! value.
+//! visible consequence: every cell formula referencing the removed name
+//! starts evaluating to `#NAME?` (conditional-formatting rules,
+//! data-validation custom formulas and chart source references can also
+//! name a named range, but are outside the grid-cell scan below). ADR-0081
+//! §2 mitigates this the way ADR-0078 §8 mitigates `merge-cells`'s data
+//! loss (`format.rs`'s `discarded_cells`): before deleting, in both
+//! `--dry-run` and the real run, this module scans the workbook's cell
+//! formulas for the name and reports the count and A1 locations of every
+//! reference — **never** the formula text or a cell's value.
 //!
 //! Three mutating verbs (`add-named-range`/`update-named-range`/
 //! `delete-named-range`) plus one read (`list-named-ranges`, ungated like
 //! `list-protections`). Shape mirrors `protection.rs`: compose a target,
 //! resolve it against a freshly-fetched workbook, gate, dry-run, mutate,
-//! log.
+//! log. The formula scan reuses `SheetsApi::batch_get_every_sheet`'s
+//! chunked `values.batchGet` (shared with `read.rs::read_whole_workbook`,
+//! which needs the same "chunk titles, fetch, resolve each result's own
+//! echoed title" skeleton for a different purpose).
 //!
-//! **`update-named-range`/`delete-named-range` resolve their target by
-//! exact name match** against the workbook's current named ranges — the
-//! name, not the server-assigned id, is the one stable handle a CLI user
-//! would actually type (the id is discoverable only via
-//! `list-named-ranges`). Sheets enforces unique names workbook-wide, so
-//! unlike `protection.rs`'s range-based lookup this can never be
-//! ambiguous — only found or not found.
+//! **`update-named-range`/`delete-named-range` resolve their target by a
+//! case-insensitive exact name match** against the workbook's current
+//! named ranges — the name, not the server-assigned id, is the one stable
+//! handle a CLI user would actually type (the id is discoverable only via
+//! `list-named-ranges`). Case-insensitive to match the formula scan's own
+//! case-insensitive resolution of a name reference (see
+//! [`scan_referencing_formulas`]); Sheets is assumed to enforce
+//! case-insensitive uniqueness on names the same way, so unlike
+//! `protection.rs`'s range-based lookup this is not expected to need an
+//! "ambiguous" branch — the first match wins.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -40,7 +48,7 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::{SheetsApi, ValueRenderOption, MAX_RANGES_PER_BATCH};
+use crate::drive::sheets::api::{SheetsApi, ValueRenderOption};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
@@ -142,8 +150,9 @@ pub enum NamedRangeResult {
     WouldChange {
         /// A human-readable summary of the effect.
         summary: String,
-        /// `delete-named-range` only: the A1 locations of every formula
-        /// referencing the name being removed. Empty for every other verb.
+        /// `delete-named-range` only: the A1 locations of every cell
+        /// formula referencing the name being removed. Empty for every
+        /// other verb.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         referencing_formulas: Vec<String>,
     },
@@ -596,12 +605,18 @@ fn find_sheet_id(workbook: &Spreadsheet, title: &str) -> Result<i64, NamedRangeR
     })
 }
 
-/// Finds the one existing named range with an exact `name` match —
-/// `update-named-range`/`delete-named-range`'s only stable handle, since a
-/// named range's server-assigned id is discoverable only via
+/// Finds the one existing named range with a case-insensitive exact `name`
+/// match — `update-named-range`/`delete-named-range`'s only stable handle,
+/// since a named range's server-assigned id is discoverable only via
 /// `list-named-ranges`. Sheets enforces unique names workbook-wide, so
 /// unlike `protection.rs::find_existing_protection` this never needs an
 /// "ambiguous" branch — only found or not found.
+///
+/// Case-insensitive to match [`scan_referencing_formulas`]'s own
+/// case-insensitive resolution of a reference to this same name — a
+/// case-sensitive lookup here would let `--name foo` report "not found"
+/// for a range actually stored as `Foo`, even though a formula spelling it
+/// `foo` resolves to it fine.
 fn find_existing_named_range<'a>(
     workbook: &'a Spreadsheet,
     name: &str,
@@ -609,7 +624,7 @@ fn find_existing_named_range<'a>(
     workbook
         .named_ranges
         .iter()
-        .find(|nr| nr.name == name)
+        .find(|nr| nr.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| NamedRangeResult::RefusedNotFound {
             name: name.to_string(),
         })
@@ -672,38 +687,33 @@ async fn scan_referencing_formulas(
     let re = regex::Regex::new(&pattern).map_err(|err| format!("{err:#}"))?;
 
     let mut locations = Vec::new();
-    for chunk in titles.chunks(MAX_RANGES_PER_BATCH) {
-        let ranges: Vec<String> = chunk.iter().map(|t| a1::quote_sheet_title(t)).collect();
-        let response = api
-            .values_batch_get(spreadsheet_id, &ranges, ValueRenderOption::Formula)
-            .await
-            .map_err(|err| format!("{err:#}"))?;
-        for value_range in response.value_ranges {
-            // Match on the range the server echoes, never on request order
-            // — see `ValueRange::range`.
-            let Some(title) = value_range.range.as_deref().and_then(a1::sheet_title_of) else {
-                continue;
-            };
-            for (row_idx, row) in value_range.values.iter().enumerate() {
-                for (col_idx, cell) in row.iter().enumerate() {
-                    let Some(formula) = cell.as_str() else {
-                        continue;
-                    };
-                    // Only a formula (leading `=`) can reference a named
-                    // range — a plain text cell whose content merely
-                    // contains the name is not a reference.
-                    if !formula.starts_with('=') || !re.is_match(formula) {
-                        continue;
-                    }
-                    let address = format!(
-                        "{}{}",
-                        grid_range::column_index_to_letters(col_idx as i64),
-                        row_idx + 1
-                    );
-                    let location = a1::compose(Some(&title), Some(&address))
-                        .unwrap_or_else(|_| format!("{title}!{address}"));
-                    locations.push(location);
+    let results = api
+        .batch_get_every_sheet(spreadsheet_id, &titles, ValueRenderOption::Formula)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
+    for (title, value_range) in results {
+        let Some(title) = title else {
+            continue;
+        };
+        for (row_idx, row) in value_range.values.iter().enumerate() {
+            for (col_idx, cell) in row.iter().enumerate() {
+                let Some(formula) = cell.as_str() else {
+                    continue;
+                };
+                // Only a formula (leading `=`) can reference a named
+                // range — a plain text cell whose content merely
+                // contains the name is not a reference.
+                if !formula.starts_with('=') || !re.is_match(formula) {
+                    continue;
                 }
+                let address = format!(
+                    "{}{}",
+                    grid_range::column_index_to_letters(col_idx as i64),
+                    row_idx + 1
+                );
+                let location = a1::compose(Some(&title), Some(&address))
+                    .unwrap_or_else(|_| format!("{title}!{address}"));
+                locations.push(location);
             }
         }
     }
@@ -868,8 +878,9 @@ fn referencing_formula_lines(referencing_formulas: &[String]) -> Vec<String> {
         return Vec::new();
     }
     let mut lines = vec![format!(
-        "{} formula(s) reference this name and will start evaluating to #NAME? once it's \
-         removed:",
+        "{} cell formula(s) reference this name and will start evaluating to #NAME? once \
+         it's removed (conditional formatting, data validation and chart references are not \
+         scanned):",
         referencing_formulas.len()
     )];
     lines.extend(referencing_formulas.iter().map(|loc| format!("  {loc}")));
@@ -929,6 +940,13 @@ mod tests {
         let workbook = workbook_with(vec![named("id-1", "Foo", grid(0))]);
         let err = find_existing_named_range(&workbook, "Bar").unwrap_err();
         assert!(matches!(err, NamedRangeResult::RefusedNotFound { name } if name == "Bar"));
+    }
+
+    #[test]
+    fn find_existing_named_range_matches_case_insensitively() {
+        let workbook = workbook_with(vec![named("id-1", "Foo", grid(0))]);
+        let found = find_existing_named_range(&workbook, "foo").unwrap();
+        assert_eq!(found.named_range_id.as_deref(), Some("id-1"));
     }
 
     #[test]
@@ -1065,18 +1083,30 @@ mod tests {
             )
     }
 
-    fn mount_batch_get(sheet: &str, values: serde_json::Value) -> wiremock::Mock {
+    /// Mounts a single `values:batchGet` response carrying every named
+    /// sheet's data in one body — the shape the real API actually returns
+    /// for one chunk (every test workbook here has 2 sheets, well under
+    /// `MAX_RANGES_PER_BATCH`, so there is always exactly one request).
+    /// Deliberately **not** one mock per sheet matched by query param:
+    /// `wiremock`'s `query_param` matcher is satisfied by any request that
+    /// *contains* the given pair, and a combined request naming every
+    /// sheet satisfies every per-sheet mock at once, so only the
+    /// first-registered one would ever actually respond — silently never
+    /// exercising the others.
+    fn mount_batch_get(sheets: &[(&str, serde_json::Value)]) -> wiremock::Mock {
+        let value_ranges: Vec<serde_json::Value> = sheets
+            .iter()
+            .map(|(sheet, values)| {
+                serde_json::json!({"range": format!("{sheet}!A1:Z1000"), "values": values})
+            })
+            .collect();
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
                 "/v4/spreadsheets/sheet-1/values:batchGet",
             ))
-            .and(wiremock::matchers::query_param(
-                "ranges",
-                format!("'{sheet}'"),
-            ))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "valueRanges": [{"range": format!("{sheet}!A1:Z1000"), "values": values}]
+                    "valueRanges": value_ranges
                 })),
             )
     }
@@ -1266,16 +1296,17 @@ mod tests {
         .mount(&server)
         .await;
         // A true reference on Q1, and a decoy on Q2 that must NOT match:
-        // "Foobar" contains "Foo" but is a distinct identifier.
-        mount_batch_get(
-            "Q1",
-            serde_json::json!([["=SUM(Foo)", "plain text with Foo in it"]]),
-        )
+        // "Foobar" contains "Foo" but is a distinct identifier. Both
+        // sheets' data ride the one combined batchGet response.
+        mount_batch_get(&[
+            (
+                "Q1",
+                serde_json::json!([["=SUM(Foo)", "plain text with Foo in it"]]),
+            ),
+            ("Q2", serde_json::json!([["=Foobar+1"]])),
+        ])
         .mount(&server)
         .await;
-        mount_batch_get("Q2", serde_json::json!([["=Foobar+1"]]))
-            .mount(&server)
-            .await;
         let rules = vec![allow_rule("folder-1")];
         let opts = NamedRangeOptions {
             spreadsheet_id: "sheet-1".to_string(),
@@ -1317,10 +1348,7 @@ mod tests {
         }]))
         .mount(&server)
         .await;
-        mount_batch_get("Q1", serde_json::json!([]))
-            .mount(&server)
-            .await;
-        mount_batch_get("Q2", serde_json::json!([]))
+        mount_batch_get(&[("Q1", serde_json::json!([])), ("Q2", serde_json::json!([]))])
             .mount(&server)
             .await;
         let rules = vec![allow_rule("folder-1")];
@@ -1362,12 +1390,12 @@ mod tests {
         }]))
         .mount(&server)
         .await;
-        mount_batch_get("Q1", serde_json::json!([["=SUM(Foo)"]]))
-            .mount(&server)
-            .await;
-        mount_batch_get("Q2", serde_json::json!([]))
-            .mount(&server)
-            .await;
+        mount_batch_get(&[
+            ("Q1", serde_json::json!([["=SUM(Foo)"]])),
+            ("Q2", serde_json::json!([])),
+        ])
+        .mount(&server)
+        .await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(
                 "/v4/spreadsheets/sheet-1:batchUpdate",

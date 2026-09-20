@@ -96,7 +96,12 @@ pub(crate) fn sheet_title_of(range: &str) -> Option<String> {
 /// bare name (`Q1`) is deliberately **not** covered — this module doesn't
 /// validate A1 grammar, and a bare identifier is indistinguishable from a
 /// defined name.
-fn is_whole_sheet_reference(range: &str) -> bool {
+///
+/// `pub(crate)` (not just `compose`-private) so `grid_range::resolve_grid_range`
+/// can tell this shape apart from a genuinely malformed range and point a
+/// `--sheet`-alone caller at `--whole-sheet` specifically, rather than a
+/// generic "does not name a sheet" that's already true of what they typed.
+pub(crate) fn is_whole_sheet_reference(range: &str) -> bool {
     let Some(rest) = range.strip_prefix('\'') else {
         return false;
     };

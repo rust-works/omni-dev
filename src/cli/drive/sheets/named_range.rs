@@ -4,7 +4,7 @@
 //!
 //! The first three are gated by
 //! [`DriveOperation::SheetsStructure`](crate::drive::write_gate::DriveOperation::SheetsStructure)
-//! — see [ADR-0081](../../../../../docs/adrs/adr-0081.md) §2 for why
+//! — see [ADR-0081](../../../../docs/adrs/adr-0081.md) §2 for why
 //! `delete-named-range` stays here rather than joining `sheets-delete`.
 //! `list-named-ranges` is a plain read, ungated like `sheets
 //! list-protections`.
@@ -20,6 +20,7 @@ use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::named_range::{
     describe_lines, named_range, NamedRangeOptions, NamedRangeVerb,
 };
+use crate::drive::sheets::{render_grid_range, sheet_title_by_id};
 
 /// Adds a named range (or, with `--whole-sheet`, one covering an entire
 /// sheet).
@@ -80,14 +81,14 @@ impl AddNamedRangeCommand {
 }
 
 /// Changes an existing named range's name and/or the range it covers. The
-/// target is resolved by exact name match — see
+/// target is resolved by a case-insensitive exact name match — see
 /// `drive sheets list-named-ranges` to find it.
 #[derive(Parser)]
 pub struct UpdateNamedRangeCommand {
     /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
     pub spreadsheet_id: String,
 
-    /// The existing name to change, by exact match.
+    /// The existing name to change, by case-insensitive exact match.
     #[arg(long, value_name = "NAME")]
     pub name: String,
 
@@ -145,19 +146,20 @@ impl UpdateNamedRangeCommand {
     }
 }
 
-/// Removes a named range. The target is resolved by exact name match — see
-/// `drive sheets list-named-ranges` to find it.
+/// Removes a named range. The target is resolved by a case-insensitive
+/// exact name match — see `drive sheets list-named-ranges` to find it.
 ///
-/// Every formula referencing the removed name starts evaluating to
-/// `#NAME?`. `--dry-run` (and the real run, before mutating) reports the
-/// count and A1 locations of every such formula — read it before running
-/// for real.
+/// Every cell formula referencing the removed name starts evaluating to
+/// `#NAME?` (conditional formatting, data validation and chart references
+/// are not scanned). `--dry-run` (and the real run, before mutating)
+/// reports the count and A1 locations of every such cell formula — read it
+/// before running for real.
 #[derive(Parser)]
 pub struct DeleteNamedRangeCommand {
     /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
     pub spreadsheet_id: String,
 
-    /// The existing name to remove, by exact match.
+    /// The existing name to remove, by case-insensitive exact match.
     #[arg(long, value_name = "NAME")]
     pub name: String,
 
@@ -216,7 +218,8 @@ impl ListNamedRangesCommand {
         }
         for named in &workbook.named_ranges {
             let id = named.named_range_id.as_deref().unwrap_or("?");
-            let sheet = sheet_title(&workbook, named.range.sheet_id);
+            let sheet = sheet_title_by_id(&workbook, named.range.sheet_id)
+                .unwrap_or_else(|| "?".to_string());
             println!(
                 "{}",
                 sanitize_for_terminal(&format!(
@@ -227,41 +230,6 @@ impl ListNamedRangesCommand {
             );
         }
         Ok(())
-    }
-}
-
-/// The title of the sheet a [`GridRange`](crate::drive::sheets::types::GridRange)'s
-/// `sheet_id` names, or `"?"` if the workbook carries no sheet with that id
-/// (a `spreadsheets.get`/`fields`-mask mismatch this command never expects
-/// in practice, but must still render something for).
-fn sheet_title(workbook: &crate::drive::sheets::types::Spreadsheet, sheet_id: i64) -> String {
-    workbook
-        .sheets
-        .iter()
-        .find(|sheet| sheet.sheet_id() == Some(sheet_id))
-        .map_or_else(|| "?".to_string(), |sheet| sheet.title().to_string())
-}
-
-/// Renders a numeric [`GridRange`](crate::drive::sheets::types::GridRange)
-/// as a compact 1-based description for `list-named-ranges`' human-readable
-/// output — e.g. `"sheetId 0, rows 1-5, cols 1-2"`, or `"sheetId 0 (whole
-/// sheet)"` when every bound is `None`. Same shape as
-/// `protection.rs::render_grid_range` (numeric, not A1-lettered: the
-/// column-letter conversion is `drive::sheets::grid_range`-private, and
-/// every other Sheets list verb already renders this way).
-fn render_grid_range(range: &crate::drive::sheets::types::GridRange) -> String {
-    let rows = match (range.start_row_index, range.end_row_index) {
-        (Some(start), Some(end)) => format!(", rows {}-{end}", start + 1),
-        _ => String::new(),
-    };
-    let cols = match (range.start_column_index, range.end_column_index) {
-        (Some(start), Some(end)) => format!(", cols {}-{}", start + 1, end),
-        _ => String::new(),
-    };
-    if rows.is_empty() && cols.is_empty() {
-        format!("sheetId {} (whole sheet)", range.sheet_id)
-    } else {
-        format!("sheetId {}{rows}{cols}", range.sheet_id)
     }
 }
 
@@ -290,50 +258,10 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::sheets::client::SHEETS_API_URL;
-    use crate::drive::sheets::types::{GridRange, Sheet, SheetProperties, Spreadsheet};
     use crate::utils::secret::Secret;
 
-    fn workbook_with_one_sheet(sheet_id: i64, title: &str) -> Spreadsheet {
-        Spreadsheet {
-            sheets: vec![Sheet {
-                properties: Some(SheetProperties {
-                    sheet_id: Some(sheet_id),
-                    title: title.to_string(),
-                    ..Default::default()
-                }),
-                protected_ranges: Vec::new(),
-            }],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn sheet_title_finds_the_matching_sheet() {
-        let workbook = workbook_with_one_sheet(0, "Q1");
-        assert_eq!(sheet_title(&workbook, 0), "Q1");
-        assert_eq!(sheet_title(&workbook, 99), "?");
-    }
-
-    #[test]
-    fn render_grid_range_whole_sheet_when_all_bounds_none() {
-        let range = GridRange {
-            sheet_id: 0,
-            ..Default::default()
-        };
-        assert_eq!(render_grid_range(&range), "sheetId 0 (whole sheet)");
-    }
-
-    #[test]
-    fn render_grid_range_rows_and_cols() {
-        let range = GridRange {
-            sheet_id: 0,
-            start_row_index: Some(0),
-            end_row_index: Some(5),
-            start_column_index: Some(0),
-            end_column_index: Some(2),
-        };
-        assert_eq!(render_grid_range(&range), "sheetId 0, rows 1-5, cols 1-2");
-    }
+    // `render_grid_range`/`sheet_title_by_id` are tested in `grid_range.rs`,
+    // the module they're shared from.
 
     fn test_credentials() -> DriveCredentials {
         DriveCredentials {

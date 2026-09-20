@@ -17,6 +17,7 @@ use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::protection::{
     describe_lines, protection, ProtectionOptions, ProtectionVerb,
 };
+use crate::drive::sheets::render_grid_range;
 
 /// Protects a range (or, with `--whole-sheet`, an entire sheet).
 #[derive(Parser)]
@@ -276,28 +277,6 @@ impl ListProtectionsCommand {
     }
 }
 
-/// Renders a numeric [`GridRange`](crate::drive::sheets::types::GridRange)
-/// as a compact 1-based description for `list-protections`' human-readable
-/// output — e.g. `"sheetId 0, rows 1-5, cols 1-2"`, or `"sheetId 0 (whole
-/// sheet)"` when every bound is `None`. Row/column *count* is deliberately
-/// not shown: unlike `structure.rs`'s inserts, a protection's bounds are
-/// static, so there is no "before -> after" to state.
-fn render_grid_range(range: &crate::drive::sheets::types::GridRange) -> String {
-    let rows = match (range.start_row_index, range.end_row_index) {
-        (Some(start), Some(end)) => format!(", rows {}-{end}", start + 1),
-        _ => String::new(),
-    };
-    let cols = match (range.start_column_index, range.end_column_index) {
-        (Some(start), Some(end)) => format!(", cols {}-{}", start + 1, end),
-        _ => String::new(),
-    };
-    if rows.is_empty() && cols.is_empty() {
-        format!("sheetId {} (whole sheet)", range.sheet_id)
-    } else {
-        format!("sheetId {}{rows}{cols}", range.sheet_id)
-    }
-}
-
 async fn run_protection(
     client: &DriveClient,
     opts: &ProtectionOptions,
@@ -323,51 +302,10 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::sheets::client::SHEETS_API_URL;
-    use crate::drive::sheets::types::GridRange;
     use crate::utils::secret::Secret;
 
-    #[test]
-    fn render_grid_range_whole_sheet_when_all_bounds_none() {
-        let range = GridRange {
-            sheet_id: 0,
-            ..Default::default()
-        };
-        assert_eq!(render_grid_range(&range), "sheetId 0 (whole sheet)");
-    }
-
-    #[test]
-    fn render_grid_range_rows_only() {
-        let range = GridRange {
-            sheet_id: 0,
-            start_row_index: Some(0),
-            end_row_index: Some(5),
-            ..Default::default()
-        };
-        assert_eq!(render_grid_range(&range), "sheetId 0, rows 1-5");
-    }
-
-    #[test]
-    fn render_grid_range_cols_only() {
-        let range = GridRange {
-            sheet_id: 0,
-            start_column_index: Some(0),
-            end_column_index: Some(2),
-            ..Default::default()
-        };
-        assert_eq!(render_grid_range(&range), "sheetId 0, cols 1-2");
-    }
-
-    #[test]
-    fn render_grid_range_rows_and_cols() {
-        let range = GridRange {
-            sheet_id: 3,
-            start_row_index: Some(0),
-            end_row_index: Some(5),
-            start_column_index: Some(0),
-            end_column_index: Some(2),
-        };
-        assert_eq!(render_grid_range(&range), "sheetId 3, rows 1-5, cols 1-2");
-    }
+    // `render_grid_range` itself is tested in `grid_range.rs`, the module
+    // it's shared from — see e.g. `render_grid_range_rows_and_cols` there.
 
     fn test_credentials() -> DriveCredentials {
         DriveCredentials {

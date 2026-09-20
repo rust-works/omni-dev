@@ -9,6 +9,7 @@ use url::Url;
 
 use crate::drive::api_client::GoogleApiClient;
 use crate::drive::files_api::{append_write_scope_hint, WriteCapability};
+use crate::drive::sheets::a1;
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::types::{
     AppendValuesResponse, BatchGetValuesResponse, BatchUpdateRequest, BatchUpdateRequestItem,
@@ -280,6 +281,38 @@ impl<'a> SheetsApi<'a> {
             .transport()
             .get_parsed(url.as_str(), "Failed to parse Sheets batchGet response")
             .await
+    }
+
+    /// Fetches every sheet named in `titles` via chunked `values.batchGet`,
+    /// pairing each result with the sheet title the server echoed back —
+    /// the "quote each title, batchGet in [`MAX_RANGES_PER_BATCH`]-sized
+    /// chunks, resolve each result's title from its own echoed `range`"
+    /// skeleton `read.rs::read_whole_workbook` and
+    /// `named_range.rs::scan_referencing_formulas` both need, factored out
+    /// once so a batching or echo-matching fix lands in one place.
+    ///
+    /// A result's title is `None`, never dropped, when
+    /// [`crate::drive::sheets::a1::sheet_title_of`] can't parse it back out
+    /// of the echoed range — the caller decides what that's worth, exactly
+    /// as `read_whole_workbook`'s `order_by_workbook` already does.
+    pub(crate) async fn batch_get_every_sheet(
+        &self,
+        spreadsheet_id: &str,
+        titles: &[String],
+        render: ValueRenderOption,
+    ) -> Result<Vec<(Option<String>, ValueRange)>> {
+        let mut out = Vec::with_capacity(titles.len());
+        for chunk in titles.chunks(MAX_RANGES_PER_BATCH) {
+            let ranges: Vec<String> = chunk.iter().map(|t| a1::quote_sheet_title(t)).collect();
+            let response = self
+                .values_batch_get(spreadsheet_id, &ranges, render)
+                .await?;
+            for value_range in response.value_ranges {
+                let title = value_range.range.as_deref().and_then(a1::sheet_title_of);
+                out.push((title, value_range));
+            }
+        }
+        Ok(out)
     }
 
     /// Overwrites the cells of `range`.
