@@ -1204,7 +1204,6 @@ fn existing_chart_kind(spec: &ChartSpec) -> Result<ExistingChartKind, String> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn merge_chart_spec(
     workbook: &Spreadsheet,
     existing: &ChartSpec,
@@ -1213,17 +1212,10 @@ fn merge_chart_spec(
     let EmbeddedObjectVerb::UpdateChart {
         chart_id,
         chart_type,
-        domain,
-        series,
-        sheet,
         title,
         subtitle,
         legend,
-        stacked,
-        header_count,
-        horizontal_axis_title,
-        vertical_axis_title,
-        pie_hole,
+        ..
     } = verb
     else {
         unreachable!("merge_chart_spec is only ever called for UpdateChart")
@@ -1256,11 +1248,6 @@ fn merge_chart_spec(
         });
     }
 
-    let legend_override = legend
-        .as_deref()
-        .map(parse_legend)
-        .transpose()
-        .map_err(invalid)?;
     let mut changed = Vec::new();
     if title.is_some() {
         changed.push("title");
@@ -1281,104 +1268,169 @@ fn merge_chart_spec(
     }
 
     if target_is_pie {
-        if header_count.is_some() {
-            return Err(invalid(
-                "--header-count only applies to a column/bar/line/area/scatter \
-                chart",
-            ));
-        }
-        if stacked.is_some() {
-            return Err(invalid(
-                "--stacked only applies to a column/bar/line/area/scatter \
-                chart",
-            ));
-        }
-        if horizontal_axis_title.is_some() || vertical_axis_title.is_some() {
-            return Err(invalid(
-                "--horizontal-axis-title/--vertical-axis-title only apply to a \
-                column/bar/line/area/scatter chart",
-            ));
-        }
-        let mut pie = spec.pie_chart.clone().unwrap_or_default();
-        if let Some(domain) = domain {
-            pie.domain = chart_data(compose_and_resolve(workbook, sheet.as_deref(), domain)?);
-            changed.push("domain");
-        }
-        if !series.is_empty() {
-            let [only_series] = series.as_slice() else {
-                return Err(invalid("a pie chart takes exactly one --series"));
-            };
-            let range = compose_and_resolve(workbook, sheet.as_deref(), only_series)?;
-            pie.series = chart_data(range);
-            changed.push("series");
-        }
-        if let Some(legend) = legend_override {
-            pie.legend_position = Some(legend);
-        }
-        if let Some(pie_hole) = pie_hole {
-            pie.pie_hole = Some(*pie_hole);
-            changed.push("pie-hole");
-        }
-        spec.pie_chart = Some(pie);
-        spec.basic_chart = None;
+        merge_pie_chart(workbook, &mut spec, verb, &mut changed)?;
     } else {
-        let mut basic = spec.basic_chart.clone().unwrap_or_default();
-        if let Some(ChartKind::Basic(chart_type)) = requested_kind {
-            basic.chart_type = chart_type.to_string();
-            changed.push("type");
-        }
-        if let Some(domain) = domain {
-            basic.domains = vec![BasicChartDomain {
-                domain: chart_data(compose_and_resolve(workbook, sheet.as_deref(), domain)?),
-                extra: BTreeMap::new(),
-            }];
-            changed.push("domain");
-        }
-        if !series.is_empty() {
-            basic.series = series
-                .iter()
-                .map(|s| {
-                    compose_and_resolve(workbook, sheet.as_deref(), s).map(|range| {
-                        BasicChartSeries {
-                            series: chart_data(range),
-                            target_axis: None,
-                            extra: BTreeMap::new(),
-                        }
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            changed.push("series");
-        }
-        if let Some(legend) = legend_override {
-            basic.legend_position = Some(legend);
-        }
-        if let Some(stacked) = stacked
-            .as_deref()
-            .map(parse_stacked)
-            .transpose()
-            .map_err(invalid)?
-        {
-            basic.stacked_type = Some(stacked);
-            changed.push("stacked");
-        }
-        if let Some(header_count) = header_count {
-            basic.header_count = Some(*header_count);
-            changed.push("header-count");
-        }
-        if let Some(title) = horizontal_axis_title {
-            upsert_axis_title(&mut basic.axis, "BOTTOM_AXIS", title);
-            changed.push("horizontal-axis-title");
-        }
-        if let Some(title) = vertical_axis_title {
-            upsert_axis_title(&mut basic.axis, "LEFT_AXIS", title);
-            changed.push("vertical-axis-title");
-        }
-        spec.basic_chart = Some(basic);
-        spec.pie_chart = None;
+        merge_basic_chart(workbook, &mut spec, verb, requested_kind, &mut changed)?;
     }
 
     let summary = format!("update chart {chart_id} ({})", changed.join(", "));
     Ok((spec, summary))
+}
+
+/// The `target_is_pie` branch of [`merge_chart_spec`]: merges every
+/// pie-only flag onto `spec.pie_chart`, refusing any basic-only flag.
+fn merge_pie_chart(
+    workbook: &Spreadsheet,
+    spec: &mut ChartSpec,
+    verb: &EmbeddedObjectVerb,
+    changed: &mut Vec<&'static str>,
+) -> Result<(), EmbeddedObjectResult> {
+    let EmbeddedObjectVerb::UpdateChart {
+        domain,
+        series,
+        sheet,
+        legend,
+        stacked,
+        header_count,
+        horizontal_axis_title,
+        vertical_axis_title,
+        pie_hole,
+        ..
+    } = verb
+    else {
+        unreachable!("merge_pie_chart is only ever called for UpdateChart")
+    };
+
+    if header_count.is_some() {
+        return Err(invalid(
+            "--header-count only applies to a column/bar/line/area/scatter chart",
+        ));
+    }
+    if stacked.is_some() {
+        return Err(invalid(
+            "--stacked only applies to a column/bar/line/area/scatter chart",
+        ));
+    }
+    if horizontal_axis_title.is_some() || vertical_axis_title.is_some() {
+        return Err(invalid(
+            "--horizontal-axis-title/--vertical-axis-title only apply to a \
+             column/bar/line/area/scatter chart",
+        ));
+    }
+
+    let mut pie = spec.pie_chart.clone().unwrap_or_default();
+    if let Some(domain) = domain {
+        pie.domain = chart_data(compose_and_resolve(workbook, sheet.as_deref(), domain)?);
+        changed.push("domain");
+    }
+    if !series.is_empty() {
+        let [only_series] = series.as_slice() else {
+            return Err(invalid("a pie chart takes exactly one --series"));
+        };
+        let range = compose_and_resolve(workbook, sheet.as_deref(), only_series)?;
+        pie.series = chart_data(range);
+        changed.push("series");
+    }
+    if let Some(legend) = legend
+        .as_deref()
+        .map(parse_legend)
+        .transpose()
+        .map_err(invalid)?
+    {
+        pie.legend_position = Some(legend);
+    }
+    if let Some(pie_hole) = pie_hole {
+        pie.pie_hole = Some(*pie_hole);
+        changed.push("pie-hole");
+    }
+    spec.pie_chart = Some(pie);
+    spec.basic_chart = None;
+    Ok(())
+}
+
+/// The `!target_is_pie` branch of [`merge_chart_spec`]: merges every
+/// basic-chart flag onto `spec.basic_chart`. `requested_kind` is passed in
+/// (rather than re-parsed) since [`merge_chart_spec`] already needed it to
+/// decide `target_is_pie`.
+fn merge_basic_chart(
+    workbook: &Spreadsheet,
+    spec: &mut ChartSpec,
+    verb: &EmbeddedObjectVerb,
+    requested_kind: Option<ChartKind>,
+    changed: &mut Vec<&'static str>,
+) -> Result<(), EmbeddedObjectResult> {
+    let EmbeddedObjectVerb::UpdateChart {
+        domain,
+        series,
+        sheet,
+        legend,
+        stacked,
+        header_count,
+        horizontal_axis_title,
+        vertical_axis_title,
+        ..
+    } = verb
+    else {
+        unreachable!("merge_basic_chart is only ever called for UpdateChart")
+    };
+
+    let mut basic = spec.basic_chart.clone().unwrap_or_default();
+    if let Some(ChartKind::Basic(chart_type)) = requested_kind {
+        basic.chart_type = chart_type.to_string();
+        changed.push("type");
+    }
+    if let Some(domain) = domain {
+        basic.domains = vec![BasicChartDomain {
+            domain: chart_data(compose_and_resolve(workbook, sheet.as_deref(), domain)?),
+            extra: BTreeMap::new(),
+        }];
+        changed.push("domain");
+    }
+    if !series.is_empty() {
+        basic.series = series
+            .iter()
+            .map(|s| {
+                compose_and_resolve(workbook, sheet.as_deref(), s).map(|range| BasicChartSeries {
+                    series: chart_data(range),
+                    target_axis: None,
+                    extra: BTreeMap::new(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        changed.push("series");
+    }
+    if let Some(legend) = legend
+        .as_deref()
+        .map(parse_legend)
+        .transpose()
+        .map_err(invalid)?
+    {
+        basic.legend_position = Some(legend);
+    }
+    if let Some(stacked) = stacked
+        .as_deref()
+        .map(parse_stacked)
+        .transpose()
+        .map_err(invalid)?
+    {
+        basic.stacked_type = Some(stacked);
+        changed.push("stacked");
+    }
+    if let Some(header_count) = header_count {
+        basic.header_count = Some(*header_count);
+        changed.push("header-count");
+    }
+    if let Some(title) = horizontal_axis_title {
+        upsert_axis_title(&mut basic.axis, "BOTTOM_AXIS", title);
+        changed.push("horizontal-axis-title");
+    }
+    if let Some(title) = vertical_axis_title {
+        upsert_axis_title(&mut basic.axis, "LEFT_AXIS", title);
+        changed.push("vertical-axis-title");
+    }
+    spec.basic_chart = Some(basic);
+    spec.pie_chart = None;
+    Ok(())
 }
 
 fn build_update_chart(
@@ -1673,8 +1725,21 @@ fn record_attempt(
     let decided_by = write_gate::decided_by_log_fields(decided_by);
     let (embedded_object_id, fields_changed) = match &outcome.result {
         EmbeddedObjectResult::Changed {
-            object_id, summary, ..
-        } => (*object_id, Some(summary.clone())),
+            object_id,
+            summary,
+            object,
+        } => {
+            // For the two deletes, `object` carries the ADR-0081 §3
+            // preview — the spec that is about to become unrecoverable —
+            // and it belongs in the audit trail exactly as much as in the
+            // `--dry-run` report, so it is appended here rather than left
+            // to the summary text alone.
+            let fields_changed = object.as_deref().map_or_else(
+                || summary.clone(),
+                |object| format!("{summary} ({})", object_preview(object)),
+            );
+            (*object_id, Some(fields_changed))
+        }
         _ => (None, None),
     };
 
@@ -1696,7 +1761,10 @@ fn record_attempt(
     });
 }
 
-fn describe_object(object: &EmbeddedObjectSummary) -> String {
+/// Renders an object's type/title/anchor — the ADR-0081 §3 preview text,
+/// shared by the human-readable CLI rendering ([`describe_object`]) and the
+/// `drivemutation` record's `fields_changed` ([`record_attempt`]).
+fn object_preview(object: &EmbeddedObjectSummary) -> String {
     let kind_detail = object
         .chart_type
         .as_deref()
@@ -1706,9 +1774,13 @@ fn describe_object(object: &EmbeddedObjectSummary) -> String {
         .as_deref()
         .map_or_else(String::new, |t| format!(" '{t}'"));
     format!(
-        "  id {}: {kind_detail}{title}, anchored {}",
+        "id {}: {kind_detail}{title}, anchored {}",
         object.object_id, object.position
     )
+}
+
+fn describe_object(object: &EmbeddedObjectSummary) -> String {
+    format!("  {}", object_preview(object))
 }
 
 /// Renders an outcome as human-readable text.
@@ -2333,6 +2405,79 @@ mod tests {
         assert_eq!(spec.basic_chart.unwrap().chart_type, "BAR");
     }
 
+    #[test]
+    fn merge_chart_spec_upserts_an_axis_title_on_a_basic_chart() {
+        let sheet = basic_chart_sheet(1, "COLUMN");
+        let workbook = workbook_with_sheet(sheet);
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let mut verb = update_chart_verb(1);
+        let EmbeddedObjectVerb::UpdateChart {
+            horizontal_axis_title,
+            ..
+        } = &mut verb
+        else {
+            unreachable!()
+        };
+        *horizontal_axis_title = Some("Quarter".to_string());
+        let (spec, summary) = merge_chart_spec(&workbook, existing, &verb).unwrap();
+        let axis = spec.basic_chart.unwrap().axis;
+        assert_eq!(axis.len(), 1);
+        assert_eq!(axis[0].position, "BOTTOM_AXIS");
+        assert_eq!(axis[0].title.as_deref(), Some("Quarter"));
+        assert!(summary.contains("horizontal-axis-title"), "{summary}");
+    }
+
+    fn pie_chart_sheet(chart_id: i64) -> Sheet {
+        Sheet {
+            properties: Some(crate::drive::sheets::types::SheetProperties {
+                sheet_id: Some(0),
+                title: "Q1".to_string(),
+                ..Default::default()
+            }),
+            charts: vec![EmbeddedChart {
+                chart_id: Some(chart_id),
+                spec: Some(ChartSpec {
+                    pie_chart: Some(PieChartSpec {
+                        domain: chart_data(GridRange {
+                            sheet_id: 0,
+                            start_row_index: Some(0),
+                            end_row_index: Some(10),
+                            start_column_index: Some(0),
+                            end_column_index: Some(1),
+                        }),
+                        series: chart_data(GridRange {
+                            sheet_id: 0,
+                            start_row_index: Some(0),
+                            end_row_index: Some(10),
+                            start_column_index: Some(1),
+                            end_column_index: Some(2),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                position: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merge_chart_spec_refuses_a_basic_only_flag_on_an_existing_pie_chart() {
+        let workbook = workbook_with_sheet(pie_chart_sheet(1));
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let mut verb = update_chart_verb(1);
+        let EmbeddedObjectVerb::UpdateChart { header_count, .. } = &mut verb else {
+            unreachable!()
+        };
+        *header_count = Some(1);
+        let err = merge_chart_spec(&workbook, existing, &verb).unwrap_err();
+        assert!(matches!(
+            err,
+            EmbeddedObjectResult::RefusedInvalidRange { .. }
+        ));
+    }
+
     // ── summarise_chart / summarise_slicer / describe_position ──────────
 
     #[test]
@@ -2410,6 +2555,21 @@ mod tests {
     }
 
     // ── write_jsonl / log_status ─────────────────────────────────────────
+
+    #[test]
+    fn object_preview_names_kind_title_and_position() {
+        let object = EmbeddedObjectSummary {
+            object_id: 5,
+            kind: "chart".to_string(),
+            chart_type: Some("PIE".to_string()),
+            title: Some("Sales".to_string()),
+            position: "Q1!C2".to_string(),
+        };
+        assert_eq!(
+            object_preview(&object),
+            "id 5: chart (PIE) 'Sales', anchored Q1!C2"
+        );
+    }
 
     #[test]
     fn write_jsonl_emits_one_line_of_json() {
