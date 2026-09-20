@@ -147,6 +147,23 @@ types, so the log is a complete invocation history, not just an HTTP history:
   rather than id-addressed). `fields_changed` is reused as-is for
   `update-filter-view`'s changed-field summary.
 
+  Charts and slicers (issue
+  [#1797](https://github.com/rust-works/omni-dev/issues/1797),
+  [ADR-0081](adrs/adr-0081.md) §3) use the same kind again. New `operation`
+  values: `sheets-add-chart`, `sheets-update-chart`, `sheets-delete-chart`,
+  `sheets-add-slicer`, `sheets-update-slicer`, `sheets-delete-slicer`. One
+  more omit-if-absent context key: `embedded_object_id` (the stable numeric
+  id of a chart or slicer acted on — server-assigned for `add-chart`/
+  `add-slicer`, otherwise the one resolved against; one key for both kinds,
+  since `deleteEmbeddedObject` itself addresses both by the same `objectId`
+  with no discriminator). `sheet_id` is reused for the sheet the object is
+  anchored on (`None` for a chart put on its own new sheet, which doesn't
+  exist yet); `fields_changed` is reused for the changed-field summary and,
+  for `update-chart`/`update-slicer`/`delete-chart`/`delete-slicer` (every
+  verb that resolves against an existing object), has the object's
+  type/title/anchor appended — the ADR-0081 §3 preview text, in the audit
+  trail as well as the `--dry-run` report.
+
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of

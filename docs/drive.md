@@ -2236,6 +2236,75 @@ restores every dependent formula to working order, since the name is what
 changed,
 not the formula text.
 
+#### drive sheets add-chart / update-chart / delete-chart / list-charts / add-slicer / update-slicer / delete-slicer / list-slicers
+
+Charts and slicers (issue #1797), sharing one module and one delete request
+(`deleteEmbeddedObject` removes either, addressed by `objectId` alone).
+Every mutating verb — including both deletes — is gated by
+`sheets-structure`: see [ADR-0081](adrs/adr-0081.md) §3 for why an
+unrecoverable embedded-object removal still sits there rather than under
+`sheets-delete` (a chart/slicer is a property of the *sheet*, not the
+sheet's grid *data*, the same argument that already covers
+`unmerge-cells`/`clear-data-validation`). Both deletes read back and report
+the object's spec — type, title, anchor position — before removing it, in
+both `--dry-run` and the real run's log record.
+
+**Chart type subset (v1):** `column`, `bar`, `line`, `area`, `scatter`, and
+`pie` — the issue's own chosen first cut, the same "curated surface, not
+full API coverage" stance `set-data-validation`/`add-conditional-format`
+take. `COMBO` and `STEPPED_AREA` basic charts, and every one of the other
+~13 chart types (bubble, candlestick, org, histogram, waterfall, treemap,
+scorecard, data-source), are documented cuts.
+
+```bash
+# A column chart, anchored on the same sheet its data comes from.
+omni-dev drive sheets add-chart <ID> --type column --sheet Q1 \
+  --domain A2:A10 --series B2:B10 --series C2:C10 \
+  --title 'Revenue by region' --legend bottom --anchor F2
+
+# A pie chart on a brand-new sheet of its own.
+omni-dev drive sheets add-chart <ID> --type pie --sheet Q1 \
+  --domain A2:A10 --series B2:B10 --pie-hole 0.4 --new-sheet
+
+# See what exists, and its numeric id — a plain, ungated read.
+omni-dev drive sheets list-charts <ID>
+
+omni-dev drive sheets update-chart <ID> --chart-id 3 --title 'Revenue (final)'
+omni-dev drive sheets delete-chart <ID> --chart-id 3
+
+# A slicer, filtering column 1 (0-based) of the range.
+omni-dev drive sheets add-slicer <ID> --sheet Q1 --range A1:D100 \
+  --column 1 --hide-values Closed,Cancelled --title Status --anchor F2
+
+omni-dev drive sheets list-slicers <ID>
+omni-dev drive sheets update-slicer <ID> --slicer-id 4 --hide-values Closed
+omni-dev drive sheets delete-slicer <ID> --slicer-id 4
+```
+
+**`update-chart`'s crux: no field mask.** Unlike every other `update-*`
+verb in this tool, Sheets' `updateChartSpec` replaces a chart's *entire*
+spec — there is no way to name "just the title". `update-chart` fetches
+the existing spec, refuses it outright if it isn't one of the two
+supported kinds (rather than silently discarding, say, an existing
+histogram's configuration), refuses a basic↔pie switch (the two shapes
+carry domain/series too differently to convert — delete and re-add
+instead), and otherwise applies only the flags actually set, preserving
+every field this crate doesn't model (styling, `hiddenDimensionStrategy`,
+…) exactly as read. `update-slicer` is the opposite case — `updateSlicerSpec`
+*does* take a field mask, so only the flags actually set are ever sent.
+
+**`--column` is a 0-based index, not an A1 letter** — the same indexing
+`set-basic-filter`'s `--hide-values`/`--sort-by` use. `FilterCriteria`
+support is `hiddenValues` only, the same cut `set-basic-filter`/
+`add-filter-view` make.
+
+**Positioning is add-only.** `--anchor` (an A1 cell, using `--sheet` for its
+prefix when bare) plus optional `--offset-x`/`--offset-y`/`--width`/
+`--height` in pixels; a chart may instead take `--new-sheet` to get a sheet
+of its own, which conflicts with every position flag. There is no
+`move-chart`/`move-slicer` verb — `updateEmbeddedObjectPosition` is a
+follow-up — and no border support on either object.
+
 ## Docs
 
 `drive docs` reads the *structural model* of a Google Doc through the Docs v1
