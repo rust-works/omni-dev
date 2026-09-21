@@ -5918,7 +5918,7 @@ Options:
       --start <N>              1-based first row/column, inclusive — identifies the group together with `--end`
       --end <N>                1-based last row/column, inclusive
       --depth <N>              Disambiguates which group at that exact span to update, when more than one exists at different depths. Omit when only one exists
-      --collapsed <BOOL>       The new collapsed state. Required — unlike `format-cells`' optional flags, `update-dimension-group` changes nothing else, so there is no "leave it unset" case. `bool`, not `Option<bool>`, so clap requires it as a value-taking flag rather than treating it as a `--collapsed`-with-no-value switch [possible values: true, false]
+      --collapsed <BOOL>       The new collapsed state: `true` hides the group's rows/columns, `false` shows them [possible values: true, false]
       --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]

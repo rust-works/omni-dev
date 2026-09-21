@@ -1290,7 +1290,7 @@ fn dimension_range_label(verb: &StructureVerb) -> Option<String> {
         return None;
     }
     let end = at.checked_add(count).and_then(|end| end.checked_sub(1))?;
-    Some(format!("{} {at}:{end}", dimension.as_str()))
+    Some(dimension.span_label(at, end))
 }
 
 /// The `grid_range` context value the request log records for a

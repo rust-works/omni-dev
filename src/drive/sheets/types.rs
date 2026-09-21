@@ -720,6 +720,16 @@ impl Dimension {
             Self::Columns => "column",
         }
     }
+
+    /// The request log's `dimension_range` context value for a **1-based
+    /// inclusive** span on this axis, e.g. `"ROWS 5:7"`. The one formatter
+    /// for that key — `structure.rs` (insert/delete-dimension verbs) and
+    /// `dimension_group.rs` both write it, and neither may spell it
+    /// differently.
+    #[must_use]
+    pub fn span_label(self, start: i64, end: i64) -> String {
+        format!("{} {start}:{end}", self.as_str())
+    }
 }
 
 /// A half-open, **zero-based** span of rows or columns.
@@ -750,15 +760,19 @@ pub struct DimensionRange {
 /// `depth` is server-derived, never client-supplied: `addDimensionGroup`'s
 /// request carries only `range`, and the server computes the new group's
 /// depth from its overlap with existing groups on the same axis (a
-/// superset increments an existing group's depth; a subset or an overlap
-/// creates a new, deeper one). This crate does not predict that outcome —
-/// see the `dimension_group.rs` module doc for why.
+/// superset increments an existing group's depth; a subset creates a new,
+/// deeper one; a partial overlap widens the existing group to the union
+/// and creates a new, deeper one over the intersection). This crate does
+/// not predict that outcome — see the `dimension_group.rs` module doc for
+/// why.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DimensionGroup {
     /// The span this group covers.
     pub range: DimensionRange,
-    /// How many groups have a range that wholly contains this one's —
-    /// server-derived, `0` for a top-level group.
+    /// Nesting level — server-derived, **1-based**: `1` for a group nested
+    /// in no other, `2` for one whose range lies wholly inside a depth-1
+    /// group's, and so on (the API reference's own examples number a lone
+    /// group `depth 1`). `0` never occurs in a reply.
     #[serde(default)]
     pub depth: i64,
     /// Whether the group is collapsed (its member rows/columns hidden).

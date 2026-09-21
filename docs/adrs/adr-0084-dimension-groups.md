@@ -40,10 +40,13 @@ Three questions needed settling before implementation:
 `addDimensionGroupRequest` carries only a `range`; the server derives the
 new group's `depth` from how that range overlaps existing groups on the
 same axis (a superset increments an existing group's depth and gives the
-new group that shallower depth; a subset or partial overlap creates a new,
-deeper one — see the Sheets API reference for `AddDimensionGroupRequest`).
-Predicting that outcome client-side would mean re-implementing those
-overlap rules in this crate, purely to enforce a cap. No maximum nesting
+new group that shallower depth; a subset creates a new, deeper one; a
+partial overlap *widens the existing group to the union of the two spans*
+and creates a new, deeper one over their intersection — see the Sheets
+API reference for `AddDimensionGroupRequest`; depths are 1-based, a lone
+group is `depth 1`). Predicting that outcome client-side would mean
+re-implementing those overlap rules in this crate, purely to enforce a
+cap. No maximum nesting
 depth is documented anywhere in the Sheets API reference to validate
 against in the first place — unlike a `GridRange`'s bounds, which are
 checked against a *fact already in hand* (the sheet's current row/column
@@ -122,6 +125,13 @@ since a dimension group carries none.
   span.** `add-dimension-group`'s outcome never reports a depth (`None`,
   always) — `list-dimension-groups` is how a caller discovers what the
   server actually assigned.
+- **An add can move an existing group's edges.** When the requested span
+  partially overlaps an existing group, the server widens that group to
+  the union of the two spans (Decision 1) — a change to a group the caller
+  did not name, which `--dry-run` cannot foresee since it reports only the
+  requested span. Still a view-state change, so it stays within
+  `sheets-structure`; a caller who needs the existing group untouched
+  should check `list-dimension-groups` for overlap first.
 - **The API's partial-span delete/decrement behavior is not reachable
   through this crate.** A caller who wants to *shrink* a group's depth
   without removing it entirely must use the Sheets UI, or a

@@ -2497,8 +2497,13 @@ omni-dev drive sheets delete-dimension-group <ID> --sheet Q1 \
 
 **No client-side depth cap.** `addDimensionGroup`'s request carries only a
 span — the server derives the new group's depth from how it overlaps
-existing groups on the same axis, and no maximum nesting depth is
-documented anywhere in the Sheets API reference to validate against. This
+existing groups on the same axis (depths are 1-based; a lone group is depth
+1, a group wholly inside it depth 2), and no maximum nesting depth is
+documented anywhere in the Sheets API reference to validate against. Note
+that a span which *partially* overlaps an existing group widens that group
+to the union of the two spans as well as creating the new, deeper one —
+`--dry-run` reports only the span you asked for, so check
+`list-dimension-groups` first if an existing group must stay put. This
 crate validates only the span itself, against the sheet's current extent
 (the same check `auto-resize-dimension` makes) — Sheets stays the
 authority on how deeply nested a structure may get, the same stance

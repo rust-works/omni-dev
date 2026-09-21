@@ -113,11 +113,13 @@ pub struct UpdateDimensionGroupCommand {
     #[arg(long, value_name = "N")]
     pub depth: Option<i64>,
 
-    /// The new collapsed state. Required — unlike `format-cells`'
-    /// optional flags, `update-dimension-group` changes nothing else, so
-    /// there is no "leave it unset" case. `bool`, not `Option<bool>`, so
-    /// clap requires it as a value-taking flag rather than treating it as
-    /// a `--collapsed`-with-no-value switch.
+    /// The new collapsed state: `true` hides the group's rows/columns,
+    /// `false` shows them.
+    // Required, unlike `format-cells`' optional `--bold`-style flags:
+    // `update-dimension-group` changes nothing else, so there is no
+    // "leave it unset" case. `bool` with `ArgAction::Set`, not
+    // `Option<bool>`, so clap requires a value rather than treating a bare
+    // `--collapsed` as a switch.
     #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
     pub collapsed: bool,
 
@@ -348,10 +350,10 @@ mod tests {
                     "sheets": [{
                         "properties": {"sheetId": 0, "title": "Sheet1"},
                         "rowGroups": [
-                            {"range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 4, "endIndex": 9}, "depth": 0},
+                            {"range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 4, "endIndex": 9}, "depth": 1},
                         ],
                         "columnGroups": [
-                            {"range": {"sheetId": 0, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 3}, "depth": 0, "collapsed": true},
+                            {"range": {"sheetId": 0, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 3}, "depth": 1, "collapsed": true},
                         ],
                     }],
                 })),
