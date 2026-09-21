@@ -154,6 +154,9 @@ Every subcommand accepts `-o/--output <FORMAT>`. It defaults to `json`.
 | `json` | Scripting; pipe into `jq`. Pretty-printed. |
 | `yaml` | Reading in a terminal.                     |
 
+`route` alone also accepts `text` — one human-readable paragraph per issue,
+for reading rather than scripting. See [Text output](#text-output) below.
+
 There is no bare-value mode. `model` and `usage` are always kept in the output,
 because they are the only place the concrete model version and the token cost
 show up. `jq -r .answer.choice` gets a bare value when a script needs one.
@@ -406,6 +409,7 @@ omni-dev ai jev route '#1779' rust-works/omni-dev#1641 -o yaml
 omni-dev ai jev route https://github.com/rust-works/omni-dev/issues/1779
 omni-dev ai jev route --all-open -C ~/src/omni-dev
 omni-dev ai jev route '#1820' --providers anthropic,openai,gemini
+omni-dev ai jev route --all-open -o text
 ```
 
 `<ISSUE>` is `#N` or `N` (in the current repository, which `-C/--repo`
@@ -481,6 +485,31 @@ usage: {input_tokens: 1432, output_tokens: 61}
   then exits non-zero, naming how many issues failed. An authentication
   failure (HTTP 401 or 403) would fail every issue, so it stops the run at
   once instead.
+
+### Text output
+
+`-o text` renders the same report as one block per issue, blank-line
+separated, in request order, followed by a line reporting `model` and the
+summed `usage` — for reading, not scripting. Plain text with no markdown: a
+terminal doesn't render `**bold**`/`*italic*` markers, so they'd just be
+clutter. Each issue is a header line (`ref — title`) followed by one indented
+line per fact, rather than one run-on sentence — which keeps a
+multi-`--providers` issue readable. Its wording is **not** a stable contract
+and may change without notice; scripts should keep using `json` or `yaml`.
+
+```
+rust-works/omni-dev#1641 — Some issue title
+  fable — design needs fable (0.52), implementation sonnet (0.83), review opus (0.41, close call)
+  cites open #1129, which could leave less design work if resolved (0.75)
+
+model: jev-1.13.0, usage: 1432 input tokens, 61 output tokens
+```
+
+Routing against several `--providers` adds one indented line per provider,
+labelled `<provider>: <class> — ...` (a single provider, the common case,
+drops the label, as above). A failed issue's line reads `  failed: <error>`
+instead of a routing. A truncated issue gets a trailing `  input truncated at
+<N> characters` line; an issue with no open citations has no `cites` line.
 
 ### What Jev sees
 

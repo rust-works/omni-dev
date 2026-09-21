@@ -723,6 +723,132 @@ fn dependency_entries(
         .collect()
 }
 
+/// Renders `report` as one block per issue, blank-line separated, in request
+/// order, followed by a trailing model/usage line (#1824).
+///
+/// Plain text, deliberately with no markdown: it's read directly in a
+/// terminal, which doesn't render `**bold**`/`*italic*` markers, so they'd
+/// just be clutter. Each issue is a header line (`ref — title`) followed by
+/// one indented line per fact — one per provider's routing, then `depends_on`
+/// — rather than one run-on sentence, which reads poorly once more than one
+/// provider is involved.
+///
+/// `max_input_chars` is threaded in explicitly rather than read off
+/// `RouteReport` (which doesn't carry it) so a truncated issue's block can
+/// name the actual configured cap. This is still a pure, side-effect-free
+/// function of its arguments, unit-tested directly with fixture reports.
+///
+/// The wording is **not** a stable contract: it may change without notice.
+/// Scripts should use `json` or `yaml` instead.
+#[must_use]
+pub fn render_route_text(report: &RouteReport, max_input_chars: usize) -> String {
+    let mut blocks: Vec<String> = report
+        .issues
+        .iter()
+        .map(|issue| render_issue_block(issue, max_input_chars))
+        .collect();
+    blocks.push(format!(
+        "model: {}, usage: {} input tokens, {} output tokens",
+        report.model, report.usage.input_tokens, report.usage.output_tokens
+    ));
+    let mut text = blocks.join("\n\n");
+    text.push('\n');
+    text
+}
+
+/// Renders one issue's block: a header line, one indented line per provider's
+/// routing (or its error), a `cites` line, and a truncation note.
+fn render_issue_block(issue: &IssueRoute, max_input_chars: usize) -> String {
+    let mut lines = vec![format!("{} — {}", issue.item_ref, issue.title)];
+    match &issue.outcome {
+        RouteOutcome::Routed {
+            providers,
+            depends_on,
+        } => {
+            for (provider, route) in providers {
+                lines.push(render_provider_line(provider, route, providers.len()));
+            }
+            if let Some(line) = render_depends_on_line(depends_on) {
+                lines.push(line);
+            }
+        }
+        RouteOutcome::Failed { error } => lines.push(format!("  failed: {error}")),
+    }
+    if issue.truncated {
+        lines.push(format!(
+            "  input truncated at {} characters",
+            with_thousands(max_input_chars)
+        ));
+    }
+    lines.join("\n")
+}
+
+/// Renders one provider's routing as an indented line, e.g. `  sonnet —
+/// design needs fable (0.52), ...` or, with more than one provider requested,
+/// `  anthropic: sonnet — design needs fable (0.52), ...`.
+fn render_provider_line(provider: &str, route: &ProviderRoute, provider_count: usize) -> String {
+    let lead = if provider_count > 1 {
+        format!("{provider}: {}", route.class)
+    } else {
+        route.class.clone()
+    };
+    let clauses: Vec<String> = Stage::ALL
+        .into_iter()
+        .map(|stage| render_stage_clause(stage, &route.stages, &route.close_calls))
+        .collect();
+    format!("  {lead} — {}", clauses.join(", "))
+}
+
+/// Renders one stage's clause, e.g. `design needs fable (0.52)` or `review
+/// opus (0.41, close call)`.
+fn render_stage_clause(stage: Stage, stages: &StageAnswers, close_calls: &[Stage]) -> String {
+    let answer = stages.get(stage);
+    let label = match stage {
+        Stage::Design if answer.choice == NO_DESIGN => "design needs no further work".to_string(),
+        Stage::Design => format!("design needs {}", answer.choice),
+        Stage::Implement => format!("implementation {}", answer.choice),
+        Stage::Review => format!("review {}", answer.choice),
+    };
+    let close_call = if close_calls.contains(&stage) {
+        ", close call"
+    } else {
+        ""
+    };
+    format!("{label} ({:.2}{close_call})", answer.confidence)
+}
+
+/// Renders the `depends_on` line, or `None` when there are no open
+/// citations.
+fn render_depends_on_line(depends_on: &[DependencyEntry]) -> Option<String> {
+    if depends_on.is_empty() {
+        return None;
+    }
+    let clauses: Vec<String> = depends_on
+        .iter()
+        .map(|dep| match dep.could_be_cheaper.get("design") {
+            Some(prob) => format!(
+                "open {}, which could leave less design work if resolved ({prob:.2})",
+                dep.item_ref
+            ),
+            None => format!("open {}", dep.item_ref),
+        })
+        .collect();
+    Some(format!("  cites {}", clauses.join("; ")))
+}
+
+/// Groups `n`'s digits by thousands, e.g. `60_000` -> `"60,000"`.
+fn with_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    grouped.chars().rev().collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1725,5 +1851,238 @@ mod tests {
         assert_eq!(value["error"], "HTTP 529");
         assert!(value.get("providers").is_none());
         assert!(value.get("depends_on").is_none());
+    }
+
+    // ── render_route_text (#1824) ──────────────────────────────────────
+
+    #[test]
+    fn render_route_text_matches_the_worked_example() {
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "rust-works/omni-dev#1641".to_string(),
+                url: "u".to_string(),
+                title: "Some issue title".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([(
+                        "anthropic".to_string(),
+                        ProviderRoute {
+                            stages: StageAnswers {
+                                design: answer("fable", 0.52),
+                                implement: answer("sonnet", 0.83),
+                                review: answer("opus", 0.41),
+                            },
+                            class: "fable".to_string(),
+                            close_calls: vec![Stage::Review],
+                        },
+                    )]),
+                    depends_on: vec![DependencyEntry {
+                        item_ref: "#1129".to_string(),
+                        state: ItemState::Open,
+                        could_be_cheaper: BTreeMap::from([("design".to_string(), 0.75)]),
+                    }],
+                },
+                truncated: false,
+            }],
+            usage: Usage {
+                input_tokens: 1432,
+                output_tokens: 61,
+            },
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert_eq!(
+            text,
+            "rust-works/omni-dev#1641 — Some issue title\n\
+             \x20\x20fable — design needs fable (0.52), implementation sonnet (0.83), review \
+             opus (0.41, close call)\n\
+             \x20\x20cites open #1129, which could leave less design work if resolved (0.75)\n\n\
+             model: jev-1.13.0, usage: 1432 input tokens, 61 output tokens\n"
+        );
+    }
+
+    #[test]
+    fn render_route_text_names_each_provider_when_there_are_several() {
+        let route = |class: &str| ProviderRoute {
+            stages: stages("none", "sonnet", "sonnet"),
+            class: class.to_string(),
+            close_calls: vec![],
+        };
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([
+                        ("anthropic".to_string(), route("sonnet")),
+                        ("openai".to_string(), route("terra")),
+                    ]),
+                    depends_on: vec![],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(text.contains("  anthropic: sonnet —"), "{text}");
+        assert!(text.contains("  openai: terra —"), "{text}");
+    }
+
+    #[test]
+    fn render_route_text_reports_a_failed_issue() {
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                outcome: RouteOutcome::Failed {
+                    error: "HTTP 529".to_string(),
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(text.contains("o/r#1 — t\n  failed: HTTP 529"), "{text}");
+    }
+
+    #[test]
+    fn render_route_text_omits_the_depends_on_sentence_when_empty() {
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([(
+                        "anthropic".to_string(),
+                        ProviderRoute {
+                            stages: stages("none", "sonnet", "sonnet"),
+                            class: "sonnet".to_string(),
+                            close_calls: vec![],
+                        },
+                    )]),
+                    depends_on: vec![],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(!text.contains("cites"), "{text}");
+    }
+
+    #[test]
+    fn render_route_text_notes_a_truncated_issue_and_omits_the_note_otherwise() {
+        let issue = |truncated: bool| IssueRoute {
+            item_ref: "o/r#1".to_string(),
+            url: "u".to_string(),
+            title: "t".to_string(),
+            outcome: RouteOutcome::Routed {
+                providers: BTreeMap::from([(
+                    "anthropic".to_string(),
+                    ProviderRoute {
+                        stages: stages("none", "sonnet", "sonnet"),
+                        class: "sonnet".to_string(),
+                        close_calls: vec![],
+                    },
+                )]),
+                depends_on: vec![],
+            },
+            truncated,
+        };
+        let report = |truncated| RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![issue(truncated)],
+            usage: Usage::default(),
+        };
+        let truncated_text = render_route_text(&report(true), 60_000);
+        assert!(
+            truncated_text.contains("  input truncated at 60,000 characters"),
+            "{truncated_text}"
+        );
+        let kept_text = render_route_text(&report(false), 60_000);
+        assert!(!kept_text.contains("truncated"), "{kept_text}");
+    }
+
+    #[test]
+    fn render_route_text_notes_no_further_design_work() {
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([(
+                        "anthropic".to_string(),
+                        ProviderRoute {
+                            stages: stages("none", "sonnet", "sonnet"),
+                            class: "sonnet".to_string(),
+                            close_calls: vec![],
+                        },
+                    )]),
+                    depends_on: vec![],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(text.contains("design needs no further work"), "{text}");
+    }
+
+    #[test]
+    fn render_route_text_separates_multiple_issues_with_a_blank_line_in_request_order() {
+        let issue = |item_ref: &str| IssueRoute {
+            item_ref: item_ref.to_string(),
+            url: "u".to_string(),
+            title: "t".to_string(),
+            outcome: RouteOutcome::Failed {
+                error: "e".to_string(),
+            },
+            truncated: false,
+        };
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![issue("o/r#1"), issue("o/r#2")],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        let first = text.find("o/r#1").unwrap();
+        let second = text.find("o/r#2").unwrap();
+        assert!(first < second, "{text}");
+        assert!(
+            text.contains("o/r#1 — t\n  failed: e\n\no/r#2 — t\n  failed: e"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_route_text_ends_with_the_model_and_summed_usage() {
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 20,
+            },
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert_eq!(
+            text,
+            "model: jev-1.13.0, usage: 10 input tokens, 20 output tokens\n"
+        );
+    }
+
+    #[test]
+    fn with_thousands_groups_digits() {
+        assert_eq!(with_thousands(0), "0");
+        assert_eq!(with_thousands(999), "999");
+        assert_eq!(with_thousands(60_000), "60,000");
+        assert_eq!(with_thousands(1_000_000), "1,000,000");
     }
 }
