@@ -105,3 +105,4 @@ by Michael Nygard.
 | [ADR-0079](adr-0079.md)                                 | ✅ Accepted                              | 2026-09-08 | Restoring an Archive into a Mailbox via `messages.insert`                                   |
 | [ADR-0080](adr-0080.md)                                 | ✅ Accepted                              | 2026-09-10 | Touch ID-Authorised Backup Leases and a Fail-Closed Audit Log for Drive Writes              |
 | [ADR-0081](adr-0081.md)                                 | ✅ Accepted                              | 2026-09-20 | Permission-Gate Mapping for the Second Sheets Capability Tranche                            |
+| [ADR-0082](adr-0082-banded-ranges.md)                   | ✅ Accepted                              | 2026-09-21 | Banded Ranges via `spreadsheets.batchUpdate`                                                |

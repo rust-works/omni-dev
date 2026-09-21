@@ -4498,10 +4498,39 @@ Commands:
   add-pivot-table              Writes a new pivot table at an anchor cell. Gated by **both** the folder write-permission rules' `sheets-write` and `sheets-structure` operations (issue #1798, ADR-0081 §5)
   delete-pivot-table           Clears the pivot table at an anchor cell. Gated by the folder write-permission rules' `sheets-write` operation alone (issue #1798, ADR-0081 §5)
   list-pivot-tables            Lists the pivot tables in a spreadsheet, by anchor cell. Read-only and ungated, like `list-conditional-formats` (issue #1798)
+  add-banding                  Adds a banded range — alternating row or column colors. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1832, ADR-0082): presentation applied to a range, same reasoning as `unmerge-cells`/`clear-data-validation`
+  update-banding               Changes an existing banded range's range and/or colors. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1832, ADR-0082)
+  delete-banding               Removes a banded range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1832, ADR-0082) — it removes presentation, not grid data
+  list-bandings                Lists the banded ranges in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1832)
   help                         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev drive sheets add-banding - Adds a banded range — alternating row or column colors. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1832, ADR-0082): presentation applied to a range, same reasoning as `unmerge-cells`/`clear-data-validation`
+
+Adds a banded range — alternating row or column colors. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1832, ADR-0082): presentation applied to a range, same reasoning as `unmerge-cells`/`clear-data-validation`
+
+Usage: add-banding [OPTIONS] --sheet <NAME> --range <A1> --first-band-color <HEX> --second-band-color <HEX> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>             Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --range <A1>               A1 range to band, optionally carrying its own `Sheet!` prefix
+      --axis <AXIS>              Which axis to alternate along [default: rows] [possible values: rows, columns]
+      --header-color <HEX>       The header row/column's color, `#RRGGBB`, if distinct from the alternating bands
+      --first-band-color <HEX>   The first band's color, `#RRGGBB`
+      --second-band-color <HEX>  The second (alternating) band's color, `#RRGGBB`
+      --footer-color <HEX>       The footer row/column's color, `#RRGGBB`, if distinct from the alternating bands
+      --dry-run                  Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>            The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                     Print help (see more with '--help')
 
 
 ================================================================================
@@ -4872,6 +4901,25 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets delete-banding - Removes a banded range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1832, ADR-0082) — it removes presentation, not grid data
+
+Removes a banded range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1832, ADR-0082) — it removes presentation, not grid data
+
+Usage: delete-banding [OPTIONS] --banded-range-id <ID> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --banded-range-id <ID>  Which banded range to remove
+      --dry-run               Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>         The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>       Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                  Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets delete-chart - Removes a chart, after reporting its spec (type, title, anchor). Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3) — not `sheets-delete`; see that ADR section for why an unrecoverable embedded-object removal still sits here. Cannot be undone through omni-dev
 
 Removes a chart, after reporting its spec (type, title, anchor). Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3) — not `sheets-delete`; see that ADR section for why an unrecoverable embedded-object removal still sits here. Cannot be undone through omni-dev
@@ -5229,6 +5277,22 @@ Options:
       --count <N>        How many rows to insert [default: 1]
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets list-bandings - Lists the banded ranges in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1832)
+
+Lists the banded ranges in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1832)
+
+Usage: list-bandings [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
@@ -5619,6 +5683,32 @@ Options:
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets update-banding - Changes an existing banded range's range and/or colors. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1832, ADR-0082)
+
+Changes an existing banded range's range and/or colors. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1832, ADR-0082)
+
+Usage: update-banding [OPTIONS] --banded-range-id <ID> <--sheet <NAME>|--range <A1>|--header-color <HEX>|--first-band-color <HEX>|--second-band-color <HEX>|--footer-color <HEX>> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --banded-range-id <ID>     Which banded range to change
+      --sheet <NAME>             Sheet (tab) title, when changing the banded range. Supplies the prefix for a bare `--range`
+      --range <A1>               The new A1 range, when changing it, optionally carrying its own `Sheet!` prefix
+      --axis <AXIS>              Which axis's colors `--header-color`/`--first-band-color`/`--second-band-color`/`--footer-color` change [default: rows] [possible values: rows, columns]
+      --header-color <HEX>       The new header color, `#RRGGBB`, when changing it
+      --first-band-color <HEX>   The new first-band color, `#RRGGBB`, when changing it
+      --second-band-color <HEX>  The new second-band color, `#RRGGBB`, when changing it
+      --footer-color <HEX>       The new footer color, `#RRGGBB`, when changing it
+      --dry-run                  Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>            The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                     Print help (see more with '--help')
 
 
 ================================================================================

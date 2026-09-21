@@ -164,6 +164,16 @@ types, so the log is a complete invocation history, not just an HTTP history:
   type/title/anchor appended — the ADR-0081 §3 preview text, in the audit
   trail as well as the `--dry-run` report.
 
+  Banded ranges (issue
+  [#1832](https://github.com/rust-works/omni-dev/issues/1832),
+  [ADR-0082](adrs/adr-0082-banded-ranges.md)) use the same kind again. New
+  `operation` values: `sheets-add-banding`, `sheets-update-banding`,
+  `sheets-delete-banding`. One more omit-if-absent context key:
+  `banded_range_id` (the stable numeric id of a banded range acted on —
+  server-assigned for `add-banding`, otherwise the one resolved against),
+  mirroring `filter_view_id`'s precedent. `sheet_id` is reused for the
+  sheet the banded range sits on.
+
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of

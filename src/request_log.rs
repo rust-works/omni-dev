@@ -1560,6 +1560,12 @@ pub struct DriveMutationOutcome {
     /// `deleteEmbeddedObject` itself addresses a chart or a slicer by the
     /// same `objectId` with no discriminator naming which.
     pub embedded_object_id: Option<i64>,
+    /// The stable numeric id of a banded range an `add-banding`/
+    /// `update-banding`/`delete-banding` acted on (issue #1832). Set from
+    /// the `addBanding` reply for `add-banding` (server-assigned, like
+    /// [`Self::filter_view_id`] for `add-filter-view`) and from the id
+    /// resolved against for `update-banding`/`delete-banding`.
+    pub banded_range_id: Option<i64>,
     /// The API/validation error, when the attempt failed.
     pub error: Option<String>,
     /// Wall time of the attempt.
@@ -1721,6 +1727,9 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
             "embedded_object_id".to_string(),
             embedded_object_id.to_string(),
         );
+    }
+    if let Some(banded_range_id) = outcome.banded_range_id {
+        context.insert("banded_range_id".to_string(), banded_range_id.to_string());
     }
     rec.context = context;
     rec

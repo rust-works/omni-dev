@@ -11,6 +11,7 @@
 //! permission diagnostics: a Sheet is a Drive file, and the permission gate
 //! is a Drive concept.
 
+pub(crate) mod banding;
 pub(crate) mod conditional_format;
 pub(crate) mod create;
 pub(crate) mod developer_metadata;
@@ -260,6 +261,22 @@ pub enum SheetsSubcommands {
     /// Lists the pivot tables in a spreadsheet, by anchor cell. Read-only
     /// and ungated, like `list-conditional-formats` (issue #1798).
     ListPivotTables(pivot::ListPivotTablesCommand),
+    /// Adds a banded range — alternating row or column colors. Gated by
+    /// the folder write-permission rules' `sheets-structure` operation
+    /// (issue #1832, ADR-0082): presentation applied to a range, same
+    /// reasoning as `unmerge-cells`/`clear-data-validation`.
+    AddBanding(banding::AddBandingCommand),
+    /// Changes an existing banded range's range and/or colors. Gated by
+    /// the folder write-permission rules' `sheets-structure` operation
+    /// (issue #1832, ADR-0082).
+    UpdateBanding(banding::UpdateBandingCommand),
+    /// Removes a banded range. Gated by the folder write-permission rules'
+    /// `sheets-structure` operation (issue #1832, ADR-0082) — it removes
+    /// presentation, not grid data.
+    DeleteBanding(banding::DeleteBandingCommand),
+    /// Lists the banded ranges in a spreadsheet. Read-only and ungated,
+    /// like `list-protections` (issue #1832).
+    ListBandings(banding::ListBandingsCommand),
 }
 
 impl SheetsCommand {
@@ -329,6 +346,10 @@ impl SheetsCommand {
             SheetsSubcommands::AddPivotTable(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeletePivotTable(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ListPivotTables(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::AddBanding(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::UpdateBanding(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteBanding(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::ListBandings(cmd) => cmd.execute(client).await,
         }
     }
 }
@@ -768,6 +789,122 @@ mod tests {
 
         assert!(dispatch(
             SheetsSubcommands::ListPivotTables(pivot::ListPivotTablesCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_banding_dispatch_arms_reach_their_leaf_commands() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        // No write-permission rules are configured (an unconfigured
+        // account), so every mutating leaf below is `Blocked` by default
+        // policy — enough to reach and return from the leaf without a
+        // lease or a workbook fetch. `list-bandings` is ungated, so it
+        // goes further and actually fetches the (banding-free) workbook.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1",
+                    "name": "Budget",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": ["folder-1"],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1",
+                    "name": "folder-1",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1"}}],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        fn no_lease() -> crate::cli::drive::helpers::LeaseTokenArg {
+            crate::cli::drive::helpers::LeaseTokenArg { lease: None }
+        }
+
+        assert!(dispatch(
+            SheetsSubcommands::AddBanding(banding::AddBandingCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: "Sheet1".to_string(),
+                range: "A1:D10".to_string(),
+                axis: banding::BandingAxisArg::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::UpdateBanding(banding::UpdateBandingCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                banded_range_id: 1,
+                sheet: None,
+                range: None,
+                axis: banding::BandingAxisArg::Rows,
+                header_color: Some("#000000".to_string()),
+                first_band_color: None,
+                second_band_color: None,
+                footer_color: None,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::DeleteBanding(banding::DeleteBandingCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                banded_range_id: 1,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::ListBandings(banding::ListBandingsCommand {
                 spreadsheet_id: "sheet-1".to_string(),
                 output: crate::cli::drive::format::OutputFormat::Table,
             }),
