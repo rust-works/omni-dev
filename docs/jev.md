@@ -513,6 +513,16 @@ labelled `<ladder>: <class> — ...` (a single ladder, the common case,
 drops the label, as above). A failed issue's line reads `  failed: <error>`
 instead of a routing. A truncated issue gets a trailing `  input truncated at
 <N> characters` line; an issue with no open citations has no `cites` line.
+An issue that cites more than one open item gets one `cites` line per
+citation, in citation order, rather than one line joining every clause with
+`; ` ([#1849](https://github.com/rust-works/omni-dev/issues/1849)):
+
+```
+rust-works/omni-dev#1845 — feat(drive): randomizeRange for drive sheets (#1830)
+  fable — design needs fable (0.42), implementation sonnet (0.66), review opus (0.36)
+  cites open #1830, which could leave less design work if resolved (0.46)
+  cites open #1831, which could leave less design work if resolved (0.52)
+```
 
 When any stage's chosen tier name is multi-model (a custom ladder's
 comma-joined tier name, [#1826](https://github.com/rust-works/omni-dev/issues/1826)),
