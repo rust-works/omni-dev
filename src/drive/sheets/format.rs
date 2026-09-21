@@ -1602,6 +1602,19 @@ mod tests {
     }
 
     #[test]
+    fn normalize_hex_for_display_always_carries_exactly_one_hash() {
+        // The two shapes `parse_hex_color` accepts must display identically,
+        // so `structure.rs`'s `update-sheet-properties` text never echoes a
+        // bare `FF8800` for one user and `#FF8800` for another (issue #1835).
+        assert_eq!(normalize_hex_for_display("#FF8800"), "#FF8800");
+        assert_eq!(normalize_hex_for_display("FF8800"), "#FF8800");
+        // Only the *leading* `#` is stripped, and only once — `strip_prefix`
+        // is not a trim, so a doubled prefix keeps its second `#`.
+        assert_eq!(normalize_hex_for_display("##FF8800"), "##FF8800");
+        assert_eq!(normalize_hex_for_display(""), "#");
+    }
+
+    #[test]
     fn build_cell_format_refuses_an_empty_flag_set() {
         let err = build_cell_format(&CellFormatFlags::default()).unwrap_err();
         assert!(err.contains("at least one property"), "{err}");
