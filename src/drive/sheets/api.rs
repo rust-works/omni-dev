@@ -114,6 +114,16 @@ const CELL_PIVOT_FIELDS: &str = "spreadsheetId,properties.title,\
     sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
     sheets.data(startRow,startColumn,rowData.values(pivotTable,formattedValue))";
 
+/// `fields` mask for `spreadsheets.get` when banded ranges are needed too
+/// (issue #1832's `add-banding`/`update-banding`/`delete-banding`/
+/// `list-bandings`, which must resolve an *existing* banded range by id
+/// before three of the four can act on one). A superset of
+/// [`SPREADSHEET_FIELDS`], kept separate for the same reason
+/// [`SPREADSHEET_FIELDS_WITH_PROTECTIONS`] is.
+const SPREADSHEET_FIELDS_WITH_BANDING: &str = "spreadsheetId,properties.title,\
+    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.bandedRanges(bandedRangeId,range,rowProperties,columnProperties)";
+
 /// Maximum ranges sent in a single `values.batchGet`.
 ///
 /// Each range is a percent-encoded, quoted sheet title in the query string,
@@ -328,6 +338,21 @@ impl<'a> SheetsApi<'a> {
             .get_parsed(
                 url.as_str(),
                 "Failed to parse Sheets spreadsheet metadata (with pivot tables)",
+            )
+            .await
+    }
+
+    /// Fetches a spreadsheet's metadata **including banded ranges** —
+    /// shared by all four `banding.rs` verbs (issue #1832), mirroring
+    /// [`Self::get_spreadsheet_with_filter_views`]'s reuse across its own
+    /// four verbs. See [`SPREADSHEET_FIELDS_WITH_BANDING`].
+    pub async fn get_spreadsheet_with_banding(&self, spreadsheet_id: &str) -> Result<Spreadsheet> {
+        let url = build_spreadsheet_get_with_banding_url(self.client.base_url(), spreadsheet_id)?;
+        self.client
+            .transport()
+            .get_parsed(
+                url.as_str(),
+                "Failed to parse Sheets spreadsheet metadata (with banded ranges)",
             )
             .await
     }
@@ -652,6 +677,15 @@ fn build_spreadsheet_get_with_pivot_tables_url(
     GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
     url.query_pairs_mut()
         .append_pair("fields", SPREADSHEET_FIELDS_WITH_PIVOT_TABLES);
+    Ok(url)
+}
+
+fn build_spreadsheet_get_with_banding_url(base_url: &str, spreadsheet_id: &str) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
+    url.query_pairs_mut()
+        .append_pair("fields", SPREADSHEET_FIELDS_WITH_BANDING);
     Ok(url)
 }
 

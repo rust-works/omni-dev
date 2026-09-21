@@ -135,6 +135,13 @@ pub enum DriveOperation {
     /// structural feature of a sheet, which is why it needs this operation
     /// too and not `SheetsWrite` alone.
     ///
+    /// Since issue #1832 ([ADR-0082](../../docs/adrs/adr-0082-banded-ranges.md)),
+    /// also banded ranges (`add-banding`/`update-banding`/`delete-banding`)
+    /// — alternating row/column colors applied to a range, the same
+    /// "property of the sheet, not the sheet's data" reasoning as
+    /// `unmerge-cells`/`clear-data-validation`; removing one destroys no
+    /// grid data.
+    ///
     /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
     /// reason that one is not folded into [`Self::Edit`]. Every existing
     /// `allow: ["sheets-write"]` rule was written when structural edits were

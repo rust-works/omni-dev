@@ -167,6 +167,17 @@ pub struct Sheet {
     /// `delete-slicer`; `list-slicers` is how that id is discovered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slicers: Vec<Slicer>,
+    /// Banded ranges (alternating row/column colors) on this sheet. Empty
+    /// unless the caller requested them with a wider `fields` mask — only
+    /// `SheetsApi::get_spreadsheet_with_banding` populates it (issue
+    /// #1832). `bandedRangeId`-addressed by `update-banding`/
+    /// `delete-banding`; `list-bandings` is how that id is discovered.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "bandedRanges"
+    )]
+    pub banded_ranges: Vec<BandedRange>,
     /// Grid data — cell-by-cell, in row-major chunks — read back only when
     /// the caller asked for it via a `fields` mask naming individual cell
     /// properties. Empty unless the caller requested a wider mask; only
@@ -530,6 +541,19 @@ pub enum BatchUpdateRequestItem {
     /// alone for `delete-pivot-table` (it only ever clears the one anchor
     /// cell's value, no structural effect).
     UpdateCells(UpdateCellsRequest),
+    /// Add a new banded range (`add-banding`) — alternating row/column
+    /// colors, presentation applied to a range. Gated by
+    /// `DriveOperation::SheetsStructure` (issue #1832,
+    /// [ADR-0082](../../../docs/adrs/adr-0082-banded-ranges.md)): the same
+    /// "property of the sheet, not the sheet's data" reasoning as
+    /// `unmerge-cells`/`clear-data-validation`.
+    AddBanding(AddBandingRequest),
+    /// Change an existing banded range's colors and/or range
+    /// (`update-banding`). Same gate as [`Self::AddBanding`].
+    UpdateBanding(UpdateBandingRequest),
+    /// Remove a banded range (`delete-banding`). Same gate as
+    /// [`Self::AddBanding`] — it removes presentation, not grid data.
+    DeleteBanding(DeleteBandingRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -2237,6 +2261,122 @@ pub struct DeleteRangeRequest {
     pub shift_dimension: ShiftDimension,
 }
 
+/// A banded range — alternating row or column colors applied to a range
+/// (issue #1832, [ADR-0082](../../../docs/adrs/adr-0082-banded-ranges.md)).
+///
+/// v1 sets at most one of `row_properties`/`column_properties` per
+/// `add-banding`/`update-banding` call, selected by `--axis`; the API
+/// itself allows both on the same range simultaneously (a checkerboard
+/// effect), which this crate does not expose — a documented cut, not a
+/// silent gap.
+///
+/// `PartialEq`-only, not `Eq`: embeds [`ColorStyle`], which wraps the
+/// `f32`-based [`Color`] — see [`Color`]'s own doc comment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BandedRange {
+    /// The server-assigned stable id. Absent on an `add-banding` request
+    /// this crate is building; always present on one read back or on an
+    /// `update-banding`/`delete-banding` request.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "bandedRangeId"
+    )]
+    pub banded_range_id: Option<i64>,
+    /// The banded range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<GridRange>,
+    /// Row-banding colors, when banding alternates by row.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "rowProperties"
+    )]
+    pub row_properties: Option<BandingProperties>,
+    /// Column-banding colors, when banding alternates by column.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "columnProperties"
+    )]
+    pub column_properties: Option<BandingProperties>,
+}
+
+/// The colors of one axis of a [`BandedRange`] — `BandingProperties`.
+///
+/// Only the modern `*ColorStyle` fields are modelled, matching
+/// `format-cells`'s precedent verbatim: the API's plain `headerColor`/
+/// `firstBandColor`/`secondBandColor`/`footerColor` fields are deprecated
+/// in favor of their `*ColorStyle` counterparts, which take precedence when
+/// both are set, so the plain fields are never worth sending. Within each
+/// `ColorStyle`, only the `rgbColor` arm is modelled — see [`ColorStyle`]'s
+/// own doc comment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BandingProperties {
+    /// The header row/column's color, if distinct from the alternating
+    /// bands.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "headerColorStyle"
+    )]
+    pub header_color_style: Option<ColorStyle>,
+    /// The first band's color.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "firstBandColorStyle"
+    )]
+    pub first_band_color_style: Option<ColorStyle>,
+    /// The second (alternating) band's color.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "secondBandColorStyle"
+    )]
+    pub second_band_color_style: Option<ColorStyle>,
+    /// The footer row/column's color, if distinct from the alternating
+    /// bands.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "footerColorStyle"
+    )]
+    pub footer_color_style: Option<ColorStyle>,
+}
+
+/// `AddBandingRequest`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AddBandingRequest {
+    /// The banded range to create. `banded_range_id` is left unset — the
+    /// server assigns it, only knowable from the reply.
+    #[serde(rename = "bandedRange")]
+    pub banded_range: BandedRange,
+}
+
+/// `UpdateBandingRequest`.
+///
+/// Reuses [`BandedRange`] itself, like `UpdateFilterViewRequest`: every
+/// field here (`range`/`rowProperties`/`columnProperties`) is
+/// independently updatable, and `banded_range_id` must be set to select the
+/// target.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UpdateBandingRequest {
+    /// The properties to write. `banded_range_id` selects the target.
+    #[serde(rename = "bandedRange")]
+    pub banded_range: BandedRange,
+    /// The field mask limiting what this request may change.
+    pub fields: String,
+}
+
+/// `DeleteBandingRequest`.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct DeleteBandingRequest {
+    /// Which banded range to remove.
+    #[serde(rename = "bandedRangeId")]
+    pub banded_range_id: i64,
+}
+
 /// Response to `spreadsheets.batchUpdate`.
 ///
 /// Only `replies` is modelled, and only the `addSheet` arm of it: the new
@@ -2290,6 +2430,11 @@ pub struct BatchUpdateReply {
     /// (issue #1797).
     #[serde(default, rename = "addSlicer")]
     pub add_slicer: Option<AddSlicerReply>,
+    /// Present only for an `addBanding` request — carries the
+    /// server-assigned `bandedRangeId`, only knowable from the reply
+    /// (issue #1832).
+    #[serde(default, rename = "addBanding")]
+    pub add_banding: Option<AddBandingReply>,
 }
 
 /// The `addProtectedRange` arm of a [`BatchUpdateReply`].
@@ -2330,6 +2475,14 @@ pub struct AddSlicerReply {
     /// The created slicer, including its assigned `slicerId`.
     #[serde(default)]
     pub slicer: Option<Slicer>,
+}
+
+/// The `addBanding` arm of a [`BatchUpdateReply`] (issue #1832).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct AddBandingReply {
+    /// The created banded range, including its assigned `bandedRangeId`.
+    #[serde(default, rename = "bandedRange")]
+    pub banded_range: Option<BandedRange>,
 }
 
 /// The `addSheet`/`duplicateSheet` arm of a [`BatchUpdateReply`].

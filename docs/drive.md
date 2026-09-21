@@ -628,7 +628,7 @@ operation anywhere in a target's ancestor chain:
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
 | `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table` |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-pivot-table` (also needs `sheets-write`) |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding` |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -697,6 +697,13 @@ mitigated the same way `merge-cells`' data loss is: `delete-named-range`'s
 and reports the count and A1 locations of every reference before it
 deletes. `drive sheets list-named-ranges` is a plain read and needs no
 grant, the same as `list-protections`.
+
+**`sheets-structure` also covers banded ranges — `add-banding`/
+`update-banding`/`delete-banding`** (issue #1832, [ADR-0082](adrs/adr-0082-banded-ranges.md)).
+A banded range is alternating row/column color applied to a range —
+presentation, not data — so `delete-banding` destroys nothing. `drive
+sheets list-bandings` is a plain read and needs no grant, the same as
+`list-protections`.
 
 **`sheets-protection` is separate from `sheets-structure`, and the reason is
 different in kind from every split above.** A protected range is a
@@ -2397,6 +2404,61 @@ prefix when bare) plus optional `--offset-x`/`--offset-y`/`--width`/
 of its own, which conflicts with every position flag. There is no
 `move-chart`/`move-slicer` verb — `updateEmbeddedObjectPosition` is a
 follow-up — and no border support on either object.
+
+#### drive sheets add-banding / update-banding / delete-banding / list-bandings
+
+Banded ranges — alternating row or column colors — gated by
+`sheets-structure`, including `delete-banding`. See
+[ADR-0082](adrs/adr-0082-banded-ranges.md): a banding is presentation
+applied to a range, so removing one destroys no data, the same reasoning as
+`unmerge-cells`/`clear-data-validation`.
+
+```bash
+# Add row banding (the default axis) to a range.
+omni-dev drive sheets add-banding <ID> --sheet Q1 --range A1:D50 \
+  --first-band-color '#FFFFFF' --second-band-color '#F3F3F3'
+
+# Add column banding, with a distinct header color.
+omni-dev drive sheets add-banding <ID> --sheet Q1 --range A1:D50 \
+  --axis columns --header-color '#4A86E8' \
+  --first-band-color '#FFFFFF' --second-band-color '#F3F3F3'
+
+# See what's defined, and its id — a plain, ungated read.
+omni-dev drive sheets list-bandings <ID>
+
+# Change a color, or reposition the range, by id.
+omni-dev drive sheets update-banding <ID> --banded-range-id 0 --footer-color '#000000'
+omni-dev drive sheets update-banding <ID> --banded-range-id 0 --sheet Q1 --range A1:D100
+
+# Remove a banded range — read --dry-run first.
+omni-dev drive sheets delete-banding <ID> --banded-range-id 0 --dry-run
+omni-dev drive sheets delete-banding <ID> --banded-range-id 0
+```
+
+**Colors are `#RRGGBB` only, written via the modern `*ColorStyle` fields.**
+The Sheets API's plain `Color` fields (`headerColor`/`firstBandColor`/
+`secondBandColor`/`footerColor`) are deprecated in favor of their
+`*ColorStyle` counterparts, so this crate never sends them; a theme color
+(the `ColorStyle` union's other arm) has no flag surface here either — the
+same cut `format-cells` makes. `--first-band-color`/`--second-band-color`
+are required on `add-banding`; `--header-color`/`--footer-color` are
+optional.
+
+**One axis per call.** The Sheets API allows a single `BandedRange` to carry
+both row and column banding at once; this crate exposes only one, selected
+by `--axis` (default `rows`). Wanting both on the same range needs two
+separate `add-banding` calls with the same `--range` — the API accepts
+overlapping bandings on different axes — or the Sheets UI.
+
+**`update-banding`/`delete-banding` are addressed directly by
+`--banded-range-id`** — the server-assigned id `list-bandings` discovers,
+not resolved by range match. `update-banding` may change the range, the
+colors, or both; passing none of `--sheet`/`--range`/`--header-color`/
+`--first-band-color`/`--second-band-color`/`--footer-color` is refused as
+nothing to change. A changed color merges onto the selected axis's
+*existing* colors — an unset color flag leaves that color untouched — so
+`update-banding --header-color '#000000'` alone does not clear the
+existing first/second band colors.
 
 ## Docs
 

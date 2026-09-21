@@ -20,6 +20,7 @@
 
 pub mod a1;
 pub mod api;
+pub mod banding;
 pub mod client;
 pub mod conditional_format;
 pub mod create;
