@@ -364,21 +364,12 @@ impl From<ShiftArg> for crate::drive::sheets::types::ShiftDimension {
     }
 }
 
-/// Inserts empty cells into a rectangular range, shifting existing cells
-/// down or right within the same grid.
-///
-/// Gated by the folder write-permission rules' `sheets-structure` operation
-/// (issue #1838). Cells shifted past the sheet's grid extent are dropped by
-/// the Sheets API.
+/// The rectangle-plus-shift-direction arguments shared verbatim by
+/// [`InsertRangeCommand`] and [`DeleteRangeCommand`] — `insert-range`'s exact
+/// inverse (issue #1838). Flattened rather than duplicated so the two
+/// commands' bounds can't drift apart field by field.
 #[derive(Parser)]
-pub struct InsertRangeCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
-
-    /// Title of the sheet to modify.
-    #[arg(long, value_name = "NAME")]
-    pub sheet: String,
-
+pub struct GridRangeArgs {
     /// First row of the range, 1-based inclusive.
     #[arg(long, value_name = "ROW")]
     pub start_row: i64,
@@ -395,9 +386,29 @@ pub struct InsertRangeCommand {
     #[arg(long, value_name = "COLUMN")]
     pub end_column: i64,
 
-    /// Which way to shift existing cells to make room.
+    /// Which way to shift cells to make room for or close the gap left by
+    /// this range.
     #[arg(long, value_enum)]
     pub shift: ShiftArg,
+}
+
+/// Inserts empty cells into a rectangular range, shifting existing cells
+/// down or right within the same grid.
+///
+/// Gated by the folder write-permission rules' `sheets-structure` operation
+/// (issue #1838). Cells shifted past the sheet's grid extent are dropped by
+/// the Sheets API.
+#[derive(Parser)]
+pub struct InsertRangeCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to modify.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    #[command(flatten)]
+    pub range: GridRangeArgs,
 
     /// Reports the gate verdict and the change that would be made, without
     /// calling `spreadsheets.batchUpdate`.
@@ -428,25 +439,8 @@ pub struct DeleteRangeCommand {
     #[arg(long, value_name = "NAME")]
     pub sheet: String,
 
-    /// First row of the range, 1-based inclusive.
-    #[arg(long, value_name = "ROW")]
-    pub start_row: i64,
-
-    /// Last row of the range, 1-based inclusive.
-    #[arg(long, value_name = "ROW")]
-    pub end_row: i64,
-
-    /// First column of the range, 1-based inclusive.
-    #[arg(long, value_name = "COLUMN")]
-    pub start_column: i64,
-
-    /// Last column of the range, 1-based inclusive.
-    #[arg(long, value_name = "COLUMN")]
-    pub end_column: i64,
-
-    /// Which way to shift the remaining cells afterward.
-    #[arg(long, value_enum)]
-    pub shift: ShiftArg,
+    #[command(flatten)]
+    pub range: GridRangeArgs,
 
     /// Reports the gate verdict and the change that would be made, without
     /// calling `spreadsheets.batchUpdate`.
@@ -897,11 +891,11 @@ impl InsertRangeCommand {
             spreadsheet_id: self.spreadsheet_id,
             verb: StructureVerb::InsertRange {
                 sheet: self.sheet,
-                start_row: self.start_row,
-                end_row: self.end_row,
-                start_column: self.start_column,
-                end_column: self.end_column,
-                shift: self.shift.into(),
+                start_row: self.range.start_row,
+                end_row: self.range.end_row,
+                start_column: self.range.start_column,
+                end_column: self.range.end_column,
+                shift: self.range.shift.into(),
             },
             dry_run: self.dry_run,
             lease_token: self.lease.lease,
@@ -918,11 +912,11 @@ impl DeleteRangeCommand {
             spreadsheet_id: self.spreadsheet_id,
             verb: StructureVerb::DeleteRange {
                 sheet: self.sheet,
-                start_row: self.start_row,
-                end_row: self.end_row,
-                start_column: self.start_column,
-                end_column: self.end_column,
-                shift: self.shift.into(),
+                start_row: self.range.start_row,
+                end_row: self.range.end_row,
+                start_column: self.range.start_column,
+                end_column: self.range.end_column,
+                shift: self.range.shift.into(),
             },
             dry_run: self.dry_run,
             lease_token: self.lease.lease,

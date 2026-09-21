@@ -4450,6 +4450,7 @@ Commands:
   rename-sheet                 Renames an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
   insert-rows                  Inserts empty rows, shifting existing rows down. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
   insert-columns               Inserts empty columns, shifting existing columns right. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+  insert-range                 Inserts empty cells into a rectangular range, shifting existing cells down or right. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1838)
   move-rows                    Moves a contiguous block of rows to a new position within a sheet, shifting the rows in between. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1834)
   move-columns                 Moves a contiguous block of columns to a new position within a sheet, shifting the columns in between. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1834)
   delete-sheet                 Deletes an entire sheet (tab) from a spreadsheet. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
@@ -5128,7 +5129,7 @@ Options:
       --end-row <ROW>          Last row of the range, 1-based inclusive
       --start-column <COLUMN>  First column of the range, 1-based inclusive
       --end-column <COLUMN>    Last column of the range, 1-based inclusive
-      --shift <SHIFT>          Which way to shift the remaining cells afterward [possible values: rows, columns]
+      --shift <SHIFT>          Which way to shift cells to make room for or close the gap left by this range [possible values: rows, columns]
       --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
@@ -5310,6 +5311,30 @@ Options:
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets insert-range - Inserts empty cells into a rectangular range, shifting existing cells down or right. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1838)
+
+Inserts empty cells into a rectangular range, shifting existing cells down or right. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1838)
+
+Usage: insert-range [OPTIONS] --sheet <NAME> --start-row <ROW> --end-row <ROW> --start-column <COLUMN> --end-column <COLUMN> --shift <SHIFT> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>           Title of the sheet to modify
+      --start-row <ROW>        First row of the range, 1-based inclusive
+      --end-row <ROW>          Last row of the range, 1-based inclusive
+      --start-column <COLUMN>  First column of the range, 1-based inclusive
+      --end-column <COLUMN>    Last column of the range, 1-based inclusive
+      --shift <SHIFT>          Which way to shift cells to make room for or close the gap left by this range [possible values: rows, columns]
+      --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
 
 
 ================================================================================

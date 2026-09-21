@@ -1135,13 +1135,6 @@ fn validate_verb_args(
         StructureVerb::InsertColumns { at, count, .. } => {
             validate_insert_bounds(Dimension::Columns, *at, *count, sheet)
         }
-        StructureVerb::InsertRange {
-            start_row,
-            end_row,
-            start_column,
-            end_column,
-            ..
-        } => validate_range_bounds(*start_row, *end_row, *start_column, *end_column, sheet),
         StructureVerb::MoveRows {
             at, count, before, ..
         } => validate_move_bounds(Dimension::Rows, *at, *count, *before, sheet),
@@ -1154,7 +1147,14 @@ fn validate_verb_args(
         StructureVerb::DeleteColumns { at, count, .. } => {
             validate_delete_dimension_bounds(Dimension::Columns, *at, *count, sheet)
         }
-        StructureVerb::DeleteRange {
+        StructureVerb::InsertRange {
+            start_row,
+            end_row,
+            start_column,
+            end_column,
+            ..
+        }
+        | StructureVerb::DeleteRange {
             start_row,
             end_row,
             start_column,
@@ -2658,6 +2658,15 @@ const FORMULA_CAVEAT: &str =
     "formulas elsewhere in the workbook that reference this may break, which cannot be \
      checked automatically";
 
+/// Shared by [`describe_would_insert_range`] and [`describe_inserted_range`]
+/// so the wording can't drift between the preview and the post-execution
+/// message; tense differs (the dry run hasn't happened yet) so this is two
+/// constants rather than one, unlike [`FORMULA_CAVEAT`].
+const INSERT_RANGE_EDGE_CAVEAT_DRY_RUN: &str =
+    "cells pushed past the sheet's grid extent may be dropped by Sheets";
+const INSERT_RANGE_EDGE_CAVEAT: &str =
+    "cells pushed past the sheet's grid extent may have been dropped by Sheets";
+
 /// The `DeleteRows`/`DeleteColumns` arm of [`describe_would_change`].
 ///
 /// Mirrors [`describe_would_insert`]'s shape (a summary line plus a shift
@@ -2766,8 +2775,8 @@ fn describe_would_insert_range(
     };
     format!(
         "Would insert empty cells at rows {start_row}-{end_row}, columns {start_column}-{end_column} \
-         of '{from}'{id} in {book}, shifting existing cells {direction}; cells pushed past the \
-         sheet's grid extent may be dropped by Sheets"
+         of '{from}'{id} in {book}, shifting existing cells {direction}; \
+         {INSERT_RANGE_EDGE_CAVEAT_DRY_RUN}"
     )
 }
 
@@ -3112,8 +3121,8 @@ fn describe_inserted_range(
     };
     format!(
         "Inserted empty cells at rows {start_row}-{end_row}, columns {start_column}-{end_column} \
-         of '{from}'{id} in {book}, shifting existing cells {direction}; cells pushed past the \
-         sheet's grid extent may have been dropped by Sheets"
+         of '{from}'{id} in {book}, shifting existing cells {direction}; \
+         {INSERT_RANGE_EDGE_CAVEAT}"
     )
 }
 

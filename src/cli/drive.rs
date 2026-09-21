@@ -862,11 +862,13 @@ mod tests {
                 sheets::structure::DeleteRangeCommand {
                     spreadsheet_id: "sheet-1".to_string(),
                     sheet: "Q2".to_string(),
-                    start_row: 2,
-                    end_row: 4,
-                    start_column: 2,
-                    end_column: 3,
-                    shift: sheets::structure::ShiftArg::Rows,
+                    range: sheets::structure::GridRangeArgs {
+                        start_row: 2,
+                        end_row: 4,
+                        start_column: 2,
+                        end_column: 3,
+                        shift: sheets::structure::ShiftArg::Rows,
+                    },
                     dry_run: false,
                     lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
                     output: OutputFormat::Table,
