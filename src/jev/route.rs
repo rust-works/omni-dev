@@ -753,7 +753,8 @@ pub fn render_route_text(report: &RouteReport, max_input_chars: usize) -> String
 }
 
 /// Renders one issue's block: a header line, one indented line per provider's
-/// routing (or its error), a `cites` line, and a truncation note.
+/// routing (or its error), one `cites` line per open citation, and a
+/// truncation note.
 fn render_issue_block(issue: &IssueRoute, max_input_chars: usize) -> String {
     let mut lines = vec![format!("{} — {}", issue.item_ref, issue.title)];
     match &issue.outcome {
@@ -764,9 +765,7 @@ fn render_issue_block(issue: &IssueRoute, max_input_chars: usize) -> String {
             for (provider, route) in providers {
                 lines.extend(render_provider_line(provider, route, providers.len()));
             }
-            if let Some(line) = render_depends_on_line(depends_on) {
-                lines.push(line);
-            }
+            lines.extend(render_depends_on_lines(depends_on));
         }
         RouteOutcome::Failed { error } => lines.push(format!("  failed: {error}")),
     }
@@ -904,23 +903,19 @@ fn render_stage_line(stage: Stage, stages: &StageAnswers, close_calls: &[Stage])
     format!("{label}: {content} ({:.2}{close_call})", answer.confidence)
 }
 
-/// Renders the `depends_on` line, or `None` when there are no open
-/// citations.
-fn render_depends_on_line(depends_on: &[DependencyEntry]) -> Option<String> {
-    if depends_on.is_empty() {
-        return None;
-    }
-    let clauses: Vec<String> = depends_on
+/// Renders one `  cites` line per open citation in `depends_on`, in citation
+/// order. Empty when there are no open citations.
+fn render_depends_on_lines(depends_on: &[DependencyEntry]) -> Vec<String> {
+    depends_on
         .iter()
         .map(|dep| match dep.could_be_cheaper.get("design") {
             Some(prob) => format!(
-                "open {}, which could leave less design work if resolved ({prob:.2})",
+                "  cites open {}, which could leave less design work if resolved ({prob:.2})",
                 dep.item_ref
             ),
-            None => format!("open {}", dep.item_ref),
+            None => format!("  cites open {}", dep.item_ref),
         })
-        .collect();
-    Some(format!("  cites {}", clauses.join("; ")))
+        .collect()
 }
 
 /// Groups `n`'s digits by thousands, e.g. `60_000` -> `"60,000"`.
@@ -1986,6 +1981,51 @@ mod tests {
              \x20\x20cites open #1129, which could leave less design work if resolved (0.75)\n\n\
              model: jev-1.13.0, usage: 1432 input tokens, 61 output tokens\n"
         );
+    }
+
+    #[test]
+    fn render_route_text_puts_each_open_citation_on_its_own_line() {
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "rust-works/omni-dev#1845".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([(
+                        "anthropic".to_string(),
+                        ProviderRoute {
+                            stages: stages("none", "sonnet", "sonnet"),
+                            class: "sonnet".to_string(),
+                            close_calls: vec![],
+                        },
+                    )]),
+                    depends_on: vec![
+                        DependencyEntry {
+                            item_ref: "#1830".to_string(),
+                            state: ItemState::Open,
+                            could_be_cheaper: BTreeMap::from([("design".to_string(), 0.46)]),
+                        },
+                        DependencyEntry {
+                            item_ref: "#1831".to_string(),
+                            state: ItemState::Open,
+                            could_be_cheaper: BTreeMap::new(),
+                        },
+                    ],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(
+            text.contains(
+                "  cites open #1830, which could leave less design work if resolved (0.46)\n  \
+                 cites open #1831\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("; "), "{text}");
     }
 
     #[test]
