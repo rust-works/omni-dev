@@ -628,7 +628,7 @@ operation anywhere in a target's ancestor chain:
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
 | `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table` |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -1062,7 +1062,7 @@ documents** (see the fidelity split below). `--lease` is required by every
 content-mutating write verb: `drive edit`; `drive sheets`
 `write`/`append`/`clear`, `add-sheet`/`rename-sheet`/`insert-rows`/
 `insert-columns`/`move-rows`/`move-columns`/`duplicate-sheet`/`reorder-sheet`/`hide-sheet`/
-`show-sheet`/`update-sheet-properties`,
+`show-sheet`/`update-sheet-properties`/`update-workbook-properties`,
 `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range`,
 `format-cells`/`merge-cells`/`unmerge-cells`/`update-borders`/
 `update-dimension-properties`/`auto-resize-columns`,
@@ -1925,6 +1925,62 @@ Refused: --freeze-rows 500 would freeze every row; the sheet has 500 row(s), so 
 Like every prior verb in this family, tab color is never read back: `sheets
 info` and `--dry-run` can state what a sheet's tab color *would become*, but
 never what it currently is (ADR-0085 §8).
+
+#### drive sheets update-workbook-properties
+
+Changes workbook-level properties — locale, time zone, automatic
+recalculation, and iterative calculation — rather than any one sheet's shape.
+The one structural verb with no sheet target: every other verb in this
+section names a `--sheet`, this one acts on the workbook itself. Gated by
+the same `sheets-structure` operation as the rest of this section.
+
+`spreadsheetTheme` (font family plus a full color palette) is deliberately
+out of scope — a large nested type left for a future issue, matching this
+crate's established pattern of shipping a documented subset.
+
+```bash
+# Set locale and time zone. At least one of --locale/--time-zone/
+# --auto-recalc/--iterative-calculation is required.
+omni-dev drive sheets update-workbook-properties <ID> --locale en_US --time-zone America/New_York
+
+# How often the workbook recalculates.
+omni-dev drive sheets update-workbook-properties <ID> --auto-recalc on-change
+
+# Turn iterative calculation on, optionally with explicit bounds — omitted
+# sub-fields take Sheets' own defaults.
+omni-dev drive sheets update-workbook-properties <ID> --iterative-calculation on \
+  --iterative-calculation-max-iterations 50 \
+  --iterative-calculation-convergence-threshold 0.01
+
+# Turn it back off.
+omni-dev drive sheets update-workbook-properties <ID> --iterative-calculation off
+```
+
+```bash
+omni-dev drive sheets update-workbook-properties <ID> --locale en_US --auto-recalc hour --dry-run
+```
+
+```
+Would update workbook properties of 'Budget': locale -> 'en_US', auto-recalc -> HOUR
+```
+
+Turning iterative calculation on changes what a circular-reference formula
+elsewhere in the workbook *evaluates to* — a value effect reached
+indirectly, the same shape of concern [ADR-0081](adrs/adr-0081.md) raised
+for named-range deletion. No cell's formula is itself changed, only what
+some formulas compute, which is why this still gates as `sheets-structure`
+rather than a data-mutating operation.
+
+`--iterative-calculation-max-iterations`/
+`--iterative-calculation-convergence-threshold` are only valid alongside
+`--iterative-calculation on`; the API has no boolean "enabled" field, so
+`--iterative-calculation off` clears the settings object entirely rather
+than writing a "disabled" value into it:
+
+```
+Refused: update-workbook-properties needs at least one property to set (--locale, --time-zone, --auto-recalc, --iterative-calculation)
+Refused: --iterative-calculation-max-iterations/--iterative-calculation-convergence-threshold require --iterative-calculation on
+```
 
 #### drive sheets delete-sheet / delete-rows / delete-columns / delete-range
 

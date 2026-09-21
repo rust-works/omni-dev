@@ -4461,6 +4461,7 @@ Commands:
   hide-sheet                   Hides an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
   show-sheet                   Shows an existing hidden sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
   update-sheet-properties      Changes a sheet's view properties — frozen rows/columns, tab color, right-to-left, hidden gridlines. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1835)
+  update-workbook-properties   Changes workbook-level properties: locale, time zone, automatic recalculation, and iterative calculation. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1836)
   format-cells                 Applies a cell format across a range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
   update-borders               Sets border lines on a range's edges. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
   merge-cells                  Merges a range into one cell, discarding every value but the top-left's. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
@@ -6118,6 +6119,40 @@ Options:
       --lease <TOKEN>                 The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>               Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                          Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets update-workbook-properties - Changes workbook-level properties: locale, time zone, automatic recalculation, and iterative calculation. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1836)
+
+Changes workbook-level properties: locale, time zone, automatic recalculation, and iterative calculation. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1836)
+
+Usage: update-workbook-properties [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --locale <LOCALE>
+          The workbook's new locale, e.g. `en_US`. Omitted leaves it unchanged
+      --time-zone <TIME_ZONE>
+          The workbook's new IANA time zone, e.g. `America/New_York`. Omitted leaves it unchanged
+      --auto-recalc <INTERVAL>
+          The workbook's new automatic-recalculation interval. Omitted leaves it unchanged [possible values: on-change, minute, hour]
+      --iterative-calculation <ON_OFF>
+          Turns iterative calculation on or off. Omitted leaves it unchanged [possible values: on, off]
+      --iterative-calculation-max-iterations <N>
+          Maximum calculation rounds per recalculation. Only valid alongside `--iterative-calculation on`; omitted takes Sheets' own default
+      --iterative-calculation-convergence-threshold <THRESHOLD>
+          The maximum change between two consecutive rounds that still counts as converged. Only valid alongside `--iterative-calculation on`; omitted takes Sheets' own default
+      --dry-run
+          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>
+          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>
+          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help
+          Print help (see more with '--help')
 
 
 ================================================================================

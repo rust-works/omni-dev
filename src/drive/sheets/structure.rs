@@ -5,11 +5,27 @@
 //! `duplicate-sheet`/`reorder-sheet`/`hide-sheet`/`show-sheet` (also
 //! additive, issue #1643, [ADR-0078](../../../docs/adrs/adr-0078.md)),
 //! `move-rows`/`move-columns` (also additive — nothing is discarded, issue
-//! #1834, [ADR-0083](../../../docs/adrs/adr-0083.md)), and
+//! #1834, [ADR-0083](../../../docs/adrs/adr-0083.md)),
 //! `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range` (destructive,
 //! issue #1623,
-//! [ADR-0077](../../../docs/adrs/adr-0077-sheets-deletion-via-batchupdate.md))
-//! engines, gated by the ADR-0071 folder write-permission rules.
+//! [ADR-0077](../../../docs/adrs/adr-0077-sheets-deletion-via-batchupdate.md)),
+//! and `update-workbook-properties` (also additive, issue #1836) engines,
+//! gated by the ADR-0071 folder write-permission rules.
+//!
+//! `update-workbook-properties` is the one verb here with no sheet target:
+//! every other verb acts on a tab within the workbook, this one acts on the
+//! workbook itself (locale, time zone, auto-recalc, iterative calculation —
+//! deliberately not `spreadsheetTheme`, a large nested type left for a
+//! future issue). [`StructureVerb::sheet_title`] returns `Option<&str>`
+//! rather than `&str` for exactly this reason, and [`resolve_sheet`] returns
+//! `Ok(None)` for it without consulting the sheet list at all. Turning
+//! iterative calculation on is a value effect reached indirectly — it
+//! changes what a circular-reference formula elsewhere *evaluates to*
+//! without changing that formula itself, the same shape of concern
+//! ADR-0081 raised for named-range deletion — so it stays gated as
+//! `sheets-structure` rather than treated as a data mutation; see
+//! [`crate::drive::sheets::types::IterativeCalculationSettings`]'s doc
+//! comment.
 //!
 //! [ADR-0073](../../../docs/adrs/adr-0073.md) §12 deferred this surface
 //! because `batchUpdate` is where "one call destroys far more than its
@@ -72,8 +88,9 @@ use crate::drive::sheets::types::{
     AddSheetRequest, BatchUpdateRequestItem, BatchUpdateResponse, ColorStyle,
     DeleteDimensionRequest, DeleteRangeRequest, DeleteSheetRequest, Dimension, DimensionRange,
     DuplicateSheetRequest, GridProperties, GridPropertiesUpdate, GridRange, InsertDimensionRequest,
-    MoveDimensionRequest, NewSheetProperties, SheetProperties, SheetPropertiesUpdate,
-    ShiftDimension, Spreadsheet, UpdateSheetPropertiesRequest,
+    IterativeCalculationSettings, MoveDimensionRequest, NewSheetProperties, RecalculationInterval,
+    SheetProperties, SheetPropertiesUpdate, ShiftDimension, Spreadsheet,
+    SpreadsheetPropertiesUpdate, UpdateSheetPropertiesRequest, UpdateSpreadsheetPropertiesRequest,
 };
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -86,7 +103,11 @@ use crate::request_log::{self, DriveMutationOutcome};
 /// take disjoint arguments, so the enum carries them. That also means an
 /// impossible combination — a `--title` on an insert, say — is not
 /// representable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `PartialEq`-only, not `Eq` (issue #1836):
+// `UpdateWorkbookProperties::iterative_calculation_convergence_threshold`
+// carries an `f64`, which has no meaningful `Eq` — see `Spreadsheet`'s own
+// doc comment (`types.rs`) for the same reasoning applied to `Color`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum StructureVerb {
     /// Add a new sheet to the workbook.
     AddSheet {
@@ -241,6 +262,48 @@ pub enum StructureVerb {
         /// The new hide-gridlines flag, when changing it.
         hide_gridlines: Option<bool>,
     },
+    /// Change workbook-level properties: locale, time zone, auto-recalc
+    /// and/or iterative calculation (issue #1836). The one verb in this
+    /// enum with no sheet target — see the module doc comment.
+    UpdateWorkbookProperties {
+        /// The new locale, e.g. `"en_US"`. `None` leaves it unchanged.
+        locale: Option<String>,
+        /// The new IANA time zone, e.g. `"America/New_York"`. `None` leaves
+        /// it unchanged.
+        time_zone: Option<String>,
+        /// The new auto-recalculation interval. `None` leaves it unchanged.
+        auto_recalc: Option<RecalculationInterval>,
+        /// Turns iterative calculation on or off. `None` leaves it
+        /// unchanged; the two sub-fields below are only meaningful
+        /// alongside `Some(IterativeCalculationToggle::On)` —
+        /// `validate_verb_args` refuses every other combination.
+        iterative_calculation: Option<IterativeCalculationToggle>,
+        /// Maximum calculation rounds, for `iterative_calculation ==
+        /// Some(On)`. `None` takes Sheets' own default.
+        iterative_calculation_max_iterations: Option<i64>,
+        /// Convergence threshold, for `iterative_calculation ==
+        /// Some(On)`. `None` takes Sheets' own default.
+        iterative_calculation_convergence_threshold: Option<f64>,
+    },
+}
+
+/// Which way `update-workbook-properties --iterative-calculation` sets
+/// iterative calculation.
+///
+/// Not [`RecalculationInterval`]-style wire vocabulary: the API has no
+/// boolean or enum field for this (see
+/// [`IterativeCalculationSettings`]'s doc comment) — this type exists purely
+/// to carry the caller's on/off *intent* through to `build_request`, which
+/// turns it into the right combination of
+/// [`SpreadsheetPropertiesUpdate::iterative_calculation_settings`] and
+/// `fields`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IterativeCalculationToggle {
+    /// Turn iterative calculation on (or update its settings; it is
+    /// already on).
+    On,
+    /// Turn iterative calculation off.
+    Off,
 }
 
 impl StructureVerb {
@@ -266,6 +329,7 @@ impl StructureVerb {
             Self::SetSheetVisibility { hidden: true, .. } => "sheets-hide-sheet",
             Self::SetSheetVisibility { hidden: false, .. } => "sheets-show-sheet",
             Self::UpdateSheetProperties { .. } => "sheets-update-sheet-properties",
+            Self::UpdateWorkbookProperties { .. } => "sheets-update-workbook-properties",
         }
     }
 
@@ -285,7 +349,8 @@ impl StructureVerb {
             | Self::DuplicateSheet { .. }
             | Self::ReorderSheet { .. }
             | Self::SetSheetVisibility { .. }
-            | Self::UpdateSheetProperties { .. } => DriveOperation::SheetsStructure,
+            | Self::UpdateSheetProperties { .. }
+            | Self::UpdateWorkbookProperties { .. } => DriveOperation::SheetsStructure,
             Self::DeleteSheet { .. }
             | Self::DeleteRows { .. }
             | Self::DeleteColumns { .. }
@@ -313,14 +378,17 @@ impl StructureVerb {
             Self::SetSheetVisibility { hidden: true, .. } => "hide-sheet",
             Self::SetSheetVisibility { hidden: false, .. } => "show-sheet",
             Self::UpdateSheetProperties { .. } => "update-sheet-properties",
+            Self::UpdateWorkbookProperties { .. } => "update-workbook-properties",
         }
     }
 
     /// The title of the sheet this verb acts on: the one being created for
-    /// `AddSheet`, the existing target otherwise.
-    fn sheet_title(&self) -> &str {
+    /// `AddSheet`, the existing target otherwise; `None` for
+    /// `UpdateWorkbookProperties`, which acts on the workbook itself and
+    /// resolves no sheet at all (see the module doc comment).
+    fn sheet_title(&self) -> Option<&str> {
         match self {
-            Self::AddSheet { title, .. } => title,
+            Self::AddSheet { title, .. } => Some(title),
             Self::RenameSheet { sheet, .. }
             | Self::InsertRows { sheet, .. }
             | Self::InsertColumns { sheet, .. }
@@ -333,7 +401,8 @@ impl StructureVerb {
             | Self::DuplicateSheet { sheet, .. }
             | Self::ReorderSheet { sheet, .. }
             | Self::SetSheetVisibility { sheet, .. }
-            | Self::UpdateSheetProperties { sheet, .. } => sheet,
+            | Self::UpdateSheetProperties { sheet, .. } => Some(sheet),
+            Self::UpdateWorkbookProperties { .. } => None,
         }
     }
 
@@ -362,7 +431,8 @@ impl StructureVerb {
             | Self::DeleteRange { .. }
             | Self::ReorderSheet { .. }
             | Self::SetSheetVisibility { .. }
-            | Self::UpdateSheetProperties { .. } => None,
+            | Self::UpdateSheetProperties { .. }
+            | Self::UpdateWorkbookProperties { .. } => None,
         }
     }
 
@@ -384,7 +454,8 @@ impl StructureVerb {
             | Self::DuplicateSheet { .. }
             | Self::ReorderSheet { .. }
             | Self::SetSheetVisibility { .. }
-            | Self::UpdateSheetProperties { .. } => None,
+            | Self::UpdateSheetProperties { .. }
+            | Self::UpdateWorkbookProperties { .. } => None,
         }
     }
 }
@@ -515,7 +586,12 @@ pub enum StructureResult {
     /// for the dry run, so this costs nothing extra and is exactly as
     /// correct as the server's own eventual rejection would be (ADR-0075
     /// §6's reasoning for the sheet-existence/duplicate-title checks,
-    /// applied to a numeric bound instead of a title).
+    /// applied to a numeric bound instead of a title). Also reused for
+    /// `update-workbook-properties`' argument-combination checks (issue
+    /// #1836, e.g. "needs at least one property to set"), which need no
+    /// workbook state at all — `format.rs::FormatResult::RefusedInvalidRange`
+    /// is the same broadening for `format-cells`' "at least one property"
+    /// check.
     RefusedInvalidRange {
         /// What was wrong and why.
         detail: String,
@@ -617,7 +693,10 @@ impl StructureResult {
 }
 
 /// The full outcome of one attempt.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+///
+/// `PartialEq`-only, not `Eq` (issue #1836) — it embeds [`StructureVerb`],
+/// which is `PartialEq`-only for the same reason.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct StructureOutcome {
     /// The spreadsheet acted on.
     pub spreadsheet_id: String,
@@ -907,11 +986,17 @@ async fn structure_inner(
 /// duplicate title regardless of which verb produced it. Renaming a sheet
 /// to the title it already has is not a collision (it names itself, not a
 /// different sheet) and is allowed through as a no-op mutation.
+///
+/// `update-workbook-properties` returns `Ok(None)` immediately, before even
+/// looking at the sheet list — [`StructureVerb::sheet_title`] returns `None`
+/// for it, since it names no sheet at all.
 fn resolve_sheet(
     workbook: &Spreadsheet,
     verb: &StructureVerb,
 ) -> Result<Option<SheetSnapshot>, StructureResult> {
-    let wanted = verb.sheet_title();
+    let Some(wanted) = verb.sheet_title() else {
+        return Ok(None);
+    };
     let found = workbook
         .sheets
         .iter()
@@ -1133,6 +1218,55 @@ fn validate_verb_args(
                     *columns,
                     sheet.and_then(|s| s.column_count),
                 )?;
+            }
+            Ok(())
+        }
+        StructureVerb::UpdateWorkbookProperties {
+            locale,
+            time_zone,
+            auto_recalc,
+            iterative_calculation,
+            iterative_calculation_max_iterations,
+            iterative_calculation_convergence_threshold,
+        } => {
+            let touches_iterative_settings = iterative_calculation_max_iterations.is_some()
+                || iterative_calculation_convergence_threshold.is_some();
+            if touches_iterative_settings
+                && *iterative_calculation != Some(IterativeCalculationToggle::On)
+            {
+                return invalid(
+                    "--iterative-calculation-max-iterations/\
+                     --iterative-calculation-convergence-threshold require \
+                     --iterative-calculation on"
+                        .to_string(),
+                );
+            }
+            if let Some(max_iterations) = iterative_calculation_max_iterations {
+                if *max_iterations < 1 {
+                    return invalid(format!(
+                        "--iterative-calculation-max-iterations must be at least 1, got \
+                         {max_iterations}"
+                    ));
+                }
+            }
+            if let Some(threshold) = iterative_calculation_convergence_threshold {
+                if !threshold.is_finite() || *threshold <= 0.0 {
+                    return invalid(format!(
+                        "--iterative-calculation-convergence-threshold must be a positive, \
+                         finite number, got {threshold}"
+                    ));
+                }
+            }
+            if locale.is_none()
+                && time_zone.is_none()
+                && auto_recalc.is_none()
+                && iterative_calculation.is_none()
+            {
+                return invalid(
+                    "update-workbook-properties needs at least one property to set \
+                     (--locale, --time-zone, --auto-recalc, --iterative-calculation)"
+                        .to_string(),
+                );
             }
             Ok(())
         }
@@ -1589,7 +1723,119 @@ fn build_request(
                 },
             ))
         }
+        StructureVerb::UpdateWorkbookProperties {
+            locale,
+            time_zone,
+            auto_recalc,
+            iterative_calculation,
+            iterative_calculation_max_iterations,
+            iterative_calculation_convergence_threshold,
+        } => {
+            // `validate_verb_args` already refused an empty field set and
+            // every invalid iterative-calculation combination, so every
+            // branch below is infallible and `fields` is guaranteed
+            // non-empty.
+            let mut properties = SpreadsheetPropertiesUpdate::default();
+            let mut fields = Vec::new();
+            if let Some(locale) = locale {
+                properties.locale = Some(locale.clone());
+                fields.push("locale");
+            }
+            if let Some(time_zone) = time_zone {
+                properties.time_zone = Some(time_zone.clone());
+                fields.push("timeZone");
+            }
+            if let Some(auto_recalc) = auto_recalc {
+                properties.auto_recalc = Some(*auto_recalc);
+                fields.push("autoRecalc");
+            }
+            match iterative_calculation {
+                Some(IterativeCalculationToggle::On) => {
+                    properties.iterative_calculation_settings =
+                        Some(IterativeCalculationSettings {
+                            max_iterations: *iterative_calculation_max_iterations,
+                            convergence_threshold: *iterative_calculation_convergence_threshold,
+                        });
+                    fields.push("iterativeCalculationSettings");
+                }
+                // `properties.iterative_calculation_settings` stays `None`
+                // here, and `fields` still names the property — an absent
+                // key on a masked field clears it, which is how "off" is
+                // spelled (see `IterativeCalculationSettings`'s doc
+                // comment).
+                Some(IterativeCalculationToggle::Off) => {
+                    fields.push("iterativeCalculationSettings");
+                }
+                None => {}
+            }
+            Ok(BatchUpdateRequestItem::UpdateSpreadsheetProperties(
+                UpdateSpreadsheetPropertiesRequest {
+                    properties,
+                    fields: fields.join(","),
+                },
+            ))
+        }
     }
+}
+
+/// A human-readable summary of the fields an `update-workbook-properties`
+/// verb sets, e.g. `"locale -> 'en_US', auto-recalc -> ON_CHANGE"`.
+///
+/// Shared by the dry-run preview ([`describe_would_change`]), the real-run
+/// confirmation ([`describe_changed`]) and the request log's
+/// `fields_changed` (`record_attempt`), so the three can never describe a
+/// different set of fields than the request actually carries — the same
+/// "describe from one source of truth" discipline `dimension_range_label`/
+/// `grid_range_label` use for the other structural verbs.
+///
+/// Panics if `verb` is not [`StructureVerb::UpdateWorkbookProperties`];
+/// every call site matches on the verb first, so this is never reached
+/// otherwise.
+fn workbook_properties_summary(verb: &StructureVerb) -> String {
+    let StructureVerb::UpdateWorkbookProperties {
+        locale,
+        time_zone,
+        auto_recalc,
+        iterative_calculation,
+        iterative_calculation_max_iterations,
+        iterative_calculation_convergence_threshold,
+    } = verb
+    else {
+        unreachable!("workbook_properties_summary called on a non-UpdateWorkbookProperties verb")
+    };
+
+    let mut parts = Vec::new();
+    if let Some(locale) = locale {
+        parts.push(format!("locale -> '{locale}'"));
+    }
+    if let Some(time_zone) = time_zone {
+        parts.push(format!("time zone -> '{time_zone}'"));
+    }
+    if let Some(auto_recalc) = auto_recalc {
+        parts.push(format!("auto-recalc -> {}", auto_recalc.as_str()));
+    }
+    match iterative_calculation {
+        Some(IterativeCalculationToggle::On) => {
+            let mut detail = "iterative calculation -> on".to_string();
+            match (
+                iterative_calculation_max_iterations,
+                iterative_calculation_convergence_threshold,
+            ) {
+                (Some(max), Some(threshold)) => {
+                    detail.push_str(&format!(" (max {max} iterations, threshold {threshold})"));
+                }
+                (Some(max), None) => detail.push_str(&format!(" (max {max} iterations)")),
+                (None, Some(threshold)) => detail.push_str(&format!(" (threshold {threshold})")),
+                (None, None) => {}
+            }
+            parts.push(detail);
+        }
+        Some(IterativeCalculationToggle::Off) => {
+            parts.push("iterative calculation -> off".to_string());
+        }
+        None => {}
+    }
+    parts.join(", ")
 }
 
 /// Converts 1-based inclusive row/column bounds into the API's zero-based
@@ -1706,6 +1952,16 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
         }
         _ => None,
     };
+    // `format.rs`'s field, reused here rather than duplicated: the only
+    // structural verbs (issues #1835/#1836) that can set more than one
+    // field in a single request, so `sheet_title`/`dimension_range`/
+    // `grid_range` alone can't name the effect.
+    let fields_changed = match &opts.verb {
+        StructureVerb::UpdateWorkbookProperties { .. } => {
+            Some(workbook_properties_summary(&opts.verb))
+        }
+        _ => fields_changed_label(&opts.verb),
+    };
 
     request_log::record_drive_mutation(DriveMutationOutcome {
         operation: opts.verb.log_operation(),
@@ -1717,12 +1973,12 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
         decided_by_depth: decided_by.depth,
         decided_by_file_id: decided_by.file_id,
         sheet_id,
-        sheet_title: Some(opts.verb.sheet_title().to_string()),
+        sheet_title: opts.verb.sheet_title().map(ToString::to_string),
         sheet_new_title: opts.verb.new_sheet_title().map(ToString::to_string),
         dimension_range: dimension_range_label(&opts.verb),
         move_to,
         grid_range: grid_range_label(&opts.verb),
-        fields_changed: fields_changed_label(&opts.verb),
+        fields_changed,
         error,
         duration,
         ..Default::default()
@@ -2085,6 +2341,10 @@ fn describe_would_change(
                 fragments.join(", ")
             )]
         }
+        StructureVerb::UpdateWorkbookProperties { .. } => vec![format!(
+            "Would update workbook properties of {book}: {}",
+            workbook_properties_summary(verb)
+        )],
     }
 }
 
@@ -2548,6 +2808,10 @@ fn describe_changed(
                 fragments.join(", ")
             )
         }
+        StructureVerb::UpdateWorkbookProperties { .. } => format!(
+            "Updated workbook properties of {book}: {}",
+            workbook_properties_summary(verb)
+        ),
     }
 }
 
@@ -2989,6 +3253,17 @@ mod tests {
         }
     }
 
+    fn update_workbook_properties() -> StructureVerb {
+        StructureVerb::UpdateWorkbookProperties {
+            locale: Some("en_US".to_string()),
+            time_zone: Some("America/New_York".to_string()),
+            auto_recalc: Some(RecalculationInterval::OnChange),
+            iterative_calculation: None,
+            iterative_calculation_max_iterations: None,
+            iterative_calculation_convergence_threshold: None,
+        }
+    }
+
     fn delete_allow_rule(folder: &str) -> FolderPermissionRule {
         FolderPermissionRule {
             folder_id: Some(folder.to_string()),
@@ -3092,6 +3367,14 @@ mod tests {
                 clear_tab_color: false,
                 right_to_left: Some(true),
                 hide_gridlines: None,
+            },
+            StructureVerb::UpdateWorkbookProperties {
+                locale: Some("en_US".to_string()),
+                time_zone: None,
+                auto_recalc: None,
+                iterative_calculation: None,
+                iterative_calculation_max_iterations: None,
+                iterative_calculation_convergence_threshold: None,
             },
         ] {
             assert_eq!(verb.gate_operation(), DriveOperation::SheetsStructure);
@@ -6747,6 +7030,311 @@ mod tests {
         );
     }
 
+    // ── update-workbook-properties (issue #1836) ────────────────────────
+
+    #[test]
+    fn sheet_title_is_none_for_update_workbook_properties() {
+        assert_eq!(update_workbook_properties().sheet_title(), None);
+        assert_eq!(update_workbook_properties().new_sheet_title(), None);
+        assert_eq!(update_workbook_properties().dimension(), None);
+    }
+
+    #[test]
+    fn resolve_sheet_returns_none_for_update_workbook_properties_without_consulting_sheets() {
+        // An empty `sheets` list would make every other verb's
+        // `resolve_sheet` fail with `RefusedSheetNotFound` — this verb must
+        // return `Ok(None)` regardless, since it never looks.
+        let workbook = Spreadsheet {
+            spreadsheet_id: Some("sheet-1".to_string()),
+            properties: None,
+            sheets: Vec::new(),
+            named_ranges: Vec::new(),
+        };
+        assert_eq!(
+            resolve_sheet(&workbook, &update_workbook_properties()),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn validate_verb_args_refuses_update_workbook_properties_with_no_fields() {
+        let verb = StructureVerb::UpdateWorkbookProperties {
+            locale: None,
+            time_zone: None,
+            auto_recalc: None,
+            iterative_calculation: None,
+            iterative_calculation_max_iterations: None,
+            iterative_calculation_convergence_threshold: None,
+        };
+        let workbook = Spreadsheet::default();
+        let err = validate_verb_args(&workbook, &verb, None).unwrap_err();
+        assert!(
+            matches!(&err, StructureResult::RefusedInvalidRange { detail }
+                if detail.contains("at least one property")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_verb_args_refuses_iterative_calculation_settings_without_the_toggle() {
+        let verb = StructureVerb::UpdateWorkbookProperties {
+            locale: None,
+            time_zone: None,
+            auto_recalc: None,
+            iterative_calculation: None,
+            iterative_calculation_max_iterations: Some(50),
+            iterative_calculation_convergence_threshold: None,
+        };
+        let workbook = Spreadsheet::default();
+        let err = validate_verb_args(&workbook, &verb, None).unwrap_err();
+        assert!(
+            matches!(&err, StructureResult::RefusedInvalidRange { detail }
+                if detail.contains("--iterative-calculation on")),
+            "{err:?}"
+        );
+
+        // Also refused when explicitly turning it *off*.
+        let verb_off = StructureVerb::UpdateWorkbookProperties {
+            locale: None,
+            time_zone: None,
+            auto_recalc: None,
+            iterative_calculation: Some(IterativeCalculationToggle::Off),
+            iterative_calculation_max_iterations: Some(50),
+            iterative_calculation_convergence_threshold: None,
+        };
+        assert!(validate_verb_args(&workbook, &verb_off, None).is_err());
+    }
+
+    #[test]
+    fn validate_verb_args_refuses_non_positive_iterative_calculation_bounds() {
+        let workbook = Spreadsheet::default();
+        let bad_max = StructureVerb::UpdateWorkbookProperties {
+            locale: None,
+            time_zone: None,
+            auto_recalc: None,
+            iterative_calculation: Some(IterativeCalculationToggle::On),
+            iterative_calculation_max_iterations: Some(0),
+            iterative_calculation_convergence_threshold: None,
+        };
+        assert!(validate_verb_args(&workbook, &bad_max, None).is_err());
+
+        let bad_threshold = StructureVerb::UpdateWorkbookProperties {
+            locale: None,
+            time_zone: None,
+            auto_recalc: None,
+            iterative_calculation: Some(IterativeCalculationToggle::On),
+            iterative_calculation_max_iterations: None,
+            iterative_calculation_convergence_threshold: Some(0.0),
+        };
+        assert!(validate_verb_args(&workbook, &bad_threshold, None).is_err());
+
+        let nan_threshold = StructureVerb::UpdateWorkbookProperties {
+            locale: None,
+            time_zone: None,
+            auto_recalc: None,
+            iterative_calculation: Some(IterativeCalculationToggle::On),
+            iterative_calculation_max_iterations: None,
+            iterative_calculation_convergence_threshold: Some(f64::NAN),
+        };
+        assert!(validate_verb_args(&workbook, &nan_threshold, None).is_err());
+    }
+
+    #[test]
+    fn validate_verb_args_accepts_a_single_field() {
+        let workbook = Spreadsheet::default();
+        let verb = StructureVerb::UpdateWorkbookProperties {
+            locale: Some("fr_FR".to_string()),
+            time_zone: None,
+            auto_recalc: None,
+            iterative_calculation: None,
+            iterative_calculation_max_iterations: None,
+            iterative_calculation_convergence_threshold: None,
+        };
+        assert!(validate_verb_args(&workbook, &verb, None).is_ok());
+    }
+
+    #[test]
+    fn build_request_masks_exactly_the_fields_given() {
+        let verb = StructureVerb::UpdateWorkbookProperties {
+            locale: Some("en_US".to_string()),
+            time_zone: None,
+            auto_recalc: Some(RecalculationInterval::Hour),
+            iterative_calculation: None,
+            iterative_calculation_max_iterations: None,
+            iterative_calculation_convergence_threshold: None,
+        };
+        let request = build_request(&verb, None).unwrap();
+        let BatchUpdateRequestItem::UpdateSpreadsheetProperties(req) = request else {
+            panic!("expected UpdateSpreadsheetProperties, got {request:?}");
+        };
+        assert_eq!(req.fields, "locale,autoRecalc");
+        assert_eq!(req.properties.locale.as_deref(), Some("en_US"));
+        assert_eq!(req.properties.time_zone, None);
+        assert_eq!(
+            req.properties.auto_recalc,
+            Some(RecalculationInterval::Hour)
+        );
+        assert_eq!(req.properties.iterative_calculation_settings, None);
+    }
+
+    #[test]
+    fn build_request_turns_iterative_calculation_on_with_explicit_settings() {
+        let verb = StructureVerb::UpdateWorkbookProperties {
+            locale: None,
+            time_zone: None,
+            auto_recalc: None,
+            iterative_calculation: Some(IterativeCalculationToggle::On),
+            iterative_calculation_max_iterations: Some(50),
+            iterative_calculation_convergence_threshold: Some(0.01),
+        };
+        let request = build_request(&verb, None).unwrap();
+        let BatchUpdateRequestItem::UpdateSpreadsheetProperties(req) = request else {
+            panic!("expected UpdateSpreadsheetProperties, got {request:?}");
+        };
+        assert_eq!(req.fields, "iterativeCalculationSettings");
+        assert_eq!(
+            req.properties.iterative_calculation_settings,
+            Some(IterativeCalculationSettings {
+                max_iterations: Some(50),
+                convergence_threshold: Some(0.01),
+            })
+        );
+    }
+
+    #[test]
+    fn build_request_turns_iterative_calculation_off_by_naming_the_field_without_a_value() {
+        // The field-mask idiom `IterativeCalculationSettings`'s doc comment
+        // describes: `fields` names the property, but
+        // `iterative_calculation_settings` itself stays `None`, so it is
+        // omitted from the JSON body and the server clears it.
+        let verb = StructureVerb::UpdateWorkbookProperties {
+            locale: None,
+            time_zone: None,
+            auto_recalc: None,
+            iterative_calculation: Some(IterativeCalculationToggle::Off),
+            iterative_calculation_max_iterations: None,
+            iterative_calculation_convergence_threshold: None,
+        };
+        let request = build_request(&verb, None).unwrap();
+        let BatchUpdateRequestItem::UpdateSpreadsheetProperties(req) = request else {
+            panic!("expected UpdateSpreadsheetProperties, got {request:?}");
+        };
+        assert_eq!(req.fields, "iterativeCalculationSettings");
+        assert_eq!(req.properties.iterative_calculation_settings, None);
+        let json = serde_json::to_value(&req.properties).unwrap();
+        assert!(
+            json.as_object().unwrap().is_empty(),
+            "expected an empty properties object, got {json}"
+        );
+    }
+
+    #[test]
+    fn workbook_properties_summary_formats_every_field() {
+        let verb = StructureVerb::UpdateWorkbookProperties {
+            locale: Some("en_US".to_string()),
+            time_zone: Some("America/New_York".to_string()),
+            auto_recalc: Some(RecalculationInterval::OnChange),
+            iterative_calculation: Some(IterativeCalculationToggle::On),
+            iterative_calculation_max_iterations: Some(50),
+            iterative_calculation_convergence_threshold: Some(0.01),
+        };
+        let summary = workbook_properties_summary(&verb);
+        assert_eq!(
+            summary,
+            "locale -> 'en_US', time zone -> 'America/New_York', \
+             auto-recalc -> ON_CHANGE, iterative calculation -> on \
+             (max 50 iterations, threshold 0.01)"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_workbook_properties_dry_run_reports_would_change_with_no_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(update_workbook_properties(), true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        match &outcome.result {
+            StructureResult::WouldChange { sheet, sheet_count } => {
+                assert_eq!(*sheet, None);
+                assert_eq!(*sheet_count, 2);
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with("Would update workbook properties of 'sheet-1'"),
+            "{lines:?}"
+        );
+
+        // A dry run reads the workbook (to report `sheet_count` honestly)
+        // but never calls `batchUpdate`.
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests
+            .iter()
+            .any(|r| r.url.path().ends_with(":batchUpdate")));
+    }
+
+    #[tokio::test]
+    async fn update_workbook_properties_apply_sends_the_masked_request_and_reports_changed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(update_workbook_properties(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        match &outcome.result {
+            StructureResult::Changed {
+                sheet, sheet_id, ..
+            } => {
+                assert_eq!(*sheet, None);
+                assert_eq!(*sheet_id, None);
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let body = sent_batch_update(&requests);
+        let update = &body["requests"][0]["updateSpreadsheetProperties"];
+        assert_eq!(update["properties"]["locale"], "en_US");
+        assert_eq!(update["properties"]["timeZone"], "America/New_York");
+        assert_eq!(update["properties"]["autoRecalc"], "ON_CHANGE");
+        assert_eq!(update["fields"], "locale,timeZone,autoRecalc");
+    }
+
+    #[test]
+    fn record_attempt_carries_the_fields_changed_summary_and_no_sheet_title() {
+        let opts = opts(update_workbook_properties(), false);
+        assert_eq!(opts.verb.sheet_title(), None);
+        assert_eq!(
+            workbook_properties_summary(&opts.verb),
+            "locale -> 'en_US', time zone -> 'America/New_York', auto-recalc -> ON_CHANGE"
+        );
+    }
+
     // ── plumbing ───────────────────────────────────────────────────────
 
     #[test]
@@ -6779,6 +7367,7 @@ mod tests {
             reorder_sheet(),
             hide_sheet(),
             show_sheet(),
+            update_workbook_properties(),
         ];
         let names: Vec<&str> = verbs.iter().map(StructureVerb::log_operation).collect();
         assert_eq!(
@@ -6798,6 +7387,7 @@ mod tests {
                 "sheets-reorder-sheet",
                 "sheets-hide-sheet",
                 "sheets-show-sheet",
+                "sheets-update-workbook-properties",
             ]
         );
         // One record per user-visible verb means the operations must not
@@ -6931,6 +7521,7 @@ mod tests {
             reorder_sheet(),
             hide_sheet(),
             show_sheet(),
+            update_workbook_properties(),
         ] {
             // A verb with a single axis (insert, delete-dimension or
             // move-dimension) earns a second `WouldChange` line for the

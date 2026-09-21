@@ -142,6 +142,7 @@ mod tests {
             spreadsheet_id: Some("s1".to_string()),
             properties: Some(crate::drive::sheets::types::SpreadsheetProperties {
                 title: "Budget".to_string(),
+                ..Default::default()
             }),
             sheets: vec![
                 sheet("Q1", false, Some((1000, 26))),
@@ -166,6 +167,7 @@ mod tests {
             spreadsheet_id: Some("s\x1b[31m1".to_string()),
             properties: Some(crate::drive::sheets::types::SpreadsheetProperties {
                 title: "evil\x1b[31mbook".to_string(),
+                ..Default::default()
             }),
             sheets: vec![sheet("tab\x1b[0mname", false, None)],
             ..Default::default()

@@ -117,6 +117,10 @@ pub enum SheetsSubcommands {
     /// right-to-left, hidden gridlines. Gated by the folder
     /// write-permission rules' `sheets-structure` operation (issue #1835).
     UpdateSheetProperties(structure::UpdateSheetPropertiesCommand),
+    /// Changes workbook-level properties: locale, time zone, automatic
+    /// recalculation, and iterative calculation. Gated by the folder
+    /// write-permission rules' `sheets-structure` operation (issue #1836).
+    UpdateWorkbookProperties(structure::UpdateWorkbookPropertiesCommand),
     /// Applies a cell format across a range. Gated by the folder
     /// write-permission rules' `sheets-structure` operation (issue #1643).
     FormatCells(format::FormatCellsCommand),
@@ -338,6 +342,7 @@ impl SheetsCommand {
             SheetsSubcommands::HideSheet(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ShowSheet(cmd) => cmd.execute(client).await,
             SheetsSubcommands::UpdateSheetProperties(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::UpdateWorkbookProperties(cmd) => cmd.execute(client).await,
             SheetsSubcommands::FormatCells(cmd) => cmd.execute(client).await,
             SheetsSubcommands::UpdateBorders(cmd) => cmd.execute(client).await,
             SheetsSubcommands::MergeCells(cmd) => cmd.execute(client).await,

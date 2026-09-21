@@ -2,10 +2,11 @@
 //! `insert-rows`/`insert-columns` (issue #1613), `duplicate-sheet`/
 //! `reorder-sheet`/`hide-sheet`/`show-sheet` (issue #1643),
 //! `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range` (issue
-//! #1623), `move-rows`/`move-columns` (issue #1834), and
-//! `update-sheet-properties` (issue #1835).
+//! #1623), `move-rows`/`move-columns` (issue #1834),
+//! `update-sheet-properties` (issue #1835) and `update-workbook-properties`
+//! (issue #1836).
 //!
-//! Fifteen clap structs over one engine call. They share `run_structure`, so
+//! Sixteen clap structs over one engine call. They share `run_structure`, so
 //! the gate wiring, `--dry-run` handling, output rendering and request
 //! logging cannot drift between them — the same arrangement `write.rs` uses
 //! for its three verbs. The additive verbs are gated on
@@ -26,7 +27,9 @@ use crate::cli::drive::helpers;
 use crate::cli::format::sanitize_for_terminal;
 use crate::drive::client::DriveClient;
 use crate::drive::sheets::client::SheetsClient;
-use crate::drive::sheets::structure::{describe_lines, structure, StructureOptions, StructureVerb};
+use crate::drive::sheets::structure::{
+    describe_lines, structure, IterativeCalculationToggle, StructureOptions, StructureVerb,
+};
 
 /// Adds a new sheet to a spreadsheet.
 #[derive(Parser)]
@@ -571,6 +574,112 @@ pub struct UpdateSheetPropertiesCommand {
     pub output: OutputFormat,
 }
 
+/// Sheets' auto-recalculation intervals, from `--auto-recalc`.
+///
+/// A CLI-facing copy for the same reason [`ShiftArg`] mirrors
+/// `ShiftDimension`: the pure engine module stays free of `clap`. Excludes
+/// `RECALCULATION_INTERVAL_UNSPECIFIED` — Sheets' way of saying the field
+/// was never set, never a value a caller would deliberately choose.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum AutoRecalcArg {
+    /// Recalculate on every edit (Sheets' own default).
+    OnChange,
+    /// Recalculate at most once a minute.
+    Minute,
+    /// Recalculate at most once an hour.
+    Hour,
+}
+
+impl From<AutoRecalcArg> for crate::drive::sheets::types::RecalculationInterval {
+    fn from(arg: AutoRecalcArg) -> Self {
+        match arg {
+            AutoRecalcArg::OnChange => Self::OnChange,
+            AutoRecalcArg::Minute => Self::Minute,
+            AutoRecalcArg::Hour => Self::Hour,
+        }
+    }
+}
+
+/// Whether `--iterative-calculation` turns iterative calculation on or off.
+///
+/// A CLI-facing copy of [`IterativeCalculationToggle`] for the same reason
+/// [`ShiftArg`] mirrors `ShiftDimension`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum IterativeCalculationArg {
+    /// Turn iterative calculation on (or update its settings).
+    On,
+    /// Turn iterative calculation off.
+    Off,
+}
+
+impl From<IterativeCalculationArg> for IterativeCalculationToggle {
+    fn from(arg: IterativeCalculationArg) -> Self {
+        match arg {
+            IterativeCalculationArg::On => Self::On,
+            IterativeCalculationArg::Off => Self::Off,
+        }
+    }
+}
+
+/// Changes workbook-level properties: locale, time zone, automatic
+/// recalculation, and iterative calculation (issue #1836).
+///
+/// Deliberately omits `spreadsheetTheme` — a large nested type (font family
+/// plus a full color palette) left for a future issue, matching this
+/// crate's established pattern of shipping a documented subset. At least one
+/// of `--locale`/`--time-zone`/`--auto-recalc`/`--iterative-calculation` is
+/// required; `--iterative-calculation-max-iterations`/
+/// `--iterative-calculation-convergence-threshold` are only valid alongside
+/// `--iterative-calculation on` — both checked by the engine so a `--dry-run`
+/// reports the same refusal a real run would
+/// (`structure.rs::validate_verb_args`).
+#[derive(Parser)]
+pub struct UpdateWorkbookPropertiesCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// The workbook's new locale, e.g. `en_US`. Omitted leaves it unchanged.
+    #[arg(long, value_name = "LOCALE")]
+    pub locale: Option<String>,
+
+    /// The workbook's new IANA time zone, e.g. `America/New_York`. Omitted
+    /// leaves it unchanged.
+    #[arg(long, value_name = "TIME_ZONE")]
+    pub time_zone: Option<String>,
+
+    /// The workbook's new automatic-recalculation interval. Omitted leaves
+    /// it unchanged.
+    #[arg(long, value_enum, value_name = "INTERVAL")]
+    pub auto_recalc: Option<AutoRecalcArg>,
+
+    /// Turns iterative calculation on or off. Omitted leaves it unchanged.
+    #[arg(long, value_enum, value_name = "ON_OFF")]
+    pub iterative_calculation: Option<IterativeCalculationArg>,
+
+    /// Maximum calculation rounds per recalculation. Only valid alongside
+    /// `--iterative-calculation on`; omitted takes Sheets' own default.
+    #[arg(long, value_name = "N")]
+    pub iterative_calculation_max_iterations: Option<i64>,
+
+    /// The maximum change between two consecutive rounds that still counts
+    /// as converged. Only valid alongside `--iterative-calculation on`;
+    /// omitted takes Sheets' own default.
+    #[arg(long, value_name = "THRESHOLD")]
+    pub iterative_calculation_convergence_threshold: Option<f64>,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
 impl AddSheetCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
@@ -843,6 +952,28 @@ impl UpdateSheetPropertiesCommand {
     }
 }
 
+impl UpdateWorkbookPropertiesCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::UpdateWorkbookProperties {
+                locale: self.locale,
+                time_zone: self.time_zone,
+                auto_recalc: self.auto_recalc.map(Into::into),
+                iterative_calculation: self.iterative_calculation.map(Into::into),
+                iterative_calculation_max_iterations: self.iterative_calculation_max_iterations,
+                iterative_calculation_convergence_threshold: self
+                    .iterative_calculation_convergence_threshold,
+            },
+            dry_run: self.dry_run,
+            lease_token: self.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
 /// Shared tail for every structural verb: derive the Sheets client, load the
 /// account's rules, run the engine, render.
 ///
@@ -909,6 +1040,35 @@ mod tests {
         assert_eq!(
             crate::drive::sheets::types::ShiftDimension::from(ShiftArg::Columns),
             crate::drive::sheets::types::ShiftDimension::Columns
+        );
+    }
+
+    #[test]
+    fn auto_recalc_arg_maps_onto_the_engine_interval() {
+        use crate::drive::sheets::types::RecalculationInterval;
+        assert_eq!(
+            RecalculationInterval::from(AutoRecalcArg::OnChange),
+            RecalculationInterval::OnChange
+        );
+        assert_eq!(
+            RecalculationInterval::from(AutoRecalcArg::Minute),
+            RecalculationInterval::Minute
+        );
+        assert_eq!(
+            RecalculationInterval::from(AutoRecalcArg::Hour),
+            RecalculationInterval::Hour
+        );
+    }
+
+    #[test]
+    fn iterative_calculation_arg_maps_onto_the_engine_toggle() {
+        assert_eq!(
+            IterativeCalculationToggle::from(IterativeCalculationArg::On),
+            IterativeCalculationToggle::On
+        );
+        assert_eq!(
+            IterativeCalculationToggle::from(IterativeCalculationArg::Off),
+            IterativeCalculationToggle::Off
         );
     }
 
