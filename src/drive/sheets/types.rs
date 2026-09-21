@@ -178,6 +178,22 @@ pub struct Sheet {
         rename = "bandedRanges"
     )]
     pub banded_ranges: Vec<BandedRange>,
+    /// Outline groups over row spans on this sheet — the collapsible +/-
+    /// grouping bar. Empty unless the caller requested them with a wider
+    /// `fields` mask — only
+    /// `SheetsApi::get_spreadsheet_with_dimension_groups` populates it
+    /// (issue #1833). Addressed by `(range, depth)`;
+    /// `list-dimension-groups` is how both are discovered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "rowGroups")]
+    pub row_groups: Vec<DimensionGroup>,
+    /// Outline groups over column spans on this sheet. Same population and
+    /// addressing as [`Self::row_groups`], the column axis.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "columnGroups"
+    )]
+    pub column_groups: Vec<DimensionGroup>,
     /// Grid data — cell-by-cell, in row-major chunks — read back only when
     /// the caller asked for it via a `fields` mask naming individual cell
     /// properties. Empty unless the caller requested a wider mask; only
@@ -554,6 +570,19 @@ pub enum BatchUpdateRequestItem {
     /// Remove a banded range (`delete-banding`). Same gate as
     /// [`Self::AddBanding`] — it removes presentation, not grid data.
     DeleteBanding(DeleteBandingRequest),
+    /// Add a new outline group over a row or column span
+    /// (`add-dimension-group`) — the collapsible +/- grouping bar. Gated by
+    /// `DriveOperation::SheetsStructure` (issue #1833,
+    /// [ADR-0084](../../../docs/adrs/adr-0084-dimension-groups.md)): the
+    /// same "property of the sheet, not the sheet's data" reasoning as
+    /// [`Self::AddBanding`].
+    AddDimensionGroup(AddDimensionGroupRequest),
+    /// Change an existing outline group's `collapsed` state
+    /// (`update-dimension-group`). Same gate as [`Self::AddDimensionGroup`].
+    UpdateDimensionGroup(UpdateDimensionGroupRequest),
+    /// Remove an outline group (`delete-dimension-group`). Same gate as
+    /// [`Self::AddDimensionGroup`] — it removes presentation, not grid data.
+    DeleteDimensionGroup(DeleteDimensionGroupRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -712,6 +741,29 @@ pub struct DimensionRange {
     /// Last index, **exclusive**, zero-based.
     #[serde(rename = "endIndex")]
     pub end_index: i64,
+}
+
+/// An outline group over a [`DimensionRange`] — the collapsible +/-
+/// grouping bar (issue #1833,
+/// [ADR-0084](../../../docs/adrs/adr-0084-dimension-groups.md)).
+///
+/// `depth` is server-derived, never client-supplied: `addDimensionGroup`'s
+/// request carries only `range`, and the server computes the new group's
+/// depth from its overlap with existing groups on the same axis (a
+/// superset increments an existing group's depth; a subset or an overlap
+/// creates a new, deeper one). This crate does not predict that outcome —
+/// see the `dimension_group.rs` module doc for why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DimensionGroup {
+    /// The span this group covers.
+    pub range: DimensionRange,
+    /// How many groups have a range that wholly contains this one's —
+    /// server-derived, `0` for a top-level group.
+    #[serde(default)]
+    pub depth: i64,
+    /// Whether the group is collapsed (its member rows/columns hidden).
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 /// A rectangular cell range, addressed numerically.
@@ -2375,6 +2427,44 @@ pub struct DeleteBandingRequest {
     /// Which banded range to remove.
     #[serde(rename = "bandedRangeId")]
     pub banded_range_id: i64,
+}
+
+/// `AddDimensionGroupRequest`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AddDimensionGroupRequest {
+    /// The span to create a group over. The server derives the new
+    /// group's `depth` from this; see [`DimensionGroup`]'s doc comment.
+    pub range: DimensionRange,
+}
+
+/// `UpdateDimensionGroupRequest`.
+///
+/// `collapsed` is the only field this crate ever changes — `range` is the
+/// group's identity and `depth` is server-derived, so both are always sent
+/// unchanged from the group `update-dimension-group` resolved against,
+/// with `fields` naming only `"collapsed"`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UpdateDimensionGroupRequest {
+    /// The group to update, identified by its (unchanged) `range` and
+    /// `depth`, carrying the new `collapsed` value.
+    #[serde(rename = "dimensionGroup")]
+    pub dimension_group: DimensionGroup,
+    /// The field mask limiting what this request may change. Always
+    /// `"collapsed"` — the only field [`Self::dimension_group`] ever
+    /// updates.
+    pub fields: String,
+}
+
+/// `DeleteDimensionGroupRequest`.
+///
+/// Addressed by `range` alone, like the API — `depth` plays no part in
+/// which group is removed. See the `dimension_group.rs` module doc for why
+/// this crate requires an **exact** range match rather than exposing the
+/// API's partial-overlap decrement semantics.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DeleteDimensionGroupRequest {
+    /// The span whose group should be removed.
+    pub range: DimensionRange,
 }
 
 /// Response to `spreadsheets.batchUpdate`.

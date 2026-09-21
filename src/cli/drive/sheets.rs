@@ -15,6 +15,7 @@ pub(crate) mod banding;
 pub(crate) mod conditional_format;
 pub(crate) mod create;
 pub(crate) mod developer_metadata;
+pub(crate) mod dimension_group;
 pub(crate) mod embedded_object;
 pub(crate) mod filter;
 pub(crate) mod format;
@@ -277,6 +278,22 @@ pub enum SheetsSubcommands {
     /// Lists the banded ranges in a spreadsheet. Read-only and ungated,
     /// like `list-protections` (issue #1832).
     ListBandings(banding::ListBandingsCommand),
+    /// Adds a new outline group — the collapsible +/- grouping bar — over
+    /// a span of rows or columns. Gated by the folder write-permission
+    /// rules' `sheets-structure` operation (issue #1833, ADR-0084): the
+    /// same reasoning as `add-banding`.
+    AddDimensionGroup(dimension_group::AddDimensionGroupCommand),
+    /// Changes an existing group's `collapsed` state. Gated by the folder
+    /// write-permission rules' `sheets-structure` operation (issue #1833,
+    /// ADR-0084).
+    UpdateDimensionGroup(dimension_group::UpdateDimensionGroupCommand),
+    /// Removes an outline group. Gated by the folder write-permission
+    /// rules' `sheets-structure` operation (issue #1833, ADR-0084) — it
+    /// removes presentation, not grid data.
+    DeleteDimensionGroup(dimension_group::DeleteDimensionGroupCommand),
+    /// Lists the row and column outline groups in a spreadsheet. Read-only
+    /// and ungated, like `list-bandings` (issue #1833).
+    ListDimensionGroups(dimension_group::ListDimensionGroupsCommand),
 }
 
 impl SheetsCommand {
@@ -350,6 +367,10 @@ impl SheetsCommand {
             SheetsSubcommands::UpdateBanding(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeleteBanding(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ListBandings(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::AddDimensionGroup(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::UpdateDimensionGroup(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteDimensionGroup(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::ListDimensionGroups(cmd) => cmd.execute(client).await,
         }
     }
 }
@@ -905,6 +926,121 @@ mod tests {
 
         assert!(dispatch(
             SheetsSubcommands::ListBandings(banding::ListBandingsCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_dimension_group_dispatch_arms_reach_their_leaf_commands() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        // No write-permission rules are configured (an unconfigured
+        // account), so every mutating leaf below is `Blocked` by default
+        // policy — enough to reach and return from the leaf without a
+        // lease or a workbook fetch. `list-dimension-groups` is ungated,
+        // so it goes further and actually fetches the (group-free)
+        // workbook.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1",
+                    "name": "Budget",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": ["folder-1"],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1",
+                    "name": "folder-1",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1"}}],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        fn no_lease() -> crate::cli::drive::helpers::LeaseTokenArg {
+            crate::cli::drive::helpers::LeaseTokenArg { lease: None }
+        }
+
+        assert!(dispatch(
+            SheetsSubcommands::AddDimensionGroup(dimension_group::AddDimensionGroupCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: "Sheet1".to_string(),
+                dimension: crate::cli::drive::sheets::format::DimensionArg::Rows,
+                start: 1,
+                end: 5,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::UpdateDimensionGroup(dimension_group::UpdateDimensionGroupCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: "Sheet1".to_string(),
+                dimension: crate::cli::drive::sheets::format::DimensionArg::Rows,
+                start: 1,
+                end: 5,
+                depth: None,
+                collapsed: true,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::DeleteDimensionGroup(dimension_group::DeleteDimensionGroupCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: "Sheet1".to_string(),
+                dimension: crate::cli::drive::sheets::format::DimensionArg::Rows,
+                start: 1,
+                end: 5,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::ListDimensionGroups(dimension_group::ListDimensionGroupsCommand {
                 spreadsheet_id: "sheet-1".to_string(),
                 output: crate::cli::drive::format::OutputFormat::Table,
             }),

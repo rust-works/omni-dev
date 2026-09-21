@@ -142,6 +142,12 @@ pub enum DriveOperation {
     /// `unmerge-cells`/`clear-data-validation`; removing one destroys no
     /// grid data.
     ///
+    /// Since issue #1833 ([ADR-0084](../../docs/adrs/adr-0084-dimension-groups.md)),
+    /// also dimension groups (`add-dimension-group`/`update-dimension-group`/
+    /// `delete-dimension-group`) — the collapsible +/- outline over a row
+    /// or column span, the same reasoning again; removing a group destroys
+    /// no grid data either.
+    ///
     /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
     /// reason that one is not folded into [`Self::Edit`]. Every existing
     /// `allow: ["sheets-write"]` rule was written when structural edits were

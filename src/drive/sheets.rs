@@ -26,6 +26,7 @@ pub mod conditional_format;
 pub mod create;
 pub mod date_value;
 pub mod developer_metadata;
+pub mod dimension_group;
 pub mod embedded_object;
 pub mod filter;
 pub mod format;

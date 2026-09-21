@@ -628,7 +628,7 @@ operation anywhere in a target's ancestor chain:
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
 | `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table` |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding` |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -704,6 +704,14 @@ A banded range is alternating row/column color applied to a range —
 presentation, not data — so `delete-banding` destroys nothing. `drive
 sheets list-bandings` is a plain read and needs no grant, the same as
 `list-protections`.
+
+**`sheets-structure` also covers dimension groups — `add-dimension-group`/
+`update-dimension-group`/`delete-dimension-group`** (issue #1833,
+[ADR-0084](adrs/adr-0084-dimension-groups.md)). A dimension group is the
+collapsible +/- outline over a row or column span — presentation, not
+data — so `delete-dimension-group` destroys nothing. `drive sheets
+list-dimension-groups` is a plain read and needs no grant, the same as
+`list-bandings`.
 
 **`sheets-protection` is separate from `sheets-structure`, and the reason is
 different in kind from every split above.** A protected range is a
@@ -2459,6 +2467,59 @@ nothing to change. A changed color merges onto the selected axis's
 *existing* colors — an unset color flag leaves that color untouched — so
 `update-banding --header-color '#000000'` alone does not clear the
 existing first/second band colors.
+
+#### drive sheets add-dimension-group / update-dimension-group / delete-dimension-group / list-dimension-groups
+
+Dimension groups — the collapsible +/- outline over a row or column span —
+gated by `sheets-structure`, including `delete-dimension-group`. See
+[ADR-0084](adrs/adr-0084-dimension-groups.md): a group is presentation
+applied to a span, so removing one destroys no data, the same reasoning as
+`add-banding`/`update-banding`/`delete-banding`.
+
+```bash
+# Group rows 5-9 into a collapsible outline.
+omni-dev drive sheets add-dimension-group <ID> --sheet Q1 \
+  --dimension rows --start 5 --end 9
+
+# See what's defined, and each group's depth — a plain, ungated read.
+omni-dev drive sheets list-dimension-groups <ID>
+
+# Collapse or expand a group, addressed by its span.
+omni-dev drive sheets update-dimension-group <ID> --sheet Q1 \
+  --dimension rows --start 5 --end 9 --collapsed true
+
+# Remove a group — read --dry-run first.
+omni-dev drive sheets delete-dimension-group <ID> --sheet Q1 \
+  --dimension rows --start 5 --end 9 --dry-run
+omni-dev drive sheets delete-dimension-group <ID> --sheet Q1 \
+  --dimension rows --start 5 --end 9
+```
+
+**No client-side depth cap.** `addDimensionGroup`'s request carries only a
+span — the server derives the new group's depth from how it overlaps
+existing groups on the same axis, and no maximum nesting depth is
+documented anywhere in the Sheets API reference to validate against. This
+crate validates only the span itself, against the sheet's current extent
+(the same check `auto-resize-dimension` makes) — Sheets stays the
+authority on how deeply nested a structure may get, the same stance
+ADR-0073 §7 takes for `--count` on `insert-rows`/`insert-columns`. See
+[ADR-0084](adrs/adr-0084-dimension-groups.md) §1.
+
+**`update-dimension-group` changes only `--collapsed`**, the only field a
+dimension group has beyond its identity — `--collapsed` is required, not
+optional. A dimension group carries no id; it is addressed by
+`--sheet`/`--dimension`/`--start`/`--end`, disambiguated by an optional
+`--depth` when more than one group shares that exact span at different
+depths (the API creates this whenever a group is added over a span equal
+to an existing one). Omitting `--depth` when the span is genuinely
+ambiguous is refused, naming the depths found.
+
+**`delete-dimension-group` requires an exact span match** among the
+groups `list-dimension-groups` would show. The API's own partial-span
+delete — a span that only partially overlaps an existing group decrements
+that group's depth rather than removing anything — is not exposed; use
+the Sheets UI for that, or delete the group's exact span and re-add a
+narrower one.
 
 ## Docs
 

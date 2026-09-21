@@ -124,6 +124,16 @@ const SPREADSHEET_FIELDS_WITH_BANDING: &str = "spreadsheetId,properties.title,\
     sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
     sheets.bandedRanges(bandedRangeId,range,rowProperties,columnProperties)";
 
+/// `fields` mask for `spreadsheets.get` when dimension groups are needed
+/// too (issue #1833's `add-dimension-group`/`update-dimension-group`/
+/// `delete-dimension-group`/`list-dimension-groups`, which must resolve an
+/// *existing* group by its `(range, depth)` before three of the four can
+/// act on one). A superset of [`SPREADSHEET_FIELDS`], kept separate for
+/// the same reason [`SPREADSHEET_FIELDS_WITH_BANDING`] is.
+const SPREADSHEET_FIELDS_WITH_DIMENSION_GROUPS: &str = "spreadsheetId,properties.title,\
+    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.rowGroups(range,depth,collapsed),sheets.columnGroups(range,depth,collapsed)";
+
 /// Maximum ranges sent in a single `values.batchGet`.
 ///
 /// Each range is a percent-encoded, quoted sheet title in the query string,
@@ -353,6 +363,27 @@ impl<'a> SheetsApi<'a> {
             .get_parsed(
                 url.as_str(),
                 "Failed to parse Sheets spreadsheet metadata (with banded ranges)",
+            )
+            .await
+    }
+
+    /// Fetches a spreadsheet's metadata **including dimension groups** —
+    /// shared by all four `dimension_group.rs` verbs (issue #1833),
+    /// mirroring [`Self::get_spreadsheet_with_banding`]'s reuse across its
+    /// own four verbs. See [`SPREADSHEET_FIELDS_WITH_DIMENSION_GROUPS`].
+    pub async fn get_spreadsheet_with_dimension_groups(
+        &self,
+        spreadsheet_id: &str,
+    ) -> Result<Spreadsheet> {
+        let url = build_spreadsheet_get_with_dimension_groups_url(
+            self.client.base_url(),
+            spreadsheet_id,
+        )?;
+        self.client
+            .transport()
+            .get_parsed(
+                url.as_str(),
+                "Failed to parse Sheets spreadsheet metadata (with dimension groups)",
             )
             .await
     }
@@ -686,6 +717,18 @@ fn build_spreadsheet_get_with_banding_url(base_url: &str, spreadsheet_id: &str) 
     GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
     url.query_pairs_mut()
         .append_pair("fields", SPREADSHEET_FIELDS_WITH_BANDING);
+    Ok(url)
+}
+
+fn build_spreadsheet_get_with_dimension_groups_url(
+    base_url: &str,
+    spreadsheet_id: &str,
+) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
+    url.query_pairs_mut()
+        .append_pair("fields", SPREADSHEET_FIELDS_WITH_DIMENSION_GROUPS);
     Ok(url)
 }
 
