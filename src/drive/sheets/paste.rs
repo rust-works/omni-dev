@@ -895,7 +895,7 @@ fn grid_range_to_a1(sheet_title: &str, grid: &GridRange) -> String {
         grid.start_column_index,
         grid.end_column_index,
     ) else {
-        unreachable!("paste extents are always fully bounded by construction")
+        unreachable!("paste extents are always fully bounded by construction") // omni-dev: coverage ignore-line reason="extents are always built by anchored_extent/copy_paste_extent from grids already confirmed bounded, so all four indices are always Some here"
     };
     let start = format!("{}{}", grid_range::column_index_to_letters(c0), r0 + 1);
     let end = format!("{}{}", grid_range::column_index_to_letters(c1 - 1), r1);
@@ -1298,6 +1298,81 @@ mod tests {
     }
 
     #[test]
+    fn sheet_exceeds_dimensions_is_false_when_the_extents_sheet_is_unknown() {
+        let workbook: crate::drive::sheets::types::Spreadsheet =
+            serde_json::from_value(serde_json::json!({
+                "sheets": [
+                    {"properties": {"sheetId": 1, "title": "Q1",
+                                     "gridProperties": {"rowCount": 10, "columnCount": 5}}},
+                ],
+            }))
+            .unwrap();
+        // `extent.sheet_id` names a sheet this workbook doesn't have —
+        // nothing to compare against, so this is never "exceeds".
+        assert!(!sheet_exceeds_dimensions(
+            &workbook,
+            &range(99, 0, 20, 0, 20)
+        ));
+    }
+
+    #[test]
+    fn paste_data_upper_bound_with_an_empty_delimiter_counts_one_column() {
+        assert_eq!(paste_data_upper_bound("ab\ncd", ""), (2, 1));
+    }
+
+    #[test]
+    fn log_operation_is_defined_for_every_verb() {
+        for verb in every_paste_verb() {
+            assert!(!verb.log_operation().is_empty());
+        }
+    }
+
+    #[test]
+    fn log_status_is_defined_for_every_result_variant() {
+        for result in every_paste_result() {
+            assert!(!result.log_status().is_empty());
+        }
+    }
+
+    #[test]
+    fn from_lease_refusal_maps_every_refusal_kind() {
+        assert_eq!(PasteResult::from_no_lease(), PasteResult::RefusedNoLease);
+        assert_eq!(
+            PasteResult::from_lease_expired(),
+            PasteResult::RefusedLeaseExpired
+        );
+        assert_eq!(
+            PasteResult::from_lease_wrong_file(),
+            PasteResult::RefusedLeaseWrongFile
+        );
+        assert_eq!(
+            PasteResult::from_lease_stale(),
+            PasteResult::RefusedLeaseStale
+        );
+        assert_eq!(
+            PasteResult::from_lease_failed("boom".to_string()),
+            PasteResult::Failed {
+                detail: "boom".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn write_jsonl_serializes_the_outcome_as_one_json_line() {
+        let outcome = PasteOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: every_paste_verb().remove(0),
+            result: PasteResult::RefusedShortcut,
+        };
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("refused-shortcut"), "{text}");
+    }
+
+    #[test]
     fn read_data_text_reads_a_local_file_verbatim() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("clip.tsv");
@@ -1310,6 +1385,16 @@ mod tests {
     fn read_data_text_reports_a_missing_file_clearly() {
         let err = read_data_text("/definitely/not/here.tsv").unwrap_err();
         assert!(err.to_string().contains("Failed to stat"), "{err}");
+    }
+
+    #[test]
+    fn read_data_text_refuses_a_file_over_the_upload_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.tsv");
+        let oversize = vec![b'a'; (crate::drive::files_api::MAX_UPLOAD_BYTES + 1) as usize];
+        std::fs::write(&path, oversize).unwrap();
+        let err = read_data_text(path.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("over the"), "{err}");
     }
 
     // ── async flow, against a wiremock Drive+Sheets backend ──
@@ -1760,6 +1845,956 @@ mod tests {
         );
     }
 
+    // ── early refusals, before any gate/workbook call ──
+
+    #[tokio::test]
+    async fn a_destination_with_no_sheet_and_no_prefix_is_refused_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // No file/folder/workbook mock is mounted at all — reaching any of
+        // them would 404 and mask this as `Failed` rather than
+        // `RefusedInvalidRange`.
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: None,
+                source: "'Q1'!A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Values,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &[]).await;
+        match outcome.result {
+            PasteResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("--destination"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+        assert_eq!(outcome.file_name, None);
+    }
+
+    #[tokio::test]
+    async fn a_source_with_no_sheet_and_no_prefix_is_refused_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: None,
+                source: "A1:B2".to_string(),
+                destination: "'Q1'!D1:E2".to_string(),
+                paste_type: PasteType::Values,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &[]).await;
+        match outcome.result {
+            PasteResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("--source"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    // ── target-gate refusals/failures ──
+
+    #[tokio::test]
+    async fn a_metadata_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Normal,
+                orientation: PasteOrientation::Normal,
+            },
+            // `false` so this also drives `record_attempt`'s `Failed` arm.
+            dry_run: false,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &[]).await;
+        assert!(matches!(outcome.result, PasteResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_shortcut_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.shortcut",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Normal,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, PasteResult::RefusedShortcut));
+    }
+
+    #[tokio::test]
+    async fn a_non_spreadsheet_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.document",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Normal,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            PasteResult::RefusedNotASpreadsheet { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_target_with_no_visible_parents_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", crate::drive::types::GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Normal,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &[]).await;
+        assert!(matches!(
+            outcome.result,
+            PasteResult::RefusedNoVisibleParents
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gate_ancestor_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Normal,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, PasteResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_workbook_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Normal,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, PasteResult::Failed { .. }));
+    }
+
+    // ── destination/source range resolution ──
+
+    #[tokio::test]
+    async fn a_destination_naming_an_unknown_sheet_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: None,
+                source: "'Q1'!A1:B2".to_string(),
+                destination: "'Ghost'!D1:E2".to_string(),
+                paste_type: PasteType::Normal,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            PasteResult::RefusedSheetNotFound { title, .. } => assert_eq!(title, "Ghost"),
+            other => panic!("expected RefusedSheetNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_destination_with_an_unparseable_range_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: None,
+                source: "'Q1'!A1:B2".to_string(),
+                destination: "'Q1'!not a range".to_string(),
+                paste_type: PasteType::Normal,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PasteResult::RefusedInvalidRange { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_destination_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: None,
+                source: "'Q1'!A1:B2".to_string(),
+                destination: "'Q1'!A:A".to_string(),
+                paste_type: PasteType::Normal,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            PasteResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("bounded"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_naming_an_unknown_sheet_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: None,
+                source: "'Ghost'!A1:B2".to_string(),
+                destination: "'Q1'!D1:E2".to_string(),
+                paste_type: PasteType::Normal,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            PasteResult::RefusedSheetNotFound { title, .. } => assert_eq!(title, "Ghost"),
+            other => panic!("expected RefusedSheetNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_with_an_unparseable_range_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: None,
+                source: "'Q1'!not a range".to_string(),
+                destination: "'Q1'!D1:E2".to_string(),
+                paste_type: PasteType::Normal,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PasteResult::RefusedInvalidRange { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_source_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: None,
+                source: "'Q1'!A:A".to_string(),
+                destination: "'Q1'!D1:E2".to_string(),
+                paste_type: PasteType::Normal,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            PasteResult::RefusedInvalidRange { detail } => {
+                assert!(
+                    detail.contains("bounded") && detail.contains("--source"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    // ── grid-edge caveat, values.get failures ──
+
+    #[tokio::test]
+    async fn a_destination_past_the_sheets_allocated_grid_gets_a_caveat() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {"properties": {"sheetId": 0, "title": "Q1", "index": 0,
+                                         "gridProperties": {"rowCount": 5, "columnCount": 5}}},
+                    ],
+                })),
+            )
+            .mount(&server)
+            .await;
+        // Format-only: no `values.get` mock is needed to reach `WouldChange`.
+        let rules = vec![allow_rule("folder-1", &[DriveOperation::SheetsStructure])];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:F1".to_string(),
+                destination: "A1:B1".to_string(),
+                paste_type: PasteType::Format,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            PasteResult::WouldChange(change) => {
+                assert!(change.grid_edge_caveat.is_some(), "{change:?}");
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_values_get_failure_for_the_destination_preview_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!D1:E2",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1", &[DriveOperation::SheetsWrite])];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Values,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, PasteResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_values_get_failure_for_the_cut_paste_source_clear_preview_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!D1:E2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!D1:E2", "values": []})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A1:B2",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CutPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1".to_string(),
+                paste_type: PasteType::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, PasteResult::Failed { .. }));
+    }
+
+    // ── real (non-dry-run) mutations ──
+
+    #[tokio::test]
+    async fn cut_paste_real_run_succeeds_and_reports_changed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!D1:E2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!D1:E2", "values": []})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A1:B2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!A1:B2", "values": []})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"replies": [{}]})),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CutPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1".to_string(),
+                paste_type: PasteType::Normal,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PasteResult::Changed(_)),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_paste_real_run_succeeds_and_reports_changed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!D1:E2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!D1:E2", "values": []})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"replies": [{}]})),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1", &[DriveOperation::SheetsWrite])];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Values,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PasteResult::Changed(_)),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_update_failure_is_reported_as_failed_not_changed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!D1:E2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!D1:E2", "values": []})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1", &[DriveOperation::SheetsWrite])];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Values,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PasteResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    // ── lease refusals ──
+
+    #[tokio::test]
+    async fn paste_data_refuses_an_unknown_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A1:B1",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!A1:B1", "values": []})),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![FolderPermissionRule::folder("folder-1")
+            .allowing([DriveOperation::SheetsWrite])
+            .requiring_lease(true)];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::PasteData {
+                sheet: Some("Q1".to_string()),
+                destination: "A1".to_string(),
+                data: "1\t2".to_string(),
+                delimiter: "\t".to_string(),
+                paste_type: PasteType::Values,
+            },
+            dry_run: false,
+            lease_token: Some("bogus-token".to_string()),
+            ledger_path,
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, PasteResult::RefusedLeaseExpired));
+    }
+
+    #[tokio::test]
+    async fn paste_data_refuses_a_lease_bound_to_a_different_file() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A1:B1",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!A1:B1", "values": []})),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![FolderPermissionRule::folder("folder-1")
+            .allowing([DriveOperation::SheetsWrite])
+            .requiring_lease(true)];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = crate::drive::test_support::seed_lease(&ledger_path, "some-other-sheet", "1");
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::PasteData {
+                sheet: Some("Q1".to_string()),
+                destination: "A1".to_string(),
+                data: "1\t2".to_string(),
+                delimiter: "\t".to_string(),
+                paste_type: PasteType::Values,
+            },
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, PasteResult::RefusedLeaseWrongFile));
+    }
+
+    #[tokio::test]
+    async fn paste_data_refuses_a_stale_lease_when_the_file_has_moved() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A1:B1",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!A1:B1", "values": []})),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![FolderPermissionRule::folder("folder-1")
+            .allowing([DriveOperation::SheetsWrite])
+            .requiring_lease(true)];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = crate::drive::test_support::seed_lease(&ledger_path, "sheet-1", "0");
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::PasteData {
+                sheet: Some("Q1".to_string()),
+                destination: "A1".to_string(),
+                data: "1\t2".to_string(),
+                delimiter: "\t".to_string(),
+                paste_type: PasteType::Values,
+            },
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, PasteResult::RefusedLeaseStale));
+    }
+
     #[tokio::test]
     async fn a_required_lease_without_one_refuses_before_batch_update() {
         let server = wiremock::MockServer::start().await;
@@ -1942,5 +2977,181 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn describe_lines_reports_no_overwritten_cells_when_the_extent_is_all_blank() {
+        let change = PasteChange {
+            destination: "'Q1'!D1".to_string(),
+            source: None,
+            written_extent: "'Q1'!D1:E2".to_string(),
+            overwritten: Some(vec![]),
+            cleared: None,
+            grid_edge_caveat: None,
+        };
+        let outcome = PasteOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: PasteVerb::PasteData {
+                sheet: Some("Q1".to_string()),
+                destination: "D1".to_string(),
+                data: "1".to_string(),
+                delimiter: "\t".to_string(),
+                paste_type: PasteType::Values,
+            },
+            result: PasteResult::WouldChange(change),
+        };
+        let lines = describe_lines(&outcome);
+        assert!(
+            lines.iter().any(|l| l.contains("no non-blank cells")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn describe_lines_notes_that_a_format_only_paste_previews_no_overwrite() {
+        let change = PasteChange {
+            destination: "'Q1'!D1:E2".to_string(),
+            source: Some("'Q1'!A1:B2".to_string()),
+            written_extent: "'Q1'!D1:E2".to_string(),
+            overwritten: None,
+            cleared: None,
+            grid_edge_caveat: None,
+        };
+        let outcome = PasteOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Format,
+                orientation: PasteOrientation::Normal,
+            },
+            result: PasteResult::WouldChange(change),
+        };
+        let lines = describe_lines(&outcome);
+        assert!(
+            lines.iter().any(|l| l.contains("not previewed")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn describe_lines_reports_no_cells_to_clear_when_the_source_is_blank() {
+        let change = PasteChange {
+            destination: "'Q1'!D1".to_string(),
+            source: Some("'Q1'!A1:B2".to_string()),
+            written_extent: "'Q1'!D1:E2".to_string(),
+            overwritten: Some(vec![]),
+            cleared: Some(vec![]),
+            grid_edge_caveat: None,
+        };
+        let outcome = PasteOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: PasteVerb::CutPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1".to_string(),
+                paste_type: PasteType::Normal,
+            },
+            result: PasteResult::WouldChange(change),
+        };
+        let lines = describe_lines(&outcome);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("no non-blank cells to clear")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn describe_lines_falls_back_to_the_spreadsheet_id_when_no_file_name_is_known() {
+        let outcome = PasteOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: None,
+            resolved_folder_id: None,
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Values,
+                orientation: PasteOrientation::Normal,
+            },
+            result: PasteResult::RefusedShortcut,
+        };
+        let lines = describe_lines(&outcome);
+        assert!(lines[0].contains("'sheet-1'"), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_lines_names_sheets_structure_alone_for_a_no_visible_parents_refusal_on_a_format_only_verb(
+    ) {
+        let outcome = PasteOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Format,
+                orientation: PasteOrientation::Normal,
+            },
+            result: PasteResult::RefusedNoVisibleParents,
+        };
+        let lines = describe_lines(&outcome);
+        assert!(lines[0].contains("\"sheets-structure\""), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_lines_reports_no_available_sheets_when_the_workbook_has_none() {
+        let outcome = PasteOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: PasteVerb::PasteData {
+                sheet: Some("Q1".to_string()),
+                destination: "D1".to_string(),
+                data: "1".to_string(),
+                delimiter: "\t".to_string(),
+                paste_type: PasteType::Values,
+            },
+            result: PasteResult::RefusedSheetNotFound {
+                title: "Ghost".to_string(),
+                available: vec![],
+            },
+        };
+        let lines = describe_lines(&outcome);
+        assert!(lines[0].contains("available: none"), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_lines_names_the_deciding_folder_rule_when_present() {
+        let outcome = PasteOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: PasteVerb::CutPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1".to_string(),
+                paste_type: PasteType::Normal,
+            },
+            result: PasteResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 2,
+                }),
+            },
+        };
+        let lines = describe_lines(&outcome);
+        assert!(lines[0].contains("folder folder-1 (depth 2)"), "{lines:?}");
     }
 }

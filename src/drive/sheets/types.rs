@@ -3417,6 +3417,20 @@ mod tests {
     }
 
     #[test]
+    fn paste_type_as_str_matches_the_wire_spelling() {
+        assert_eq!(PasteType::Normal.as_str(), "PASTE_NORMAL");
+        assert_eq!(PasteType::Values.as_str(), "PASTE_VALUES");
+        assert_eq!(PasteType::Formula.as_str(), "PASTE_FORMULA");
+        assert_eq!(PasteType::Format.as_str(), "PASTE_FORMAT");
+    }
+
+    #[test]
+    fn paste_orientation_as_str_matches_the_wire_spelling() {
+        assert_eq!(PasteOrientation::Normal.as_str(), "NORMAL");
+        assert_eq!(PasteOrientation::Transpose.as_str(), "TRANSPOSE");
+    }
+
+    #[test]
     fn iterative_calculation_settings_describe_bounds_covers_every_combination() {
         assert_eq!(
             IterativeCalculationSettings {

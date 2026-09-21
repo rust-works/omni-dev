@@ -1226,4 +1226,100 @@ mod tests {
         .await
         .is_ok());
     }
+
+    #[tokio::test]
+    async fn the_paste_dispatch_arms_reach_their_leaf_commands() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        // No write-permission rules are configured (an unconfigured
+        // account), so every leaf below is `Blocked` by default policy —
+        // enough to reach and return from the leaf without a lease or a
+        // workbook fetch, which a `Blocked` verdict never gets to (same
+        // trick as `the_banding_dispatch_arms_reach_their_leaf_commands`).
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1",
+                    "name": "Budget",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": ["folder-1"],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1",
+                    "name": "folder-1",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        fn no_lease() -> crate::cli::drive::helpers::LeaseTokenArg {
+            crate::cli::drive::helpers::LeaseTokenArg { lease: None }
+        }
+
+        assert!(dispatch(
+            SheetsSubcommands::CutPaste(paste::CutPasteCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1".to_string(),
+                paste_type: paste::PasteTypeArg::Normal,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::CopyPaste(paste::CopyPasteCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: paste::PasteTypeArg::Normal,
+                orientation: paste::OrientationArg::Normal,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.tsv");
+        std::fs::write(&path, "1\t2").unwrap();
+        assert!(dispatch(
+            SheetsSubcommands::PasteData(paste::PasteDataCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: Some("Q1".to_string()),
+                destination: "A1".to_string(),
+                data: path.to_str().unwrap().to_string(),
+                delimiter: "\t".to_string(),
+                paste_type: paste::PasteTypeArg::Values,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+    }
 }
