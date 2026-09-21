@@ -1028,7 +1028,11 @@ mod tests {
                 grid_properties: Some(GridProperties {
                     row_count: Some(1000),
                     column_count: Some(26),
+                    frozen_row_count: None,
+                    frozen_column_count: None,
+                    hide_gridlines: None,
                 }),
+                right_to_left: None,
             }),
             row_groups: groups,
             ..Default::default()
@@ -1082,6 +1086,7 @@ mod tests {
                 index: Some(0),
                 hidden: None,
                 grid_properties: None,
+                right_to_left: None,
             }),
             ..Default::default()
         };
