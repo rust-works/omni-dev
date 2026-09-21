@@ -319,4 +319,171 @@ mod tests {
             PasteOrientation::Transpose
         ));
     }
+
+    // ── `execute`, against a wiremock Drive+Sheets backend ──
+
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::utils::secret::Secret;
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    async fn client_with_bootstrapped_token(server: &wiremock::MockServer) -> DriveClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+
+        let mut client = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    /// No write-permission rules are configured (an unconfigured account —
+    /// see `client_with_bootstrapped_token`'s `EnvGuard::clear_credentials`
+    /// caller), so the gate refuses by default policy. That's enough to
+    /// drive each `execute` (and thus `run_paste`) through its full
+    /// CLI-level path — building `PasteOptions`, calling `paste`, and
+    /// rendering the `describe_lines` output — without needing a lease or a
+    /// workbook fetch, which a `Blocked` verdict never reaches.
+    async fn mount_ungated_target(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1",
+                    "name": "Budget",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": ["folder-1"],
+                })),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1",
+                    "name": "folder-1",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [],
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cut_paste_command_runs_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let cmd = CutPasteCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: Some("Q1".to_string()),
+            source: "A1:B2".to_string(),
+            destination: "D1".to_string(),
+            paste_type: PasteTypeArg::Normal,
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn copy_paste_command_runs_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let cmd = CopyPasteCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: Some("Q1".to_string()),
+            source: "A1:B2".to_string(),
+            destination: "D1:E2".to_string(),
+            paste_type: PasteTypeArg::Normal,
+            orientation: OrientationArg::Transpose,
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Yaml,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn paste_data_command_reads_data_from_a_file_and_runs_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.tsv");
+        std::fs::write(&path, "1\t2").unwrap();
+
+        let cmd = PasteDataCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: Some("Q1".to_string()),
+            destination: "A1".to_string(),
+            data: path.to_str().unwrap().to_string(),
+            delimiter: "\t".to_string(),
+            paste_type: PasteTypeArg::Values,
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn paste_data_command_execute_surfaces_a_missing_data_file_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        // No mocks at all — `read_data_text` must fail before any network
+        // call is ever attempted.
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let cmd = PasteDataCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: Some("Q1".to_string()),
+            destination: "A1".to_string(),
+            data: "/definitely/not/here.tsv".to_string(),
+            delimiter: "\t".to_string(),
+            paste_type: PasteTypeArg::Values,
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        let err = cmd.execute(&client).await.unwrap_err();
+        assert!(err.to_string().contains("Failed to stat"), "{err}");
+    }
 }
