@@ -326,6 +326,21 @@ pub enum EmbeddedObjectResult {
         /// The id that was not found.
         object_id: i64,
     },
+    /// A chart-only verb (`update-chart`/`delete-chart`/`move-chart`/
+    /// `update-chart-border`) named an id that exists but belongs to a
+    /// slicer, or a slicer-only verb (`update-slicer`/`delete-slicer`/
+    /// `move-slicer`) named one that belongs to a chart. Distinct from
+    /// [`Self::RefusedObjectNotFound`] — the id is real, just the wrong
+    /// kind of object — so the message can point straight at the `list-*`
+    /// command that would have shown it.
+    RefusedWrongObjectKind {
+        /// The id that was named.
+        object_id: i64,
+        /// `"chart"` or `"slicer"` — what the verb expected.
+        expected: String,
+        /// `"chart"` or `"slicer"` — what the id actually names.
+        found: String,
+    },
     /// `update-chart` named a chart whose existing spec is not one of the
     /// two supported kinds (basic or pie), or would switch between them.
     RefusedUnsupportedChart {
@@ -399,6 +414,7 @@ impl EmbeddedObjectResult {
             Self::RefusedSheetNotFound { .. } => "refused-sheet-not-found",
             Self::RefusedInvalidRange { .. } => "refused-invalid-range",
             Self::RefusedObjectNotFound { .. } => "refused-object-not-found",
+            Self::RefusedWrongObjectKind { .. } => "refused-wrong-object-kind",
             Self::RefusedUnsupportedChart { .. } => "refused-unsupported-chart",
             Self::Blocked { .. } => "blocked",
             Self::RefusedNoLease => LeaseGateRefusal::NoLease.log_status(),
@@ -1172,6 +1188,50 @@ fn find_slicer(workbook: &Spreadsheet, slicer_id: i64) -> Option<(&Sheet, &Slice
     })
 }
 
+/// Resolves `chart_id` against every chart-only verb's id lookup: found as a
+/// chart it resolves normally, found instead as a slicer it refuses with
+/// [`EmbeddedObjectResult::RefusedWrongObjectKind`] rather than the
+/// misleading [`EmbeddedObjectResult::RefusedObjectNotFound`], and found as
+/// neither it falls back to that not-found refusal.
+fn find_chart_or_refuse(
+    workbook: &Spreadsheet,
+    chart_id: i64,
+) -> Result<(&Sheet, &EmbeddedChart), EmbeddedObjectResult> {
+    if let Some(found) = find_chart(workbook, chart_id) {
+        return Ok(found);
+    }
+    if find_slicer(workbook, chart_id).is_some() {
+        return Err(EmbeddedObjectResult::RefusedWrongObjectKind {
+            object_id: chart_id,
+            expected: "chart".to_string(),
+            found: "slicer".to_string(),
+        });
+    }
+    Err(EmbeddedObjectResult::RefusedObjectNotFound {
+        object_id: chart_id,
+    })
+}
+
+/// The slicer-only mirror of [`find_chart_or_refuse`].
+fn find_slicer_or_refuse(
+    workbook: &Spreadsheet,
+    slicer_id: i64,
+) -> Result<(&Sheet, &Slicer), EmbeddedObjectResult> {
+    if let Some(found) = find_slicer(workbook, slicer_id) {
+        return Ok(found);
+    }
+    if find_chart(workbook, slicer_id).is_some() {
+        return Err(EmbeddedObjectResult::RefusedWrongObjectKind {
+            object_id: slicer_id,
+            expected: "slicer".to_string(),
+            found: "chart".to_string(),
+        });
+    }
+    Err(EmbeddedObjectResult::RefusedObjectNotFound {
+        object_id: slicer_id,
+    })
+}
+
 fn describe_overlay_position(sheet: &Sheet, overlay: &OverlayPosition) -> String {
     format!(
         "{}!{}{}",
@@ -1496,11 +1556,7 @@ fn build_update_chart(
     verb: &EmbeddedObjectVerb,
     chart_id: i64,
 ) -> Result<Plan, EmbeddedObjectResult> {
-    let Some((sheet, chart)) = find_chart(workbook, chart_id) else {
-        return Err(EmbeddedObjectResult::RefusedObjectNotFound {
-            object_id: chart_id,
-        });
-    };
+    let (sheet, chart) = find_chart_or_refuse(workbook, chart_id)?;
     let Some(existing_spec) = chart.spec.as_ref() else {
         return Err(EmbeddedObjectResult::RefusedUnsupportedChart {
             chart_id,
@@ -1521,11 +1577,7 @@ fn build_update_chart(
 }
 
 fn build_delete_chart(workbook: &Spreadsheet, chart_id: i64) -> Result<Plan, EmbeddedObjectResult> {
-    let Some((sheet, chart)) = find_chart(workbook, chart_id) else {
-        return Err(EmbeddedObjectResult::RefusedObjectNotFound {
-            object_id: chart_id,
-        });
-    };
+    let (sheet, chart) = find_chart_or_refuse(workbook, chart_id)?;
     let before = summarise_chart(sheet, chart);
     let sheet_id = sheet.sheet_id();
     let summary = format!("delete chart {chart_id}");
@@ -1632,11 +1684,7 @@ fn build_update_slicer(
         // omni-dev: coverage end
     };
 
-    let Some((host_sheet, slicer)) = find_slicer(workbook, slicer_id) else {
-        return Err(EmbeddedObjectResult::RefusedObjectNotFound {
-            object_id: slicer_id,
-        });
-    };
+    let (host_sheet, slicer) = find_slicer_or_refuse(workbook, slicer_id)?;
     let before = summarise_slicer(host_sheet, slicer);
     let sheet_id = host_sheet.sheet_id();
 
@@ -1693,11 +1741,7 @@ fn build_delete_slicer(
     workbook: &Spreadsheet,
     slicer_id: i64,
 ) -> Result<Plan, EmbeddedObjectResult> {
-    let Some((sheet, slicer)) = find_slicer(workbook, slicer_id) else {
-        return Err(EmbeddedObjectResult::RefusedObjectNotFound {
-            object_id: slicer_id,
-        });
-    };
+    let (sheet, slicer) = find_slicer_or_refuse(workbook, slicer_id)?;
     let before = summarise_slicer(sheet, slicer);
     let sheet_id = sheet.sheet_id();
     let summary = format!("delete slicer {slicer_id}");
@@ -1898,6 +1942,14 @@ pub fn describe_lines(outcome: &EmbeddedObjectOutcome) -> Vec<String> {
         EmbeddedObjectResult::RefusedObjectNotFound { object_id } => vec![format!(
             "Refused: {book} has no chart or slicer with id {object_id}; run `drive sheets \
              list-charts`/`list-slicers` to see what exists"
+        )],
+        EmbeddedObjectResult::RefusedWrongObjectKind {
+            object_id,
+            expected,
+            found,
+        } => vec![format!(
+            "Refused: id {object_id} in {book} is a {found}, not a {expected}; run `drive \
+             sheets list-{found}s` to see what exists"
         )],
         EmbeddedObjectResult::RefusedUnsupportedChart { chart_id, detail } => {
             vec![format!("Refused: chart {chart_id} in {book}: {detail}")]
@@ -4117,6 +4169,73 @@ mod tests {
         ));
     }
 
+    /// A workbook whose one sheet carries both a chart (id 1) and a slicer
+    /// (id 4) — every `*_refuses_a_*_id` test below resolves the *other*
+    /// kind's id against a chart-only or slicer-only verb.
+    fn mixed_object_workbook() -> Spreadsheet {
+        let mut sheet = basic_chart_sheet(1, "COLUMN");
+        sheet.slicers = slicer_workbook().sheets.remove(0).slicers;
+        workbook_with_sheet(sheet)
+    }
+
+    #[test]
+    fn build_update_chart_refuses_a_slicer_id() {
+        let workbook = mixed_object_workbook();
+        assert!(matches!(
+            refusal(build_update_chart(&workbook, &update_chart_verb(4), 4)),
+            EmbeddedObjectResult::RefusedWrongObjectKind {
+                object_id: 4,
+                expected,
+                found,
+            } if expected == "chart" && found == "slicer"
+        ));
+    }
+
+    #[test]
+    fn build_delete_chart_refuses_a_slicer_id() {
+        let workbook = mixed_object_workbook();
+        assert!(matches!(
+            refusal(build_delete_chart(&workbook, 4)),
+            EmbeddedObjectResult::RefusedWrongObjectKind {
+                object_id: 4,
+                expected,
+                found,
+            } if expected == "chart" && found == "slicer"
+        ));
+    }
+
+    #[test]
+    fn build_update_slicer_refuses_a_chart_id() {
+        let workbook = mixed_object_workbook();
+        let verb = update_slicer_verb(|verb| {
+            let EmbeddedObjectVerb::UpdateSlicer { title, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+            };
+            *title = Some("Territory".to_string());
+        });
+        assert!(matches!(
+            refusal(build_update_slicer(&workbook, &verb, 1)),
+            EmbeddedObjectResult::RefusedWrongObjectKind {
+                object_id: 1,
+                expected,
+                found,
+            } if expected == "slicer" && found == "chart"
+        ));
+    }
+
+    #[test]
+    fn build_delete_slicer_refuses_a_chart_id() {
+        let workbook = mixed_object_workbook();
+        assert!(matches!(
+            refusal(build_delete_slicer(&workbook, 1)),
+            EmbeddedObjectResult::RefusedWrongObjectKind {
+                object_id: 1,
+                expected,
+                found,
+            } if expected == "slicer" && found == "chart"
+        ));
+    }
+
     // ── build_add_slicer / build_update_slicer / build_delete_slicer ─────
 
     fn add_slicer_verb() -> EmbeddedObjectVerb {
@@ -4535,6 +4654,24 @@ mod tests {
     }
 
     #[test]
+    fn describe_lines_renders_wrong_object_kind() {
+        let out = outcome_with(
+            update_chart_verb(4),
+            Some("Budget"),
+            EmbeddedObjectResult::RefusedWrongObjectKind {
+                object_id: 4,
+                expected: "chart".to_string(),
+                found: "slicer".to_string(),
+            },
+        );
+        assert_eq!(
+            describe(&out),
+            "Refused: id 4 in 'Budget' is a slicer, not a chart; run `drive sheets \
+             list-slicers` to see what exists"
+        );
+    }
+
+    #[test]
     fn describe_lines_renders_blocked_with_and_without_a_deciding_rule() {
         let by_rule = outcome_with(
             add_chart_verb(),
@@ -4653,6 +4790,11 @@ mod tests {
                 detail: String::new(),
             },
             EmbeddedObjectResult::RefusedObjectNotFound { object_id: 1 },
+            EmbeddedObjectResult::RefusedWrongObjectKind {
+                object_id: 1,
+                expected: String::new(),
+                found: String::new(),
+            },
             EmbeddedObjectResult::RefusedUnsupportedChart {
                 chart_id: 1,
                 detail: String::new(),
