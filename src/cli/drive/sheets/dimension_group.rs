@@ -457,6 +457,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_dimension_group_yaml_output_short_circuits_before_printing_lines() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let cmd = AddDimensionGroupCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: "Sheet1".to_string(),
+            dimension: DimensionArg::Rows,
+            start: 1,
+            end: 5,
+            dry_run: false,
+            lease: no_lease(),
+            output: crate::cli::drive::format::OutputFormat::Yaml,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn update_dimension_group_command_reaches_the_engine_under_a_blocked_gate() {
         let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();
