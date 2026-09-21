@@ -162,6 +162,17 @@ pub enum DriveOperation {
     /// touching any formula directly, the same shape of value effect
     /// ADR-0081 §2 already accepted here for named-range deletion.
     ///
+    /// Since issue #1838, also `insert-range` — the exact inverse of
+    /// `delete-range`'s cell-range half, inserting empty cells into a
+    /// sub-rectangle and shifting the existing cells in that column/row
+    /// extent right or down. It joins this operation, not
+    /// [`Self::SheetsDelete`], because no cell value is discarded: every
+    /// shifted cell keeps its content and the vacated cells become empty.
+    /// The one asymmetry with `delete-range`: a cell pushed past the
+    /// sheet's current grid extent by the shift is silently dropped by the
+    /// Sheets API, so this capability can lose data at the grid edge even
+    /// though it destroys none within it.
+    ///
     /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
     /// reason that one is not folded into [`Self::Edit`]. Every existing
     /// `allow: ["sheets-write"]` rule was written when structural edits were

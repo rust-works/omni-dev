@@ -217,6 +217,17 @@ types, so the log is a complete invocation history, not just an HTTP history:
   all, so `sheet_id`/`sheet_title` are always absent on its records,
   unlike every other `sheets-*` operation.
 
+  `insert-range` (issue #1838) uses the same kind again, with `operation`
+  of `sheets-insert-range`. It is `delete-range`'s exact inverse and so
+  needs no new context key either: it reuses `grid_range` (introduced
+  above for `delete-range`) to record the same rectangle notation. Unlike
+  the destructive edits above, `insert-range` is gated `sheets-structure`,
+  not `sheets-delete` — no cell value is discarded, cells are shifted
+  within the sheet and the vacated cells become empty — so `grid_range`
+  is not exclusively a destructive-edit signal: a `sheets-insert-range`
+  record carries it too, and only the `operation` value tells the two
+  apart.
+
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of
