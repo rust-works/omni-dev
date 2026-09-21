@@ -860,6 +860,19 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
             new_sheet,
             ..
         } => {
+            // Checked *before* `nothing_to_change` below: a `--sheet`-only
+            // call (no `--anchor`, nothing else set either) would otherwise
+            // fall through `nothing_to_change` and report the generic
+            // "nothing to change" error instead of naming the actual
+            // problem. `--sheet` only supplies the prefix `--anchor`
+            // doesn't carry itself; without `--anchor` it has nothing to
+            // prefix and would otherwise be silently ignored. The CLI
+            // leaf's `requires = "anchor"` on `--sheet` already refuses
+            // this, but `validate_verb` is the real gate (see the comment
+            // above the slicer arm's equivalent check).
+            if sheet.is_some() && anchor.is_none() {
+                return Err("--sheet has no effect without --anchor".to_string());
+            }
             let nothing_to_change = !new_sheet
                 && anchor.is_none()
                 && offset_x.is_none()
@@ -873,15 +886,6 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            // `--sheet` only supplies the prefix `--anchor` doesn't carry
-            // itself; without `--anchor` it has nothing to prefix and would
-            // otherwise be silently ignored. The CLI leaf's `requires =
-            // "anchor"` on `--sheet` already refuses this, but
-            // `validate_verb` is the real gate (see the comment above the
-            // slicer arm's equivalent check).
-            if sheet.is_some() && anchor.is_none() {
-                return Err("--sheet has no effect without --anchor".to_string());
-            }
             Ok(())
         }
         EmbeddedObjectVerb::MoveSlicer {
@@ -893,6 +897,17 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
             height,
             ..
         } => {
+            // Checked *before* `nothing_to_change` below, for the same
+            // reason as the chart arm above: a `--sheet`-only call must
+            // name `--sheet`'s own problem, not fall through to the
+            // generic "nothing to change" error. Checked here *and* via
+            // `requires = "anchor"` on the CLI leaf's `--sheet` flag, for
+            // the same reason noted throughout this function:
+            // `validate_verb` is the actual gate every caller funnels
+            // through, not just the CLI.
+            if sheet.is_some() && anchor.is_none() {
+                return Err("--sheet has no effect without --anchor".to_string());
+            }
             let nothing_to_change = anchor.is_none()
                 && offset_x.is_none()
                 && offset_y.is_none()
@@ -904,13 +919,6 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
                      --height"
                         .to_string(),
                 );
-            }
-            // Checked here *and* via `requires = "anchor"` on the CLI
-            // leaf's `--sheet` flag, for the same reason noted throughout
-            // this function: `validate_verb` is the actual gate every
-            // caller funnels through, not just the CLI.
-            if sheet.is_some() && anchor.is_none() {
-                return Err("--sheet has no effect without --anchor".to_string());
             }
             Ok(())
         }
@@ -1986,8 +1994,9 @@ struct PlacementResize {
 /// rather than left as a zero value — `offset_x`/`offset_y`/`width`/
 /// `height` need no such fallback, since they're all optional on the wire
 /// and outside the mask when unset. An object with no current overlay
-/// position (a chart on its own sheet) requires `--anchor` to be moved onto
-/// a grid.
+/// position (a chart on its own sheet; a slicer is always an overlay, so
+/// this would mean a malformed read-back) requires `--anchor` to be moved
+/// onto a grid.
 fn overlay_position_update(
     workbook: &Spreadsheet,
     existing: Option<&OverlayPosition>,
@@ -2003,8 +2012,9 @@ fn overlay_position_update(
         }
         None => existing.map(|overlay| overlay.anchor_cell).ok_or_else(|| {
             invalid(
-                "this object has no current overlay position (it's on its own sheet); \
-                 --anchor is required to move it onto a grid",
+                "this object has no current overlay position (a chart can be on its own \
+                 sheet; a slicer is always an overlay, so this would mean a malformed \
+                 read-back); --anchor is required to move it onto a grid",
             )
         })?,
     };
@@ -2237,8 +2247,7 @@ fn build_update_chart_border(
     chart_id: i64,
 ) -> Result<Plan, EmbeddedObjectResult> {
     let EmbeddedObjectVerb::UpdateChartBorder { color, clear, .. } = verb else {
-        unreachable!("build_update_chart_border is only ever called for UpdateChartBorder")
-        // omni-dev: coverage ignore-line reason="build_plan only calls build_update_chart_border after matching verb as EmbeddedObjectVerb::UpdateChartBorder; this else-arm exists only to destructure the already-known variant"
+        unreachable!("only ever called for UpdateChartBorder") // omni-dev: coverage ignore-line reason="build_plan only calls build_update_chart_border after matching verb as EmbeddedObjectVerb::UpdateChartBorder; this else-arm exists only to destructure the already-known variant"
     };
 
     let (sheet, chart) = find_chart_or_refuse(workbook, chart_id)?;
@@ -5266,16 +5275,57 @@ mod tests {
 
     #[test]
     fn move_chart_refuses_an_empty_flag_set() {
-        let verb = move_chart_verb(|_| {});
+        // Clears the fixture's default `sheet` too, so this exercises
+        // `nothing_to_change` in isolation rather than tripping the
+        // `--sheet`-without-`--anchor` check first (see
+        // `move_chart_refuses_a_sheet_flag_with_no_anchor` for that case).
+        let verb = move_chart_verb(|verb| {
+            let EmbeddedObjectVerb::MoveChart { sheet, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+            };
+            *sheet = None;
+        });
         let err = validate_verb(&verb).unwrap_err();
         assert!(err.contains("nothing to change"), "{err}");
     }
 
     #[test]
     fn move_slicer_refuses_an_empty_flag_set() {
-        let verb = move_slicer_verb(|_| {});
+        // Clears the fixture's default `sheet` too, so this exercises
+        // `nothing_to_change` in isolation rather than tripping the
+        // `--sheet`-without-`--anchor` check first.
+        let verb = move_slicer_verb(|verb| {
+            let EmbeddedObjectVerb::MoveSlicer { sheet, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="move_slicer_verb always builds an EmbeddedObjectVerb::MoveSlicer, so this arm can never run"
+            };
+            *sheet = None;
+        });
         let err = validate_verb(&verb).unwrap_err();
         assert!(err.contains("nothing to change"), "{err}");
+    }
+
+    #[test]
+    fn move_chart_refuses_a_sheet_only_move() {
+        // The reordering fix (issue #1837 review): a `--sheet`-only call
+        // must report `--sheet has no effect without --anchor`, not fall
+        // through to the generic `nothing to change` error the old
+        // unordered checks produced for this exact input.
+        let verb = move_chart_verb(|_| {});
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(
+            err.contains("--sheet has no effect without --anchor"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn move_slicer_refuses_a_sheet_only_move() {
+        let verb = move_slicer_verb(|_| {});
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(
+            err.contains("--sheet has no effect without --anchor"),
+            "{err}"
+        );
     }
 
     #[test]
