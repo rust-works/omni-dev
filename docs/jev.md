@@ -497,7 +497,7 @@ summed `usage` — for reading, not scripting. Plain text with no markdown: a
 terminal doesn't render `**bold**`/`*italic*` markers, so they'd just be
 clutter. Each issue is a header line (`ref — title`) followed by one indented
 line per fact, rather than one run-on sentence — which keeps a
-multi-`--providers` issue readable. Its wording is **not** a stable contract
+multi-`--ladders` issue readable. Its wording is **not** a stable contract
 and may change without notice; scripts should keep using `json` or `yaml`.
 
 ```
@@ -508,8 +508,8 @@ rust-works/omni-dev#1641 — Some issue title
 model: jev-1.13.0, usage: 1432 input tokens, 61 output tokens
 ```
 
-Routing against several `--providers` adds one indented line per provider,
-labelled `<provider>: <class> — ...` (a single provider, the common case,
+Routing against several `--ladders` adds one indented line per ladder,
+labelled `<ladder>: <class> — ...` (a single ladder, the common case,
 drops the label, as above). A failed issue's line reads `  failed: <error>`
 instead of a routing. A truncated issue gets a trailing `  input truncated at
 <N> characters` line; an issue with no open citations has no `cites` line.
