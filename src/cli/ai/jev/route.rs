@@ -147,14 +147,28 @@ impl RouteCommand {
             allow_closed: self.allow_closed,
         };
         let report = run_route(&client, &docs, &ladders, &opts, &dependencies).await?;
-        let rendered = match self.output {
-            RouteFormat::Json => format_output(&report, JevFormat::Json)?,
-            RouteFormat::Yaml => format_output(&report, JevFormat::Yaml)?,
-            RouteFormat::Text => render_route_text(&report, self.max_input_chars),
-        };
-        print!("{rendered}");
+        print!(
+            "{}",
+            render_output(&report, self.output, self.max_input_chars)?
+        );
         failure_summary(&report).map_or(Ok(()), |msg| bail!(msg))
     }
+}
+
+/// Renders a routed report in `output`'s format. Split out of
+/// [`RouteCommand::execute`] so the format dispatch is unit-testable without
+/// a Jev client or a `gh` binary — `execute` itself stays an untested thin
+/// shell, per the project's `run_*` convention (STYLE-0025).
+fn render_output(
+    report: &RouteReport,
+    output: RouteFormat,
+    max_input_chars: usize,
+) -> Result<String> {
+    Ok(match output {
+        RouteFormat::Json => format_output(report, JevFormat::Json)?,
+        RouteFormat::Yaml => format_output(report, JevFormat::Yaml)?,
+        RouteFormat::Text => render_route_text(report, max_input_chars),
+    })
 }
 
 /// Resolves `--tiers`/`--providers` to the ladders to route against: a
@@ -455,6 +469,53 @@ mod tests {
         assert_eq!(failure_summary(&report(vec![routed(), routed()])), None);
         let msg = failure_summary(&report(vec![routed(), failed(), routed()])).unwrap();
         assert!(msg.starts_with("1 of 3 issues"), "{msg}");
+    }
+
+    #[test]
+    fn render_output_dispatches_on_format() {
+        use crate::jev::protocol::Usage;
+        use crate::jev::route::{
+            IssueRoute, ProviderRoute, RouteOutcome, StageAnswer, StageAnswers,
+        };
+        let answer = || StageAnswer {
+            choice: "sonnet".to_string(),
+            confidence: 0.9,
+            probabilities: BTreeMap::new(),
+        };
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([(
+                        "anthropic".to_string(),
+                        ProviderRoute {
+                            stages: StageAnswers {
+                                design: answer(),
+                                implement: answer(),
+                                review: answer(),
+                            },
+                            class: "sonnet".to_string(),
+                            close_calls: vec![],
+                        },
+                    )]),
+                    depends_on: vec![],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+
+        let json = render_output(&report, RouteFormat::Json, DEFAULT_MAX_INPUT_CHARS).unwrap();
+        assert!(json.contains("\"model\": \"jev-1.13.0\""), "{json}");
+
+        let yaml = render_output(&report, RouteFormat::Yaml, DEFAULT_MAX_INPUT_CHARS).unwrap();
+        assert!(yaml.contains("model: jev-1.13.0"), "{yaml}");
+
+        let text = render_output(&report, RouteFormat::Text, DEFAULT_MAX_INPUT_CHARS).unwrap();
+        assert!(text.starts_with("o/r#1 — t\n"), "{text}");
     }
 
     // ── fetch_docs (fake-gh shim) ────────────────────────────────────
