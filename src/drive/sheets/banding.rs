@@ -640,8 +640,7 @@ fn build_request(
             ..
         } => {
             let Some(range) = resolved else {
-                // omni-dev: coverage ignore-line reason="resolve_sheet_target always resolves AddBanding to a range or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
-                unreachable!("resolved is resolved for AddBanding above")
+                unreachable!("resolved is resolved for AddBanding above") // omni-dev: coverage ignore-line reason="resolve_sheet_target always resolves AddBanding to a range or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
             };
             let properties = BandingProperties {
                 header_color_style: header_color.as_deref().map(parse_color_style).transpose()?,
@@ -674,8 +673,7 @@ fn build_request(
             ..
         } => {
             let Some(existing) = existing else {
-                // omni-dev: coverage ignore-line reason="find_existing_banded_range returns Some for UpdateBanding or has already returned RefusedBandedRangeNotFound; this else-arm exists only to unwrap the shared Option"
-                unreachable!("existing is resolved for UpdateBanding above")
+                unreachable!("existing is resolved for UpdateBanding above") // omni-dev: coverage ignore-line reason="find_existing_banded_range returns Some for UpdateBanding or has already returned RefusedBandedRangeNotFound; this else-arm exists only to unwrap the shared Option"
             };
             let update = build_update(
                 existing,
@@ -992,6 +990,14 @@ mod tests {
         validate_verb(&verb).unwrap();
     }
 
+    #[test]
+    fn banding_axis_label_and_field_name_cover_both_axes() {
+        assert_eq!(BandingAxis::Rows.label(), "row");
+        assert_eq!(BandingAxis::Columns.label(), "column");
+        assert_eq!(BandingAxis::Rows.field_name(), "rowProperties");
+        assert_eq!(BandingAxis::Columns.field_name(), "columnProperties");
+    }
+
     fn sheet_with_banding(sheet_id: i64, banded_range_id: i64) -> Sheet {
         Sheet {
             banded_ranges: vec![BandedRange {
@@ -1073,7 +1079,7 @@ mod tests {
         let (request, existing_id) = build_request(&verb, Some(range), None).unwrap();
         assert_eq!(existing_id, None);
         let BatchUpdateRequestItem::AddBanding(add) = request else {
-            panic!("expected AddBanding");
+            panic!("expected AddBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns AddBanding for a BandingVerb::AddBanding verb"
         };
         assert_eq!(add.banded_range.banded_range_id, None);
         assert_eq!(add.banded_range.range, Some(range));
@@ -1101,7 +1107,7 @@ mod tests {
         };
         let (request, _) = build_request(&verb, Some(range), None).unwrap();
         let BatchUpdateRequestItem::AddBanding(add) = request else {
-            panic!("expected AddBanding");
+            panic!("expected AddBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns AddBanding for a BandingVerb::AddBanding verb"
         };
         assert!(add.banded_range.row_properties.is_none());
         assert!(add.banded_range.column_properties.is_some());
@@ -1142,7 +1148,7 @@ mod tests {
         let (request, existing_id) = build_request(&verb, None, Some(&existing)).unwrap();
         assert_eq!(existing_id, Some(7));
         let BatchUpdateRequestItem::UpdateBanding(update) = request else {
-            panic!("expected UpdateBanding");
+            panic!("expected UpdateBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
         };
         assert_eq!(update.fields, "rowProperties");
         assert!(update.banded_range.range.is_none());
@@ -1154,6 +1160,53 @@ mod tests {
             properties.first_band_color_style,
             existing.row_properties.unwrap().first_band_color_style
         );
+    }
+
+    #[test]
+    fn build_request_update_banding_changes_every_color_field() {
+        let existing = sheet_with_banding(0, 7).banded_ranges.remove(0);
+        let verb = BandingVerb::UpdateBanding {
+            banded_range_id: 7,
+            sheet: None,
+            range: None,
+            axis: BandingAxis::Rows,
+            header_color: Some("#123456".to_string()),
+            first_band_color: Some("#111111".to_string()),
+            second_band_color: Some("#222222".to_string()),
+            footer_color: Some("#333333".to_string()),
+        };
+        let (request, _) = build_request(&verb, None, Some(&existing)).unwrap();
+        let BatchUpdateRequestItem::UpdateBanding(update) = request else {
+            panic!("expected UpdateBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
+        };
+        assert_eq!(update.fields, "rowProperties");
+        let properties = update.banded_range.row_properties.unwrap();
+        assert!(properties.header_color_style.is_some());
+        assert!(properties.first_band_color_style.is_some());
+        assert!(properties.second_band_color_style.is_some());
+        assert!(properties.footer_color_style.is_some());
+    }
+
+    #[test]
+    fn build_request_update_banding_sets_column_properties_for_the_columns_axis() {
+        let existing = sheet_with_banding(0, 7).banded_ranges.remove(0);
+        let verb = BandingVerb::UpdateBanding {
+            banded_range_id: 7,
+            sheet: None,
+            range: None,
+            axis: BandingAxis::Columns,
+            header_color: Some("#123456".to_string()),
+            first_band_color: None,
+            second_band_color: None,
+            footer_color: None,
+        };
+        let (request, _) = build_request(&verb, None, Some(&existing)).unwrap();
+        let BatchUpdateRequestItem::UpdateBanding(update) = request else {
+            panic!("expected UpdateBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
+        };
+        assert_eq!(update.fields, "columnProperties");
+        assert!(update.banded_range.row_properties.is_none());
+        assert!(update.banded_range.column_properties.is_some());
     }
 
     #[test]
@@ -1178,7 +1231,7 @@ mod tests {
         };
         let (request, _) = build_request(&verb, Some(range), Some(&existing)).unwrap();
         let BatchUpdateRequestItem::UpdateBanding(update) = request else {
-            panic!("expected UpdateBanding");
+            panic!("expected UpdateBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
         };
         assert_eq!(update.fields, "range");
         assert_eq!(update.banded_range.range, Some(range));
@@ -1191,7 +1244,7 @@ mod tests {
         let (request, existing_id) = build_request(&verb, None, None).unwrap();
         assert_eq!(existing_id, Some(7));
         let BatchUpdateRequestItem::DeleteBanding(delete) = request else {
-            panic!("expected DeleteBanding");
+            panic!("expected DeleteBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns DeleteBanding for a BandingVerb::DeleteBanding verb"
         };
         assert_eq!(delete.banded_range_id, 7);
     }
@@ -1567,5 +1620,1071 @@ mod tests {
             }
         );
         assert_eq!(outcome.sheet_id, Some(0));
+    }
+
+    // ── validate_verb/compose_target errors, reached through banding()
+    // rather than by calling the pure helpers directly ─────────────────────
+
+    #[tokio::test]
+    async fn update_banding_end_to_end_refuses_nothing_to_change() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::UpdateBanding {
+                banded_range_id: 1,
+                sheet: None,
+                range: None,
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: None,
+                second_band_color: None,
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            BandingResult::RefusedInvalidRange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_banding_end_to_end_rejects_conflicting_sheet_and_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Other".to_string(),
+                range: "Sheet1!A1:B2".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            BandingResult::RefusedInvalidRange { .. }
+        ));
+    }
+
+    // ── target_gate outcomes other than a granted gate ──────────────────
+
+    #[tokio::test]
+    async fn a_metadata_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, BandingResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_shortcut_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.shortcut",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, BandingResult::RefusedShortcut));
+    }
+
+    #[tokio::test]
+    async fn a_non_spreadsheet_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.document",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            BandingResult::RefusedNotASpreadsheet { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_target_with_no_visible_parents_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", crate::drive::types::GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            BandingResult::RefusedNoVisibleParents
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gate_ancestor_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, BandingResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_workbook_fetch_failure_after_a_granted_gate_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, BandingResult::Failed { .. }));
+    }
+
+    // ── resolve_sheet_target's own error branches, reached through
+    // banding() rather than by calling it directly ─────────────────────
+
+    #[tokio::test]
+    async fn add_banding_reports_sheet_not_found_for_an_unknown_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Missing".to_string(),
+                range: "A1:D10".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            BandingResult::RefusedSheetNotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_banding_reports_invalid_range_for_a_malformed_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Q1".to_string(),
+                range: "not-a-range".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            BandingResult::RefusedInvalidRange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_banding_reports_sheet_not_found_when_re_pointing() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::UpdateBanding {
+                banded_range_id: 7,
+                sheet: Some("Missing".to_string()),
+                range: Some("A1:B2".to_string()),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: None,
+                second_band_color: None,
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            BandingResult::RefusedSheetNotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_banding_reports_invalid_range_for_a_malformed_range_when_re_pointing() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::UpdateBanding {
+                banded_range_id: 7,
+                sheet: Some("Q1".to_string()),
+                range: Some("not-a-range".to_string()),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: None,
+                second_band_color: None,
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            BandingResult::RefusedInvalidRange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_banding_with_a_new_range_succeeds() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {
+                "properties": {"sheetId": 0, "title": "Q1", "index": 0},
+                "bandedRanges": [{
+                    "bandedRangeId": 7,
+                    "range": {"sheetId": 0},
+                    "rowProperties": {
+                        "firstBandColorStyle": {"rgbColor": {"red": 1, "green": 1, "blue": 1}},
+                        "secondBandColorStyle": {"rgbColor": {"red": 0, "green": 0, "blue": 0}},
+                    },
+                }],
+            },
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::UpdateBanding {
+                banded_range_id: 7,
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:B2".to_string()),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: None,
+                second_band_color: None,
+                footer_color: None,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, BandingResult::WouldChange { .. }));
+    }
+
+    // ── build_request's own error branch, reached through banding()
+    // rather than by calling build_request directly ─────────────────────
+
+    #[tokio::test]
+    async fn update_banding_end_to_end_rejects_a_malformed_color() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {
+                "properties": {"sheetId": 0, "title": "Q1", "index": 0},
+                "bandedRanges": [{
+                    "bandedRangeId": 7,
+                    "range": {"sheetId": 0},
+                    "rowProperties": {
+                        "firstBandColorStyle": {"rgbColor": {"red": 1, "green": 1, "blue": 1}},
+                        "secondBandColorStyle": {"rgbColor": {"red": 0, "green": 0, "blue": 0}},
+                    },
+                }],
+            },
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::UpdateBanding {
+                banded_range_id: 7,
+                sheet: None,
+                range: None,
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: Some("not-a-color".to_string()),
+                second_band_color: None,
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            BandingResult::RefusedInvalidRange { .. }
+        ));
+    }
+
+    // ── a real batchUpdate rejection surfaces as Failed ────────────────
+
+    #[tokio::test]
+    async fn a_batch_update_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, BandingResult::Failed { .. }));
+    }
+
+    // ── the Drive write lease (ADR-0080 §9) ────────────────────────────
+
+    #[tokio::test]
+    async fn refuses_without_a_lease_when_the_rule_requires_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, BandingResult::RefusedNoLease));
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: Some("bogus-token".to_string()),
+            ledger_path,
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, BandingResult::RefusedLeaseExpired));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_lease_bound_to_a_different_file() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "some-other-sheet", "1");
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            BandingResult::RefusedLeaseWrongFile
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_stale_lease_when_the_file_has_moved() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::AddBanding {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: "#FFFFFF".to_string(),
+                second_band_color: "#EEEEEE".to_string(),
+                footer_color: None,
+            },
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, BandingResult::RefusedLeaseStale));
+    }
+
+    // ── describe/describe_lines (pure) ──────────────────────────────────
+
+    fn outcome_with(
+        verb: BandingVerb,
+        file_name: Option<&str>,
+        result: BandingResult,
+    ) -> BandingOutcome {
+        BandingOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: file_name.map(str::to_string),
+            resolved_folder_id: None,
+            sheet_id: None,
+            verb,
+            result,
+        }
+    }
+
+    fn add_verb() -> BandingVerb {
+        BandingVerb::AddBanding {
+            sheet: "Q1".to_string(),
+            range: "A1:D10".to_string(),
+            axis: BandingAxis::Rows,
+            header_color: None,
+            first_band_color: "#FFFFFF".to_string(),
+            second_band_color: "#EEEEEE".to_string(),
+            footer_color: None,
+        }
+    }
+
+    fn update_verb() -> BandingVerb {
+        BandingVerb::UpdateBanding {
+            banded_range_id: 7,
+            sheet: None,
+            range: None,
+            axis: BandingAxis::Rows,
+            header_color: Some("#000000".to_string()),
+            first_band_color: None,
+            second_band_color: None,
+            footer_color: None,
+        }
+    }
+
+    fn delete_verb() -> BandingVerb {
+        BandingVerb::DeleteBanding { banded_range_id: 7 }
+    }
+
+    #[test]
+    fn describe_lines_renders_would_change() {
+        let out = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            BandingResult::WouldChange {
+                summary: "add row banding".to_string(),
+            },
+        );
+        assert_eq!(describe(&out), "Would add row banding in 'Budget'");
+    }
+
+    #[test]
+    fn describe_lines_renders_not_a_spreadsheet_with_no_file_name() {
+        let out = outcome_with(
+            add_verb(),
+            None,
+            BandingResult::RefusedNotASpreadsheet {
+                mime_type: "text/plain".to_string(),
+            },
+        );
+        let text = describe(&out);
+        assert!(text.contains("'sheet-1'"), "{text}");
+        assert!(text.contains("add-banding"), "{text}");
+        assert!(text.contains("text/plain"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_shortcut() {
+        let out = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            BandingResult::RefusedShortcut,
+        );
+        let text = describe(&out);
+        assert!(text.contains("shortcut"), "{text}");
+        assert!(text.contains("delete-banding"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_no_visible_parents() {
+        let out = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            BandingResult::RefusedNoVisibleParents,
+        );
+        assert!(describe(&out).contains("sheets-structure"));
+    }
+
+    #[test]
+    fn describe_lines_renders_sheet_not_found_with_and_without_available_titles() {
+        let none = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            BandingResult::RefusedSheetNotFound {
+                title: "Q2".to_string(),
+                available: Vec::new(),
+            },
+        );
+        assert!(describe(&none).contains("Available: none"));
+
+        let some = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            BandingResult::RefusedSheetNotFound {
+                title: "Q2".to_string(),
+                available: vec!["Q1".to_string(), "Q3".to_string()],
+            },
+        );
+        assert!(describe(&some).contains("'Q1', 'Q3'"));
+    }
+
+    #[test]
+    fn describe_lines_renders_invalid_range_and_banded_range_not_found() {
+        let invalid = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            BandingResult::RefusedInvalidRange {
+                detail: "bad range".to_string(),
+            },
+        );
+        assert_eq!(describe(&invalid), "Refused: bad range");
+
+        let not_found = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            BandingResult::RefusedBandedRangeNotFound {
+                banded_range_id: 99,
+            },
+        );
+        let text = describe(&not_found);
+        assert!(text.contains("no banded range with id 99"), "{text}");
+        assert!(text.contains("list-bandings"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_blocked_with_and_without_a_deciding_rule() {
+        let folder_rule = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            BandingResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 2,
+                }),
+            },
+        );
+        let text = describe(&folder_rule);
+        assert!(text.contains("update-banding"), "{text}");
+        assert!(text.contains("folder folder-1 (depth 2)"), "{text}");
+
+        let default_policy = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            BandingResult::Blocked { decided_by: None },
+        );
+        assert!(describe(&default_policy).contains("default policy"));
+    }
+
+    #[test]
+    fn describe_lines_renders_every_lease_refusal() {
+        for (result, needle) in [
+            (
+                BandingResult::RefusedNoLease,
+                "requires a Drive write lease",
+            ),
+            (
+                BandingResult::RefusedLeaseExpired,
+                "expired, released, or unknown",
+            ),
+            (
+                BandingResult::RefusedLeaseWrongFile,
+                "acquired for a different file",
+            ),
+            (
+                BandingResult::RefusedLeaseStale,
+                "changed since the lease was acquired",
+            ),
+        ] {
+            let out = outcome_with(add_verb(), Some("Budget"), result);
+            let text = describe(&out);
+            assert!(text.contains(needle), "{text}");
+            assert!(text.contains("drive lease acquire sheet-1"), "{text}");
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_changed_with_and_without_an_id() {
+        let with_id = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            BandingResult::Changed {
+                summary: "add row banding".to_string(),
+                banded_range_id: Some(42),
+            },
+        );
+        assert!(describe(&with_id).contains("(id 42)"));
+
+        let without_id = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            BandingResult::Changed {
+                summary: "update row banding id 7".to_string(),
+                banded_range_id: None,
+            },
+        );
+        let text = describe(&without_id);
+        assert!(!text.contains("(id"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_failed() {
+        let out = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            BandingResult::Failed {
+                detail: "boom".to_string(),
+            },
+        );
+        assert_eq!(describe(&out), "Failed: boom");
+    }
+
+    // ── write_jsonl / log_status ─────────────────────────────────────────
+
+    #[test]
+    fn write_jsonl_emits_one_line_of_json() {
+        let outcome = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            BandingResult::Changed {
+                summary: "add row banding".to_string(),
+                banded_range_id: Some(1),
+            },
+        );
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(parsed["result"]["status"], "changed");
+    }
+
+    #[test]
+    fn banding_result_log_status_names_every_variant() {
+        assert_eq!(
+            BandingResult::WouldChange {
+                summary: String::new(),
+            }
+            .log_status(),
+            "would-change"
+        );
+        assert_eq!(
+            BandingResult::RefusedNotASpreadsheet {
+                mime_type: String::new(),
+            }
+            .log_status(),
+            "refused-not-a-spreadsheet"
+        );
+        assert_eq!(
+            BandingResult::RefusedShortcut.log_status(),
+            "refused-shortcut"
+        );
+        assert_eq!(
+            BandingResult::RefusedNoVisibleParents.log_status(),
+            "refused-no-visible-parents"
+        );
+        assert_eq!(
+            BandingResult::RefusedSheetNotFound {
+                title: String::new(),
+                available: Vec::new(),
+            }
+            .log_status(),
+            "refused-sheet-not-found"
+        );
+        assert_eq!(
+            BandingResult::RefusedInvalidRange {
+                detail: String::new(),
+            }
+            .log_status(),
+            "refused-invalid-range"
+        );
+        assert_eq!(
+            BandingResult::RefusedBandedRangeNotFound { banded_range_id: 1 }.log_status(),
+            "refused-banded-range-not-found"
+        );
+        assert_eq!(
+            BandingResult::Blocked { decided_by: None }.log_status(),
+            "blocked"
+        );
+        assert_eq!(
+            BandingResult::RefusedNoLease.log_status(),
+            LeaseGateRefusal::NoLease.log_status()
+        );
+        assert_eq!(
+            BandingResult::RefusedLeaseExpired.log_status(),
+            LeaseGateRefusal::Expired.log_status()
+        );
+        assert_eq!(
+            BandingResult::RefusedLeaseWrongFile.log_status(),
+            LeaseGateRefusal::WrongFile.log_status()
+        );
+        assert_eq!(
+            BandingResult::RefusedLeaseStale.log_status(),
+            LeaseGateRefusal::Stale.log_status()
+        );
+        assert_eq!(
+            BandingResult::Changed {
+                summary: String::new(),
+                banded_range_id: None,
+            }
+            .log_status(),
+            "changed"
+        );
+        assert_eq!(
+            BandingResult::Failed {
+                detail: String::new(),
+            }
+            .log_status(),
+            "failed"
+        );
     }
 }

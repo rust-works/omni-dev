@@ -315,3 +315,239 @@ async fn run_banding(
     println!("{}", lines.join("\n"));
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::utils::secret::Secret;
+
+    #[test]
+    fn banding_axis_arg_converts_to_the_matching_banding_axis() {
+        assert_eq!(BandingAxis::from(BandingAxisArg::Rows), BandingAxis::Rows);
+        assert_eq!(
+            BandingAxis::from(BandingAxisArg::Columns),
+            BandingAxis::Columns
+        );
+    }
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    async fn client_with_bootstrapped_token(server: &wiremock::MockServer) -> DriveClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token",
+                    "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+
+        let mut client = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    #[tokio::test]
+    async fn list_bandings_prints_every_banded_range() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{
+                        "properties": {"sheetId": 0, "title": "Sheet1"},
+                        "bandedRanges": [
+                            {
+                                "bandedRangeId": 1,
+                                "range": {
+                                    "sheetId": 0,
+                                    "startRowIndex": 0,
+                                    "endRowIndex": 5,
+                                    "startColumnIndex": 0,
+                                    "endColumnIndex": 2,
+                                },
+                                "rowProperties": {
+                                    "firstBandColorStyle": {"rgbColor": {"red": 1, "green": 1, "blue": 1}},
+                                    "secondBandColorStyle": {"rgbColor": {"red": 0, "green": 0, "blue": 0}},
+                                },
+                            },
+                            {
+                                "bandedRangeId": 2,
+                                "columnProperties": {
+                                    "firstBandColorStyle": {"rgbColor": {"red": 1, "green": 1, "blue": 1}},
+                                    "secondBandColorStyle": {"rgbColor": {"red": 0, "green": 0, "blue": 0}},
+                                },
+                            },
+                        ],
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListBandingsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_bandings_yaml_output_short_circuits_before_printing_lines() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1"}}],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListBandingsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: crate::cli::drive::format::OutputFormat::Yaml,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    /// Mounts a Drive-file/parent-folder pair with no write-permission rules
+    /// configured (`active_account_rules()` reads an unconfigured account —
+    /// see `client_with_bootstrapped_token`'s `EnvGuard::clear_credentials`
+    /// caller), so the gate refuses by default policy. That's enough to
+    /// drive `Add`/`Update`/`DeleteBandingCommand::execute` (and thus
+    /// `run_banding`) through their full CLI-level path — building
+    /// `BandingOptions`, calling `banding`, and rendering the
+    /// `describe_lines` output — without needing a lease or a workbook
+    /// fetch, which a `Blocked` verdict never reaches.
+    async fn mount_ungated_target(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1",
+                    "name": "Budget",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": ["folder-1"],
+                })),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1",
+                    "name": "folder-1",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [],
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn add_banding_command_runs_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let cmd = AddBandingCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: "Q1".to_string(),
+            range: "A1:D10".to_string(),
+            axis: BandingAxisArg::Rows,
+            header_color: None,
+            first_band_color: "#FFFFFF".to_string(),
+            second_band_color: "#EEEEEE".to_string(),
+            footer_color: None,
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_banding_command_runs_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let cmd = UpdateBandingCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            banded_range_id: 7,
+            sheet: None,
+            range: None,
+            axis: BandingAxisArg::Rows,
+            header_color: Some("#000000".to_string()),
+            first_band_color: None,
+            second_band_color: None,
+            footer_color: None,
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Yaml,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_banding_command_runs_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let cmd = DeleteBandingCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            banded_range_id: 7,
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+}
