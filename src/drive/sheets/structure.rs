@@ -1572,7 +1572,9 @@ fn build_request(
                 // `validate_verb_args` already refuses this before
                 // `build_request` is ever reached; this is an unreachable
                 // defensive fallback, not a real path.
+                // omni-dev: coverage ignore reason="validate_verb_args refuses an UpdateSheetProperties verb that set none of its six properties before structure_inner ever reaches build_request, and every one of those six pushes a fields entry, so fields is never empty here"
                 return Err("update-sheet-properties: no property was set".to_string());
+                // omni-dev: coverage end
             }
             Ok(BatchUpdateRequestItem::UpdateSheetProperties(
                 UpdateSheetPropertiesRequest {
@@ -5165,6 +5167,39 @@ mod tests {
             )
     }
 
+    /// A `spreadsheets.get` reply like [`mount_workbook`], but `Q2` already
+    /// carries the three view properties whose "before" value is read off
+    /// the snapshot rather than off `gridProperties.rowCount` —
+    /// `frozenColumnCount`, `rightToLeft` and `hideGridlines`. Without a
+    /// fixture that reports them, every fragment
+    /// [`update_sheet_properties_fragments`] builds for them falls to the
+    /// `before: None` shape, so the `"<label> <before> -> <after>"` half of
+    /// the description would never be exercised for anything but frozen
+    /// rows (issue #1835).
+    fn mount_workbook_with_view_state() -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {"properties": {
+                            "sheetId": 0, "title": "Q1", "index": 0,
+                            "gridProperties": {"rowCount": 1000, "columnCount": 26}}},
+                        {"properties": {
+                            "sheetId": 118_293, "title": "Q2", "index": 1,
+                            "rightToLeft": true,
+                            "gridProperties": {
+                                "rowCount": 500, "columnCount": 10,
+                                "frozenColumnCount": 2,
+                                "hideGridlines": true,
+                            }}}
+                    ],
+                })),
+            )
+    }
+
     #[tokio::test]
     async fn update_sheet_properties_apply_sends_only_the_set_fields_in_the_mask() {
         let server = wiremock::MockServer::start().await;
@@ -5282,6 +5317,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_sheet_properties_apply_sends_every_property_and_reports_each_one() {
+        // The companion of
+        // `update_sheet_properties_apply_sends_only_the_set_fields_in_the_mask`,
+        // which sets two properties: this one sets all five, so every
+        // `fields` entry and every description fragment is exercised, and
+        // the mask's order is pinned against the order `build_request`
+        // pushes them in. `mount_workbook`'s Q2 reports none of the three
+        // optional view properties, so this is also the run where each
+        // fragment takes its `before: None` shape ("<label> -> <after>").
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        // A bare hex, so the reported text also pins that the display
+        // normalization supplies the '#' the user didn't type.
+        let verb = update_sheet_properties(
+            Some(2),
+            Some(3),
+            Some("0000FF"),
+            false,
+            Some(true),
+            Some(true),
+        );
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, StructureResult::Changed { .. }),
+            "{:?}",
+            outcome.result
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        let update = &body["requests"][0]["updateSheetProperties"];
+        assert_eq!(
+            update["fields"],
+            "gridProperties.frozenRowCount,gridProperties.frozenColumnCount,\
+             gridProperties.hideGridlines,tabColorStyle,rightToLeft"
+        );
+        let grid = &update["properties"]["gridProperties"];
+        assert_eq!(grid["frozenRowCount"], 2);
+        assert_eq!(grid["frozenColumnCount"], 3);
+        assert_eq!(grid["hideGridlines"], true);
+        assert_eq!(update["properties"]["rightToLeft"], true);
+
+        let text = describe(&outcome);
+        assert!(text.starts_with("Updated sheet 'Q2'"), "{text}");
+        for fragment in [
+            "frozen rows -> 2",
+            "frozen columns -> 3",
+            "tab color -> #0000FF",
+            "right-to-left -> true",
+            "gridlines -> hidden",
+        ] {
+            assert!(text.contains(fragment), "{fragment} missing from {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_dry_run_reports_clears_and_the_values_being_replaced() {
+        // The other half of
+        // `update_sheet_properties_apply_sends_every_property_and_reports_each_one`:
+        // the sheet already carries `frozenColumnCount`/`rightToLeft`/
+        // `hideGridlines`, so each fragment takes its
+        // "<label> <before> -> <after>" shape, gridlines read as
+        // hidden/shown rather than as booleans, and `--clear-tab-color`
+        // states the clear instead of a target color. Frozen rows are left
+        // unset, which is the only run where that property contributes no
+        // fragment at all.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook_with_view_state().mount(&server).await;
+        let verb = update_sheet_properties(None, Some(4), None, true, Some(false), Some(false));
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let text = describe(&outcome);
+        assert!(text.starts_with("Would update sheet 'Q2'"), "{text}");
+        assert!(!text.contains("frozen rows"), "{text}");
+        for fragment in [
+            "frozen columns 2 -> 4",
+            "tab color cleared",
+            "right-to-left true -> false",
+            "gridlines hidden -> shown",
+        ] {
+            assert!(text.contains(fragment), "{fragment} missing from {text}");
+        }
+    }
+
+    #[test]
+    fn fields_changed_label_names_exactly_the_properties_the_verb_set() {
+        // `record_attempt` logs what the verb *asked* to change, so this is
+        // what lands in the request log's `fields_changed` context key for
+        // an `update-sheet-properties` attempt — including a refused one.
+        let every = update_sheet_properties(
+            Some(2),
+            Some(3),
+            Some("#FF8800"),
+            false,
+            Some(true),
+            Some(false),
+        );
+        assert_eq!(
+            fields_changed_label(&every).as_deref(),
+            Some(
+                "frozenRowCount=2, frozenColumnCount=3, hideGridlines=false, \
+                 tabColorStyle=#FF8800, rightToLeft=true"
+            )
+        );
+        // A clear is a property change with no value, so it says so rather
+        // than reporting a hex nobody asked for.
+        let cleared = update_sheet_properties(None, None, None, true, None, None);
+        assert_eq!(
+            fields_changed_label(&cleared).as_deref(),
+            Some("tabColorStyle=cleared")
+        );
+        // The shape `update_sheet_properties_refuses_when_nothing_is_set`
+        // logs: refused before any property was set, so there is nothing to
+        // name and the key is omitted rather than written empty.
+        let empty = update_sheet_properties(None, None, None, false, None, None);
+        assert_eq!(fields_changed_label(&empty), None);
+        // Every other verb has no `fields_changed` at all.
+        assert_eq!(fields_changed_label(&rename()), None);
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_refuses_a_tab_color_and_a_clear_together() {
+        // The CLI's `clap::ArgGroup` already makes these two mutually
+        // exclusive, but `StructureVerb` is also reachable from a
+        // non-CLI caller, so the engine refuses the combination itself
+        // rather than silently letting the color win.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = update_sheet_properties(None, None, Some("#FF8800"), true, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; validate_verb_args always refuses --tab-color with --clear-tab-color as RefusedInvalidRange"
+        };
+        assert!(detail.contains("mutually exclusive"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_names_its_own_subcommand_in_a_refusal() {
+        // `label()` exists so a refusal names the command the user typed;
+        // the `not a Google Sheet` refusal is the shortest path to it, and
+        // nothing else in this module renders the verb's own name.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", "application/pdf", &["parent-1"])
+            .mount(&server)
+            .await;
+        let verb = update_sheet_properties(Some(2), None, None, false, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            StructureResult::RefusedNotASpreadsheet { .. }
+        ));
+        let text = describe(&outcome);
+        assert!(
+            text.contains("drive sheets update-sheet-properties"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
     async fn update_sheet_properties_refuses_a_negative_freeze_count() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
@@ -5299,7 +5539,7 @@ mod tests {
         )
         .await;
         let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; check_freeze_bound always refuses a negative --freeze-rows as RefusedInvalidRange"
         };
         assert!(
             detail.contains("--freeze-rows must be at least 0"),
@@ -5327,7 +5567,7 @@ mod tests {
         )
         .await;
         let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; check_freeze_bound always refuses a --freeze-rows at or above the sheet's known row count as RefusedInvalidRange"
         };
         assert!(detail.contains("would freeze every row"), "{detail}");
     }
@@ -5367,6 +5607,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_sheet_properties_invents_no_freeze_ceiling_when_the_count_is_unknown() {
+        // The other side of `check_freeze_bound`'s `Option`: a sheet with
+        // no `gridProperties` at all — which is what Sheets reports for a
+        // non-grid (`OBJECT`, full-page chart) sheet — leaves
+        // `row_count`/`column_count` unknown. With no count to compare
+        // against there is no ceiling to enforce, so the request goes
+        // through and Sheets stays the authority on whether it is legal,
+        // rather than omni-dev guessing a bound (ADR-0073 §7).
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {"properties": {"sheetId": 118_293, "title": "Q2", "index": 0}}
+                    ],
+                })),
+            )
+            .mount(&server)
+            .await;
+        let verb = update_sheet_properties(Some(9_000), Some(9_000), None, false, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, StructureResult::WouldChange { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
     async fn update_sheet_properties_refuses_a_negative_freeze_column_count() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
@@ -5384,7 +5667,7 @@ mod tests {
         )
         .await;
         let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; check_freeze_bound always refuses a negative --freeze-columns as RefusedInvalidRange"
         };
         assert!(
             detail.contains("--freeze-columns must be at least 0"),
@@ -5411,7 +5694,7 @@ mod tests {
         )
         .await;
         let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; check_freeze_bound always refuses a --freeze-columns at or above the sheet's known column count as RefusedInvalidRange"
         };
         assert!(detail.contains("would freeze every column"), "{detail}");
     }
@@ -5457,7 +5740,7 @@ mod tests {
         )
         .await;
         let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; validate_verb_args always refuses an update-sheet-properties verb that set no property as RefusedInvalidRange"
         };
         assert!(detail.contains("at least one"), "{detail}");
     }
