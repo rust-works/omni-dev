@@ -28,7 +28,7 @@
 //! prefix here.
 
 use crate::drive::sheets::a1;
-use crate::drive::sheets::types::{GridRange, Spreadsheet};
+use crate::drive::sheets::types::{GridRange, Sheet, Spreadsheet};
 
 /// What one `:`-delimited token names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,11 +104,19 @@ pub(crate) fn find_sheet_id<E>(
 /// list verb (e.g. `list-named-ranges`) that renders a workbook-scoped
 /// object's `sheetId` back into a human-readable title.
 pub(crate) fn sheet_title_by_id(workbook: &Spreadsheet, sheet_id: i64) -> Option<String> {
+    find_sheet_by_id(workbook, sheet_id).map(|sheet| sheet.title().to_string())
+}
+
+/// A workbook's sheet by its numeric id, or `None` if it carries none with
+/// that id. The `&Sheet` counterpart to [`sheet_title_by_id`], for a caller
+/// that needs more than the title (e.g. `embedded_object.rs`'s `move-chart`/
+/// `move-slicer`, which renders a destination anchor via
+/// `describe_overlay_position(sheet, ..)`, issue #1837).
+pub(crate) fn find_sheet_by_id(workbook: &Spreadsheet, sheet_id: i64) -> Option<&Sheet> {
     workbook
         .sheets
         .iter()
         .find(|sheet| sheet.sheet_id() == Some(sheet_id))
-        .map(|sheet| sheet.title().to_string())
 }
 
 /// Renders a numeric [`GridRange`] as a compact 1-based description for a
@@ -490,6 +498,13 @@ mod tests {
         let workbook = workbook_with_sheet(3, "Q1");
         assert_eq!(sheet_title_by_id(&workbook, 3), Some("Q1".to_string()));
         assert_eq!(sheet_title_by_id(&workbook, 99), None);
+    }
+
+    #[test]
+    fn find_sheet_by_id_finds_the_matching_sheet() {
+        let workbook = workbook_with_sheet(3, "Q1");
+        assert_eq!(find_sheet_by_id(&workbook, 3).map(Sheet::title), Some("Q1"));
+        assert!(find_sheet_by_id(&workbook, 99).is_none());
     }
 
     #[test]

@@ -454,6 +454,20 @@ pub(super) fn normalize_hex_for_display(input: &str) -> String {
     format!("#{}", input.strip_prefix('#').unwrap_or(input))
 }
 
+/// Renders a [`crate::drive::sheets::types::Color`] back to `#RRGGBB`, for
+/// display only — the inverse of [`parse_hex_color`]'s 0.0-1.0-per-channel
+/// scale. Used to report a chart's *existing* border colour in a preview
+/// (issue #1837), which the API returns as a `Color`, never as a hex string.
+pub(super) fn format_hex_color(color: crate::drive::sheets::types::Color) -> String {
+    let channel = |v: f32| -> u8 { (v.clamp(0.0, 1.0) * 255.0).round() as u8 };
+    format!(
+        "#{:02X}{:02X}{:02X}",
+        channel(color.red),
+        channel(color.green),
+        channel(color.blue)
+    )
+}
+
 /// Converts a padding value to the wire's `i32`, rejecting anything that
 /// doesn't fit or is negative — a pixel padding can be neither.
 fn to_padding_i32(value: i64, flag: &str) -> Result<i32, String> {
@@ -1612,6 +1626,14 @@ mod tests {
         // is not a trim, so a doubled prefix keeps its second `#`.
         assert_eq!(normalize_hex_for_display("##FF8800"), "##FF8800");
         assert_eq!(normalize_hex_for_display(""), "#");
+    }
+
+    #[test]
+    fn format_hex_color_round_trips_parse_hex_color() {
+        for hex in ["#FF8800", "#000000", "#FFFFFF", "#4A86E8"] {
+            let color = parse_hex_color(hex).unwrap();
+            assert_eq!(format_hex_color(color), hex);
+        }
     }
 
     #[test]

@@ -605,8 +605,8 @@ pub struct MoveChartCommand {
     pub chart_id: i64,
 
     /// Sheet title, supplying the prefix for `--anchor` when it doesn't
-    /// carry its own.
-    #[arg(long, value_name = "NAME")]
+    /// carry its own. Has no effect without `--anchor`.
+    #[arg(long, value_name = "NAME", requires = "anchor")]
     pub sheet: Option<String>,
 
     /// The new anchor cell, e.g. `F2`. Required to move a chart that
@@ -685,8 +685,8 @@ pub struct MoveSlicerCommand {
     pub slicer_id: i64,
 
     /// Sheet title, supplying the prefix for `--anchor` when it doesn't
-    /// carry its own.
-    #[arg(long, value_name = "NAME")]
+    /// carry its own. Has no effect without `--anchor`.
+    #[arg(long, value_name = "NAME", requires = "anchor")]
     pub sheet: Option<String>,
 
     /// The new anchor cell, e.g. `F2`.

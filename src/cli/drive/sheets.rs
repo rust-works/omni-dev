@@ -276,11 +276,11 @@ pub enum SheetsSubcommands {
     /// operation (issue #1837, ADR-0081 §3) — the same operation as
     /// `add-chart`'s own placement, since a move discards no data.
     MoveChart(embedded_object::MoveChartCommand),
-    /// Moves and/or resizes an existing slicer. Same gate as
-    /// [`Self::MoveChart`] (issue #1837, ADR-0081 §3).
+    /// Moves and/or resizes an existing slicer. Same gate as `move-chart`
+    /// (issue #1837, ADR-0081 §3).
     MoveSlicer(embedded_object::MoveSlicerCommand),
     /// Sets or clears an existing chart's border colour
-    /// (`updateEmbeddedObjectBorder`). Same gate as [`Self::MoveChart`]
+    /// (`updateEmbeddedObjectBorder`). Same gate as `move-chart`
     /// (issue #1837, ADR-0081 §3). Charts only — a slicer has no border.
     UpdateChartBorder(embedded_object::UpdateChartBorderCommand),
     /// Writes a new pivot table at an anchor cell. Gated by **both** the
