@@ -567,6 +567,10 @@ pub struct ClearValuesResponse {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum BatchUpdateRequestItem {
+    /// Find and replace cell text (`find-replace`, issue #1841). Gated by
+    /// `DriveOperation::SheetsWrite`; [`FindReplaceRequest::scope`] makes
+    /// an unscoped request unrepresentable.
+    FindReplace(FindReplaceRequest),
     /// Add a new sheet to the workbook.
     AddSheet(AddSheetRequest),
     /// Change an existing sheet's properties — title (rename), index
@@ -3101,6 +3105,59 @@ pub struct SourceAndDestination {
     pub fill_length: i64,
 }
 
+/// A typed `findReplace` request. The scope is an enum so callers cannot
+/// serialise the API's invalid no-scope or multiple-scope shapes.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FindReplaceRequest {
+    pub find: String,
+    pub replacement: String,
+    #[serde(rename = "matchCase")]
+    pub match_case: bool,
+    #[serde(rename = "matchEntireCell")]
+    pub match_entire_cell: bool,
+    #[serde(rename = "searchByRegex")]
+    pub search_by_regex: bool,
+    #[serde(rename = "includeFormulas")]
+    pub include_formulas: bool,
+    #[serde(flatten)]
+    pub scope: FindReplaceScope,
+}
+
+/// Exactly one `findReplace` scope.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum FindReplaceScope {
+    Range {
+        range: GridRange,
+    },
+    Sheet {
+        #[serde(rename = "sheetId")]
+        sheet_id: i64,
+    },
+    AllSheets {
+        #[serde(rename = "allSheets")]
+        all_sheets: bool,
+    },
+}
+
+/// The `findReplace` reply's exact server counts.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct FindReplaceResponse {
+    #[serde(default, rename = "valuesChanged")]
+    pub values_changed: i64,
+    #[serde(default, rename = "formulasChanged")]
+    pub formulas_changed: i64,
+    #[serde(default, rename = "rowsChanged")]
+    pub rows_changed: i64,
+    #[serde(default, rename = "sheetsChanged")]
+    pub sheets_changed: i64,
+    #[serde(default, rename = "occurrencesChanged")]
+    pub occurrences_changed: i64,
+}
+
 /// Response to `spreadsheets.batchUpdate`.
 ///
 /// Only `replies` is modelled, and only the `addSheet` arm of it: the new
@@ -3124,6 +3181,9 @@ pub struct BatchUpdateResponse {
 /// same reason [`Spreadsheet`] lost `Eq` in #1793.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct BatchUpdateReply {
+    /// Present only for a `findReplace` request (issue #1841).
+    #[serde(default, rename = "findReplace")]
+    pub find_replace: Option<FindReplaceResponse>,
     /// Present only for an `addSheet` request.
     #[serde(default, rename = "addSheet")]
     pub add_sheet: Option<AddSheetReply>,
@@ -3923,5 +3983,39 @@ mod tests {
         assert_eq!(parsed.updated_cells, None);
         let parsed: AppendValuesResponse = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(parsed.updates.is_none());
+    }
+
+    #[test]
+    fn find_replace_request_serializes_exactly_one_scope_and_reply_counts() {
+        let request = BatchUpdateRequestItem::FindReplace(FindReplaceRequest {
+            find: "draft".to_string(),
+            replacement: "final".to_string(),
+            match_case: true,
+            match_entire_cell: false,
+            search_by_regex: false,
+            include_formulas: true,
+            scope: FindReplaceScope::Sheet { sheet_id: 0 },
+        });
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"findReplace": {
+                "find": "draft", "replacement": "final", "matchCase": true,
+                "matchEntireCell": false, "searchByRegex": false,
+                "includeFormulas": true, "sheetId": 0,
+            }})
+        );
+        let response: BatchUpdateResponse = serde_json::from_value(serde_json::json!({
+            "replies": [{"findReplace": {"valuesChanged": 2, "formulasChanged": 3,
+                "rowsChanged": 4, "sheetsChanged": 5, "occurrencesChanged": 6}}]
+        }))
+        .unwrap();
+        assert_eq!(
+            response.replies[0]
+                .find_replace
+                .as_ref()
+                .unwrap()
+                .occurrences_changed,
+            6
+        );
     }
 }

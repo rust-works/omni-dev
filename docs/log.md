@@ -61,7 +61,8 @@ types, so the log is a complete invocation history, not just an HTTP history:
   Cell writes through the Sheets API (issue
   [#1589](https://github.com/rust-works/omni-dev/issues/1589),
   [ADR-0073](adrs/adr-0073.md)) use this same kind, with `operation` of
-  `sheets-write`/`sheets-append`/`sheets-clear`/`sheets-create` — so
+  `sheets-write`/`sheets-append`/`sheets-clear`/`sheets-create`/
+  `sheets-find-replace` — so
   `command` reads `["drive", "sheets-write"]` even though the CLI spells it
   `drive sheets write`. They add five more omit-if-absent context keys:
   `range` (the A1 range as composed and sent), and `updated_range`,
@@ -70,6 +71,11 @@ types, so the log is a complete invocation history, not just an HTTP history:
   resolves an open-ended range against the sheet's real extent — which is
   what makes `omni-dev log --query kind:drivemutation` able to answer "how
   much did that write touch", not just "a write happened".
+
+  `sheets-find-replace` also records `occurrences_changed` and a compact
+  scope/count summary. Its `--find` and `--replacement` values are document
+  content and are redacted from the invocation log and absent from mutation
+  records.
 
   Structural edits (issue
   [#1613](https://github.com/rust-works/omni-dev/issues/1613),

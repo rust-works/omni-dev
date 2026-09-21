@@ -112,6 +112,12 @@ pub enum DriveOperation {
     /// live-verification rule — if a fill is found to carry the source
     /// cells' formatting, `auto-fill` moves to the two-operation
     /// composition `add-pivot-table` uses, alongside [`Self::SheetsStructure`].
+    ///
+    /// Since issue #1841 ([ADR-0083](../../docs/adrs/adr-0083.md) §1), also
+    /// required for `find-replace`. Its range, sheet and all-sheets scopes
+    /// replace only cell values or formulas, already covered by `sheets
+    /// write` and `sheets clear`; scope does not create a new permission
+    /// boundary within a spreadsheet.
     SheetsWrite,
     /// Structurally edit an existing Google Sheet via `spreadsheets.batchUpdate`
     /// (issue #1613, [ADR-0075](../../docs/adrs/adr-0075.md) §1) — adding,

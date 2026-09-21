@@ -627,7 +627,7 @@ operation anywhere in a target's ancestor chain:
 | `create`            | deny    | `create`, `sheets create` |
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
 | `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
@@ -1713,6 +1713,30 @@ Would write: 10 row(s) x 2 column(s) into A1:B10 of '2026 Budget'
 
 A dry run makes no Sheets API call and writes no request-log record, matching
 `create`/`upload`/`edit`.
+
+#### `drive sheets find-replace`
+
+`find-replace` is also gated by `sheets-write` ([ADR-0083](adrs/adr-0083.md)
+§1). It requires `--find`, `--replacement`, and exactly one scope: `--range`,
+`--whole-sheet --sheet`, or `--all-sheets`.
+
+```bash
+# Replace in one range; an empty replacement removes matches.
+omni-dev drive sheets find-replace <ID> --range 'Q1!A2:B100' \
+  --find 'draft' --replacement 'final'
+
+# Search every sheet, including formulas, with Java-regex syntax.
+omni-dev drive sheets find-replace <ID> --all-sheets --search-by-regex \
+  --include-formulas --find 'FY([0-9]+)' --replacement '202$1'
+```
+
+`--match-case`, `--match-entire-cell`, `--search-by-regex`, and
+`--include-formulas` map directly to the Sheets request. Formula inclusion
+adds formula cells to the search; Sheets has no formulas-only mode. A dry run
+reports the resolved scope and modifiers without reading cells or estimating
+matches, because Sheets determines matching semantics and counts. A real run
+reports values, formulas, rows, sheets, and occurrences changed; one cell can
+contain several changed occurrences.
 
 **`--values`** takes a file path or `-` for stdin. CSV by default; JSON (an
 array of arrays) when the path ends in `.json` or `--values-format json` is
