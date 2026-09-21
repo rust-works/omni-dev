@@ -762,6 +762,19 @@ mod tests {
             output: OutputFormat::Table,
         };
         assert!(cmd.execute(&client).await.is_ok());
+
+        // `-o json` takes `run_embedded_object`'s serialize-and-return
+        // branch instead of the `describe_lines` table — shared by every
+        // add/update/delete chart and slicer leaf, so exercising it once
+        // here covers it for all six.
+        let cmd = DeleteChartCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            chart_id: 1,
+            dry_run: false,
+            lease: lease_arg(),
+            output: OutputFormat::Json,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
     }
 
     #[tokio::test]
@@ -801,6 +814,14 @@ mod tests {
         let cmd = ListChartsCommand {
             spreadsheet_id: "sheet-1".to_string(),
             output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+
+        // `-o json` serializes the whole workbook and returns early,
+        // skipping the per-chart summary lines above.
+        let cmd = ListChartsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: OutputFormat::Json,
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -916,6 +937,14 @@ mod tests {
         let cmd = ListSlicersCommand {
             spreadsheet_id: "sheet-1".to_string(),
             output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+
+        // `-o json` serializes the whole workbook and returns early,
+        // skipping the per-slicer summary lines above.
+        let cmd = ListSlicersCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: OutputFormat::Json,
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
