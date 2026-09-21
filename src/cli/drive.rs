@@ -788,6 +788,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_sheets_move_chart() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::MoveChart(
+                sheets::embedded_object::MoveChartCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    chart_id: 1,
+                    sheet: None,
+                    anchor: Some("F2".to_string()),
+                    offset_x: None,
+                    offset_y: None,
+                    width: None,
+                    height: None,
+                    new_sheet: false,
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_move_slicer() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::MoveSlicer(
+                sheets::embedded_object::MoveSlicerCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    slicer_id: 1,
+                    sheet: None,
+                    anchor: Some("F2".to_string()),
+                    offset_x: None,
+                    offset_y: None,
+                    width: None,
+                    height: None,
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_sheets_delete_sheet() {
         let guard = crate::drive::test_support::EnvGuard::take();
         guard.redirect_api_hosts_to_a_dead_port();

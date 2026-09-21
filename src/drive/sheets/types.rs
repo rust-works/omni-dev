@@ -719,6 +719,12 @@ pub enum BatchUpdateRequestItem {
     /// is why `embedded_object.rs` reads back and reports the object's
     /// spec before ever sending this.
     DeleteEmbeddedObject(DeleteEmbeddedObjectRequest),
+    /// Move and/or resize an existing chart or slicer (`move-chart`/
+    /// `move-slicer`). Gated by `DriveOperation::SheetsStructure` (issue
+    /// #1837, [ADR-0081](../../../docs/adrs/adr-0081.md) §3) — the same
+    /// operation as `add-chart`/`add-slicer`'s own placement, since a move
+    /// discards no data.
+    UpdateEmbeddedObjectPosition(UpdateEmbeddedObjectPositionRequest),
     /// Write a pivot table into (`add-pivot-table`) or clear one from
     /// (`delete-pivot-table`) a single anchor cell. The crate's only
     /// `updateCells` request — issue #1643's "`updateCells` stays unused"
@@ -2337,6 +2343,34 @@ pub struct DeleteEmbeddedObjectRequest {
     /// Which chart or slicer to remove.
     #[serde(rename = "objectId")]
     pub object_id: i64,
+}
+
+/// `UpdateEmbeddedObjectPositionRequest` — moves and/or resizes an existing
+/// chart or slicer (`move-chart`/`move-slicer`, issue #1837).
+///
+/// **The `fields` mask is rooted at `newPosition.overlayPosition`, not at
+/// `newPosition`** — the API's own rule ("the root `newPosition.overlayPosition`
+/// is implied and should not be specified"), and the one place this request
+/// differs from every other masked request in this file, where the mask is
+/// rooted at the request's own payload field (cf. [`UpdateSlicerSpecRequest`],
+/// whose mask is rooted at `spec`). So a move sends `anchorCell`, never
+/// `overlayPosition.anchorCell`. The mask is used **only** when
+/// `new_position.overlay_position` is set — a `newSheet` move sends no
+/// `fields` at all (`skip_serializing_if = "String::is_empty"`), since there
+/// is nothing under `overlayPosition` to name.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UpdateEmbeddedObjectPositionRequest {
+    /// Which chart or slicer to move.
+    #[serde(rename = "objectId")]
+    pub object_id: i64,
+    /// The position to write.
+    #[serde(rename = "newPosition")]
+    pub new_position: EmbeddedObjectPosition,
+    /// The field mask limiting what this request may change, relative to
+    /// `newPosition.overlayPosition`. Empty (and omitted on the wire) for a
+    /// `--new-sheet` move.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub fields: String,
 }
 
 /// `updateCells` — issue #1798's `add-pivot-table`/`delete-pivot-table`,

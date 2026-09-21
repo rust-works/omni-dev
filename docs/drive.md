@@ -628,7 +628,7 @@ operation anywhere in a target's ancestor chain:
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
 | `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table` |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -1067,10 +1067,12 @@ content-mutating write verb: `drive edit`; `drive sheets`
 `format-cells`/`merge-cells`/`unmerge-cells`/`update-borders`/
 `update-dimension-properties`/`auto-resize-columns`,
 `set-data-validation`/`clear-data-validation`,
-`protect-range`/`update-protection`/`unprotect-range`, and
+`protect-range`/`update-protection`/`unprotect-range`,
 `set-basic-filter`/`clear-basic-filter`/`add-filter-view`/
-`update-filter-view`/`delete-filter-view`; and `drive docs
-replace`/`append`. `--dry-run` never needs one on any of them.
+`update-filter-view`/`delete-filter-view`, and
+`add-chart`/`update-chart`/`delete-chart`/`add-slicer`/`update-slicer`/
+`delete-slicer`/`move-chart`/`move-slicer`; and
+`drive docs replace`/`append`. `--dry-run` never needs one on any of them.
 
 **The backup fidelity splits by file type** ([ADR-0080](adrs/adr-0080.md)
 §3). A binary file backs up as **bytes on this machine**, named
@@ -2579,12 +2581,62 @@ it, so silently accepting it would be a no-op write). `update-slicer`'s
 criteria is a single value rather than a per-column map, so there is
 nothing for the two to compose *onto*.
 
-**Positioning is add-only.** `--anchor` (an A1 cell, using `--sheet` for its
-prefix when bare) plus optional `--offset-x`/`--offset-y`/`--width`/
-`--height` in pixels; a chart may instead take `--new-sheet` to get a sheet
-of its own, which conflicts with every position flag. There is no
-`move-chart`/`move-slicer` verb — `updateEmbeddedObjectPosition` is a
-follow-up — and no border support on either object.
+**Placement on `add-chart`/`add-slicer`.** `--anchor` (an A1 cell, using
+`--sheet` for its prefix when bare) plus optional `--offset-x`/`--offset-y`/
+`--width`/`--height` in pixels; a chart may instead take `--new-sheet` to get
+a sheet of its own, which conflicts with every position flag. Moving or
+resizing an *existing* chart/slicer is the `move-chart`/`move-slicer` verbs
+below (issue #1837) — see that subsection for how they differ from
+`add-chart`/`add-slicer`'s own placement flags. There is no chart/slicer
+border support yet.
+
+#### drive sheets move-chart / move-slicer
+
+Two more verbs on the same charts/slicers embedded objects (issue #1837),
+gated `sheets-structure` like every other verb in this section, wrapping
+`updateEmbeddedObjectPosition`.
+
+```bash
+# Move a chart to a new anchor cell on the same sheet, resizing it too.
+omni-dev drive sheets move-chart <ID> --chart-id 3 --sheet Q1 --anchor F2 --width 480
+
+# Resize without moving: every placement flag is optional, unlike add-chart.
+omni-dev drive sheets move-chart <ID> --chart-id 3 --height 300
+
+# Move a chart onto a brand-new sheet of its own.
+omni-dev drive sheets move-chart <ID> --chart-id 3 --new-sheet
+
+# A slicer moves the same way, minus --new-sheet — it has no own-sheet
+# placement.
+omni-dev drive sheets move-slicer <ID> --slicer-id 4 --sheet Q2 --anchor B2
+```
+
+**Every flag on `move-chart`/`move-slicer` is optional** — unlike `add-chart`,
+which requires one of `--anchor`/`--new-sheet` — since "leave it where it is
+and only resize" is a valid call; passing none of `--anchor`/`--offset-x`/
+`--offset-y`/`--width`/`--height`[/`--new-sheet`] is refused as nothing to
+change. `--new-sheet` (`move-chart` only) conflicts with every other
+placement flag, the same rule `add-chart` enforces.
+
+**The field mask is rooted at `overlayPosition`, not `newPosition`** — the
+API's own rule ("the root `newPosition.overlayPosition` is implied and
+should not be specified"), the one request in this tool whose mask isn't
+rooted at the request's own payload field (`update-slicer`'s mask, by
+contrast, is rooted at `spec`). A move naming only `--width` sends
+`"fields": "widthPixels"`, never `"overlayPosition.widthPixels"`. A
+`--new-sheet` move sends no `fields` key at all.
+
+**A resize-only move (no `--anchor`) carries the object's *current* anchor
+cell forward on the wire**, even though the mask never names it —
+`anchorCell` is a required field of `OverlayPosition` on the wire, unlike
+the optional offset/width/height fields, so there is no "leave it unset"
+value to send instead. A chart currently on its own sheet has no overlay
+position to carry forward, so moving it onto a grid requires `--anchor`.
+
+**A cross-sheet move** — `--sheet`/`--anchor` naming a different sheet than
+the object is currently on — is exactly like any other move: the
+destination sheet's id becomes the object's new `sheet_id` in the outcome
+and log record.
 
 #### drive sheets add-banding / update-banding / delete-banding / list-bandings
 

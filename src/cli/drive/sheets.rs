@@ -271,6 +271,14 @@ pub enum SheetsSubcommands {
     /// Lists the slicers in a spreadsheet. Read-only and ungated, like
     /// `list-protections` (issue #1797).
     ListSlicers(embedded_object::ListSlicersCommand),
+    /// Moves and/or resizes an existing chart (`updateEmbeddedObjectPosition`).
+    /// Gated by the folder write-permission rules' `sheets-structure`
+    /// operation (issue #1837, ADR-0081 §3) — the same operation as
+    /// `add-chart`'s own placement, since a move discards no data.
+    MoveChart(embedded_object::MoveChartCommand),
+    /// Moves and/or resizes an existing slicer. Same gate as
+    /// [`Self::MoveChart`] (issue #1837, ADR-0081 §3).
+    MoveSlicer(embedded_object::MoveSlicerCommand),
     /// Writes a new pivot table at an anchor cell. Gated by **both** the
     /// folder write-permission rules' `sheets-write` and
     /// `sheets-structure` operations (issue #1798, ADR-0081 §5).
@@ -385,6 +393,8 @@ impl SheetsCommand {
             SheetsSubcommands::UpdateSlicer(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeleteSlicer(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ListSlicers(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::MoveChart(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::MoveSlicer(cmd) => cmd.execute(client).await,
             SheetsSubcommands::AddPivotTable(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeletePivotTable(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ListPivotTables(cmd) => cmd.execute(client).await,
@@ -736,6 +746,45 @@ mod tests {
         assert!(dispatch(
             SheetsSubcommands::ListSlicers(embedded_object::ListSlicersCommand {
                 spreadsheet_id: "sheet-1".to_string(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::MoveChart(embedded_object::MoveChartCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                chart_id: 1,
+                sheet: None,
+                anchor: Some("F2".to_string()),
+                offset_x: None,
+                offset_y: None,
+                width: None,
+                height: None,
+                new_sheet: false,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::MoveSlicer(embedded_object::MoveSlicerCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                slicer_id: 1,
+                sheet: None,
+                anchor: Some("F2".to_string()),
+                offset_x: None,
+                offset_y: None,
+                width: None,
+                height: None,
+                dry_run: true,
+                lease: no_lease(),
                 output: crate::cli::drive::format::OutputFormat::Table,
             }),
             &client,

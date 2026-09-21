@@ -1,6 +1,9 @@
 //! Charts and slicers via `spreadsheets.batchUpdate` (issue #1797,
 //! [ADR-0081](../../../docs/adrs/adr-0081.md) §3).
 //!
+//! Extended by issue #1837 with `move-chart`/`move-slicer`
+//! (`updateEmbeddedObjectPosition`).
+//!
 //! One module for both, per the issue's own framing: a slicer is an
 //! embedded object exactly like a chart, and both are removed by the same
 //! `deleteEmbeddedObject` request, addressed by `objectId` alone with no
@@ -36,13 +39,24 @@
 //! opposite case: `updateSlicerSpec` *does* take a field mask, so it only
 //! ever names the fields actually set.
 //!
+//! **`move-chart`/`move-slicer`'s crux: the field mask is rooted at
+//! `overlayPosition`, not `newPosition`.** `updateEmbeddedObjectPosition`'s
+//! own rule is that "the root `newPosition.overlayPosition` is implied and
+//! should not be specified" — the one request in this file whose mask isn't
+//! rooted at the request's own payload field (cf. `update-slicer`'s mask,
+//! rooted at `spec`). `overlay_position_update` builds both the position and
+//! the mask together so the two can't drift apart; a resize-only move (no
+//! `--anchor`) still carries the object's *current* anchor forward on the
+//! wire, since `OverlayPosition.anchor_cell` is a required field there, even
+//! though the mask never names it. A chart on its own sheet has no overlay
+//! position to carry forward, so moving it onto a grid requires `--anchor`;
+//! `--new-sheet` sends no `fields` at all.
+//!
 //! **Documented cuts, matching this feature's general stance:**
 //! `COMBO`/`STEPPED_AREA` basic charts (need a per-series `type` this crate
-//! doesn't model), moving or resizing an existing chart/slicer
-//! (`updateEmbeddedObjectPosition` — a `move-chart`/`move-slicer` verb is a
-//! natural follow-up), chart/slicer borders, and condition-based slicer
-//! filter criteria (`FilterCriteria` supports `hiddenValues` only, the same
-//! cut `filter.rs` makes).
+//! doesn't model), chart/slicer borders, and condition-based slicer filter
+//! criteria (`FilterCriteria` supports `hiddenValues` only, the same cut
+//! `filter.rs` makes).
 //!
 //! Shape mirrors `filter.rs`: compose/validate, resolve against a
 //! freshly-fetched workbook, gate, dry-run, mutate, log.
@@ -70,7 +84,8 @@ use crate::drive::sheets::types::{
     BasicChartSpec, BatchUpdateRequestItem, BatchUpdateResponse, ChartData, ChartSourceRange,
     ChartSpec, DeleteEmbeddedObjectRequest, EmbeddedChart, EmbeddedObjectPosition, FilterCriteria,
     GridCoordinate, GridRange, OverlayPosition, PieChartSpec, Sheet, Slicer, SlicerSpec,
-    Spreadsheet, UpdateChartSpecRequest, UpdateSlicerSpecRequest,
+    Spreadsheet, UpdateChartSpecRequest, UpdateEmbeddedObjectPositionRequest,
+    UpdateSlicerSpecRequest,
 };
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -218,6 +233,48 @@ pub enum EmbeddedObjectVerb {
         /// Which slicer to remove, discovered via `list-slicers`.
         slicer_id: i64,
     },
+    /// Move and/or resize an existing chart (issue #1837).
+    MoveChart {
+        /// Which chart to move, discovered via `list-charts`.
+        chart_id: i64,
+        /// Sheet title, supplying the prefix for `anchor` when it doesn't
+        /// carry its own.
+        sheet: Option<String>,
+        /// The new anchor cell, when the chart stays (or becomes) an
+        /// overlay. Required for a chart on its own sheet, which has no
+        /// existing anchor to carry forward.
+        anchor: Option<String>,
+        /// Additional horizontal offset from the anchor cell, in pixels.
+        offset_x: Option<i64>,
+        /// Additional vertical offset from the anchor cell, in pixels.
+        offset_y: Option<i64>,
+        /// The chart's new width in pixels.
+        width: Option<i64>,
+        /// The chart's new height in pixels.
+        height: Option<i64>,
+        /// Move the chart onto a brand-new sheet of its own. Mutually
+        /// exclusive with every other field but `chart_id`.
+        new_sheet: bool,
+    },
+    /// Move and/or resize an existing slicer (issue #1837). No own-sheet
+    /// placement — a slicer can only ever be an overlay.
+    MoveSlicer {
+        /// Which slicer to move, discovered via `list-slicers`.
+        slicer_id: i64,
+        /// Sheet title, supplying the prefix for `anchor` when it doesn't
+        /// carry its own.
+        sheet: Option<String>,
+        /// The new anchor cell, when set.
+        anchor: Option<String>,
+        /// Additional horizontal offset from the anchor cell, in pixels.
+        offset_x: Option<i64>,
+        /// Additional vertical offset from the anchor cell, in pixels.
+        offset_y: Option<i64>,
+        /// The slicer's new width in pixels.
+        width: Option<i64>,
+        /// The slicer's new height in pixels.
+        height: Option<i64>,
+    },
 }
 
 impl EmbeddedObjectVerb {
@@ -229,6 +286,8 @@ impl EmbeddedObjectVerb {
             Self::AddSlicer { .. } => "sheets-add-slicer",
             Self::UpdateSlicer { .. } => "sheets-update-slicer",
             Self::DeleteSlicer { .. } => "sheets-delete-slicer",
+            Self::MoveChart { .. } => "sheets-move-chart",
+            Self::MoveSlicer { .. } => "sheets-move-slicer",
         }
     }
 
@@ -240,6 +299,8 @@ impl EmbeddedObjectVerb {
             Self::AddSlicer { .. } => "add-slicer",
             Self::UpdateSlicer { .. } => "update-slicer",
             Self::DeleteSlicer { .. } => "delete-slicer",
+            Self::MoveChart { .. } => "move-chart",
+            Self::MoveSlicer { .. } => "move-slicer",
         }
     }
 }
@@ -760,6 +821,52 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
             }
             Ok(())
         }
+        EmbeddedObjectVerb::MoveChart {
+            anchor,
+            offset_x,
+            offset_y,
+            width,
+            height,
+            new_sheet,
+            ..
+        } => {
+            let nothing_to_change = !new_sheet
+                && anchor.is_none()
+                && offset_x.is_none()
+                && offset_y.is_none()
+                && width.is_none()
+                && height.is_none();
+            if nothing_to_change {
+                return Err(
+                    "nothing to change: pass --anchor, --offset-x, --offset-y, --width, \
+                     --height, or --new-sheet"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        EmbeddedObjectVerb::MoveSlicer {
+            anchor,
+            offset_x,
+            offset_y,
+            width,
+            height,
+            ..
+        } => {
+            let nothing_to_change = anchor.is_none()
+                && offset_x.is_none()
+                && offset_y.is_none()
+                && width.is_none()
+                && height.is_none();
+            if nothing_to_change {
+                return Err(
+                    "nothing to change: pass --anchor, --offset-x, --offset-y, --width, or \
+                     --height"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
         EmbeddedObjectVerb::DeleteChart { .. }
         | EmbeddedObjectVerb::DeleteSlicer { .. }
         | EmbeddedObjectVerb::AddSlicer { .. } => Ok(()),
@@ -796,6 +903,36 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
                 Ok(())
             }
         }
+        // Mirrors `AddChart`'s own `--new-sheet` conflict check above,
+        // verbatim except that `move-chart` has no unconditional "an anchor
+        // is required" branch: leaving every placement flag unset is
+        // already refused above (`nothing_to_change`), and a resize-only
+        // move (no `--anchor`, no `--new-sheet`) is valid — the existing
+        // anchor is carried forward by `overlay_position_update`.
+        EmbeddedObjectVerb::MoveChart {
+            anchor,
+            offset_x,
+            offset_y,
+            width,
+            height,
+            new_sheet,
+            ..
+        } if *new_sheet => {
+            if anchor.is_some()
+                || offset_x.is_some()
+                || offset_y.is_some()
+                || width.is_some()
+                || height.is_some()
+            {
+                Err(
+                    "--new-sheet cannot be combined with --anchor/--offset-x/--offset-y/\
+                     --width/--height"
+                        .to_string(),
+                )
+            } else {
+                Ok(())
+            }
+        }
         _ => Ok(()),
     })
 }
@@ -825,6 +962,12 @@ fn build_plan(
             build_update_slicer(workbook, verb, *slicer_id)
         }
         EmbeddedObjectVerb::DeleteSlicer { slicer_id } => build_delete_slicer(workbook, *slicer_id),
+        EmbeddedObjectVerb::MoveChart { chart_id, .. } => {
+            build_move_chart(workbook, verb, *chart_id)
+        }
+        EmbeddedObjectVerb::MoveSlicer { slicer_id, .. } => {
+            build_move_slicer(workbook, verb, *slicer_id)
+        }
     }
 }
 
@@ -1756,6 +1899,275 @@ fn build_delete_slicer(
     })
 }
 
+// ── move-chart / move-slicer ────────────────────────────────────────────
+
+fn find_sheet_by_id(workbook: &Spreadsheet, sheet_id: i64) -> Option<&Sheet> {
+    workbook
+        .sheets
+        .iter()
+        .find(|sheet| sheet.sheet_id() == Some(sheet_id))
+}
+
+/// Merges the caller's overlay overrides onto `existing`, returning the
+/// position to send, the `fields` mask (relative to `overlayPosition`, per
+/// [`UpdateEmbeddedObjectPositionRequest`]'s doc comment), and the
+/// destination sheet id.
+///
+/// `anchor_cell` is a required field of `OverlayPosition` on the wire, so an
+/// unnamed anchor is carried forward from the object's current position
+/// rather than left as a zero value — `offset_x`/`offset_y`/`width`/
+/// `height` need no such fallback, since they're all optional on the wire
+/// and outside the mask when unset. An object with no current overlay
+/// position (a chart on its own sheet) requires `--anchor` to be moved onto
+/// a grid.
+#[allow(clippy::too_many_arguments)]
+fn overlay_position_update(
+    workbook: &Spreadsheet,
+    existing: Option<&OverlayPosition>,
+    sheet: Option<&str>,
+    anchor: Option<&str>,
+    offset_x: Option<i64>,
+    offset_y: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
+) -> Result<(EmbeddedObjectPosition, String, i64), EmbeddedObjectResult> {
+    let mut fields = Vec::new();
+    let anchor_cell = match anchor {
+        Some(anchor) => {
+            fields.push("anchorCell");
+            resolve_anchor(workbook, sheet, anchor)?
+        }
+        None => existing.map(|overlay| overlay.anchor_cell).ok_or_else(|| {
+            invalid(
+                "this object has no current overlay position (it's on its own sheet); \
+                 --anchor is required to move it onto a grid",
+            )
+        })?,
+    };
+    let sheet_id = anchor_cell.sheet_id;
+
+    if offset_x.is_some() {
+        fields.push("offsetXPixels");
+    }
+    if offset_y.is_some() {
+        fields.push("offsetYPixels");
+    }
+    if width.is_some() {
+        fields.push("widthPixels");
+    }
+    if height.is_some() {
+        fields.push("heightPixels");
+    }
+
+    let position = EmbeddedObjectPosition {
+        overlay_position: Some(OverlayPosition {
+            anchor_cell,
+            offset_x_pixels: offset_x,
+            offset_y_pixels: offset_y,
+            width_pixels: width,
+            height_pixels: height,
+        }),
+        ..Default::default()
+    };
+    Ok((position, fields.join(","), sheet_id))
+}
+
+/// The overlay-position tail shared by `build_move_chart`/`build_move_slicer`
+/// once each has resolved its own verb-specific fields (and, for a chart,
+/// ruled out `--new-sheet`) down to a plain overlay move — the `--sheet`/
+/// `--anchor`/id-flag differences live in the two callers, not here.
+///
+/// The summary leads "move `<noun>` `<id>` to `<destination>`" when the
+/// anchor changed, or "resize `<noun>` `<id>`" when it didn't (an
+/// offset/width/height-only call) — `anchor_changed` is `true` whenever the
+/// caller passed `--anchor`, even if it happens to resolve to the same
+/// cell the object was already at.
+#[allow(clippy::too_many_arguments)]
+fn build_move(
+    workbook: &Spreadsheet,
+    object_id: i64,
+    noun: &str,
+    position: EmbeddedObjectPosition,
+    fields: String,
+    sheet_id: i64,
+    anchor_changed: bool,
+    offset_x: Option<i64>,
+    offset_y: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
+    before: Option<EmbeddedObjectSummary>,
+) -> Plan {
+    let mut changed = Vec::new();
+    if let Some(offset_x) = offset_x {
+        changed.push(format!("offset-x {offset_x}"));
+    }
+    if let Some(offset_y) = offset_y {
+        changed.push(format!("offset-y {offset_y}"));
+    }
+    if let Some(width) = width {
+        changed.push(format!("width {width}"));
+    }
+    if let Some(height) = height {
+        changed.push(format!("height {height}"));
+    }
+    let suffix = if changed.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", changed.join(", "))
+    };
+    let summary = if anchor_changed {
+        let destination = position
+            .overlay_position
+            .as_ref()
+            .and_then(|overlay| {
+                find_sheet_by_id(workbook, sheet_id)
+                    .map(|sheet| describe_overlay_position(sheet, overlay))
+            })
+            .unwrap_or_else(|| format!("sheet {sheet_id}"));
+        format!("move {noun} {object_id} to {destination}{suffix}")
+    } else {
+        format!("resize {noun} {object_id}{suffix}")
+    };
+
+    Plan {
+        request: BatchUpdateRequestItem::UpdateEmbeddedObjectPosition(
+            UpdateEmbeddedObjectPositionRequest {
+                object_id,
+                new_position: position,
+                fields,
+            },
+        ),
+        summary,
+        sheet_id: Some(sheet_id),
+        before,
+        existing_id: Some(object_id),
+    }
+}
+
+fn build_move_chart(
+    workbook: &Spreadsheet,
+    verb: &EmbeddedObjectVerb,
+    chart_id: i64,
+) -> Result<Plan, EmbeddedObjectResult> {
+    let EmbeddedObjectVerb::MoveChart {
+        sheet,
+        anchor,
+        offset_x,
+        offset_y,
+        width,
+        height,
+        new_sheet,
+        ..
+    } = verb
+    else {
+        unreachable!("build_move_chart is only ever called for MoveChart") // omni-dev: coverage ignore-line reason="build_plan only calls build_move_chart after matching verb as EmbeddedObjectVerb::MoveChart; this else-arm exists only to destructure the already-known variant"
+    };
+
+    let (host_sheet, chart) = find_chart_or_refuse(workbook, chart_id)?;
+    let before = summarise_chart(host_sheet, chart);
+
+    if *new_sheet {
+        return Ok(Plan {
+            request: BatchUpdateRequestItem::UpdateEmbeddedObjectPosition(
+                UpdateEmbeddedObjectPositionRequest {
+                    object_id: chart_id,
+                    new_position: EmbeddedObjectPosition {
+                        new_sheet: Some(true),
+                        ..Default::default()
+                    },
+                    fields: String::new(),
+                },
+            ),
+            summary: format!("move chart {chart_id} to a new sheet"),
+            sheet_id: None,
+            before,
+            existing_id: Some(chart_id),
+        });
+    }
+
+    let existing_overlay = chart
+        .position
+        .as_ref()
+        .and_then(|position| position.overlay_position.as_ref());
+    let (position, fields, sheet_id) = overlay_position_update(
+        workbook,
+        existing_overlay,
+        sheet.as_deref(),
+        anchor.as_deref(),
+        *offset_x,
+        *offset_y,
+        *width,
+        *height,
+    )?;
+
+    Ok(build_move(
+        workbook,
+        chart_id,
+        "chart",
+        position,
+        fields,
+        sheet_id,
+        anchor.is_some(),
+        *offset_x,
+        *offset_y,
+        *width,
+        *height,
+        before,
+    ))
+}
+
+fn build_move_slicer(
+    workbook: &Spreadsheet,
+    verb: &EmbeddedObjectVerb,
+    slicer_id: i64,
+) -> Result<Plan, EmbeddedObjectResult> {
+    let EmbeddedObjectVerb::MoveSlicer {
+        sheet,
+        anchor,
+        offset_x,
+        offset_y,
+        width,
+        height,
+        ..
+    } = verb
+    else {
+        unreachable!("build_move_slicer is only ever called for MoveSlicer") // omni-dev: coverage ignore-line reason="build_plan only calls build_move_slicer after matching verb as EmbeddedObjectVerb::MoveSlicer; this else-arm exists only to destructure the already-known variant"
+    };
+
+    let (host_sheet, slicer) = find_slicer_or_refuse(workbook, slicer_id)?;
+    let before = summarise_slicer(host_sheet, slicer);
+
+    let existing_overlay = slicer
+        .position
+        .as_ref()
+        .and_then(|position| position.overlay_position.as_ref());
+    let (position, fields, sheet_id) = overlay_position_update(
+        workbook,
+        existing_overlay,
+        sheet.as_deref(),
+        anchor.as_deref(),
+        *offset_x,
+        *offset_y,
+        *width,
+        *height,
+    )?;
+
+    Ok(build_move(
+        workbook,
+        slicer_id,
+        "slicer",
+        position,
+        fields,
+        sheet_id,
+        anchor.is_some(),
+        *offset_x,
+        *offset_y,
+        *width,
+        *height,
+        before,
+    ))
+}
+
 // ── list-charts / list-slicers ───────────────────────────────────────────
 
 /// Extracts every chart's summary from an already-fetched workbook, for
@@ -2179,6 +2591,25 @@ mod tests {
                 apply_to_pivot_tables: None,
             },
             EmbeddedObjectVerb::DeleteSlicer { slicer_id: 1 },
+            EmbeddedObjectVerb::MoveChart {
+                chart_id: 1,
+                sheet: None,
+                anchor: Some(String::new()),
+                offset_x: None,
+                offset_y: None,
+                width: None,
+                height: None,
+                new_sheet: false,
+            },
+            EmbeddedObjectVerb::MoveSlicer {
+                slicer_id: 1,
+                sheet: None,
+                anchor: Some(String::new()),
+                offset_x: None,
+                offset_y: None,
+                width: None,
+                height: None,
+            },
         ];
         let ops: HashSet<&str> = verbs
             .iter()
@@ -4498,6 +4929,354 @@ mod tests {
             refusal(build_delete_slicer(&workbook, 99)),
             EmbeddedObjectResult::RefusedObjectNotFound { object_id: 99 }
         ));
+    }
+
+    // ── build_move_chart / build_move_slicer ─────────────────────────────
+
+    fn move_chart_verb(tweak: impl FnOnce(&mut EmbeddedObjectVerb)) -> EmbeddedObjectVerb {
+        let mut verb = EmbeddedObjectVerb::MoveChart {
+            chart_id: 1,
+            sheet: Some("Q1".to_string()),
+            anchor: None,
+            offset_x: None,
+            offset_y: None,
+            width: None,
+            height: None,
+            new_sheet: false,
+        };
+        tweak(&mut verb);
+        verb
+    }
+
+    fn move_slicer_verb(tweak: impl FnOnce(&mut EmbeddedObjectVerb)) -> EmbeddedObjectVerb {
+        let mut verb = EmbeddedObjectVerb::MoveSlicer {
+            slicer_id: 4,
+            sheet: Some("Q1".to_string()),
+            anchor: None,
+            offset_x: None,
+            offset_y: None,
+            width: None,
+            height: None,
+        };
+        tweak(&mut verb);
+        verb
+    }
+
+    fn set_move_chart_anchor(verb: &mut EmbeddedObjectVerb, value: &str) {
+        let EmbeddedObjectVerb::MoveChart { anchor, .. } = verb else {
+            unreachable!() // omni-dev: coverage ignore-line reason="callers always pass a verb built by move_chart_verb, which is always MoveChart"
+        };
+        *anchor = Some(value.to_string());
+    }
+
+    fn set_move_slicer_anchor(verb: &mut EmbeddedObjectVerb, value: &str) {
+        let EmbeddedObjectVerb::MoveSlicer { anchor, .. } = verb else {
+            unreachable!() // omni-dev: coverage ignore-line reason="callers always pass a verb built by move_slicer_verb, which is always MoveSlicer"
+        };
+        *anchor = Some(value.to_string());
+    }
+
+    #[test]
+    fn move_chart_sends_update_embedded_object_position() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let verb = move_chart_verb(|verb| set_move_chart_anchor(verb, "F2"));
+        let plan = build_move_chart(&workbook, &verb, 1).unwrap();
+        let request = serde_json::to_value(&plan.request).unwrap();
+        let overlay = &request["updateEmbeddedObjectPosition"]["newPosition"]["overlayPosition"];
+        assert_eq!(overlay["anchorCell"]["rowIndex"], 1);
+        assert_eq!(overlay["anchorCell"]["columnIndex"], 5);
+        assert_eq!(
+            request["updateEmbeddedObjectPosition"]["fields"],
+            "anchorCell"
+        );
+        assert_eq!(plan.sheet_id, Some(0));
+        assert_eq!(plan.summary, "move chart 1 to Q1!F2");
+    }
+
+    #[test]
+    fn position_field_mask_is_relative_to_overlay_position() {
+        // THE regression guard: `updateEmbeddedObjectPosition`'s own rule is
+        // that the mask is rooted at `newPosition.overlayPosition`, not at
+        // `newPosition` — so a move sends `"anchorCell"`, never
+        // `"overlayPosition.anchorCell"`. Invisible unless asserted.
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let verb = move_chart_verb(|verb| set_move_chart_anchor(verb, "F2"));
+        let plan = build_move_chart(&workbook, &verb, 1).unwrap();
+        let request = serde_json::to_value(&plan.request).unwrap();
+        let fields = request["updateEmbeddedObjectPosition"]["fields"]
+            .as_str()
+            .unwrap();
+        assert_eq!(fields, "anchorCell");
+        assert_ne!(fields, "overlayPosition.anchorCell");
+    }
+
+    #[test]
+    fn move_chart_resize_only_carries_the_existing_anchor_forward() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let verb = move_chart_verb(|verb| {
+            let EmbeddedObjectVerb::MoveChart { width, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+            };
+            *width = Some(480);
+        });
+        let plan = build_move_chart(&workbook, &verb, 1).unwrap();
+        let request = serde_json::to_value(&plan.request).unwrap();
+        let overlay = &request["updateEmbeddedObjectPosition"]["newPosition"]["overlayPosition"];
+        // `basic_chart_sheet(1, ..)` anchors the chart at row 1, column 4
+        // (E2) — carried forward unchanged since `--anchor` wasn't given.
+        assert_eq!(overlay["anchorCell"]["rowIndex"], 1);
+        assert_eq!(overlay["anchorCell"]["columnIndex"], 4);
+        assert_eq!(overlay["widthPixels"], 480);
+        assert_eq!(
+            request["updateEmbeddedObjectPosition"]["fields"],
+            "widthPixels"
+        );
+        assert_eq!(plan.summary, "resize chart 1 (width 480)");
+    }
+
+    #[test]
+    fn move_chart_masks_exactly_the_flags_given() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let verb = move_chart_verb(|verb| {
+            set_move_chart_anchor(verb, "F2");
+            let EmbeddedObjectVerb::MoveChart {
+                offset_x,
+                offset_y,
+                width,
+                height,
+                ..
+            } = verb
+            else {
+                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+            };
+            *offset_x = Some(3);
+            *offset_y = Some(4);
+            *width = Some(480);
+            *height = Some(300);
+        });
+        let plan = build_move_chart(&workbook, &verb, 1).unwrap();
+        let request = serde_json::to_value(&plan.request).unwrap();
+        assert_eq!(
+            request["updateEmbeddedObjectPosition"]["fields"],
+            "anchorCell,offsetXPixels,offsetYPixels,widthPixels,heightPixels"
+        );
+        assert_eq!(
+            plan.summary,
+            "move chart 1 to Q1!F2 (offset-x 3, offset-y 4, width 480, height 300)"
+        );
+    }
+
+    #[test]
+    fn move_chart_new_sheet_sends_new_sheet_true_and_no_mask() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let verb = move_chart_verb(|verb| {
+            let EmbeddedObjectVerb::MoveChart { new_sheet, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+            };
+            *new_sheet = true;
+        });
+        let plan = build_move_chart(&workbook, &verb, 1).unwrap();
+        let request = serde_json::to_value(&plan.request).unwrap();
+        assert_eq!(
+            request["updateEmbeddedObjectPosition"]["newPosition"]["newSheet"],
+            true
+        );
+        assert!(
+            request["updateEmbeddedObjectPosition"]
+                .get("fields")
+                .is_none(),
+            "a new-sheet move sends no fields key at all: {request}"
+        );
+        assert_eq!(plan.sheet_id, None);
+        assert_eq!(plan.summary, "move chart 1 to a new sheet");
+    }
+
+    #[test]
+    fn move_chart_on_its_own_sheet_without_an_anchor_is_refused() {
+        let sheet = Sheet {
+            properties: Some(crate::drive::sheets::types::SheetProperties {
+                sheet_id: Some(0),
+                title: "Q1".to_string(),
+                ..Default::default()
+            }),
+            charts: vec![EmbeddedChart {
+                chart_id: Some(1),
+                spec: Some(ChartSpec::default()),
+                position: Some(EmbeddedObjectPosition {
+                    sheet_id: Some(9),
+                    new_sheet: Some(true),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let workbook = workbook_with_sheet(sheet);
+        let verb = move_chart_verb(|verb| {
+            let EmbeddedObjectVerb::MoveChart { width, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+            };
+            *width = Some(480);
+        });
+        let err = refusal(build_move_chart(&workbook, &verb, 1));
+        assert_invalid(&err, "has no current overlay position");
+    }
+
+    #[test]
+    fn move_chart_refuses_an_empty_flag_set() {
+        let verb = move_chart_verb(|_| {});
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("nothing to change"), "{err}");
+    }
+
+    #[test]
+    fn move_slicer_refuses_an_empty_flag_set() {
+        let verb = move_slicer_verb(|_| {});
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("nothing to change"), "{err}");
+    }
+
+    #[test]
+    fn move_chart_refuses_new_sheet_combined_with_anchor() {
+        let verb = move_chart_verb(|verb| {
+            set_move_chart_anchor(verb, "F2");
+            let EmbeddedObjectVerb::MoveChart { new_sheet, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+            };
+            *new_sheet = true;
+        });
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("--new-sheet cannot be combined"), "{err}");
+    }
+
+    #[test]
+    fn move_chart_refuses_an_anchor_that_names_a_range() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let verb = move_chart_verb(|verb| set_move_chart_anchor(verb, "F2:G3"));
+        let err = refusal(build_move_chart(&workbook, &verb, 1));
+        assert_invalid(&err, "not a range");
+    }
+
+    fn two_sheet_slicer_workbook() -> Spreadsheet {
+        let mut workbook = slicer_workbook();
+        workbook.sheets.push(Sheet {
+            properties: Some(crate::drive::sheets::types::SheetProperties {
+                sheet_id: Some(1),
+                title: "Q2".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        workbook
+    }
+
+    #[test]
+    fn move_slicer_across_sheets_uses_the_destination_anchor_sheet_id() {
+        let workbook = two_sheet_slicer_workbook();
+        let verb = move_slicer_verb(|verb| {
+            let EmbeddedObjectVerb::MoveSlicer { sheet, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="move_slicer_verb always builds an EmbeddedObjectVerb::MoveSlicer, so this arm can never run"
+            };
+            *sheet = Some("Q2".to_string());
+            set_move_slicer_anchor(verb, "B2");
+        });
+        let plan = build_move_slicer(&workbook, &verb, 4).unwrap();
+        assert_eq!(plan.sheet_id, Some(1));
+        assert_eq!(plan.summary, "move slicer 4 to Q2!B2");
+    }
+
+    #[test]
+    fn move_slicer_refuses_a_chart_id() {
+        let workbook = mixed_object_workbook();
+        let verb = move_slicer_verb(|verb| set_move_slicer_anchor(verb, "F2"));
+        assert!(matches!(
+            refusal(build_move_slicer(&workbook, &verb, 1)),
+            EmbeddedObjectResult::RefusedWrongObjectKind {
+                object_id: 1,
+                expected,
+                found,
+            } if expected == "slicer" && found == "chart"
+        ));
+    }
+
+    #[test]
+    fn move_chart_refuses_a_slicer_id() {
+        let workbook = mixed_object_workbook();
+        let verb = move_chart_verb(|verb| set_move_chart_anchor(verb, "F2"));
+        assert!(matches!(
+            refusal(build_move_chart(&workbook, &verb, 4)),
+            EmbeddedObjectResult::RefusedWrongObjectKind {
+                object_id: 4,
+                expected,
+                found,
+            } if expected == "chart" && found == "slicer"
+        ));
+    }
+
+    #[test]
+    fn move_chart_refuses_an_unknown_object_id() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let verb = move_chart_verb(|verb| set_move_chart_anchor(verb, "F2"));
+        assert!(matches!(
+            refusal(build_move_chart(&workbook, &verb, 99)),
+            EmbeddedObjectResult::RefusedObjectNotFound { object_id: 99 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn move_chart_dry_run_reports_the_object_before_the_move() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {
+                "properties": {"sheetId": 0, "title": "Q1", "index": 0},
+                "charts": [{
+                    "chartId": 5,
+                    "spec": {"title": "Sales", "pieChart": {
+                        "domain": {"sourceRange": {"sources": [{"sheetId": 0}]}},
+                        "series": {"sourceRange": {"sources": [{"sheetId": 0}]}},
+                    }},
+                    "position": {"overlayPosition": {"anchorCell": {"sheetId": 0, "rowIndex": 1, "columnIndex": 2}}},
+                }],
+            },
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: EmbeddedObjectVerb::MoveChart {
+                chart_id: 5,
+                sheet: Some("Q1".to_string()),
+                anchor: Some("F2".to_string()),
+                offset_x: None,
+                offset_y: None,
+                width: None,
+                height: None,
+                new_sheet: false,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            EmbeddedObjectResult::WouldChange { object, summary } => {
+                let object = object.expect("move-chart previews the object before the move");
+                assert_eq!(object.object_id, 5);
+                assert_eq!(object.title.as_deref(), Some("Sales"));
+                assert_eq!(object.position, "Q1!C2", "previews the position pre-move");
+                assert_eq!(summary, "move chart 5 to Q1!F2");
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
     }
 
     // ── describe / describe_lines ────────────────────────────────────────

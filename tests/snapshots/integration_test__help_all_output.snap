@@ -4500,6 +4500,8 @@ Commands:
   update-slicer                Changes an existing slicer's range, filter column/criteria, title, or pivot-table linkage. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3)
   delete-slicer                Removes a slicer, after reporting its spec. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1797, ADR-0081 §3) — not `sheets-delete`. Cannot be undone through omni-dev
   list-slicers                 Lists the slicers in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1797)
+  move-chart                   Moves and/or resizes an existing chart (`updateEmbeddedObjectPosition`). Gated by the folder write-permission rules' `sheets-structure` operation (issue #1837, ADR-0081 §3) — the same operation as `add-chart`'s own placement, since a move discards no data
+  move-slicer                  Moves and/or resizes an existing slicer. Same gate as [`Self::MoveChart`] (issue #1837, ADR-0081 §3)
   add-pivot-table              Writes a new pivot table at an anchor cell. Gated by **both** the folder write-permission rules' `sheets-write` and `sheets-structure` operations (issue #1798, ADR-0081 §5)
   delete-pivot-table           Clears the pivot table at an anchor cell. Gated by the folder write-permission rules' `sheets-write` operation alone (issue #1798, ADR-0081 §5)
   list-pivot-tables            Lists the pivot tables in a spreadsheet, by anchor cell. Read-only and ungated, like `list-conditional-formats` (issue #1798)
@@ -5525,6 +5527,32 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets move-chart - Moves and/or resizes an existing chart (`updateEmbeddedObjectPosition`). Gated by the folder write-permission rules' `sheets-structure` operation (issue #1837, ADR-0081 §3) — the same operation as `add-chart`'s own placement, since a move discards no data
+
+Moves and/or resizes an existing chart (`updateEmbeddedObjectPosition`). Gated by the folder write-permission rules' `sheets-structure` operation (issue #1837, ADR-0081 §3) — the same operation as `add-chart`'s own placement, since a move discards no data
+
+Usage: move-chart [OPTIONS] --chart-id <ID> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --chart-id <ID>    Which chart to move, discovered via `list-charts`
+      --sheet <NAME>     Sheet title, supplying the prefix for `--anchor` when it doesn't carry its own
+      --anchor <A1>      The new anchor cell, e.g. `F2`. Required to move a chart that currently occupies its own sheet
+      --offset-x <PX>    Additional horizontal offset from the anchor cell, in pixels
+      --offset-y <PX>    Additional vertical offset from the anchor cell, in pixels
+      --width <PX>       The chart's new width in pixels
+      --height <PX>      The chart's new height in pixels
+      --new-sheet        Move the chart onto a brand-new sheet of its own, instead of anchoring it to an existing one. Mutually exclusive with every other placement flag
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets move-columns - Moves a contiguous block of columns to a new position within a sheet, shifting the columns in between. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1834)
 
 Moves a contiguous block of columns to a new position within a sheet, shifting the columns in between. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1834)
@@ -5561,6 +5589,31 @@ Options:
       --at <ROW>         First row of the block to move, 1-based inclusive — the row number the spreadsheet itself shows
       --count <N>        How many rows the block spans [default: 1]
       --before <ROW>     Move the block to before this row, numbered as the sheet stands *before* the move — the same numbering `--at` uses. `--before` one past the sheet's last row moves the block to the end. A `--before` inside or immediately after the block being moved is refused (it would move nothing)
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets move-slicer - Moves and/or resizes an existing slicer. Same gate as [`Self::MoveChart`] (issue #1837, ADR-0081 §3)
+
+Moves and/or resizes an existing slicer. Same gate as [`Self::MoveChart`] (issue #1837, ADR-0081 §3)
+
+Usage: move-slicer [OPTIONS] --slicer-id <ID> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --slicer-id <ID>   Which slicer to move, discovered via `list-slicers`
+      --sheet <NAME>     Sheet title, supplying the prefix for `--anchor` when it doesn't carry its own
+      --anchor <A1>      The new anchor cell, e.g. `F2`
+      --offset-x <PX>    Additional horizontal offset from the anchor cell, in pixels
+      --offset-y <PX>    Additional vertical offset from the anchor cell, in pixels
+      --width <PX>       The slicer's new width in pixels
+      --height <PX>      The slicer's new height in pixels
       --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
