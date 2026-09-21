@@ -49,12 +49,14 @@ stages.\n\nMakes one Jev call per issue. Jev judges the issue's title, body and 
 comments (never the issues or pull requests it references) and picks, for each stage, the \
 least capable class likely to do it correctly with no rework. The issue's class is the \
 higher of its design and implement choices, and a stage whose confidence is below \
---close-call is listed under close_calls.\n\nThe classes are one AI provider's model ladder, \
-named by abbreviated model name: anthropic (sonnet/opus/fable, the default), openai \
-(terra/sol/astra) and gemini (flash/pro/deep-think). --providers routes against several at \
-once, still in one Jev call per issue, and the output nests stages, class and close_calls \
-under each provider's name. --tiers FILE swaps in a custom ladder instead, reported under \
-`custom`; it cannot be combined with --providers.\n\nEach open issue or pull request the text \
+--close-call is listed under close_calls.\n\nThe classes come from a named model ladder: \
+built-in ladders are anthropic (sonnet/opus/fable, the default), openai (terra/sol/astra) \
+and gemini (flash/pro/deep-think). --ladders NAMES routes against several ladders at once, \
+still in one Jev call per issue, and the output nests stages, class and close_calls under \
+each ladder's name. --ladder-definition NAME=FILE registers a custom ladder under NAME, its \
+tiers loaded from a YAML file, so it can be routed alongside built-in ladders in the same \
+--ladders list; a built-in name cannot be redefined, and a definition never listed in \
+--ladders is an error.\n\nEach open issue or pull request the text \
 cites is reported under depends_on, with a could_be_cheaper.design probability: how likely it \
 is that resolving that dependency would leave less design work remaining than the text \
 implies. One extra Jev question is asked per open citation; a closed citation is settled and \
@@ -77,20 +79,20 @@ pub struct RouteCommand {
     #[arg(long)]
     pub all_open: bool,
 
-    /// AI providers whose model ladders to route against (comma-separated).
+    /// Ladder names to route against (comma-separated, repeatable): a built-in provider
+    /// name or one registered via --ladder-definition.
     #[arg(
         long,
         value_name = "NAMES",
-        value_enum,
         value_delimiter = ',',
-        default_value = "anthropic",
-        conflicts_with = "tiers"
+        default_value = "anthropic"
     )]
-    pub providers: Vec<Provider>,
+    pub ladders: Vec<String>,
 
-    /// YAML file of model-class tiers, least capable first, replacing the provider ladders.
-    #[arg(long, value_name = "FILE")]
-    pub tiers: Option<PathBuf>,
+    /// Registers a custom ladder as NAME=FILE, its tiers loaded from FILE (same YAML shape
+    /// as a tiers file: `tiers: [{name, description}, ...]`). Repeatable.
+    #[arg(long, value_name = "NAME=FILE", value_parser = parse_ladder_definition)]
+    pub ladder_definition: Vec<(String, PathBuf)>,
 
     /// Confidence below which a stage is reported as a close call.
     #[arg(long, value_name = "CONFIDENCE", default_value_t = DEFAULT_CLOSE_CALL)]
@@ -124,7 +126,7 @@ impl RouteCommand {
         if let Some(model) = self.jev_model {
             config.model = model;
         }
-        let ladders = build_ladders(self.tiers.as_deref(), &self.providers)?;
+        let ladders = build_ladders(&self.ladders, &self.ladder_definition)?;
         let client = JevClient::from_config(&config)?;
 
         let bin = crate::pr_status::resolve_gh_binary();
@@ -171,15 +173,80 @@ fn render_output(
     })
 }
 
-/// Resolves `--tiers`/`--providers` to the ladders to route against: a
-/// single custom ladder for `--tiers`, or one builtin ladder per
-/// `--providers` entry (in the order given) otherwise. Clap's
-/// `conflicts_with` already rules out both being set.
-fn build_ladders(tiers: Option<&Path>, providers: &[Provider]) -> Result<Vec<Ladder>> {
-    match tiers {
-        Some(path) => Ok(vec![Ladder::custom(Tiers::load_file(path)?)]),
-        None => providers.iter().map(|&p| Ladder::builtin(p)).collect(),
+/// Parses a `NAME=FILE` `--ladder-definition` value.
+///
+/// Splits on the **first** `=` only, so a later `=` stays inside the path; an
+/// empty `NAME` is rejected. Wired as a clap `value_parser`.
+fn parse_ladder_definition(s: &str) -> Result<(String, PathBuf), String> {
+    let (name, path) = s
+        .split_once('=')
+        .ok_or_else(|| format!("`{s}` is not in NAME=FILE form"))?;
+    if name.is_empty() {
+        return Err(format!("`{s}` has an empty ladder name"));
     }
+    Ok((name.to_string(), PathBuf::from(path)))
+}
+
+/// Validates a `--ladder-definition` name: non-empty, `[a-z0-9_-]+`, and not
+/// a built-in provider's name — built-in names are reserved rather than
+/// silently overridable.
+fn validate_ladder_name(name: &str) -> Result<()> {
+    let valid_charset = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    if !valid_charset {
+        bail!("ladder name {name:?} must be non-empty and match [a-z0-9_-]+");
+    }
+    if Provider::ALL.iter().any(|p| p.name() == name) {
+        bail!("ladder name {name:?} is a built-in provider name and cannot be redefined");
+    }
+    Ok(())
+}
+
+/// Resolves `--ladders`/`--ladder-definition` to the ladders to route
+/// against, in `--ladders`' order (#1826). Each `--ladders` entry is either a
+/// built-in provider's name or one registered via `--ladder-definition`; a
+/// `--ladder-definition` never referenced by `--ladders` is an error, since
+/// that is more likely a typo'd `--ladders` entry than an intentionally
+/// unused definition.
+fn build_ladders(ladders: &[String], definitions: &[(String, PathBuf)]) -> Result<Vec<Ladder>> {
+    let mut custom: BTreeMap<&str, &Path> = BTreeMap::new();
+    for (name, path) in definitions {
+        validate_ladder_name(name)?;
+        if custom.insert(name.as_str(), path.as_path()).is_some() {
+            bail!("ladder definition {name:?} is given more than once");
+        }
+    }
+
+    let mut used = HashSet::new();
+    let result = ladders
+        .iter()
+        .map(|name| {
+            used.insert(name.as_str());
+            if let Some(provider) = Provider::ALL
+                .into_iter()
+                .find(|p| p.name() == name.as_str())
+            {
+                Ladder::builtin(provider)
+            } else if let Some(&path) = custom.get(name.as_str()) {
+                Ok(Ladder::named(name.clone(), Tiers::load_file(path)?))
+            } else {
+                let mut known: Vec<&str> =
+                    Provider::ALL.iter().map(|p| p.name()).collect::<Vec<_>>();
+                known.extend(custom.keys().copied());
+                bail!(
+                    "unknown ladder {name:?}; known ladders are {}",
+                    known.join(", ")
+                )
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if let Some(unused) = custom.keys().find(|name| !used.contains(*name)) {
+        bail!("ladder definition {unused:?} was never listed in --ladders");
+    }
+    Ok(result)
 }
 
 /// The exit error for a report with failed issues, after the report itself
@@ -336,8 +403,8 @@ mod tests {
         assert_eq!(cmd.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
         assert!(!cmd.allow_closed);
         assert_eq!(cmd.output, RouteFormat::Json);
-        assert_eq!(cmd.providers, [Provider::Anthropic]);
-        assert!(cmd.tiers.is_none());
+        assert_eq!(cmd.ladders, ["anthropic"]);
+        assert!(cmd.ladder_definition.is_empty());
     }
 
     #[test]
@@ -347,58 +414,142 @@ mod tests {
     }
 
     #[test]
-    fn route_parses_providers_in_order() {
-        let cmd = parse(&["#1", "--providers", "openai,gemini"]).unwrap();
-        assert_eq!(cmd.providers, [Provider::OpenAi, Provider::Gemini]);
-        let cmd = parse(&["#1", "--providers", "gemini", "--providers", "anthropic"]).unwrap();
-        assert_eq!(cmd.providers, [Provider::Gemini, Provider::Anthropic]);
+    fn route_parses_ladders_in_order() {
+        let cmd = parse(&["#1", "--ladders", "openai,gemini"]).unwrap();
+        assert_eq!(cmd.ladders, ["openai", "gemini"]);
+        let cmd = parse(&["#1", "--ladders", "gemini", "--ladders", "anthropic"]).unwrap();
+        assert_eq!(cmd.ladders, ["gemini", "anthropic"]);
     }
 
     #[test]
-    fn route_rejects_an_unknown_or_empty_provider() {
-        let Err(err) = parse(&["#1", "--providers", "nope"]) else {
-            // omni-dev: coverage ignore-line reason="guards this test's assumption; the parse above always fails on an unknown provider"
-            panic!("an unknown provider parsed");
+    fn route_accepts_a_ladder_definition() {
+        let cmd = parse(&[
+            "#1",
+            "--ladders",
+            "anthropic,mine",
+            "--ladder-definition",
+            "mine=my-tiers.yaml",
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd.ladder_definition,
+            [("mine".to_string(), PathBuf::from("my-tiers.yaml"))]
+        );
+    }
+
+    #[test]
+    fn clap_rejects_a_malformed_ladder_definition() {
+        let Err(err) = parse(&["#1", "--ladder-definition", "noequals"]) else {
+            // omni-dev: coverage ignore-line reason="guards this test's assumption; the parse above always fails on a malformed --ladder-definition"
+            panic!("a malformed --ladder-definition parsed");
         };
-        let text = err.to_string();
-        assert!(text.contains("anthropic"), "{text}");
-        assert!(text.contains("openai"), "{text}");
-        assert!(text.contains("gemini"), "{text}");
-        assert!(parse(&["#1", "--providers", ""]).is_err());
-        assert!(parse(&["#1", "--providers"]).is_err());
-    }
-
-    /// A defaulted `--providers` does not conflict, so `--tiers` alone is
-    /// fine; naming both is an error rather than one silently winning.
-    #[test]
-    fn route_tiers_conflicts_with_an_explicit_providers() {
-        assert!(parse(&["#1", "--tiers", "t.yaml"]).is_ok());
-        let Err(err) = parse(&["#1", "--tiers", "t.yaml", "--providers", "openai"]) else {
-            // omni-dev: coverage ignore-line reason="guards this test's assumption; clap's conflicts_with always rejects --tiers with --providers"
-            panic!("--tiers with --providers parsed");
-        };
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(err.to_string().contains("NAME=FILE"), "{err}");
     }
 
     #[test]
-    fn build_ladders_from_providers_preserves_order() {
-        let ladders = build_ladders(None, &[Provider::Gemini, Provider::Anthropic]).unwrap();
-        let names: Vec<&str> = ladders.iter().map(|l| l.provider.as_str()).collect();
+    fn clap_still_requires_a_value_for_ladders() {
+        assert!(parse(&["#1", "--ladders"]).is_err());
+    }
+
+    // ── build_ladders ────────────────────────────────────────────────
+
+    #[test]
+    fn build_ladders_preserves_ladders_order() {
+        let ladders = build_ladders(&["gemini".to_string(), "anthropic".to_string()], &[]).unwrap();
+        let names: Vec<&str> = ladders.iter().map(|l| l.name.as_str()).collect();
         assert_eq!(names, ["gemini", "anthropic"]);
     }
 
-    #[test]
-    fn build_ladders_from_tiers_file_ignores_providers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tiers.yaml");
+    fn write_tiers_file(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
         std::fs::write(
             &path,
             "tiers:\n  - {name: small, description: S}\n  - {name: big, description: B}\n",
         )
         .unwrap();
-        let ladders = build_ladders(Some(&path), &[Provider::OpenAi]).unwrap();
+        path
+    }
+
+    #[test]
+    fn build_ladders_resolves_a_custom_ladder_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tiers_file(dir.path(), "tiers.yaml");
+        let ladders = build_ladders(&["mine".to_string()], &[("mine".to_string(), path)]).unwrap();
         assert_eq!(ladders.len(), 1);
-        assert_eq!(ladders[0].provider, crate::jev::route::CUSTOM_PROVIDER);
+        assert_eq!(ladders[0].name, "mine");
+    }
+
+    #[test]
+    fn build_ladders_combines_a_builtin_and_a_custom_ladder_in_one_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tiers_file(dir.path(), "tiers.yaml");
+        let ladders = build_ladders(
+            &["anthropic".to_string(), "mine".to_string()],
+            &[("mine".to_string(), path)],
+        )
+        .unwrap();
+        let names: Vec<&str> = ladders.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["anthropic", "mine"]);
+    }
+
+    #[test]
+    fn build_ladders_rejects_an_unknown_ladder_name() {
+        let err = build_ladders(&["nope".to_string()], &[]).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("anthropic"), "{text}");
+        assert!(text.contains("openai"), "{text}");
+        assert!(text.contains("gemini"), "{text}");
+    }
+
+    #[test]
+    fn build_ladders_rejects_a_duplicate_ladder_definition_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tiers_file(dir.path(), "tiers.yaml");
+        let err = build_ladders(
+            &["mine".to_string()],
+            &[
+                ("mine".to_string(), path.clone()),
+                ("mine".to_string(), path),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("given more than once"), "{err}");
+    }
+
+    #[test]
+    fn build_ladders_rejects_an_unused_ladder_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tiers_file(dir.path(), "tiers.yaml");
+        let err =
+            build_ladders(&["anthropic".to_string()], &[("mine".to_string(), path)]).unwrap_err();
+        assert!(
+            err.to_string().contains("\"mine\" was never listed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_ladders_rejects_a_ladder_definition_that_shadows_a_builtin_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tiers_file(dir.path(), "tiers.yaml");
+        let err = build_ladders(
+            &["anthropic".to_string()],
+            &[("anthropic".to_string(), path)],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be redefined"), "{err}");
+    }
+
+    #[test]
+    fn build_ladders_rejects_an_invalid_ladder_name_charset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tiers_file(dir.path(), "tiers.yaml");
+        let err = build_ladders(
+            &["My.Ladder".to_string()],
+            &[("My.Ladder".to_string(), path)],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("[a-z0-9_-]+"), "{err}");
     }
 
     #[test]
