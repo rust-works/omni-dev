@@ -85,7 +85,7 @@ use crate::drive::lease::check::{
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
-use crate::drive::sheets::format::parse_hex_color;
+use crate::drive::sheets::format::{format_hex_color, parse_hex_color};
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
@@ -365,6 +365,12 @@ pub struct EmbeddedObjectSummary {
     pub title: Option<String>,
     /// A human-readable rendering of where the object is anchored.
     pub position: String,
+    /// The chart's existing border colour, as `#RRGGBB`. `None` for a
+    /// slicer (no border field on the wire) or a chart with no border set.
+    /// Lets `update-chart-border`'s preview report the colour about to be
+    /// replaced or cleared (issue #1837).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border: Option<String>,
 }
 
 /// What happened (or, under `--dry-run`, would happen).
@@ -845,6 +851,7 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
             Ok(())
         }
         EmbeddedObjectVerb::MoveChart {
+            sheet,
             anchor,
             offset_x,
             offset_y,
@@ -866,9 +873,19 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
                         .to_string(),
                 );
             }
+            // `--sheet` only supplies the prefix `--anchor` doesn't carry
+            // itself; without `--anchor` it has nothing to prefix and would
+            // otherwise be silently ignored. The CLI leaf's `requires =
+            // "anchor"` on `--sheet` already refuses this, but
+            // `validate_verb` is the real gate (see the comment above the
+            // slicer arm's equivalent check).
+            if sheet.is_some() && anchor.is_none() {
+                return Err("--sheet has no effect without --anchor".to_string());
+            }
             Ok(())
         }
         EmbeddedObjectVerb::MoveSlicer {
+            sheet,
             anchor,
             offset_x,
             offset_y,
@@ -887,6 +904,13 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
                      --height"
                         .to_string(),
                 );
+            }
+            // Checked here *and* via `requires = "anchor"` on the CLI
+            // leaf's `--sheet` flag, for the same reason noted throughout
+            // this function: `validate_verb` is the actual gate every
+            // caller funnels through, not just the CLI.
+            if sheet.is_some() && anchor.is_none() {
+                return Err("--sheet has no effect without --anchor".to_string());
             }
             Ok(())
         }
@@ -1448,6 +1472,10 @@ fn summarise_chart(sheet: &Sheet, chart: &EmbeddedChart) -> Option<EmbeddedObjec
         chart_type,
         title: spec.and_then(|s| s.title.clone()),
         position: describe_position(sheet, chart.position.as_ref()),
+        border: chart
+            .border
+            .and_then(|b| b.color_style)
+            .map(|c| format_hex_color(c.rgb_color)),
     })
 }
 
@@ -1459,6 +1487,7 @@ fn summarise_slicer(sheet: &Sheet, slicer: &Slicer) -> Option<EmbeddedObjectSumm
         chart_type: None,
         title: slicer.spec.as_ref().and_then(|s| s.title.clone()),
         position: describe_position(sheet, slicer.position.as_ref()),
+        border: None,
     })
 }
 
@@ -1933,11 +1962,18 @@ fn build_delete_slicer(
 
 // ── move-chart / move-slicer ────────────────────────────────────────────
 
-fn find_sheet_by_id(workbook: &Spreadsheet, sheet_id: i64) -> Option<&Sheet> {
-    workbook
-        .sheets
-        .iter()
-        .find(|sheet| sheet.sheet_id() == Some(sheet_id))
+/// The four independent overlay-resize flags `move-chart`/`move-slicer`
+/// share, grouped into one struct rather than passed as four positional
+/// `Option<i64>`s — `overlay_position_update`/`build_move` each took eight
+/// and twelve positional arguments before this, with no type-level guard
+/// against transposing `offset_x`/`offset_y`/`width`/`height` at a call
+/// site (issue #1837 review).
+#[derive(Debug, Clone, Copy, Default)]
+struct PlacementResize {
+    offset_x: Option<i64>,
+    offset_y: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
 }
 
 /// Merges the caller's overlay overrides onto `existing`, returning the
@@ -1952,16 +1988,12 @@ fn find_sheet_by_id(workbook: &Spreadsheet, sheet_id: i64) -> Option<&Sheet> {
 /// and outside the mask when unset. An object with no current overlay
 /// position (a chart on its own sheet) requires `--anchor` to be moved onto
 /// a grid.
-#[allow(clippy::too_many_arguments)]
 fn overlay_position_update(
     workbook: &Spreadsheet,
     existing: Option<&OverlayPosition>,
     sheet: Option<&str>,
     anchor: Option<&str>,
-    offset_x: Option<i64>,
-    offset_y: Option<i64>,
-    width: Option<i64>,
-    height: Option<i64>,
+    resize: PlacementResize,
 ) -> Result<(EmbeddedObjectPosition, String, i64), EmbeddedObjectResult> {
     let mut fields = Vec::new();
     let anchor_cell = match anchor {
@@ -1978,26 +2010,26 @@ fn overlay_position_update(
     };
     let sheet_id = anchor_cell.sheet_id;
 
-    if offset_x.is_some() {
+    if resize.offset_x.is_some() {
         fields.push("offsetXPixels");
     }
-    if offset_y.is_some() {
+    if resize.offset_y.is_some() {
         fields.push("offsetYPixels");
     }
-    if width.is_some() {
+    if resize.width.is_some() {
         fields.push("widthPixels");
     }
-    if height.is_some() {
+    if resize.height.is_some() {
         fields.push("heightPixels");
     }
 
     let position = EmbeddedObjectPosition {
         overlay_position: Some(OverlayPosition {
             anchor_cell,
-            offset_x_pixels: offset_x,
-            offset_y_pixels: offset_y,
-            width_pixels: width,
-            height_pixels: height,
+            offset_x_pixels: resize.offset_x,
+            offset_y_pixels: resize.offset_y,
+            width_pixels: resize.width,
+            height_pixels: resize.height,
         }),
         ..Default::default()
     };
@@ -2023,23 +2055,20 @@ fn build_move(
     fields: String,
     sheet_id: i64,
     anchor_changed: bool,
-    offset_x: Option<i64>,
-    offset_y: Option<i64>,
-    width: Option<i64>,
-    height: Option<i64>,
+    resize: PlacementResize,
     before: Option<EmbeddedObjectSummary>,
 ) -> Plan {
     let mut changed = Vec::new();
-    if let Some(offset_x) = offset_x {
+    if let Some(offset_x) = resize.offset_x {
         changed.push(format!("offset-x {offset_x}"));
     }
-    if let Some(offset_y) = offset_y {
+    if let Some(offset_y) = resize.offset_y {
         changed.push(format!("offset-y {offset_y}"));
     }
-    if let Some(width) = width {
+    if let Some(width) = resize.width {
         changed.push(format!("width {width}"));
     }
-    if let Some(height) = height {
+    if let Some(height) = resize.height {
         changed.push(format!("height {height}"));
     }
     let suffix = if changed.is_empty() {
@@ -2052,7 +2081,7 @@ fn build_move(
             .overlay_position
             .as_ref()
             .and_then(|overlay| {
-                find_sheet_by_id(workbook, sheet_id)
+                grid_range::find_sheet_by_id(workbook, sheet_id)
                     .map(|sheet| describe_overlay_position(sheet, overlay))
             })
             .unwrap_or_else(|| format!("sheet {sheet_id}"));
@@ -2117,6 +2146,12 @@ fn build_move_chart(
         });
     }
 
+    let resize = PlacementResize {
+        offset_x: *offset_x,
+        offset_y: *offset_y,
+        width: *width,
+        height: *height,
+    };
     let existing_overlay = chart
         .position
         .as_ref()
@@ -2126,10 +2161,7 @@ fn build_move_chart(
         existing_overlay,
         sheet.as_deref(),
         anchor.as_deref(),
-        *offset_x,
-        *offset_y,
-        *width,
-        *height,
+        resize,
     )?;
 
     Ok(build_move(
@@ -2140,10 +2172,7 @@ fn build_move_chart(
         fields,
         sheet_id,
         anchor.is_some(),
-        *offset_x,
-        *offset_y,
-        *width,
-        *height,
+        resize,
         before,
     ))
 }
@@ -2169,6 +2198,12 @@ fn build_move_slicer(
     let (host_sheet, slicer) = find_slicer_or_refuse(workbook, slicer_id)?;
     let before = summarise_slicer(host_sheet, slicer);
 
+    let resize = PlacementResize {
+        offset_x: *offset_x,
+        offset_y: *offset_y,
+        width: *width,
+        height: *height,
+    };
     let existing_overlay = slicer
         .position
         .as_ref()
@@ -2178,10 +2213,7 @@ fn build_move_slicer(
         existing_overlay,
         sheet.as_deref(),
         anchor.as_deref(),
-        *offset_x,
-        *offset_y,
-        *width,
-        *height,
+        resize,
     )?;
 
     Ok(build_move(
@@ -2192,10 +2224,7 @@ fn build_move_slicer(
         fields,
         sheet_id,
         anchor.is_some(),
-        *offset_x,
-        *offset_y,
-        *width,
-        *height,
+        resize,
         before,
     ))
 }
@@ -2370,8 +2399,12 @@ fn object_preview(object: &EmbeddedObjectSummary) -> String {
         .title
         .as_deref()
         .map_or_else(String::new, |t| format!(" '{t}'"));
+    let border = object
+        .border
+        .as_deref()
+        .map_or_else(String::new, |b| format!(", border {b}"));
     format!(
-        "id {}: {kind_detail}{title}, anchored {}",
+        "id {}: {kind_detail}{title}, anchored {}{border}",
         object.object_id, object.position
     )
 }
@@ -3506,10 +3539,27 @@ mod tests {
             chart_type: Some("PIE".to_string()),
             title: Some("Sales".to_string()),
             position: "Q1!C2".to_string(),
+            border: None,
         };
         assert_eq!(
             object_preview(&object),
             "id 5: chart (PIE) 'Sales', anchored Q1!C2"
+        );
+    }
+
+    #[test]
+    fn object_preview_reports_the_chart_border_colour() {
+        let object = EmbeddedObjectSummary {
+            object_id: 5,
+            kind: "chart".to_string(),
+            chart_type: Some("PIE".to_string()),
+            title: Some("Sales".to_string()),
+            position: "Q1!C2".to_string(),
+            border: Some("#4A86E8".to_string()),
+        };
+        assert_eq!(
+            object_preview(&object),
+            "id 5: chart (PIE) 'Sales', anchored Q1!C2, border #4A86E8"
         );
     }
 
@@ -3521,6 +3571,7 @@ mod tests {
             chart_type: None,
             title: None,
             position: "unknown position".to_string(),
+            border: None,
         };
         assert_eq!(
             object_preview(&object),
@@ -5228,6 +5279,39 @@ mod tests {
     }
 
     #[test]
+    fn move_chart_refuses_a_sheet_flag_with_no_anchor() {
+        // `--sheet` only supplies the prefix `--anchor` doesn't carry
+        // itself; without `--anchor` it would otherwise be silently
+        // ignored (issue #1837 review).
+        let verb = move_chart_verb(|verb| {
+            let EmbeddedObjectVerb::MoveChart { width, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+            };
+            *width = Some(480);
+        });
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(
+            err.contains("--sheet has no effect without --anchor"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn move_slicer_refuses_a_sheet_flag_with_no_anchor() {
+        let verb = move_slicer_verb(|verb| {
+            let EmbeddedObjectVerb::MoveSlicer { width, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="move_slicer_verb always builds an EmbeddedObjectVerb::MoveSlicer, so this arm can never run"
+            };
+            *width = Some(480);
+        });
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(
+            err.contains("--sheet has no effect without --anchor"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn move_chart_refuses_new_sheet_combined_with_anchor() {
         let verb = move_chart_verb(|verb| {
             set_move_chart_anchor(verb, "F2");
@@ -5490,6 +5574,7 @@ mod tests {
             chart_type: Some("PIE".to_string()),
             title: Some("Sales".to_string()),
             position: "Q1!C2".to_string(),
+            border: None,
         }
     }
 
