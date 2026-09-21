@@ -202,6 +202,21 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `"frozenRowCount=2, tabColorStyle=#FF8800"`), the same key `format-cells`
   and friends already write, rather than introducing one of its own.
 
+  `update-workbook-properties` (issue #1836,
+  [ADR-0086](adrs/adr-0086-workbook-properties.md)) uses the same kind
+  again, with `operation` of `sheets-update-workbook-properties`. Like
+  `update-sheet-properties` it may set several properties (locale, time
+  zone, auto-recalc, iterative calculation) in one request, so it reuses
+  `fields_changed` rather than a new key, but the summary it writes is a
+  prose join rather than `update-sheet-properties`' `key=value` pairs —
+  e.g. `"locale -> 'en_US', auto-recalc -> ON_CHANGE, iterative calculation
+  -> on (max 50 iterations, threshold 0.01)"`, or `"iterative calculation ->
+  off"` when clearing it — the same string `--dry-run`/the real-run
+  confirmation print, from the one `workbook_properties_summary` helper
+  that builds it. It is the one structural verb with no sheet target at
+  all, so `sheet_id`/`sheet_title` are always absent on its records,
+  unlike every other `sheets-*` operation.
+
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of

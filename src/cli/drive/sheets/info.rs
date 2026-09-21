@@ -51,12 +51,43 @@ async fn run_info(
 /// Renders the workbook as a bespoke header block plus one line per sheet —
 /// a "table" in the sense of "one command, one rendering", matching
 /// `crate::cli::drive::read::render_metadata_table`'s precedent.
+///
+/// The workbook-level properties `update-workbook-properties` can set
+/// (issue #1836) — locale, time zone, recalculation, iterative calculation —
+/// each get their own line, but only when Sheets actually returned the
+/// field: `-o json`/`-o yaml` already surface them unconditionally via
+/// `SpreadsheetProperties`'s own `Serialize` impl, so this table render is
+/// the one place that needs an explicit presence check per field. Iterative
+/// calculation is shown only when *on* — its absence is indistinguishable
+/// from "never fetched" only in principle, since the base `fields` mask
+/// (`api.rs::SPREADSHEET_FIELDS`) always requests it, so an absent value
+/// here means Sheets reported it off, matching how hidden sheets are
+/// flagged but visible ones are not called out.
 fn render_info_table(spreadsheet: &Spreadsheet, out: &mut dyn std::io::Write) -> Result<()> {
     let ctx = "Failed to write sheets info";
     if let Some(id) = &spreadsheet.spreadsheet_id {
         writeln!(out, "Id: {}", sanitize_for_terminal(id)).context(ctx)?;
     }
     writeln!(out, "Title: {}", sanitize_for_terminal(spreadsheet.title())).context(ctx)?;
+    if let Some(properties) = &spreadsheet.properties {
+        if let Some(locale) = &properties.locale {
+            writeln!(out, "Locale: {}", sanitize_for_terminal(locale)).context(ctx)?;
+        }
+        if let Some(time_zone) = &properties.time_zone {
+            writeln!(out, "Time zone: {}", sanitize_for_terminal(time_zone)).context(ctx)?;
+        }
+        if let Some(auto_recalc) = properties.auto_recalc {
+            writeln!(out, "Recalculation: {}", auto_recalc.as_str()).context(ctx)?;
+        }
+        if let Some(settings) = &properties.iterative_calculation_settings {
+            writeln!(
+                out,
+                "Iterative calculation: on{}",
+                settings.describe_bounds()
+            )
+            .context(ctx)?;
+        }
+    }
     writeln!(out, "Sheets: {}", spreadsheet.sheets.len()).context(ctx)?;
 
     for sheet in &spreadsheet.sheets {
@@ -158,6 +189,63 @@ mod tests {
         assert!(text.contains("Sheets: 2"), "{text}");
         assert!(text.contains("  Q1 (1000x26)"), "{text}");
         assert!(text.contains("  Notes [hidden]"), "{text}");
+        // No workbook-property fields set on the fixture above, so none of
+        // their lines appear at all.
+        assert!(!text.contains("Locale:"), "{text}");
+        assert!(!text.contains("Time zone:"), "{text}");
+        assert!(!text.contains("Recalculation:"), "{text}");
+        assert!(!text.contains("Iterative calculation:"), "{text}");
+    }
+
+    #[test]
+    fn render_info_table_shows_workbook_properties_when_present() {
+        use crate::drive::sheets::types::{
+            IterativeCalculationSettings, RecalculationInterval, SpreadsheetProperties,
+        };
+        let spreadsheet = Spreadsheet {
+            spreadsheet_id: Some("s1".to_string()),
+            properties: Some(SpreadsheetProperties {
+                title: "Budget".to_string(),
+                locale: Some("en_US".to_string()),
+                time_zone: Some("America/New_York".to_string()),
+                auto_recalc: Some(RecalculationInterval::Hour),
+                iterative_calculation_settings: Some(IterativeCalculationSettings {
+                    max_iterations: Some(50),
+                    convergence_threshold: Some(0.01),
+                }),
+            }),
+            sheets: vec![sheet("Q1", false, None)],
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        render_info_table(&spreadsheet, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("Locale: en_US"), "{text}");
+        assert!(text.contains("Time zone: America/New_York"), "{text}");
+        assert!(text.contains("Recalculation: HOUR"), "{text}");
+        assert!(
+            text.contains("Iterative calculation: on (max 50 iterations, threshold 0.01)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_info_table_shows_iterative_calculation_on_with_no_explicit_bounds() {
+        use crate::drive::sheets::types::{IterativeCalculationSettings, SpreadsheetProperties};
+        let spreadsheet = Spreadsheet {
+            spreadsheet_id: Some("s1".to_string()),
+            properties: Some(SpreadsheetProperties {
+                title: "Budget".to_string(),
+                iterative_calculation_settings: Some(IterativeCalculationSettings::default()),
+                ..Default::default()
+            }),
+            sheets: Vec::new(),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        render_info_table(&spreadsheet, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("Iterative calculation: on\n"), "{text}");
     }
 
     #[test]
@@ -167,6 +255,7 @@ mod tests {
             spreadsheet_id: Some("s\x1b[31m1".to_string()),
             properties: Some(crate::drive::sheets::types::SpreadsheetProperties {
                 title: "evil\x1b[31mbook".to_string(),
+                locale: Some("en\x1b[31mUS".to_string()),
                 ..Default::default()
             }),
             sheets: vec![sheet("tab\x1b[0mname", false, None)],

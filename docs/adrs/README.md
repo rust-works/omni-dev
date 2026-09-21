@@ -109,3 +109,4 @@ by Michael Nygard.
 | [ADR-0083](adr-0083.md)                                 | ✅ Accepted                              | 2026-09-21 | Permission-Gate Mapping for the Grid-Mutation `batchUpdate` Verbs                           |
 | [ADR-0084](adr-0084-dimension-groups.md)                | ✅ Accepted                              | 2026-09-21 | Dimension Groups (Row/Column Outlining) via `spreadsheets.batchUpdate`                      |
 | [ADR-0085](adr-0085.md)                                 | ✅ Accepted                              | 2026-09-21 | Sheet View Properties via `updateSheetProperties`                                           |
+| [ADR-0086](adr-0086-workbook-properties.md)             | ✅ Accepted                              | 2026-09-22 | Workbook Properties via `updateSpreadsheetProperties`                                       |

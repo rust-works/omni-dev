@@ -186,7 +186,8 @@ impl RecalculationInterval {
 /// indirectly, the same shape of concern ADR-0081 raised for named-range
 /// deletion. It is still gated as `sheets-structure` rather than a data-
 /// mutating operation, because — like a named-range deletion — no cell's
-/// formula is itself changed, only what some formulas compute (issue #1836).
+/// formula is itself changed, only what some formulas compute (issue #1836,
+/// [ADR-0086](../../../docs/adrs/adr-0086-workbook-properties.md) §9).
 ///
 /// `PartialEq`-only, not `Eq`: `convergence_threshold` is an `f64`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
@@ -200,6 +201,29 @@ pub struct IterativeCalculationSettings {
     /// as converged. Omitted in a request takes Sheets' own default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convergence_threshold: Option<f64>,
+}
+
+impl IterativeCalculationSettings {
+    /// A human-readable qualifier for whichever bounds are set, e.g.
+    /// `" (max 50 iterations, threshold 0.01)"` — empty (not just the
+    /// bounds omitted) when both take Sheets' own default. The leading
+    /// space lets every call site append it directly after `"on"`.
+    ///
+    /// Shared by `update-workbook-properties`'s dry-run preview and
+    /// real-run confirmation (`structure.rs::workbook_properties_summary`)
+    /// and `sheets info`'s table render, so the two can never describe the
+    /// same settings differently.
+    #[must_use]
+    pub fn describe_bounds(&self) -> String {
+        match (self.max_iterations, self.convergence_threshold) {
+            (Some(max), Some(threshold)) => {
+                format!(" (max {max} iterations, threshold {threshold})")
+            }
+            (Some(max), None) => format!(" (max {max} iterations)"),
+            (None, Some(threshold)) => format!(" (threshold {threshold})"),
+            (None, None) => String::new(),
+        }
+    }
 }
 
 /// One sheet (tab) within a spreadsheet.
@@ -3127,6 +3151,49 @@ mod tests {
     fn shift_dimension_as_str_matches_the_wire_spelling() {
         assert_eq!(ShiftDimension::Rows.as_str(), "ROWS");
         assert_eq!(ShiftDimension::Columns.as_str(), "COLUMNS");
+    }
+
+    #[test]
+    fn recalculation_interval_as_str_matches_the_wire_spelling() {
+        assert_eq!(
+            RecalculationInterval::Unspecified.as_str(),
+            "RECALCULATION_INTERVAL_UNSPECIFIED"
+        );
+        assert_eq!(RecalculationInterval::OnChange.as_str(), "ON_CHANGE");
+        assert_eq!(RecalculationInterval::Minute.as_str(), "MINUTE");
+        assert_eq!(RecalculationInterval::Hour.as_str(), "HOUR");
+    }
+
+    #[test]
+    fn iterative_calculation_settings_describe_bounds_covers_every_combination() {
+        assert_eq!(
+            IterativeCalculationSettings {
+                max_iterations: Some(50),
+                convergence_threshold: Some(0.01),
+            }
+            .describe_bounds(),
+            " (max 50 iterations, threshold 0.01)"
+        );
+        assert_eq!(
+            IterativeCalculationSettings {
+                max_iterations: Some(50),
+                convergence_threshold: None,
+            }
+            .describe_bounds(),
+            " (max 50 iterations)"
+        );
+        assert_eq!(
+            IterativeCalculationSettings {
+                max_iterations: None,
+                convergence_threshold: Some(0.01),
+            }
+            .describe_bounds(),
+            " (threshold 0.01)"
+        );
+        assert_eq!(
+            IterativeCalculationSettings::default().describe_bounds(),
+            ""
+        );
     }
 
     #[test]
