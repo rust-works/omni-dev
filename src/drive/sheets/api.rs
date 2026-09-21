@@ -24,7 +24,20 @@ use crate::drive::sheets::types::{
 /// every sheet in the response, so on a large workbook the difference
 /// between sending this and not is an out-of-memory failure rather than a
 /// slower request. We only ever need the tab list.
-const SPREADSHEET_FIELDS: &str = "spreadsheetId,properties.title,\
+///
+/// `properties.locale,timeZone,autoRecalc,iterativeCalculationSettings`
+/// (issue #1836's `update-workbook-properties`) ride along on the base mask
+/// rather than getting their own `SPREADSHEET_FIELDS_WITH_*` widening like
+/// every other feature in this file: unlike a `sheets.*` list that grows
+/// with workbook content (protected ranges, charts, named ranges, …), these
+/// are four fixed scalar/small-object fields on the single `properties`
+/// object already fetched for `properties.title`, so including them
+/// unconditionally costs every other caller nothing measurable — and
+/// `structure.rs`'s `structure()` has exactly one `get_spreadsheet` call
+/// site shared by all fifteen `StructureVerb`s, so branching it per verb
+/// would be new complexity for no real savings.
+const SPREADSHEET_FIELDS: &str = "spreadsheetId,\
+    properties(title,locale,timeZone,autoRecalc,iterativeCalculationSettings),\
     sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines))";
 
 /// `fields` mask for `spreadsheets.get` when protected ranges are needed

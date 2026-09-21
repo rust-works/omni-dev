@@ -99,11 +99,107 @@ impl Spreadsheet {
 }
 
 /// Workbook-level properties.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `PartialEq`-only, not `Eq` (issue #1836): [`IterativeCalculationSettings`]
+/// carries an `f64`, which has no meaningful `Eq` — see [`Spreadsheet`]'s own
+/// doc comment for the same reasoning applied to [`Color`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SpreadsheetProperties {
     /// The workbook's display title.
     #[serde(default)]
     pub title: String,
+    /// The workbook's locale, e.g. `"en_US"` (issue #1836's
+    /// `update-workbook-properties --locale`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    /// The workbook's IANA time zone, e.g. `"America/New_York"`
+    /// (`update-workbook-properties --time-zone`).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeZone")]
+    pub time_zone: Option<String>,
+    /// How often the workbook recalculates
+    /// (`update-workbook-properties --auto-recalc`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "autoRecalc"
+    )]
+    pub auto_recalc: Option<RecalculationInterval>,
+    /// Iterative-calculation settings, present only when iterative
+    /// calculation is on (`update-workbook-properties --iterative-calculation`).
+    /// See [`IterativeCalculationSettings`]'s doc comment for why presence,
+    /// not a boolean field, is what "on" means.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "iterativeCalculationSettings"
+    )]
+    pub iterative_calculation_settings: Option<IterativeCalculationSettings>,
+}
+
+/// A workbook's automatic-recalculation interval (`autoRecalc`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RecalculationInterval {
+    /// Sheets' way of saying the field was never set. Never something
+    /// `update-workbook-properties --auto-recalc` writes — see
+    /// [`crate::cli::drive::sheets::structure::AutoRecalcArg`]'s doc comment
+    /// for why the CLI-facing enum omits it.
+    #[serde(rename = "RECALCULATION_INTERVAL_UNSPECIFIED")]
+    Unspecified,
+    /// Recalculate on every edit (Sheets' own default).
+    #[serde(rename = "ON_CHANGE")]
+    OnChange,
+    /// Recalculate at most once a minute.
+    #[serde(rename = "MINUTE")]
+    Minute,
+    /// Recalculate at most once an hour.
+    #[serde(rename = "HOUR")]
+    Hour,
+}
+
+impl RecalculationInterval {
+    /// The wire spelling, also reused in human-readable output (the
+    /// `update-workbook-properties` dry-run preview, the real-run
+    /// confirmation, and the request log's `fields_changed`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "RECALCULATION_INTERVAL_UNSPECIFIED",
+            Self::OnChange => "ON_CHANGE",
+            Self::Minute => "MINUTE",
+            Self::Hour => "HOUR",
+        }
+    }
+}
+
+/// A workbook's iterative-calculation settings (`iterativeCalculationSettings`).
+///
+/// Sheets has no boolean "enabled" field: this object's mere *presence* on
+/// [`SpreadsheetProperties`] is what turns iterative calculation on, and its
+/// *absence* is what turns it off. `update-workbook-properties
+/// --iterative-calculation off` therefore clears the field entirely (an
+/// absent key in the field-masked request, via
+/// [`SpreadsheetPropertiesUpdate::iterative_calculation_settings`]) rather
+/// than writing some "disabled" value into it — there is no such value.
+///
+/// Turning iterative calculation on changes what a circular-reference
+/// formula elsewhere in the workbook *evaluates to*: a value effect reached
+/// indirectly, the same shape of concern ADR-0081 raised for named-range
+/// deletion. It is still gated as `sheets-structure` rather than a data-
+/// mutating operation, because — like a named-range deletion — no cell's
+/// formula is itself changed, only what some formulas compute (issue #1836).
+///
+/// `PartialEq`-only, not `Eq`: `convergence_threshold` is an `f64`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct IterativeCalculationSettings {
+    /// Maximum number of calculation rounds per recalculation. Omitted in a
+    /// request takes Sheets' own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<i64>,
+    /// The maximum change between two consecutive rounds that still counts
+    /// as converged. Omitted in a request takes Sheets' own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_threshold: Option<f64>,
 }
 
 /// One sheet (tab) within a spreadsheet.
@@ -459,6 +555,14 @@ pub enum BatchUpdateRequestItem {
     /// populated, one entry per field, so it can never blank a property it
     /// didn't mean to touch.
     UpdateSheetProperties(UpdateSheetPropertiesRequest),
+    /// Change workbook-level properties — locale, time zone, auto-recalc
+    /// and/or iterative calculation (`update-workbook-properties`, issue
+    /// #1836). Gated by
+    /// [`crate::drive::write_gate::DriveOperation::SheetsStructure`], like
+    /// [`Self::UpdateSheetProperties`]: no cell's formula changes, only
+    /// (for iterative calculation) what some formulas compute — see
+    /// [`IterativeCalculationSettings`]'s doc comment.
+    UpdateSpreadsheetProperties(UpdateSpreadsheetPropertiesRequest),
     /// Insert empty rows or columns, shifting existing ones.
     InsertDimension(InsertDimensionRequest),
     /// Delete an entire sheet from the workbook.
@@ -682,6 +786,64 @@ pub struct UpdateSheetPropertiesRequest {
     pub properties: SheetPropertiesUpdate,
     /// The field mask limiting what this request may change.
     pub fields: String,
+}
+
+/// `UpdateSpreadsheetPropertiesRequest` (`update-workbook-properties`, issue
+/// #1836).
+///
+/// Same field-mask discipline as [`UpdateSheetPropertiesRequest`]: `fields`
+/// is not optional, and `structure.rs::build_request` is the single place
+/// that pairs it with [`SpreadsheetPropertiesUpdate`] so the two can never
+/// drift apart. Unlike a sheet-properties update this one has no id to
+/// select a target — the workbook itself is the target, addressed by the
+/// `spreadsheetId` already in the URL.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UpdateSpreadsheetPropertiesRequest {
+    /// The properties to write.
+    pub properties: SpreadsheetPropertiesUpdate,
+    /// The field mask limiting what this request may change.
+    pub fields: String,
+}
+
+/// The mutable subset of a workbook's properties this crate can set
+/// (`update-workbook-properties`, issue #1836).
+///
+/// Deliberately not [`SpreadsheetProperties`] itself, for the same reason
+/// [`SheetPropertiesUpdate`] is not [`SheetProperties`]: reusing the response
+/// type would serialise whatever else it happened to carry, and a field mask
+/// widened by accident is how an unintended property gets overwritten. Every
+/// field is independently optional and `structure.rs::build_request` names
+/// in `fields` exactly the ones the caller actually set — never more, since
+/// an unset field named in the mask would blank it rather than leave it
+/// alone.
+///
+/// `iterative_calculation_settings` is `None` both when the caller never
+/// touched iterative calculation (in which case `fields` omits
+/// `iterativeCalculationSettings` and this value is never serialised) and
+/// when the caller explicitly turned it off (in which case `fields` *does*
+/// name it, so the omitted key clears the property) — `structure.rs`'s
+/// `IterativeCalculationToggle` is what tells the two apart before the mask
+/// is built. `PartialEq`-only, not `Eq`, for the same reason
+/// [`IterativeCalculationSettings`] is.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct SpreadsheetPropertiesUpdate {
+    /// The new locale, for `--locale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    /// The new time zone, for `--time-zone`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "timeZone")]
+    pub time_zone: Option<String>,
+    /// The new recalculation interval, for `--auto-recalc`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "autoRecalc")]
+    pub auto_recalc: Option<RecalculationInterval>,
+    /// The new iterative-calculation settings, for `--iterative-calculation
+    /// on`; `None` to leave it untouched *or* to turn it off — see this
+    /// struct's own doc comment for how `fields` disambiguates the two.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "iterativeCalculationSettings"
+    )]
+    pub iterative_calculation_settings: Option<IterativeCalculationSettings>,
 }
 
 /// Body of `spreadsheets.sheets.copyTo`.
