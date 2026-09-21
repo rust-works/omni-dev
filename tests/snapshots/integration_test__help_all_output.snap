@@ -4517,6 +4517,7 @@ Commands:
   cut-paste                    Moves a range to a destination cell, clearing the source. Gated by **both** the folder write-permission rules' `sheets-write` and `sheets-structure` operations, whatever `--paste-type` names (issue #1839, ADR-0083 §4): the source is cleared in full regardless of what is pasted
   copy-paste                   Copies a range to a destination, spilling a larger source past the destination's end or repeating a smaller one to fill it. Gated by `--paste-type` (issue #1839, ADR-0083 §4): a value-only type needs `sheets-write` alone, a presentation-only type `sheets-structure` alone, and `normal` (the default) needs both
   paste-data                   Pastes delimited text into a range anchored at a destination cell, as if pasted from the clipboard (issue #1839, ADR-0083 §4). `delimiter`-form only. Same `--paste-type` gate mapping as `copy-paste`
+  auto-fill                    Extends a series from source cells into an adjacent destination, using Sheets' own pattern-detection heuristics. Gated by the folder write-permission rules' `sheets-write` operation (issue #1840, ADR-0083 §1) — it writes ordinary cell content, doing nothing a `sheets clear` followed by a `sheets write` could not already do under the same grant. The filled values can never be previewed; see `auto-fill --help`
   help                         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -4834,6 +4835,30 @@ Options:
       --lease <TOKEN>                  The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                           Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets auto-fill - Extends a series from source cells into an adjacent destination, using Sheets' own pattern-detection heuristics. Gated by the folder write-permission rules' `sheets-write` operation (issue #1840, ADR-0083 §1) — it writes ordinary cell content, doing nothing a `sheets clear` followed by a `sheets write` could not already do under the same grant. The filled values can never be previewed; see `auto-fill --help`
+
+Extends a series from source cells into an adjacent destination, using Sheets' own pattern-detection heuristics. Gated by the folder write-permission rules' `sheets-write` operation (issue #1840, ADR-0083 §1) — it writes ordinary cell content, doing nothing a `sheets clear` followed by a `sheets write` could not already do under the same grant. The filled values can never be previewed; see `auto-fill --help`
+
+Usage: auto-fill [OPTIONS] <--range <A1>|--source <A1>> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>           Sheet (tab) title. Supplies the prefix for a bare `--range`/ `--source`
+      --range <A1>             Form A: the whole region, optionally carrying its own `Sheet!` prefix. Sheets examines it and decides for itself which cells are the source and which are filled — so the destination reported by `--dry-run` is only ever an upper bound on what will be overwritten
+      --source <A1>            Form B: the cells holding the series to extend, optionally carrying its own `Sheet!` prefix. Requires `--dimension` and `--fill-length`
+      --dimension <DIMENSION>  Form B: which axis `--fill-length` extends `--source` along [possible values: rows, columns]
+      --fill-length <N>        Form B: how many rows/columns to fill, extending from `--source`'s edge. Negative fills backward (up or left) instead of forward (down or right)
+      --alternate-series       Fills using the alternate series Sheets would not otherwise choose — e.g. a copy instead of a linear progression for a plain numeric run, or vice versa
+      --dry-run                Reports the gate verdict, the destination range, and the count and A1 locations of the non-blank cells that would be overwritten — never the values Sheets would fill, which cannot be previewed
+      --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
 
 
 ================================================================================

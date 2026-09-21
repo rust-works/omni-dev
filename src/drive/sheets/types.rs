@@ -786,6 +786,14 @@ pub enum BatchUpdateRequestItem {
     /// the API's `html` alternative is a documented cut (ADR-0083 §4). Same
     /// `pasteType` gate mapping as [`Self::CopyPaste`].
     PasteData(PasteDataRequest),
+    /// Extend a series from source cells into an adjacent destination,
+    /// using Sheets' own pattern-detection heuristics (`auto-fill`, issue
+    /// #1840, [ADR-0083](../../../docs/adrs/adr-0083.md) §1). Gated by
+    /// `DriveOperation::SheetsWrite` alone: it writes ordinary cell
+    /// content into a range, doing nothing a `sheets clear` followed by a
+    /// `sheets write` of the same range could not already do under the
+    /// same grant.
+    AutoFill(AutoFillRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -3041,6 +3049,58 @@ pub struct PasteDataRequest {
     pub r#type: PasteType,
 }
 
+/// `AutoFillRequest` — the crate's only `autoFill` request (issue #1840,
+/// [ADR-0083](../../../docs/adrs/adr-0083.md) §1).
+///
+/// Extends a series from source cells into an adjacent destination,
+/// computed entirely by Sheets' own pattern-detection heuristics: this
+/// crate never sees or predicts the filled *values* — see `auto_fill.rs`'s
+/// module docs for what `--dry-run` can and cannot say about it.
+///
+/// Exactly one of [`Self::range`]/[`Self::source_and_destination`] is set,
+/// mirroring the API's own oneof; `auto_fill.rs::build_request` is the one
+/// site that enforces it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AutoFillRequest {
+    /// Form A (`--range`): the whole region. Sheets examines it and
+    /// decides for itself which cells are the source and which are
+    /// filled — so, unlike form B, the destination this writes is only
+    /// ever knowable as an upper bound before the request is sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<GridRange>,
+    /// Form B (`--source`/`--dimension`/`--fill-length`): an explicit
+    /// source range extended by a caller-chosen length and direction, so
+    /// the destination is computable client-side.
+    #[serde(
+        rename = "sourceAndDestination",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_and_destination: Option<SourceAndDestination>,
+    /// Fills using the alternate series Sheets would not otherwise choose
+    /// (`--alternate-series`) — e.g. a copy instead of a linear
+    /// progression for a plain numeric run, or vice versa. Always sent
+    /// explicitly, matching this file's other always-present booleans
+    /// (e.g. [`DimensionGroup::collapsed`]) rather than being omitted when
+    /// `false`.
+    #[serde(rename = "useAlternateSeries")]
+    pub use_alternate_series: bool,
+}
+
+/// [`AutoFillRequest`]'s form-B payload.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SourceAndDestination {
+    /// The cells holding the series to extend.
+    pub source: GridRange,
+    /// Which axis [`Self::fill_length`] extends along.
+    pub dimension: Dimension,
+    /// How many rows/columns to fill, extending from `source`'s edge.
+    /// **Negative fills backward** (up or left) instead of forward (down
+    /// or right) — the API's own documented convention. Never `0`;
+    /// `auto_fill.rs` refuses that before building this request.
+    #[serde(rename = "fillLength")]
+    pub fill_length: i64,
+}
+
 /// Response to `spreadsheets.batchUpdate`.
 ///
 /// Only `replies` is modelled, and only the `addSheet` arm of it: the new
@@ -3603,6 +3663,74 @@ mod tests {
         assert!(!PasteType::Formula.writes_presentation());
         assert!(!PasteType::Format.writes_values());
         assert!(PasteType::Format.writes_presentation());
+    }
+
+    #[test]
+    fn auto_fill_serializes_the_range_form_with_no_source_and_destination_key() {
+        let request = BatchUpdateRequestItem::AutoFill(AutoFillRequest {
+            range: Some(GridRange {
+                sheet_id: 0,
+                start_row_index: Some(0),
+                end_row_index: Some(10),
+                start_column_index: Some(0),
+                end_column_index: Some(1),
+            }),
+            source_and_destination: None,
+            use_alternate_series: false,
+        });
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "autoFill": {
+                    "range": {
+                        "sheetId": 0,
+                        "startRowIndex": 0,
+                        "endRowIndex": 10,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 1,
+                    },
+                    "useAlternateSeries": false,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn auto_fill_serializes_the_source_and_destination_form_with_no_range_key() {
+        let request = BatchUpdateRequestItem::AutoFill(AutoFillRequest {
+            range: None,
+            source_and_destination: Some(SourceAndDestination {
+                source: GridRange {
+                    sheet_id: 0,
+                    start_row_index: Some(0),
+                    end_row_index: Some(3),
+                    start_column_index: Some(0),
+                    end_column_index: Some(1),
+                },
+                dimension: Dimension::Rows,
+                fill_length: -2,
+            }),
+            use_alternate_series: true,
+        });
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "autoFill": {
+                    "sourceAndDestination": {
+                        "source": {
+                            "sheetId": 0,
+                            "startRowIndex": 0,
+                            "endRowIndex": 3,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 1,
+                        },
+                        "dimension": "ROWS",
+                        "fillLength": -2,
+                    },
+                    "useAlternateSeries": true,
+                },
+            })
+        );
     }
 
     #[test]

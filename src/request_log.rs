@@ -1516,6 +1516,14 @@ pub struct DriveMutationOutcome {
     /// request that destroys data, so its record says exactly what was
     /// lost rather than only that a merge happened.
     pub discarded_cells: Vec<String>,
+    /// `auto-fill` only (issue #1840, [ADR-0083](../docs/adrs/adr-0083.md)
+    /// §6): the non-blank cells in the destination range that were (or,
+    /// under `--dry-run`, would be) overwritten, as **bare A1 addresses**
+    /// — deliberately not `"A1: value"` like [`Self::discarded_cells`],
+    /// since a fill's values are Sheets' own series detection and this
+    /// crate never sees them, before or after the request. Empty when the
+    /// destination has no non-blank cells, and for every other verb.
+    pub overwritten_cells: Vec<String>,
     /// The data validation condition type a `set-data-validation` applied
     /// (issue #1643) — `"ONE_OF_LIST"`, `"NUMBER_BETWEEN"`, `"BOOLEAN"`,
     /// `"CUSTOM_FORMULA"` — or `"cleared"` for `clear-data-validation`.
@@ -1691,6 +1699,12 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
         context.insert(
             "discarded_cells".to_string(),
             outcome.discarded_cells.join("; "),
+        );
+    }
+    if !outcome.overwritten_cells.is_empty() {
+        context.insert(
+            "overwritten_cells".to_string(),
+            outcome.overwritten_cells.join(", "),
         );
     }
     if let Some(validation_type) = outcome.validation_type {
