@@ -602,6 +602,24 @@ mod tests {
         )
         .await
         .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::AutoFill(auto_fill::AutoFillCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: Some("Sheet1".to_string()),
+                range: Some("A1:A3".to_string()),
+                source: None,
+                dimension: None,
+                fill_length: None,
+                alternate_series: false,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]

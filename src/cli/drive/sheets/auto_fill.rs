@@ -148,7 +148,103 @@ async fn run_auto_fill(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::utils::secret::Secret;
     use clap::CommandFactory;
+
+    async fn client(server: &wiremock::MockServer) -> DriveClient {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"access_token": "test-token", "expires_in": 3600}),
+            ))
+            .mount(server)
+            .await;
+        let credentials = DriveCredentials {
+            client_id: "client-1".into(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        };
+        let mut client = DriveClient::new(&server.uri(), &credentials).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut client,
+            &credentials,
+            &format!("{}/token", server.uri()),
+        );
+        client
+    }
+
+    #[tokio::test]
+    async fn both_cli_forms_reach_the_gate_and_render_table_and_json() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        let server = wiremock::MockServer::start().await;
+        let client = client(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1", "name": "Budget",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": ["folder-1"],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1", "name": "folder-1",
+                    "mimeType": "application/vnd.google-apps.folder", "parents": [],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let range = AutoFillCommand::try_parse_from([
+            "auto-fill",
+            "sheet-1",
+            "--sheet",
+            "Q1",
+            "--range",
+            "A1:A3",
+            "--dry-run",
+            "--output",
+            "table",
+        ])
+        .unwrap();
+        range.execute(&client).await.unwrap();
+
+        let source = AutoFillCommand::try_parse_from([
+            "auto-fill",
+            "sheet-1",
+            "--source",
+            "Q1!A1:A3",
+            "--dimension",
+            "rows",
+            "--fill-length",
+            "-1",
+            "--alternate-series",
+            "--dry-run",
+            "--output",
+            "json",
+        ])
+        .unwrap();
+        source.execute(&client).await.unwrap();
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == "/drive/v3/files/sheet-1")
+                .count(),
+            2
+        );
+    }
 
     #[test]
     fn range_and_source_are_mutually_exclusive() {

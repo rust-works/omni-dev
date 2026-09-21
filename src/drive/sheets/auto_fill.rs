@@ -606,7 +606,7 @@ fn compute_destination(
         if new_start < 0 {
             return Err(format!(
                 "--fill-length {fill_length} would fill {} {}(s) before the start of the sheet",
-                -new_start,
+                new_start.unsigned_abs(),
                 dimension.noun()
             ));
         }
@@ -985,6 +985,67 @@ mod tests {
         let source = bounded(0, i64::MAX - 1, i64::MAX, 0, 1);
         let err = compute_destination(source, Dimension::Rows, i64::MAX).unwrap_err();
         assert!(err.contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn compute_destination_refuses_an_unbounded_axis_and_backward_overflow() {
+        let unbounded = GridRange {
+            sheet_id: 0,
+            ..Default::default()
+        };
+        assert!(compute_destination(unbounded, Dimension::Columns, 1)
+            .unwrap_err()
+            .contains("fully bounded"));
+        assert!(
+            compute_destination(bounded(0, 0, 1, 0, 1), Dimension::Rows, i64::MIN)
+                .unwrap_err()
+                .contains("9223372036854775808 row(s) before the start")
+        );
+        assert!(
+            compute_destination(bounded(0, -1, 1, 0, 1), Dimension::Rows, i64::MIN)
+                .unwrap_err()
+                .contains("out of range")
+        );
+    }
+
+    #[test]
+    fn lease_refusals_map_to_their_auto_fill_results() {
+        assert_eq!(
+            AutoFillResult::from_lease_expired(),
+            AutoFillResult::RefusedLeaseExpired
+        );
+        assert_eq!(
+            AutoFillResult::from_lease_wrong_file(),
+            AutoFillResult::RefusedLeaseWrongFile
+        );
+        assert_eq!(
+            AutoFillResult::from_lease_stale(),
+            AutoFillResult::RefusedLeaseStale
+        );
+        assert_eq!(
+            AutoFillResult::from_lease_failed("ledger unavailable".into()),
+            AutoFillResult::Failed {
+                detail: "ledger unavailable".into()
+            }
+        );
+    }
+
+    #[test]
+    fn jsonl_outcome_serializes_one_record_without_the_input_form() {
+        let outcome = AutoFillOutcome {
+            spreadsheet_id: "sheet-1".into(),
+            file_name: None,
+            resolved_folder_id: None,
+            sheet_id: None,
+            form: range_form(),
+            result: AutoFillResult::RefusedShortcut,
+        };
+        let mut out = Vec::new();
+        outcome.write_jsonl(&mut out).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["result"]["status"], "refused-shortcut");
+        assert!(value.get("form").is_none());
+        assert_eq!(std::str::from_utf8(&out).unwrap().lines().count(), 1);
     }
 
     fn sheet_with_extent(row_count: i64, column_count: i64) -> Sheet {
@@ -1385,6 +1446,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn describe_handles_missing_metadata_and_identifies_a_deciding_rule() {
+        let base = AutoFillOutcome {
+            spreadsheet_id: "sheet-1".into(),
+            file_name: None,
+            resolved_folder_id: None,
+            sheet_id: None,
+            form: range_form(),
+            result: AutoFillResult::RefusedSheetNotFound {
+                title: "Missing".into(),
+                available: Vec::new(),
+            },
+        };
+        assert!(describe(&base).contains("Available: none"));
+        assert!(describe(&base).contains("'sheet-1'"));
+
+        let blocked = AutoFillOutcome {
+            result: AutoFillResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".into(),
+                    depth: 1,
+                }),
+            },
+            ..base
+        };
+        assert!(describe(&blocked).contains("folder-1"));
+    }
+
     fn range_form() -> AutoFillForm {
         AutoFillForm::Range {
             sheet: Some("Q1".to_string()),
@@ -1511,6 +1600,163 @@ mod tests {
         let opts = base_opts(range_form(), false);
         let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, AutoFillResult::Blocked { .. }));
+    }
+
+    #[tokio::test]
+    async fn invalid_composed_range_is_refused_before_fetching_metadata() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let form = AutoFillForm::Range {
+            sheet: Some("Q1".into()),
+            range: Some("Other!A1:A2".into()),
+        };
+        let outcome = auto_fill_inner(&drive, &sheets, &base_opts(form, true), &[]).await;
+        assert!(matches!(
+            outcome.result,
+            AutoFillResult::RefusedInvalidRange { .. }
+        ));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.url.path() != "/drive/v3/files/sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn target_resolution_refusals_keep_the_target_name() {
+        for (mime, parents, expected) in [
+            (
+                crate::drive::types::GOOGLE_SHORTCUT_MIME_TYPE,
+                vec!["folder-1"],
+                "shortcut",
+            ),
+            ("application/pdf", vec!["folder-1"], "not-spreadsheet"),
+            (
+                crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                vec![],
+                "no-parents",
+            ),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            let (drive, sheets) = clients(&server).await;
+            mount_file("sheet-1", mime, &parents).mount(&server).await;
+            let outcome =
+                auto_fill_inner(&drive, &sheets, &base_opts(range_form(), true), &[]).await;
+            assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+            assert!(outcome.sheet_id.is_none());
+            assert!(
+                match expected {
+                    "shortcut" => matches!(outcome.result, AutoFillResult::RefusedShortcut),
+                    "not-spreadsheet" => matches!(
+                        outcome.result,
+                        AutoFillResult::RefusedNotASpreadsheet { .. }
+                    ),
+                    _ => matches!(outcome.result, AutoFillResult::RefusedNoVisibleParents),
+                },
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_and_workbook_failures_are_reported_at_their_respective_stages() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let outcome = auto_fill_inner(&drive, &sheets, &base_opts(range_form(), true), &[]).await;
+        assert!(matches!(outcome.result, AutoFillResult::Failed { .. }));
+        assert!(outcome.file_name.is_none());
+
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let outcome = auto_fill_inner(
+            &drive,
+            &sheets,
+            &base_opts(range_form(), true),
+            &[allow_rule("folder-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, AutoFillResult::Failed { .. }));
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn a_folder_lookup_failure_preserves_the_target_name() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let outcome = auto_fill_inner(
+            &drive,
+            &sheets,
+            &base_opts(range_form(), true),
+            &[allow_rule("folder-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, AutoFillResult::Failed { .. }));
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+        assert!(outcome.sheet_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn backward_fill_before_the_sheet_start_is_refused_before_values_get() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = auto_fill_inner(
+            &drive,
+            &sheets,
+            &base_opts(source_and_destination_form(Dimension::Rows, -1), true),
+            &[allow_rule("folder-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            AutoFillResult::RefusedInvalidRange { .. }
+        ));
+        assert_eq!(outcome.sheet_id, Some(0));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| !r.url.path().contains("/values/")));
     }
 
     #[tokio::test]
