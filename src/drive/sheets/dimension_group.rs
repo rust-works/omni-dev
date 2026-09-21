@@ -1064,6 +1064,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_span_checks_the_columns_extent_too() {
+        let sheet = sheet_with_row_groups(0, Vec::new());
+        let err = validate_span(Dimension::Columns, 20, 30, &sheet, 0).unwrap_err();
+        assert!(err.contains("past the end") && err.contains("26"), "{err}");
+
+        let result = validate_span(Dimension::Columns, 20, 26, &sheet, 0).unwrap();
+        assert_eq!(result, range(0, Dimension::Columns, 19, 26));
+    }
+
+    #[test]
+    fn validate_span_allows_any_span_when_the_sheet_extent_is_unknown() {
+        let sheet = Sheet {
+            properties: Some(SheetProperties {
+                sheet_id: Some(0),
+                title: "Q1".to_string(),
+                index: Some(0),
+                hidden: None,
+                grid_properties: None,
+            }),
+            ..Default::default()
+        };
+        let result = validate_span(Dimension::Rows, 1, 1_000_000, &sheet, 0).unwrap();
+        assert_eq!(result, range(0, Dimension::Rows, 0, 1_000_000));
+    }
+
+    #[test]
     fn validate_span_converts_one_based_inclusive_to_zero_based_half_open() {
         let sheet = sheet_with_row_groups(0, Vec::new());
         let result = validate_span(Dimension::Rows, 5, 7, &sheet, 0).unwrap();
@@ -2156,6 +2182,20 @@ mod tests {
             DimensionGroupResult::Blocked { decided_by: None },
         );
         assert!(describe(&without_rule).contains("default policy"));
+
+        let with_folder_rule = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            DimensionGroupResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 2,
+                }),
+            },
+        );
+        let text = describe(&with_folder_rule);
+        assert!(text.contains("update-dimension-group"), "{text}");
+        assert!(text.contains("folder folder-1 (depth 2)"), "{text}");
     }
 
     #[test]
@@ -2205,6 +2245,16 @@ mod tests {
             },
         );
         assert_eq!(describe(&out), "Failed: boom");
+    }
+
+    #[test]
+    fn from_lease_failed_maps_to_the_failed_variant() {
+        assert_eq!(
+            <DimensionGroupResult as FromLeaseRefusal>::from_lease_failed("boom".to_string()),
+            DimensionGroupResult::Failed {
+                detail: "boom".to_string()
+            }
+        );
     }
 
     #[test]
