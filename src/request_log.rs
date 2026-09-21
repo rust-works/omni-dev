@@ -2903,6 +2903,32 @@ mod tests {
     }
 
     #[test]
+    fn auto_fill_record_includes_only_overwritten_addresses() {
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "sheets-auto-fill",
+                file_id: "sheet-1".into(),
+                file_name: "Budget".into(),
+                status: "changed".into(),
+                range: Some("'Q1'!A4:A5".into()),
+                overwritten_cells: vec!["A4".into(), "A5".into()],
+                duration: Duration::from_millis(1),
+                ..Default::default()
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(
+            rec.context.get("overwritten_cells").map(String::as_str),
+            Some("A4, A5")
+        );
+        assert_eq!(
+            rec.context.get("range").map(String::as_str),
+            Some("'Q1'!A4:A5")
+        );
+        assert_eq!(rec.context.get("updated_cells"), None);
+    }
+
+    #[test]
     fn record_kind_drive_mutation_serializes_as_drivemutation_and_round_trips() {
         let rec = build_drive_mutation_record(
             DriveMutationOutcome {
