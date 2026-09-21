@@ -1,6 +1,7 @@
 //! CLI commands for `omni-dev drive sheets add-chart`/`update-chart`/
 //! `delete-chart`/`list-charts`/`add-slicer`/`update-slicer`/
-//! `delete-slicer`/`list-slicers` (issue #1797).
+//! `delete-slicer`/`list-slicers` (issue #1797), and `move-chart`/
+//! `move-slicer` (issue #1837).
 //!
 //! Every mutating verb here is gated by
 //! [`DriveOperation::SheetsStructure`](crate::drive::write_gate::DriveOperation::SheetsStructure)
@@ -9,8 +10,15 @@
 //!
 //! **Chart subset (v1):** `column`, `bar`, `line`, `area`, `scatter`, and
 //! `pie`. See `embedded_object.rs`'s module docs for the full list of
-//! documented cuts (COMBO/STEPPED_AREA charts, moving/resizing an existing
-//! object, borders, condition-based slicer criteria).
+//! documented cuts (COMBO/STEPPED_AREA charts, chart/slicer borders,
+//! condition-based slicer criteria) — moving/resizing an existing object,
+//! previously on that list, is what issue #1837 adds here.
+//!
+//! **`move-chart`/`move-slicer`'s field mask is rooted at
+//! `overlayPosition`, not `newPosition`** — see
+//! `embedded_object.rs::overlay_position_update`'s doc comment for the API
+//! rule behind it, and why a resize-only move still carries the object's
+//! current anchor forward on the wire even though the mask never names it.
 
 use anyhow::Result;
 use clap::Parser;
@@ -583,6 +591,159 @@ impl ListSlicersCommand {
     }
 }
 
+/// Moves and/or resizes an existing chart (`updateEmbeddedObjectPosition`,
+/// issue #1837). Every flag is optional — unlike `add-chart`, which
+/// requires one of `--anchor`/`--new-sheet` — since "leave it where it is
+/// and only resize" is a valid call.
+#[derive(Parser)]
+pub struct MoveChartCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Which chart to move, discovered via `list-charts`.
+    #[arg(long, value_name = "ID")]
+    pub chart_id: i64,
+
+    /// Sheet title, supplying the prefix for `--anchor` when it doesn't
+    /// carry its own.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: Option<String>,
+
+    /// The new anchor cell, e.g. `F2`. Required to move a chart that
+    /// currently occupies its own sheet.
+    #[arg(long, value_name = "A1", conflicts_with = "new_sheet")]
+    pub anchor: Option<String>,
+
+    /// Additional horizontal offset from the anchor cell, in pixels.
+    #[arg(long, value_name = "PX", conflicts_with = "new_sheet")]
+    pub offset_x: Option<i64>,
+
+    /// Additional vertical offset from the anchor cell, in pixels.
+    #[arg(long, value_name = "PX", conflicts_with = "new_sheet")]
+    pub offset_y: Option<i64>,
+
+    /// The chart's new width in pixels.
+    #[arg(long, value_name = "PX", conflicts_with = "new_sheet")]
+    pub width: Option<i64>,
+
+    /// The chart's new height in pixels.
+    #[arg(long, value_name = "PX", conflicts_with = "new_sheet")]
+    pub height: Option<i64>,
+
+    /// Move the chart onto a brand-new sheet of its own, instead of
+    /// anchoring it to an existing one. Mutually exclusive with every other
+    /// placement flag.
+    #[arg(long)]
+    pub new_sheet: bool,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl MoveChartCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: EmbeddedObjectVerb::MoveChart {
+                chart_id: self.chart_id,
+                sheet: self.sheet,
+                anchor: self.anchor,
+                offset_x: self.offset_x,
+                offset_y: self.offset_y,
+                width: self.width,
+                height: self.height,
+                new_sheet: self.new_sheet,
+            },
+            dry_run: self.dry_run,
+            lease_token: self.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+        };
+        run_embedded_object(client, &opts, &self.output).await
+    }
+}
+
+/// Moves and/or resizes an existing slicer. See [`MoveChartCommand`]'s doc
+/// comment; a slicer has no own-sheet placement, so there is no
+/// `--new-sheet`.
+#[derive(Parser)]
+pub struct MoveSlicerCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Which slicer to move, discovered via `list-slicers`.
+    #[arg(long, value_name = "ID")]
+    pub slicer_id: i64,
+
+    /// Sheet title, supplying the prefix for `--anchor` when it doesn't
+    /// carry its own.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: Option<String>,
+
+    /// The new anchor cell, e.g. `F2`.
+    #[arg(long, value_name = "A1")]
+    pub anchor: Option<String>,
+
+    /// Additional horizontal offset from the anchor cell, in pixels.
+    #[arg(long, value_name = "PX")]
+    pub offset_x: Option<i64>,
+
+    /// Additional vertical offset from the anchor cell, in pixels.
+    #[arg(long, value_name = "PX")]
+    pub offset_y: Option<i64>,
+
+    /// The slicer's new width in pixels.
+    #[arg(long, value_name = "PX")]
+    pub width: Option<i64>,
+
+    /// The slicer's new height in pixels.
+    #[arg(long, value_name = "PX")]
+    pub height: Option<i64>,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl MoveSlicerCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: EmbeddedObjectVerb::MoveSlicer {
+                slicer_id: self.slicer_id,
+                sheet: self.sheet,
+                anchor: self.anchor,
+                offset_x: self.offset_x,
+                offset_y: self.offset_y,
+                width: self.width,
+                height: self.height,
+            },
+            dry_run: self.dry_run,
+            lease_token: self.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+        };
+        run_embedded_object(client, &opts, &self.output).await
+    }
+}
+
 fn describe_summary_line(object: &EmbeddedObjectSummary) -> String {
     let kind = object
         .chart_type
@@ -901,6 +1062,63 @@ mod tests {
             output: OutputFormat::Table,
         };
         assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn move_chart_command_reports_blocked_with_no_rules() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        for output in [OutputFormat::Table, OutputFormat::Json] {
+            let cmd = MoveChartCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                chart_id: 1,
+                sheet: None,
+                anchor: Some("F2".to_string()),
+                offset_x: None,
+                offset_y: None,
+                width: None,
+                height: None,
+                new_sheet: false,
+                dry_run: false,
+                lease: lease_arg(),
+                output,
+            };
+            assert!(cmd.execute(&client).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn move_slicer_command_reports_blocked_with_no_rules() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        for output in [OutputFormat::Table, OutputFormat::Json] {
+            let cmd = MoveSlicerCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                slicer_id: 1,
+                sheet: None,
+                anchor: Some("F2".to_string()),
+                offset_x: None,
+                offset_y: None,
+                width: None,
+                height: None,
+                dry_run: false,
+                lease: lease_arg(),
+                output,
+            };
+            assert!(cmd.execute(&client).await.is_ok());
+        }
     }
 
     #[tokio::test]

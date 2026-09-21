@@ -173,6 +173,13 @@ pub enum DriveOperation {
     /// Sheets API, so this capability can lose data at the grid edge even
     /// though it destroys none within it.
     ///
+    /// Since issue #1837, also moving/resizing an existing chart or slicer
+    /// (`move-chart`/`move-slicer`, `updateEmbeddedObjectPosition`) — the
+    /// same operation as the rest of this chart/slicer set
+    /// (`add-chart`/`update-chart`/`delete-chart`/`add-slicer`/
+    /// `update-slicer`/`delete-slicer`), since a move discards no data
+    /// either.
+    ///
     /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
     /// reason that one is not folded into [`Self::Edit`]. Every existing
     /// `allow: ["sheets-write"]` rule was written when structural edits were
