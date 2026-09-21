@@ -725,6 +725,10 @@ pub enum BatchUpdateRequestItem {
     /// operation as `add-chart`/`add-slicer`'s own placement, since a move
     /// discards no data.
     UpdateEmbeddedObjectPosition(UpdateEmbeddedObjectPositionRequest),
+    /// Set or clear an existing chart's border colour
+    /// (`update-chart-border`). Same gate as
+    /// [`Self::UpdateEmbeddedObjectPosition`] (issue #1837).
+    UpdateEmbeddedObjectBorder(UpdateEmbeddedObjectBorderRequest),
     /// Write a pivot table into (`add-pivot-table`) or clear one from
     /// (`delete-pivot-table`) a single anchor cell. The crate's only
     /// `updateCells` request — issue #1643's "`updateCells` stays unused"
@@ -1945,6 +1949,24 @@ pub struct DeleteNamedRangeRequest {
 // them — which stay `PartialEq`-only, the same reason [`Color`] forces
 // `PartialEq`-only up through everything that embeds *it*.
 
+/// A chart's border — `EmbeddedObjectBorder` (issue #1837).
+///
+/// Only `colorStyle` is modelled; the API's deprecated plain `color` is
+/// never sent, the same cut `banding.rs`/`format.rs` make. Unlike a cell
+/// [`Border`], this type has **no style and no width** — a chart border is
+/// a colour and nothing else. A slicer has no border field at all.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct EmbeddedObjectBorder {
+    /// The border's colour. Absent means no border (or, on
+    /// `update-chart-border --clear`, an explicit reset to none).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "colorStyle"
+    )]
+    pub color_style: Option<ColorStyle>,
+}
+
 /// One chart embedded on a sheet — `EmbeddedChart`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct EmbeddedChart {
@@ -1959,6 +1981,12 @@ pub struct EmbeddedChart {
     /// Where the chart is anchored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<EmbeddedObjectPosition>,
+    /// The chart's border colour, if it has one. Read back for free once
+    /// requested — `SPREADSHEET_FIELDS_WITH_EMBEDDED_OBJECTS` already
+    /// requests `sheets.charts` wholesale — so `update-chart-border`'s
+    /// preview can report the colour about to be replaced (issue #1837).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border: Option<EmbeddedObjectBorder>,
 }
 
 /// A chart's content and styling — `ChartSpec`. See the module-level note
@@ -2370,6 +2398,25 @@ pub struct UpdateEmbeddedObjectPositionRequest {
     /// `newPosition.overlayPosition`. Empty (and omitted on the wire) for a
     /// `--new-sheet` move.
     #[serde(skip_serializing_if = "String::is_empty")]
+    pub fields: String,
+}
+
+/// `UpdateEmbeddedObjectBorderRequest`.
+///
+/// Sets or clears an existing chart's border colour (`update-chart-border`,
+/// issue #1837). Charts only; a [`Slicer`] carries no `border` field, so
+/// there is no `update-slicer-border` counterpart.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UpdateEmbeddedObjectBorderRequest {
+    /// Which chart to update.
+    #[serde(rename = "objectId")]
+    pub object_id: i64,
+    /// The border to write — `EmbeddedObjectBorder::default()` (no
+    /// `colorStyle`) clears it.
+    pub border: EmbeddedObjectBorder,
+    /// The field mask limiting what this request may change. Always
+    /// `"colorStyle"` — the only field [`EmbeddedObjectBorder`] models —
+    /// whether setting a colour or clearing one.
     pub fields: String,
 }
 

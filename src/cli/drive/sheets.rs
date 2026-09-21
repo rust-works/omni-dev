@@ -279,6 +279,10 @@ pub enum SheetsSubcommands {
     /// Moves and/or resizes an existing slicer. Same gate as
     /// [`Self::MoveChart`] (issue #1837, ADR-0081 §3).
     MoveSlicer(embedded_object::MoveSlicerCommand),
+    /// Sets or clears an existing chart's border colour
+    /// (`updateEmbeddedObjectBorder`). Same gate as [`Self::MoveChart`]
+    /// (issue #1837, ADR-0081 §3). Charts only — a slicer has no border.
+    UpdateChartBorder(embedded_object::UpdateChartBorderCommand),
     /// Writes a new pivot table at an anchor cell. Gated by **both** the
     /// folder write-permission rules' `sheets-write` and
     /// `sheets-structure` operations (issue #1798, ADR-0081 §5).
@@ -395,6 +399,7 @@ impl SheetsCommand {
             SheetsSubcommands::ListSlicers(cmd) => cmd.execute(client).await,
             SheetsSubcommands::MoveChart(cmd) => cmd.execute(client).await,
             SheetsSubcommands::MoveSlicer(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::UpdateChartBorder(cmd) => cmd.execute(client).await,
             SheetsSubcommands::AddPivotTable(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeletePivotTable(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ListPivotTables(cmd) => cmd.execute(client).await,
@@ -783,6 +788,21 @@ mod tests {
                 offset_y: None,
                 width: None,
                 height: None,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::UpdateChartBorder(embedded_object::UpdateChartBorderCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                chart_id: 1,
+                color: Some("#4A86E8".to_string()),
+                clear: false,
                 dry_run: true,
                 lease: no_lease(),
                 output: crate::cli::drive::format::OutputFormat::Table,

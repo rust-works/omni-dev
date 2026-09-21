@@ -628,7 +628,7 @@ operation anywhere in a target's ancestor chain:
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
 | `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table` |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -1071,7 +1071,7 @@ content-mutating write verb: `drive edit`; `drive sheets`
 `set-basic-filter`/`clear-basic-filter`/`add-filter-view`/
 `update-filter-view`/`delete-filter-view`, and
 `add-chart`/`update-chart`/`delete-chart`/`add-slicer`/`update-slicer`/
-`delete-slicer`/`move-chart`/`move-slicer`; and
+`delete-slicer`/`move-chart`/`move-slicer`/`update-chart-border`; and
 `drive docs replace`/`append`. `--dry-run` never needs one on any of them.
 
 **The backup fidelity splits by file type** ([ADR-0080](adrs/adr-0080.md)
@@ -2585,16 +2585,18 @@ nothing for the two to compose *onto*.
 `--sheet` for its prefix when bare) plus optional `--offset-x`/`--offset-y`/
 `--width`/`--height` in pixels; a chart may instead take `--new-sheet` to get
 a sheet of its own, which conflicts with every position flag. Moving or
-resizing an *existing* chart/slicer is the `move-chart`/`move-slicer` verbs
-below (issue #1837) — see that subsection for how they differ from
-`add-chart`/`add-slicer`'s own placement flags. There is no chart/slicer
-border support yet.
+resizing an *existing* chart/slicer, and setting a chart's border colour,
+are the `move-chart`/`move-slicer`/`update-chart-border` verbs below (issue
+#1837) — see that subsection for how they differ from `add-chart`/
+`add-slicer`'s own placement flags.
 
-#### drive sheets move-chart / move-slicer
+#### drive sheets move-chart / move-slicer / update-chart-border
 
-Two more verbs on the same charts/slicers embedded objects (issue #1837),
-gated `sheets-structure` like every other verb in this section, wrapping
-`updateEmbeddedObjectPosition`.
+Three more verbs on the same charts/slicers embedded objects (issue #1837),
+gated `sheets-structure` like every other verb in this section.
+`move-chart`/`move-slicer` wrap `updateEmbeddedObjectPosition`;
+`update-chart-border` wraps `updateEmbeddedObjectBorder`, chart-only — a
+slicer carries no `border` field at all.
 
 ```bash
 # Move a chart to a new anchor cell on the same sheet, resizing it too.
@@ -2609,6 +2611,9 @@ omni-dev drive sheets move-chart <ID> --chart-id 3 --new-sheet
 # A slicer moves the same way, minus --new-sheet — it has no own-sheet
 # placement.
 omni-dev drive sheets move-slicer <ID> --slicer-id 4 --sheet Q2 --anchor B2
+
+omni-dev drive sheets update-chart-border <ID> --chart-id 3 --color '#4A86E8'
+omni-dev drive sheets update-chart-border <ID> --chart-id 3 --clear
 ```
 
 **Every flag on `move-chart`/`move-slicer` is optional** — unlike `add-chart`,
@@ -2637,6 +2642,13 @@ position to carry forward, so moving it onto a grid requires `--anchor`.
 the object is currently on — is exactly like any other move: the
 destination sheet's id becomes the object's new `sheet_id` in the outcome
 and log record.
+
+**`update-chart-border` is colour-only**: `--color '#RRGGBB'` or `--clear`,
+mutually exclusive, one of them required. There is no `--style`/`--width`
+flag — the API's `EmbeddedObjectBorder` models neither, unlike a cell's
+`Border`. Clearing sends an empty border (`{}`) with the same
+`"colorStyle"` mask a set does; this has not been verified against a live
+account.
 
 #### drive sheets add-banding / update-banding / delete-banding / list-bandings
 

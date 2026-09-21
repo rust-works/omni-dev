@@ -841,6 +841,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_sheets_update_chart_border() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::UpdateChartBorder(
+                sheets::embedded_object::UpdateChartBorderCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    chart_id: 1,
+                    color: Some("#4A86E8".to_string()),
+                    clear: false,
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_sheets_delete_sheet() {
         let guard = crate::drive::test_support::EnvGuard::take();
         guard.redirect_api_hosts_to_a_dead_port();
