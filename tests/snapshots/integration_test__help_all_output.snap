@@ -4450,6 +4450,8 @@ Commands:
   rename-sheet                 Renames an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
   insert-rows                  Inserts empty rows, shifting existing rows down. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
   insert-columns               Inserts empty columns, shifting existing columns right. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
+  move-rows                    Moves a contiguous block of rows to a new position within a sheet, shifting the rows in between. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1834)
+  move-columns                 Moves a contiguous block of columns to a new position within a sheet, shifting the columns in between. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1834)
   delete-sheet                 Deletes an entire sheet (tab) from a spreadsheet. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
   delete-rows                  Deletes whole rows, shifting existing rows up. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
   delete-columns               Deletes whole columns, shifting existing columns left. Gated by the folder write-permission rules' `sheets-delete` operation (issue #1623). Cannot be undone through omni-dev
@@ -5489,6 +5491,50 @@ Options:
       --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
       --type <TYPE>      How to merge: one cell for the whole range, one per row, or one per column [default: all] [possible values: all, rows, columns]
       --dry-run          Reports the gate verdict and, critically, every cell value the merge would discard — see `drive sheets merge-cells --help` before running without this flag first
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets move-columns - Moves a contiguous block of columns to a new position within a sheet, shifting the columns in between. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1834)
+
+Moves a contiguous block of columns to a new position within a sheet, shifting the columns in between. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1834)
+
+Usage: move-columns [OPTIONS] --sheet <NAME> --at <COLUMN> --before <COLUMN> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Title of the sheet to modify
+      --at <COLUMN>      First column of the block to move, 1-based inclusive (column A is 1) — the column number the spreadsheet itself shows
+      --count <N>        How many columns the block spans [default: 1]
+      --before <COLUMN>  Move the block to before this column, numbered as the sheet stands *before* the move — the same numbering `--at` uses (column A is 1). `--before` one past the sheet's last column moves the block to the end. A `--before` inside or immediately after the block being moved is refused (it would move nothing)
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets move-rows - Moves a contiguous block of rows to a new position within a sheet, shifting the rows in between. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1834)
+
+Moves a contiguous block of rows to a new position within a sheet, shifting the rows in between. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1834)
+
+Usage: move-rows [OPTIONS] --sheet <NAME> --at <ROW> --before <ROW> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Title of the sheet to modify
+      --at <ROW>         First row of the block to move, 1-based inclusive — the row number the spreadsheet itself shows
+      --count <N>        How many rows the block spans [default: 1]
+      --before <ROW>     Move the block to before this row, numbered as the sheet stands *before* the move — the same numbering `--at` uses. `--before` one past the sheet's last row moves the block to the end. A `--before` inside or immediately after the block being moved is refused (it would move nothing)
+      --dry-run          Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')

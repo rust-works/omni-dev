@@ -427,6 +427,12 @@ pub enum BatchUpdateRequestItem {
     DeleteSheet(DeleteSheetRequest),
     /// Delete whole rows or columns, shifting the remainder to close the gap.
     DeleteDimension(DeleteDimensionRequest),
+    /// Move whole rows or columns to a new position within their sheet
+    /// (`move-rows`/`move-columns`, issue #1834). Gated by
+    /// [`crate::drive::write_gate::DriveOperation::SheetsStructure`] like
+    /// the inserts, not `SheetsDelete`: a reordering discards nothing
+    /// (ADR-0083's "additive/structural" group).
+    MoveDimension(MoveDimensionRequest),
     /// Delete a rectangular cell range, shifting the remainder to close the
     /// gap along one axis.
     DeleteRange(DeleteRangeRequest),
@@ -2291,6 +2297,27 @@ pub struct DeleteSheetRequest {
 pub struct DeleteDimensionRequest {
     /// The rows or columns to delete.
     pub range: DimensionRange,
+}
+
+/// `MoveDimensionRequest` — moves the rows or columns spanned by `source` to
+/// a new position within the same sheet (`move-rows`/`move-columns`, issue
+/// #1834).
+///
+/// Nothing is discarded: the moved rows/columns take their values with them
+/// and the rows/columns between the source and the destination shift to
+/// close the gap. Reuses [`DimensionRange`] as-is, exactly as
+/// [`DeleteDimensionRequest`] does.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MoveDimensionRequest {
+    /// The rows or columns to move.
+    pub source: DimensionRange,
+    /// The zero-based index the source is moved *in front of*, in the
+    /// sheet's coordinates **before** the source is removed from the grid —
+    /// the API's own definition, so a downward move lands `source.len()`
+    /// short of this number. The CLI's 1-based `--before` is converted in
+    /// `structure.rs::move_destination_index`, never at a call site.
+    #[serde(rename = "destinationIndex")]
+    pub destination_index: i64,
 }
 
 /// Which axis a [`DeleteRangeRequest`] shifts remaining cells along to fill

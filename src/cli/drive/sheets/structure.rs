@@ -1,10 +1,10 @@
 //! CLI commands for `omni-dev drive sheets add-sheet`/`rename-sheet`/
 //! `insert-rows`/`insert-columns` (issue #1613), `duplicate-sheet`/
-//! `reorder-sheet`/`hide-sheet`/`show-sheet` (issue #1643), and
+//! `reorder-sheet`/`hide-sheet`/`show-sheet` (issue #1643),
 //! `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range` (issue
-//! #1623).
+//! #1623), and `move-rows`/`move-columns` (issue #1834).
 //!
-//! Twelve clap structs over one engine call. They share `run_structure`, so
+//! Fourteen clap structs over one engine call. They share `run_structure`, so
 //! the gate wiring, `--dry-run` handling, output rendering and request
 //! logging cannot drift between them — the same arrangement `write.rs` uses
 //! for its three verbs. The additive verbs are gated on
@@ -138,6 +138,88 @@ pub struct InsertColumnsCommand {
     /// How many columns to insert.
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub count: i64,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+/// Moves a contiguous block of rows to a new position within a sheet,
+/// shifting the rows in between to close the gap.
+#[derive(Parser)]
+pub struct MoveRowsCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to modify.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    /// First row of the block to move, 1-based inclusive — the row number
+    /// the spreadsheet itself shows.
+    #[arg(long, value_name = "ROW")]
+    pub at: i64,
+
+    /// How many rows the block spans.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub count: i64,
+
+    /// Move the block to before this row, numbered as the sheet stands
+    /// *before* the move — the same numbering `--at` uses. `--before` one
+    /// past the sheet's last row moves the block to the end. A `--before`
+    /// inside or immediately after the block being moved is refused (it
+    /// would move nothing).
+    #[arg(long, value_name = "ROW")]
+    pub before: i64,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+/// Moves a contiguous block of columns to a new position within a sheet,
+/// shifting the columns in between to close the gap.
+#[derive(Parser)]
+pub struct MoveColumnsCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to modify.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    /// First column of the block to move, 1-based inclusive (column A is
+    /// 1) — the column number the spreadsheet itself shows.
+    #[arg(long, value_name = "COLUMN")]
+    pub at: i64,
+
+    /// How many columns the block spans.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub count: i64,
+
+    /// Move the block to before this column, numbered as the sheet stands
+    /// *before* the move — the same numbering `--at` uses (column A is 1).
+    /// `--before` one past the sheet's last column moves the block to the
+    /// end. A `--before` inside or immediately after the block being moved
+    /// is refused (it would move nothing).
+    #[arg(long, value_name = "COLUMN")]
+    pub before: i64,
 
     /// Reports the gate verdict and the change that would be made, without
     /// calling `spreadsheets.batchUpdate`.
@@ -497,6 +579,44 @@ impl InsertColumnsCommand {
                 sheet: self.sheet,
                 at: self.at,
                 count: self.count,
+            },
+            dry_run: self.dry_run,
+            lease_token: self.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
+impl MoveRowsCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::MoveRows {
+                sheet: self.sheet,
+                at: self.at,
+                count: self.count,
+                before: self.before,
+            },
+            dry_run: self.dry_run,
+            lease_token: self.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
+impl MoveColumnsCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::MoveColumns {
+                sheet: self.sheet,
+                at: self.at,
+                count: self.count,
+                before: self.before,
             },
             dry_run: self.dry_run,
             lease_token: self.lease.lease,

@@ -1475,6 +1475,11 @@ pub struct DriveMutationOutcome {
     /// of [`Self::range`], for effects A1 notation cannot express; absent
     /// for verbs that span no dimension.
     pub dimension_range: Option<String>,
+    /// The 1-based `--before` value of a `move-rows`/`move-columns` verb
+    /// (issue #1834), numbered as the sheet stood *before* the move —
+    /// matching the CLI flag and [`Self::dimension_range`]'s own numbering.
+    /// `None` for every other verb.
+    pub move_to: Option<i64>,
     /// The rectangular cell range a `delete-range` verb spanned (issue
     /// #1623), e.g. `"rows 2-10, columns 2-4"`, 1-based inclusive like the
     /// CLI's `--start-row`/`--end-row`/`--start-column`/`--end-column`. The
@@ -1663,6 +1668,9 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
     }
     if let Some(dimension_range) = outcome.dimension_range {
         context.insert("dimension_range".to_string(), dimension_range);
+    }
+    if let Some(move_to) = outcome.move_to {
+        context.insert("move_to".to_string(), move_to.to_string());
     }
     if let Some(grid_range) = outcome.grid_range {
         context.insert("grid_range".to_string(), grid_range);
@@ -2650,6 +2658,38 @@ mod tests {
         // An insert renames nothing.
         assert_eq!(rec.context.get("sheet_new_title"), None);
         // An insert spans one dimension, not a rectangle.
+        assert_eq!(rec.context.get("grid_range"), None);
+        // Only a move has a destination.
+        assert_eq!(rec.context.get("move_to"), None);
+    }
+
+    #[test]
+    fn build_drive_mutation_record_includes_the_move_to_key_for_a_move() {
+        // Issue #1834: `dimension_range` names the span that moved, which
+        // is only half the effect — without `move_to` the record could not
+        // say where it went. Both are 1-based and numbered as the sheet
+        // stood before the move, matching `--at`/`--count`/`--before`.
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "sheets-move-rows",
+                file_id: "s1".to_string(),
+                file_name: "Budget".to_string(),
+                status: "changed".to_string(),
+                sheet_id: Some(118_293),
+                sheet_title: Some("Q2".to_string()),
+                dimension_range: Some("ROWS 2:3".to_string()),
+                move_to: Some(6),
+                duration: Duration::from_millis(1),
+                ..Default::default()
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(rec.command, vec!["drive", "sheets-move-rows"]);
+        assert_eq!(
+            rec.context.get("dimension_range").map(String::as_str),
+            Some("ROWS 2:3")
+        );
+        assert_eq!(rec.context.get("move_to").map(String::as_str), Some("6"));
         assert_eq!(rec.context.get("grid_range"), None);
     }
 

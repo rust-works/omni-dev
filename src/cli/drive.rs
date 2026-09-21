@@ -744,6 +744,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_sheets_move_rows() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::MoveRows(sheets::structure::MoveRowsCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: "Q2".to_string(),
+                at: 5,
+                count: 3,
+                before: 10,
+                dry_run: false,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sheets_move_columns() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::MoveColumns(
+                sheets::structure::MoveColumnsCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    sheet: "Q2".to_string(),
+                    at: 5,
+                    count: 3,
+                    before: 10,
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_sheets_delete_sheet() {
         let guard = crate::drive::test_support::EnvGuard::take();
         guard.redirect_api_hosts_to_a_dead_port();
