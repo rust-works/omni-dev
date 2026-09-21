@@ -6164,6 +6164,7 @@ mod tests {
             title: "Q2".to_string(),
             row_count: Some(500),
             column_count: Some(26),
+            ..Default::default()
         };
         for (at, count, before, expected) in [
             (2, 0, 9, "--count must be at least 1, got 0"),
@@ -6188,6 +6189,7 @@ mod tests {
             title: "Q2".to_string(),
             row_count: Some(500),
             column_count: Some(26),
+            ..Default::default()
         };
         // `--before 1` throughout, so the overflow guard is what fires and
         // not the inside-the-block refusal that follows it.
