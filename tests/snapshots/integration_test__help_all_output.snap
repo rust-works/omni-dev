@@ -4502,6 +4502,10 @@ Commands:
   update-banding               Changes an existing banded range's range and/or colors. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1832, ADR-0082)
   delete-banding               Removes a banded range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1832, ADR-0082) — it removes presentation, not grid data
   list-bandings                Lists the banded ranges in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1832)
+  add-dimension-group          Adds a new outline group — the collapsible +/- grouping bar — over a span of rows or columns. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1833, ADR-0084): the same reasoning as `add-banding`
+  update-dimension-group       Changes an existing group's `collapsed` state. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1833, ADR-0084)
+  delete-dimension-group       Removes an outline group. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1833, ADR-0084) — it removes presentation, not grid data
+  list-dimension-groups        Lists the row and column outline groups in a spreadsheet. Read-only and ungated, like `list-bandings` (issue #1833)
   help                         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -4638,6 +4642,28 @@ Options:
       --lease <TOKEN>                   The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>                 Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                            Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets add-dimension-group - Adds a new outline group — the collapsible +/- grouping bar — over a span of rows or columns. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1833, ADR-0084): the same reasoning as `add-banding`
+
+Adds a new outline group — the collapsible +/- grouping bar — over a span of rows or columns. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1833, ADR-0084): the same reasoning as `add-banding`
+
+Usage: add-dimension-group [OPTIONS] --sheet <NAME> --dimension <DIMENSION> --start <N> --end <N> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>           Title of the sheet to modify
+      --dimension <DIMENSION>  Rows or columns [possible values: rows, columns]
+      --start <N>              1-based first row/column, inclusive
+      --end <N>                1-based last row/column, inclusive
+      --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
 
 
 ================================================================================
@@ -5003,6 +5029,28 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets delete-dimension-group - Removes an outline group. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1833, ADR-0084) — it removes presentation, not grid data
+
+Removes an outline group. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1833, ADR-0084) — it removes presentation, not grid data
+
+Usage: delete-dimension-group [OPTIONS] --sheet <NAME> --dimension <DIMENSION> --start <N> --end <N> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>           Title of the sheet the group is on
+      --dimension <DIMENSION>  Rows or columns [possible values: rows, columns]
+      --start <N>              1-based first row/column, inclusive — identifies the group together with `--end`
+      --end <N>                1-based last row/column, inclusive
+      --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets delete-filter-view - Removes a filter view. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
 
 Removes a filter view. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1794)
@@ -5320,6 +5368,22 @@ omni-dev drive sheets list-conditional-formats - Lists the conditional format ru
 Lists the conditional format rules in a spreadsheet. Read-only and ungated, like `list-protections` (issue #1793)
 
 Usage: list-conditional-formats [OPTIONS] <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets list-dimension-groups - Lists the row and column outline groups in a spreadsheet. Read-only and ungated, like `list-bandings` (issue #1833)
+
+Lists the row and column outline groups in a spreadsheet. Read-only and ungated, like `list-bandings` (issue #1833)
+
+Usage: list-dimension-groups [OPTIONS] <SPREADSHEET_ID>
 
 Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
@@ -5835,6 +5899,30 @@ Options:
       --lease <TOKEN>                   The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>                 Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                            Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets update-dimension-group - Changes an existing group's `collapsed` state. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1833, ADR-0084)
+
+Changes an existing group's `collapsed` state. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1833, ADR-0084)
+
+Usage: update-dimension-group [OPTIONS] --sheet <NAME> --dimension <DIMENSION> --start <N> --end <N> --collapsed <BOOL> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>           Title of the sheet the group is on
+      --dimension <DIMENSION>  Rows or columns [possible values: rows, columns]
+      --start <N>              1-based first row/column, inclusive — identifies the group together with `--end`
+      --end <N>                1-based last row/column, inclusive
+      --depth <N>              Disambiguates which group at that exact span to update, when more than one exists at different depths. Omit when only one exists
+      --collapsed <BOOL>       The new collapsed state. Required — unlike `format-cells`' optional flags, `update-dimension-group` changes nothing else, so there is no "leave it unset" case. `bool`, not `Option<bool>`, so clap requires it as a value-taking flag rather than treating it as a `--collapsed`-with-no-value switch [possible values: true, false]
+      --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
 
 
 ================================================================================

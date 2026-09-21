@@ -174,6 +174,18 @@ types, so the log is a complete invocation history, not just an HTTP history:
   mirroring `filter_view_id`'s precedent. `sheet_id` is reused for the
   sheet the banded range sits on.
 
+  Dimension groups (issue
+  [#1833](https://github.com/rust-works/omni-dev/issues/1833),
+  [ADR-0084](adrs/adr-0084-dimension-groups.md)) use the same kind again.
+  New `operation` values: `sheets-add-dimension-group`,
+  `sheets-update-dimension-group`, `sheets-delete-dimension-group`. No new
+  context key: a dimension group carries no id of its own, so `sheet_id`
+  and `dimension_range` (already used by the insert/delete-dimension
+  structural verbs) are reused for the sheet and span a group acts on, and
+  `fields_changed` (already used by the dimension-property formatting
+  verbs) records `collapsed=true`/`collapsed=false` for
+  `sheets-update-dimension-group`.
+
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of
