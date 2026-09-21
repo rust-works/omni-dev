@@ -627,8 +627,8 @@ operation anywhere in a target's ancestor chain:
 | `create`            | deny    | `create`, `sheets create` |
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table` |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -2762,6 +2762,90 @@ delete — a span that only partially overlaps an existing group decrements
 that group's depth rather than removing anything — is not exposed; use
 the Sheets UI for that, or delete the group's exact span and re-add a
 narrower one.
+
+#### drive sheets cut-paste / copy-paste / paste-data
+
+Clipboard-style range operations (issue #1839,
+[ADR-0083](adrs/adr-0083.md) §4): `cut-paste` moves a range to a
+destination cell, clearing the source; `copy-paste` copies a range to a
+destination; `paste-data` pastes delimited text into a range as if pasted
+from the clipboard.
+
+```bash
+# Move A1:B10 on Q1 to D1, clearing the source. --paste-type defaults to
+# normal (values, formulas, formats and merges).
+omni-dev drive sheets cut-paste <ID> --sheet Q1 \
+  --source A1:B10 --destination D1 --dry-run
+omni-dev drive sheets cut-paste <ID> --sheet Q1 --source A1:B10 --destination D1
+
+# Copy a single cell across a 3x3 block — repeats to fill it, since 3 is a
+# multiple of the source's 1x1 size.
+omni-dev drive sheets copy-paste <ID> --sheet Q1 \
+  --source A1 --destination B1:D3 --paste-type values
+
+# Paste a tab-separated block at A1. --paste-type defaults to values, not
+# normal, since delimited text carries no formats to add.
+omni-dev drive sheets paste-data <ID> --sheet Q1 \
+  --destination A1 --data clip.tsv
+printf '1\t2\n3\t4\n' | omni-dev drive sheets paste-data <ID> --sheet Q1 \
+  --destination A1 --data -
+```
+
+**Gate, per `--paste-type` (ADR-0083 §4).** `--paste-type` curates four of
+the Sheets API's seven `PasteType` values — `normal`, `values`, `formula`,
+`format`; `no-borders`, `data-validation` and `conditional-formatting` are
+a deliberate cut, tracked as a follow-up. `values`/`formula` write cell
+content alone and need `sheets-write`; `format` writes only presentation
+and needs `sheets-structure` alone; `normal` (the default on `cut-paste`/
+`copy-paste`) writes both and needs both grants together. **`cut-paste`
+always needs both operations, whatever `--paste-type` names**, because its
+source is cleared in full — values, formats and merges — regardless of
+what gets pasted. `paste-data` defaults to `values`, not `normal`: its
+`--data` input is delimited text with no formats or merges for `normal` to
+add, though `normal` stays selectable and resolves both operations (the
+API does not document it as doing anything beyond values on delimited
+text). `paste-data` is `--data`-as-a-file/stdin, `delimiter`-form only —
+the Sheets API's `html` paste alternative is not exposed.
+
+**`--source`/`--destination`, and `--sheet` as their shared default.** A
+reference already carrying its own `'Sheet'!` prefix is used as-is — a
+source and destination may sit on different sheets, which the API allows;
+otherwise `--sheet` supplies the prefix. `cut-paste`'s and `paste-data`'s
+`--destination` must be a single cell (the pasted block extends from
+there); `copy-paste`'s may be a single-cell anchor or a range. Every
+source must be a bounded rectangle — an open-ended column or row span
+(`A:A`) is refused, the same restriction `merge-cells`/`insert-range`
+place on their own ranges.
+
+**`copy-paste --orientation transpose`** swaps the source's rows and
+columns before pasting. Changes no gate.
+
+**The written extent, for `copy-paste`.** When the destination is an
+exact multiple of the (possibly transposed) source's size on an axis, the
+source repeats along that axis to fill it exactly; otherwise the source is
+copied once at its own size, spilling past a smaller destination or only
+partly filling a larger, non-multiple one — the Sheets API's own
+spill/repeat rule. `cut-paste` never spills or repeats: the written region
+is always the source's own dimensions, anchored at the destination.
+`paste-data`'s extent is an upper bound computed by locally splitting
+`--data` on newlines and `--delimiter` — the API's own row-separator
+convention for `pasteData` is undocumented, so this is a preview input,
+never sent on the wire.
+
+**`--dry-run` reports counts and A1 locations, never cell values**
+(ADR-0083 §6, ADR-0081 §2's posture — `merge-cells` remains the one
+preview in this crate that prints contents). It reports the non-blank
+cells within the written extent that would be overwritten; a
+presentation-only `--paste-type format` reads no values at all, since it
+overwrites none. `cut-paste`'s preview additionally reports the non-blank
+cells in the source that will be cleared, as a separate count from the
+destination overwrite. When the written extent runs past the sheet's
+currently allocated rows or columns, the preview and the real run both
+carry a caveat: whether the Sheets API errors or silently expands the
+grid in that case is undocumented and has not been verified against a
+live workbook — this tool never prepends a structural request to grow the
+grid first, since that would smuggle `sheets-structure` into a
+`sheets-write`-gated batch.
 
 ## Docs
 

@@ -93,6 +93,17 @@ pub enum DriveOperation {
     /// grid with a server-computed rendered extent, which is this
     /// operation's territory by construction. `delete-pivot-table` needs
     /// this operation alone.
+    ///
+    /// Since issue #1839 ([ADR-0083](../../docs/adrs/adr-0083.md) §4), also
+    /// the clipboard-style paste family — `cut-paste`/`copy-paste` with a
+    /// value-only `--paste-type` (`values`/`formula`) and `paste-data`'s
+    /// `values`/`formula` types — since each writes ordinary cell content
+    /// into a range this crate already lets `sheets clear`/`write` reach.
+    /// `cut-paste` additionally requires [`Self::SheetsStructure`] whatever
+    /// `--paste-type` names, since it always clears its source's formats
+    /// and merges too; `copy-paste`/`paste-data` require it alongside this
+    /// operation only for `--paste-type normal`, per that variant's doc
+    /// comment.
     SheetsWrite,
     /// Structurally edit an existing Google Sheet via `spreadsheets.batchUpdate`
     /// (issue #1613, [ADR-0075](../../docs/adrs/adr-0075.md) §1) — adding,
@@ -180,6 +191,18 @@ pub enum DriveOperation {
     /// this chart/slicer set (`add-chart`/`update-chart`/`delete-chart`/
     /// `add-slicer`/`update-slicer`/`delete-slicer`), since a move or a
     /// border change discards no data either.
+    ///
+    /// Since issue #1839 ([ADR-0083](../../docs/adrs/adr-0083.md) §4), also
+    /// required (alongside [`Self::SheetsWrite`]) for `cut-paste`
+    /// unconditionally, and for `copy-paste`/`paste-data` when
+    /// `--paste-type` is `normal` (formats and merges travel with the cell
+    /// content) — plus required *alone*, no [`Self::SheetsWrite`] needed,
+    /// for `copy-paste`/`paste-data`'s presentation-only `format` type,
+    /// which writes nothing this crate treats as a cell value. `cut-paste`
+    /// needs this operation whatever it pastes because the source is
+    /// always cleared of its formats and merges too, the same "property of
+    /// the sheet, not the sheet's data" removal `unmerge-cells`/
+    /// `clear-data-validation` already make under this operation.
     ///
     /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
     /// reason that one is not folded into [`Self::Edit`]. Every existing
