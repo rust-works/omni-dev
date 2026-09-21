@@ -19,6 +19,7 @@ pub(crate) mod developer_metadata;
 pub(crate) mod dimension_group;
 pub(crate) mod embedded_object;
 pub(crate) mod filter;
+pub(crate) mod find_replace;
 pub(crate) mod format;
 pub(crate) mod info;
 pub(crate) mod named_range;
@@ -61,6 +62,9 @@ pub enum SheetsSubcommands {
     /// Clears a range's values, leaving formatting intact. Gated by the
     /// write-permission rules (issues #1589, #1612).
     Clear(write::ClearCommand),
+    /// Finds text and replaces it across a range, one sheet, or the workbook.
+    /// Gated by `sheets-write` (issue #1841, ADR-0083 §1).
+    FindReplace(find_replace::FindReplaceCommand),
     /// Creates a new Google Sheet, optionally seeded with values. Gated by
     /// the folder write-permission rules' `create` operation (issue #1589).
     Create(create::CreateCommand),
@@ -369,6 +373,7 @@ impl SheetsCommand {
             SheetsSubcommands::Write(cmd) => cmd.execute(client).await,
             SheetsSubcommands::Append(cmd) => cmd.execute(client).await,
             SheetsSubcommands::Clear(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::FindReplace(cmd) => cmd.execute(client).await,
             SheetsSubcommands::Create(cmd) => cmd.execute(client).await,
             SheetsSubcommands::AddSheet(cmd) => cmd.execute(client).await,
             SheetsSubcommands::RenameSheet(cmd) => cmd.execute(client).await,

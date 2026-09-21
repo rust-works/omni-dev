@@ -2142,6 +2142,7 @@ fn scrub_flag_value(name: &str, value: &str) -> Option<String> {
     match name {
         "header" => scrub_header_arg(value),
         "body" => (!value.starts_with('@')).then(|| "REDACTED".to_string()),
+        "find" | "replacement" => Some("REDACTED".to_string()),
         _ if is_secretish_flag(name) => Some("REDACTED".to_string()),
         _ => None,
     }
@@ -2187,7 +2188,8 @@ fn scrub_flag_secrets(argv: &[String]) -> Vec<String> {
         } else {
             out.push(arg.clone());
             let takes_secret_value =
-                matches!(flag_body, "header" | "body") || is_secretish_flag(flag_body);
+                matches!(flag_body, "header" | "body" | "find" | "replacement")
+                    || is_secretish_flag(flag_body);
             if takes_secret_value {
                 if let Some(value) = argv.get(i) {
                     i += 1;
@@ -3477,6 +3479,20 @@ mod tests {
 
         let out = scrub_argv(&argv(&["omni-dev", "--body=sekret"]));
         assert_eq!(out, argv(&["omni-dev", "--body=REDACTED"]));
+    }
+
+    #[test]
+    fn scrub_argv_redacts_find_replace_content_in_both_flag_forms() {
+        let out = scrub_argv(&argv(&[
+            "omni-dev",
+            "--find",
+            "customer@example.com",
+            "--replacement=redacted",
+        ]));
+        assert_eq!(
+            out,
+            argv(&["omni-dev", "--find", "REDACTED", "--replacement=REDACTED",])
+        );
     }
 
     #[test]

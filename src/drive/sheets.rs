@@ -30,6 +30,7 @@ pub mod developer_metadata;
 pub mod dimension_group;
 pub mod embedded_object;
 pub mod filter;
+pub mod find_replace;
 pub mod format;
 mod grid_range;
 // Re-exported (not the whole module) so the CLI layer's list verbs can

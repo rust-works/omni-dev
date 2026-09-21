@@ -4445,6 +4445,7 @@ Commands:
   write                        Overwrites the cells of a range, gated by the write-permission rules (issues #1589, #1612). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
   append                       Appends rows after the last row of a range's table, gated by the write-permission rules (issues #1589, #1612)
   clear                        Clears a range's values, leaving formatting intact. Gated by the write-permission rules (issues #1589, #1612)
+  find-replace                 Finds text and replaces it across a range, one sheet, or the workbook. Gated by `sheets-write` (issue #1841, ADR-0083 §1)
   create                       Creates a new Google Sheet, optionally seeded with values. Gated by the folder write-permission rules' `create` operation (issue #1589)
   add-sheet                    Adds a new sheet (tab) to a spreadsheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
   rename-sheet                 Renames an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1613)
@@ -5290,6 +5291,34 @@ Options:
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets find-replace - Finds text and replaces it across a range, one sheet, or the workbook. Gated by `sheets-write` (issue #1841, ADR-0083 §1)
+
+Finds text and replaces it across a range, one sheet, or the workbook. Gated by `sheets-write` (issue #1841, ADR-0083 §1)
+
+Usage: find-replace [OPTIONS] --find <TEXT> --replacement <TEXT> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --find <TEXT>         Text to find. Cannot be empty
+      --replacement <TEXT>  Replacement text. Pass an empty string to remove matches
+      --range <A1>          A1 range to search, optionally carrying its own `Sheet!` prefix
+      --sheet <NAME>        Sheet (tab) title. Supplies the prefix for a bare `--range`, and is required with `--whole-sheet`
+      --whole-sheet         Search the whole sheet named by `--sheet`
+      --all-sheets          Search every sheet in the workbook
+      --match-case          Match case exactly
+      --match-entire-cell   Require the search text to match the whole cell
+      --search-by-regex     Interpret the search and replacement as Java regular-expression text
+      --include-formulas    Include cells containing formulas. Without this flag, formula cells are skipped; Sheets has no formulas-only mode
+      --dry-run             Reports the gate verdict and request scope without calling `spreadsheets.batchUpdate`. Sheets computes matching counts only when the request executes
+      --lease <TOKEN>       The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>     Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                Print help (see more with '--help')
 
 
 ================================================================================
