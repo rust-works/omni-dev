@@ -628,7 +628,7 @@ operation anywhere in a target's ancestor chain:
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
 | `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table` |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -1062,7 +1062,8 @@ documents** (see the fidelity split below). `--lease` is required by every
 content-mutating write verb: `drive edit`; `drive sheets`
 `write`/`append`/`clear`, `add-sheet`/`rename-sheet`/`insert-rows`/
 `insert-columns`/`move-rows`/`move-columns`/`duplicate-sheet`/`reorder-sheet`/`hide-sheet`/
-`show-sheet`, `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range`,
+`show-sheet`/`update-sheet-properties`,
+`delete-sheet`/`delete-rows`/`delete-columns`/`delete-range`,
 `format-cells`/`merge-cells`/`unmerge-cells`/`update-borders`/
 `update-dimension-properties`/`auto-resize-columns`,
 `set-data-validation`/`clear-data-validation`,
@@ -1878,6 +1879,52 @@ for being positive: the workbook's state implies no upper bound on how much
 you may add, so `omni-dev` doesn't invent one, and Sheets remains the
 authority on how large a sheet may actually get. A count large enough to
 overflow the row/column index space is refused rather than sent.
+
+#### drive sheets update-sheet-properties
+
+Changes a sheet's view properties — frozen rows/columns, tab color,
+right-to-left layout, and hidden gridlines — via the same
+`updateSheetProperties` request `rename-sheet`/`reorder-sheet`/
+`hide-sheet`/`show-sheet` use, but able to set several of them in one call.
+Gated by `sheets-structure`, like the rest of this family; see
+[ADR-0085](adrs/adr-0085.md).
+
+Every flag is independently optional and only the ones passed go in the
+field mask, so a change to one property never disturbs another. At least
+one must be given.
+
+```bash
+omni-dev drive sheets update-sheet-properties <ID> --sheet Q2 \
+  --freeze-rows 1 --tab-color '#FF8800'
+```
+
+```
+Would update sheet 'Q2' (sheetId 118293) in 'Budget': frozen rows 0 -> 1, tab color -> #FF8800
+```
+
+Tab color has no bare "unset" value, so clearing it is a separate flag:
+
+```bash
+omni-dev drive sheets update-sheet-properties <ID> --sheet Q2 --clear-tab-color
+```
+
+`--right-to-left`/`--hide-gridlines` take an explicit `true`/`false` rather
+than being bare presence flags, so passing `false` restores the default
+instead of the flag being unable to mean anything but "on".
+
+`--tab-color` and `--clear-tab-color` are mutually exclusive. Freezing every
+row or column is refused — Sheets requires at least one to stay unfrozen —
+and an invalid `#RRGGBB` value is refused before anything is sent:
+
+```
+Refused: update-sheet-properties requires at least one property to change
+Refused: '#GGGGGG' is not a color; expected 6 hex digits, optionally prefixed with '#' (e.g. #FF8800)
+Refused: --freeze-rows 500 would freeze every row; the sheet has 500 row(s), so the most that can be frozen is 499
+```
+
+Like every prior verb in this family, tab color is never read back: `sheets
+info` and `--dry-run` can state what a sheet's tab color *would become*, but
+never what it currently is (ADR-0085 §8).
 
 #### drive sheets delete-sheet / delete-rows / delete-columns / delete-range
 

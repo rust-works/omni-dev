@@ -256,6 +256,17 @@ pub struct SheetProperties {
         rename = "gridProperties"
     )]
     pub grid_properties: Option<GridProperties>,
+    /// Whether the sheet is laid out right-to-left (issue #1835). Not
+    /// paired with a `tab_color_style` field here — see
+    /// [`SheetPropertiesUpdate::tab_color_style`]'s doc comment for why the
+    /// tab color is write-only and deliberately never read back onto this
+    /// response type.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "rightToLeft"
+    )]
+    pub right_to_left: Option<bool>,
 }
 
 /// A grid sheet's declared dimensions.
@@ -274,6 +285,27 @@ pub struct GridProperties {
         rename = "columnCount"
     )]
     pub column_count: Option<i64>,
+    /// Rows frozen at the top (issue #1835).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "frozenRowCount"
+    )]
+    pub frozen_row_count: Option<i64>,
+    /// Columns frozen at the left (issue #1835).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "frozenColumnCount"
+    )]
+    pub frozen_column_count: Option<i64>,
+    /// Whether gridlines are hidden in the UI (issue #1835).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "hideGridlines"
+    )]
+    pub hide_gridlines: Option<bool>,
 }
 
 /// Cell values for one range, from `values.get` / `values.batchGet`.
@@ -418,8 +450,14 @@ pub enum BatchUpdateRequestItem {
     /// Add a new sheet to the workbook.
     AddSheet(AddSheetRequest),
     /// Change an existing sheet's properties — title (rename), index
-    /// (reorder) or hidden (hide/show); exactly one per request, matching
-    /// the request's own single-field `fields` mask.
+    /// (reorder), hidden (hide/show), or, since issue #1835's
+    /// `update-sheet-properties`, any of frozen rows/columns, hidden
+    /// gridlines, tab color, or right-to-left layout. `rename-sheet`/
+    /// `reorder-sheet`/`hide-sheet`/`show-sheet` each set exactly one field
+    /// per request; `update-sheet-properties` may set several at once, but
+    /// the request's `fields` mask always names exactly what was
+    /// populated, one entry per field, so it can never blank a property it
+    /// didn't mean to touch.
     UpdateSheetProperties(UpdateSheetPropertiesRequest),
     /// Insert empty rows or columns, shifting existing ones.
     InsertDimension(InsertDimensionRequest),
@@ -628,10 +666,17 @@ pub struct NewSheetProperties {
 ///
 /// `fields` is a field mask and is **not** optional: an empty mask is an
 /// error, and a mask naming more than we set would blank the unnamed fields.
-/// Every caller populates exactly the one [`SheetPropertiesUpdate`] field its
-/// `fields` string names — `structure.rs::build_request` is the single
-/// place that pairs the two, so they can never drift apart.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// Every caller but `update-sheet-properties` (issue #1835) populates
+/// exactly the one [`SheetPropertiesUpdate`] field its `fields` string
+/// names; `update-sheet-properties` may populate several at once (frozen
+/// rows/columns, hidden gridlines, tab color, right-to-left), and its mask
+/// still names exactly what was populated, field for field.
+/// `structure.rs::build_request` is the single place that pairs the
+/// properties and the mask, so they can never drift apart.
+///
+/// `PartialEq`-only, not `Eq`: [`SheetPropertiesUpdate`] embeds
+/// [`ColorStyle`], which wraps [`Color`]'s `f32` channels.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct UpdateSheetPropertiesRequest {
     /// The properties to write. `sheet_id` selects the target.
     pub properties: SheetPropertiesUpdate,
@@ -657,13 +702,17 @@ pub struct CopySheetToAnotherSpreadsheetRequest {
 /// serialise whatever else it happened to carry, and a field mask widened by
 /// accident is how an unintended property gets overwritten.
 ///
-/// Every field but `sheet_id` is optional and every caller sets exactly one
-/// of them — `title` (rename), `index` (reorder) or `hidden` (hide/show) —
-/// alongside a `fields` mask naming that one field. Modelling all three on
-/// one struct, rather than one struct per verb, is what lets `resolve_sheet`/
+/// Every field but `sheet_id` is optional. `title` (rename), `index`
+/// (reorder) and `hidden` (hide/show) each have their own single-field
+/// caller, which sets exactly that field alongside a `fields` mask naming
+/// it. `update-sheet-properties` (issue #1835) is different: it is the
+/// first caller that may populate several fields — `grid_properties`,
+/// `tab_color_style`, `right_to_left` — in one request, each still paired
+/// with its own mask entry. Modelling every settable property on one
+/// struct, rather than one struct per verb, is what lets `resolve_sheet`/
 /// `validate_verb_args`/`build_request`'s existing `updateSheetProperties`
-/// plumbing serve all three without triplicating it.
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+/// plumbing serve all of them without triplicating it.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct SheetPropertiesUpdate {
     /// Which sheet to modify.
     #[serde(rename = "sheetId")]
@@ -677,6 +726,49 @@ pub struct SheetPropertiesUpdate {
     /// Whether the sheet should be hidden, for hide/show.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden: Option<bool>,
+    /// Frozen rows/columns and hidden gridlines, for `update-sheet-properties`
+    /// (issue #1835).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "gridProperties")]
+    pub grid_properties: Option<GridPropertiesUpdate>,
+    /// The new tab color, for `update-sheet-properties` (issue #1835).
+    ///
+    /// Deliberately write-only: [`SheetProperties`] (the response type)
+    /// never carries this field, even though the API returns
+    /// `tabColorStyle` on a sheet that has one. Adding it there would strip
+    /// `Eq` from `SheetProperties`, and transitively from `Sheet` and
+    /// `Spreadsheet`, for no benefit — a dry-run preview only ever needs to
+    /// state what the color *becomes*, never what it was, since (unlike
+    /// frozen rows/columns) there is no meaningful "before" number to show
+    /// next to a swatch. `--clear-tab-color` (the CLI layer) leaves this
+    /// `None` while still naming `tabColorStyle` in the `fields` mask —
+    /// that is how the API is told to clear a field rather than leave it
+    /// unset.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "tabColorStyle")]
+    pub tab_color_style: Option<ColorStyle>,
+    /// Whether the sheet should be right-to-left, for `update-sheet-properties`
+    /// (issue #1835).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "rightToLeft")]
+    pub right_to_left: Option<bool>,
+}
+
+/// The `gridProperties` subset [`SheetPropertiesUpdate`] can set — frozen
+/// rows/columns and hidden gridlines (issue #1835).
+///
+/// Mirrors [`SheetPropertiesUpdate`]'s relationship to [`SheetProperties`]:
+/// a request-side type distinct from the response-side [`GridProperties`]
+/// so a field mask widened by accident can't blank `rowCount`/`columnCount`,
+/// which this type has no way to even name.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct GridPropertiesUpdate {
+    /// Rows to freeze at the top.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "frozenRowCount")]
+    pub frozen_row_count: Option<i64>,
+    /// Columns to freeze at the left.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "frozenColumnCount")]
+    pub frozen_column_count: Option<i64>,
+    /// Whether gridlines should be hidden.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "hideGridlines")]
+    pub hide_gridlines: Option<bool>,
 }
 
 /// `DuplicateSheetRequest`.

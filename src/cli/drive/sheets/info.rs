@@ -125,6 +125,7 @@ mod tests {
                 grid_properties: grid.map(|(rows, cols)| GridProperties {
                     row_count: Some(rows),
                     column_count: Some(cols),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),

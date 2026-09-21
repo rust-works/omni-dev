@@ -978,8 +978,7 @@ async fn rename_back_if_free(
                     properties: SheetPropertiesUpdate {
                         sheet_id: new_sheet_id,
                         title: Some(original_title.to_string()),
-                        index: None,
-                        hidden: None,
+                        ..Default::default()
                     },
                     fields: "title".to_string(),
                 },

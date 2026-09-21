@@ -4460,6 +4460,7 @@ Commands:
   reorder-sheet                Moves an existing sheet to a new position among its siblings. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
   hide-sheet                   Hides an existing sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
   show-sheet                   Shows an existing hidden sheet. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
+  update-sheet-properties      Changes a sheet's view properties — frozen rows/columns, tab color, right-to-left, hidden gridlines. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1835)
   format-cells                 Applies a cell format across a range. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
   update-borders               Sets border lines on a range's edges. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
   merge-cells                  Merges a range into one cell, discarding every value but the top-left's. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1643)
@@ -6062,6 +6063,31 @@ Options:
       --warning-only <BOOL>    The new warning-only flag [possible values: true, false]
       --add-editor <EMAIL>     An editor to add. Repeatable
       --remove-editor <EMAIL>  An editor to remove. Repeatable
+      --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets update-sheet-properties - Changes a sheet's view properties — frozen rows/columns, tab color, right-to-left, hidden gridlines. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1835)
+
+Changes a sheet's view properties — frozen rows/columns, tab color, right-to-left, hidden gridlines. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1835)
+
+Usage: update-sheet-properties [OPTIONS] --sheet <NAME> <--freeze-rows <N>|--freeze-columns <N>|--tab-color <HEX>|--clear-tab-color|--right-to-left <BOOL>|--hide-gridlines <BOOL>> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>           Title of the sheet to modify
+      --freeze-rows <N>        Rows to freeze at the top of the grid; 0 unfreezes
+      --freeze-columns <N>     Columns to freeze at the left of the grid; 0 unfreezes
+      --tab-color <HEX>        The new tab color, `#RRGGBB`
+      --clear-tab-color        Clears the tab color back to none
+      --right-to-left <BOOL>   Whether the sheet is laid out right-to-left [possible values: true, false]
+      --hide-gridlines <BOOL>  Whether to hide the grid's lines [possible values: true, false]
       --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]

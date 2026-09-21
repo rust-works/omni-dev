@@ -25,7 +25,7 @@ use crate::drive::sheets::types::{
 /// between sending this and not is an out-of-memory failure rather than a
 /// slower request. We only ever need the tab list.
 const SPREADSHEET_FIELDS: &str = "spreadsheetId,properties.title,\
-    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount))";
+    sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines))";
 
 /// `fields` mask for `spreadsheets.get` when protected ranges are needed
 /// too (issue #1643's `list-protections`/`update-protection`/
@@ -34,7 +34,7 @@ const SPREADSHEET_FIELDS: &str = "spreadsheetId,properties.title,\
 /// so every other caller — `sheets info`, `structure.rs`, `format.rs`,
 /// `validation.rs` — never pays for data it doesn't use.
 const SPREADSHEET_FIELDS_WITH_PROTECTIONS: &str = "spreadsheetId,properties.title,\
-    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)),\
     sheets.protectedRanges(protectedRangeId,range,description,warningOnly,editors.users)";
 
 /// `fields` mask for `spreadsheets.get` when the basic filter and filter
@@ -44,7 +44,7 @@ const SPREADSHEET_FIELDS_WITH_PROTECTIONS: &str = "spreadsheetId,properties.titl
 /// superset of [`SPREADSHEET_FIELDS`], kept separate for the same reason
 /// [`SPREADSHEET_FIELDS_WITH_PROTECTIONS`] is.
 const SPREADSHEET_FIELDS_WITH_FILTER_VIEWS: &str = "spreadsheetId,properties.title,\
-    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)),\
     sheets.basicFilter(range,sortSpecs,criteria),\
     sheets.filterViews(filterViewId,title,range,sortSpecs,criteria)";
 
@@ -57,7 +57,7 @@ const SPREADSHEET_FIELDS_WITH_FILTER_VIEWS: &str = "spreadsheetId,properties.tit
 /// strictly needing it). A superset of [`SPREADSHEET_FIELDS`], kept separate
 /// for the same reason [`SPREADSHEET_FIELDS_WITH_PROTECTIONS`] is.
 const SPREADSHEET_FIELDS_WITH_CONDITIONAL_FORMATS: &str = "spreadsheetId,properties.title,\
-    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)),\
     sheets.conditionalFormats(ranges,booleanRule,gradientRule)";
 
 /// `fields` mask for `spreadsheets.get` when named ranges are needed too
@@ -70,7 +70,7 @@ const SPREADSHEET_FIELDS_WITH_CONDITIONAL_FORMATS: &str = "spreadsheetId,propert
 /// `namedRanges` sits at the top level, not nested under `sheets` the way
 /// `protectedRanges` is.
 const SPREADSHEET_FIELDS_WITH_NAMED_RANGES: &str = "spreadsheetId,properties.title,\
-    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)),\
     namedRanges(namedRangeId,name,range)";
 
 /// `fields` mask for `spreadsheets.get` when charts and slicers are needed
@@ -87,7 +87,7 @@ const SPREADSHEET_FIELDS_WITH_NAMED_RANGES: &str = "spreadsheetId,properties.tit
 /// [`SPREADSHEET_FIELDS`], kept separate for the same reason
 /// [`SPREADSHEET_FIELDS_WITH_PROTECTIONS`] is.
 const SPREADSHEET_FIELDS_WITH_EMBEDDED_OBJECTS: &str = "spreadsheetId,properties.title,\
-    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)),\
     sheets.charts,sheets.slicers";
 
 /// `fields` mask for `spreadsheets.get` when every pivot table in the
@@ -100,7 +100,7 @@ const SPREADSHEET_FIELDS_WITH_EMBEDDED_OBJECTS: &str = "spreadsheetId,properties
 /// [`SPREADSHEET_FIELDS`], kept separate for the same reason
 /// [`SPREADSHEET_FIELDS_WITH_PROTECTIONS`] is.
 const SPREADSHEET_FIELDS_WITH_PIVOT_TABLES: &str = "spreadsheetId,properties.title,\
-    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)),\
     sheets.data(startRow,startColumn,rowData.values(pivotTable))";
 
 /// `fields` mask for `spreadsheets.get` when only a single cell's pivot
@@ -111,7 +111,7 @@ const SPREADSHEET_FIELDS_WITH_PIVOT_TABLES: &str = "spreadsheetId,properties.tit
 /// cell (see [`SheetsApi::get_cell_pivot`]), so this mask alone would still
 /// return every sheet's grid data without it.
 const CELL_PIVOT_FIELDS: &str = "spreadsheetId,properties.title,\
-    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)),\
     sheets.data(startRow,startColumn,rowData.values(pivotTable,formattedValue))";
 
 /// `fields` mask for `spreadsheets.get` when banded ranges are needed too
@@ -121,7 +121,7 @@ const CELL_PIVOT_FIELDS: &str = "spreadsheetId,properties.title,\
 /// [`SPREADSHEET_FIELDS`], kept separate for the same reason
 /// [`SPREADSHEET_FIELDS_WITH_PROTECTIONS`] is.
 const SPREADSHEET_FIELDS_WITH_BANDING: &str = "spreadsheetId,properties.title,\
-    sheets.properties(sheetId,title,index,hidden,gridProperties(rowCount,columnCount)),\
+    sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)),\
     sheets.bandedRanges(bandedRangeId,range,rowProperties,columnProperties)";
 
 /// `fields` mask for `spreadsheets.get` when dimension groups are needed
@@ -898,6 +898,9 @@ mod tests {
             .expect("fields mask must always be sent");
         assert!(fields.contains("sheets.properties"));
         assert!(fields.contains("title"));
+        // issue #1835: frozen rows/columns/hidden-gridlines/rightToLeft ride
+        // the same `sheets.properties` sub-mask every constant shares.
+        assert!(fields.contains("frozenRowCount"));
     }
 
     #[test]

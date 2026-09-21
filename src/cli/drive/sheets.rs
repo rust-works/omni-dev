@@ -113,6 +113,10 @@ pub enum SheetsSubcommands {
     /// Shows an existing hidden sheet. Gated by the folder write-permission
     /// rules' `sheets-structure` operation (issue #1643).
     ShowSheet(structure::ShowSheetCommand),
+    /// Changes a sheet's view properties — frozen rows/columns, tab color,
+    /// right-to-left, hidden gridlines. Gated by the folder
+    /// write-permission rules' `sheets-structure` operation (issue #1835).
+    UpdateSheetProperties(structure::UpdateSheetPropertiesCommand),
     /// Applies a cell format across a range. Gated by the folder
     /// write-permission rules' `sheets-structure` operation (issue #1643).
     FormatCells(format::FormatCellsCommand),
@@ -333,6 +337,7 @@ impl SheetsCommand {
             SheetsSubcommands::ReorderSheet(cmd) => cmd.execute(client).await,
             SheetsSubcommands::HideSheet(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ShowSheet(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::UpdateSheetProperties(cmd) => cmd.execute(client).await,
             SheetsSubcommands::FormatCells(cmd) => cmd.execute(client).await,
             SheetsSubcommands::UpdateBorders(cmd) => cmd.execute(client).await,
             SheetsSubcommands::MergeCells(cmd) => cmd.execute(client).await,
@@ -1052,6 +1057,68 @@ mod tests {
         assert!(dispatch(
             SheetsSubcommands::ListDimensionGroups(dimension_group::ListDimensionGroupsCommand {
                 spreadsheet_id: "sheet-1".to_string(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_update_sheet_properties_dispatch_arm_reaches_its_leaf_command() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        // No write-permission rules are configured (an unconfigured
+        // account), so the mutating leaf below is `Blocked` by default
+        // policy — enough to reach and return from the leaf without a
+        // lease or a workbook fetch, which a `Blocked` verdict never gets
+        // to (same trick as `the_banding_dispatch_arms_reach_their_leaf_commands`).
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1",
+                    "name": "Budget",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": ["folder-1"],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1",
+                    "name": "folder-1",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        fn no_lease() -> crate::cli::drive::helpers::LeaseTokenArg {
+            crate::cli::drive::helpers::LeaseTokenArg { lease: None }
+        }
+
+        assert!(dispatch(
+            SheetsSubcommands::UpdateSheetProperties(structure::UpdateSheetPropertiesCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: "Q1".to_string(),
+                freeze_rows: Some(1),
+                freeze_columns: None,
+                tab_color: Some("#FF8800".to_string()),
+                clear_tab_color: false,
+                right_to_left: None,
+                hide_gridlines: None,
+                dry_run: true,
+                lease: no_lease(),
                 output: crate::cli::drive::format::OutputFormat::Table,
             }),
             &client,
