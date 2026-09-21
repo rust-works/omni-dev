@@ -66,7 +66,7 @@ use crate::drive::lease::check::{
 use crate::drive::lease::ledger::LeaseBackup;
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
-use crate::drive::sheets::format::parse_hex_color;
+use crate::drive::sheets::format::{normalize_hex_for_display, parse_hex_color};
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
     AddSheetRequest, BatchUpdateRequestItem, BatchUpdateResponse, ColorStyle,
@@ -1119,34 +1119,20 @@ fn validate_verb_args(
                 }
             }
             if let Some(rows) = freeze_rows {
-                if *rows < 0 {
-                    return invalid(format!("--freeze-rows must be at least 0, got {rows}"));
-                }
-                if let Some(current) = sheet.and_then(|s| s.row_count) {
-                    if *rows >= current {
-                        return invalid(format!(
-                            "--freeze-rows {rows} would freeze every row; the sheet has \
-                             {current} row(s), so the most that can be frozen is {}",
-                            current - 1
-                        ));
-                    }
-                }
+                check_freeze_bound(
+                    "--freeze-rows",
+                    "row",
+                    *rows,
+                    sheet.and_then(|s| s.row_count),
+                )?;
             }
             if let Some(columns) = freeze_columns {
-                if *columns < 0 {
-                    return invalid(format!(
-                        "--freeze-columns must be at least 0, got {columns}"
-                    ));
-                }
-                if let Some(current) = sheet.and_then(|s| s.column_count) {
-                    if *columns >= current {
-                        return invalid(format!(
-                            "--freeze-columns {columns} would freeze every column; the sheet \
-                             has {current} column(s), so the most that can be frozen is {}",
-                            current - 1
-                        ));
-                    }
-                }
+                check_freeze_bound(
+                    "--freeze-columns",
+                    "column",
+                    *columns,
+                    sheet.and_then(|s| s.column_count),
+                )?;
             }
             Ok(())
         }
@@ -1184,6 +1170,37 @@ fn validate_span_start(dimension: Dimension, at: i64, count: i64) -> Result<i64,
                 noun = dimension.noun(),
             ))
         })
+}
+
+/// Validates a `--freeze-rows`/`--freeze-columns` value: non-negative, and,
+/// when the sheet's current count is known, strictly less than it — Sheets
+/// requires at least one row/column to stay unfrozen and rejects a request
+/// that would freeze the whole grid. Shared by both flags in
+/// [`validate_verb_args`]'s `UpdateSheetProperties` arm (issue #1835) so the
+/// bound and its wording can't drift between them.
+fn check_freeze_bound(
+    flag: &str,
+    noun: &str,
+    value: i64,
+    current: Option<i64>,
+) -> Result<(), StructureResult> {
+    if value < 0 {
+        return Err(StructureResult::RefusedInvalidRange {
+            detail: format!("{flag} must be at least 0, got {value}"),
+        });
+    }
+    if let Some(current) = current {
+        if value >= current {
+            return Err(StructureResult::RefusedInvalidRange {
+                detail: format!(
+                    "{flag} {value} would freeze every {noun}; the sheet has {current} \
+                     {noun}(s), so the most that can be frozen is {}",
+                    current - 1
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The `InsertRows`/`InsertColumns` half of [`validate_verb_args`], split
@@ -1523,20 +1540,16 @@ fn build_request(
         } => {
             let mut fields = Vec::new();
             let mut grid = GridPropertiesUpdate::default();
-            let mut grid_set = false;
             if let Some(rows) = freeze_rows {
                 grid.frozen_row_count = Some(*rows);
-                grid_set = true;
                 fields.push("gridProperties.frozenRowCount");
             }
             if let Some(columns) = freeze_columns {
                 grid.frozen_column_count = Some(*columns);
-                grid_set = true;
                 fields.push("gridProperties.frozenColumnCount");
             }
             if let Some(hide) = hide_gridlines {
                 grid.hide_gridlines = Some(*hide);
-                grid_set = true;
                 fields.push("gridProperties.hideGridlines");
             }
             let mut tab_color_style = None;
@@ -1565,7 +1578,7 @@ fn build_request(
                 UpdateSheetPropertiesRequest {
                     properties: SheetPropertiesUpdate {
                         sheet_id: sheet_id("update-sheet-properties")?,
-                        grid_properties: grid_set.then_some(grid),
+                        grid_properties: (grid != GridPropertiesUpdate::default()).then_some(grid),
                         tab_color_style,
                         right_to_left: *right_to_left,
                         ..Default::default()
@@ -2073,6 +2086,32 @@ fn describe_would_change(
     }
 }
 
+/// One `"<label> <before> -> <after>"` fragment, or `"<label> -> <after>"`
+/// when `before` is `None` — the shape every `update-sheet-properties`
+/// property reduces to (issue #1835). Shared so the four properties that
+/// carry a "before" value from the snapshot can't phrase it four different
+/// ways.
+fn before_after_fragment(
+    label: &str,
+    before: Option<impl std::fmt::Display>,
+    after: impl std::fmt::Display,
+) -> String {
+    match before {
+        Some(before) => format!("{label} {before} -> {after}"),
+        None => format!("{label} -> {after}"),
+    }
+}
+
+/// The `hide_gridlines` before/after label: `true`/`false` read as
+/// "hidden"/"shown" rather than as bare booleans.
+fn gridlines_label(hidden: bool) -> &'static str {
+    if hidden {
+        "hidden"
+    } else {
+        "shown"
+    }
+}
+
 /// The fragments shared by [`describe_would_change`]'s and
 /// [`describe_changed`]'s `UpdateSheetProperties` arms (issue #1835) — one
 /// per property the verb actually set, each stated as a before->after where
@@ -2090,42 +2129,37 @@ fn update_sheet_properties_fragments(
 ) -> Vec<String> {
     let mut fragments = Vec::new();
     if let Some(rows) = freeze_rows {
-        fragments.push(match sheet.and_then(|s| s.frozen_row_count) {
-            Some(before) => format!("frozen rows {before} -> {rows}"),
-            None => format!("frozen rows -> {rows}"),
-        });
+        fragments.push(before_after_fragment(
+            "frozen rows",
+            sheet.and_then(|s| s.frozen_row_count),
+            rows,
+        ));
     }
     if let Some(columns) = freeze_columns {
-        fragments.push(match sheet.and_then(|s| s.frozen_column_count) {
-            Some(before) => format!("frozen columns {before} -> {columns}"),
-            None => format!("frozen columns -> {columns}"),
-        });
+        fragments.push(before_after_fragment(
+            "frozen columns",
+            sheet.and_then(|s| s.frozen_column_count),
+            columns,
+        ));
     }
     if let Some(hex) = tab_color {
-        let display_hex = if hex.starts_with('#') {
-            hex.clone()
-        } else {
-            format!("#{hex}")
-        };
-        fragments.push(format!("tab color -> {display_hex}"));
+        fragments.push(format!("tab color -> {}", normalize_hex_for_display(hex)));
     } else if clear_tab_color {
         fragments.push("tab color cleared".to_string());
     }
     if let Some(rtl) = right_to_left {
-        fragments.push(match sheet.and_then(|s| s.right_to_left) {
-            Some(before) => format!("right-to-left {before} -> {rtl}"),
-            None => format!("right-to-left -> {rtl}"),
-        });
+        fragments.push(before_after_fragment(
+            "right-to-left",
+            sheet.and_then(|s| s.right_to_left),
+            rtl,
+        ));
     }
     if let Some(hide) = hide_gridlines {
-        let after_label = if hide { "hidden" } else { "shown" };
-        fragments.push(match sheet.and_then(|s| s.hide_gridlines) {
-            Some(before) => {
-                let before_label = if before { "hidden" } else { "shown" };
-                format!("gridlines {before_label} -> {after_label}")
-            }
-            None => format!("gridlines -> {after_label}"),
-        });
+        fragments.push(before_after_fragment(
+            "gridlines",
+            sheet.and_then(|s| s.hide_gridlines).map(gridlines_label),
+            gridlines_label(hide),
+        ));
     }
     fragments
 }
@@ -5296,6 +5330,90 @@ mod tests {
             panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
         };
         assert!(detail.contains("would freeze every row"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_allows_freezing_up_to_one_less_than_the_row_count() {
+        // The boundary `check_freeze_bound` is supposed to allow: one
+        // fewer than the sheet's current row count leaves exactly one row
+        // unfrozen, which Sheets permits (the `>=` refusal in
+        // `update_sheet_properties_refuses_freezing_every_row` above only
+        // pins the refused side of this same bound).
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook_with_frozen_rows(118_293, 5, 0)
+            .mount(&server)
+            .await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let verb = update_sheet_properties(Some(4), None, None, false, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, StructureResult::Changed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_refuses_a_negative_freeze_column_count() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = update_sheet_properties(None, Some(-1), None, false, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(
+            detail.contains("--freeze-columns must be at least 0"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_refuses_freezing_every_column() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        // mount_workbook()'s Q2 has columnCount 10.
+        mount_workbook().mount(&server).await;
+        let verb = update_sheet_properties(None, Some(10), None, false, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("would freeze every column"), "{detail}");
     }
 
     #[tokio::test]
