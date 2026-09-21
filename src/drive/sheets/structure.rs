@@ -3345,6 +3345,21 @@ mod tests {
         }
     }
 
+    /// [`insert_range`]'s twin with the other shift axis, so the `COLUMNS`
+    /// wire value and "shift ... right" wording get exercised too — `Rows`
+    /// is otherwise the only [`ShiftDimension`] any test ever names, mirroring
+    /// [`delete_range_columns_shift`].
+    fn insert_range_columns_shift() -> StructureVerb {
+        StructureVerb::InsertRange {
+            sheet: "Q2".to_string(),
+            start_row: 2,
+            end_row: 4,
+            start_column: 2,
+            end_column: 3,
+            shift: ShiftDimension::Columns,
+        }
+    }
+
     fn delete_range() -> StructureVerb {
         StructureVerb::DeleteRange {
             sheet: "Q2".to_string(),
@@ -4666,6 +4681,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn insert_range_with_columns_shift_sends_the_column_direction() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(insert_range_columns_shift(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+        assert!(describe(&outcome).contains("shifting existing cells right"));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        assert_eq!(
+            body["requests"][0]["insertRange"]["shiftDimension"],
+            "COLUMNS"
+        );
+    }
+
+    #[tokio::test]
     async fn insert_range_dry_run_at_the_grid_edge_warns_without_mutating() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
@@ -4697,6 +4746,47 @@ mod tests {
         ));
         let text = describe(&outcome);
         assert!(text.contains("shifting existing cells right"), "{text}");
+        assert!(text.contains("may be dropped by Sheets"), "{text}");
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !request.url.path().ends_with(":batchUpdate")));
+    }
+
+    #[tokio::test]
+    async fn insert_range_dry_run_with_rows_shift_warns_without_mutating() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::InsertRange {
+                    sheet: "Q2".to_string(),
+                    start_row: 500,
+                    end_row: 500,
+                    start_column: 10,
+                    end_column: 10,
+                    shift: ShiftDimension::Rows,
+                },
+                true,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            StructureResult::WouldChange { .. }
+        ));
+        let text = describe(&outcome);
+        assert!(text.contains("shifting existing cells down"), "{text}");
         assert!(text.contains("may be dropped by Sheets"), "{text}");
         assert!(server
             .received_requests()
