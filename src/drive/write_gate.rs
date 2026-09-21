@@ -174,11 +174,12 @@ pub enum DriveOperation {
     /// though it destroys none within it.
     ///
     /// Since issue #1837, also moving/resizing an existing chart or slicer
-    /// (`move-chart`/`move-slicer`, `updateEmbeddedObjectPosition`) — the
-    /// same operation as the rest of this chart/slicer set
-    /// (`add-chart`/`update-chart`/`delete-chart`/`add-slicer`/
-    /// `update-slicer`/`delete-slicer`), since a move discards no data
-    /// either.
+    /// (`move-chart`/`move-slicer`, `updateEmbeddedObjectPosition`) and
+    /// setting or clearing a chart's border colour (`update-chart-border`,
+    /// `updateEmbeddedObjectBorder`) — the same operation as the rest of
+    /// this chart/slicer set (`add-chart`/`update-chart`/`delete-chart`/
+    /// `add-slicer`/`update-slicer`/`delete-slicer`), since a move or a
+    /// border change discards no data either.
     ///
     /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
     /// reason that one is not folded into [`Self::Edit`]. Every existing

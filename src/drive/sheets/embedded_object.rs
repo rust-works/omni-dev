@@ -2,7 +2,8 @@
 //! [ADR-0081](../../../docs/adrs/adr-0081.md) §3).
 //!
 //! Extended by issue #1837 with `move-chart`/`move-slicer`
-//! (`updateEmbeddedObjectPosition`).
+//! (`updateEmbeddedObjectPosition`) and `update-chart-border`
+//! (`updateEmbeddedObjectBorder`).
 //!
 //! One module for both, per the issue's own framing: a slicer is an
 //! embedded object exactly like a chart, and both are removed by the same
@@ -52,11 +53,18 @@
 //! position to carry forward, so moving it onto a grid requires `--anchor`;
 //! `--new-sheet` sends no `fields` at all.
 //!
+//! **`update-chart-border` is colour-only.** `EmbeddedObjectBorder` models
+//! `colorStyle` alone — no style, no width — so `--clear` sends an empty
+//! border (`border: {}`) with the same `"colorStyle"` mask a set does. This
+//! is unverified against a live account; see
+//! [`UpdateEmbeddedObjectBorderRequest`](crate::drive::sheets::types::UpdateEmbeddedObjectBorderRequest)'s
+//! doc comment.
+//!
 //! **Documented cuts, matching this feature's general stance:**
 //! `COMBO`/`STEPPED_AREA` basic charts (need a per-series `type` this crate
-//! doesn't model), chart/slicer borders, and condition-based slicer filter
-//! criteria (`FilterCriteria` supports `hiddenValues` only, the same cut
-//! `filter.rs` makes).
+//! doesn't model), and condition-based slicer filter criteria
+//! (`FilterCriteria` supports `hiddenValues` only, the same cut `filter.rs`
+//! makes).
 //!
 //! Shape mirrors `filter.rs`: compose/validate, resolve against a
 //! freshly-fetched workbook, gate, dry-run, mutate, log.
@@ -77,14 +85,16 @@ use crate::drive::lease::check::{
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
+use crate::drive::sheets::format::parse_hex_color;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
     AddChartRequest, AddSlicerRequest, BasicChartAxis, BasicChartDomain, BasicChartSeries,
     BasicChartSpec, BatchUpdateRequestItem, BatchUpdateResponse, ChartData, ChartSourceRange,
-    ChartSpec, DeleteEmbeddedObjectRequest, EmbeddedChart, EmbeddedObjectPosition, FilterCriteria,
-    GridCoordinate, GridRange, OverlayPosition, PieChartSpec, Sheet, Slicer, SlicerSpec,
-    Spreadsheet, UpdateChartSpecRequest, UpdateEmbeddedObjectPositionRequest,
+    ChartSpec, ColorStyle, DeleteEmbeddedObjectRequest, EmbeddedChart, EmbeddedObjectBorder,
+    EmbeddedObjectPosition, FilterCriteria, GridCoordinate, GridRange, OverlayPosition,
+    PieChartSpec, Sheet, Slicer, SlicerSpec, Spreadsheet, UpdateChartSpecRequest,
+    UpdateEmbeddedObjectBorderRequest, UpdateEmbeddedObjectPositionRequest,
     UpdateSlicerSpecRequest,
 };
 use crate::drive::types::SheetTargetRefusal;
@@ -275,6 +285,17 @@ pub enum EmbeddedObjectVerb {
         /// The slicer's new height in pixels.
         height: Option<i64>,
     },
+    /// Set or clear a chart's border colour (issue #1837).
+    UpdateChartBorder {
+        /// Which chart to update, discovered via `list-charts`.
+        chart_id: i64,
+        /// The new border colour, as `#RRGGBB`. Mutually exclusive with
+        /// `clear`.
+        color: Option<String>,
+        /// Remove the chart's border entirely. Mutually exclusive with
+        /// `color`.
+        clear: bool,
+    },
 }
 
 impl EmbeddedObjectVerb {
@@ -288,6 +309,7 @@ impl EmbeddedObjectVerb {
             Self::DeleteSlicer { .. } => "sheets-delete-slicer",
             Self::MoveChart { .. } => "sheets-move-chart",
             Self::MoveSlicer { .. } => "sheets-move-slicer",
+            Self::UpdateChartBorder { .. } => "sheets-update-chart-border",
         }
     }
 
@@ -301,6 +323,7 @@ impl EmbeddedObjectVerb {
             Self::DeleteSlicer { .. } => "delete-slicer",
             Self::MoveChart { .. } => "move-chart",
             Self::MoveSlicer { .. } => "move-slicer",
+            Self::UpdateChartBorder { .. } => "update-chart-border",
         }
     }
 }
@@ -867,6 +890,11 @@ fn validate_verb(verb: &EmbeddedObjectVerb) -> Result<(), String> {
             }
             Ok(())
         }
+        EmbeddedObjectVerb::UpdateChartBorder { color, clear, .. } => match (color, clear) {
+            (None, false) => Err("nothing to change: pass --color or --clear".to_string()),
+            (Some(_), true) => Err("--color and --clear are mutually exclusive".to_string()),
+            _ => Ok(()),
+        },
         EmbeddedObjectVerb::DeleteChart { .. }
         | EmbeddedObjectVerb::DeleteSlicer { .. }
         | EmbeddedObjectVerb::AddSlicer { .. } => Ok(()),
@@ -967,6 +995,9 @@ fn build_plan(
         }
         EmbeddedObjectVerb::MoveSlicer { slicer_id, .. } => {
             build_move_slicer(workbook, verb, *slicer_id)
+        }
+        EmbeddedObjectVerb::UpdateChartBorder { chart_id, .. } => {
+            build_update_chart_border(workbook, verb, *chart_id)
         }
     }
 }
@@ -1300,6 +1331,7 @@ fn build_add_chart(
                 chart_id: None,
                 spec: Some(spec),
                 position: Some(position),
+                border: None,
             },
         }),
         summary,
@@ -2168,6 +2200,55 @@ fn build_move_slicer(
     ))
 }
 
+// ── update-chart-border ─────────────────────────────────────────────────
+
+fn build_update_chart_border(
+    workbook: &Spreadsheet,
+    verb: &EmbeddedObjectVerb,
+    chart_id: i64,
+) -> Result<Plan, EmbeddedObjectResult> {
+    let EmbeddedObjectVerb::UpdateChartBorder { color, clear, .. } = verb else {
+        unreachable!("build_update_chart_border is only ever called for UpdateChartBorder")
+        // omni-dev: coverage ignore-line reason="build_plan only calls build_update_chart_border after matching verb as EmbeddedObjectVerb::UpdateChartBorder; this else-arm exists only to destructure the already-known variant"
+    };
+
+    let (sheet, chart) = find_chart_or_refuse(workbook, chart_id)?;
+    let before = summarise_chart(sheet, chart);
+    let sheet_id = sheet.sheet_id();
+
+    let (border, summary) = if *clear {
+        (
+            EmbeddedObjectBorder::default(),
+            format!("clear chart {chart_id} border"),
+        )
+    } else {
+        let Some(color) = color else {
+            unreachable!("validate_verb refuses neither --color nor --clear") // omni-dev: coverage ignore-line reason="validate_verb already refuses UpdateChartBorder { color: None, clear: false, .. } before build_plan is ever reached, so this arm can never run"
+        };
+        let rgb_color = parse_hex_color(color).map_err(invalid)?;
+        (
+            EmbeddedObjectBorder {
+                color_style: Some(ColorStyle { rgb_color }),
+            },
+            format!("set chart {chart_id} border to {color}"),
+        )
+    };
+
+    Ok(Plan {
+        request: BatchUpdateRequestItem::UpdateEmbeddedObjectBorder(
+            UpdateEmbeddedObjectBorderRequest {
+                object_id: chart_id,
+                border,
+                fields: "colorStyle".to_string(),
+            },
+        ),
+        summary,
+        sheet_id,
+        before,
+        existing_id: Some(chart_id),
+    })
+}
+
 // ── list-charts / list-slicers ───────────────────────────────────────────
 
 /// Extracts every chart's summary from an already-fetched workbook, for
@@ -2609,6 +2690,11 @@ mod tests {
                 offset_y: None,
                 width: None,
                 height: None,
+            },
+            EmbeddedObjectVerb::UpdateChartBorder {
+                chart_id: 1,
+                color: Some(String::new()),
+                clear: false,
             },
         ];
         let ops: HashSet<&str> = verbs
@@ -3075,6 +3161,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
+                border: None,
             }],
             ..Default::default()
         }
@@ -3206,6 +3293,7 @@ mod tests {
                     ..Default::default()
                 }),
                 position: None,
+                border: None,
             }],
             ..Default::default()
         }
@@ -3363,6 +3451,7 @@ mod tests {
                     new_sheet: Some(true),
                     ..Default::default()
                 }),
+                border: None,
             }],
             ..Default::default()
         };
@@ -4276,6 +4365,7 @@ mod tests {
                 chart_id: Some(2),
                 spec: Some(ChartSpec::default()),
                 position: None,
+                border: None,
             }],
             ..Default::default()
         };
@@ -4559,6 +4649,7 @@ mod tests {
                 chart_id: Some(1),
                 spec: None,
                 position: None,
+                border: None,
             }],
             ..Default::default()
         };
@@ -5107,6 +5198,7 @@ mod tests {
                     new_sheet: Some(true),
                     ..Default::default()
                 }),
+                border: None,
             }],
             ..Default::default()
         };
@@ -5219,6 +5311,101 @@ mod tests {
         assert!(matches!(
             refusal(build_move_chart(&workbook, &verb, 99)),
             EmbeddedObjectResult::RefusedObjectNotFound { object_id: 99 }
+        ));
+    }
+
+    // ── build_update_chart_border ────────────────────────────────────────
+
+    fn update_chart_border_verb(tweak: impl FnOnce(&mut EmbeddedObjectVerb)) -> EmbeddedObjectVerb {
+        let mut verb = EmbeddedObjectVerb::UpdateChartBorder {
+            chart_id: 1,
+            color: Some("#4A86E8".to_string()),
+            clear: false,
+        };
+        tweak(&mut verb);
+        verb
+    }
+
+    #[test]
+    fn update_chart_border_sets_color_style() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let verb = update_chart_border_verb(|_| {});
+        let plan = build_update_chart_border(&workbook, &verb, 1).unwrap();
+        let request = serde_json::to_value(&plan.request).unwrap();
+        let body = &request["updateEmbeddedObjectBorder"];
+        assert_eq!(body["fields"], "colorStyle");
+        let rgb = &body["border"]["colorStyle"]["rgbColor"];
+        let red = rgb["red"].as_f64().unwrap();
+        assert!((red - f64::from(0x4Au8) / 255.0).abs() < 1e-6, "{rgb}");
+        assert_eq!(plan.summary, "set chart 1 border to #4A86E8");
+    }
+
+    #[test]
+    fn update_chart_border_clear_sends_an_empty_border() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let verb = update_chart_border_verb(|verb| {
+            let EmbeddedObjectVerb::UpdateChartBorder { color, clear, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_border_verb always builds an EmbeddedObjectVerb::UpdateChartBorder, so this arm can never run"
+            };
+            *color = None;
+            *clear = true;
+        });
+        let plan = build_update_chart_border(&workbook, &verb, 1).unwrap();
+        let request = serde_json::to_value(&plan.request).unwrap();
+        let body = &request["updateEmbeddedObjectBorder"];
+        assert_eq!(body["fields"], "colorStyle");
+        assert_eq!(body["border"], serde_json::json!({}));
+        assert_eq!(plan.summary, "clear chart 1 border");
+    }
+
+    #[test]
+    fn update_chart_border_refuses_a_bad_hex() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let verb = update_chart_border_verb(|verb| {
+            let EmbeddedObjectVerb::UpdateChartBorder { color, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_border_verb always builds an EmbeddedObjectVerb::UpdateChartBorder, so this arm can never run"
+            };
+            *color = Some("not-a-color".to_string());
+        });
+        let err = refusal(build_update_chart_border(&workbook, &verb, 1));
+        assert_invalid(&err, "is not a color");
+    }
+
+    #[test]
+    fn update_chart_border_refuses_an_empty_flag_set() {
+        let verb = update_chart_border_verb(|verb| {
+            let EmbeddedObjectVerb::UpdateChartBorder { color, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_border_verb always builds an EmbeddedObjectVerb::UpdateChartBorder, so this arm can never run"
+            };
+            *color = None;
+        });
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("nothing to change"), "{err}");
+    }
+
+    #[test]
+    fn update_chart_border_refuses_color_and_clear_together() {
+        let verb = update_chart_border_verb(|verb| {
+            let EmbeddedObjectVerb::UpdateChartBorder { clear, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_border_verb always builds an EmbeddedObjectVerb::UpdateChartBorder, so this arm can never run"
+            };
+            *clear = true;
+        });
+        let err = validate_verb(&verb).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn update_chart_border_refuses_a_slicer_id() {
+        let workbook = mixed_object_workbook();
+        let verb = update_chart_border_verb(|_| {});
+        assert!(matches!(
+            refusal(build_update_chart_border(&workbook, &verb, 4)),
+            EmbeddedObjectResult::RefusedWrongObjectKind {
+                object_id: 4,
+                expected,
+                found,
+            } if expected == "chart" && found == "slicer"
         ));
     }
 

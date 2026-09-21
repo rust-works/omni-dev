@@ -1,7 +1,7 @@
 //! CLI commands for `omni-dev drive sheets add-chart`/`update-chart`/
 //! `delete-chart`/`list-charts`/`add-slicer`/`update-slicer`/
-//! `delete-slicer`/`list-slicers` (issue #1797), and `move-chart`/
-//! `move-slicer` (issue #1837).
+//! `delete-slicer`/`list-slicers` (issue #1797), and
+//! `move-chart`/`move-slicer`/`update-chart-border` (issue #1837).
 //!
 //! Every mutating verb here is gated by
 //! [`DriveOperation::SheetsStructure`](crate::drive::write_gate::DriveOperation::SheetsStructure)
@@ -10,9 +10,9 @@
 //!
 //! **Chart subset (v1):** `column`, `bar`, `line`, `area`, `scatter`, and
 //! `pie`. See `embedded_object.rs`'s module docs for the full list of
-//! documented cuts (COMBO/STEPPED_AREA charts, chart/slicer borders,
-//! condition-based slicer criteria) — moving/resizing an existing object,
-//! previously on that list, is what issue #1837 adds here.
+//! documented cuts (COMBO/STEPPED_AREA charts, condition-based slicer
+//! criteria) — moving/resizing an existing object and chart borders,
+//! previously on that list, are what issue #1837 adds here.
 //!
 //! **`move-chart`/`move-slicer`'s field mask is rooted at
 //! `overlayPosition`, not `newPosition`** — see
@@ -744,6 +744,57 @@ impl MoveSlicerCommand {
     }
 }
 
+/// Sets or clears an existing chart's border colour
+/// (`updateEmbeddedObjectBorder`, issue #1837). Colour-only — there is no
+/// `--style`/`--width` flag, since `EmbeddedObjectBorder` models neither.
+#[derive(Parser)]
+pub struct UpdateChartBorderCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Which chart to update, discovered via `list-charts`.
+    #[arg(long, value_name = "ID")]
+    pub chart_id: i64,
+
+    /// The new border colour, e.g. `#4A86E8`.
+    #[arg(long, value_name = "#RRGGBB", conflicts_with = "clear")]
+    pub color: Option<String>,
+
+    /// Remove the chart's border entirely.
+    #[arg(long, conflicts_with = "color")]
+    pub clear: bool,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl UpdateChartBorderCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: EmbeddedObjectVerb::UpdateChartBorder {
+                chart_id: self.chart_id,
+                color: self.color,
+                clear: self.clear,
+            },
+            dry_run: self.dry_run,
+            lease_token: self.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+        };
+        run_embedded_object(client, &opts, &self.output).await
+    }
+}
+
 fn describe_summary_line(object: &EmbeddedObjectSummary) -> String {
     let kind = object
         .chart_type
@@ -1113,6 +1164,30 @@ mod tests {
                 offset_y: None,
                 width: None,
                 height: None,
+                dry_run: false,
+                lease: lease_arg(),
+                output,
+            };
+            assert!(cmd.execute(&client).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn update_chart_border_command_reports_blocked_with_no_rules() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_orphan_sheet(&server).await;
+
+        for output in [OutputFormat::Table, OutputFormat::Json] {
+            let cmd = UpdateChartBorderCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                chart_id: 1,
+                color: Some("#4A86E8".to_string()),
+                clear: false,
                 dry_run: false,
                 lease: lease_arg(),
                 output,

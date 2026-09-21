@@ -171,13 +171,13 @@ types, so the log is a complete invocation history, not just an HTTP history:
   type/title/anchor appended — the ADR-0081 §3 preview text, in the audit
   trail as well as the `--dry-run` report.
 
-  Moving/resizing an existing chart or slicer (issue
-  [#1837](https://github.com/rust-works/omni-dev/issues/1837)) uses the same
-  kind again. New `operation` values: `sheets-move-chart`,
-  `sheets-move-slicer`. No new context key: `embedded_object_id` and
-  `fields_changed` are reused exactly as above, and `sheet_id` records the
-  destination sheet for a move (`None` for a resize-only or `--new-sheet`
-  move, which has no destination sheet yet).
+  Moving/resizing an existing chart or slicer, and setting a chart's border
+  colour (issue [#1837](https://github.com/rust-works/omni-dev/issues/1837))
+  use the same kind again. New `operation` values: `sheets-move-chart`,
+  `sheets-move-slicer`, `sheets-update-chart-border`. No new context key:
+  `embedded_object_id` and `fields_changed` are reused exactly as above, and
+  `sheet_id` records the destination sheet for a move (`None` for a
+  resize-only or `--new-sheet` move, which has no destination sheet yet).
 
   Banded ranges (issue
   [#1832](https://github.com/rust-works/omni-dev/issues/1832),
