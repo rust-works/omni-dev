@@ -1975,6 +1975,41 @@ mod tests {
         assert!(!text.contains("cites"), "{text}");
     }
 
+    /// A dependency with no `could_be_cheaper` probability for `design`
+    /// (defensive: [`run_route`] always sets one for every entry it puts in
+    /// `depends_on`) still renders, just without the parenthetical.
+    #[test]
+    fn render_route_text_cites_a_dependency_with_no_could_be_cheaper_probability() {
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([(
+                        "anthropic".to_string(),
+                        ProviderRoute {
+                            stages: stages("none", "sonnet", "sonnet"),
+                            class: "sonnet".to_string(),
+                            close_calls: vec![],
+                        },
+                    )]),
+                    depends_on: vec![DependencyEntry {
+                        item_ref: "#1129".to_string(),
+                        state: ItemState::Open,
+                        could_be_cheaper: BTreeMap::new(),
+                    }],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(text.contains("cites open #1129"), "{text}");
+        assert!(!text.contains("could leave less design work"), "{text}");
+    }
+
     #[test]
     fn render_route_text_notes_a_truncated_issue_and_omits_the_note_otherwise() {
         let issue = |truncated: bool| IssueRoute {
