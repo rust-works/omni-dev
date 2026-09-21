@@ -14,12 +14,32 @@ use crate::jev::citations::{find_citations, Citation};
 use crate::jev::client::JevClient;
 use crate::jev::config::JevConfig;
 use crate::jev::route::{
-    build_route_state, run_route, Ladder, OpenDependencies, Provider, RouteOptions, RouteReport,
-    Tiers, DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
+    build_route_state, render_route_text, run_route, Ladder, OpenDependencies, Provider,
+    RouteOptions, RouteReport, Tiers, DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
 };
 use crate::provider::{GitProvider, IssueDoc, ItemKind, ItemRef, ItemState};
 
 use super::common::{format_output, JevFormat};
+
+/// Output format for `route`.
+///
+/// Route-only, not a variant of the shared [`JevFormat`]: `route`'s
+/// stage/provider breakdown is the only `ai jev` leaf with a natural human
+/// paragraph to write, so the other leaves (`choice`/`score`/`noul`/`ask`/
+/// `verify-decision`) never have to reject a `Text` variant that would never
+/// apply to them.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum RouteFormat {
+    /// Pretty-printed JSON (default).
+    #[default]
+    Json,
+    /// YAML.
+    Yaml,
+    /// One human-readable paragraph per issue. The wording is not a stable
+    /// contract and may change without notice; scripts should use `json` or
+    /// `yaml`.
+    Text,
+}
 
 /// Routes issues to model classes for their design, implement and review stages.
 #[derive(Parser)]
@@ -85,8 +105,8 @@ pub struct RouteCommand {
     pub allow_closed: bool,
 
     /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = JevFormat::Json)]
-    pub(super) output: JevFormat,
+    #[arg(short = 'o', long, value_enum, default_value_t = RouteFormat::Json)]
+    pub(super) output: RouteFormat,
 
     /// Overrides the configured Jev model for this call.
     #[arg(long, value_name = "MODEL")]
@@ -127,7 +147,12 @@ impl RouteCommand {
             allow_closed: self.allow_closed,
         };
         let report = run_route(&client, &docs, &ladders, &opts, &dependencies).await?;
-        print!("{}", format_output(&report, self.output)?);
+        let rendered = match self.output {
+            RouteFormat::Json => format_output(&report, JevFormat::Json)?,
+            RouteFormat::Yaml => format_output(&report, JevFormat::Yaml)?,
+            RouteFormat::Text => render_route_text(&report, self.max_input_chars),
+        };
+        print!("{rendered}");
         failure_summary(&report).map_or(Ok(()), |msg| bail!(msg))
     }
 }
@@ -296,9 +321,15 @@ mod tests {
         assert!((cmd.close_call - DEFAULT_CLOSE_CALL).abs() < f64::EPSILON);
         assert_eq!(cmd.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
         assert!(!cmd.allow_closed);
-        assert_eq!(cmd.output, JevFormat::Json);
+        assert_eq!(cmd.output, RouteFormat::Json);
         assert_eq!(cmd.providers, [Provider::Anthropic]);
         assert!(cmd.tiers.is_none());
+    }
+
+    #[test]
+    fn route_parses_text_output() {
+        let cmd = parse(&["#1", "-o", "text"]).unwrap();
+        assert_eq!(cmd.output, RouteFormat::Text);
     }
 
     #[test]
