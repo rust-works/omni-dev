@@ -1006,7 +1006,7 @@ fn build_add_chart(
         new_sheet,
     } = verb
     else {
-        unreachable!("build_add_chart is only ever called for AddChart")
+        unreachable!("build_add_chart is only ever called for AddChart") // omni-dev: coverage ignore-line reason="build_plan only calls build_add_chart after matching verb as EmbeddedObjectVerb::AddChart; this else-arm exists only to destructure the already-known variant"
     };
 
     let kind = parse_chart_type(chart_type).map_err(invalid)?;
@@ -1109,7 +1109,7 @@ fn build_add_chart(
             }
             let mut series_ranges = series_ranges;
             let Some(pie_series_range) = series_ranges.pop() else {
-                unreachable!("checked series_ranges.len() == 1 above")
+                unreachable!("checked series_ranges.len() == 1 above") // omni-dev: coverage ignore-line reason="the series_ranges.len() != 1 check immediately above has already returned, so the pop always yields Some; this else-arm exists only to unwrap it"
             };
             ChartSpec {
                 title: title.clone(),
@@ -1268,7 +1268,7 @@ fn merge_chart_spec(
         ..
     } = verb
     else {
-        unreachable!("merge_chart_spec is only ever called for UpdateChart")
+        unreachable!("merge_chart_spec is only ever called for UpdateChart") // omni-dev: coverage ignore-line reason="merge_chart_spec is only ever called from build_update_chart, which build_plan reaches only after matching verb as EmbeddedObjectVerb::UpdateChart; this else-arm exists only to destructure the already-known variant"
     };
 
     let existing_kind = existing_chart_kind(existing).map_err(|detail| {
@@ -1348,7 +1348,7 @@ fn merge_pie_chart(
         ..
     } = verb
     else {
-        unreachable!("merge_pie_chart is only ever called for UpdateChart")
+        unreachable!("merge_pie_chart is only ever called for UpdateChart") // omni-dev: coverage ignore-line reason="merge_pie_chart is only ever called from merge_chart_spec, which has already destructured the same verb as EmbeddedObjectVerb::UpdateChart; this else-arm exists only to destructure the already-known variant"
     };
 
     if header_count.is_some() {
@@ -1422,7 +1422,7 @@ fn merge_basic_chart(
         ..
     } = verb
     else {
-        unreachable!("merge_basic_chart is only ever called for UpdateChart")
+        unreachable!("merge_basic_chart is only ever called for UpdateChart") // omni-dev: coverage ignore-line reason="merge_basic_chart is only ever called from merge_chart_spec, which has already destructured the same verb as EmbeddedObjectVerb::UpdateChart; this else-arm exists only to destructure the already-known variant"
     };
 
     // The mirror image of `merge_pie_chart`'s basic-only rejections below:
@@ -1560,7 +1560,7 @@ fn build_add_slicer(
         height,
     } = verb
     else {
-        unreachable!("build_add_slicer is only ever called for AddSlicer")
+        unreachable!("build_add_slicer is only ever called for AddSlicer") // omni-dev: coverage ignore-line reason="build_plan only calls build_add_slicer after matching verb as EmbeddedObjectVerb::AddSlicer; this else-arm exists only to destructure the already-known variant"
     };
 
     let data_range = compose_and_resolve(workbook, sheet.as_deref(), range)?;
@@ -1627,7 +1627,9 @@ fn build_update_slicer(
         ..
     } = verb
     else {
+        // omni-dev: coverage ignore reason="build_plan only calls build_update_slicer after matching verb as EmbeddedObjectVerb::UpdateSlicer; this else-arm exists only to destructure the already-known variant"
         unreachable!("build_update_slicer is only ever called for UpdateSlicer")
+        // omni-dev: coverage end
     };
 
     let Some((host_sheet, slicer)) = find_slicer(workbook, slicer_id) else {
@@ -1974,7 +1976,7 @@ mod tests {
             match (&kind, expect_basic) {
                 (ChartKind::Basic(t), Some(expected)) => assert_eq!(*t, expected),
                 (ChartKind::Pie, None) => {}
-                _ => panic!("unexpected parse for {raw:?}: {kind:?}"),
+                _ => panic!("unexpected parse for {raw:?}: {kind:?}"), // omni-dev: coverage ignore-line reason="every row of the table above pairs its raw value with the kind `parse_chart_type` returns for it, so the mismatch arm only fires if one of the two assertions above would already have failed"
             }
         }
     }
@@ -2164,7 +2166,7 @@ mod tests {
     fn validate_verb_rejects_add_chart_with_no_series() {
         let mut verb = add_chart_verb();
         let EmbeddedObjectVerb::AddChart { series, .. } = &mut verb else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         series.clear();
         let err = validate_verb(&verb).unwrap_err();
@@ -2175,7 +2177,7 @@ mod tests {
     fn validate_verb_rejects_add_chart_with_neither_anchor_nor_new_sheet() {
         let mut verb = add_chart_verb();
         let EmbeddedObjectVerb::AddChart { anchor, .. } = &mut verb else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *anchor = None;
         let err = validate_verb(&verb).unwrap_err();
@@ -2186,7 +2188,7 @@ mod tests {
     fn validate_verb_rejects_new_sheet_combined_with_anchor() {
         let mut verb = add_chart_verb();
         let EmbeddedObjectVerb::AddChart { new_sheet, .. } = &mut verb else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *new_sheet = true;
         let err = validate_verb(&verb).unwrap_err();
@@ -2200,7 +2202,7 @@ mod tests {
             anchor, new_sheet, ..
         } = &mut verb
         else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *anchor = None;
         *new_sheet = true;
@@ -2303,7 +2305,7 @@ mod tests {
             ..
         } = &mut verb
         else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         // `chart_type` must be `pie` here, or the applicability check now
         // fires first (see the ordering test below) and this would assert
@@ -2326,7 +2328,7 @@ mod tests {
             ..
         } = &mut verb
         else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *chart_type = "pie".to_string();
         *pie_hole = Some(0.5);
@@ -2343,7 +2345,7 @@ mod tests {
                 ..
             } = &mut verb
             else {
-                unreachable!()
+                unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
             };
             *chart_type = "pie".to_string();
             *pie_hole = Some(boundary);
@@ -2364,7 +2366,7 @@ mod tests {
                 ..
             } = &mut verb
             else {
-                unreachable!()
+                unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
             };
             *chart_type = "pie".to_string();
             *pie_hole = Some(bad);
@@ -2385,7 +2387,7 @@ mod tests {
         // `validate_verb`'s `AddChart` arm doc comment.
         let mut verb = add_chart_verb();
         let EmbeddedObjectVerb::AddChart { pie_hole, .. } = &mut verb else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *pie_hole = Some(1.5);
         let err = validate_verb(&verb).unwrap_err();
@@ -2397,7 +2399,7 @@ mod tests {
     fn validate_verb_rejects_add_chart_pie_hole_on_a_non_pie_chart_even_in_range() {
         let mut verb = add_chart_verb();
         let EmbeddedObjectVerb::AddChart { pie_hole, .. } = &mut verb else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *pie_hole = Some(0.5);
         let err = validate_verb(&verb).unwrap_err();
@@ -2532,6 +2534,14 @@ mod tests {
         assert_eq!(err, "histogramChart");
     }
 
+    #[test]
+    fn existing_chart_kind_names_an_empty_spec_unknown() {
+        // A spec carrying neither union *and* no unmodelled key to name —
+        // the error message still has to say something.
+        let err = existing_chart_kind(&ChartSpec::default()).unwrap_err();
+        assert_eq!(err, "unknown");
+    }
+
     // ── merge_chart_spec ─────────────────────────────────────────────────
 
     fn workbook_with_sheet(sheet: Sheet) -> Spreadsheet {
@@ -2637,7 +2647,7 @@ mod tests {
         let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
         let mut verb = update_chart_verb(1);
         let EmbeddedObjectVerb::UpdateChart { chart_type, .. } = &mut verb else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *chart_type = Some("pie".to_string());
         let err = merge_chart_spec(&workbook, existing, &verb).unwrap_err();
@@ -2654,7 +2664,7 @@ mod tests {
         let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
         let mut verb = update_chart_verb(1);
         let EmbeddedObjectVerb::UpdateChart { chart_type, .. } = &mut verb else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *chart_type = Some("bar".to_string());
         let (spec, _) = merge_chart_spec(&workbook, existing, &verb).unwrap();
@@ -2672,7 +2682,7 @@ mod tests {
             ..
         } = &mut verb
         else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *horizontal_axis_title = Some("Quarter".to_string());
         let (spec, summary) = merge_chart_spec(&workbook, existing, &verb).unwrap();
@@ -2724,7 +2734,7 @@ mod tests {
         let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
         let mut verb = update_chart_verb(1);
         let EmbeddedObjectVerb::UpdateChart { header_count, .. } = &mut verb else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *header_count = Some(1);
         let err = merge_chart_spec(&workbook, existing, &verb).unwrap_err();
@@ -2773,7 +2783,7 @@ mod tests {
             ..
         } = &mut verb
         else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *title = None;
         *sheet = Some("Q1".to_string());
@@ -2802,7 +2812,7 @@ mod tests {
             ..
         } = &mut verb
         else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *title = None;
         *sheet = Some("Q1".to_string());
@@ -2827,7 +2837,7 @@ mod tests {
             title, pie_hole, ..
         } = &mut verb
         else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *title = None;
         *pie_hole = Some(0.4);
@@ -2928,6 +2938,21 @@ mod tests {
         assert_eq!(
             object_preview(&object),
             "id 5: chart (PIE) 'Sales', anchored Q1!C2"
+        );
+    }
+
+    #[test]
+    fn object_preview_omits_the_chart_type_and_title_a_slicer_lacks() {
+        let object = EmbeddedObjectSummary {
+            object_id: 9,
+            kind: "slicer".to_string(),
+            chart_type: None,
+            title: None,
+            position: "unknown position".to_string(),
+        };
+        assert_eq!(
+            object_preview(&object),
+            "id 9: slicer, anchored unknown position"
         );
     }
 
@@ -3134,7 +3159,7 @@ mod tests {
             chart_type, series, ..
         } = &mut verb
         else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *chart_type = "pie".to_string();
         series.push("C1:C10".to_string());
@@ -3490,5 +3515,1608 @@ mod tests {
         let workbook = workbook_with_sheet(with_slicer);
         assert_eq!(charts_from_workbook(&workbook).len(), 1);
         assert_eq!(slicers_from_workbook(&workbook).len(), 1);
+    }
+
+    // ── shared assertion helpers ─────────────────────────────────────────
+
+    /// [`Plan`] deliberately carries no `Debug`, so `Result::unwrap_err` is
+    /// unavailable on a plan builder's result; this is the equivalent.
+    #[track_caller]
+    fn refusal(plan: Result<Plan, EmbeddedObjectResult>) -> EmbeddedObjectResult {
+        plan.err().expect("expected the plan builder to refuse")
+    }
+
+    /// Asserts a refusal is [`EmbeddedObjectResult::RefusedInvalidRange`]
+    /// and that its detail mentions `needle`.
+    ///
+    /// Written against the rendered `Debug` rather than a `match` so that
+    /// no call site needs an arm that can never run.
+    #[track_caller]
+    fn assert_invalid(result: &EmbeddedObjectResult, needle: &str) {
+        let rendered = format!("{result:?}");
+        assert!(
+            matches!(result, EmbeddedObjectResult::RefusedInvalidRange { .. }),
+            "expected RefusedInvalidRange, got {rendered}"
+        );
+        assert!(rendered.contains(needle), "{rendered}");
+    }
+
+    /// A one-sheet workbook with no charts or slicers on it.
+    fn plain_workbook(title: &str) -> Spreadsheet {
+        workbook_with_sheet(Sheet {
+            properties: Some(crate::drive::sheets::types::SheetProperties {
+                sheet_id: Some(0),
+                title: title.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    // ── resolve_anchor ───────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_anchor_refuses_an_open_ended_range() {
+        let workbook = plain_workbook("Sheet1");
+        let err = resolve_anchor(&workbook, Some("Sheet1"), "A:A")
+            .expect_err("an open-ended range is not a single cell");
+        assert_invalid(&err, "not an open-ended range");
+    }
+
+    #[test]
+    fn resolve_anchor_refuses_a_multi_cell_range() {
+        let workbook = plain_workbook("Sheet1");
+        let err = resolve_anchor(&workbook, Some("Sheet1"), "A1:B2")
+            .expect_err("a bounded 2x2 range is not a single cell");
+        assert_invalid(&err, "not a range");
+    }
+
+    #[test]
+    fn resolve_anchor_accepts_a_single_cell() {
+        let workbook = plain_workbook("Sheet1");
+        let cell = resolve_anchor(&workbook, Some("Sheet1"), "E2").unwrap();
+        assert_eq!(cell.sheet_id, 0);
+        assert_eq!(cell.row_index, 1);
+        assert_eq!(cell.column_index, 4);
+    }
+
+    // ── build_add_chart ──────────────────────────────────────────────────
+
+    /// Mutates a freshly-built [`add_chart_verb`] through a closure, so the
+    /// many one-flag variations below need no destructuring boilerplate.
+    fn add_chart_verb_with(tweak: impl FnOnce(&mut EmbeddedObjectVerb)) -> EmbeddedObjectVerb {
+        let mut verb = add_chart_verb();
+        tweak(&mut verb);
+        verb
+    }
+
+    fn set_pie(verb: &mut EmbeddedObjectVerb) {
+        let EmbeddedObjectVerb::AddChart { chart_type, .. } = verb else {
+            unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+        };
+        *chart_type = "pie".to_string();
+    }
+
+    #[test]
+    fn build_add_chart_puts_the_chart_on_its_own_new_sheet() {
+        let workbook = plain_workbook("Sheet1");
+        let verb = add_chart_verb_with(|verb| {
+            let EmbeddedObjectVerb::AddChart {
+                anchor, new_sheet, ..
+            } = verb
+            else {
+                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+            };
+            *anchor = None;
+            *new_sheet = true;
+        });
+        let plan = build_add_chart(&workbook, &verb).unwrap();
+        assert_eq!(plan.sheet_id, None, "a new-sheet chart has no host sheet");
+        let request = serde_json::to_value(&plan.request).unwrap();
+        assert_eq!(request["addChart"]["chart"]["position"]["newSheet"], true);
+        assert!(request["addChart"]["chart"]["position"]["overlayPosition"].is_null());
+    }
+
+    #[test]
+    fn build_add_chart_refuses_neither_anchor_nor_new_sheet() {
+        // `validate_verb` rejects this combination first in the real flow;
+        // `build_add_chart` keeps its own check so a non-CLI caller reaching
+        // the builder directly still cannot produce a position-less chart.
+        let workbook = plain_workbook("Sheet1");
+        let verb = add_chart_verb_with(|verb| {
+            let EmbeddedObjectVerb::AddChart { anchor, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+            };
+            *anchor = None;
+        });
+        let err = refusal(build_add_chart(&workbook, &verb));
+        assert_invalid(&err, "either --anchor or --new-sheet is required");
+    }
+
+    #[test]
+    fn build_add_chart_propagates_an_unresolvable_anchor() {
+        // The `?` on `overlay_position` is the only path out of
+        // `build_add_chart` that a *position* can refuse on.
+        let workbook = plain_workbook("Sheet1");
+        let verb = add_chart_verb_with(|verb| {
+            let EmbeddedObjectVerb::AddChart { anchor, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+            };
+            *anchor = Some("E2:F3".to_string());
+        });
+        let err = refusal(build_add_chart(&workbook, &verb));
+        assert_invalid(&err, "must name a single cell, not a range");
+    }
+
+    #[test]
+    fn build_add_chart_refuses_pie_hole_on_a_basic_chart() {
+        let workbook = plain_workbook("Sheet1");
+        let verb = add_chart_verb_with(|verb| {
+            let EmbeddedObjectVerb::AddChart { pie_hole, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+            };
+            *pie_hole = Some(0.4);
+        });
+        let err = refusal(build_add_chart(&workbook, &verb));
+        assert_invalid(&err, "--pie-hole only applies to a pie chart");
+    }
+
+    #[test]
+    fn build_add_chart_refuses_every_basic_only_flag_on_a_pie_chart() {
+        let workbook = plain_workbook("Sheet1");
+        for (tweak, needle) in [
+            (
+                Box::new(|verb: &mut EmbeddedObjectVerb| {
+                    let EmbeddedObjectVerb::AddChart { header_count, .. } = verb else {
+                        unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                    };
+                    *header_count = Some(1);
+                }) as Box<dyn FnOnce(&mut EmbeddedObjectVerb)>,
+                "--header-count only applies",
+            ),
+            (
+                Box::new(|verb: &mut EmbeddedObjectVerb| {
+                    let EmbeddedObjectVerb::AddChart { stacked, .. } = verb else {
+                        unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                    };
+                    *stacked = Some("stacked".to_string());
+                }),
+                "--stacked only applies",
+            ),
+            (
+                Box::new(|verb: &mut EmbeddedObjectVerb| {
+                    let EmbeddedObjectVerb::AddChart {
+                        horizontal_axis_title,
+                        ..
+                    } = verb
+                    else {
+                        unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                    };
+                    *horizontal_axis_title = Some("Quarter".to_string());
+                }),
+                "--horizontal-axis-title/--vertical-axis-title only apply",
+            ),
+            (
+                Box::new(|verb: &mut EmbeddedObjectVerb| {
+                    let EmbeddedObjectVerb::AddChart {
+                        vertical_axis_title,
+                        ..
+                    } = verb
+                    else {
+                        unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                    };
+                    *vertical_axis_title = Some("Revenue".to_string());
+                }),
+                "--horizontal-axis-title/--vertical-axis-title only apply",
+            ),
+        ] {
+            let verb = add_chart_verb_with(|verb| {
+                set_pie(verb);
+                tweak(verb);
+            });
+            let err = refusal(build_add_chart(&workbook, &verb));
+            assert_invalid(&err, needle);
+        }
+    }
+
+    #[test]
+    fn build_add_chart_refuses_a_pie_chart_with_more_than_one_series() {
+        let workbook = plain_workbook("Sheet1");
+        let verb = add_chart_verb_with(|verb| {
+            set_pie(verb);
+            let EmbeddedObjectVerb::AddChart { series, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+            };
+            series.push("C1:C10".to_string());
+        });
+        let err = refusal(build_add_chart(&workbook, &verb));
+        assert_invalid(&err, "a pie chart takes exactly one --series");
+    }
+
+    #[test]
+    fn build_add_chart_builds_a_full_pie_chart_spec() {
+        let workbook = plain_workbook("Sheet1");
+        let verb = add_chart_verb_with(|verb| {
+            set_pie(verb);
+            let EmbeddedObjectVerb::AddChart {
+                title,
+                subtitle,
+                legend,
+                pie_hole,
+                ..
+            } = verb
+            else {
+                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+            };
+            *title = Some("Share".to_string());
+            *subtitle = Some("by region".to_string());
+            *legend = Some("right".to_string());
+            *pie_hole = Some(0.4);
+        });
+        let plan = build_add_chart(&workbook, &verb).unwrap();
+        assert_eq!(plan.sheet_id, Some(0));
+        assert_eq!(plan.summary, "add pie chart 'Share'");
+        assert!(plan.before.is_none());
+        assert_eq!(plan.existing_id, None);
+        let spec = &serde_json::to_value(&plan.request).unwrap()["addChart"]["chart"]["spec"];
+        assert_eq!(spec["title"], "Share");
+        assert_eq!(spec["subtitle"], "by region");
+        assert!(
+            spec["basicChart"].is_null(),
+            "a pie chart has no basicChart"
+        );
+        assert_eq!(spec["pieChart"]["legendPosition"], "RIGHT_LEGEND");
+        assert_eq!(spec["pieChart"]["pieHole"], 0.4);
+        assert_eq!(
+            spec["pieChart"]["domain"]["sourceRange"]["sources"][0]["startColumnIndex"],
+            0
+        );
+        assert_eq!(
+            spec["pieChart"]["series"]["sourceRange"]["sources"][0]["startColumnIndex"],
+            1
+        );
+    }
+
+    // ── describe_position ────────────────────────────────────────────────
+
+    #[test]
+    fn summarise_chart_reports_no_type_for_a_spec_that_is_neither_basic_nor_pie() {
+        // A histogram (or any chart kind this crate doesn't model) still
+        // has to list, even though its type can't be named.
+        let sheet = Sheet {
+            properties: Some(crate::drive::sheets::types::SheetProperties {
+                sheet_id: Some(0),
+                title: "Q1".to_string(),
+                ..Default::default()
+            }),
+            charts: vec![EmbeddedChart {
+                chart_id: Some(2),
+                spec: Some(ChartSpec::default()),
+                position: None,
+            }],
+            ..Default::default()
+        };
+        let summary = summarise_chart(&sheet, &sheet.charts[0]).unwrap();
+        assert_eq!(summary.chart_type, None);
+        assert_eq!(summary.object_id, 2);
+    }
+
+    #[test]
+    fn describe_position_names_an_own_sheet_chart_with_and_without_an_id() {
+        let sheet = plain_workbook("Q1").sheets.remove(0);
+        let anonymous = EmbeddedObjectPosition {
+            new_sheet: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(describe_position(&sheet, Some(&anonymous)), "own sheet");
+        let identified = EmbeddedObjectPosition {
+            sheet_id: Some(9),
+            ..Default::default()
+        };
+        assert_eq!(
+            describe_position(&sheet, Some(&identified)),
+            "own sheet (id 9)"
+        );
+    }
+
+    #[test]
+    fn describe_position_falls_back_to_unknown_without_an_overlay() {
+        let sheet = plain_workbook("Q1").sheets.remove(0);
+        let empty = EmbeddedObjectPosition::default();
+        assert_eq!(
+            describe_position(&sheet, Some(&empty)),
+            "unknown position",
+            "a position carrying neither an overlay nor a sheet is unknown"
+        );
+        assert_eq!(describe_position(&sheet, None), "unknown position");
+    }
+
+    #[test]
+    fn summarise_chart_reports_pie_for_a_pie_spec() {
+        let sheet = pie_chart_sheet(3);
+        let summary = summarise_chart(&sheet, &sheet.charts[0]).unwrap();
+        assert_eq!(summary.chart_type.as_deref(), Some("PIE"));
+        assert_eq!(
+            summary.position, "unknown position",
+            "pie_chart_sheet's chart carries no position at all"
+        );
+    }
+
+    // ── merge_chart_spec: title / subtitle / legend ──────────────────────
+
+    /// Mutates a freshly-built [`update_chart_verb`] through a closure,
+    /// mirroring [`add_chart_verb_with`].
+    fn update_chart_verb_with(
+        chart_id: i64,
+        tweak: impl FnOnce(&mut EmbeddedObjectVerb),
+    ) -> EmbeddedObjectVerb {
+        let mut verb = update_chart_verb(chart_id);
+        tweak(&mut verb);
+        verb
+    }
+
+    #[test]
+    fn merge_chart_spec_sets_subtitle_and_legend_alongside_the_title() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let verb = update_chart_verb_with(1, |verb| {
+            let EmbeddedObjectVerb::UpdateChart {
+                subtitle, legend, ..
+            } = verb
+            else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+            };
+            *subtitle = Some("FY25".to_string());
+            *legend = Some("top".to_string());
+        });
+        let (spec, summary) = merge_chart_spec(&workbook, existing, &verb).unwrap();
+        assert_eq!(spec.title.as_deref(), Some("New title"));
+        assert_eq!(spec.subtitle.as_deref(), Some("FY25"));
+        assert_eq!(
+            spec.basic_chart.unwrap().legend_position.as_deref(),
+            Some("TOP_LEGEND")
+        );
+        assert_eq!(summary, "update chart 1 (title, subtitle, legend)");
+    }
+
+    // ── merge_pie_chart ──────────────────────────────────────────────────
+
+    #[test]
+    fn merge_pie_chart_refuses_stacked_and_axis_titles() {
+        let workbook = workbook_with_sheet(pie_chart_sheet(1));
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+
+        let stacked = update_chart_verb_with(1, |verb| {
+            let EmbeddedObjectVerb::UpdateChart { stacked, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+            };
+            *stacked = Some("stacked".to_string());
+        });
+        assert_invalid(
+            &merge_chart_spec(&workbook, existing, &stacked).unwrap_err(),
+            "--stacked only applies",
+        );
+
+        let axis = update_chart_verb_with(1, |verb| {
+            let EmbeddedObjectVerb::UpdateChart {
+                horizontal_axis_title,
+                ..
+            } = verb
+            else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+            };
+            *horizontal_axis_title = Some("Quarter".to_string());
+        });
+        assert_invalid(
+            &merge_chart_spec(&workbook, existing, &axis).unwrap_err(),
+            "--horizontal-axis-title/--vertical-axis-title only apply",
+        );
+    }
+
+    #[test]
+    fn merge_pie_chart_refuses_more_than_one_series() {
+        let workbook = workbook_with_sheet(pie_chart_sheet(1));
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let verb = update_chart_verb_with(1, |verb| {
+            let EmbeddedObjectVerb::UpdateChart { sheet, series, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+            };
+            *sheet = Some("Q1".to_string());
+            *series = vec!["B1:B10".to_string(), "C1:C10".to_string()];
+        });
+        assert_invalid(
+            &merge_chart_spec(&workbook, existing, &verb).unwrap_err(),
+            "a pie chart takes exactly one --series",
+        );
+    }
+
+    #[test]
+    fn merge_pie_chart_leaves_domain_and_series_alone_when_neither_is_named() {
+        let workbook = workbook_with_sheet(pie_chart_sheet(1));
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let original = existing.pie_chart.clone().unwrap();
+        let verb = update_chart_verb_with(1, |verb| {
+            let EmbeddedObjectVerb::UpdateChart { pie_hole, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+            };
+            *pie_hole = Some(0.6);
+        });
+        let (spec, summary) = merge_chart_spec(&workbook, existing, &verb).unwrap();
+        let pie = spec.pie_chart.unwrap();
+        assert_eq!(pie.domain, original.domain, "domain must survive untouched");
+        assert_eq!(pie.series, original.series, "series must survive untouched");
+        assert_eq!(pie.pie_hole, Some(0.6));
+        assert_eq!(summary, "update chart 1 (title, pie-hole)");
+    }
+
+    #[test]
+    fn merge_pie_chart_propagates_an_unresolvable_series_range() {
+        let workbook = workbook_with_sheet(pie_chart_sheet(1));
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let verb = update_chart_verb_with(1, |verb| {
+            let EmbeddedObjectVerb::UpdateChart { sheet, series, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+            };
+            *sheet = Some("Nope".to_string());
+            *series = vec!["B1:B10".to_string()];
+        });
+        let err = merge_chart_spec(&workbook, existing, &verb).unwrap_err();
+        assert!(
+            matches!(err, EmbeddedObjectResult::RefusedSheetNotFound { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_pie_chart_merges_domain_series_legend_and_pie_hole() {
+        let workbook = workbook_with_sheet(pie_chart_sheet(1));
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let verb = update_chart_verb_with(1, |verb| {
+            let EmbeddedObjectVerb::UpdateChart {
+                title,
+                sheet,
+                domain,
+                series,
+                legend,
+                pie_hole,
+                ..
+            } = verb
+            else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+            };
+            *title = None;
+            *sheet = Some("Q1".to_string());
+            *domain = Some("C1:C10".to_string());
+            *series = vec!["D1:D10".to_string()];
+            *legend = Some("left".to_string());
+            *pie_hole = Some(0.25);
+        });
+        let (spec, summary) = merge_chart_spec(&workbook, existing, &verb).unwrap();
+        assert!(spec.basic_chart.is_none(), "the merge stays a pie chart");
+        let pie = spec.pie_chart.unwrap();
+        assert_eq!(
+            pie.domain.source_range.sources[0].start_column_index,
+            Some(2)
+        );
+        assert_eq!(
+            pie.series.source_range.sources[0].start_column_index,
+            Some(3)
+        );
+        assert_eq!(pie.legend_position.as_deref(), Some("LEFT_LEGEND"));
+        assert_eq!(pie.pie_hole, Some(0.25));
+        assert_eq!(summary, "update chart 1 (legend, domain, series, pie-hole)");
+    }
+
+    // ── merge_basic_chart ────────────────────────────────────────────────
+
+    #[test]
+    fn merge_basic_chart_merges_every_basic_flag_at_once() {
+        let workbook = workbook_with_sheet(basic_chart_sheet_with_series(1));
+        let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
+        let verb = update_chart_verb_with(1, |verb| {
+            let EmbeddedObjectVerb::UpdateChart {
+                title,
+                sheet,
+                domain,
+                series,
+                legend,
+                stacked,
+                header_count,
+                horizontal_axis_title,
+                vertical_axis_title,
+                ..
+            } = verb
+            else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+            };
+            *title = None;
+            *sheet = Some("Q1".to_string());
+            *domain = Some("A1:A10".to_string());
+            *series = vec!["B1:B10".to_string(), "C1:C10".to_string()];
+            *legend = Some("bottom".to_string());
+            *stacked = Some("percent".to_string());
+            *header_count = Some(1);
+            *horizontal_axis_title = Some("Quarter".to_string());
+            *vertical_axis_title = Some("Revenue".to_string());
+        });
+        let (spec, summary) = merge_chart_spec(&workbook, existing, &verb).unwrap();
+        assert!(spec.pie_chart.is_none(), "the merge stays a basic chart");
+        let basic = spec.basic_chart.unwrap();
+        assert_eq!(basic.domains.len(), 1);
+        assert_eq!(
+            basic.series.len(),
+            2,
+            "--series replaces the list wholesale"
+        );
+        assert_eq!(basic.legend_position.as_deref(), Some("BOTTOM_LEGEND"));
+        assert_eq!(basic.stacked_type.as_deref(), Some("PERCENT_STACKED"));
+        assert_eq!(basic.header_count, Some(1));
+        assert_eq!(basic.axis.len(), 2);
+        assert_eq!(basic.axis[0].title.as_deref(), Some("Quarter"));
+        assert_eq!(basic.axis[1].position, "LEFT_AXIS");
+        assert_eq!(basic.axis[1].title.as_deref(), Some("Revenue"));
+        assert_eq!(
+            summary,
+            "update chart 1 (legend, domain, series, stacked, header-count, \
+             horizontal-axis-title, vertical-axis-title)"
+        );
+    }
+
+    // ── build_update_chart / build_delete_chart ──────────────────────────
+
+    #[test]
+    fn build_update_chart_refuses_a_chart_with_no_spec() {
+        let sheet = Sheet {
+            properties: Some(crate::drive::sheets::types::SheetProperties {
+                sheet_id: Some(0),
+                title: "Q1".to_string(),
+                ..Default::default()
+            }),
+            charts: vec![EmbeddedChart {
+                chart_id: Some(1),
+                spec: None,
+                position: None,
+            }],
+            ..Default::default()
+        };
+        let workbook = workbook_with_sheet(sheet);
+        let err = refusal(build_update_chart(&workbook, &update_chart_verb(1), 1));
+        let rendered = format!("{err:?}");
+        assert!(
+            matches!(
+                err,
+                EmbeddedObjectResult::RefusedUnsupportedChart { chart_id: 1, .. }
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("no spec to merge onto"), "{rendered}");
+    }
+
+    #[test]
+    fn build_update_chart_carries_the_pre_change_object_and_the_existing_id() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        let plan = build_update_chart(&workbook, &update_chart_verb(1), 1).unwrap();
+        assert_eq!(plan.existing_id, Some(1));
+        assert_eq!(plan.sheet_id, Some(0));
+        let before = plan
+            .before
+            .expect("an update previews the pre-change state");
+        assert_eq!(before.title.as_deref(), Some("Old title"));
+        assert_eq!(before.position, "Q1!E2");
+        let request = serde_json::to_value(&plan.request).unwrap();
+        assert_eq!(request["updateChartSpec"]["chartId"], 1);
+        assert_eq!(request["updateChartSpec"]["spec"]["title"], "New title");
+    }
+
+    #[test]
+    fn build_delete_chart_refuses_an_unknown_id() {
+        let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
+        assert!(matches!(
+            refusal(build_delete_chart(&workbook, 99)),
+            EmbeddedObjectResult::RefusedObjectNotFound { object_id: 99 }
+        ));
+    }
+
+    // ── build_add_slicer / build_update_slicer / build_delete_slicer ─────
+
+    fn add_slicer_verb() -> EmbeddedObjectVerb {
+        EmbeddedObjectVerb::AddSlicer {
+            sheet: Some("Q1".to_string()),
+            range: "A1:D10".to_string(),
+            column: 1,
+            hide_values: Vec::new(),
+            title: Some("Status".to_string()),
+            apply_to_pivot_tables: None,
+            anchor: "F2".to_string(),
+            offset_x: None,
+            offset_y: None,
+            width: None,
+            height: None,
+        }
+    }
+
+    #[test]
+    fn build_add_slicer_omits_filter_criteria_when_no_values_are_hidden() {
+        let workbook = plain_workbook("Q1");
+        let plan = build_add_slicer(&workbook, &add_slicer_verb()).unwrap();
+        assert_eq!(plan.summary, "add slicer 'Status'");
+        assert_eq!(plan.sheet_id, Some(0));
+        let spec = &serde_json::to_value(&plan.request).unwrap()["addSlicer"]["slicer"]["spec"];
+        assert!(
+            spec["filterCriteria"].is_null(),
+            "no --hide-values means no filterCriteria at all: {spec}"
+        );
+        assert_eq!(spec["columnIndex"], 1);
+        assert_eq!(spec["title"], "Status");
+    }
+
+    #[test]
+    fn build_add_slicer_propagates_an_unresolvable_anchor() {
+        let workbook = plain_workbook("Q1");
+        let EmbeddedObjectVerb::AddSlicer {
+            sheet,
+            range,
+            column,
+            hide_values,
+            title,
+            apply_to_pivot_tables,
+            offset_x,
+            offset_y,
+            width,
+            height,
+            ..
+        } = add_slicer_verb()
+        else {
+            unreachable!() // omni-dev: coverage ignore-line reason="add_slicer_verb always returns an EmbeddedObjectVerb::AddSlicer, so this arm can never run"
+        };
+        let verb = EmbeddedObjectVerb::AddSlicer {
+            sheet,
+            range,
+            column,
+            hide_values,
+            title,
+            apply_to_pivot_tables,
+            anchor: "F2:G3".to_string(),
+            offset_x,
+            offset_y,
+            width,
+            height,
+        };
+        let err = refusal(build_add_slicer(&workbook, &verb));
+        assert_invalid(&err, "must name a single cell, not a range");
+    }
+
+    #[test]
+    fn build_add_slicer_carries_hidden_values_when_given() {
+        let workbook = plain_workbook("Q1");
+        let EmbeddedObjectVerb::AddSlicer {
+            sheet,
+            range,
+            column,
+            title,
+            anchor,
+            ..
+        } = add_slicer_verb()
+        else {
+            unreachable!() // omni-dev: coverage ignore-line reason="add_slicer_verb always returns an EmbeddedObjectVerb::AddSlicer, so this arm can never run"
+        };
+        let verb = EmbeddedObjectVerb::AddSlicer {
+            sheet,
+            range,
+            column,
+            hide_values: vec!["Closed".to_string()],
+            title,
+            apply_to_pivot_tables: Some(true),
+            anchor,
+            offset_x: Some(3),
+            offset_y: Some(4),
+            width: Some(300),
+            height: Some(200),
+        };
+        let plan = build_add_slicer(&workbook, &verb).unwrap();
+        let slicer = &serde_json::to_value(&plan.request).unwrap()["addSlicer"]["slicer"];
+        assert_eq!(
+            slicer["spec"]["filterCriteria"]["hiddenValues"][0],
+            "Closed"
+        );
+        assert_eq!(slicer["spec"]["applyToPivotTables"], true);
+        let overlay = &slicer["position"]["overlayPosition"];
+        assert_eq!(overlay["offsetXPixels"], 3);
+        assert_eq!(overlay["offsetYPixels"], 4);
+        assert_eq!(overlay["widthPixels"], 300);
+        assert_eq!(overlay["heightPixels"], 200);
+    }
+
+    fn slicer_workbook() -> Spreadsheet {
+        workbook_with_sheet(Sheet {
+            properties: Some(crate::drive::sheets::types::SheetProperties {
+                sheet_id: Some(0),
+                title: "Q1".to_string(),
+                ..Default::default()
+            }),
+            slicers: vec![Slicer {
+                slicer_id: Some(4),
+                spec: Some(SlicerSpec {
+                    title: Some("Region".to_string()),
+                    ..Default::default()
+                }),
+                position: Some(EmbeddedObjectPosition {
+                    overlay_position: Some(OverlayPosition {
+                        anchor_cell: GridCoordinate {
+                            sheet_id: 0,
+                            row_index: 0,
+                            column_index: 5,
+                        },
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        })
+    }
+
+    /// A boxed one-shot verb mutation, for the table-driven flag tests.
+    type VerbTweak = Box<dyn FnOnce(&mut EmbeddedObjectVerb)>;
+
+    fn update_slicer_verb(tweak: impl FnOnce(&mut EmbeddedObjectVerb)) -> EmbeddedObjectVerb {
+        let mut verb = EmbeddedObjectVerb::UpdateSlicer {
+            slicer_id: 4,
+            sheet: Some("Q1".to_string()),
+            range: None,
+            column: None,
+            hide_values: Vec::new(),
+            clear_criteria: false,
+            title: None,
+            apply_to_pivot_tables: None,
+        };
+        tweak(&mut verb);
+        verb
+    }
+
+    #[test]
+    fn build_update_slicer_names_exactly_the_field_each_flag_changes() {
+        let workbook = slicer_workbook();
+        let cases: Vec<(VerbTweak, &str, &str)> = vec![
+            (
+                Box::new(|verb: &mut EmbeddedObjectVerb| {
+                    let EmbeddedObjectVerb::UpdateSlicer { range, .. } = verb else {
+                        unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                    };
+                    *range = Some("A1:D20".to_string());
+                }),
+                "dataRange",
+                "range",
+            ),
+            (
+                Box::new(|verb: &mut EmbeddedObjectVerb| {
+                    let EmbeddedObjectVerb::UpdateSlicer { clear_criteria, .. } = verb else {
+                        unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                    };
+                    *clear_criteria = true;
+                }),
+                "filterCriteria",
+                "clear criteria",
+            ),
+            (
+                Box::new(|verb: &mut EmbeddedObjectVerb| {
+                    let EmbeddedObjectVerb::UpdateSlicer { hide_values, .. } = verb else {
+                        unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                    };
+                    *hide_values = vec!["Closed".to_string()];
+                }),
+                "filterCriteria",
+                "criteria",
+            ),
+            (
+                Box::new(|verb: &mut EmbeddedObjectVerb| {
+                    let EmbeddedObjectVerb::UpdateSlicer { column, .. } = verb else {
+                        unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                    };
+                    *column = Some(2);
+                }),
+                "columnIndex",
+                "column",
+            ),
+            (
+                Box::new(|verb: &mut EmbeddedObjectVerb| {
+                    let EmbeddedObjectVerb::UpdateSlicer { title, .. } = verb else {
+                        unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                    };
+                    *title = Some("Territory".to_string());
+                }),
+                "title",
+                "title",
+            ),
+            (
+                Box::new(|verb: &mut EmbeddedObjectVerb| {
+                    let EmbeddedObjectVerb::UpdateSlicer {
+                        apply_to_pivot_tables,
+                        ..
+                    } = verb
+                    else {
+                        unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                    };
+                    *apply_to_pivot_tables = Some(true);
+                }),
+                "applyToPivotTables",
+                "apply-to-pivot-tables",
+            ),
+        ];
+        for (tweak, field, changed) in cases {
+            let verb = update_slicer_verb(tweak);
+            let plan = build_update_slicer(&workbook, &verb, 4).unwrap();
+            assert_eq!(plan.existing_id, Some(4));
+            assert_eq!(plan.sheet_id, Some(0));
+            let request = serde_json::to_value(&plan.request).unwrap();
+            assert_eq!(
+                request["updateSlicerSpec"]["fields"], field,
+                "one flag must name exactly one field"
+            );
+            assert_eq!(plan.summary, format!("update slicer 4 ({changed})"));
+        }
+    }
+
+    #[test]
+    fn build_update_slicer_refuses_an_unknown_id() {
+        let workbook = slicer_workbook();
+        let verb = update_slicer_verb(|verb| {
+            let EmbeddedObjectVerb::UpdateSlicer { title, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+            };
+            *title = Some("Territory".to_string());
+        });
+        assert!(matches!(
+            refusal(build_update_slicer(&workbook, &verb, 99)),
+            EmbeddedObjectResult::RefusedObjectNotFound { object_id: 99 }
+        ));
+    }
+
+    #[test]
+    fn build_delete_slicer_refuses_an_unknown_id() {
+        let workbook = slicer_workbook();
+        assert!(matches!(
+            refusal(build_delete_slicer(&workbook, 99)),
+            EmbeddedObjectResult::RefusedObjectNotFound { object_id: 99 }
+        ));
+    }
+
+    // ── describe / describe_lines ────────────────────────────────────────
+
+    fn outcome_with(
+        verb: EmbeddedObjectVerb,
+        file_name: Option<&str>,
+        result: EmbeddedObjectResult,
+    ) -> EmbeddedObjectOutcome {
+        EmbeddedObjectOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: file_name.map(str::to_string),
+            resolved_folder_id: None,
+            sheet_id: None,
+            verb,
+            result,
+        }
+    }
+
+    fn sample_object() -> EmbeddedObjectSummary {
+        EmbeddedObjectSummary {
+            object_id: 5,
+            kind: "chart".to_string(),
+            chart_type: Some("PIE".to_string()),
+            title: Some("Sales".to_string()),
+            position: "Q1!C2".to_string(),
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_would_change_with_and_without_an_object() {
+        let bare = outcome_with(
+            add_chart_verb(),
+            Some("Budget"),
+            EmbeddedObjectResult::WouldChange {
+                summary: "add column chart".to_string(),
+                object: None,
+            },
+        );
+        assert_eq!(
+            describe_lines(&bare),
+            vec!["Would add column chart in 'Budget'"]
+        );
+
+        let previewed = outcome_with(
+            EmbeddedObjectVerb::DeleteChart { chart_id: 5 },
+            Some("Budget"),
+            EmbeddedObjectResult::WouldChange {
+                summary: "delete chart 5".to_string(),
+                object: Some(Box::new(sample_object())),
+            },
+        );
+        let lines = describe_lines(&previewed);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1], "  id 5: chart (PIE) 'Sales', anchored Q1!C2");
+    }
+
+    #[test]
+    fn describe_lines_falls_back_to_the_spreadsheet_id_without_a_file_name() {
+        let out = outcome_with(
+            add_chart_verb(),
+            None,
+            EmbeddedObjectResult::RefusedNotASpreadsheet {
+                mime_type: "application/vnd.google-apps.document".to_string(),
+            },
+        );
+        let text = describe(&out);
+        assert!(text.contains("'sheet-1' is not a Google Sheet"), "{text}");
+        assert!(text.contains("drive sheets add-chart"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_shortcut_and_no_visible_parents() {
+        let shortcut = outcome_with(
+            EmbeddedObjectVerb::DeleteSlicer { slicer_id: 9 },
+            Some("Budget"),
+            EmbeddedObjectResult::RefusedShortcut,
+        );
+        let text = describe(&shortcut);
+        assert!(text.contains("is a shortcut"), "{text}");
+        assert!(text.contains("delete-slicer"), "{text}");
+
+        let orphan = outcome_with(
+            add_chart_verb(),
+            Some("Budget"),
+            EmbeddedObjectResult::RefusedNoVisibleParents,
+        );
+        assert!(describe(&orphan).contains("sheets-structure"));
+    }
+
+    #[test]
+    fn describe_lines_renders_sheet_not_found_with_and_without_available_titles() {
+        let none = outcome_with(
+            add_chart_verb(),
+            Some("Budget"),
+            EmbeddedObjectResult::RefusedSheetNotFound {
+                title: "Q9".to_string(),
+                available: Vec::new(),
+            },
+        );
+        assert!(
+            describe(&none).contains("Available: none"),
+            "{}",
+            describe(&none)
+        );
+
+        let some = outcome_with(
+            add_chart_verb(),
+            Some("Budget"),
+            EmbeddedObjectResult::RefusedSheetNotFound {
+                title: "Q9".to_string(),
+                available: vec!["Q1".to_string(), "Q3".to_string()],
+            },
+        );
+        assert!(
+            describe(&some).contains("'Q1', 'Q3'"),
+            "{}",
+            describe(&some)
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_invalid_range_object_not_found_and_unsupported_chart() {
+        let invalid = outcome_with(
+            add_chart_verb(),
+            Some("Budget"),
+            EmbeddedObjectResult::RefusedInvalidRange {
+                detail: "bad anchor".to_string(),
+            },
+        );
+        assert_eq!(describe(&invalid), "Refused: bad anchor");
+
+        let missing = outcome_with(
+            EmbeddedObjectVerb::DeleteChart { chart_id: 7 },
+            Some("Budget"),
+            EmbeddedObjectResult::RefusedObjectNotFound { object_id: 7 },
+        );
+        let text = describe(&missing);
+        assert!(text.contains("no chart or slicer with id 7"), "{text}");
+        assert!(text.contains("list-charts"), "{text}");
+
+        let unsupported = outcome_with(
+            update_chart_verb(7),
+            Some("Budget"),
+            EmbeddedObjectResult::RefusedUnsupportedChart {
+                chart_id: 7,
+                detail: "chart has no spec to merge onto".to_string(),
+            },
+        );
+        assert_eq!(
+            describe(&unsupported),
+            "Refused: chart 7 in 'Budget': chart has no spec to merge onto"
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_blocked_with_and_without_a_deciding_rule() {
+        let by_rule = outcome_with(
+            add_chart_verb(),
+            Some("Budget"),
+            EmbeddedObjectResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 2,
+                }),
+            },
+        );
+        let text = describe(&by_rule);
+        assert!(text.contains("add-chart on 'Budget'"), "{text}");
+        assert!(text.contains("folder-1"), "{text}");
+
+        let by_default = outcome_with(
+            add_chart_verb(),
+            Some("Budget"),
+            EmbeddedObjectResult::Blocked { decided_by: None },
+        );
+        let text = describe(&by_default);
+        assert!(text.contains("default policy"), "{text}");
+        assert!(text.contains("sheets-structure"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_every_lease_refusal_with_the_lease_acquire_hint() {
+        for (result, phrase) in [
+            (
+                EmbeddedObjectResult::RefusedNoLease,
+                "requires a Drive write lease",
+            ),
+            (
+                EmbeddedObjectResult::RefusedLeaseExpired,
+                "expired, released, or unknown",
+            ),
+            (
+                EmbeddedObjectResult::RefusedLeaseWrongFile,
+                "acquired for a different file",
+            ),
+            (
+                EmbeddedObjectResult::RefusedLeaseStale,
+                "changed since the lease was acquired",
+            ),
+        ] {
+            let out = outcome_with(add_chart_verb(), Some("Budget"), result);
+            let text = describe(&out);
+            assert!(text.contains(phrase), "{text}");
+            assert!(text.contains("drive lease acquire sheet-1"), "{text}");
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_changed_with_and_without_an_id_and_an_object() {
+        let added = outcome_with(
+            add_chart_verb(),
+            Some("Budget"),
+            EmbeddedObjectResult::Changed {
+                summary: "add column chart".to_string(),
+                object_id: Some(42),
+                object: None,
+            },
+        );
+        assert_eq!(
+            describe(&added),
+            "Applied: add column chart (id 42) in 'Budget'"
+        );
+
+        let deleted = outcome_with(
+            EmbeddedObjectVerb::DeleteChart { chart_id: 5 },
+            Some("Budget"),
+            EmbeddedObjectResult::Changed {
+                summary: "delete chart 5".to_string(),
+                object_id: None,
+                object: Some(Box::new(sample_object())),
+            },
+        );
+        assert_eq!(
+            describe_lines(&deleted),
+            vec![
+                "Applied: delete chart 5 in 'Budget'".to_string(),
+                "  id 5: chart (PIE) 'Sales', anchored Q1!C2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_failed() {
+        let out = outcome_with(
+            add_chart_verb(),
+            Some("Budget"),
+            EmbeddedObjectResult::Failed {
+                detail: "boom".to_string(),
+            },
+        );
+        assert_eq!(describe(&out), "Failed: boom");
+    }
+
+    #[test]
+    fn every_result_variant_has_a_distinct_log_status() {
+        let statuses: Vec<&str> = [
+            EmbeddedObjectResult::WouldChange {
+                summary: String::new(),
+                object: None,
+            },
+            EmbeddedObjectResult::RefusedNotASpreadsheet {
+                mime_type: String::new(),
+            },
+            EmbeddedObjectResult::RefusedShortcut,
+            EmbeddedObjectResult::RefusedNoVisibleParents,
+            EmbeddedObjectResult::RefusedSheetNotFound {
+                title: String::new(),
+                available: Vec::new(),
+            },
+            EmbeddedObjectResult::RefusedInvalidRange {
+                detail: String::new(),
+            },
+            EmbeddedObjectResult::RefusedObjectNotFound { object_id: 1 },
+            EmbeddedObjectResult::RefusedUnsupportedChart {
+                chart_id: 1,
+                detail: String::new(),
+            },
+            EmbeddedObjectResult::Blocked { decided_by: None },
+            EmbeddedObjectResult::RefusedNoLease,
+            EmbeddedObjectResult::RefusedLeaseExpired,
+            EmbeddedObjectResult::RefusedLeaseWrongFile,
+            EmbeddedObjectResult::RefusedLeaseStale,
+            EmbeddedObjectResult::Changed {
+                summary: String::new(),
+                object_id: None,
+                object: None,
+            },
+            EmbeddedObjectResult::Failed {
+                detail: String::new(),
+            },
+        ]
+        .iter()
+        .map(EmbeddedObjectResult::log_status)
+        .collect();
+        let distinct: HashSet<&str> = statuses.iter().copied().collect();
+        assert_eq!(distinct.len(), statuses.len(), "{statuses:?}");
+    }
+
+    #[test]
+    fn from_lease_refusal_maps_each_refusal_onto_its_own_variant() {
+        assert!(matches!(
+            EmbeddedObjectResult::from_no_lease(),
+            EmbeddedObjectResult::RefusedNoLease
+        ));
+        assert!(matches!(
+            EmbeddedObjectResult::from_lease_expired(),
+            EmbeddedObjectResult::RefusedLeaseExpired
+        ));
+        assert!(matches!(
+            EmbeddedObjectResult::from_lease_wrong_file(),
+            EmbeddedObjectResult::RefusedLeaseWrongFile
+        ));
+        assert!(matches!(
+            EmbeddedObjectResult::from_lease_stale(),
+            EmbeddedObjectResult::RefusedLeaseStale
+        ));
+        assert_eq!(
+            EmbeddedObjectResult::from_lease_failed("boom".to_string()),
+            EmbeddedObjectResult::Failed {
+                detail: "boom".to_string()
+            }
+        );
+    }
+
+    // ── the target gate, end to end ──────────────────────────────────────
+
+    fn unleased_opts(verb: EmbeddedObjectVerb) -> EmbeddedObjectOptions {
+        EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_verb_is_refused_before_any_call() {
+        // Nothing is mounted at all: a refusal decided from the flags alone
+        // must make no HTTP request, so any call would surface as `Failed`.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let verb = add_chart_verb_with(|verb| {
+            let EmbeddedObjectVerb::AddChart { series, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+            };
+            series.clear();
+        });
+        let rules = vec![allow_rule("folder-1")];
+        let outcome = embedded_object(&drive, &sheets, &unleased_opts(verb), &rules).await;
+        assert_eq!(outcome.file_name, None);
+        assert_invalid(&outcome.result, "at least one --series");
+    }
+
+    #[tokio::test]
+    async fn a_metadata_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let outcome =
+            embedded_object(&drive, &sheets, &unleased_opts(add_chart_verb()), &rules).await;
+        assert!(
+            matches!(outcome.result, EmbeddedObjectResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.file_name, None);
+    }
+
+    #[tokio::test]
+    async fn a_shortcut_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.shortcut",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let outcome =
+            embedded_object(&drive, &sheets, &unleased_opts(add_chart_verb()), &rules).await;
+        assert!(matches!(
+            outcome.result,
+            EmbeddedObjectResult::RefusedShortcut
+        ));
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn a_non_spreadsheet_target_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.document",
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let outcome = embedded_object(
+            &drive,
+            &sheets,
+            &unleased_opts(EmbeddedObjectVerb::DeleteChart { chart_id: 5 }),
+            &rules,
+        )
+        .await;
+        let rendered = format!("{:?}", outcome.result);
+        assert!(
+            matches!(
+                outcome.result,
+                EmbeddedObjectResult::RefusedNotASpreadsheet { .. }
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("application/vnd.google-apps.document"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_with_no_visible_parents_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", crate::drive::types::GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let rules: Vec<FolderPermissionRule> = Vec::new();
+        let outcome =
+            embedded_object(&drive, &sheets, &unleased_opts(add_chart_verb()), &rules).await;
+        assert!(matches!(
+            outcome.result,
+            EmbeddedObjectResult::RefusedNoVisibleParents
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gate_ancestor_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let outcome =
+            embedded_object(&drive, &sheets, &unleased_opts(add_chart_verb()), &rules).await;
+        assert!(
+            matches!(outcome.result, EmbeddedObjectResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.file_name.as_deref(), Some("sheet-1"));
+    }
+
+    #[tokio::test]
+    async fn a_workbook_fetch_failure_after_a_granted_gate_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let outcome =
+            embedded_object(&drive, &sheets, &unleased_opts(add_chart_verb()), &rules).await;
+        assert!(
+            matches!(outcome.result, EmbeddedObjectResult::Failed { .. }),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.sheet_id, None);
+    }
+
+    #[tokio::test]
+    async fn add_chart_refuses_an_unknown_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q2", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let verb = add_chart_verb_with(|verb| {
+            let EmbeddedObjectVerb::AddChart { sheet, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+            };
+            *sheet = Some("Nope".to_string());
+        });
+        let outcome = embedded_object(&drive, &sheets, &unleased_opts(verb), &rules).await;
+        let rendered = format!("{:?}", outcome.result);
+        assert!(
+            matches!(
+                outcome.result,
+                EmbeddedObjectResult::RefusedSheetNotFound { .. }
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Nope"), "{rendered}");
+        assert!(rendered.contains("Q2"), "{rendered}");
+    }
+
+    // ── the Drive write lease (ADR-0080 §9) and batchUpdate failure ──────
+
+    /// A workbook holding both a chart (id 5) and a slicer (id 9), so the
+    /// plan always builds and the only thing left to decide the outcome is
+    /// the lease — or the `batchUpdate` call itself.
+    fn mount_workbook_with_chart_and_slicer() -> wiremock::Mock {
+        mount_workbook(serde_json::json!([
+            {
+                "properties": {"sheetId": 0, "title": "Q1", "index": 0},
+                "charts": [{
+                    "chartId": 5,
+                    "spec": {"title": "Sales", "basicChart": {"chartType": "COLUMN"}},
+                    "position": {"overlayPosition": {"anchorCell": {"sheetId": 0, "rowIndex": 1, "columnIndex": 2}}},
+                }],
+                "slicers": [{
+                    "slicerId": 9,
+                    "spec": {"title": "Region"},
+                    "position": {"overlayPosition": {"anchorCell": {"sheetId": 0, "rowIndex": 0, "columnIndex": 5}}},
+                }],
+            },
+        ]))
+    }
+
+    async fn mount_granted_gate_with_objects(server: &wiremock::MockServer) {
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(server)
+        .await;
+        mount_folder("folder-1").mount(server).await;
+        mount_workbook_with_chart_and_slicer().mount(server).await;
+    }
+
+    fn fresh_ledger_path() -> std::path::PathBuf {
+        tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl")
+    }
+
+    #[tokio::test]
+    async fn refuses_without_a_lease_when_the_rule_requires_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_objects(&server).await;
+        // No batchUpdate mock mounted — a refusal must make zero mutating
+        // calls.
+        let rules = vec![allow_rule("folder-1")];
+        let opts = unleased_opts(EmbeddedObjectVerb::DeleteChart { chart_id: 5 });
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            EmbeddedObjectResult::RefusedNoLease
+        ));
+        assert_eq!(outcome.result.log_status(), "refused-no-lease");
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_objects(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        // Never seeded — the ledger knows nothing of this token.
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: EmbeddedObjectVerb::DeleteSlicer { slicer_id: 9 },
+            dry_run: false,
+            lease_token: Some("bogus-token".to_string()),
+            ledger_path: fresh_ledger_path(),
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            EmbeddedObjectResult::RefusedLeaseExpired
+        ));
+        assert_eq!(outcome.result.log_status(), "refused-lease-expired");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_lease_bound_to_a_different_file() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_objects(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = fresh_ledger_path();
+        // Seeded for a *different* spreadsheet id.
+        let token = seed_lease(&ledger_path, "some-other-sheet", "1");
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: EmbeddedObjectVerb::DeleteSlicer { slicer_id: 9 },
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            EmbeddedObjectResult::RefusedLeaseWrongFile
+        ));
+        assert_eq!(outcome.result.log_status(), "refused-lease-wrong-file");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_stale_lease_when_the_file_has_moved() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // `mount_file` always returns version "1"; the lease below was
+        // acquired against version "0" — a foreign edit landed since.
+        mount_granted_gate_with_objects(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let ledger_path = fresh_ledger_path();
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: EmbeddedObjectVerb::DeleteSlicer { slicer_id: 9 },
+            dry_run: false,
+            lease_token: Some(token),
+            ledger_path,
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            EmbeddedObjectResult::RefusedLeaseStale
+        ));
+        assert_eq!(outcome.result.log_status(), "refused-lease-stale");
+    }
+
+    #[tokio::test]
+    async fn a_batch_update_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_objects(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: update_chart_verb(5),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        let rendered = format!("{:?}", outcome.result);
+        assert!(
+            matches!(outcome.result, EmbeddedObjectResult::Failed { .. }),
+            "{rendered}"
+        );
+        assert!(rendered.contains("500"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn a_real_delete_chart_reports_the_object_it_discarded() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_objects(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"replies": [{}]})),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: EmbeddedObjectVerb::DeleteChart { chart_id: 5 },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        let rendered = format!("{:?}", outcome.result);
+        // `deleteEmbeddedObject` has no reply body, so the id comes from
+        // the plan's `existing_id`, and the discarded object rides along
+        // for the audit trail (ADR-0081 §3).
+        assert!(
+            matches!(
+                outcome.result,
+                EmbeddedObjectResult::Changed {
+                    object_id: Some(5),
+                    object: Some(_),
+                    ..
+                }
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Sales"), "{rendered}");
+        assert_eq!(describe_lines(&outcome).len(), 2);
     }
 }

@@ -749,6 +749,38 @@ mod tests {
         assert!(fields.contains("gradientRule"));
     }
 
+    #[tokio::test]
+    async fn get_spreadsheet_with_embedded_objects_surfaces_an_unparseable_base_url() {
+        // The `?` on the URL builder is the only failure this method can
+        // reach before the network call, so a base URL the `url` crate
+        // cannot parse is what exercises it — and it must surface as an
+        // error, never a panic.
+        use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+        use crate::drive::client::DriveClient;
+        use crate::drive::sheets::client::SHEETS_API_URL;
+        use crate::test_support::env::MapEnv;
+        use crate::utils::secret::Secret;
+
+        let credentials = DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        };
+        let drive = DriveClient::new("https://www.googleapis.com", &credentials).unwrap();
+        let env = MapEnv::new().with(SHEETS_API_URL, "not a url");
+        let sheets = SheetsClient::from_drive_client_with(&env, &drive).unwrap();
+
+        let err = SheetsApi::new(&sheets)
+            .get_spreadsheet_with_embedded_objects("sheet-1")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid Sheets base URL"),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn spreadsheet_get_with_embedded_objects_url_masks_the_wider_fields() {
         let url = build_spreadsheet_get_with_embedded_objects_url(BASE, "sheet-1").unwrap();

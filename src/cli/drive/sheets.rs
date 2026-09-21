@@ -475,4 +475,190 @@ mod tests {
         .await
         .is_ok());
     }
+
+    #[tokio::test]
+    async fn the_chart_and_slicer_dispatch_arms_reach_their_leaf_commands() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        // Same trick as `the_named_range_dispatch_arms_reach_their_leaf_commands`
+        // above: with no write-permission rules configured, every mutating
+        // chart/slicer leaf is `Blocked` by default policy, which returns
+        // `Ok(())` without a lease or a `batchUpdate`. `list-charts` and
+        // `list-slicers` are ungated, so they go on to fetch the workbook.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1",
+                    "name": "Budget",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": [],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1"}}],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        fn no_lease() -> crate::cli::drive::helpers::LeaseTokenArg {
+            crate::cli::drive::helpers::LeaseTokenArg { lease: None }
+        }
+
+        assert!(dispatch(
+            SheetsSubcommands::AddChart(Box::new(embedded_object::AddChartCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                chart_type: "column".to_string(),
+                domain: "A1:A10".to_string(),
+                series: vec!["B1:B10".to_string()],
+                sheet: Some("Sheet1".to_string()),
+                title: None,
+                subtitle: None,
+                legend: None,
+                stacked: None,
+                header_count: None,
+                horizontal_axis_title: None,
+                vertical_axis_title: None,
+                pie_hole: None,
+                anchor: Some("E2".to_string()),
+                offset_x: None,
+                offset_y: None,
+                width: None,
+                height: None,
+                new_sheet: false,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            })),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::UpdateChart(Box::new(embedded_object::UpdateChartCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                chart_id: 1,
+                chart_type: None,
+                domain: None,
+                series: Vec::new(),
+                sheet: None,
+                title: Some("New title".to_string()),
+                subtitle: None,
+                legend: None,
+                stacked: None,
+                header_count: None,
+                horizontal_axis_title: None,
+                vertical_axis_title: None,
+                pie_hole: None,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            })),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::DeleteChart(embedded_object::DeleteChartCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                chart_id: 1,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::ListCharts(embedded_object::ListChartsCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::AddSlicer(embedded_object::AddSlicerCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: Some("Sheet1".to_string()),
+                range: "A1:D10".to_string(),
+                column: 1,
+                hide_values: vec!["Closed".to_string()],
+                title: None,
+                apply_to_pivot_tables: None,
+                anchor: "F2".to_string(),
+                offset_x: None,
+                offset_y: None,
+                width: None,
+                height: None,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::UpdateSlicer(embedded_object::UpdateSlicerCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                slicer_id: 1,
+                sheet: None,
+                range: None,
+                column: None,
+                hide_values: Vec::new(),
+                clear_criteria: true,
+                title: None,
+                apply_to_pivot_tables: None,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::DeleteSlicer(embedded_object::DeleteSlicerCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                slicer_id: 1,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::ListSlicers(embedded_object::ListSlicersCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+    }
 }
