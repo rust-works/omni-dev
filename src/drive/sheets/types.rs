@@ -768,6 +768,24 @@ pub enum BatchUpdateRequestItem {
     /// Remove an outline group (`delete-dimension-group`). Same gate as
     /// [`Self::AddDimensionGroup`] — it removes presentation, not grid data.
     DeleteDimensionGroup(DeleteDimensionGroupRequest),
+    /// Move a source range to a destination, clearing the source
+    /// (`cut-paste`, issue #1839, [ADR-0083](../../../docs/adrs/adr-0083.md)
+    /// §4). Gated by **both** `SheetsWrite` and `SheetsStructure`
+    /// regardless of `pasteType`: the source is always cleared in full —
+    /// values, formats and merges — which is `SheetsStructure`'s territory
+    /// on the formats/merges half exactly as clearing values is
+    /// `SheetsWrite`'s.
+    CutPaste(CutPasteRequest),
+    /// Copy a source range to a destination, optionally repeated
+    /// (`copy-paste`, issue #1839, ADR-0083 §4). Gated by `pasteType`:
+    /// value-only types resolve `SheetsWrite` alone, presentation-only
+    /// types `SheetsStructure` alone, and `PASTE_NORMAL` both.
+    CopyPaste(CopyPasteRequest),
+    /// Paste delimited text into a range as if pasted from the clipboard
+    /// (`paste-data`, issue #1839, ADR-0083 §4). `delimiter`-form only —
+    /// the API's `html` alternative is a documented cut (ADR-0083 §4). Same
+    /// `pasteType` gate mapping as [`Self::CopyPaste`].
+    PasteData(PasteDataRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -2883,6 +2901,143 @@ pub struct DeleteDimensionGroupRequest {
     pub range: DimensionRange,
 }
 
+/// `PasteType` — what a paste request carries, per the Sheets API's own
+/// enum (issue #1839, [ADR-0083](../../../docs/adrs/adr-0083.md) §4).
+///
+/// **Curated: four of the API's seven variants.** `PASTE_NORMAL`,
+/// `PASTE_VALUES`, `PASTE_FORMULA` and `PASTE_FORMAT` cover the common
+/// cases (a plain copy or cut, a values-only or formula-only copy, and a
+/// format-only copy); `PASTE_NO_BORDERS`, `PASTE_DATA_VALIDATION` and
+/// `PASTE_CONDITIONAL_FORMATTING` are deferred — a documented cut, not a
+/// silent gap (`docs/drive.md`'s cut-paste/copy-paste/paste-data section
+/// names it). No default arm anywhere this is matched: a variant this enum
+/// doesn't carry is unrepresentable, never a fall-through to the weakest
+/// gate.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum PasteType {
+    /// Values, formulas, formats and merges — the API's own default and
+    /// what "paste" means to a Sheets user. Resolves **both**
+    /// `SheetsWrite` and `SheetsStructure` (ADR-0083 §4).
+    #[serde(rename = "PASTE_NORMAL")]
+    Normal,
+    /// Cell content only, evaluated formulas rendered to their values.
+    /// Resolves `SheetsWrite` alone.
+    #[serde(rename = "PASTE_VALUES")]
+    Values,
+    /// Cell content only, formulas preserved. Resolves `SheetsWrite` alone.
+    #[serde(rename = "PASTE_FORMULA")]
+    Formula,
+    /// The cell format only, excluding data validation. Resolves
+    /// `SheetsStructure` alone.
+    #[serde(rename = "PASTE_FORMAT")]
+    Format,
+}
+
+impl PasteType {
+    /// The wire spelling, also used in human-readable output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "PASTE_NORMAL",
+            Self::Values => "PASTE_VALUES",
+            Self::Formula => "PASTE_FORMULA",
+            Self::Format => "PASTE_FORMAT",
+        }
+    }
+
+    /// Whether this paste type writes cell content — the half `SheetsWrite`
+    /// covers.
+    #[must_use]
+    pub const fn writes_values(self) -> bool {
+        matches!(self, Self::Normal | Self::Values | Self::Formula)
+    }
+
+    /// Whether this paste type writes formats or merges — the half
+    /// `SheetsStructure` covers.
+    #[must_use]
+    pub const fn writes_presentation(self) -> bool {
+        matches!(self, Self::Normal | Self::Format)
+    }
+}
+
+/// `PasteOrientation` — `copy-paste`'s `--orientation` (issue #1839,
+/// ADR-0083 §4). Changes no gate; `Transpose` swaps the source's
+/// dimensions before the written extent is computed.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+pub enum PasteOrientation {
+    /// Rows stay rows, columns stay columns — the API's own default.
+    #[default]
+    #[serde(rename = "NORMAL")]
+    Normal,
+    /// Rows and columns are swapped.
+    #[serde(rename = "TRANSPOSE")]
+    Transpose,
+}
+
+impl PasteOrientation {
+    /// The wire spelling, also used in human-readable output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "NORMAL",
+            Self::Transpose => "TRANSPOSE",
+        }
+    }
+}
+
+/// `CutPasteRequest` — moves `source` to `destination` (a single cell; the
+/// pasted block extends from there), clearing `source` entirely regardless
+/// of `paste_type`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CutPasteRequest {
+    /// The range to move.
+    pub source: GridRange,
+    /// The top-left cell of the destination.
+    pub destination: GridCoordinate,
+    /// What to carry over — always both operations' worth of consent is
+    /// required to send this request (ADR-0083 §4), whatever this names.
+    #[serde(rename = "pasteType")]
+    pub paste_type: PasteType,
+}
+
+/// `CopyPasteRequest` — copies `source` to `destination`, spilling a
+/// larger source past the destination's end or repeating a smaller one to
+/// fill it, per the Sheets API's own rule.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CopyPasteRequest {
+    /// The range to copy from.
+    pub source: GridRange,
+    /// The range to copy into.
+    pub destination: GridRange,
+    /// What to carry over.
+    #[serde(rename = "pasteType")]
+    pub paste_type: PasteType,
+    /// Whether rows/columns are swapped before pasting.
+    #[serde(rename = "pasteOrientation")]
+    pub paste_orientation: PasteOrientation,
+}
+
+/// `PasteDataRequest` — pastes delimited text into a range as if pasted
+/// from the clipboard, anchored at `coordinate`.
+///
+/// `html` is not modelled — this crate's surface is `delimiter`-form only
+/// (ADR-0083 §4's documented cut), so there is nowhere on this type to put
+/// markup even if a caller wanted to send it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PasteDataRequest {
+    /// The top-left cell to paste into.
+    pub coordinate: GridCoordinate,
+    /// The delimited text to paste.
+    pub data: String,
+    /// The delimiter splitting `data` into columns.
+    pub delimiter: String,
+    /// What to carry over. `PASTE_NORMAL` on delimited text is undocumented
+    /// beyond values — ADR-0083 §4 keeps it selectable, resolving both
+    /// operations, since the API does not say it does nothing extra.
+    #[serde(rename = "type")]
+    pub r#type: PasteType,
+}
+
 /// Response to `spreadsheets.batchUpdate`.
 ///
 /// Only `replies` is modelled, and only the `addSheet` arm of it: the new
@@ -3320,6 +3475,117 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn cut_paste_request_serializes_the_paste_type() {
+        let request = BatchUpdateRequestItem::CutPaste(CutPasteRequest {
+            source: GridRange {
+                sheet_id: 1,
+                start_row_index: Some(0),
+                end_row_index: Some(2),
+                start_column_index: Some(0),
+                end_column_index: Some(2),
+            },
+            destination: GridCoordinate {
+                sheet_id: 1,
+                row_index: 5,
+                column_index: 5,
+            },
+            paste_type: PasteType::Values,
+        });
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "cutPaste": {
+                    "source": {
+                        "sheetId": 1,
+                        "startRowIndex": 0,
+                        "endRowIndex": 2,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 2,
+                    },
+                    "destination": {"sheetId": 1, "rowIndex": 5, "columnIndex": 5},
+                    "pasteType": "PASTE_VALUES",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn copy_paste_request_serializes_type_and_orientation() {
+        let request = BatchUpdateRequestItem::CopyPaste(CopyPasteRequest {
+            source: GridRange {
+                sheet_id: 1,
+                start_row_index: Some(0),
+                end_row_index: Some(1),
+                start_column_index: Some(0),
+                end_column_index: Some(1),
+            },
+            destination: GridRange {
+                sheet_id: 1,
+                start_row_index: Some(5),
+                end_row_index: Some(6),
+                start_column_index: Some(5),
+                end_column_index: Some(6),
+            },
+            paste_type: PasteType::Normal,
+            paste_orientation: PasteOrientation::Transpose,
+        });
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "copyPaste": {
+                    "source": {
+                        "sheetId": 1, "startRowIndex": 0, "endRowIndex": 1,
+                        "startColumnIndex": 0, "endColumnIndex": 1,
+                    },
+                    "destination": {
+                        "sheetId": 1, "startRowIndex": 5, "endRowIndex": 6,
+                        "startColumnIndex": 5, "endColumnIndex": 6,
+                    },
+                    "pasteType": "PASTE_NORMAL",
+                    "pasteOrientation": "TRANSPOSE",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn paste_data_request_serializes_the_delimiter_form() {
+        let request = BatchUpdateRequestItem::PasteData(PasteDataRequest {
+            coordinate: GridCoordinate {
+                sheet_id: 2,
+                row_index: 0,
+                column_index: 0,
+            },
+            data: "a\tb\nc\td".to_string(),
+            delimiter: "\t".to_string(),
+            r#type: PasteType::Values,
+        });
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "pasteData": {
+                    "coordinate": {"sheetId": 2, "rowIndex": 0, "columnIndex": 0},
+                    "data": "a\tb\nc\td",
+                    "delimiter": "\t",
+                    "type": "PASTE_VALUES",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn paste_type_writes_values_and_presentation_match_the_adr_0083_4_table() {
+        assert!(PasteType::Normal.writes_values());
+        assert!(PasteType::Normal.writes_presentation());
+        assert!(PasteType::Values.writes_values());
+        assert!(!PasteType::Values.writes_presentation());
+        assert!(PasteType::Formula.writes_values());
+        assert!(!PasteType::Formula.writes_presentation());
+        assert!(!PasteType::Format.writes_values());
+        assert!(PasteType::Format.writes_presentation());
     }
 
     #[test]

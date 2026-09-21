@@ -4514,6 +4514,9 @@ Commands:
   update-dimension-group       Changes an existing group's `collapsed` state. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1833, ADR-0084)
   delete-dimension-group       Removes an outline group. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1833, ADR-0084) — it removes presentation, not grid data
   list-dimension-groups        Lists the row and column outline groups in a spreadsheet. Read-only and ungated, like `list-bandings` (issue #1833)
+  cut-paste                    Moves a range to a destination cell, clearing the source. Gated by **both** the folder write-permission rules' `sheets-write` and `sheets-structure` operations, whatever `--paste-type` names (issue #1839, ADR-0083 §4): the source is cleared in full regardless of what is pasted
+  copy-paste                   Copies a range to a destination, spilling a larger source past the destination's end or repeating a smaller one to fill it. Gated by `--paste-type` (issue #1839, ADR-0083 §4): a value-only type needs `sheets-write` alone, a presentation-only type `sheets-structure` alone, and `normal` (the default) needs both
+  paste-data                   Pastes delimited text into a range anchored at a destination cell, as if pasted from the clipboard (issue #1839, ADR-0083 §4). `delimiter`-form only. Same `--paste-type` gate mapping as `copy-paste`
   help                         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -4916,6 +4919,29 @@ Options:
 
 ================================================================================
 
+omni-dev drive sheets copy-paste - Copies a range to a destination, spilling a larger source past the destination's end or repeating a smaller one to fill it. Gated by `--paste-type` (issue #1839, ADR-0083 §4): a value-only type needs `sheets-write` alone, a presentation-only type `sheets-structure` alone, and `normal` (the default) needs both
+
+Copies a range to a destination, spilling a larger source past the destination's end or repeating a smaller one to fill it. Gated by `--paste-type` (issue #1839, ADR-0083 §4): a value-only type needs `sheets-write` alone, a presentation-only type `sheets-structure` alone, and `normal` (the default) needs both
+
+Usage: copy-paste [OPTIONS] --source <[SHEET!]A1_RANGE> --destination <[SHEET!]A1_RANGE> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>                    Default sheet for `--source`/`--destination` when either lacks its own `Sheet!` prefix
+      --source <[SHEET!]A1_RANGE>       The range to copy from. May carry its own `Sheet!` prefix. Must be a bounded rectangle
+      --destination <[SHEET!]A1_RANGE>  The destination range (a single cell is a valid anchor). May carry its own `Sheet!` prefix. Must be a bounded rectangle
+      --paste-type <PASTE_TYPE>         What to carry over. `normal` (the default) needs both the `sheets-write` and `sheets-structure` operations — a bare `copy-paste` under a `sheets-write`-only grant is refused; pass `--paste-type values` for a values-only copy that grant already covers [default: normal] [possible values: normal, values, formula, format]
+      --orientation <ORIENTATION>       Swaps rows and columns before pasting [default: normal] [possible values: normal, transpose]
+      --dry-run                         Reports the gate verdict and the region that would be overwritten at the destination, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>                   The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>                 Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                            Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive sheets create - Creates a new Google Sheet, optionally seeded with values. Gated by the folder write-permission rules' `create` operation (issue #1589)
 
 Creates a new Google Sheet, optionally seeded with values. Gated by the folder write-permission rules' `create` operation (issue #1589)
@@ -4931,6 +4957,28 @@ Options:
       --dry-run                        Reports the gate verdict without creating anything
   -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                           Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets cut-paste - Moves a range to a destination cell, clearing the source. Gated by **both** the folder write-permission rules' `sheets-write` and `sheets-structure` operations, whatever `--paste-type` names (issue #1839, ADR-0083 §4): the source is cleared in full regardless of what is pasted
+
+Moves a range to a destination cell, clearing the source. Gated by **both** the folder write-permission rules' `sheets-write` and `sheets-structure` operations, whatever `--paste-type` names (issue #1839, ADR-0083 §4): the source is cleared in full regardless of what is pasted
+
+Usage: cut-paste [OPTIONS] --source <[SHEET!]A1_RANGE> --destination <[SHEET!]A1> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>               Default sheet for `--source`/`--destination` when either lacks its own `Sheet!` prefix
+      --source <[SHEET!]A1_RANGE>  The range to move. May carry its own `Sheet!` prefix. Must be a bounded rectangle
+      --destination <[SHEET!]A1>   The single-cell destination. May carry its own `Sheet!` prefix
+      --paste-type <PASTE_TYPE>    What to carry into the destination. The source is cleared in full either way [default: normal] [possible values: normal, values, formula, format]
+      --dry-run                    Reports the gate verdict, the region that would be overwritten at the destination, and the cells that would be cleared at the source, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>              The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>            Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                       Print help (see more with '--help')
 
 
 ================================================================================
@@ -5619,6 +5667,29 @@ Options:
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets paste-data - Pastes delimited text into a range anchored at a destination cell, as if pasted from the clipboard (issue #1839, ADR-0083 §4). `delimiter`-form only. Same `--paste-type` gate mapping as `copy-paste`
+
+Pastes delimited text into a range anchored at a destination cell, as if pasted from the clipboard (issue #1839, ADR-0083 §4). `delimiter`-form only. Same `--paste-type` gate mapping as `copy-paste`
+
+Usage: paste-data [OPTIONS] --destination <[SHEET!]A1> --data <PATH|-> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>              Default sheet for `--destination` when it lacks its own `Sheet!` prefix
+      --destination <[SHEET!]A1>  The single-cell destination. May carry its own `Sheet!` prefix
+      --data <PATH|->             The delimited text to paste: a local file path, or `-` to read stdin. Sent verbatim — never parsed into cells locally
+      --delimiter <DELIMITER>     The delimiter splitting `--data` into columns [default: "\t"]
+      --paste-type <PASTE_TYPE>   What to carry over. Defaults to `values`, not `normal`: delimited text carries no formats, merges or validation for `normal` to add. `normal` is still selectable — the API does not document a normal paste of delimited text as doing anything beyond values — and resolves both operations [default: values] [possible values: normal, values, formula, format]
+      --dry-run                   Reports the gate verdict and the region that would be overwritten at the destination, without calling `spreadsheets.batchUpdate`
+      --lease <TOKEN>             The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>           Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                      Print help (see more with '--help')
 
 
 ================================================================================

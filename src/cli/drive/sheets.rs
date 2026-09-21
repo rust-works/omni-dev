@@ -21,6 +21,7 @@ pub(crate) mod filter;
 pub(crate) mod format;
 pub(crate) mod info;
 pub(crate) mod named_range;
+pub(crate) mod paste;
 pub(crate) mod pivot;
 pub(crate) mod protection;
 pub(crate) mod read;
@@ -326,6 +327,23 @@ pub enum SheetsSubcommands {
     /// Lists the row and column outline groups in a spreadsheet. Read-only
     /// and ungated, like `list-bandings` (issue #1833).
     ListDimensionGroups(dimension_group::ListDimensionGroupsCommand),
+    /// Moves a range to a destination cell, clearing the source. Gated by
+    /// **both** the folder write-permission rules' `sheets-write` and
+    /// `sheets-structure` operations, whatever `--paste-type` names (issue
+    /// #1839, ADR-0083 §4): the source is cleared in full regardless of
+    /// what is pasted.
+    CutPaste(paste::CutPasteCommand),
+    /// Copies a range to a destination, spilling a larger source past the
+    /// destination's end or repeating a smaller one to fill it. Gated by
+    /// `--paste-type` (issue #1839, ADR-0083 §4): a value-only type needs
+    /// `sheets-write` alone, a presentation-only type `sheets-structure`
+    /// alone, and `normal` (the default) needs both.
+    CopyPaste(paste::CopyPasteCommand),
+    /// Pastes delimited text into a range anchored at a destination cell,
+    /// as if pasted from the clipboard (issue #1839, ADR-0083 §4).
+    /// `delimiter`-form only. Same `--paste-type` gate mapping as
+    /// `copy-paste`.
+    PasteData(paste::PasteDataCommand),
 }
 
 impl SheetsCommand {
@@ -411,6 +429,9 @@ impl SheetsCommand {
             SheetsSubcommands::UpdateDimensionGroup(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeleteDimensionGroup(cmd) => cmd.execute(client).await,
             SheetsSubcommands::ListDimensionGroups(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::CutPaste(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::CopyPaste(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::PasteData(cmd) => cmd.execute(client).await,
         }
     }
 }
