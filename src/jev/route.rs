@@ -762,7 +762,7 @@ fn render_issue_block(issue: &IssueRoute, max_input_chars: usize) -> String {
             depends_on,
         } => {
             for (provider, route) in providers {
-                lines.push(render_provider_line(provider, route, providers.len()));
+                lines.extend(render_provider_line(provider, route, providers.len()));
             }
             if let Some(line) = render_depends_on_line(depends_on) {
                 lines.push(line);
@@ -779,10 +779,52 @@ fn render_issue_block(issue: &IssueRoute, max_input_chars: usize) -> String {
     lines.join("\n")
 }
 
+/// Whether any of `route`'s three stage answers names a multi-model tier (a
+/// comma-joined tier name from a custom ladder, #1826). The compact
+/// single-line layout repeats a chosen tier name up to four times, which
+/// becomes unreadable once that name is ~100 characters of comma-joined
+/// model ids — so this is the trigger for the one-line-per-stage layout
+/// (#1847). Checking the three stage choices is sufficient: `route.class` is
+/// always one of `design`/`implement`'s choice (see `issue_class`), so it
+/// can never be multi-model without one of those already being caught.
+fn route_has_multi_model_tier(route: &ProviderRoute) -> bool {
+    [
+        &route.stages.design,
+        &route.stages.implement,
+        &route.stages.review,
+    ]
+    .into_iter()
+    .any(|answer| answer.choice.contains(','))
+}
+
+/// Renders one provider's routing as one or more indented lines: the compact
+/// single line (unchanged since #1824) when every chosen tier is
+/// single-model, or one line per fact when a multi-model tier name would
+/// otherwise repeat illegibly on one line (#1847).
+fn render_provider_line(
+    provider: &str,
+    route: &ProviderRoute,
+    provider_count: usize,
+) -> Vec<String> {
+    if route_has_multi_model_tier(route) {
+        render_provider_block(provider, route, provider_count)
+    } else {
+        vec![render_provider_line_compact(
+            provider,
+            route,
+            provider_count,
+        )]
+    }
+}
+
 /// Renders one provider's routing as an indented line, e.g. `  sonnet —
 /// design needs fable (0.52), ...` or, with more than one provider requested,
 /// `  anthropic: sonnet — design needs fable (0.52), ...`.
-fn render_provider_line(provider: &str, route: &ProviderRoute, provider_count: usize) -> String {
+fn render_provider_line_compact(
+    provider: &str,
+    route: &ProviderRoute,
+    provider_count: usize,
+) -> String {
     let lead = if provider_count > 1 {
         format!("{provider}: {}", route.class)
     } else {
@@ -811,6 +853,55 @@ fn render_stage_clause(stage: Stage, stages: &StageAnswers, close_calls: &[Stage
         ""
     };
     format!("{label} ({:.2}{close_call})", answer.confidence)
+}
+
+/// Renders one provider's routing as one line per fact: `class:` once, then
+/// `design:` / `implementation:` / `review:` — the one-line-per-stage layout
+/// used when a chosen tier name is multi-model (#1847). With more than one
+/// provider requested, the provider name heads the block instead of
+/// prefixing every line, and the fact lines nest one indent level deeper.
+fn render_provider_block(
+    provider: &str,
+    route: &ProviderRoute,
+    provider_count: usize,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(5);
+    let indent = if provider_count > 1 {
+        lines.push(format!("  {provider}:"));
+        "    "
+    } else {
+        "  "
+    };
+    lines.push(format!("{indent}class: {}", route.class));
+    for stage in Stage::ALL {
+        lines.push(format!(
+            "{indent}{}",
+            render_stage_line(stage, &route.stages, &route.close_calls)
+        ));
+    }
+    lines
+}
+
+/// Renders one stage's fact line for [`render_provider_block`], e.g.
+/// `design: needs no further work (0.94)` or `review: opus (0.41, close
+/// call)` — parallel to [`render_stage_clause`] but with the stage name as a
+/// `label:` prefix rather than folded into a clause.
+fn render_stage_line(stage: Stage, stages: &StageAnswers, close_calls: &[Stage]) -> String {
+    let answer = stages.get(stage);
+    let (label, content) = match stage {
+        Stage::Design if answer.choice == NO_DESIGN => {
+            ("design", "needs no further work".to_string())
+        }
+        Stage::Design => ("design", format!("needs {}", answer.choice)),
+        Stage::Implement => ("implementation", answer.choice.clone()),
+        Stage::Review => ("review", answer.choice.clone()),
+    };
+    let close_call = if close_calls.contains(&stage) {
+        ", close call"
+    } else {
+        ""
+    };
+    format!("{label}: {content} ({:.2}{close_call})", answer.confidence)
 }
 
 /// Renders the `depends_on` line, or `None` when there are no open
@@ -2065,6 +2156,205 @@ mod tests {
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
         assert!(text.contains("design needs no further work"), "{text}");
+    }
+
+    /// Pins the layout switch from #1847: a comma-joined (multi-model) tier
+    /// name switches the block to one line per fact instead of repeating the
+    /// name up to four times on one line.
+    #[test]
+    fn render_route_text_switches_to_one_line_per_stage_for_multi_model_tiers() {
+        let multi = "global.anthropic.claude-sonnet-4-6,global.anthropic.claude-sonnet-5";
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "rust-works/omni-dev#1832".to_string(),
+                url: "u".to_string(),
+                title: "feat(drive): banded ranges for drive sheets (#1830)".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([(
+                        "anthropic".to_string(),
+                        ProviderRoute {
+                            stages: StageAnswers {
+                                design: answer(NO_DESIGN, 0.94),
+                                implement: answer(multi, 0.94),
+                                review: answer(multi, 0.70),
+                            },
+                            class: multi.to_string(),
+                            close_calls: vec![],
+                        },
+                    )]),
+                    depends_on: vec![DependencyEntry {
+                        item_ref: "#1830".to_string(),
+                        state: ItemState::Open,
+                        could_be_cheaper: BTreeMap::from([("design".to_string(), 0.48)]),
+                    }],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert_eq!(
+            text,
+            format!(
+                "rust-works/omni-dev#1832 — feat(drive): banded ranges for drive sheets (#1830)\n\
+                 \x20\x20class: {multi}\n\
+                 \x20\x20design: needs no further work (0.94)\n\
+                 \x20\x20implementation: {multi} (0.94)\n\
+                 \x20\x20review: {multi} (0.70)\n\
+                 \x20\x20cites open #1830, which could leave less design work if resolved (0.48)\n\n\
+                 model: jev-1.13.0, usage: 0 input tokens, 0 output tokens\n"
+            )
+        );
+    }
+
+    /// A comma-free (single-model) choice keeps today's exact compact
+    /// layout — no output churn for existing built-in-ladder users.
+    #[test]
+    fn render_route_text_keeps_the_compact_line_for_single_word_tiers() {
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([(
+                        "anthropic".to_string(),
+                        ProviderRoute {
+                            stages: stages("fable", "sonnet", "opus"),
+                            class: "fable".to_string(),
+                            close_calls: vec![],
+                        },
+                    )]),
+                    depends_on: vec![],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(
+            text.contains(
+                "  fable — design needs fable (0.90), implementation sonnet (0.90), review \
+                 opus (0.90)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("class:"), "{text}");
+    }
+
+    /// With more than one ladder requested, a multi-model ladder's block is
+    /// headed by its provider name rather than prefixing every line.
+    #[test]
+    fn render_route_text_headers_the_block_by_provider_when_multi_model_and_multiple_ladders() {
+        let route = |class: &str| ProviderRoute {
+            stages: StageAnswers {
+                design: answer(NO_DESIGN, 0.9),
+                implement: answer(class, 0.9),
+                review: answer(class, 0.9),
+            },
+            class: class.to_string(),
+            close_calls: vec![],
+        };
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([
+                        ("anthropic".to_string(), route("a,b")),
+                        ("openai".to_string(), route("c,d")),
+                    ]),
+                    depends_on: vec![],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(text.contains("  anthropic:\n    class: a,b\n"), "{text}");
+        assert!(text.contains("    implementation: a,b (0.90)"), "{text}");
+        assert!(text.contains("  openai:\n    class: c,d\n"), "{text}");
+        assert!(text.contains("    implementation: c,d (0.90)"), "{text}");
+    }
+
+    /// The multi-line layout is decided per ladder, not for the whole issue:
+    /// one provider with a multi-model choice does not force another
+    /// provider's single-model choice into the block layout too.
+    #[test]
+    fn render_route_text_multi_model_layout_is_decided_per_ladder() {
+        let multi_route = ProviderRoute {
+            stages: StageAnswers {
+                design: answer(NO_DESIGN, 0.9),
+                implement: answer("a,b", 0.9),
+                review: answer("a,b", 0.9),
+            },
+            class: "a,b".to_string(),
+            close_calls: vec![],
+        };
+        let compact_route = ProviderRoute {
+            stages: stages("none", "terra", "terra"),
+            class: "terra".to_string(),
+            close_calls: vec![],
+        };
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([
+                        ("anthropic".to_string(), multi_route),
+                        ("openai".to_string(), compact_route),
+                    ]),
+                    depends_on: vec![],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(text.contains("  anthropic:\n    class: a,b\n"), "{text}");
+        assert!(
+            text.contains("  openai: terra — design needs no further work"),
+            "{text}"
+        );
+    }
+
+    /// The close-call marker stays per stage in the multi-line layout too.
+    #[test]
+    fn render_route_text_notes_a_close_call_in_the_multi_line_layout() {
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([(
+                        "anthropic".to_string(),
+                        ProviderRoute {
+                            stages: StageAnswers {
+                                design: answer(NO_DESIGN, 0.9),
+                                implement: answer("a,b", 0.94),
+                                review: answer("a,b", 0.41),
+                            },
+                            class: "a,b".to_string(),
+                            close_calls: vec![Stage::Review],
+                        },
+                    )]),
+                    depends_on: vec![],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(text.contains("review: a,b (0.41, close call)"), "{text}");
     }
 
     #[test]
