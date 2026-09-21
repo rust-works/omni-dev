@@ -915,6 +915,9 @@ mod tests {
         assert!(fields.contains("sheets.conditionalFormats"));
         assert!(fields.contains("booleanRule"));
         assert!(fields.contains("gradientRule"));
+        // issue #1835: every SPREADSHEET_FIELDS* constant carries the same
+        // sheets.properties sub-mask, so this one must too.
+        assert!(fields.contains("frozenRowCount"));
     }
 
     #[tokio::test]
@@ -960,6 +963,9 @@ mod tests {
             .expect("fields mask must always be sent");
         assert!(fields.contains("sheets.charts"));
         assert!(fields.contains("sheets.slicers"));
+        // issue #1835: every SPREADSHEET_FIELDS* constant carries the same
+        // sheets.properties sub-mask, so this one must too.
+        assert!(fields.contains("frozenRowCount"));
     }
 
     #[test]
@@ -974,6 +980,9 @@ mod tests {
         assert!(fields.contains("sheets.data"));
         assert!(fields.contains("pivotTable"));
         assert!(!fields.contains("formattedValue"));
+        // issue #1835: every SPREADSHEET_FIELDS* constant carries the same
+        // sheets.properties sub-mask, so this one must too.
+        assert!(fields.contains("frozenRowCount"));
     }
 
     #[tokio::test]
@@ -1038,6 +1047,9 @@ mod tests {
             .expect("fields mask must always be sent");
         assert!(fields.contains("pivotTable"));
         assert!(fields.contains("formattedValue"));
+        // issue #1835: CELL_PIVOT_FIELDS carries the same sheets.properties
+        // sub-mask every other SPREADSHEET_FIELDS* constant does.
+        assert!(fields.contains("frozenRowCount"));
     }
 
     // ── values.get: encoding is the whole point ────────────────────────

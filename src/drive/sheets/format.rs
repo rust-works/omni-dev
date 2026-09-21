@@ -445,6 +445,15 @@ pub(super) fn parse_hex_color(input: &str) -> Result<crate::drive::sheets::types
     })
 }
 
+/// Normalizes a `#RRGGBB`/`RRGGBB` string to always carry its leading `#`,
+/// for display only (e.g. `structure.rs`'s `update-sheet-properties`
+/// dry-run/changed text, issue #1835). Shares [`parse_hex_color`]'s own
+/// `strip_prefix` so the two never disagree about what counts as "this
+/// already has a `#`".
+pub(super) fn normalize_hex_for_display(input: &str) -> String {
+    format!("#{}", input.strip_prefix('#').unwrap_or(input))
+}
+
 /// Converts a padding value to the wire's `i32`, rejecting anything that
 /// doesn't fit or is negative — a pixel padding can be neither.
 fn to_padding_i32(value: i64, flag: &str) -> Result<i32, String> {
