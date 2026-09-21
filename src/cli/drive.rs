@@ -952,6 +952,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_sheets_update_workbook_properties() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let _dir = guard.clear_credentials();
+
+        let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
+            command: sheets::SheetsSubcommands::UpdateWorkbookProperties(
+                sheets::structure::UpdateWorkbookPropertiesCommand {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    locale: Some("en_US".to_string()),
+                    time_zone: None,
+                    auto_recalc: None,
+                    iterative_calculation: None,
+                    iterative_calculation_max_iterations: None,
+                    iterative_calculation_convergence_threshold: None,
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
+            ),
+        });
+        // Reaches the engine, which never returns `Err` — every failure is a
+        // `StructureResult` variant (ADR-0073 §13).
+        assert!(cmd.dispatch(&dead_client()).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_sheets_format_cells() {
         let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();

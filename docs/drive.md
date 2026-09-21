@@ -1591,6 +1591,25 @@ Sheets: 3
   Notes [hidden]
 ```
 
+`Locale:`/`Time zone:`/`Recalculation:`/`Iterative calculation:` lines
+appear between `Title:` and `Sheets:` whenever Sheets reports that workbook
+property — the read side of `update-workbook-properties` (issue #1836,
+[ADR-0086](adrs/adr-0086-workbook-properties.md)):
+
+```bash
+$ omni-dev drive sheets info 1AbC_dEfGhIjKlMnOpQrStUvWxYz
+Id: 1AbC_dEfGhIjKlMnOpQrStUvWxYz
+Title: 2026 Budget
+Locale: en_US
+Time zone: America/New_York
+Recalculation: HOUR
+Iterative calculation: on (max 50 iterations, threshold 0.01)
+Sheets: 3
+  Q1 (1000x26)
+  Q2 (1000x26)
+  Notes [hidden]
+```
+
 #### `drive sheets read`
 
 With neither `--range` nor `--sheet`, reads **every** sheet: one
@@ -1932,7 +1951,13 @@ Changes workbook-level properties — locale, time zone, automatic
 recalculation, and iterative calculation — rather than any one sheet's shape.
 The one structural verb with no sheet target: every other verb in this
 section names a `--sheet`, this one acts on the workbook itself. Gated by
-the same `sheets-structure` operation as the rest of this section.
+the same `sheets-structure` operation as the rest of this section
+([ADR-0086](adrs/adr-0086-workbook-properties.md)).
+
+Whatever `update-workbook-properties` sets, `drive sheets info` reads back:
+its table render gains `Locale:`/`Time zone:`/`Recalculation:`/`Iterative
+calculation:` lines, each shown only when Sheets reports the field
+(`-o json`/`-o yaml` already carry every workbook property unconditionally).
 
 `spreadsheetTheme` (font family plus a full color palette) is deliberately
 out of scope — a large nested type left for a future issue, matching this
@@ -1967,9 +1992,10 @@ Would update workbook properties of 'Budget': locale -> 'en_US', auto-recalc -> 
 Turning iterative calculation on changes what a circular-reference formula
 elsewhere in the workbook *evaluates to* — a value effect reached
 indirectly, the same shape of concern [ADR-0081](adrs/adr-0081.md) raised
-for named-range deletion. No cell's formula is itself changed, only what
-some formulas compute, which is why this still gates as `sheets-structure`
-rather than a data-mutating operation.
+for named-range deletion and [ADR-0086](adrs/adr-0086-workbook-properties.md)
+§9 applies here. No cell's formula is itself changed, only what some
+formulas compute, which is why this still gates as `sheets-structure` rather
+than a data-mutating operation.
 
 `--iterative-calculation-max-iterations`/
 `--iterative-calculation-convergence-threshold` are only valid alongside

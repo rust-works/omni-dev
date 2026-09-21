@@ -9,7 +9,8 @@
 //! `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range` (destructive,
 //! issue #1623,
 //! [ADR-0077](../../../docs/adrs/adr-0077-sheets-deletion-via-batchupdate.md)),
-//! and `update-workbook-properties` (also additive, issue #1836) engines,
+//! and `update-workbook-properties` (also additive, issue #1836,
+//! [ADR-0086](../../../docs/adrs/adr-0086-workbook-properties.md)) engines,
 //! gated by the ADR-0071 folder write-permission rules.
 //!
 //! `update-workbook-properties` is the one verb here with no sheet target:
@@ -1800,9 +1801,11 @@ fn workbook_properties_summary(verb: &StructureVerb) -> String {
         iterative_calculation_max_iterations,
         iterative_calculation_convergence_threshold,
     } = verb
+    // omni-dev: coverage ignore reason="every call site matches on the verb as UpdateWorkbookProperties before calling workbook_properties_summary, so this else-arm exists only to destructure the already-known variant"
     else {
         unreachable!("workbook_properties_summary called on a non-UpdateWorkbookProperties verb")
     };
+    // omni-dev: coverage end
 
     let mut parts = Vec::new();
     if let Some(locale) = locale {
@@ -1816,19 +1819,12 @@ fn workbook_properties_summary(verb: &StructureVerb) -> String {
     }
     match iterative_calculation {
         Some(IterativeCalculationToggle::On) => {
-            let mut detail = "iterative calculation -> on".to_string();
-            match (
-                iterative_calculation_max_iterations,
-                iterative_calculation_convergence_threshold,
-            ) {
-                (Some(max), Some(threshold)) => {
-                    detail.push_str(&format!(" (max {max} iterations, threshold {threshold})"));
-                }
-                (Some(max), None) => detail.push_str(&format!(" (max {max} iterations)")),
-                (None, Some(threshold)) => detail.push_str(&format!(" (threshold {threshold})")),
-                (None, None) => {}
+            let bounds = IterativeCalculationSettings {
+                max_iterations: *iterative_calculation_max_iterations,
+                convergence_threshold: *iterative_calculation_convergence_threshold,
             }
-            parts.push(detail);
+            .describe_bounds();
+            parts.push(format!("iterative calculation -> on{bounds}"));
         }
         Some(IterativeCalculationToggle::Off) => {
             parts.push("iterative calculation -> off".to_string());
@@ -7140,6 +7136,20 @@ mod tests {
     }
 
     #[test]
+    fn validate_verb_args_accepts_positive_iterative_calculation_bounds() {
+        let workbook = Spreadsheet::default();
+        let verb = StructureVerb::UpdateWorkbookProperties {
+            locale: None,
+            time_zone: None,
+            auto_recalc: None,
+            iterative_calculation: Some(IterativeCalculationToggle::On),
+            iterative_calculation_max_iterations: Some(50),
+            iterative_calculation_convergence_threshold: Some(0.01),
+        };
+        assert!(validate_verb_args(&workbook, &verb, None).is_ok());
+    }
+
+    #[test]
     fn validate_verb_args_accepts_a_single_field() {
         let workbook = Spreadsheet::default();
         let verb = StructureVerb::UpdateWorkbookProperties {
@@ -7165,7 +7175,7 @@ mod tests {
         };
         let request = build_request(&verb, None).unwrap();
         let BatchUpdateRequestItem::UpdateSpreadsheetProperties(req) = request else {
-            panic!("expected UpdateSpreadsheetProperties, got {request:?}");
+            panic!("expected UpdateSpreadsheetProperties, got {request:?}"); // omni-dev: coverage ignore-line reason="build_request always returns UpdateSpreadsheetProperties for an UpdateWorkbookProperties verb, so this else-arm exists only to unwrap the shared enum"
         };
         assert_eq!(req.fields, "locale,autoRecalc");
         assert_eq!(req.properties.locale.as_deref(), Some("en_US"));
@@ -7189,7 +7199,7 @@ mod tests {
         };
         let request = build_request(&verb, None).unwrap();
         let BatchUpdateRequestItem::UpdateSpreadsheetProperties(req) = request else {
-            panic!("expected UpdateSpreadsheetProperties, got {request:?}");
+            panic!("expected UpdateSpreadsheetProperties, got {request:?}"); // omni-dev: coverage ignore-line reason="build_request always returns UpdateSpreadsheetProperties for an UpdateWorkbookProperties verb, so this else-arm exists only to unwrap the shared enum"
         };
         assert_eq!(req.fields, "iterativeCalculationSettings");
         assert_eq!(
@@ -7217,7 +7227,7 @@ mod tests {
         };
         let request = build_request(&verb, None).unwrap();
         let BatchUpdateRequestItem::UpdateSpreadsheetProperties(req) = request else {
-            panic!("expected UpdateSpreadsheetProperties, got {request:?}");
+            panic!("expected UpdateSpreadsheetProperties, got {request:?}"); // omni-dev: coverage ignore-line reason="build_request always returns UpdateSpreadsheetProperties for an UpdateWorkbookProperties verb, so this else-arm exists only to unwrap the shared enum"
         };
         assert_eq!(req.fields, "iterativeCalculationSettings");
         assert_eq!(req.properties.iterative_calculation_settings, None);
@@ -7269,7 +7279,7 @@ mod tests {
                 assert_eq!(*sheet, None);
                 assert_eq!(*sheet_count, 2);
             }
-            other => panic!("expected WouldChange, got {other:?}"),
+            other => panic!("expected WouldChange, got {other:?}"), // omni-dev: coverage ignore-line reason="guards this test's assumption; a dry run against an allowed target always reaches WouldChange here"
         }
         let lines = describe_lines(&outcome);
         assert_eq!(lines.len(), 1);
@@ -7313,7 +7323,7 @@ mod tests {
                 assert_eq!(*sheet, None);
                 assert_eq!(*sheet_id, None);
             }
-            other => panic!("expected Changed, got {other:?}"),
+            other => panic!("expected Changed, got {other:?}"), // omni-dev: coverage ignore-line reason="guards this test's assumption; an apply against an allowed target with a mocked batchUpdate always reaches Changed here"
         }
 
         let requests = server.received_requests().await.unwrap();

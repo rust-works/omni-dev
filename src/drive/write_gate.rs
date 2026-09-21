@@ -153,6 +153,15 @@ pub enum DriveOperation {
     /// right-to-left layout, and hidden gridlines, all per-sheet view state
     /// rather than grid data.
     ///
+    /// Since issue #1836 ([ADR-0086](../../docs/adrs/adr-0086-workbook-properties.md)),
+    /// also `update-workbook-properties` — locale, time zone, automatic
+    /// recalculation, and iterative calculation. The one capability in this
+    /// variant with no *sheet* target at all, since it acts on the workbook
+    /// itself; turning iterative calculation on changes what an unchanged
+    /// circular-reference formula elsewhere *evaluates to* rather than
+    /// touching any formula directly, the same shape of value effect
+    /// ADR-0081 §2 already accepted here for named-range deletion.
+    ///
     /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
     /// reason that one is not folded into [`Self::Edit`]. Every existing
     /// `allow: ["sheets-write"]` rule was written when structural edits were
