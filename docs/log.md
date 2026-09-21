@@ -87,7 +87,12 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `"ROWS 5:7"`, 1-based inclusive like the CLI's `--at`). `dimension_range`
   is the structural analogue of `range`, for effects A1 notation cannot
   express, and is omitted for a span that spans nothing; a structural verb
-  sets no `range` and no cell counts.
+  sets no `range` and no cell counts. `move-rows`/`move-columns` (issue
+  [#1834](https://github.com/rust-works/omni-dev/issues/1834)) add one more
+  omit-if-absent context key, `move_to`: the raw 1-based `--before` value —
+  `None` for every other verb. It is distinct from `dimension_range`, which
+  for these two verbs holds the *source* span that moved, not the
+  destination.
 
   Destructive edits (issue
   [#1623](https://github.com/rust-works/omni-dev/issues/1623),
@@ -118,7 +123,9 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `sheets-merge-cells`, `sheets-unmerge-cells`,
   `sheets-auto-resize-dimension`, `sheets-update-dimension-properties`,
   `sheets-duplicate-sheet`, `sheets-reorder-sheet`, `sheets-hide-sheet`,
-  `sheets-show-sheet`, `sheets-set-data-validation`,
+  `sheets-show-sheet`, `sheets-move-rows`, `sheets-move-columns`
+  (issue [#1834](https://github.com/rust-works/omni-dev/issues/1834)),
+  `sheets-set-data-validation`,
   `sheets-clear-data-validation`, `sheets-protect-range`,
   `sheets-update-protection`, `sheets-unprotect-range`. Six more
   omit-if-absent context keys: `fields_changed` (a human-readable summary of

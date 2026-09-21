@@ -3,7 +3,9 @@
 //! The `drive sheets add-sheet`/`rename-sheet`/`insert-rows`/`insert-columns`
 //! (additive, issue #1613, [ADR-0075](../../../docs/adrs/adr-0075.md)),
 //! `duplicate-sheet`/`reorder-sheet`/`hide-sheet`/`show-sheet` (also
-//! additive, issue #1643, [ADR-0078](../../../docs/adrs/adr-0078.md)), and
+//! additive, issue #1643, [ADR-0078](../../../docs/adrs/adr-0078.md)),
+//! `move-rows`/`move-columns` (also additive — nothing is discarded, issue
+//! #1834, [ADR-0083](../../../docs/adrs/adr-0083.md)), and
 //! `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range` (destructive,
 //! issue #1623,
 //! [ADR-0077](../../../docs/adrs/adr-0077-sheets-deletion-via-batchupdate.md))
@@ -68,8 +70,9 @@ use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
     AddSheetRequest, BatchUpdateRequestItem, BatchUpdateResponse, DeleteDimensionRequest,
     DeleteRangeRequest, DeleteSheetRequest, Dimension, DimensionRange, DuplicateSheetRequest,
-    GridProperties, GridRange, InsertDimensionRequest, NewSheetProperties, SheetProperties,
-    SheetPropertiesUpdate, ShiftDimension, Spreadsheet, UpdateSheetPropertiesRequest,
+    GridProperties, GridRange, InsertDimensionRequest, MoveDimensionRequest, NewSheetProperties,
+    SheetProperties, SheetPropertiesUpdate, ShiftDimension, Spreadsheet,
+    UpdateSheetPropertiesRequest,
 };
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -119,6 +122,34 @@ pub enum StructureVerb {
         at: i64,
         /// How many columns to insert.
         count: i64,
+    },
+    /// Move a contiguous block of rows to a new position within the same
+    /// sheet, shifting the rows in between to close the gap (issue #1834).
+    MoveRows {
+        /// Title of the sheet to modify.
+        sheet: String,
+        /// 1-based first row of the block to move, inclusive.
+        at: i64,
+        /// How many rows the block spans.
+        count: i64,
+        /// 1-based row the block moves in front of, numbered as the sheet
+        /// stands *before* the move (the API's own `destinationIndex`
+        /// convention, translated by `move_destination_index`).
+        before: i64,
+    },
+    /// Move a contiguous block of columns to a new position within the same
+    /// sheet, shifting the columns in between to close the gap (issue
+    /// #1834).
+    MoveColumns {
+        /// Title of the sheet to modify.
+        sheet: String,
+        /// 1-based first column of the block to move, inclusive.
+        at: i64,
+        /// How many columns the block spans.
+        count: i64,
+        /// 1-based column the block moves in front of, numbered as the
+        /// sheet stands *before* the move.
+        before: i64,
     },
     /// Delete an entire sheet from the workbook.
     DeleteSheet {
@@ -201,6 +232,8 @@ impl StructureVerb {
             Self::RenameSheet { .. } => "sheets-rename-sheet",
             Self::InsertRows { .. } => "sheets-insert-rows",
             Self::InsertColumns { .. } => "sheets-insert-columns",
+            Self::MoveRows { .. } => "sheets-move-rows",
+            Self::MoveColumns { .. } => "sheets-move-columns",
             Self::DeleteSheet { .. } => "sheets-delete-sheet",
             Self::DeleteRows { .. } => "sheets-delete-rows",
             Self::DeleteColumns { .. } => "sheets-delete-columns",
@@ -223,6 +256,8 @@ impl StructureVerb {
             | Self::RenameSheet { .. }
             | Self::InsertRows { .. }
             | Self::InsertColumns { .. }
+            | Self::MoveRows { .. }
+            | Self::MoveColumns { .. }
             | Self::DuplicateSheet { .. }
             | Self::ReorderSheet { .. }
             | Self::SetSheetVisibility { .. } => DriveOperation::SheetsStructure,
@@ -242,6 +277,8 @@ impl StructureVerb {
             Self::RenameSheet { .. } => "rename-sheet",
             Self::InsertRows { .. } => "insert-rows",
             Self::InsertColumns { .. } => "insert-columns",
+            Self::MoveRows { .. } => "move-rows",
+            Self::MoveColumns { .. } => "move-columns",
             Self::DeleteSheet { .. } => "delete-sheet",
             Self::DeleteRows { .. } => "delete-rows",
             Self::DeleteColumns { .. } => "delete-columns",
@@ -261,6 +298,8 @@ impl StructureVerb {
             Self::RenameSheet { sheet, .. }
             | Self::InsertRows { sheet, .. }
             | Self::InsertColumns { sheet, .. }
+            | Self::MoveRows { sheet, .. }
+            | Self::MoveColumns { sheet, .. }
             | Self::DeleteSheet { sheet }
             | Self::DeleteRows { sheet, .. }
             | Self::DeleteColumns { sheet, .. }
@@ -288,6 +327,8 @@ impl StructureVerb {
             Self::AddSheet { .. }
             | Self::InsertRows { .. }
             | Self::InsertColumns { .. }
+            | Self::MoveRows { .. }
+            | Self::MoveColumns { .. }
             | Self::DeleteSheet { .. }
             | Self::DeleteRows { .. }
             | Self::DeleteColumns { .. }
@@ -297,13 +338,17 @@ impl StructureVerb {
         }
     }
 
-    /// The axis an insert or a row/column delete runs along, or `None` for
-    /// the verbs with no single axis (`add-sheet`, `rename-sheet`,
-    /// `delete-sheet`, `delete-range`).
+    /// The axis an insert, a row/column delete or a row/column move runs
+    /// along, or `None` for the verbs with no single axis (`add-sheet`,
+    /// `rename-sheet`, `delete-sheet`, `delete-range`).
     const fn dimension(&self) -> Option<Dimension> {
         match self {
-            Self::InsertRows { .. } | Self::DeleteRows { .. } => Some(Dimension::Rows),
-            Self::InsertColumns { .. } | Self::DeleteColumns { .. } => Some(Dimension::Columns),
+            Self::InsertRows { .. } | Self::DeleteRows { .. } | Self::MoveRows { .. } => {
+                Some(Dimension::Rows)
+            }
+            Self::InsertColumns { .. } | Self::DeleteColumns { .. } | Self::MoveColumns { .. } => {
+                Some(Dimension::Columns)
+            }
             Self::AddSheet { .. }
             | Self::RenameSheet { .. }
             | Self::DeleteSheet { .. }
@@ -561,6 +606,18 @@ fn dimension_range(sheet_id: i64, dimension: Dimension, at: i64, count: i64) -> 
         start_index: start,
         end_index: start + count,
     }
+}
+
+/// Converts a 1-based `--before` into the API's zero-based, pre-move
+/// `destinationIndex`.
+///
+/// The single conversion site, on purpose — see [`dimension_range`]'s doc
+/// comment for why inlining this at a call site is how an off-by-one gets
+/// in. `moveDimension` numbers its destination in the sheet's coordinates
+/// *before* the source is lifted out, which is exactly what `--before`
+/// means, so the conversion is the 1-based/0-based shift and nothing else.
+const fn move_destination_index(before: i64) -> i64 {
+    before - 1
 }
 
 /// Runs one structural mutation, logging every attempt that isn't a dry run.
@@ -884,6 +941,12 @@ fn validate_verb_args(
         StructureVerb::InsertColumns { at, count, .. } => {
             validate_insert_bounds(Dimension::Columns, *at, *count, sheet)
         }
+        StructureVerb::MoveRows {
+            at, count, before, ..
+        } => validate_move_bounds(Dimension::Rows, *at, *count, *before, sheet),
+        StructureVerb::MoveColumns {
+            at, count, before, ..
+        } => validate_move_bounds(Dimension::Columns, *at, *count, *before, sheet),
         StructureVerb::DeleteRows { at, count, .. } => {
             validate_delete_dimension_bounds(Dimension::Rows, *at, *count, sheet)
         }
@@ -994,6 +1057,85 @@ fn validate_insert_bounds(
             return invalid(format!(
                 "--at {at} is past the end of the sheet, which has {current} {noun}(s); \
                  the furthest valid position is {max_at}",
+                noun = dimension.noun(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `MoveRows`/`MoveColumns` half of [`validate_verb_args`].
+///
+/// Three bounds, and the third is the one a move adds. The source block must
+/// already exist in full (delete's rule), and `--before` may name the
+/// append boundary one past the last row/column (insert's rule) — but a
+/// destination *inside* the block, or immediately after it, describes a
+/// position the block already occupies. `moveDimension` accepts those
+/// happily and changes nothing, so refusing them is the same "never promise
+/// a change the real run then rejects" rule read the other way round: never
+/// report having moved something that did not move. That check needs no
+/// sheet size, only the relationship between `--at`, `--count` and
+/// `--before`, so it runs whether or not the sheet's dimensions are known.
+fn validate_move_bounds(
+    dimension: Dimension,
+    at: i64,
+    count: i64,
+    before: i64,
+    sheet: Option<&SheetSnapshot>,
+) -> Result<(), StructureResult> {
+    let invalid = |detail: String| Err(StructureResult::RefusedInvalidRange { detail });
+
+    if count < 1 {
+        return invalid(format!("--count must be at least 1, got {count}"));
+    }
+    if at < 1 {
+        return invalid(format!("--at must be at least 1, got {at}"));
+    }
+    if before < 1 {
+        return invalid(format!("--before must be at least 1, got {before}"));
+    }
+    // Keeps `dimension_range`'s `at - 1 + count` total, exactly as
+    // [`validate_insert_bounds`] does, so the one pure conversion stays
+    // infallible.
+    let Some(last) = at.checked_sub(1).and_then(|start| start.checked_add(count)) else {
+        return invalid(format!(
+            "--at {at} with --count {count} overflows the {noun} index space",
+            noun = dimension.noun(),
+        ));
+    };
+    // `before == at + count` is the no-op boundary: the block already sits
+    // immediately before that row/column, so lifting it out and putting it
+    // back lands it exactly where it was. `before == at - 1` is one further
+    // out and is a real move.
+    // `before - 1 <= last` rather than `before <= last + 1`: `last` is only
+    // known not to overflow `at - 1 + count`, so adding to it could, while
+    // `before` is already known to be at least 1.
+    if before >= at && before - 1 <= last {
+        return invalid(format!(
+            "--before {before} is inside or immediately after the block being moved \
+             ({noun}s {at}-{last}), so nothing would move",
+            noun = dimension.noun(),
+        ));
+    }
+    let current = match dimension {
+        Dimension::Rows => sheet.and_then(|s| s.row_count),
+        Dimension::Columns => sheet.and_then(|s| s.column_count),
+    };
+    if let Some(current) = current {
+        if last > current {
+            return invalid(format!(
+                "--at {at} with --count {count} reaches {noun} {last}, past the end of the \
+                 sheet, which has {current} {noun}(s)",
+                noun = dimension.noun(),
+            ));
+        }
+        // The same append boundary insert allows: `before == current + 1`
+        // moves the block to the very end.
+        let max_before = current + 1;
+        if before > max_before {
+            return invalid(format!(
+                "--before {before} is past the end of the sheet, which has {current} \
+                 {noun}(s); the furthest valid position is {max_before}",
                 noun = dimension.noun(),
             ));
         }
@@ -1161,6 +1303,22 @@ fn build_request(
                 inherit_from_before: false,
             }),
         ),
+        StructureVerb::MoveRows {
+            at, count, before, ..
+        } => Ok(BatchUpdateRequestItem::MoveDimension(
+            MoveDimensionRequest {
+                source: dimension_range(sheet_id("move-rows")?, Dimension::Rows, *at, *count),
+                destination_index: move_destination_index(*before),
+            },
+        )),
+        StructureVerb::MoveColumns {
+            at, count, before, ..
+        } => Ok(BatchUpdateRequestItem::MoveDimension(
+            MoveDimensionRequest {
+                source: dimension_range(sheet_id("move-columns")?, Dimension::Columns, *at, *count),
+                destination_index: move_destination_index(*before),
+            },
+        )),
         StructureVerb::DeleteSheet { .. } => {
             Ok(BatchUpdateRequestItem::DeleteSheet(DeleteSheetRequest {
                 sheet_id: sheet_id("delete-sheet")?,
@@ -1278,7 +1436,9 @@ fn dimension_range_label(verb: &StructureVerb) -> Option<String> {
         StructureVerb::InsertRows { at, count, .. }
         | StructureVerb::InsertColumns { at, count, .. }
         | StructureVerb::DeleteRows { at, count, .. }
-        | StructureVerb::DeleteColumns { at, count, .. } => (*at, *count),
+        | StructureVerb::DeleteColumns { at, count, .. }
+        | StructureVerb::MoveRows { at, count, .. }
+        | StructureVerb::MoveColumns { at, count, .. } => (*at, *count),
         _ => return None,
     };
     // A span is only meaningful for a positive count. `count < 1` is a
@@ -1332,6 +1492,14 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
         StructureResult::WouldChange { sheet, .. } => sheet.as_ref().and_then(|s| s.sheet_id),
         _ => None,
     };
+    // The destination `dimension_range` cannot carry: it names the span that
+    // moved, not where it went.
+    let move_to = match &opts.verb {
+        StructureVerb::MoveRows { before, .. } | StructureVerb::MoveColumns { before, .. } => {
+            Some(*before)
+        }
+        _ => None,
+    };
 
     request_log::record_drive_mutation(DriveMutationOutcome {
         operation: opts.verb.log_operation(),
@@ -1346,6 +1514,7 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
         sheet_title: Some(opts.verb.sheet_title().to_string()),
         sheet_new_title: opts.verb.new_sheet_title().map(ToString::to_string),
         dimension_range: dimension_range_label(&opts.verb),
+        move_to,
         grid_range: grid_range_label(&opts.verb),
         error,
         duration,
@@ -1538,6 +1707,36 @@ fn describe_would_change(
             at,
             count,
         } => describe_would_insert(Dimension::Columns, from, &id, *at, *count, sheet, book),
+        StructureVerb::MoveRows {
+            sheet: from,
+            at,
+            count,
+            before,
+        } => describe_would_move(
+            Dimension::Rows,
+            from,
+            &id,
+            *at,
+            *count,
+            *before,
+            sheet,
+            book,
+        ),
+        StructureVerb::MoveColumns {
+            sheet: from,
+            at,
+            count,
+            before,
+        } => describe_would_move(
+            Dimension::Columns,
+            from,
+            &id,
+            *at,
+            *count,
+            *before,
+            sheet,
+            book,
+        ),
         StructureVerb::DeleteSheet { sheet: from } => {
             vec![format!(
                 "Would delete sheet '{from}'{id} from {book} ({sheet_count} sheet(s) -> {}); \
@@ -1677,6 +1876,94 @@ fn describe_would_insert(
     ]
 }
 
+/// The move arms of [`describe_would_change`].
+///
+/// Same shape and the same reason as [`describe_would_insert`]: the summary
+/// names the block and its destination, and the second line names the
+/// shift — which for a move is the whole point, since `--before` is numbered
+/// in the sheet's *pre-move* coordinates and the block therefore does not
+/// land on the number the user typed. Spelling out where the block ends up,
+/// and which rows/columns slid past it, is what stops that convention being
+/// a trap.
+// One parameter per fact the message needs, with a single call site — see
+// `describe_would_insert`'s note.
+#[allow(clippy::too_many_arguments)]
+fn describe_would_move(
+    dimension: Dimension,
+    from: &str,
+    id: &str,
+    at: i64,
+    count: i64,
+    before: i64,
+    sheet: Option<&SheetSnapshot>,
+    book: &str,
+) -> Vec<String> {
+    let Some(last) = at.checked_add(count).and_then(|end| end.checked_sub(1)) else {
+        return vec![format!(
+            "Would move {count} {noun}(s) from {noun} {at} of '{from}'{id} in {book}",
+            noun = dimension.noun(),
+        )];
+    };
+    let summary = format!(
+        "Would move {count} {noun}(s) {at}-{last} of '{from}'{id} in {book} to before \
+         {noun} {before}",
+        noun = dimension.noun(),
+    );
+    let current = match dimension {
+        Dimension::Rows => sheet.and_then(|s| s.row_count),
+        Dimension::Columns => sheet.and_then(|s| s.column_count),
+    };
+    // The shift line is the trustworthy half of a structural preview, so it
+    // is omitted outright when the current size is unknown rather than
+    // guessed at — `describe_would_insert`'s rule.
+    let Some(current) = current else {
+        return vec![summary];
+    };
+    // `validate_move_bounds` refuses every `before` in `at..=at + count`, so
+    // exactly one of these two branches describes a real move.
+    let detail = if before > last {
+        // Downward: the rows/columns strictly between the block and the
+        // destination slide back to close the gap, and the block lands
+        // immediately before where `before` used to sit — `count` short of
+        // the number typed, which is the convention this line exists to
+        // spell out.
+        format!(
+            "  ({current} {plural} unchanged; {plural} {shift_first}-{shift_last} shift \
+             {direction} to {at}-{shifted_last}; moved {plural} land at {land_first}-\
+             {land_last})",
+            plural = plural(dimension),
+            direction = match dimension {
+                Dimension::Rows => "up",
+                Dimension::Columns => "left",
+            },
+            shift_first = last + 1,
+            shift_last = before - 1,
+            shifted_last = before - 1 - count,
+            land_first = before - count,
+            land_last = before - 1,
+        )
+    } else {
+        // Upward (`before < at`): the block lands exactly on the number
+        // typed, and everything from there to the block's old start slides
+        // forward by `count`.
+        format!(
+            "  ({current} {plural} unchanged; {plural} {before}-{shift_last} shift \
+             {direction} to {shifted_first}-{shifted_last}; moved {plural} land at \
+             {before}-{land_last})",
+            plural = plural(dimension),
+            direction = match dimension {
+                Dimension::Rows => "down",
+                Dimension::Columns => "right",
+            },
+            shift_last = at - 1,
+            shifted_first = before + count,
+            shifted_last = at - 1 + count,
+            land_last = before + count - 1,
+        )
+    };
+    vec![summary, detail]
+}
+
 /// A destructive `--dry-run` cannot check whether some formula elsewhere in
 /// the workbook references what would be deleted — that would need reading
 /// every other sheet's formulas, not just this verb's own target, and ADR-0077
@@ -1806,6 +2093,18 @@ fn describe_changed(
             at,
             count,
         } => describe_inserted(Dimension::Columns, from, &id, *at, *count, sheet, book),
+        StructureVerb::MoveRows {
+            sheet: from,
+            at,
+            count,
+            before,
+        } => describe_moved(Dimension::Rows, from, &id, *at, *count, *before, book),
+        StructureVerb::MoveColumns {
+            sheet: from,
+            at,
+            count,
+            before,
+        } => describe_moved(Dimension::Columns, from, &id, *at, *count, *before, book),
         StructureVerb::DeleteSheet { sheet: from } => {
             format!("Deleted sheet '{from}'{id} from {book}; {recovery}")
         }
@@ -1899,6 +2198,42 @@ fn describe_inserted(
     });
     format!(
         "Inserted {count} {noun}(s) before {noun} {at} of '{from}'{id} in {book}{now}",
+        noun = dimension.noun(),
+    )
+}
+
+/// The move arms of [`describe_changed`].
+///
+/// One line, like [`describe_inserted`], but it still names the landing
+/// span: `--before` is pre-move numbering, so "moved rows 2-3 to before row
+/// 6" alone would leave the reader to redo the arithmetic that
+/// [`describe_would_move`] already does for the preview. It takes no
+/// [`SheetSnapshot`], unlike every other `describe_*` helper here: a move
+/// changes neither the row nor the column count, so there is no "now N
+/// rows" tail the sheet's dimensions could supply — the landing span is
+/// determined by the block's own numbers alone.
+fn describe_moved(
+    dimension: Dimension,
+    from: &str,
+    id: &str,
+    at: i64,
+    count: i64,
+    before: i64,
+    book: &str,
+) -> String {
+    let last = at.checked_add(count).and_then(|end| end.checked_sub(1));
+    let range = last.map_or_else(|| at.to_string(), |last| format!("{at}-{last}"));
+    let now = last.map_or_else(String::new, |last| {
+        let landing = if before > last {
+            format!("{}-{}", before - count, before - 1)
+        } else {
+            format!("{before}-{}", before + count - 1)
+        };
+        format!(" (now {} {landing})", plural(dimension))
+    });
+    format!(
+        "Moved {count} {noun}(s) {range} of '{from}'{id} in {book} to before {noun} \
+         {before}{now}",
         noun = dimension.noun(),
     )
 }
@@ -2177,6 +2512,18 @@ mod tests {
         }
     }
 
+    /// Rows 2-3 of `Q2` moved to before row 6 — a downward move, the case
+    /// where `--before`'s pre-move numbering and the block's landing
+    /// position differ.
+    fn move_rows() -> StructureVerb {
+        StructureVerb::MoveRows {
+            sheet: "Q2".to_string(),
+            at: 2,
+            count: 2,
+            before: 6,
+        }
+    }
+
     fn add_sheet() -> StructureVerb {
         StructureVerb::AddSheet {
             title: "Q3".to_string(),
@@ -2339,6 +2686,18 @@ mod tests {
                 sheet: "Q1".to_string(),
                 at: 1,
                 count: 1,
+            },
+            StructureVerb::MoveRows {
+                sheet: "Q1".to_string(),
+                at: 1,
+                count: 1,
+                before: 3,
+            },
+            StructureVerb::MoveColumns {
+                sheet: "Q1".to_string(),
+                at: 1,
+                count: 1,
+                before: 3,
             },
             StructureVerb::DuplicateSheet {
                 sheet: "Q1".to_string(),
@@ -4761,6 +5120,620 @@ mod tests {
             .is_none());
     }
 
+    // ── move-rows / move-columns (issue #1834) ─────────────────────────
+
+    /// The `batchUpdate` body the server actually received.
+    fn sent_batch_update(requests: &[wiremock::Request]) -> serde_json::Value {
+        requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request")
+    }
+
+    /// [`mount_workbook`] with the `Q2` sheet object supplied wholesale —
+    /// the hook the "does not consult" tests below use to add grid state
+    /// this engine must keep ignoring.
+    fn mount_workbook_with_q2(q2: serde_json::Value) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {"properties": {
+                            "sheetId": 0, "title": "Q1", "index": 0,
+                            "gridProperties": {"rowCount": 1000, "columnCount": 26}}},
+                        q2,
+                    ],
+                })),
+            )
+    }
+
+    /// Everything a move's real run needs mounted, minus the workbook.
+    async fn mount_move_prereqs(server: &wiremock::MockServer) {
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(server)
+            .await;
+        mount_folder("parent-1").mount(server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(server)
+            .await;
+    }
+
+    /// The conversion this verb exists to get right: `--at 2 --count 2`
+    /// becomes the half-open `[1, 3)`, and `--before 6` becomes
+    /// `destinationIndex: 5` — the API's *pre-move* numbering, so the block
+    /// actually lands on rows 4-5, not row 6.
+    #[tokio::test]
+    async fn move_rows_apply_sends_move_dimension_with_pre_move_destination() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_move_prereqs(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(move_rows(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, StructureResult::Changed { .. }),
+            "{:?}",
+            outcome.result
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let body = sent_batch_update(&requests);
+        assert_eq!(
+            body["requests"][0]["moveDimension"],
+            serde_json::json!({
+                "source": {
+                    "sheetId": 118_293, "dimension": "ROWS",
+                    "startIndex": 1, "endIndex": 3,
+                },
+                "destinationIndex": 5,
+            })
+        );
+        assert_eq!(body["requests"].as_array().unwrap().len(), 1);
+
+        // The real-run message resolves the pre-move numbering for the
+        // reader rather than echoing `--before` alone.
+        let rendered = describe(&outcome);
+        assert!(rendered.contains("Moved 2 row(s) 2-3"), "{rendered}");
+        assert!(rendered.contains("to before row 6"), "{rendered}");
+        assert!(rendered.contains("(now rows 4-5)"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn move_columns_apply_sends_move_dimension() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_move_prereqs(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::MoveColumns {
+                    sheet: "Q2".to_string(),
+                    at: 2,
+                    count: 2,
+                    before: 6,
+                },
+                false,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, StructureResult::Changed { .. }),
+            "{:?}",
+            outcome.result
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let body = sent_batch_update(&requests);
+        assert_eq!(
+            body["requests"][0]["moveDimension"],
+            serde_json::json!({
+                "source": {
+                    "sheetId": 118_293, "dimension": "COLUMNS",
+                    "startIndex": 1, "endIndex": 3,
+                },
+                "destinationIndex": 5,
+            })
+        );
+    }
+
+    /// The append boundary: `Q2` has 500 rows, so `--before 501` is the
+    /// furthest legal destination — "move it to the very end" — and must
+    /// not be refused the way `--before 502` is.
+    #[tokio::test]
+    async fn move_rows_to_the_end_uses_row_count_plus_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_move_prereqs(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::MoveRows {
+                    sheet: "Q2".to_string(),
+                    at: 1,
+                    count: 1,
+                    before: 501,
+                },
+                false,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, StructureResult::Changed { .. }),
+            "{:?}",
+            outcome.result
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let body = sent_batch_update(&requests);
+        assert_eq!(
+            body["requests"][0]["moveDimension"]["destinationIndex"],
+            500
+        );
+    }
+
+    /// The source block must exist in full — `delete`'s rule, and the
+    /// reason a move validates two spans rather than one.
+    #[tokio::test]
+    async fn move_rows_refuses_a_source_past_the_sheets_end() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_move_prereqs(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::MoveRows {
+                    sheet: "Q2".to_string(),
+                    at: 499,
+                    count: 3,
+                    before: 1,
+                },
+                false,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("500 row(s)"), "{detail}");
+        assert!(detail.contains("501"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn move_rows_refuses_a_destination_past_the_end() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_move_prereqs(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::MoveRows {
+                    sheet: "Q2".to_string(),
+                    at: 5,
+                    count: 1,
+                    before: 502,
+                },
+                false,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("500 row(s)"), "{detail}");
+        assert!(detail.contains("501"), "{detail}");
+    }
+
+    /// The refusal a move adds on top of insert's and delete's: for
+    /// `--at 2 --count 2` the block occupies rows 2-3, and every
+    /// `--before` in `2..=4` describes where it already is. Sheets accepts
+    /// all three and changes nothing, so reporting "Moved" would be a
+    /// lie — the "never promise a change the real run then rejects" rule
+    /// read the other way round.
+    #[tokio::test]
+    async fn move_rows_refuses_a_destination_inside_or_adjacent_to_the_block() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_move_prereqs(&server).await;
+        mount_workbook().mount(&server).await;
+
+        for before in 2..=4 {
+            let outcome = structure(
+                &drive,
+                &sheets,
+                &opts(
+                    StructureVerb::MoveRows {
+                        sheet: "Q2".to_string(),
+                        at: 2,
+                        count: 2,
+                        before,
+                    },
+                    false,
+                ),
+                &[allow_rule("parent-1")],
+            )
+            .await;
+            let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+                panic!(
+                    "expected RefusedInvalidRange for --before {before}, got {:?}",
+                    outcome.result
+                );
+            };
+            assert!(detail.contains("nothing would move"), "{detail}");
+            assert!(detail.contains("rows 2-3"), "{detail}");
+        }
+    }
+
+    /// The two values immediately outside that band, which must stay legal.
+    /// For rows 2-3: `--before 1` is the smallest upward move (one position
+    /// earlier) and `--before 5` the smallest downward one — `4` is the
+    /// no-op boundary, so `5` is the first real move above the block, not
+    /// `4`.
+    #[tokio::test]
+    async fn move_rows_allows_a_destination_immediately_adjacent_but_outside_the_block() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // `dry_run: true` throughout: the point is the classification, and
+        // a dry run issues no `batchUpdate` to mock.
+        for before in [1, 5] {
+            let outcome = structure(
+                &drive,
+                &sheets,
+                &opts(
+                    StructureVerb::MoveRows {
+                        sheet: "Q2".to_string(),
+                        at: 2,
+                        count: 2,
+                        before,
+                    },
+                    true,
+                ),
+                &[allow_rule("parent-1")],
+            )
+            .await;
+            assert!(
+                matches!(outcome.result, StructureResult::WouldChange { .. }),
+                "--before {before} must be a real move, got {:?}",
+                outcome.result
+            );
+        }
+    }
+
+    #[test]
+    fn move_bounds_refuse_every_argument_below_one() {
+        let sheet = SheetSnapshot {
+            sheet_id: Some(1),
+            title: "Q2".to_string(),
+            row_count: Some(500),
+            column_count: Some(26),
+        };
+        for (at, count, before, expected) in [
+            (2, 0, 9, "--count must be at least 1, got 0"),
+            (0, 1, 9, "--at must be at least 1, got 0"),
+            (2, 1, 0, "--before must be at least 1, got 0"),
+        ] {
+            let Err(StructureResult::RefusedInvalidRange { detail }) =
+                validate_move_bounds(Dimension::Rows, at, count, before, Some(&sheet))
+            else {
+                panic!(
+                    "expected RefusedInvalidRange for --at {at} --count {count} --before {before}"
+                );
+            };
+            assert_eq!(detail, expected);
+        }
+    }
+
+    #[test]
+    fn a_move_at_and_count_that_would_overflow_the_index_space_are_refused() {
+        let sheet = SheetSnapshot {
+            sheet_id: Some(1),
+            title: "Q2".to_string(),
+            row_count: Some(500),
+            column_count: Some(26),
+        };
+        // `--before 1` throughout, so the overflow guard is what fires and
+        // not the inside-the-block refusal that follows it.
+        for (at, count) in [(i64::MAX, 5), (500, i64::MAX)] {
+            let Err(StructureResult::RefusedInvalidRange { detail }) =
+                validate_move_bounds(Dimension::Rows, at, count, 1, Some(&sheet))
+            else {
+                panic!("expected RefusedInvalidRange for --at {at} --count {count}");
+            };
+            assert!(detail.contains("overflows the row index space"), "{detail}");
+        }
+    }
+
+    /// `record_attempt` builds a record from the very arguments
+    /// `validate_move_bounds` just rejected, so `dimension_range_label`'s
+    /// span arithmetic runs on them. Plain arithmetic panics here rather
+    /// than in the mutation it refused to make — the
+    /// `a_refused_out_of_range_insert_still_records_without_panicking`
+    /// regression, for the move verbs.
+    #[tokio::test]
+    async fn a_refused_move_still_records_without_panicking() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::MoveRows {
+                    sheet: "Q2".to_string(),
+                    at: i64::MAX,
+                    count: 5,
+                    before: 1,
+                },
+                false,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, StructureResult::RefusedInvalidRange { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    /// The dry run's second line is where `--before`'s pre-move numbering
+    /// stops being a trap: rows 2-3 moved to before row 6 land on rows
+    /// 4-5, because rows 4-5 slid up into the gap first.
+    #[tokio::test]
+    async fn move_rows_dry_run_describes_a_downward_move_and_its_landing_rows() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(move_rows(), true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("Would move 2 row(s) 2-3"), "{lines:?}");
+        assert!(lines[0].contains("to before row 6"), "{lines:?}");
+        assert_eq!(
+            lines[1],
+            "  (500 rows unchanged; rows 4-5 shift up to 2-3; moved rows land at 4-5)"
+        );
+    }
+
+    /// The mirror image: an upward move lands the block exactly on the
+    /// number typed, and pushes everything from there to its old start
+    /// forward by `--count`.
+    #[tokio::test]
+    async fn move_rows_dry_run_describes_an_upward_move_and_its_landing_rows() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::MoveRows {
+                    sheet: "Q2".to_string(),
+                    at: 6,
+                    count: 2,
+                    before: 2,
+                },
+                true,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("Would move 2 row(s) 6-7"), "{lines:?}");
+        assert!(lines[0].contains("to before row 2"), "{lines:?}");
+        assert_eq!(
+            lines[1],
+            "  (500 rows unchanged; rows 2-5 shift down to 4-7; moved rows land at 2-3)"
+        );
+    }
+
+    /// A preview and a real run share one classification by construction
+    /// (the dry run returns after the gate, not before it), so a refusal
+    /// must read identically either way — `--dry-run` may never promise a
+    /// move the real run then refuses.
+    #[tokio::test]
+    async fn move_rows_dry_run_matches_the_real_run_refusal() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_move_prereqs(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let verb = StructureVerb::MoveRows {
+            sheet: "Q2".to_string(),
+            at: 5,
+            count: 1,
+            before: 502,
+        };
+        let real = structure(
+            &drive,
+            &sheets,
+            &opts(verb.clone(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let dry = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(
+            matches!(real.result, StructureResult::RefusedInvalidRange { .. }),
+            "{:?}",
+            real.result
+        );
+        assert_eq!(dry.result, real.result);
+    }
+
+    /// Frozen panes are Sheets' own business. `moveDimension` interacts with
+    /// them server-side (a frozen band does not travel with the move), and
+    /// no client-side check here may grow around that: the request must be
+    /// byte-identical to the one sent against a sheet with no frozen rows,
+    /// and the move must not be refused. ADR-0073 §7's rule — Sheets is the
+    /// authority on its own semantics.
+    #[tokio::test]
+    async fn move_rows_does_not_consult_frozen_rows() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_move_prereqs(&server).await;
+        mount_workbook_with_q2(serde_json::json!({
+            "properties": {
+                "sheetId": 118_293, "title": "Q2", "index": 1,
+                "gridProperties": {
+                    "rowCount": 500, "columnCount": 10, "frozenRowCount": 2,
+                },
+            },
+        }))
+        .mount(&server)
+        .await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::MoveRows {
+                    sheet: "Q2".to_string(),
+                    at: 1,
+                    count: 1,
+                    before: 3,
+                },
+                false,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, StructureResult::Changed { .. }),
+            "{:?}",
+            outcome.result
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let body = sent_batch_update(&requests);
+        assert_eq!(
+            body["requests"][0]["moveDimension"],
+            serde_json::json!({
+                "source": {
+                    "sheetId": 118_293, "dimension": "ROWS",
+                    "startIndex": 0, "endIndex": 1,
+                },
+                "destinationIndex": 2,
+            })
+        );
+    }
+
+    /// The same claim for row/column groups: an outline group whose range
+    /// spans the block being moved is state this engine never reads, so it
+    /// can neither refuse nor reshape the request. Sheets resolves what
+    /// happens to the group.
+    #[tokio::test]
+    async fn move_rows_does_not_consult_dimension_groups() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_move_prereqs(&server).await;
+        mount_workbook_with_q2(serde_json::json!({
+            "properties": {
+                "sheetId": 118_293, "title": "Q2", "index": 1,
+                "gridProperties": {"rowCount": 500, "columnCount": 10},
+            },
+            "rowGroups": [{
+                "range": {
+                    "sheetId": 118_293, "dimension": "ROWS",
+                    "startIndex": 1, "endIndex": 4,
+                },
+            }],
+        }))
+        .mount(&server)
+        .await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::MoveRows {
+                    sheet: "Q2".to_string(),
+                    at: 2,
+                    count: 1,
+                    before: 1,
+                },
+                false,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, StructureResult::Changed { .. }),
+            "{:?}",
+            outcome.result
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let body = sent_batch_update(&requests);
+        assert_eq!(
+            body["requests"][0]["moveDimension"],
+            serde_json::json!({
+                "source": {
+                    "sheetId": 118_293, "dimension": "ROWS",
+                    "startIndex": 1, "endIndex": 2,
+                },
+                "destinationIndex": 0,
+            })
+        );
+    }
+
     // ── plumbing ───────────────────────────────────────────────────────
 
     #[test]
@@ -4773,6 +5746,13 @@ mod tests {
                 sheet: "Q2".to_string(),
                 at: 1,
                 count: 1,
+            },
+            move_rows(),
+            StructureVerb::MoveColumns {
+                sheet: "Q2".to_string(),
+                at: 1,
+                count: 1,
+                before: 3,
             },
             delete_sheet(),
             delete_rows(),
@@ -4795,6 +5775,8 @@ mod tests {
                 "sheets-rename-sheet",
                 "sheets-insert-rows",
                 "sheets-insert-columns",
+                "sheets-move-rows",
+                "sheets-move-columns",
                 "sheets-delete-sheet",
                 "sheets-delete-rows",
                 "sheets-delete-columns",
@@ -4917,6 +5899,13 @@ mod tests {
                 at: 2,
                 count: 1,
             },
+            move_rows(),
+            StructureVerb::MoveColumns {
+                sheet: "Q2".to_string(),
+                at: 2,
+                count: 1,
+                before: 5,
+            },
             delete_sheet(),
             delete_rows(),
             delete_columns(),
@@ -4928,9 +5917,10 @@ mod tests {
             hide_sheet(),
             show_sheet(),
         ] {
-            // A verb with a single axis (insert or delete-dimension) earns a
-            // second `WouldChange` line for the shift; every other verb,
-            // additive or destructive, stays one line.
+            // A verb with a single axis (insert, delete-dimension or
+            // move-dimension) earns a second `WouldChange` line for the
+            // shift; every other verb, additive or destructive, stays one
+            // line.
             let has_dimension_shift = verb.dimension().is_some();
             for result in every_structure_result() {
                 let previews_an_insert =

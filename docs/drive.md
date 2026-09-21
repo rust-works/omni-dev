@@ -609,7 +609,7 @@ never a missed visibility increase. See
 
 `drive create`/`drive upload`/`drive edit`, and `drive sheets
 write`/`append`/`clear`/`create`/`add-sheet`/`rename-sheet`/`insert-rows`/
-`insert-columns` (below), need a much broader OAuth grant
+`insert-columns`/`move-rows`/`move-columns` (below), need a much broader OAuth grant
 than rename/move — `--write-file`/`--write-full` — but Google's
 scopes are all-or-nothing across your whole Drive. There's no way to tell
 Google "only let this credential write inside folder X." So `omni-dev` adds
@@ -628,7 +628,7 @@ operation anywhere in a target's ancestor chain:
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
 | `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table` |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -1061,7 +1061,7 @@ a script or a PTY.
 documents** (see the fidelity split below). `--lease` is required by every
 content-mutating write verb: `drive edit`; `drive sheets`
 `write`/`append`/`clear`, `add-sheet`/`rename-sheet`/`insert-rows`/
-`insert-columns`/`duplicate-sheet`/`reorder-sheet`/`hide-sheet`/
+`insert-columns`/`move-rows`/`move-columns`/`duplicate-sheet`/`reorder-sheet`/`hide-sheet`/
 `show-sheet`, `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range`,
 `format-cells`/`merge-cells`/`unmerge-cells`/`update-borders`/
 `update-dimension-properties`/`auto-resize-columns`,
@@ -1764,7 +1764,7 @@ rolled back automatically.
 
 Delete it yourself if you don't want it.
 
-#### drive sheets add-sheet / rename-sheet / insert-rows / insert-columns / duplicate-sheet / reorder-sheet / hide-sheet / show-sheet
+#### drive sheets add-sheet / rename-sheet / insert-rows / insert-columns / move-rows / move-columns / duplicate-sheet / reorder-sheet / hide-sheet / show-sheet
 
 Structural edits — changing the *shape* of a workbook rather than its cell
 values. Gated by the separate `sheets-structure` operation (above), so a
@@ -1807,6 +1807,33 @@ omni-dev drive sheets insert-columns <ID> --sheet Q2 --at 2
 `--count` defaults to 1.
 
 ```bash
+# Move a contiguous block of rows or columns. --at/--count name the source
+# (1-based inclusive, same as insert-rows/insert-columns); --before is the
+# 1-based row/column the block moves in front of, numbered as the sheet
+# stands *before* the move — the same numbering --at uses.
+omni-dev drive sheets move-rows <ID> --sheet Q2 --at 2 --count 2 --before 6
+omni-dev drive sheets move-columns <ID> --sheet Q2 --at 5 --before 1
+```
+
+```bash
+omni-dev drive sheets move-rows <ID> --sheet Q2 --at 2 --count 2 --before 6 --dry-run
+```
+
+```
+Would move 2 row(s) 2-3 of 'Q2' (sheetId 118293) in 'Budget' to before row 6
+  (500 rows unchanged; rows 4-5 shift up to 2-3; moved rows land at 4-5)
+```
+
+The dry run's second line, like an insert's, states both the shift and
+where the block actually lands. Because `--before` is numbered as the sheet
+stood *before* the move, the two directions land differently: an upward move
+lands the block exactly on the `--before` number, while a downward move —
+like the one above — lands it `count` short, since everything between the
+source and `--before` has already shifted up to fill the gap. The CLI's own
+validation deliberately does not consult frozen rows/columns or dimension
+groups; Sheets applies its own rules to the move.
+
+```bash
 # Copy a sheet. --title omitted takes Sheets' own "Copy of X" default;
 # --index omitted takes Sheets' own default position — confirmed against
 # the live API to be the front of the workbook (index 0), not the end,
@@ -1831,7 +1858,13 @@ real run then fails:
 Refused: 'Budget' has no sheet titled 'Nope'. Available: 'Q1', 'Q2'
 Refused: 'Budget' already has a sheet titled 'Q1'
 Refused: --at 502 is past the end of the sheet, which has 500 row(s); the furthest valid position is 501
+Refused: --before 502 is past the end of the sheet, which has 500 row(s); the furthest valid position is 501
+Refused: --before 3 is inside or immediately after the block being moved (rows 2-3), so nothing would move
 ```
+
+The last of these is unique to `move-rows`/`move-columns`: no other verb has
+a destination that can collide with its own source, so only a move can be
+refused for moving nothing.
 
 The duplicate-title refusal applies to `rename-sheet` too — renaming a
 sheet to a title a *different* sheet already has fails the same way

@@ -75,6 +75,14 @@ pub enum SheetsSubcommands {
     /// folder write-permission rules' `sheets-structure` operation
     /// (issue #1613).
     InsertColumns(structure::InsertColumnsCommand),
+    /// Moves a contiguous block of rows to a new position within a sheet,
+    /// shifting the rows in between. Gated by the folder write-permission
+    /// rules' `sheets-structure` operation (issue #1834).
+    MoveRows(structure::MoveRowsCommand),
+    /// Moves a contiguous block of columns to a new position within a
+    /// sheet, shifting the columns in between. Gated by the folder
+    /// write-permission rules' `sheets-structure` operation (issue #1834).
+    MoveColumns(structure::MoveColumnsCommand),
     /// Deletes an entire sheet (tab) from a spreadsheet. Gated by the folder
     /// write-permission rules' `sheets-delete` operation (issue #1623).
     /// Cannot be undone through omni-dev.
@@ -315,6 +323,8 @@ impl SheetsCommand {
             SheetsSubcommands::RenameSheet(cmd) => cmd.execute(client).await,
             SheetsSubcommands::InsertRows(cmd) => cmd.execute(client).await,
             SheetsSubcommands::InsertColumns(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::MoveRows(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::MoveColumns(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeleteSheet(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeleteRows(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeleteColumns(cmd) => cmd.execute(client).await,
