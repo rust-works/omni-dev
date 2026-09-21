@@ -36,10 +36,6 @@ const STAGE_QUESTIONS_YAML: &str = include_str!("../templates/jev-route-question
 /// tier may use this name.
 pub const NO_DESIGN: &str = "none";
 
-/// The provider name a `--tiers FILE` ladder is reported under: a custom
-/// file names no provider, and the output nests every ladder under one.
-pub const CUSTOM_PROVIDER: &str = "custom";
-
 /// An AI provider with an embedded model ladder (#1820).
 ///
 /// Each variant's ladder lives in `src/templates/jev-route-tiers-<name>.yaml`,
@@ -214,32 +210,32 @@ impl Tiers {
     }
 }
 
-/// One provider's model ladder: the name its answers are reported under and
-/// the tiers Jev chooses between (#1820).
+/// One model ladder (#1820, #1826).
+///
+/// The name its answers are reported under and the tiers Jev chooses
+/// between. A ladder is either a built-in provider's embedded ladder or a
+/// custom one registered under its own name via `--ladder-definition`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ladder {
-    /// The provider name: the output key and the question-key prefix.
-    pub provider: String,
+    /// The ladder's name: the output key and the question-key prefix.
+    pub name: String,
     /// The tiers, least capable first.
     pub tiers: Tiers,
 }
 
 impl Ladder {
-    /// A built-in provider's embedded ladder.
+    /// A built-in provider's embedded ladder, named after the provider.
     pub fn builtin(provider: Provider) -> Result<Self> {
         Ok(Self {
-            provider: provider.name().to_string(),
+            name: provider.name().to_string(),
             tiers: provider.tiers()?,
         })
     }
 
-    /// A `--tiers FILE` ladder, reported under [`CUSTOM_PROVIDER`].
+    /// A custom ladder registered under `name` (#1826).
     #[must_use]
-    pub fn custom(tiers: Tiers) -> Self {
-        Self {
-            provider: CUSTOM_PROVIDER.to_string(),
-            tiers,
-        }
+    pub fn named(name: String, tiers: Tiers) -> Self {
+        Self { name, tiers }
     }
 }
 
@@ -271,18 +267,18 @@ pub fn build_route_questions(ladders: &[Ladder]) -> Result<BTreeMap<String, Ques
                     .insert(tier.name.clone(), tier.description.clone())
                     .is_some()
                 {
-                    // omni-dev: coverage ignore-line reason="defensive: no embedded or --tiers tier is ever named `none`, the one fixed criterion (stage_design's no-design-work option)"
+                    // omni-dev: coverage ignore-line reason="defensive: no embedded or custom tier is ever named `none`, the one fixed criterion (stage_design's no-design-work option)"
                     bail!(
-                        "tier {:?} of provider {:?} collides with a fixed option of {key:?}",
+                        "tier {:?} of ladder {:?} collides with a fixed option of {key:?}",
                         tier.name,
-                        ladder.provider
+                        ladder.name
                     );
                 }
             }
             question
                 .validate()
-                .with_context(|| format!("stage question {key:?} for {:?}", ladder.provider))?;
-            questions.insert(format!("{}.{key}", ladder.provider), question);
+                .with_context(|| format!("stage question {key:?} for {:?}", ladder.name))?;
+            questions.insert(format!("{}.{key}", ladder.name), question);
         }
     }
     Ok(questions)
@@ -559,12 +555,12 @@ fn validate_options(docs: &[IssueDoc], ladders: &[Ladder], opts: &RouteOptions) 
         bail!("no issues to route");
     }
     if ladders.is_empty() {
-        bail!("no providers to route against");
+        bail!("no ladders to route against");
     }
     let mut seen = BTreeSet::new();
     for ladder in ladders {
-        if !seen.insert(ladder.provider.as_str()) {
-            bail!("provider {:?} is listed more than once", ladder.provider);
+        if !seen.insert(ladder.name.as_str()) {
+            bail!("ladder {:?} is listed more than once", ladder.name);
         }
     }
     if !(0.0..=1.0).contains(&opts.close_call) {
@@ -610,7 +606,7 @@ fn provider_routes(
                 close_calls: close_calls(&stages, close_call),
                 stages,
             };
-            Ok((ladder.provider.clone(), route))
+            Ok((ladder.name.clone(), route))
         })
         .collect()
 }
@@ -620,7 +616,7 @@ fn provider_routes(
 fn stage_answers(answers: &BTreeMap<String, Answer>, ladder: &Ladder) -> Result<StageAnswers> {
     let tiers = &ladder.tiers;
     let read = |stage: Stage| -> Result<StageAnswer> {
-        let key = stage.question_key(&ladder.provider);
+        let key = stage.question_key(&ladder.name);
         let Some(Answer::Choice {
             choice,
             confidence,
@@ -956,11 +952,11 @@ mod tests {
     }
 
     #[test]
-    fn ladders_are_named_by_provider_or_custom() {
+    fn ladders_are_named_by_provider_or_a_custom_name() {
         let ladder = Ladder::builtin(Provider::Gemini).unwrap();
-        assert_eq!(ladder.provider, "gemini");
-        let custom = Ladder::custom(default_tiers());
-        assert_eq!(custom.provider, CUSTOM_PROVIDER);
+        assert_eq!(ladder.name, "gemini");
+        let custom = Ladder::named("mine".to_string(), default_tiers());
+        assert_eq!(custom.name, "mine");
         assert_eq!(custom.tiers, default_tiers());
     }
 
@@ -1128,13 +1124,14 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_ladder_is_keyed_custom() {
-        let ladders = [Ladder::custom(
+    fn a_named_ladder_is_keyed_by_its_own_name() {
+        let ladders = [Ladder::named(
+            "mine".to_string(),
             Tiers::parse("tiers:\n  - {name: a, description: A}\n  - {name: b, description: B}\n")
                 .unwrap(),
         )];
         let questions = build_route_questions(&ladders).unwrap();
-        assert_eq!(options(&questions, "custom.stage_implement"), ["a", "b"]);
+        assert_eq!(options(&questions, "mine.stage_implement"), ["a", "b"]);
     }
 
     // ── build_route_state ────────────────────────────────────────────
@@ -1402,7 +1399,7 @@ mod tests {
     #[test]
     fn empty_and_duplicate_providers_are_rejected() {
         let err = validate_options(&[doc(1, ItemState::Open)], &[], &opts()).unwrap_err();
-        assert!(err.to_string().contains("no providers"), "{err}");
+        assert!(err.to_string().contains("no ladders"), "{err}");
         let twice = [
             Ladder::builtin(Provider::Gemini).unwrap(),
             Ladder::builtin(Provider::Gemini).unwrap(),

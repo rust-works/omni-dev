@@ -398,17 +398,19 @@ usually means the spec was mistyped.
 
 Asks which **model class** should handle each stage of the work on a GitHub
 issue: the **design** (choosing the approach and settling open questions), the
-**implementation** and the **review**. The classes are one AI provider's
-model ladder (see [Providers](#providers)); `--providers` routes against
-several at once. It makes one Jev call per issue, with three `choice`
-questions per provider plus one `noul` question per open issue/PR the text
-cites, and fetches the issues through `gh`.
+**implementation** and the **review**. The classes come from a named model
+ladder (see [Built-in ladders](#built-in-ladders) and
+[Custom ladders](#custom-ladders)); `--ladders` routes against several at
+once. It makes one Jev call per issue, with three `choice` questions per
+ladder plus one `noul` question per open issue/PR the text cites, and
+fetches the issues through `gh`.
 
 ```bash
 omni-dev ai jev route '#1779' rust-works/omni-dev#1641 -o yaml
 omni-dev ai jev route https://github.com/rust-works/omni-dev/issues/1779
 omni-dev ai jev route --all-open -C ~/src/omni-dev
-omni-dev ai jev route '#1820' --providers anthropic,openai,gemini
+omni-dev ai jev route '#1820' --ladders anthropic,openai,gemini
+omni-dev ai jev route '#1826' --ladders anthropic,mine --ladder-definition mine=my-tiers.yaml
 omni-dev ai jev route --all-open -o text
 ```
 
@@ -445,9 +447,10 @@ issues:
 usage: {input_tokens: 1432, output_tokens: 61}
 ```
 
-- **`providers`** holds one entry per requested provider (default
-  `anthropic`), each with its own `stages`, `class` and `close_calls`. A
-  `--tiers FILE` ladder is reported under `custom`.
+- **`providers`** holds one entry per requested ladder (default `anthropic`),
+  keyed by that ladder's own name, each with its own `stages`, `class` and
+  `close_calls`. A built-in ladder is keyed by its provider name; a custom
+  one registered via `--ladder-definition` is keyed by the name it was given.
 - **`class`** is the higher of the design and implement choices. The most
   capable class earns its cost in the design stage; once a plan exists, the
   design answer usually becomes `none` and implementation drops to a cheaper
@@ -553,14 +556,15 @@ comments often describe how the work was actually done, which leaks the
 answer. `--allow-closed` is for evaluation runs against issues whose outcome
 you already know.
 
-### Providers
+### Built-in ladders
 
-`--providers <NAMES>` is a comma-separated list of the providers to route
+`--ladders <NAMES>` is a comma-separated list of ladder names to route
 against (default `anthropic`; an unknown name is an error listing the known
-ones). Each provider has an embedded three-rung ladder, least capable first,
-named by the **abbreviated model name** so a consumer that drives that
-provider's agents gets a model to hand the work to rather than a rung it has
-to translate. There is deliberately no provider-neutral rung name.
+built-in and `--ladder-definition`-registered ones). A built-in name selects
+one of three embedded three-rung ladders, least capable first, named by the
+**abbreviated model name** so a consumer that drives that provider's agents
+gets a model to hand the work to rather than a rung it has to translate.
+There is deliberately no provider-neutral rung name.
 
 | Provider    | Rungs, least capable first          | Expansions                                                          |
 |-------------|-------------------------------------|---------------------------------------------------------------------|
@@ -569,11 +573,11 @@ to translate. There is deliberately no provider-neutral rung name.
 | `gemini`    | `flash` / `pro` / `deep-think`      | gemini-3-flash-preview / gemini-3.1-pro-preview / Gemini 3 Deep Think |
 
 The ladders live in `src/templates/jev-route-tiers-<provider>.yaml`. Several
-providers still cost **one Jev call per issue**: Jev takes a map of questions
-over one state, so the three stage questions are keyed per provider
+ladders still cost **one Jev call per issue**: Jev takes a map of questions
+over one state, so the three stage questions are keyed per ladder name
 (`openai.stage_design`, …) and share the issue text. `depends_on` is about
-the issue, not a provider, so its `could_be_cheaper` question is asked once
-per open citation, not once per provider.
+the issue, not a ladder, so its `could_be_cheaper` question is asked once
+per open citation, not once per ladder.
 
 Only the `anthropic` ladder was validated (see
 [Evidence and its limits](#evidence-and-its-limits)). Because rewording a
@@ -581,21 +585,25 @@ description shifts answers across the board, the `openai` and `gemini`
 ladders reuse the `anthropic` descriptions **rung for rung, byte for byte**;
 only the tier names differ, and a test pins the equality. Two things are
 therefore untested: the effect of the new tier names, which Jev sees as
-criterion keys, and keying several providers' questions into one call. Treat
+criterion keys, and keying several ladders' questions into one call. Treat
 a non-`anthropic` answer as a starting point until an evaluation like
-#1779's is repeated for it, and if `anthropic`'s answers in a multi-provider
-run drift from a single-provider run, route one provider per run instead.
+#1779's is repeated for it, and if `anthropic`'s answers in a multi-ladder
+run drift from a single-ladder run, route one ladder per run instead.
 
 A fourth, cheapest rung (Haiku 4.5, gpt-5.6-luna, gemini-3.1-flash-lite), an
 effort/reasoning-level knob, and the Chinese-lab and open-weight providers are
 out of scope: each changes the validated `anthropic` question or needs its own
 validation.
 
-### Tiers
+### Custom ladders
 
-`--tiers FILE` replaces the provider ladders with a fully custom one, reported
-under the provider name `custom`. It **conflicts with `--providers`**:
-passing both is an error rather than one silently winning.
+`--ladder-definition NAME=FILE` registers a custom ladder under `NAME`, its
+tiers loaded from `FILE`, so it can be routed alongside built-in ladders in
+the same `--ladders` list (#1826):
+
+```bash
+omni-dev ai jev route '#1234' --ladders anthropic,mine --ladder-definition mine=my-tiers.yaml
+```
 
 ```yaml
 tiers:
@@ -608,6 +616,12 @@ tiers:
 A tiers file needs at least two tiers, unique non-empty names and
 descriptions, and no tier named `none`, which is reserved for "no design work
 remains". Rank comes from the order in the file.
+
+A ladder name must be non-empty and match `[a-z0-9_-]+`; a built-in provider's
+name (`anthropic`/`openai`/`gemini`) is reserved and cannot be redefined. A
+`--ladder-definition` registered but never listed in `--ladders` is an error,
+on the assumption that it is a typo'd `--ladders` entry rather than an
+intentionally unused definition.
 
 The `anthropic` descriptions and the three stage questions are the exact text
 the evidence was gathered with. Every question ends with the same bar:
