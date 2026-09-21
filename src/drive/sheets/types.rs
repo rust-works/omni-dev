@@ -589,6 +589,9 @@ pub enum BatchUpdateRequestItem {
     UpdateSpreadsheetProperties(UpdateSpreadsheetPropertiesRequest),
     /// Insert empty rows or columns, shifting existing ones.
     InsertDimension(InsertDimensionRequest),
+    /// Insert empty cells into a rectangular range, shifting existing cells
+    /// down or right within the grid.
+    InsertRange(InsertRangeRequest),
     /// Delete an entire sheet from the workbook.
     DeleteSheet(DeleteSheetRequest),
     /// Delete whole rows or columns, shifting the remainder to close the gap.
@@ -2598,14 +2601,14 @@ pub struct MoveDimensionRequest {
     pub destination_index: i64,
 }
 
-/// Which axis a [`DeleteRangeRequest`] shifts remaining cells along to fill
-/// the gap left by a deleted rectangular range.
+/// Which axis a range operation shifts cells along.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub enum ShiftDimension {
-    /// Cells below the deleted range shift up.
+    /// Cells below a range shift up after deletion or down after insertion.
     #[serde(rename = "ROWS")]
     Rows,
-    /// Cells to the right of the deleted range shift left.
+    /// Cells to the right of a range shift left after deletion or right after
+    /// insertion.
     #[serde(rename = "COLUMNS")]
     Columns,
 }
@@ -2619,6 +2622,19 @@ impl ShiftDimension {
             Self::Columns => "COLUMNS",
         }
     }
+}
+
+/// `InsertRangeRequest` — inserts empty cells into `range`, shifting existing
+/// cells along `shift_dimension` to make room.
+///
+/// Cells shifted past the sheet's grid extent are dropped by the Sheets API.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct InsertRangeRequest {
+    /// The empty cells to insert.
+    pub range: GridRange,
+    /// Which way existing cells shift to make room.
+    #[serde(rename = "shiftDimension")]
+    pub shift_dimension: ShiftDimension,
 }
 
 /// `DeleteRangeRequest` — deletes the cells in `range`, shifting the
@@ -3193,6 +3209,35 @@ mod tests {
         assert_eq!(
             IterativeCalculationSettings::default().describe_bounds(),
             ""
+        );
+    }
+
+    #[test]
+    fn insert_range_serializes_the_column_shift_direction() {
+        let request = BatchUpdateRequestItem::InsertRange(InsertRangeRequest {
+            range: GridRange {
+                sheet_id: 7,
+                start_row_index: Some(1),
+                end_row_index: Some(2),
+                start_column_index: Some(3),
+                end_column_index: Some(4),
+            },
+            shift_dimension: ShiftDimension::Columns,
+        });
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "insertRange": {
+                    "range": {
+                        "sheetId": 7,
+                        "startRowIndex": 1,
+                        "endRowIndex": 2,
+                        "startColumnIndex": 3,
+                        "endColumnIndex": 4,
+                    },
+                    "shiftDimension": "COLUMNS",
+                },
+            })
         );
     }
 

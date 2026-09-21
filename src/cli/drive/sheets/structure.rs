@@ -1,5 +1,6 @@
 //! CLI commands for `omni-dev drive sheets add-sheet`/`rename-sheet`/
-//! `insert-rows`/`insert-columns` (issue #1613), `duplicate-sheet`/
+//! `insert-rows`/`insert-columns` (issue #1613), `insert-range` (issue
+//! #1838), `duplicate-sheet`/
 //! `reorder-sheet`/`hide-sheet`/`show-sheet` (issue #1643),
 //! `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range` (issue
 //! #1623), `move-rows`/`move-columns` (issue #1834),
@@ -339,17 +340,18 @@ pub struct DeleteColumnsCommand {
     pub output: OutputFormat,
 }
 
-/// Which way [`DeleteRangeCommand`] shifts the cells remaining after a
-/// delete, mirroring [`crate::drive::sheets::types::ShiftDimension`].
+/// Which way a range operation shifts cells, mirroring
+/// [`crate::drive::sheets::types::ShiftDimension`].
 ///
 /// A CLI-facing copy for the same reason
 /// [`crate::cli::drive::permissions::check::OperationArg`] mirrors
 /// `DriveOperation`: the pure engine module stays free of `clap`.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum ShiftArg {
-    /// Cells below the deleted range shift up.
+    /// Cells below a range shift up after deletion or down after insertion.
     Rows,
-    /// Cells to the right of the deleted range shift left.
+    /// Cells to the right of a range shift left after deletion or right after
+    /// insertion.
     Columns,
 }
 
@@ -360,6 +362,54 @@ impl From<ShiftArg> for crate::drive::sheets::types::ShiftDimension {
             ShiftArg::Columns => Self::Columns,
         }
     }
+}
+
+/// Inserts empty cells into a rectangular range, shifting existing cells
+/// down or right within the same grid.
+///
+/// Gated by the folder write-permission rules' `sheets-structure` operation
+/// (issue #1838). Cells shifted past the sheet's grid extent are dropped by
+/// the Sheets API.
+#[derive(Parser)]
+pub struct InsertRangeCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to modify.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    /// First row of the range, 1-based inclusive.
+    #[arg(long, value_name = "ROW")]
+    pub start_row: i64,
+
+    /// Last row of the range, 1-based inclusive.
+    #[arg(long, value_name = "ROW")]
+    pub end_row: i64,
+
+    /// First column of the range, 1-based inclusive.
+    #[arg(long, value_name = "COLUMN")]
+    pub start_column: i64,
+
+    /// Last column of the range, 1-based inclusive.
+    #[arg(long, value_name = "COLUMN")]
+    pub end_column: i64,
+
+    /// Which way to shift existing cells to make room.
+    #[arg(long, value_enum)]
+    pub shift: ShiftArg,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 /// Deletes a rectangular cell range, shifting the remainder along one axis
@@ -831,6 +881,27 @@ impl DeleteColumnsCommand {
                 sheet: self.sheet,
                 at: self.at,
                 count: self.count,
+            },
+            dry_run: self.dry_run,
+            lease_token: self.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
+impl InsertRangeCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::InsertRange {
+                sheet: self.sheet,
+                start_row: self.start_row,
+                end_row: self.end_row,
+                start_column: self.start_column,
+                end_column: self.end_column,
+                shift: self.shift.into(),
             },
             dry_run: self.dry_run,
             lease_token: self.lease.lease,

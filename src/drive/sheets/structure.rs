@@ -2,6 +2,7 @@
 //!
 //! The `drive sheets add-sheet`/`rename-sheet`/`insert-rows`/`insert-columns`
 //! (additive, issue #1613, [ADR-0075](../../../docs/adrs/adr-0075.md)),
+//! `insert-range` (additive, issue #1838),
 //! `duplicate-sheet`/`reorder-sheet`/`hide-sheet`/`show-sheet` (also
 //! additive, issue #1643, [ADR-0078](../../../docs/adrs/adr-0078.md)),
 //! `move-rows`/`move-columns` (also additive — nothing is discarded, issue
@@ -89,8 +90,8 @@ use crate::drive::sheets::types::{
     AddSheetRequest, BatchUpdateRequestItem, BatchUpdateResponse, ColorStyle,
     DeleteDimensionRequest, DeleteRangeRequest, DeleteSheetRequest, Dimension, DimensionRange,
     DuplicateSheetRequest, GridProperties, GridPropertiesUpdate, GridRange, InsertDimensionRequest,
-    IterativeCalculationSettings, MoveDimensionRequest, NewSheetProperties, RecalculationInterval,
-    SheetProperties, SheetPropertiesUpdate, ShiftDimension, Spreadsheet,
+    InsertRangeRequest, IterativeCalculationSettings, MoveDimensionRequest, NewSheetProperties,
+    RecalculationInterval, SheetProperties, SheetPropertiesUpdate, ShiftDimension, Spreadsheet,
     SpreadsheetPropertiesUpdate, UpdateSheetPropertiesRequest, UpdateSpreadsheetPropertiesRequest,
 };
 use crate::drive::types::SheetTargetRefusal;
@@ -145,6 +146,26 @@ pub enum StructureVerb {
         at: i64,
         /// How many columns to insert.
         count: i64,
+    },
+    /// Insert empty cells into a rectangular range, shifting existing cells
+    /// down or right within the same grid (issue #1838).
+    ///
+    /// All four bounds are required together: this crate only ever sends a
+    /// fully-bounded [`GridRange`]. Whole rows and columns belong to
+    /// [`Self::InsertRows`] and [`Self::InsertColumns`].
+    InsertRange {
+        /// Title of the sheet to modify.
+        sheet: String,
+        /// 1-based first row, inclusive.
+        start_row: i64,
+        /// 1-based last row, inclusive.
+        end_row: i64,
+        /// 1-based first column, inclusive.
+        start_column: i64,
+        /// 1-based last column, inclusive.
+        end_column: i64,
+        /// Which way existing cells shift to make room.
+        shift: ShiftDimension,
     },
     /// Move a contiguous block of rows to a new position within the same
     /// sheet, shifting the rows in between to close the gap (issue #1834).
@@ -319,6 +340,7 @@ impl StructureVerb {
             Self::RenameSheet { .. } => "sheets-rename-sheet",
             Self::InsertRows { .. } => "sheets-insert-rows",
             Self::InsertColumns { .. } => "sheets-insert-columns",
+            Self::InsertRange { .. } => "sheets-insert-range",
             Self::MoveRows { .. } => "sheets-move-rows",
             Self::MoveColumns { .. } => "sheets-move-columns",
             Self::DeleteSheet { .. } => "sheets-delete-sheet",
@@ -345,6 +367,7 @@ impl StructureVerb {
             | Self::RenameSheet { .. }
             | Self::InsertRows { .. }
             | Self::InsertColumns { .. }
+            | Self::InsertRange { .. }
             | Self::MoveRows { .. }
             | Self::MoveColumns { .. }
             | Self::DuplicateSheet { .. }
@@ -368,6 +391,7 @@ impl StructureVerb {
             Self::RenameSheet { .. } => "rename-sheet",
             Self::InsertRows { .. } => "insert-rows",
             Self::InsertColumns { .. } => "insert-columns",
+            Self::InsertRange { .. } => "insert-range",
             Self::MoveRows { .. } => "move-rows",
             Self::MoveColumns { .. } => "move-columns",
             Self::DeleteSheet { .. } => "delete-sheet",
@@ -393,6 +417,7 @@ impl StructureVerb {
             Self::RenameSheet { sheet, .. }
             | Self::InsertRows { sheet, .. }
             | Self::InsertColumns { sheet, .. }
+            | Self::InsertRange { sheet, .. }
             | Self::MoveRows { sheet, .. }
             | Self::MoveColumns { sheet, .. }
             | Self::DeleteSheet { sheet }
@@ -424,6 +449,7 @@ impl StructureVerb {
             Self::AddSheet { .. }
             | Self::InsertRows { .. }
             | Self::InsertColumns { .. }
+            | Self::InsertRange { .. }
             | Self::MoveRows { .. }
             | Self::MoveColumns { .. }
             | Self::DeleteSheet { .. }
@@ -451,6 +477,7 @@ impl StructureVerb {
             Self::AddSheet { .. }
             | Self::RenameSheet { .. }
             | Self::DeleteSheet { .. }
+            | Self::InsertRange { .. }
             | Self::DeleteRange { .. }
             | Self::DuplicateSheet { .. }
             | Self::ReorderSheet { .. }
@@ -1108,6 +1135,13 @@ fn validate_verb_args(
         StructureVerb::InsertColumns { at, count, .. } => {
             validate_insert_bounds(Dimension::Columns, *at, *count, sheet)
         }
+        StructureVerb::InsertRange {
+            start_row,
+            end_row,
+            start_column,
+            end_column,
+            ..
+        } => validate_range_bounds(*start_row, *end_row, *start_column, *end_column, sheet),
         StructureVerb::MoveRows {
             at, count, before, ..
         } => validate_move_bounds(Dimension::Rows, *at, *count, *before, sheet),
@@ -1126,7 +1160,7 @@ fn validate_verb_args(
             start_column,
             end_column,
             ..
-        } => validate_delete_range_bounds(*start_row, *end_row, *start_column, *end_column, sheet),
+        } => validate_range_bounds(*start_row, *end_row, *start_column, *end_column, sheet),
         StructureVerb::DuplicateSheet {
             index: Some(index), ..
         } => {
@@ -1465,12 +1499,12 @@ fn validate_delete_dimension_bounds(
     Ok(())
 }
 
-/// The `DeleteRange` half of [`validate_verb_args`].
+/// The `InsertRange`/`DeleteRange` half of [`validate_verb_args`].
 ///
 /// Checks both axes are well-ordered and within the sheet's current bounds —
 /// the same "never promise a change the real run then rejects" reasoning as
 /// [`validate_insert_bounds`], applied to a rectangle instead of a span.
-fn validate_delete_range_bounds(
+fn validate_range_bounds(
     start_row: i64,
     end_row: i64,
     start_column: i64,
@@ -1584,6 +1618,23 @@ fn build_request(
                 inherit_from_before: false,
             }),
         ),
+        StructureVerb::InsertRange {
+            start_row,
+            end_row,
+            start_column,
+            end_column,
+            shift,
+            ..
+        } => Ok(BatchUpdateRequestItem::InsertRange(InsertRangeRequest {
+            range: grid_range(
+                sheet_id("insert-range")?,
+                *start_row,
+                *end_row,
+                *start_column,
+                *end_column,
+            ),
+            shift_dimension: *shift,
+        })),
         StructureVerb::MoveRows {
             at, count, before, ..
         } => Ok(BatchUpdateRequestItem::MoveDimension(
@@ -1902,12 +1953,19 @@ fn dimension_range_label(verb: &StructureVerb) -> Option<String> {
 }
 
 /// The `grid_range` context value the request log records for a
-/// `delete-range` verb, e.g. `"rows 2-10, columns 2-4"` — 1-based inclusive,
+/// `insert-range` or `delete-range` verb, e.g. `"rows 2-10, columns 2-4"` — 1-based inclusive,
 /// matching the CLI's `--start-row`/`--end-row`/`--start-column`/
 /// `--end-column`. `None` for every other verb.
 fn grid_range_label(verb: &StructureVerb) -> Option<String> {
     match verb {
-        StructureVerb::DeleteRange {
+        StructureVerb::InsertRange {
+            start_row,
+            end_row,
+            start_column,
+            end_column,
+            ..
+        }
+        | StructureVerb::DeleteRange {
             start_row,
             end_row,
             start_column,
@@ -2214,6 +2272,23 @@ fn describe_would_change(
             at,
             count,
         } => describe_would_insert(Dimension::Columns, from, &id, *at, *count, sheet, book),
+        StructureVerb::InsertRange {
+            sheet: from,
+            start_row,
+            end_row,
+            start_column,
+            end_column,
+            shift,
+        } => vec![describe_would_insert_range(
+            from,
+            &id,
+            *start_row,
+            *end_row,
+            *start_column,
+            *end_column,
+            *shift,
+            book,
+        )],
         StructureVerb::MoveRows {
             sheet: from,
             at,
@@ -2673,6 +2748,29 @@ fn describe_would_delete_range(
     )
 }
 
+/// The `InsertRange` arm of [`describe_would_change`].
+#[allow(clippy::too_many_arguments)]
+fn describe_would_insert_range(
+    from: &str,
+    id: &str,
+    start_row: i64,
+    end_row: i64,
+    start_column: i64,
+    end_column: i64,
+    shift: ShiftDimension,
+    book: &str,
+) -> String {
+    let direction = match shift {
+        ShiftDimension::Rows => "down",
+        ShiftDimension::Columns => "right",
+    };
+    format!(
+        "Would insert empty cells at rows {start_row}-{end_row}, columns {start_column}-{end_column} \
+         of '{from}'{id} in {book}, shifting existing cells {direction}; cells pushed past the \
+         sheet's grid extent may be dropped by Sheets"
+    )
+}
+
 fn describe_changed(
     verb: &StructureVerb,
     sheet: Option<&SheetSnapshot>,
@@ -2702,6 +2800,23 @@ fn describe_changed(
             at,
             count,
         } => describe_inserted(Dimension::Columns, from, &id, *at, *count, sheet, book),
+        StructureVerb::InsertRange {
+            sheet: from,
+            start_row,
+            end_row,
+            start_column,
+            end_column,
+            shift,
+        } => describe_inserted_range(
+            from,
+            &id,
+            *start_row,
+            *end_row,
+            *start_column,
+            *end_column,
+            *shift,
+            book,
+        ),
         StructureVerb::MoveRows {
             sheet: from,
             at,
@@ -2979,6 +3094,29 @@ fn describe_deleted_range(
     )
 }
 
+/// The `InsertRange` arm of [`describe_changed`].
+#[allow(clippy::too_many_arguments)]
+fn describe_inserted_range(
+    from: &str,
+    id: &str,
+    start_row: i64,
+    end_row: i64,
+    start_column: i64,
+    end_column: i64,
+    shift: ShiftDimension,
+    book: &str,
+) -> String {
+    let direction = match shift {
+        ShiftDimension::Rows => "down",
+        ShiftDimension::Columns => "right",
+    };
+    format!(
+        "Inserted empty cells at rows {start_row}-{end_row}, columns {start_column}-{end_column} \
+         of '{from}'{id} in {book}, shifting existing cells {direction}; cells pushed past the \
+         sheet's grid extent may have been dropped by Sheets"
+    )
+}
+
 const fn plural(dimension: Dimension) -> &'static str {
     match dimension {
         Dimension::Rows => "rows",
@@ -3187,6 +3325,17 @@ mod tests {
         }
     }
 
+    fn insert_range() -> StructureVerb {
+        StructureVerb::InsertRange {
+            sheet: "Q2".to_string(),
+            start_row: 2,
+            end_row: 4,
+            start_column: 2,
+            end_column: 3,
+            shift: ShiftDimension::Rows,
+        }
+    }
+
     fn delete_range() -> StructureVerb {
         StructureVerb::DeleteRange {
             sheet: "Q2".to_string(),
@@ -3329,6 +3478,14 @@ mod tests {
                 sheet: "Q1".to_string(),
                 at: 1,
                 count: 1,
+            },
+            StructureVerb::InsertRange {
+                sheet: "Q1".to_string(),
+                start_row: 1,
+                end_row: 2,
+                start_column: 1,
+                end_column: 2,
+                shift: ShiftDimension::Rows,
             },
             StructureVerb::MoveRows {
                 sheet: "Q1".to_string(),
@@ -4453,6 +4610,91 @@ mod tests {
         // half-open.
         assert_eq!(delete["range"]["startIndex"], 2);
         assert_eq!(delete["range"]["endIndex"], 4);
+    }
+
+    #[tokio::test]
+    async fn insert_range_sends_a_zero_based_half_open_grid_range() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(insert_range(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+        assert!(describe(&outcome).contains("shifting existing cells down"));
+        assert!(describe(&outcome).contains("may have been dropped by Sheets"));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        assert_eq!(
+            body["requests"][0]["insertRange"],
+            serde_json::json!({
+                "range": {
+                    "sheetId": 118_293,
+                    "startRowIndex": 1,
+                    "endRowIndex": 4,
+                    "startColumnIndex": 1,
+                    "endColumnIndex": 3,
+                },
+                "shiftDimension": "ROWS",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_range_dry_run_at_the_grid_edge_warns_without_mutating() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::InsertRange {
+                    sheet: "Q2".to_string(),
+                    start_row: 500,
+                    end_row: 500,
+                    start_column: 10,
+                    end_column: 10,
+                    shift: ShiftDimension::Columns,
+                },
+                true,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            StructureResult::WouldChange { .. }
+        ));
+        let text = describe(&outcome);
+        assert!(text.contains("shifting existing cells right"), "{text}");
+        assert!(text.contains("may be dropped by Sheets"), "{text}");
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !request.url.path().ends_with(":batchUpdate")));
     }
 
     #[tokio::test]
@@ -7358,6 +7600,7 @@ mod tests {
                 at: 1,
                 count: 1,
             },
+            insert_range(),
             move_rows(),
             StructureVerb::MoveColumns {
                 sheet: "Q2".to_string(),
@@ -7387,6 +7630,7 @@ mod tests {
                 "sheets-rename-sheet",
                 "sheets-insert-rows",
                 "sheets-insert-columns",
+                "sheets-insert-range",
                 "sheets-move-rows",
                 "sheets-move-columns",
                 "sheets-delete-sheet",
@@ -7405,6 +7649,14 @@ mod tests {
         let unique: HashSet<&&str> = names.iter().collect();
         assert_eq!(unique.len(), names.len());
         assert!(!names.contains(&"sheets-write"));
+    }
+
+    #[test]
+    fn insert_range_records_its_one_based_inclusive_grid_context() {
+        assert_eq!(
+            grid_range_label(&insert_range()).as_deref(),
+            Some("rows 2-4, columns 2-3")
+        );
     }
 
     /// One of every [`StructureResult`] variant.

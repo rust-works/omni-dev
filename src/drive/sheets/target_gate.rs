@@ -1,6 +1,6 @@
 //! Shared target-resolution-and-gate step for every Sheets-mutating engine
 //! (`write.rs`'s `write`/`append`/`clear`, `structure.rs`'s
-//! `add-sheet`/`rename-sheet`/`insert-rows`/`insert-columns`, and —
+//! `add-sheet`/`rename-sheet`/`insert-rows`/`insert-columns`/`insert-range`, and —
 //! since ADR-0080's Phase 3 — `format.rs`, `protection.rs` and
 //! `validation.rs`'s own verbs; since issue #1796, `named_range.rs`'s too).
 //!

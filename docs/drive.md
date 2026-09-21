@@ -609,7 +609,7 @@ never a missed visibility increase. See
 
 `drive create`/`drive upload`/`drive edit`, and `drive sheets
 write`/`append`/`clear`/`create`/`add-sheet`/`rename-sheet`/`insert-rows`/
-`insert-columns`/`move-rows`/`move-columns` (below), need a much broader OAuth grant
+`insert-columns`/`insert-range`/`move-rows`/`move-columns` (below), need a much broader OAuth grant
 than rename/move — `--write-file`/`--write-full` — but Google's
 scopes are all-or-nothing across your whole Drive. There's no way to tell
 Google "only let this credential write inside folder X." So `omni-dev` adds
@@ -628,7 +628,7 @@ operation anywhere in a target's ancestor chain:
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
 | `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table` |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group` |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -1784,7 +1784,7 @@ rolled back automatically.
 
 Delete it yourself if you don't want it.
 
-#### drive sheets add-sheet / rename-sheet / insert-rows / insert-columns / move-rows / move-columns / duplicate-sheet / reorder-sheet / hide-sheet / show-sheet
+#### drive sheets add-sheet / rename-sheet / insert-rows / insert-columns / insert-range / move-rows / move-columns / duplicate-sheet / reorder-sheet / hide-sheet / show-sheet
 
 Structural edits — changing the *shape* of a workbook rather than its cell
 values. Gated by the separate `sheets-structure` operation (above), so a
@@ -1821,10 +1821,21 @@ omni-dev drive sheets rename-sheet <ID> --sheet Q2 --title 'Q2 (final)'
 # number the spreadsheet itself shows — and inserts *before* it.
 omni-dev drive sheets insert-rows <ID> --sheet Q2 --at 5 --count 3
 omni-dev drive sheets insert-columns <ID> --sheet Q2 --at 2
+
+# Insert empty cells into a bounded rectangle. Existing cells shift down
+# (`--shift rows`) or right (`--shift columns`); the bounds are 1-based and
+# inclusive, like delete-range.
+omni-dev drive sheets insert-range <ID> --sheet Q2 \
+  --start-row 2 --end-row 4 --start-column 2 --end-column 3 --shift rows
 ```
 
 `--at 5` puts the new rows above the current row 5. Column A is 1.
 `--count` defaults to 1.
+
+`insert-range` keeps the sheet's dimensions unchanged. It uses
+`sheets-structure`, unlike its destructive inverse `delete-range`, because it
+shifts cells and creates empty ones. Sheets silently drops cells pushed past
+the grid edge, so the `--dry-run` preview always calls out that risk.
 
 ```bash
 # Move a contiguous block of rows or columns. --at/--count name the source

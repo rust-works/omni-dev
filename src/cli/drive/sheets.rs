@@ -75,6 +75,10 @@ pub enum SheetsSubcommands {
     /// folder write-permission rules' `sheets-structure` operation
     /// (issue #1613).
     InsertColumns(structure::InsertColumnsCommand),
+    /// Inserts empty cells into a rectangular range, shifting existing cells
+    /// down or right. Gated by the folder write-permission rules'
+    /// `sheets-structure` operation (issue #1838).
+    InsertRange(structure::InsertRangeCommand),
     /// Moves a contiguous block of rows to a new position within a sheet,
     /// shifting the rows in between. Gated by the folder write-permission
     /// rules' `sheets-structure` operation (issue #1834).
@@ -331,6 +335,7 @@ impl SheetsCommand {
             SheetsSubcommands::RenameSheet(cmd) => cmd.execute(client).await,
             SheetsSubcommands::InsertRows(cmd) => cmd.execute(client).await,
             SheetsSubcommands::InsertColumns(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::InsertRange(cmd) => cmd.execute(client).await,
             SheetsSubcommands::MoveRows(cmd) => cmd.execute(client).await,
             SheetsSubcommands::MoveColumns(cmd) => cmd.execute(client).await,
             SheetsSubcommands::DeleteSheet(cmd) => cmd.execute(client).await,
