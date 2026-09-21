@@ -1877,8 +1877,7 @@ mod tests {
         };
         let outcome = pivot(&drive, &sheets, &opts, &rules).await;
         let PivotResult::WouldChange(change) = &outcome.result else {
-            // omni-dev: coverage ignore-line reason="dry_run plus a fully-allowing gate always reaches WouldChange here; this branch is a safety net against an unexpected refusal, not a coverage gap"
-            panic!("expected WouldChange, got {:?}", outcome.result);
+            panic!("expected WouldChange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="dry_run plus a fully-allowing gate always reaches WouldChange here; this branch is a safety net against an unexpected refusal, not a coverage gap"
         };
         assert_eq!(change.anchor_currently, "empty");
         let rendered = describe(&outcome);
