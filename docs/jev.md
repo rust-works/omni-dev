@@ -514,6 +514,30 @@ drops the label, as above). A failed issue's line reads `  failed: <error>`
 instead of a routing. A truncated issue gets a trailing `  input truncated at
 <N> characters` line; an issue with no open citations has no `cites` line.
 
+When any stage's chosen tier name is multi-model (a custom ladder's
+comma-joined tier name, [#1826](https://github.com/rust-works/omni-dev/issues/1826)),
+the compact line above would repeat that name up to four times and become
+unreadable, so the block switches to one line per fact instead
+([#1847](https://github.com/rust-works/omni-dev/issues/1847)): `class:` once,
+then `design:`/`implementation:`/`review:` each on their own line, with the
+close-call marker still per stage:
+
+```
+rust-works/omni-dev#1832 — feat(drive): banded ranges for drive sheets (#1830)
+  class: global.anthropic.claude-sonnet-4-6,global.anthropic.claude-sonnet-5
+  design: needs no further work (0.94)
+  implementation: global.anthropic.claude-sonnet-4-6,global.anthropic.claude-sonnet-5 (0.94)
+  review: global.anthropic.claude-sonnet-4-6,global.anthropic.claude-sonnet-5 (0.70)
+  cites open #1830, which could leave less design work if resolved (0.48)
+```
+
+With more than one `--ladders` requested, a multi-model ladder's block is
+headed by its provider name (`  anthropic:`, with the fact lines nested one
+indent level deeper) rather than prefixing every line, and the layout is
+decided per ladder — one multi-model ladder does not force another,
+single-model ladder into the block form too. Single-word tiers (every
+built-in ladder) keep the compact line unchanged, with no output churn.
+
 ### What Jev sees
 
 Only the issue's title, body and **human** comments, oldest first. Bot
