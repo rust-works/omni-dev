@@ -7875,6 +7875,8 @@ mod tests {
             delete_sheet(),
             delete_rows(),
             delete_columns(),
+            insert_range(),
+            insert_range_columns_shift(),
             delete_range(),
             delete_range_columns_shift(),
             duplicate_sheet(),
