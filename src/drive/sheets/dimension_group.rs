@@ -12,7 +12,10 @@
 //! the server derives the new group's `depth` from how that range
 //! overlaps existing groups on the same axis (a superset increments an
 //! existing group's depth and gives the new group that shallower depth; a
-//! subset or partial overlap creates a new, deeper one; see the Sheets API
+//! subset creates a new, deeper one; a partial overlap *widens the
+//! existing group to the union of the two spans* and creates a new,
+//! deeper one over their intersection — so an add can move an existing
+//! group's edges, which `--dry-run` cannot foresee; see the Sheets API
 //! reference for `AddDimensionGroupRequest`). Predicting that outcome
 //! client-side would mean re-implementing those rules, and no maximum
 //! depth is documented anywhere in the API reference to validate against
@@ -658,16 +661,14 @@ fn validate_span(
 }
 
 /// Renders a [`DimensionRange`] as the request log's `dimension_range`
-/// context value, e.g. `"ROWS 5:7"` — 1-based inclusive, matching
-/// `structure.rs::dimension_range_label`'s existing convention exactly (the
-/// same key, reused rather than duplicated).
+/// context value, e.g. `"ROWS 5:7"` — 1-based inclusive, through the same
+/// [`Dimension::span_label`] `structure.rs`'s insert/delete-dimension
+/// verbs use, so the two writers of one log key cannot drift. The only
+/// thing this adds is the zero-based-half-open → one-based-inclusive step.
 fn dimension_range_label(range: &DimensionRange) -> String {
-    format!(
-        "{} {}:{}",
-        range.dimension.as_str(),
-        range.start_index + 1,
-        range.end_index
-    )
+    range
+        .dimension
+        .span_label(range.start_index + 1, range.end_index)
 }
 
 /// Builds the request for `verb`. Placed after the `--dry-run` branch in
@@ -686,8 +687,9 @@ fn build_request(
         ),
         DimensionGroupVerb::UpdateDimensionGroup { collapsed, .. } => {
             let ExistingGroups::One(existing) = existing else {
-                unreachable!("resolve_for_update always resolves UpdateDimensionGroup to one group or has already returned its refusal")
-                // omni-dev: coverage ignore-line reason="resolve_for_update returns Ok only with exactly one group, or the caller has already returned RefusedDimensionGroupNotFound/RefusedAmbiguousDimensionGroup; this else-arm exists only to unwrap the shared enum"
+                // omni-dev: coverage ignore reason="resolve_for_update returns Ok only with exactly one group, or the caller has already returned RefusedDimensionGroupNotFound/RefusedAmbiguousDimensionGroup; this else-arm exists only to unwrap the shared enum"
+                unreachable!("existing is resolved for UpdateDimensionGroup above")
+                // omni-dev: coverage end
             };
             let dimension_group = DimensionGroup {
                 range,
@@ -704,8 +706,9 @@ fn build_request(
         }
         DimensionGroupVerb::DeleteDimensionGroup { .. } => {
             let ExistingGroups::MaybeOne(depth) = existing else {
-                unreachable!("resolve_for_delete always resolves DeleteDimensionGroup to MaybeOne or has already returned its refusal")
-                // omni-dev: coverage ignore-line reason="resolve_for_delete returns Ok only as MaybeOne, or the caller has already returned RefusedDimensionGroupNotFound; this else-arm exists only to unwrap the shared enum"
+                // omni-dev: coverage ignore reason="resolve_for_delete returns Ok only as MaybeOne, or the caller has already returned RefusedDimensionGroupNotFound; this else-arm exists only to unwrap the shared enum"
+                unreachable!("existing is resolved for DeleteDimensionGroup above")
+                // omni-dev: coverage end
             };
             (
                 BatchUpdateRequestItem::DeleteDimensionGroup(DeleteDimensionGroupRequest { range }),
@@ -1085,9 +1088,9 @@ mod tests {
         let sheet = sheet_with_row_groups(
             0,
             vec![
-                group(0, 4, 9, 0, false),
-                group(0, 4, 9, 1, true),
-                group(0, 10, 20, 0, false),
+                group(0, 4, 9, 1, false),
+                group(0, 4, 9, 2, true),
+                group(0, 10, 20, 1, false),
             ],
         );
         let found = candidates(&sheet, Dimension::Rows, &target);
@@ -1101,7 +1104,7 @@ mod tests {
         let mut sheet = sheet_with_row_groups(0, Vec::new());
         sheet.column_groups = vec![DimensionGroup {
             range: target.clone(),
-            depth: 0,
+            depth: 1,
             collapsed: false,
         }];
         let found = candidates(&sheet, Dimension::Columns, &target);
@@ -1126,27 +1129,27 @@ mod tests {
 
     #[test]
     fn resolve_for_update_refuses_ambiguous_without_depth() {
-        let shallow = group(0, 4, 9, 0, false);
-        let deep = group(0, 4, 9, 1, true);
+        let shallow = group(0, 4, 9, 1, false);
+        let deep = group(0, 4, 9, 2, true);
         let err = resolve_for_update(vec![&shallow, &deep], None).unwrap_err();
         let DimensionGroupResult::RefusedAmbiguousDimensionGroup { depths } = err else {
             panic!("expected RefusedAmbiguousDimensionGroup"); // omni-dev: coverage ignore-line reason="guards this test's assumption; resolve_for_update always returns RefusedAmbiguousDimensionGroup for more than one candidate with no depth given"
         };
-        assert_eq!(depths, vec![0, 1]);
+        assert_eq!(depths, vec![1, 2]);
     }
 
     #[test]
     fn resolve_for_update_disambiguates_by_depth() {
-        let shallow = group(0, 4, 9, 0, false);
-        let deep = group(0, 4, 9, 1, true);
-        let found = resolve_for_update(vec![&shallow, &deep], Some(1)).unwrap();
+        let shallow = group(0, 4, 9, 1, false);
+        let deep = group(0, 4, 9, 2, true);
+        let found = resolve_for_update(vec![&shallow, &deep], Some(2)).unwrap();
         assert!(found.collapsed);
-        assert_eq!(found.depth, 1);
+        assert_eq!(found.depth, 2);
     }
 
     #[test]
     fn resolve_for_update_refuses_a_depth_that_does_not_exist() {
-        let shallow = group(0, 4, 9, 0, false);
+        let shallow = group(0, 4, 9, 1, false);
         let err = resolve_for_update(vec![&shallow], Some(9)).unwrap_err();
         assert!(matches!(
             err,
@@ -1172,8 +1175,8 @@ mod tests {
 
     #[test]
     fn resolve_for_delete_accepts_an_ambiguous_match_reporting_no_depth() {
-        let shallow = group(0, 4, 9, 0, false);
-        let deep = group(0, 4, 9, 1, true);
+        let shallow = group(0, 4, 9, 1, false);
+        let deep = group(0, 4, 9, 2, true);
         let depth = resolve_for_delete(vec![&shallow, &deep]).unwrap();
         assert_eq!(depth, None);
     }
@@ -1512,8 +1515,8 @@ mod tests {
             {"properties": {"sheetId": 0, "title": "Q1", "index": 0,
                 "gridProperties": {"rowCount": 1000, "columnCount": 26}},
                 "rowGroups": [
-                    {"range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 4, "endIndex": 9}, "depth": 0},
-                    {"range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 4, "endIndex": 9}, "depth": 1, "collapsed": true},
+                    {"range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 4, "endIndex": 9}, "depth": 1},
+                    {"range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 4, "endIndex": 9}, "depth": 2, "collapsed": true},
                 ]},
         ]))
         .mount(&server)
@@ -1543,8 +1546,8 @@ mod tests {
             {"properties": {"sheetId": 0, "title": "Q1", "index": 0,
                 "gridProperties": {"rowCount": 1000, "columnCount": 26}},
                 "rowGroups": [
-                    {"range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 4, "endIndex": 9}, "depth": 0},
-                    {"range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 4, "endIndex": 9}, "depth": 1, "collapsed": true},
+                    {"range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 4, "endIndex": 9}, "depth": 1},
+                    {"range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 4, "endIndex": 9}, "depth": 2, "collapsed": true},
                 ]},
         ]))
         .mount(&server)
@@ -1563,7 +1566,7 @@ mod tests {
                                 "startIndex": 4,
                                 "endIndex": 9,
                             },
-                            "depth": 1,
+                            "depth": 2,
                             "collapsed": false,
                         },
                         "fields": "collapsed",
@@ -1584,7 +1587,7 @@ mod tests {
             dimension: Dimension::Rows,
             start: 5,
             end: 9,
-            depth: Some(1),
+            depth: Some(2),
             collapsed: false,
         };
         let mut opts = base_opts(verb, false);
@@ -1595,7 +1598,7 @@ mod tests {
             outcome.result,
             DimensionGroupResult::Changed {
                 summary: "set collapsed=false on the group over ROWS 5:9".to_string(),
-                depth: Some(1),
+                depth: Some(2),
             }
         );
     }
@@ -1616,7 +1619,7 @@ mod tests {
             {"properties": {"sheetId": 0, "title": "Q1", "index": 0,
                 "gridProperties": {"rowCount": 1000, "columnCount": 26}},
                 "rowGroups": [
-                    {"range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 4, "endIndex": 9}, "depth": 0},
+                    {"range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 4, "endIndex": 9}, "depth": 1},
                 ]},
         ]))
         .mount(&server)
@@ -1654,7 +1657,7 @@ mod tests {
             outcome.result,
             DimensionGroupResult::Changed {
                 summary: "delete the group over ROWS 5:9".to_string(),
-                depth: Some(0),
+                depth: Some(1),
             }
         );
     }
