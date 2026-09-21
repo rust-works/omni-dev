@@ -11,6 +11,7 @@
 //! permission diagnostics: a Sheet is a Drive file, and the permission gate
 //! is a Drive concept.
 
+pub(crate) mod auto_fill;
 pub(crate) mod banding;
 pub(crate) mod conditional_format;
 pub(crate) mod create;
@@ -344,6 +345,14 @@ pub enum SheetsSubcommands {
     /// `delimiter`-form only. Same `--paste-type` gate mapping as
     /// `copy-paste`.
     PasteData(paste::PasteDataCommand),
+    /// Extends a series from source cells into an adjacent destination,
+    /// using Sheets' own pattern-detection heuristics. Gated by the folder
+    /// write-permission rules' `sheets-write` operation (issue #1840,
+    /// ADR-0083 §1) — it writes ordinary cell content, doing nothing a
+    /// `sheets clear` followed by a `sheets write` could not already do
+    /// under the same grant. The filled values can never be previewed;
+    /// see `auto-fill --help`.
+    AutoFill(auto_fill::AutoFillCommand),
 }
 
 impl SheetsCommand {
@@ -432,6 +441,7 @@ impl SheetsCommand {
             SheetsSubcommands::CutPaste(cmd) => cmd.execute(client).await,
             SheetsSubcommands::CopyPaste(cmd) => cmd.execute(client).await,
             SheetsSubcommands::PasteData(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::AutoFill(cmd) => cmd.execute(client).await,
         }
     }
 }

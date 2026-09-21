@@ -104,6 +104,14 @@ pub enum DriveOperation {
     /// and merges too; `copy-paste`/`paste-data` require it alongside this
     /// operation only for `--paste-type normal`, per that variant's doc
     /// comment.
+    /// Since issue #1840 ([ADR-0083](../../docs/adrs/adr-0083.md) §1), also
+    /// covers `auto-fill` (`autoFill`) alone: it writes ordinary cell
+    /// content into a range the request names or derives, exactly what
+    /// this operation already permits via `sheets clear` followed by
+    /// `sheets write` of the same range. Provisional on ADR-0083 §5's
+    /// live-verification rule — if a fill is found to carry the source
+    /// cells' formatting, `auto-fill` moves to the two-operation
+    /// composition `add-pivot-table` uses, alongside [`Self::SheetsStructure`].
     SheetsWrite,
     /// Structurally edit an existing Google Sheet via `spreadsheets.batchUpdate`
     /// (issue #1613, [ADR-0075](../../docs/adrs/adr-0075.md) §1) — adding,

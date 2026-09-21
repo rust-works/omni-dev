@@ -238,6 +238,18 @@ types, so the log is a complete invocation history, not just an HTTP history:
   record carries it too, and only the `operation` value tells the two
   apart.
 
+  `auto-fill` (issue #1840, [ADR-0083](adrs/adr-0083.md) §1) uses the same
+  kind again, with `operation` of `sheets-auto-fill` and gated
+  `sheets-write`. No new context key for the destination itself: `range`
+  (introduced above for `write`/`append`/`clear`) is reused for the
+  destination's A1 address, and `fields_changed` for a prose summary of the
+  effect (source, direction, alternate-series flag). One new key,
+  `overwritten_cells`: the non-blank cells in the destination that were
+  overwritten, as **bare A1 addresses** — deliberately not `"A1: value"`
+  like `discarded_cells`, since a fill's values are Sheets' own series
+  detection and this crate never records them, before or after the
+  request.
+
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of
