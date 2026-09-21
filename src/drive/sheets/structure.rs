@@ -66,13 +66,14 @@ use crate::drive::lease::check::{
 use crate::drive::lease::ledger::LeaseBackup;
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
+use crate::drive::sheets::format::parse_hex_color;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
-    AddSheetRequest, BatchUpdateRequestItem, BatchUpdateResponse, DeleteDimensionRequest,
-    DeleteRangeRequest, DeleteSheetRequest, Dimension, DimensionRange, DuplicateSheetRequest,
-    GridProperties, GridRange, InsertDimensionRequest, MoveDimensionRequest, NewSheetProperties,
-    SheetProperties, SheetPropertiesUpdate, ShiftDimension, Spreadsheet,
-    UpdateSheetPropertiesRequest,
+    AddSheetRequest, BatchUpdateRequestItem, BatchUpdateResponse, ColorStyle,
+    DeleteDimensionRequest, DeleteRangeRequest, DeleteSheetRequest, Dimension, DimensionRange,
+    DuplicateSheetRequest, GridProperties, GridPropertiesUpdate, GridRange, InsertDimensionRequest,
+    MoveDimensionRequest, NewSheetProperties, SheetProperties, SheetPropertiesUpdate,
+    ShiftDimension, Spreadsheet, UpdateSheetPropertiesRequest,
 };
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -218,6 +219,28 @@ pub enum StructureVerb {
         /// `true` hides it, `false` shows it.
         hidden: bool,
     },
+    /// Change a sheet's view properties — frozen rows/columns, tab color,
+    /// right-to-left layout, and whether gridlines are hidden (issue #1835).
+    /// Every field is independently optional; the caller sets whichever it
+    /// passed, and `build_request`'s `fields` mask names exactly those.
+    UpdateSheetProperties {
+        /// Title of the sheet to modify.
+        sheet: String,
+        /// Rows to freeze at the top, when changing it.
+        freeze_rows: Option<i64>,
+        /// Columns to freeze at the left, when changing it.
+        freeze_columns: Option<i64>,
+        /// The new tab color, `#RRGGBB`, when setting it.
+        tab_color: Option<String>,
+        /// Clear the tab color back to none. Mutually exclusive with
+        /// `tab_color` (the CLI's `clap::ArgGroup` conflict enforces this;
+        /// `validate_verb_args` refuses the combination defensively too).
+        clear_tab_color: bool,
+        /// The new right-to-left flag, when changing it.
+        right_to_left: Option<bool>,
+        /// The new hide-gridlines flag, when changing it.
+        hide_gridlines: Option<bool>,
+    },
 }
 
 impl StructureVerb {
@@ -242,6 +265,7 @@ impl StructureVerb {
             Self::ReorderSheet { .. } => "sheets-reorder-sheet",
             Self::SetSheetVisibility { hidden: true, .. } => "sheets-hide-sheet",
             Self::SetSheetVisibility { hidden: false, .. } => "sheets-show-sheet",
+            Self::UpdateSheetProperties { .. } => "sheets-update-sheet-properties",
         }
     }
 
@@ -260,7 +284,8 @@ impl StructureVerb {
             | Self::MoveColumns { .. }
             | Self::DuplicateSheet { .. }
             | Self::ReorderSheet { .. }
-            | Self::SetSheetVisibility { .. } => DriveOperation::SheetsStructure,
+            | Self::SetSheetVisibility { .. }
+            | Self::UpdateSheetProperties { .. } => DriveOperation::SheetsStructure,
             Self::DeleteSheet { .. }
             | Self::DeleteRows { .. }
             | Self::DeleteColumns { .. }
@@ -287,6 +312,7 @@ impl StructureVerb {
             Self::ReorderSheet { .. } => "reorder-sheet",
             Self::SetSheetVisibility { hidden: true, .. } => "hide-sheet",
             Self::SetSheetVisibility { hidden: false, .. } => "show-sheet",
+            Self::UpdateSheetProperties { .. } => "update-sheet-properties",
         }
     }
 
@@ -306,7 +332,8 @@ impl StructureVerb {
             | Self::DeleteRange { sheet, .. }
             | Self::DuplicateSheet { sheet, .. }
             | Self::ReorderSheet { sheet, .. }
-            | Self::SetSheetVisibility { sheet, .. } => sheet,
+            | Self::SetSheetVisibility { sheet, .. }
+            | Self::UpdateSheetProperties { sheet, .. } => sheet,
         }
     }
 
@@ -334,7 +361,8 @@ impl StructureVerb {
             | Self::DeleteColumns { .. }
             | Self::DeleteRange { .. }
             | Self::ReorderSheet { .. }
-            | Self::SetSheetVisibility { .. } => None,
+            | Self::SetSheetVisibility { .. }
+            | Self::UpdateSheetProperties { .. } => None,
         }
     }
 
@@ -355,7 +383,8 @@ impl StructureVerb {
             | Self::DeleteRange { .. }
             | Self::DuplicateSheet { .. }
             | Self::ReorderSheet { .. }
-            | Self::SetSheetVisibility { .. } => None,
+            | Self::SetSheetVisibility { .. }
+            | Self::UpdateSheetProperties { .. } => None,
         }
     }
 }
@@ -398,6 +427,19 @@ pub struct SheetSnapshot {
     /// Allocated columns, when the API reported them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub column_count: Option<i64>,
+    /// Rows frozen at the top, when the API reported them (issue #1835).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frozen_row_count: Option<i64>,
+    /// Columns frozen at the left, when the API reported them (issue #1835).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frozen_column_count: Option<i64>,
+    /// Whether the sheet is right-to-left, when the API reported it (issue
+    /// #1835).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right_to_left: Option<bool>,
+    /// Whether gridlines are hidden, when the API reported it (issue #1835).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hide_gridlines: Option<bool>,
 }
 
 impl SheetSnapshot {
@@ -408,6 +450,10 @@ impl SheetSnapshot {
             title: props.title.clone(),
             row_count: grid.and_then(|g| g.row_count),
             column_count: grid.and_then(|g| g.column_count),
+            frozen_row_count: grid.and_then(|g| g.frozen_row_count),
+            frozen_column_count: grid.and_then(|g| g.frozen_column_count),
+            right_to_left: props.right_to_left,
+            hide_gridlines: grid.and_then(|g| g.hide_gridlines),
         }
     }
 }
@@ -420,8 +466,14 @@ pub enum StructureResult {
     WouldChange {
         /// The target sheet as it stands now. `None` for an `add-sheet`,
         /// which has no existing sheet to snapshot.
+        ///
+        /// Boxed (issue #1835): `SheetSnapshot` grew enough with
+        /// `update-sheet-properties`'s frozen-row/column and layout fields
+        /// that this enum otherwise trips `clippy::result_large_err`, the
+        /// same reasoning `Changed`'s own `backup` field is already boxed
+        /// for.
         #[serde(skip_serializing_if = "Option::is_none")]
-        sheet: Option<SheetSnapshot>,
+        sheet: Option<Box<SheetSnapshot>>,
         /// How many sheets the workbook currently has.
         sheet_count: usize,
     },
@@ -488,8 +540,11 @@ pub enum StructureResult {
     /// The mutation succeeded.
     Changed {
         /// The sheet acted on, as it stood *before* the change.
+        ///
+        /// Boxed for the same `clippy::result_large_err` reason as
+        /// `WouldChange`'s own `sheet` field (issue #1835).
         #[serde(skip_serializing_if = "Option::is_none")]
-        sheet: Option<SheetSnapshot>,
+        sheet: Option<Box<SheetSnapshot>>,
         /// The sheet id, which for `add-sheet` the server assigns and is
         /// only knowable from the reply.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -772,7 +827,10 @@ async fn structure_inner(
         // A move, not a clone: this branch always returns, so `sheet` is
         // never read again on it — the later uses below are only reachable
         // on the disjoint non-dry-run path.
-        return gated(StructureResult::WouldChange { sheet, sheet_count });
+        return gated(StructureResult::WouldChange {
+            sheet: sheet.map(Box::new),
+            sheet_count,
+        });
     }
 
     // ── The request ────────────────────────────────────────────────────
@@ -826,7 +884,7 @@ async fn structure_inner(
     {
         Ok(response) => StructureResult::Changed {
             sheet_id: added_sheet_id(&response).or_else(|| sheet.as_ref().and_then(|s| s.sheet_id)),
-            sheet,
+            sheet: sheet.map(Box::new),
             backup: lease_grant
                 .as_ref()
                 .map(|grant| Box::new(grant.backup.clone())),
@@ -1027,6 +1085,68 @@ fn validate_verb_args(
                     "hiding '{title}' would leave the workbook with no visible sheets; \
                      Sheets requires at least one"
                 ));
+            }
+            Ok(())
+        }
+        StructureVerb::UpdateSheetProperties {
+            sheet: _title,
+            freeze_rows,
+            freeze_columns,
+            tab_color,
+            clear_tab_color,
+            right_to_left,
+            hide_gridlines,
+        } => {
+            if freeze_rows.is_none()
+                && freeze_columns.is_none()
+                && tab_color.is_none()
+                && !clear_tab_color
+                && right_to_left.is_none()
+                && hide_gridlines.is_none()
+            {
+                return invalid(
+                    "update-sheet-properties requires at least one property to change".to_string(),
+                );
+            }
+            if tab_color.is_some() && *clear_tab_color {
+                return invalid(
+                    "--tab-color and --clear-tab-color are mutually exclusive".to_string(),
+                );
+            }
+            if let Some(hex) = tab_color {
+                if let Err(detail) = parse_hex_color(hex) {
+                    return invalid(detail);
+                }
+            }
+            if let Some(rows) = freeze_rows {
+                if *rows < 0 {
+                    return invalid(format!("--freeze-rows must be at least 0, got {rows}"));
+                }
+                if let Some(current) = sheet.and_then(|s| s.row_count) {
+                    if *rows >= current {
+                        return invalid(format!(
+                            "--freeze-rows {rows} would freeze every row; the sheet has \
+                             {current} row(s), so the most that can be frozen is {}",
+                            current - 1
+                        ));
+                    }
+                }
+            }
+            if let Some(columns) = freeze_columns {
+                if *columns < 0 {
+                    return invalid(format!(
+                        "--freeze-columns must be at least 0, got {columns}"
+                    ));
+                }
+                if let Some(current) = sheet.and_then(|s| s.column_count) {
+                    if *columns >= current {
+                        return invalid(format!(
+                            "--freeze-columns {columns} would freeze every column; the sheet \
+                             has {current} column(s), so the most that can be frozen is {}",
+                            current - 1
+                        ));
+                    }
+                }
             }
             Ok(())
         }
@@ -1273,6 +1393,7 @@ fn build_request(
             let grid_properties = (rows.is_some() || columns.is_some()).then_some(GridProperties {
                 row_count: *rows,
                 column_count: *columns,
+                ..Default::default()
             });
             Ok(BatchUpdateRequestItem::AddSheet(AddSheetRequest {
                 properties: NewSheetProperties {
@@ -1391,6 +1512,68 @@ fn build_request(
                 fields: "hidden".to_string(),
             }),
         ),
+        StructureVerb::UpdateSheetProperties {
+            freeze_rows,
+            freeze_columns,
+            tab_color,
+            clear_tab_color,
+            right_to_left,
+            hide_gridlines,
+            ..
+        } => {
+            let mut fields = Vec::new();
+            let mut grid = GridPropertiesUpdate::default();
+            let mut grid_set = false;
+            if let Some(rows) = freeze_rows {
+                grid.frozen_row_count = Some(*rows);
+                grid_set = true;
+                fields.push("gridProperties.frozenRowCount");
+            }
+            if let Some(columns) = freeze_columns {
+                grid.frozen_column_count = Some(*columns);
+                grid_set = true;
+                fields.push("gridProperties.frozenColumnCount");
+            }
+            if let Some(hide) = hide_gridlines {
+                grid.hide_gridlines = Some(*hide);
+                grid_set = true;
+                fields.push("gridProperties.hideGridlines");
+            }
+            let mut tab_color_style = None;
+            if let Some(hex) = tab_color {
+                // Already validated in `validate_verb_args`; re-parsing here
+                // rather than threading the parsed `Color` through keeps this
+                // function the sole place a request is assembled from a
+                // verb, matching every sibling arm's shape.
+                let color = parse_hex_color(hex)
+                    .map_err(|detail| format!("update-sheet-properties: {detail}"))?;
+                tab_color_style = Some(ColorStyle { rgb_color: color });
+                fields.push("tabColorStyle");
+            } else if *clear_tab_color {
+                fields.push("tabColorStyle");
+            }
+            if right_to_left.is_some() {
+                fields.push("rightToLeft");
+            }
+            if fields.is_empty() {
+                // `validate_verb_args` already refuses this before
+                // `build_request` is ever reached; this is an unreachable
+                // defensive fallback, not a real path.
+                return Err("update-sheet-properties: no property was set".to_string());
+            }
+            Ok(BatchUpdateRequestItem::UpdateSheetProperties(
+                UpdateSheetPropertiesRequest {
+                    properties: SheetPropertiesUpdate {
+                        sheet_id: sheet_id("update-sheet-properties")?,
+                        grid_properties: grid_set.then_some(grid),
+                        tab_color_style,
+                        right_to_left: *right_to_left,
+                        ..Default::default()
+                    },
+                    fields: fields.join(","),
+                },
+            ))
+        }
     }
 }
 
@@ -1524,10 +1707,59 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
         dimension_range: dimension_range_label(&opts.verb),
         move_to,
         grid_range: grid_range_label(&opts.verb),
+        fields_changed: fields_changed_label(&opts.verb),
         error,
         duration,
         ..Default::default()
     });
+}
+
+/// The `fields_changed` context value the request log records for an
+/// `update-sheet-properties` verb, e.g. `"frozenRowCount=2,
+/// tabColorStyle=#FF8800"` — a comma-joined list of the properties this verb
+/// set, reusing the `fields_changed` context key `format.rs` already writes
+/// for `format-cells`/`update-borders`/etc. rather than adding a new one
+/// (docs/log.md). `None` for every other verb.
+///
+/// Runs on the refusal path too, like [`dimension_range_label`]/
+/// [`grid_range_label`]: `record_attempt` logs attempts, not only successes,
+/// so this reports what the verb *asked* to change even when the request was
+/// never built.
+fn fields_changed_label(verb: &StructureVerb) -> Option<String> {
+    let StructureVerb::UpdateSheetProperties {
+        freeze_rows,
+        freeze_columns,
+        tab_color,
+        clear_tab_color,
+        right_to_left,
+        hide_gridlines,
+        ..
+    } = verb
+    else {
+        return None;
+    };
+    let mut parts = Vec::new();
+    if let Some(rows) = freeze_rows {
+        parts.push(format!("frozenRowCount={rows}"));
+    }
+    if let Some(columns) = freeze_columns {
+        parts.push(format!("frozenColumnCount={columns}"));
+    }
+    if let Some(hide) = hide_gridlines {
+        parts.push(format!("hideGridlines={hide}"));
+    }
+    if let Some(hex) = tab_color {
+        parts.push(format!("tabColorStyle={hex}"));
+    } else if *clear_tab_color {
+        parts.push("tabColorStyle=cleared".to_string());
+    }
+    if let Some(rtl) = right_to_left {
+        parts.push(format!("rightToLeft={rtl}"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join(", "))
 }
 
 /// Renders an outcome as human-readable text.
@@ -1569,7 +1801,7 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
 
     match &outcome.result {
         StructureResult::WouldChange { sheet, sheet_count } => {
-            describe_would_change(verb, sheet.as_ref(), *sheet_count, &book)
+            describe_would_change(verb, sheet.as_deref(), *sheet_count, &book)
         }
         StructureResult::RefusedNotASpreadsheet { mime_type } => vec![format!(
             "Refused: {book} is not a Google Sheet (mimeType: {mime_type}); \
@@ -1654,7 +1886,7 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
         } => {
             vec![describe_changed(
                 verb,
-                sheet.as_ref(),
+                sheet.as_deref(),
                 *sheet_id,
                 backup.as_deref(),
                 &book,
@@ -1815,7 +2047,87 @@ fn describe_would_change(
             let verb_word = if *hidden { "hide" } else { "show" };
             vec![format!("Would {verb_word} sheet '{from}'{id} in {book}")]
         }
+        StructureVerb::UpdateSheetProperties {
+            sheet: from,
+            freeze_rows,
+            freeze_columns,
+            tab_color,
+            clear_tab_color,
+            right_to_left,
+            hide_gridlines,
+        } => {
+            let fragments = update_sheet_properties_fragments(
+                freeze_rows,
+                freeze_columns,
+                tab_color,
+                *clear_tab_color,
+                *right_to_left,
+                *hide_gridlines,
+                sheet,
+            );
+            vec![format!(
+                "Would update sheet '{from}'{id} in {book}: {}",
+                fragments.join(", ")
+            )]
+        }
     }
+}
+
+/// The fragments shared by [`describe_would_change`]'s and
+/// [`describe_changed`]'s `UpdateSheetProperties` arms (issue #1835) — one
+/// per property the verb actually set, each stated as a before->after where
+/// the snapshot knows the current value and as just the target otherwise.
+/// Kept as one function so the dry-run preview and the real-run report can
+/// never phrase the same effect two different ways.
+fn update_sheet_properties_fragments(
+    freeze_rows: &Option<i64>,
+    freeze_columns: &Option<i64>,
+    tab_color: &Option<String>,
+    clear_tab_color: bool,
+    right_to_left: Option<bool>,
+    hide_gridlines: Option<bool>,
+    sheet: Option<&SheetSnapshot>,
+) -> Vec<String> {
+    let mut fragments = Vec::new();
+    if let Some(rows) = freeze_rows {
+        fragments.push(match sheet.and_then(|s| s.frozen_row_count) {
+            Some(before) => format!("frozen rows {before} -> {rows}"),
+            None => format!("frozen rows -> {rows}"),
+        });
+    }
+    if let Some(columns) = freeze_columns {
+        fragments.push(match sheet.and_then(|s| s.frozen_column_count) {
+            Some(before) => format!("frozen columns {before} -> {columns}"),
+            None => format!("frozen columns -> {columns}"),
+        });
+    }
+    if let Some(hex) = tab_color {
+        let display_hex = if hex.starts_with('#') {
+            hex.clone()
+        } else {
+            format!("#{hex}")
+        };
+        fragments.push(format!("tab color -> {display_hex}"));
+    } else if clear_tab_color {
+        fragments.push("tab color cleared".to_string());
+    }
+    if let Some(rtl) = right_to_left {
+        fragments.push(match sheet.and_then(|s| s.right_to_left) {
+            Some(before) => format!("right-to-left {before} -> {rtl}"),
+            None => format!("right-to-left -> {rtl}"),
+        });
+    }
+    if let Some(hide) = hide_gridlines {
+        let after_label = if hide { "hidden" } else { "shown" };
+        fragments.push(match sheet.and_then(|s| s.hide_gridlines) {
+            Some(before) => {
+                let before_label = if before { "hidden" } else { "shown" };
+                format!("gridlines {before_label} -> {after_label}")
+            }
+            None => format!("gridlines -> {after_label}"),
+        });
+    }
+    fragments
 }
 
 /// The insert arms of [`describe_would_change`].
@@ -2176,6 +2488,29 @@ fn describe_changed(
         } => {
             let verb_word = if *hidden { "Hid" } else { "Showed" };
             format!("{verb_word} sheet '{from}'{id} in {book}")
+        }
+        StructureVerb::UpdateSheetProperties {
+            sheet: from,
+            freeze_rows,
+            freeze_columns,
+            tab_color,
+            clear_tab_color,
+            right_to_left,
+            hide_gridlines,
+        } => {
+            let fragments = update_sheet_properties_fragments(
+                freeze_rows,
+                freeze_columns,
+                tab_color,
+                *clear_tab_color,
+                *right_to_left,
+                *hide_gridlines,
+                sheet,
+            );
+            format!(
+                "Updated sheet '{from}'{id} in {book}: {}",
+                fragments.join(", ")
+            )
         }
     }
 }
@@ -2712,6 +3047,15 @@ mod tests {
             StructureVerb::SetSheetVisibility {
                 sheet: "Q1".to_string(),
                 hidden: true,
+            },
+            StructureVerb::UpdateSheetProperties {
+                sheet: "Q1".to_string(),
+                freeze_rows: None,
+                freeze_columns: None,
+                tab_color: None,
+                clear_tab_color: false,
+                right_to_left: Some(true),
+                hide_gridlines: None,
             },
         ] {
             assert_eq!(verb.gate_operation(), DriveOperation::SheetsStructure);
@@ -3434,6 +3778,7 @@ mod tests {
             title: "Q2".to_string(),
             row_count: Some(500),
             column_count: Some(26),
+            ..Default::default()
         };
         // Both halves of `at - 1 + count`, since either can be the one that
         // overflows: a huge `--at` (refused for being past the end too, but
@@ -4735,6 +5080,270 @@ mod tests {
         );
     }
 
+    // ── update-sheet-properties (issue #1835) ───────────────────────────
+
+    fn update_sheet_properties(
+        freeze_rows: Option<i64>,
+        freeze_columns: Option<i64>,
+        tab_color: Option<&str>,
+        clear_tab_color: bool,
+        right_to_left: Option<bool>,
+        hide_gridlines: Option<bool>,
+    ) -> StructureVerb {
+        StructureVerb::UpdateSheetProperties {
+            sheet: "Q2".to_string(),
+            freeze_rows,
+            freeze_columns,
+            tab_color: tab_color.map(ToString::to_string),
+            clear_tab_color,
+            right_to_left,
+            hide_gridlines,
+        }
+    }
+
+    /// A `spreadsheets.get` reply like [`mount_workbook`], but `Q2` reports
+    /// `frozenRowCount: 1` — the fixture
+    /// [`update_sheet_properties_dry_run_reports_before_and_after`] needs to
+    /// exercise the before->after line.
+    fn mount_workbook_with_frozen_rows(
+        sheet_id: i64,
+        row_count: i64,
+        frozen_row_count: i64,
+    ) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {"properties": {
+                            "sheetId": 0, "title": "Q1", "index": 0,
+                            "gridProperties": {"rowCount": 1000, "columnCount": 26}}},
+                        {"properties": {
+                            "sheetId": sheet_id, "title": "Q2", "index": 1,
+                            "gridProperties": {
+                                "rowCount": row_count, "columnCount": 10,
+                                "frozenRowCount": frozen_row_count,
+                            }}}
+                    ],
+                })),
+            )
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_apply_sends_only_the_set_fields_in_the_mask() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let verb = update_sheet_properties(Some(2), None, Some("#FF8800"), false, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        let update = &body["requests"][0]["updateSheetProperties"];
+        assert_eq!(
+            update["fields"],
+            "gridProperties.frozenRowCount,tabColorStyle"
+        );
+        assert_eq!(update["properties"]["sheetId"], 118_293);
+        assert_eq!(update["properties"]["gridProperties"]["frozenRowCount"], 2);
+        let rgb = &update["properties"]["tabColorStyle"]["rgbColor"];
+        assert!((rgb["red"].as_f64().unwrap() - 1.0).abs() < 1e-6, "{rgb}");
+        assert!(
+            (rgb["green"].as_f64().unwrap() - (136.0 / 255.0)).abs() < 1e-6,
+            "{rgb}"
+        );
+        assert!((rgb["blue"].as_f64().unwrap() - 0.0).abs() < 1e-6, "{rgb}");
+        assert!(
+            update["properties"]["gridProperties"]
+                .get("frozenColumnCount")
+                .is_none(),
+            "{update}"
+        );
+        assert!(
+            update["properties"].get("rightToLeft").is_none(),
+            "{update}"
+        );
+        assert!(update["properties"].get("hidden").is_none(), "{update}");
+        assert!(update["properties"].get("title").is_none(), "{update}");
+        assert!(update["properties"].get("index").is_none(), "{update}");
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_apply_clear_tab_color_names_tab_color_style_with_no_value() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
+            .mount(&server)
+            .await;
+        let verb = update_sheet_properties(None, None, None, true, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(outcome.result, StructureResult::Changed { .. }));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .expect("a batchUpdate request");
+        let update = &body["requests"][0]["updateSheetProperties"];
+        assert_eq!(update["fields"], "tabColorStyle");
+        assert!(
+            update["properties"].get("tabColorStyle").is_none(),
+            "{update}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_dry_run_reports_before_and_after() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook_with_frozen_rows(118_293, 500, 1)
+            .mount(&server)
+            .await;
+        let verb = update_sheet_properties(Some(3), None, None, false, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let text = describe(&outcome);
+        assert!(text.contains("frozen rows 1 -> 3"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_refuses_a_negative_freeze_count() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = update_sheet_properties(Some(-1), None, None, false, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(
+            detail.contains("--freeze-rows must be at least 0"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_refuses_freezing_every_row() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook_with_frozen_rows(118_293, 5, 0)
+            .mount(&server)
+            .await;
+        let verb = update_sheet_properties(Some(5), None, None, false, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("would freeze every row"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_refuses_an_invalid_hex_color() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = update_sheet_properties(None, None, Some("nope"), false, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            StructureResult::RefusedInvalidRange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_sheet_properties_refuses_when_nothing_is_set() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let verb = update_sheet_properties(None, None, None, false, None, None);
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(verb, true),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("at least one"), "{detail}");
+    }
+
     // ── the Drive write lease (ADR-0080 §9) ─────────────────────────────
 
     fn allow_rule_no_lease(folder: &str) -> FolderPermissionRule {
@@ -5803,12 +6412,13 @@ mod tests {
     fn every_structure_result() -> Vec<StructureResult> {
         let all = vec![
             StructureResult::WouldChange {
-                sheet: Some(SheetSnapshot {
+                sheet: Some(Box::new(SheetSnapshot {
                     sheet_id: Some(7),
                     title: "Q2".to_string(),
                     row_count: Some(500),
                     column_count: Some(26),
-                }),
+                    ..Default::default()
+                })),
                 sheet_count: 2,
             },
             StructureResult::RefusedNotASpreadsheet {
@@ -5832,12 +6442,13 @@ mod tests {
             StructureResult::RefusedLeaseWrongFile,
             StructureResult::RefusedLeaseStale,
             StructureResult::Changed {
-                sheet: Some(SheetSnapshot {
+                sheet: Some(Box::new(SheetSnapshot {
                     sheet_id: Some(7),
                     title: "Q2".to_string(),
                     row_count: Some(500),
                     column_count: Some(26),
-                }),
+                    ..Default::default()
+                })),
                 sheet_id: Some(7),
                 backup: Some(Box::new(LeaseBackup::DriveCopy {
                     file_id: "backup-copy-1".to_string(),
@@ -5973,7 +6584,7 @@ mod tests {
             resolved_folder_id: None,
             verb,
             result: StructureResult::WouldChange {
-                sheet,
+                sheet: sheet.map(Box::new),
                 sheet_count: 2,
             },
         };
@@ -5984,6 +6595,7 @@ mod tests {
             title: "Q2".to_string(),
             row_count: None,
             column_count: Some(column_count),
+            ..Default::default()
         };
 
         // `--at`/`--count` overflowing the `last` computation: no dash-range
@@ -6106,6 +6718,7 @@ mod tests {
             title: "Q2".to_string(),
             row_count: None,
             column_count: None,
+            ..Default::default()
         };
         let err = build_request(&rename(), Some(&sheet)).unwrap_err();
         assert!(err.contains("sheetId"), "{err}");

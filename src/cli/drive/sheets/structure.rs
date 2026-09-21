@@ -2,9 +2,10 @@
 //! `insert-rows`/`insert-columns` (issue #1613), `duplicate-sheet`/
 //! `reorder-sheet`/`hide-sheet`/`show-sheet` (issue #1643),
 //! `delete-sheet`/`delete-rows`/`delete-columns`/`delete-range` (issue
-//! #1623), and `move-rows`/`move-columns` (issue #1834).
+//! #1623), `move-rows`/`move-columns` (issue #1834), and
+//! `update-sheet-properties` (issue #1835).
 //!
-//! Fourteen clap structs over one engine call. They share `run_structure`, so
+//! Fifteen clap structs over one engine call. They share `run_structure`, so
 //! the gate wiring, `--dry-run` handling, output rendering and request
 //! logging cannot drift between them — the same arrangement `write.rs` uses
 //! for its three verbs. The additive verbs are gated on
@@ -516,6 +517,60 @@ pub struct ShowSheetCommand {
     pub output: OutputFormat,
 }
 
+/// Changes a sheet's view properties — frozen rows/columns, tab color,
+/// right-to-left layout, and whether gridlines are hidden (issue #1835).
+/// Every flag is independently optional; only the ones passed are sent, in
+/// a field mask naming exactly them.
+#[derive(Parser)]
+#[command(group(clap::ArgGroup::new("change")
+    .args(["freeze_rows", "freeze_columns", "tab_color", "clear_tab_color", "right_to_left", "hide_gridlines"])
+    .multiple(true)
+    .required(true)))]
+pub struct UpdateSheetPropertiesCommand {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+
+    /// Title of the sheet to modify.
+    #[arg(long, value_name = "NAME")]
+    pub sheet: String,
+
+    /// Rows to freeze at the top of the grid; 0 unfreezes.
+    #[arg(long, value_name = "N")]
+    pub freeze_rows: Option<i64>,
+
+    /// Columns to freeze at the left of the grid; 0 unfreezes.
+    #[arg(long, value_name = "N")]
+    pub freeze_columns: Option<i64>,
+
+    /// The new tab color, `#RRGGBB`.
+    #[arg(long, value_name = "HEX", conflicts_with = "clear_tab_color")]
+    pub tab_color: Option<String>,
+
+    /// Clears the tab color back to none.
+    #[arg(long, conflicts_with = "tab_color")]
+    pub clear_tab_color: bool,
+
+    /// Whether the sheet is laid out right-to-left.
+    #[arg(long, value_name = "BOOL")]
+    pub right_to_left: Option<bool>,
+
+    /// Whether to hide the grid's lines.
+    #[arg(long, value_name = "BOOL")]
+    pub hide_gridlines: Option<bool>,
+
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
 impl AddSheetCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
@@ -757,6 +812,28 @@ impl ShowSheetCommand {
             verb: StructureVerb::SetSheetVisibility {
                 sheet: self.sheet,
                 hidden: false,
+            },
+            dry_run: self.dry_run,
+            lease_token: self.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+        };
+        run_structure(client, &opts, &self.output).await
+    }
+}
+
+impl UpdateSheetPropertiesCommand {
+    /// Runs the command against the shared Drive client.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let opts = StructureOptions {
+            spreadsheet_id: self.spreadsheet_id,
+            verb: StructureVerb::UpdateSheetProperties {
+                sheet: self.sheet,
+                freeze_rows: self.freeze_rows,
+                freeze_columns: self.freeze_columns,
+                tab_color: self.tab_color,
+                clear_tab_color: self.clear_tab_color,
+                right_to_left: self.right_to_left,
+                hide_gridlines: self.hide_gridlines,
             },
             dry_run: self.dry_run,
             lease_token: self.lease.lease,

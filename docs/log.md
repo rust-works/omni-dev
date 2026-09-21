@@ -193,6 +193,15 @@ types, so the log is a complete invocation history, not just an HTTP history:
   verbs) records `collapsed=true`/`collapsed=false` for
   `sheets-update-dimension-group`.
 
+  `update-sheet-properties` (issue #1835,
+  [ADR-0085](adrs/adr-0085.md)) uses the same kind again, with
+  `operation` of `sheets-update-sheet-properties`. It may set several
+  properties (frozen rows/columns, hidden gridlines, tab color,
+  right-to-left) in one request, so it needs no new context key: it reuses
+  `fields_changed` for a comma-joined summary of what it set (e.g.
+  `"frozenRowCount=2, tabColorStyle=#FF8800"`), the same key `format-cells`
+  and friends already write, rather than introducing one of its own.
+
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of

@@ -148,6 +148,11 @@ pub enum DriveOperation {
     /// or column span, the same reasoning again; removing a group destroys
     /// no grid data either.
     ///
+    /// Since issue #1835 ([ADR-0085](../../docs/adrs/adr-0085.md)), also
+    /// `update-sheet-properties` — frozen rows/columns, tab color,
+    /// right-to-left layout, and hidden gridlines, all per-sheet view state
+    /// rather than grid data.
+    ///
     /// Deliberately **not** folded into [`Self::SheetsWrite`], for the same
     /// reason that one is not folded into [`Self::Edit`]. Every existing
     /// `allow: ["sheets-write"]` rule was written when structural edits were
