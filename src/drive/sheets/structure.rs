@@ -620,6 +620,29 @@ const fn move_destination_index(before: i64) -> i64 {
     before - 1
 }
 
+/// The block's landing span after a move, given `--before`'s pre-move
+/// numbering, the block's `count`, and its inclusive pre-move last index.
+///
+/// The single computation site, on purpose — [`describe_would_move`] (the
+/// dry-run preview) and [`describe_moved`] (the real-run message) both need
+/// it, and a formula duplicated between them could drift so the preview and
+/// the confirmation disagree about where the block ended up.
+/// `validate_move_bounds` refuses every `before` in `at..=at + count`, so
+/// callers may assume exactly one of the two branches applies.
+const fn move_landing_span(before: i64, count: i64, last: i64) -> (i64, i64) {
+    if before > last {
+        // Downward: the block lands immediately before where `before` used
+        // to sit — `count` short of the number typed, since the rows/
+        // columns between the block and the destination slide back to
+        // close the gap.
+        (before - count, before - 1)
+    } else {
+        // Upward (`before < at`): the block lands exactly on the number
+        // typed.
+        (before, before + count - 1)
+    }
+}
+
 /// Runs one structural mutation, logging every attempt that isn't a dry run.
 ///
 /// Never returns `Err`: every failure is a [`StructureResult`] variant, so
@@ -1010,6 +1033,39 @@ fn validate_verb_args(
     }
 }
 
+/// The `--count >= 1` / `--at >= 1` / overflow checks shared by
+/// [`validate_insert_bounds`], [`validate_move_bounds`] and
+/// [`validate_delete_dimension_bounds`] — every span-based verb needs them
+/// verbatim, so they live in one place rather than three, and returns the
+/// inclusive last index (`at - 1 + count`) so callers that need it (move,
+/// delete) don't recompute it.
+///
+/// Keeps `dimension_range`'s `at - 1 + count` total, so the one pure
+/// conversion stays infallible and every value that reaches it is already
+/// known to fit. Deliberately an *arithmetic* bound and not a ceiling on how
+/// many rows may be added: the workbook's own state implies no upper bound
+/// on `--count`, so inventing one would be the client-side validation
+/// ADR-0073 §7 rejects, with Sheets the authority on how large a sheet may
+/// actually get.
+fn validate_span_start(dimension: Dimension, at: i64, count: i64) -> Result<i64, StructureResult> {
+    let invalid = |detail: String| StructureResult::RefusedInvalidRange { detail };
+
+    if count < 1 {
+        return Err(invalid(format!("--count must be at least 1, got {count}")));
+    }
+    if at < 1 {
+        return Err(invalid(format!("--at must be at least 1, got {at}")));
+    }
+    at.checked_sub(1)
+        .and_then(|start| start.checked_add(count))
+        .ok_or_else(|| {
+            invalid(format!(
+                "--at {at} with --count {count} overflows the {noun} index space",
+                noun = dimension.noun(),
+            ))
+        })
+}
+
 /// The `InsertRows`/`InsertColumns` half of [`validate_verb_args`], split
 /// out so each caller supplies its own [`Dimension`] directly rather than
 /// recovering it from the verb.
@@ -1021,29 +1077,7 @@ fn validate_insert_bounds(
 ) -> Result<(), StructureResult> {
     let invalid = |detail: String| Err(StructureResult::RefusedInvalidRange { detail });
 
-    if count < 1 {
-        return invalid(format!("--count must be at least 1, got {count}"));
-    }
-    if at < 1 {
-        return invalid(format!("--at must be at least 1, got {at}"));
-    }
-    // Keeps `dimension_range`'s `at - 1 + count` total, so the one pure
-    // conversion stays infallible and every value that reaches it is already
-    // known to fit. Deliberately an *arithmetic* bound and not a ceiling on
-    // how many rows may be added: the workbook's own state implies no upper
-    // bound on `--count`, so inventing one would be the client-side
-    // validation ADR-0073 §7 rejects, with Sheets the authority on how large
-    // a sheet may actually get.
-    if at
-        .checked_sub(1)
-        .and_then(|start| start.checked_add(count))
-        .is_none()
-    {
-        return invalid(format!(
-            "--at {at} with --count {count} overflows the {noun} index space",
-            noun = dimension.noun(),
-        ));
-    }
+    validate_span_start(dimension, at, count)?;
     let current = match dimension {
         Dimension::Rows => sheet.and_then(|s| s.row_count),
         Dimension::Columns => sheet.and_then(|s| s.column_count),
@@ -1085,24 +1119,10 @@ fn validate_move_bounds(
 ) -> Result<(), StructureResult> {
     let invalid = |detail: String| Err(StructureResult::RefusedInvalidRange { detail });
 
-    if count < 1 {
-        return invalid(format!("--count must be at least 1, got {count}"));
-    }
-    if at < 1 {
-        return invalid(format!("--at must be at least 1, got {at}"));
-    }
+    let last = validate_span_start(dimension, at, count)?;
     if before < 1 {
         return invalid(format!("--before must be at least 1, got {before}"));
     }
-    // Keeps `dimension_range`'s `at - 1 + count` total, exactly as
-    // [`validate_insert_bounds`] does, so the one pure conversion stays
-    // infallible.
-    let Some(last) = at.checked_sub(1).and_then(|start| start.checked_add(count)) else {
-        return invalid(format!(
-            "--at {at} with --count {count} overflows the {noun} index space",
-            noun = dimension.noun(),
-        ));
-    };
     // `before == at + count` is the no-op boundary: the block already sits
     // immediately before that row/column, so lifting it out and putting it
     // back lands it exactly where it was. `before == at - 1` is one further
@@ -1156,18 +1176,7 @@ fn validate_delete_dimension_bounds(
 ) -> Result<(), StructureResult> {
     let invalid = |detail: String| Err(StructureResult::RefusedInvalidRange { detail });
 
-    if count < 1 {
-        return invalid(format!("--count must be at least 1, got {count}"));
-    }
-    if at < 1 {
-        return invalid(format!("--at must be at least 1, got {at}"));
-    }
-    let Some(last) = at.checked_sub(1).and_then(|start| start.checked_add(count)) else {
-        return invalid(format!(
-            "--at {at} with --count {count} overflows the {noun} index space",
-            noun = dimension.noun(),
-        ));
-    };
+    let last = validate_span_start(dimension, at, count)?;
     let current = match dimension {
         Dimension::Rows => sheet.and_then(|s| s.row_count),
         Dimension::Columns => sheet.and_then(|s| s.column_count),
@@ -1175,10 +1184,9 @@ fn validate_delete_dimension_bounds(
     if let Some(current) = current {
         if last > current {
             return invalid(format!(
-                "--at {at} with --count {count} reaches {noun} {end}, past the end of the \
+                "--at {at} with --count {count} reaches {noun} {last}, past the end of the \
                  sheet, which has {current} {noun}(s)",
                 noun = dimension.noun(),
-                end = at + count - 1,
             ));
         }
     }
@@ -1921,12 +1929,12 @@ fn describe_would_move(
     };
     // `validate_move_bounds` refuses every `before` in `at..=at + count`, so
     // exactly one of these two branches describes a real move.
+    let (land_first, land_last) = move_landing_span(before, count, last);
     let detail = if before > last {
         // Downward: the rows/columns strictly between the block and the
-        // destination slide back to close the gap, and the block lands
-        // immediately before where `before` used to sit — `count` short of
-        // the number typed, which is the convention this line exists to
-        // spell out.
+        // destination slide back to close the gap — `count` short of the
+        // number typed, which is the convention this line exists to spell
+        // out.
         format!(
             "  ({current} {plural} unchanged; {plural} {shift_first}-{shift_last} shift \
              {direction} to {at}-{shifted_last}; moved {plural} land at {land_first}-\
@@ -1939,8 +1947,6 @@ fn describe_would_move(
             shift_first = last + 1,
             shift_last = before - 1,
             shifted_last = before - 1 - count,
-            land_first = before - count,
-            land_last = before - 1,
         )
     } else {
         // Upward (`before < at`): the block lands exactly on the number
@@ -1949,7 +1955,7 @@ fn describe_would_move(
         format!(
             "  ({current} {plural} unchanged; {plural} {before}-{shift_last} shift \
              {direction} to {shifted_first}-{shifted_last}; moved {plural} land at \
-             {before}-{land_last})",
+             {land_first}-{land_last})",
             plural = plural(dimension),
             direction = match dimension {
                 Dimension::Rows => "down",
@@ -1958,7 +1964,6 @@ fn describe_would_move(
             shift_last = at - 1,
             shifted_first = before + count,
             shifted_last = at - 1 + count,
-            land_last = before + count - 1,
         )
     };
     vec![summary, detail]
@@ -2224,12 +2229,8 @@ fn describe_moved(
     let last = at.checked_add(count).and_then(|end| end.checked_sub(1));
     let range = last.map_or_else(|| at.to_string(), |last| format!("{at}-{last}"));
     let now = last.map_or_else(String::new, |last| {
-        let landing = if before > last {
-            format!("{}-{}", before - count, before - 1)
-        } else {
-            format!("{before}-{}", before + count - 1)
-        };
-        format!(" (now {} {landing})", plural(dimension))
+        let (land_first, land_last) = move_landing_span(before, count, last);
+        format!(" (now {} {land_first}-{land_last})", plural(dimension))
     });
     format!(
         "Moved {count} {noun}(s) {range} of '{from}'{id} in {book} to before {noun} \
