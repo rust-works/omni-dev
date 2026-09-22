@@ -677,7 +677,7 @@ pub fn fetch_items(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<IssueDoc>>
             // omni-dev: coverage ignore-line reason="chunks() never yields an empty chunk from a non-empty refs slice, and build_item_query returns None only for an empty slice"
             continue;
         };
-        let body = crate::pr_status::run_gh_graphql(bin, &query)?;
+        let body = crate::pr_status::run_gh_graphql_with_partial_data(bin, &query)?;
         by_key.extend(parse_item_response(&body, &index)?);
     }
     refs.iter()
@@ -1195,6 +1195,37 @@ mod tests {
     }
 
     #[test]
+    fn fetch_items_keeps_valid_items_when_gh_exits_nonzero_for_one_missing_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            &serde_json::json!({
+                "data": {"r0": {
+                    "i0": null,
+                    "i1": {
+                        "__typename": "Issue",
+                        "title": "Valid", "body": "b",
+                        "state": "OPEN", "url": "u"
+                    }
+                }},
+                "errors": [{
+                    "type": "NOT_FOUND", "path": ["r0", "i0"],
+                    "message": "Could not resolve to an issue or pull request."
+                }]
+            })
+            .to_string(),
+            1,
+        );
+        let refs = [
+            item_ref("rust-works/omni-dev", 2063),
+            item_ref("rust-works/omni-dev", 1871),
+        ];
+        let docs = retry_on_etxtbsy(|| fetch_items(&bin, &refs)).unwrap();
+        assert!(docs[0].is_none());
+        assert_eq!(docs[1].as_ref().unwrap().title, "Valid");
+    }
+
+    #[test]
     fn fetch_items_still_bails_on_a_missing_repository() {
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(
@@ -1204,7 +1235,7 @@ mod tests {
                 "errors": [{"type": "NOT_FOUND", "path": ["r0"], "message": "Could not resolve"}]
             })
             .to_string(),
-            0,
+            1,
         );
         let err = retry_on_etxtbsy(|| fetch_items(&bin, &[pr_ref("no/such", 1)])).unwrap_err();
         assert!(err.to_string().contains("no/such"), "{err}");

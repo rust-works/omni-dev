@@ -562,6 +562,17 @@ fn resolve_gh_binary_from(
 /// aliased query in the style of this module's [`build_query`] and runs it
 /// here rather than duplicating this subprocess wrapper.
 pub(crate) fn run_gh_graphql(bin: &Path, query: &str) -> Result<Value> {
+    run_gh_graphql_inner(bin, query, false)
+}
+
+/// Like [`run_gh_graphql`], but returns a partial GraphQL response when `gh`
+/// exits nonzero with both `data` and `errors`. The caller must inspect every
+/// error before using that data; `fetch_items` permits only per-item `NOT_FOUND`.
+pub(crate) fn run_gh_graphql_with_partial_data(bin: &Path, query: &str) -> Result<Value> {
+    run_gh_graphql_inner(bin, query, true)
+}
+
+fn run_gh_graphql_inner(bin: &Path, query: &str, allow_partial_data: bool) -> Result<Value> {
     let query_arg = format!("query={query}");
     let output = crate::github_metrics::run_gh(
         bin,
@@ -576,6 +587,18 @@ pub(crate) fn run_gh_graphql(bin: &Path, query: &str) -> Result<Value> {
         )
     })?;
     if !output.status.success() {
+        if allow_partial_data {
+            if let Ok(body) = serde_json::from_slice::<Value>(&output.stdout) {
+                if body.get("data").and_then(Value::as_object).is_some()
+                    && body
+                        .get("errors")
+                        .and_then(Value::as_array)
+                        .is_some_and(|errors| !errors.is_empty())
+                {
+                    return Ok(body);
+                }
+            }
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("gh api graphql failed: {}", stderr.trim());
     }
