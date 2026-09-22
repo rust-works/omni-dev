@@ -1044,6 +1044,150 @@ mod tests {
         );
     }
 
+    // ── target-gate failures and refusals ───────────────────────────────
+
+    #[tokio::test]
+    async fn a_metadata_fetch_failure_surfaces_as_failed_without_a_file_name() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let outcome = trim_whitespace(&drive, &sheets, &options(true), &[]).await;
+
+        assert!(matches!(
+            outcome.result,
+            TrimWhitespaceResult::Failed { .. }
+        ));
+        assert!(outcome.file_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_shortcut_target_is_refused_without_following_it() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1", "name": "Budget",
+                    "mimeType": "application/vnd.google-apps.shortcut",
+                    "parents": ["parent-1"], "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let outcome = trim_whitespace(&drive, &sheets, &options(true), &[]).await;
+
+        assert_eq!(outcome.result, TrimWhitespaceResult::RefusedShortcut);
+        assert_eq!(outcome.file_name.as_deref(), Some("Budget"));
+    }
+
+    #[tokio::test]
+    async fn a_non_spreadsheet_target_is_refused_with_its_mime_type() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1", "name": "Budget",
+                    "mimeType": "application/vnd.google-apps.document",
+                    "parents": ["parent-1"], "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let outcome = trim_whitespace(&drive, &sheets, &options(true), &[]).await;
+
+        assert_eq!(
+            outcome.result,
+            TrimWhitespaceResult::RefusedNotASpreadsheet {
+                mime_type: "application/vnd.google-apps.document".into(),
+            }
+        );
+        assert_eq!(outcome.file_name.as_deref(), Some("Budget"));
+    }
+
+    #[tokio::test]
+    async fn a_target_with_no_visible_parents_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1", "name": "Budget", "mimeType": GOOGLE_SHEET_MIME_TYPE,
+                    "parents": [], "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let outcome = trim_whitespace(&drive, &sheets, &options(true), &[]).await;
+
+        assert_eq!(
+            outcome.result,
+            TrimWhitespaceResult::RefusedNoVisibleParents
+        );
+        assert_eq!(outcome.file_name.as_deref(), Some("Budget"));
+    }
+
+    #[tokio::test]
+    async fn a_gate_ancestor_fetch_failure_surfaces_as_failed_with_the_file_name() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1", "name": "Budget", "mimeType": GOOGLE_SHEET_MIME_TYPE,
+                    "parents": ["parent-1"], "version": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/parent-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let outcome = trim_whitespace(&drive, &sheets, &options(true), &[]).await;
+
+        assert!(matches!(
+            outcome.result,
+            TrimWhitespaceResult::Failed { .. }
+        ));
+        assert_eq!(outcome.file_name.as_deref(), Some("Budget"));
+        assert!(outcome.resolved_folder_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_workbook_fetch_failure_after_a_granted_gate_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_metadata(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let outcome = trim_whitespace(&drive, &sheets, &options(true), &[rule()]).await;
+
+        assert!(matches!(
+            outcome.result,
+            TrimWhitespaceResult::Failed { .. }
+        ));
+        assert_eq!(outcome.file_name.as_deref(), Some("Budget"));
+    }
+
     // ── the two read paths ──────────────────────────────────────────────
 
     #[tokio::test]
