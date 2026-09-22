@@ -627,9 +627,9 @@ operation anywhere in a target's ancestor chain:
 | `create`            | deny    | `create`, `sheets create` |
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets sort-range` — cell values; `sheets text-to-columns` (also needs `sheets-structure`); `sheets randomize-range` (also needs `sheets-structure`); `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets sort-range`, `sheets trim-whitespace` — cell values; `sheets text-to-columns` (also needs `sheets-structure`); `sheets randomize-range` (also needs `sheets-structure`); `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
 | `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `text-to-columns` (also needs `sheets-write`), `randomize-range` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
-| `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
+| `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`, `delete-duplicates` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
 
@@ -2026,6 +2026,110 @@ documents none of them:
   while cells *within* that width are cleared even on rows that need
   fewer.
 
+#### `drive sheets trim-whitespace`
+
+Trims whitespace in every cell of a range, or of a whole sheet. Gated under
+**`sheets-write`** (issue #1844, [ADR-0083](adrs/adr-0083.md) §1): it
+rewrites ordinary cell content in place, doing nothing a `sheets clear`
+followed by a `sheets write` of the same range could not already do under
+that grant.
+
+Pass either `--range` or `--whole-sheet`, never both. An open-ended
+`--range` (`A:A`) is completed from the sheet's current grid extent, and
+`--whole-sheet` needs `--sheet` to say which tab:
+
+```bash
+# A bounded range.
+omni-dev drive sheets trim-whitespace <ID> --sheet Q1 --range A2:D100
+
+# A whole tab.
+omni-dev drive sheets trim-whitespace <ID> --sheet Q1 --whole-sheet
+
+# Preview: reads the range's values, sends no batchUpdate.
+omni-dev drive sheets trim-whitespace <ID> --sheet Q1 --range A2:D100 --dry-run
+```
+
+**`--dry-run` never claims which cells will change.** Sheets owns the trim
+rule, and reproducing it locally would be a preview that disagrees with the
+real run — the same reason `find-replace` declines a local match count
+([ADR-0083](adrs/adr-0083.md) §6). So the preview reports the count and A1
+locations of the range's **non-blank** cells, any of which *may* be
+trimmed, and never their values:
+
+```
+$ omni-dev drive sheets trim-whitespace <ID> --sheet Q1 --range A2:C10 --dry-run
+Would trim whitespace in 'Q1'!A2:C10 of 'Budget'
+  4 non-blank cell(s) may be trimmed: A2, C2, B3, B7
+```
+
+Past 50 addresses the rendered line elides the remainder (`… and N more`);
+the `-o json` outcome and the request log keep the full list.
+
+The real run reports the API's own `cellsChangedCount` — an exact count of
+what changed — and deliberately does **not** re-read the range, unlike
+`auto-fill` and the paste family, whose requests return no count:
+
+```
+$ omni-dev drive sheets trim-whitespace <ID> --sheet Q1 --range A2:C10
+Trimmed whitespace in 3 cell(s) of 'Q1'!A2:C10 in 'Budget'
+```
+
+#### `drive sheets delete-duplicates`
+
+Removes rows within a bounded range that duplicate an earlier row. This is
+the **only verb in its tranche gated by `sheets-delete`** rather than
+`sheets-write` (issue #1844, [ADR-0083](adrs/adr-0083.md) §2): rows cease
+to exist and the survivors close over the gap, which is `delete-rows`'
+shape, not `clear`'s. A `sheets-write` grant does not open it, and neither
+does `sheets-structure`.
+
+```bash
+# Compare every column in the range.
+omni-dev drive sheets delete-duplicates <ID> --sheet Q1 --range A2:D100
+
+# Compare only columns 0 and 2 (absolute, zero-based, as --sort-by uses).
+omni-dev drive sheets delete-duplicates <ID> --sheet Q1 --range A2:D100 \
+  --comparison-column 0 --comparison-column 2
+
+# Preview: makes no values read and no batchUpdate.
+omni-dev drive sheets delete-duplicates <ID> --sheet Q1 --range A2:D100 --dry-run
+```
+
+Each `--comparison-column` must fall inside the selected range, and the
+range must be fully bounded (`A2:D100`, not `A:A`) — an open-ended range
+is refused so the request cannot reach past the data.
+
+**The API selects the rows, not the caller.** Every other `sheets-delete`
+verb removes cells named by address; here Sheets applies its own equality
+rule and removes whatever it finds. Because a wrong local guess would cost
+a *row*, `--dry-run` states that rule rather than listing rows it cannot
+vouch for ([ADR-0083](adrs/adr-0083.md) §6):
+
+```
+$ omni-dev drive sheets delete-duplicates <ID> --sheet Q1 --range A2:D100 --dry-run
+Warning: blank rows inside the range duplicate one another, so a range extending past the data can remove every blank row but the first
+Would remove duplicate rows from 'Q1'!A2:D100 in 'Budget', comparing every column in the range
+  the API keeps the first instance of each duplicate and removes the rest; duplicates need not be adjacent, rows differing only in letter case, formatting or formulas still count as duplicates, and rows hidden by a filter are removed along with visible ones
+  which rows would be removed is decided by the API and cannot be previewed
+```
+
+That blank-row warning is the reason there is no `--whole-sheet` scope
+here, though `trim-whitespace` has one: blank rows duplicate one another,
+so a whole-sheet dedupe would delete a tab's entire trailing empty region.
+It applies to any bounded range that runs past the data, too.
+
+The real run reports the API's `duplicatesRemovedCount` and, being a
+`sheets-delete` verb, the same recovery tail every destructive verb ends
+with — naming the lease's backup when one was taken, and saying plainly
+that there is none when the deciding rule set `require_lease: false`:
+
+```
+$ omni-dev drive sheets delete-duplicates <ID> --sheet Q1 --range A2:D100 --lease <TOKEN>
+Removed 4 duplicate row(s) from 'Q1'!A2:D100 in 'Budget', comparing every column in the range
+  the API keeps the first instance of each duplicate and removes the rest; …
+  this cannot be undone through omni-dev — the lease this write required backed the whole spreadsheet up when it was acquired (Drive copy 1AbC…); run `omni-dev drive lease restore <TOKEN>` to locate it, restore from that copy in the Drive UI, or fall back to Google Drive's own version history
+```
+
 #### `drive sheets create`
 
 Creates a spreadsheet, optionally seeded with values. Gated under the
@@ -2304,6 +2408,13 @@ but these actually remove data. Gated by the separate `sheets-delete`
 operation, **not** `sheets-structure`: a folder granted `sheets-structure`
 cannot delete anything without an explicit additional grant, and vice versa.
 See [ADR-0077](adrs/adr-0077-sheets-deletion-via-batchupdate.md).
+
+Since issue #1844, [`delete-duplicates`](#drive-sheets-delete-duplicates)
+joins them under the same operation — the first capability to do so since
+ADR-0077 defined it ([ADR-0083](adrs/adr-0083.md) §2). It differs from the
+four above in one way worth knowing before granting `sheets-delete`: they
+remove cells you name by address, while it removes rows **Sheets** selects
+from the data.
 
 There is still no interactive confirmation and no `--force` anywhere in this
 tool, deletion included — the permission gate and an honest `--dry-run` are

@@ -282,6 +282,24 @@ types, so the log is a complete invocation history, not just an HTTP history:
   never tries), but the key has no third state; that caveat is carried in
   the rendered output rather than in the record.
 
+  `trim-whitespace` and `delete-duplicates` (issue #1844,
+  [ADR-0083](adrs/adr-0083.md) §§1, 2, 6) use the same kind, with
+  `operation` of `sheets-trim-whitespace` and `sheets-delete-duplicates`.
+  They are the tranche's one pair taking **different gates** —
+  `sheets-write` for the trim, `sheets-delete` for the dedupe — so a
+  `decided_by_*` chain on one says nothing about the other. Neither adds a
+  context key: `fields_changed` carries the server's own count
+  (`cellsChangedCount`, `duplicatesRemovedCount`) plus the range, or says
+  the API reported no count.
+
+  `delete-duplicates` deliberately records **no** cell or row list. ADR-0083
+  §6 places it in the server-decided preview tier — Sheets chooses the rows
+  by an equality rule this crate does not reproduce — so there is nothing
+  to record that the tool could vouch for. `trim-whitespace` records none
+  either: its real run reports the server's exact count instead of
+  re-reading the range, so the candidate list exists only in the `--dry-run`
+  outcome, which writes no mutation record at all.
+
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of
