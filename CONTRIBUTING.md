@@ -32,6 +32,13 @@ Thank you for your interest in contributing to omni-dev! We welcome contribution
    cargo test
    ```
 
+5. **(Optional) Trust the project hooks**: if you use the Codex CLI, this
+   repo ships `.codex/hooks.json` (rustfmt-on-edit, snapshot-drift-on-stop —
+   the same gates Claude Code gets from `.claude/settings.json`). Codex
+   skips an untrusted hook silently, so approve it once via `/hooks` after
+   opening the repo. Trust is keyed by the hook file's absolute path, so
+   **each new worktree needs its own approval**.
+
 ## Development Workflow
 
 ### Before You Start
