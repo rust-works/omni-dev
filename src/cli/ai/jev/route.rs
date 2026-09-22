@@ -21,6 +21,7 @@ use crate::jev::route::{
     DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
 };
 use crate::provider::{GitProvider, IssueDoc, ItemKind, ItemRef, ItemState};
+use crate::utils::env::{EnvSource, SystemEnv};
 
 use super::common::{format_output, JevFormat};
 
@@ -211,25 +212,40 @@ fn render_output_with_style(
     }
 }
 
-/// OSC 8 has no universal capability query, so opt in for terminals known to
-/// support it. Colour and links are independent: NO_COLOR only disables SGR.
+/// Whether stdout may carry colour and OSC 8 links.
 fn terminal_style() -> TerminalStyle {
-    let term = std::env::var("TERM").unwrap_or_default();
-    let tty = std::io::stdout().is_terminal();
+    terminal_style_with(&SystemEnv, std::io::stdout().is_terminal())
+}
+
+/// The env-parsing seam behind [`terminal_style`] (STYLE-0028): given these
+/// variables and whether stdout is a terminal, what may be emitted?
+///
+/// OSC 8 has no universal capability query, so links are opt-in for terminals
+/// known to support them. Colour and links are independent: `NO_COLOR` only
+/// disables SGR.
+fn terminal_style_with(env: &impl EnvSource, tty: bool) -> TerminalStyle {
     let supports_links = matches!(
-        std::env::var("TERM_PROGRAM").as_deref(),
-        Ok("iTerm.app" | "WezTerm" | "vscode" | "Hyper")
-    ) || std::env::var_os("WT_SESSION").is_some()
-        || std::env::var_os("KITTY_WINDOW_ID").is_some()
-        || std::env::var_os("KONSOLE_VERSION").is_some()
-        || std::env::var("VTE_VERSION")
-            .ok()
+        env.var("TERM_PROGRAM").as_deref(),
+        Some("iTerm.app" | "WezTerm" | "vscode" | "Hyper" | "ghostty")
+    ) || [
+        "WT_SESSION",
+        "KITTY_WINDOW_ID",
+        "KONSOLE_VERSION",
+        // Only set from Alacritty 0.12, which is past 0.11's OSC 8 support.
+        "ALACRITTY_WINDOW_ID",
+    ]
+    .iter()
+    .any(|key| env.var(key).is_some())
+        || env
+            .var("VTE_VERSION")
             .and_then(|v| v.parse::<u32>().ok())
             .is_some_and(|v| v >= 5000);
     TerminalStyle::new(
         tty,
-        &term,
-        std::env::var_os("NO_COLOR").is_some(),
+        &env.var("TERM").unwrap_or_default(),
+        // no-color.org: the variable suppresses colour only when non-empty,
+        // so `NO_COLOR=` neutralises an exported value for one invocation.
+        env.var("NO_COLOR").is_some_and(|v| !v.is_empty()),
         supports_links,
     )
 }
@@ -775,6 +791,58 @@ mod tests {
                 render_output(&report, format, DEFAULT_MAX_INPUT_CHARS).unwrap()
             );
         }
+    }
+
+    // ── terminal_style_with (env seam) ───────────────────────────────
+
+    #[test]
+    fn terminal_style_reads_colour_and_link_support_from_the_environment() {
+        use crate::test_support::env::MapEnv;
+
+        let xterm = MapEnv::new().with("TERM", "xterm-256color");
+        assert_eq!(
+            terminal_style_with(&xterm, true),
+            TerminalStyle {
+                color: true,
+                hyperlinks: false
+            }
+        );
+        assert_eq!(terminal_style_with(&xterm, false), TerminalStyle::default());
+        assert!(!terminal_style_with(&xterm.clone().with("NO_COLOR", "1"), true).color);
+        // An empty `NO_COLOR` is "unset" per no-color.org.
+        assert!(terminal_style_with(&xterm.clone().with("NO_COLOR", ""), true).color);
+        for (key, value) in [
+            ("TERM_PROGRAM", "ghostty"),
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_PROGRAM", "WezTerm"),
+            ("TERM_PROGRAM", "vscode"),
+            ("TERM_PROGRAM", "Hyper"),
+            ("WT_SESSION", "1"),
+            ("KITTY_WINDOW_ID", "1"),
+            ("KONSOLE_VERSION", "230804"),
+            ("ALACRITTY_WINDOW_ID", "1"),
+            ("VTE_VERSION", "6003"),
+        ] {
+            assert!(
+                terminal_style_with(&xterm.clone().with(key, value), true).hyperlinks,
+                "{key}={value}"
+            );
+        }
+        for (key, value) in [
+            ("TERM_PROGRAM", "Apple_Terminal"),
+            ("VTE_VERSION", "4602"),
+            ("VTE_VERSION", "not a number"),
+        ] {
+            assert!(
+                !terminal_style_with(&xterm.clone().with(key, value), true).hyperlinks,
+                "{key}={value}"
+            );
+        }
+        // A capable terminal still emits nothing when stdout is redirected.
+        assert_eq!(
+            terminal_style_with(&xterm.with("TERM_PROGRAM", "ghostty"), false),
+            TerminalStyle::default()
+        );
     }
 
     // ── fetch_docs (fake-gh shim) ────────────────────────────────────
