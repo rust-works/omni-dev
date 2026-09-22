@@ -514,7 +514,8 @@ requests are clickable links to their GitHub pages. Low-complexity choices and
 successful routing are green, intermediate choices yellow, and high-complexity
 choices and failures red. Colours follow each ladder's tier order, including
 custom ladders. Redirected output and unsupported terminals remain plain text;
-`NO_COLOR` suppresses colour. JSON and YAML never contain terminal styling.
+a non-empty `NO_COLOR` suppresses colour. JSON and YAML never contain terminal
+styling.
 
 ```
 rust-works/omni-dev#1641 — Some issue title
