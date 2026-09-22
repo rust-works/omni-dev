@@ -27,6 +27,7 @@ pub(crate) mod paste;
 pub(crate) mod pivot;
 pub(crate) mod protection;
 pub(crate) mod read;
+pub(crate) mod sort_range;
 pub(crate) mod structure;
 pub(crate) mod validation;
 pub(crate) mod values;
@@ -357,6 +358,9 @@ pub enum SheetsSubcommands {
     /// under the same grant. The filled values can never be previewed;
     /// see `auto-fill --help`.
     AutoFill(auto_fill::AutoFillCommand),
+    /// Reorders rows in a range by one or more column keys. Gated by the
+    /// folder `sheets-write` operation (issue #1842, ADR-0083 §3).
+    SortRange(sort_range::SortRangeCommand),
 }
 
 impl SheetsCommand {
@@ -447,6 +451,7 @@ impl SheetsCommand {
             SheetsSubcommands::CopyPaste(cmd) => cmd.execute(client).await,
             SheetsSubcommands::PasteData(cmd) => cmd.execute(client).await,
             SheetsSubcommands::AutoFill(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::SortRange(cmd) => cmd.execute(client).await,
         }
     }
 }

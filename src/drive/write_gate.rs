@@ -118,6 +118,10 @@ pub enum DriveOperation {
     /// replace only cell values or formulas, already covered by `sheets
     /// write` and `sheets clear`; scope does not create a new permission
     /// boundary within a spreadsheet.
+    ///
+    /// Since issue #1842 ([ADR-0083](../../docs/adrs/adr-0083.md) §3), also
+    /// covers `sort-range`: it permutes values within a caller-named range,
+    /// which a `sheets-write` grant could already replace or clear.
     SheetsWrite,
     /// Structurally edit an existing Google Sheet via `spreadsheets.batchUpdate`
     /// (issue #1613, [ADR-0075](../../docs/adrs/adr-0075.md) §1) — adding,

@@ -627,7 +627,7 @@ operation anywhere in a target's ancestor chain:
 | `create`            | deny    | `create`, `sheets create` |
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets sort-range` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
 | `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
@@ -1774,6 +1774,37 @@ it deliberately.
 
 Exit code is 0 whether the write succeeded, was blocked, or failed — inspect
 the output, not `$?`.
+
+#### `drive sheets sort-range`
+
+Reorders rows in a fully bounded range by one or more column keys. It is
+gated by **`sheets-write`** (issue #1842, [ADR-0083](adrs/adr-0083.md) §3):
+the request only permutes the named range's cells, which is strictly less
+than clearing or replacing that same range under an existing `sheets-write`
+grant.
+
+```bash
+# Sort first by column 0 ascending, then column 2 descending.
+omni-dev drive sheets sort-range <ID> --sheet Q1 --range A2:D100 \
+  --sort-by 0:asc --sort-by 2:desc
+
+# Preview the gate and request; this never reads values or calls batchUpdate.
+omni-dev drive sheets sort-range <ID> --sheet Q1 --range A2:D100 \
+  --sort-by 0:asc --dry-run
+```
+
+Each `--sort-by` is `COLUMN:asc|desc`; repeat it in precedence order. The
+range must be bounded (`A2:D100`, not `A:A` or `2:2`). v1 supports
+column-value order only: Sheets color-based criteria are intentionally not
+exposed yet.
+
+`--dry-run` does not predict the after-order. It names the range and sort
+keys, and compares the selected columns with the sheet's allocated width.
+This is a conservative warning: the metadata does not say which columns
+actually contain data. Sorting only part of a wider table can detach records
+from their other columns; formulas and references outside the range may then
+observe a different row's value. Sort keys use absolute, zero-based sheet
+column indexes and must fall inside the selected range.
 
 #### `drive sheets auto-fill`
 
