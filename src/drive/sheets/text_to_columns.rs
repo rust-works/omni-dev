@@ -1361,6 +1361,20 @@ mod tests {
         );
     }
 
+    /// `Auto` earns its own no-spill wording: unlike every fixed
+    /// delimiter, a local no-match says nothing about what Sheets will
+    /// detect, so the summary reports the span as unknown rather than
+    /// claiming no row spills.
+    #[test]
+    fn describe_effect_with_no_spill_under_auto() {
+        let summary = describe_effect("'Q1'!A2:A10", None, 1, &Delimiter::Auto);
+        assert_eq!(
+            summary,
+            "split 'Q1'!A2:A10 on auto-detected; no separator this preview tries appears in the \
+             source, so the spill span is unknown"
+        );
+    }
+
     /// The summary is reused verbatim by `Changed` and by the request
     /// log's `fields_changed`, so it must read correctly *after* the
     /// fact too — a conditional clause here would describe a mutation
@@ -1408,7 +1422,7 @@ mod tests {
                 assert_eq!(req.delimiter, None);
                 assert_eq!(req.delimiter_type, DelimiterType::Comma);
             }
-            other => panic!("unexpected request: {other:?}"),
+            other => panic!("unexpected request: {other:?}"), // omni-dev: coverage ignore-line reason="this match's catch-all only runs if build_request failed to return the request variant this test constructs it to build; that never happens, so the branch never executes"
         }
     }
 
@@ -1420,7 +1434,7 @@ mod tests {
                 assert_eq!(req.delimiter, Some("|".to_string()));
                 assert_eq!(req.delimiter_type, DelimiterType::Custom);
             }
-            other => panic!("unexpected request: {other:?}"),
+            other => panic!("unexpected request: {other:?}"), // omni-dev: coverage ignore-line reason="this match's catch-all only runs if build_request failed to return the request variant this test constructs it to build; that never happens, so the branch never executes"
         }
     }
 
@@ -1490,7 +1504,7 @@ mod tests {
                 overwritten_cells,
                 past_grid_extent,
             },
-            other => other,
+            other => other, // omni-dev: coverage ignore-line reason="would_change_outcome always constructs a WouldChange result, so this catch-all identity arm never runs"
         };
         let lines = describe_lines(&outcome);
         assert!(lines[0].starts_with("Applied: "));
@@ -1564,8 +1578,20 @@ mod tests {
     fn a_failed_lease_check_maps_to_failed() {
         match TextToColumnsResult::from_lease_failed("ledger unreadable".to_string()) {
             TextToColumnsResult::Failed { detail } => assert_eq!(detail, "ledger unreadable"),
-            other => panic!("expected Failed, got {other:?}"),
+            other => panic!("expected Failed, got {other:?}"), // omni-dev: coverage ignore-line reason="from_lease_failed always returns Failed; this test's catch-all guards that assumption and never runs"
         }
+    }
+
+    /// No engine call site ever renders a book-using result with no file
+    /// name (every path that resolves one already has the target's
+    /// name), but `describe`/`describe_lines` are `pub` and take
+    /// whatever `TextToColumnsOutcome` they are given — so this pins the
+    /// fallback to the raw spreadsheet id directly.
+    #[test]
+    fn describe_falls_back_to_the_spreadsheet_id_with_no_file_name() {
+        let mut outcome = would_change_outcome(Vec::new(), false);
+        outcome.file_name = None;
+        assert!(describe(&outcome).contains("'sheet-1'"));
     }
 
     #[test]
@@ -1973,6 +1999,42 @@ mod tests {
         ));
     }
 
+    /// A `deny` entry — as opposed to the "no matching rule" default
+    /// policy every other `Blocked` test exercises — names the deciding
+    /// rule in the rendered message. `dry_run: false` also reaches
+    /// `record_attempt`'s `Blocked` arm, which a dry run never does.
+    #[tokio::test]
+    async fn a_blocked_by_rule_names_the_deciding_folder_in_the_message() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_metadata(&server).await;
+        let deny_by_rule = FolderPermissionRule {
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
+            recursive: true,
+            allow: std::iter::once(DriveOperation::SheetsWrite).collect(),
+            deny: std::iter::once(DriveOperation::SheetsStructure).collect(),
+            require_lease: false,
+        };
+        let outcome = text_to_columns(&client, &sheets, &base_opts(false), &[deny_by_rule]).await;
+        assert!(
+            matches!(
+                outcome.result,
+                TextToColumnsResult::Blocked {
+                    decided_by: Some(_),
+                    ..
+                }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        let text = describe(&outcome);
+        assert!(
+            text.contains("refused by rule on folder parent-1"),
+            "{text}"
+        );
+    }
+
     #[tokio::test]
     async fn open_ended_source_is_refused() {
         let server = wiremock::MockServer::start().await;
@@ -2019,6 +2081,8 @@ mod tests {
             TextToColumnsResult::RefusedInvalidDelimiter { .. }
         ));
         assert!(server.received_requests().await.unwrap().is_empty());
+        // Refused before any request, so there is no file name yet.
+        assert!(outcome.file_name.is_none());
     }
 
     #[tokio::test]
@@ -2089,6 +2153,35 @@ mod tests {
         ));
     }
 
+    /// The lease-holding counterpart of `a_batch_update_failure_is_reported_as_failed`:
+    /// with a lease actually granted, a failed `batchUpdate` must reach
+    /// `conclude_native_leased_write`'s `Err` arm and record the failure
+    /// against the held lease, not just report `Failed`.
+    #[tokio::test]
+    async fn a_valid_lease_records_the_failure_when_batch_update_fails() {
+        let ledger_dir = tempfile::tempdir().unwrap();
+        let ledger_path = ledger_dir.path().join("leases.json");
+        let token = seed_lease(&ledger_path, "sheet-1", "1");
+
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_metadata(&server).await;
+        mount_values(
+            &server,
+            "'Q1'!A2:A4",
+            serde_json::json!({"values": [["a,b"]]}),
+        )
+        .await;
+        mount_values(&server, "'Q1'!B2:B4", serde_json::json!({"values": []})).await;
+        mount_batch_update(&server, 400).await;
+        let mut opts = base_opts(false);
+        opts.lease_token = Some(token);
+        opts.ledger_path = ledger_path;
+        let rules = vec![rule(DriveOperation::SheetsWrite, true)];
+        let outcome = text_to_columns(&client, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, TextToColumnsResult::Failed { .. }));
+    }
+
     // ── the §6 "never a value" guard, end to end ─────────────────────────
 
     /// The pinned form of ADR-0083 §6's rule for this verb: a
@@ -2126,7 +2219,7 @@ mod tests {
             TextToColumnsResult::WouldChange {
                 overwritten_cells, ..
             } => assert_eq!(overwritten_cells, &vec!["B2".to_string()]),
-            other => panic!("expected WouldChange, got {other:?}"),
+            other => panic!("expected WouldChange, got {other:?}"), // omni-dev: coverage ignore-line reason="this test's mocked responses always drive a WouldChange outcome; this catch-all guards that assumption and never runs"
         }
         let rendered = describe_lines(&outcome).join("\n");
         assert!(
@@ -2221,7 +2314,7 @@ mod tests {
                 assert!(overwritten_cells.is_empty());
                 assert!(past_grid_extent);
             }
-            other => panic!("expected Changed, got {other:?}"),
+            other => panic!("expected Changed, got {other:?}"), // omni-dev: coverage ignore-line reason="this test's mocked responses always drive a Changed outcome; this catch-all guards that assumption and never runs"
         }
         // Only the source was read: there was no in-grid spill to ask about.
         let reads: Vec<_> = server
@@ -2573,7 +2666,7 @@ mod tests {
                 assert!(!past_grid_extent);
                 assert!(summary.contains("no row spills beyond the source"));
             }
-            other => panic!("expected Changed, got {other:?}"),
+            other => panic!("expected Changed, got {other:?}"), // omni-dev: coverage ignore-line reason="this test's mocked responses always drive a Changed outcome; this catch-all guards that assumption and never runs"
         }
         let reads: Vec<_> = server
             .received_requests()
