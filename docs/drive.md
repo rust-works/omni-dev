@@ -2034,6 +2034,22 @@ rewrites ordinary cell content in place, doing nothing a `sheets clear`
 followed by a `sheets write` of the same range could not already do under
 that grant.
 
+**What "trims" means**, measured against the live API rather than assumed —
+the request reference describes it in one sentence, so each of these was
+confirmed by running it:
+
+| input | becomes | |
+|---|---|---|
+| `"  lead-trail  "` | `"lead-trail"` | leading/trailing stripped |
+| `"a   b"` | `"a b"` | **internal runs collapse to one space** |
+| `"   "` | `""` | an all-whitespace cell becomes blank |
+| `"  =1+1  "` | `"=1+1"` (still text) | not reinterpreted as a formula |
+| `=A5` (a real formula) | unchanged | formula text is not touched |
+
+The second row is the one to note: this is not a leading/trailing trim, so
+a cell can change in the middle. The fourth matters if you store
+formula-looking text.
+
 Pass either `--range` or `--whole-sheet`, never both. An open-ended
 `--range` (`A:A`) is completed from the sheet's current grid extent, and
 `--whole-sheet` needs `--sheet` to say which tab:
@@ -2057,10 +2073,16 @@ locations of the range's **non-blank** cells, any of which *may* be
 trimmed, and never their values:
 
 ```
-$ omni-dev drive sheets trim-whitespace <ID> --sheet Q1 --range A2:C10 --dry-run
-Would trim whitespace in 'Q1'!A2:C10 of 'Budget'
-  4 non-blank cell(s) may be trimmed: A2, C2, B3, B7
+$ omni-dev drive sheets trim-whitespace <ID> --sheet Sheet1 --range A1:C5 --dry-run
+Would trim whitespace in 'Sheet1'!A1:C5 of 'Budget'
+  13 non-blank cell(s) may be trimmed: A1, B1, C1, A2, B2, C2, A3, B3, C3, A4, C4, A5, C5
 ```
+
+**That gap is real, not theoretical.** The run above is a live one, and the
+real run that followed it reported `5` — the preview named every non-blank
+cell in the range because it cannot know which of them the server's rule
+will touch. Read the preview as "at most these", never as a list of cells
+that will change.
 
 Past 50 addresses the rendered line elides the remainder (`… and N more`);
 the `-o json` outcome and the request log keep the full list.
@@ -2070,9 +2092,12 @@ what changed — and deliberately does **not** re-read the range, unlike
 `auto-fill` and the paste family, whose requests return no count:
 
 ```
-$ omni-dev drive sheets trim-whitespace <ID> --sheet Q1 --range A2:C10
-Trimmed whitespace in 3 cell(s) of 'Q1'!A2:C10 in 'Budget'
+$ omni-dev drive sheets trim-whitespace <ID> --sheet Sheet1 --range A1:C5
+Trimmed whitespace in 5 cell(s) of 'Sheet1'!A1:C5 in 'Budget'
 ```
+
+A run that changes nothing reports `0` rather than omitting the count — the
+API returns the field either way.
 
 #### `drive sheets delete-duplicates`
 
@@ -2097,7 +2122,11 @@ omni-dev drive sheets delete-duplicates <ID> --sheet Q1 --range A2:D100 --dry-ru
 
 Each `--comparison-column` must fall inside the selected range, and the
 range must be fully bounded (`A2:D100`, not `A:A`) — an open-ended range
-is refused so the request cannot reach past the data.
+is refused so the request cannot reach past the data. The column check is
+this tool's own, made before the request: the API rejects an out-of-range
+column too, with `400 INVALID_ARGUMENT: A column used for determining
+duplicates is not contained in the range`, so the local refusal only buys
+a clearer message and a round trip.
 
 **The API selects the rows, not the caller.** Every other `sheets-delete`
 verb removes cells named by address; here Sheets applies its own equality
@@ -2113,7 +2142,23 @@ Would remove duplicate rows from 'Q1'!A2:D100 in 'Budget', comparing every colum
   which rows would be removed is decided by the API and cannot be previewed
 ```
 
-That blank-row warning is the reason there is no `--whole-sheet` scope
+Each clause of that rule was confirmed against the live API, on a
+seven-row range comparing every column:
+
+- `["A","1","x"]` was removed as a duplicate of `["a","1","x"]` —
+  **case is ignored**.
+- A second blank row was removed as a duplicate of the first —
+  **blank rows duplicate one another**.
+- A row identical to row 1 but five rows below it was removed —
+  **duplicates need not be adjacent**.
+- A row differing only in an *uncompared* column was removed when
+  `--comparison-column` excluded that column, and kept when it didn't.
+- A row **hidden by a basic filter** was removed like any other. Worth
+  dwelling on: the removed row carried a value in a column the filter was
+  hiding, so a dedupe can delete data the operator could not see on screen
+  when they ran it.
+
+That blank-row behaviour is the reason there is no `--whole-sheet` scope
 here, though `trim-whitespace` has one: blank rows duplicate one another,
 so a whole-sheet dedupe would delete a tab's entire trailing empty region.
 It applies to any bounded range that runs past the data, too.

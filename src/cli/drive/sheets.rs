@@ -381,6 +381,10 @@ pub enum SheetsSubcommands {
     /// see `text-to-columns --help`.
     TextToColumns(text_to_columns::TextToColumnsCommand),
     /// Trims whitespace in every cell of a range, or of a whole sheet.
+    /// Trimming strips leading and trailing whitespace **and collapses
+    /// each internal run to a single space** (measured live: `a   b`
+    /// becomes `a b`); text that trims to something starting `=` or `+`
+    /// stays a string and is not reinterpreted as a formula.
     /// Gated by the folder `sheets-write` operation (issue #1844,
     /// ADR-0083 §1) — it rewrites ordinary cell content in place, doing
     /// nothing a `sheets clear` followed by a `sheets write` of the same

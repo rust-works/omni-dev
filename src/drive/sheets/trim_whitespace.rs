@@ -6,6 +6,13 @@
 //! place, which a `sheets clear` followed by a `sheets write` of the same
 //! range could already do under that grant.
 //!
+//! The trim rule, measured live against the API (issue #1844): leading
+//! and trailing whitespace is stripped **and each internal run collapses
+//! to a single space** (`a   b` becomes `a b`), a cell of nothing but
+//! whitespace becomes blank, a formula's text is untouched, and text that
+//! trims to something starting `=` or `+` stays a string rather than
+//! becoming a formula.
+//!
 //! **The preview never predicts which cells change.** §6 puts this verb in
 //! the first `--dry-run` tier — one bounded read, reporting the *count and
 //! A1 locations* of the range's non-blank cells and never their values —
@@ -13,7 +20,8 @@
 //! deciding that means reproducing the server's trim rule locally, the
 //! same "preview that lies" risk §6 declined for `findReplace`. So every
 //! non-blank cell is a candidate and the wording is always "may be
-//! trimmed".
+//! trimmed". The gap is real, not theoretical: a live run over a 13-cell
+//! range previewed all 13 as candidates and the server changed 5.
 //!
 //! **The read happens on `--dry-run` only**, unlike `auto_fill.rs` and
 //! `paste.rs`, which read on both paths so their real runs can report the
