@@ -644,6 +644,69 @@ effort/reasoning-level knob, and the Chinese-lab and open-weight providers are
 out of scope: each changes the validated `anthropic` question or needs its own
 validation.
 
+### Rungs and model versions
+
+A rung names a model **family**, not a version, and its description describes
+a **capability level**, not a particular model. Jev reads only the
+description, so its answer says what kind of capability the work needs. Which
+current model supplies that capability is for the consumer to decide.
+
+That distinction matters whenever a new model reorders the families. Claude
+Opus 5.5 (released 2026-09-22) is the first such case. Anthropic reports it
+performs at the level of Claude Fable 5.1 on most work, and ahead of it on
+coding benchmarks, at $4/$20 per MTok against Fable 5.1's $10/$50. The
+`opus` description's caveat, *"Can under-explore a genuinely open design
+space"*, may therefore understate Opus 5.5.
+
+The descriptions are deliberately **left unchanged**. They are the only text
+validated against `jev-1.13.0`, and rewording one shifts every answer. Adjust
+the mapping from rung to model instead. A reasonable starting point, which has
+**not** been evaluated:
+
+| Stage answer | Hand the work to                                                                  |
+|--------------|-----------------------------------------------------------------------------------|
+| `sonnet`     | `claude-sonnet-5`                                                                 |
+| `opus`       | `claude-opus-5-5`                                                                 |
+| `fable`      | `claude-fable-5-1` for design; consider `claude-opus-5-5` for implement or review |
+
+Keep `fable` → Fable 5.1 for design. Anthropic's "most work" claim leaves room
+for open-ended design and research, which is exactly what the `fable`
+description names. For implementation, where Opus 5.5 leads on coding
+benchmarks, downgrading a `fable` answer is the cheapest change to try first.
+
+To have `route` emit versioned model names directly, register a custom ladder
+that keeps the `anthropic` descriptions byte for byte and changes only the
+tier names:
+
+```yaml
+# claude-versions.yaml — the anthropic descriptions, versioned tier names
+tiers:
+  - name: claude-sonnet-5
+    description: >-
+      Reliable at executing a clear specification and following patterns that already exist in the
+      codebase. Tends to miss non-obvious interactions between parts and does not question the
+      specification.
+  - name: claude-opus-5-5
+    description: >-
+      Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
+      ordering, once the overall direction is set. Can under-explore a genuinely open design space.
+  - name: claude-fable-5-1
+    description: >-
+      Strongest at open-ended design and research: choosing between architectures, working in
+      unfamiliar territory with no precedent in the codebase, anticipating failure modes, and
+      security-critical judgement.
+```
+
+```bash
+omni-dev ai jev route '#1234' --ladders claude --ladder-definition claude=claude-versions.yaml
+```
+
+Jev sees tier names as criterion keys, so versioned names are the same
+untested change as the `openai` and `gemini` ladders' names; treat their
+answers the same way. Re-running the #1779 evaluation is deferred until
+Claude Sonnet 5.5 ships ("within weeks" of Opus 5.5), since that release may
+date the `sonnet` description too and one evaluation can cover both.
+
 ### Custom ladders
 
 `--ladder-definition NAME=FILE` registers a custom ladder under `NAME`, its

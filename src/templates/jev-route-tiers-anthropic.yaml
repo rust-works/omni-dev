@@ -1,6 +1,13 @@
 # The `anthropic` model ladder for `omni-dev ai jev route` (#1779, #1820):
 # sonnet (Claude Sonnet) / opus (Claude Opus) / fable (Claude Fable).
 #
+# A rung names a model family and its description a capability level, not a
+# version: Jev reads only the description, and mapping a rung to a current
+# model is the consumer's job. When a release reorders the families (Claude
+# Opus 5.5, 2026-09-22, is reported at Fable 5.1's level on most work), change
+# that mapping, not these descriptions. See docs/jev.md, "Rungs and model
+# versions".
+#
 # Tiers are listed from least to most capable; `route` ranks them by position.
 # The descriptions are the text validated against jev-1.13.0 — rewording them
 # shifts every answer, so re-run the evaluation before changing a word. The
