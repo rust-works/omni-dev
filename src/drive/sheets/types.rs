@@ -804,11 +804,12 @@ pub enum BatchUpdateRequestItem {
     SortRange(SortRangeRequest),
     /// Splits a single column's delimited text across the adjacent columns
     /// to its right (`text-to-columns`, issue #1843,
-    /// [ADR-0083](../../../docs/adrs/adr-0083.md) §1). Gated by
-    /// `DriveOperation::SheetsWrite` alone: it writes ordinary cell content
-    /// into columns the request derives from `source`, doing nothing a
-    /// `sheets clear` followed by a `sheets write` of the same span could
-    /// not already do under the same grant.
+    /// [ADR-0083](../../../docs/adrs/adr-0083.md) §§1, 5). Gated by
+    /// `DriveOperation::SheetsWrite` **and** `SheetsStructure`: it writes
+    /// ordinary cell content into columns the request derives from
+    /// `source`, which the first covers, and was measured carrying the
+    /// source cell's formatting into those columns, which only the second
+    /// does (§5's live-verification consequence).
     TextToColumns(TextToColumnsRequest),
 }
 

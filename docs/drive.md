@@ -627,8 +627,8 @@ operation anywhere in a target's ancestor chain:
 | `create`            | deny    | `create`, `sheets create` |
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets sort-range`, `sheets text-to-columns` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets sort-range` — cell values; `sheets text-to-columns` (also needs `sheets-structure`); `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `text-to-columns` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -1880,10 +1880,17 @@ holds no value, so nothing is lost by not reading it.
 #### `drive sheets text-to-columns`
 
 Splits a single column's delimited text across the adjacent columns to its
-right. Also gated under **`sheets-write`** (issue #1843,
-[ADR-0083](adrs/adr-0083.md) §1) — it writes ordinary cell content, exactly
-what a `sheets clear` followed by a `sheets write` of the same span could
-already do under that grant.
+right. Gated under **both `sheets-write` and `sheets-structure`** (issue
+#1843, [ADR-0083](adrs/adr-0083.md) §§1, 5).
+
+ADR-0083 §1 proposed `sheets-write` alone — the split writes ordinary cell
+content, exactly what a `sheets clear` followed by a `sheets write` of the
+same span could already do under that grant — and §5 made that provisional
+on live verification. The live run settled it the other way: splitting a
+**bold, pink** source column left every spill cell bold and pink, where
+they had been unformatted. A `sheets-write` grant does not confer
+formatting, so the union is the honest gate. Neither half opens it alone,
+and a refusal names the half that was missing.
 
 `--source` must resolve to a **fully bounded, single column** — the API's
 own "must span exactly one column" constraint, plus this v1's own
@@ -1926,22 +1933,26 @@ only `--range` is): the API decides for itself how many columns each row's
 split needs, and a quoted delimiter or a run of consecutive separators can
 make the local split wider than the real one.
 
-`--delimiter auto` is the one case where the count is an **estimate
-rather than a bound**, and those runs carry an extra caveat line saying
-so. For every other delimiter the local split uses the same separator the
-API is told to use, so it can only over-count; under `auto` the separator
-is Sheets' own choice, and this crate can only guess it by trying comma,
-semicolon, period and space and keeping the widest. Whether Sheets'
-detection is confined to those four is undocumented and unverified
-against a live workbook — if it can detect some other separator, the real
-split can reach cells the preview does not name:
+`--delimiter auto` is different, and **not** in a way a caveat alone
+covers. For every other delimiter the local split uses the same separator
+the API is told to use, so it can only over-count. Under `auto` the
+separator is Sheets' own choice, and this crate can only guess it by
+trying comma, semicolon, period and space. Sheets' detection is **not**
+confined to those four — a live run split a **tab**-separated column
+under `auto` with none of the four present — so an `auto` preview can
+under-report as well as over-report.
+
+Because of that, an `auto` run never prints an all-clear. Where another
+delimiter would say "no non-blank cells in the spill columns", `auto`
+says nothing and carries its caveat instead; and where the local split
+finds no separator at all, the summary reports the spill span as unknown
+rather than claiming no row spills:
 
 ```
 $ omni-dev drive sheets text-to-columns <ID> --sheet Q1 --source A2:A4 \
     --delimiter auto --dry-run
-Would split 'Q1'!A2:A4 on auto-detected into up to 3 column(s), spill 'Q1'!B2:C4 in 'Budget'
-  no non-blank cells in the spill columns
-  --delimiter auto lets Sheets detect the separator itself; this count comes from trying comma, semicolon, period and space locally and keeping the widest, so it is an estimate rather than an upper bound if Sheets detects some other separator
+Would split 'Q1'!A2:A4 on auto-detected; no separator this preview tries appears in the source, so the spill span is unknown in 'Budget'
+  --delimiter auto lets Sheets detect the separator itself, and it detects separators this preview does not try (a tab-separated column splits under auto, though none of comma, semicolon, period or space appears in it) — so for auto the width above and the cells listed are a guess in both directions, not a bound
   the number of columns the split needs, and the values it writes, are computed by Sheets' own splitting and are never reported, before or after the request; the count above is a local upper-bound estimate only
 ```
 
@@ -1949,6 +1960,21 @@ A spill that runs past the sheet's current column count is **not refused
 client-side**: `sheets append` already grows the grid under `sheets-write`,
 so `text-to-columns` follows the same rule. The summary carries a caveat
 instead, and the verb never prepends a request to grow the sheet first.
+Measured live: splitting `Z60` on a 26-column sheet grew it to 28 columns
+rather than erroring.
+
+Two more behaviours were measured against a live workbook, since the API
+documents none of them:
+
+- **Consecutive delimiters do not collapse.** `f,,g` splits into three
+  columns, the middle one empty — the naive local split agrees exactly.
+  Runs of spaces behave the same way under `--delimiter space`.
+- **Quoted delimiters are honoured, and cells past the real width are
+  left alone.** `q,"x,y",z` splits into three columns, not the four the
+  local split counts, which is why the reported count is an upper bound;
+  and a column beyond the widest row's real width keeps its old value,
+  while cells *within* that width are cleared even on rows that need
+  fewer.
 
 #### `drive sheets create`
 

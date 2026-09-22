@@ -264,9 +264,10 @@ types, so the log is a complete invocation history, not just an HTTP history:
   listed cells are the source and were never touched. Absent means the list
   is exact, which is `--source` and every other verb.
 
-  `text-to-columns` (issue #1843, [ADR-0083](adrs/adr-0083.md) §1) uses the
-  same kind and keys again, with `operation` of `sheets-text-to-columns`
-  and gated `sheets-write`. `range` carries the source column's A1
+  `text-to-columns` (issue #1843, [ADR-0083](adrs/adr-0083.md) §§1, 5) uses
+  the same kind and keys again, with `operation` of
+  `sheets-text-to-columns`, gated by `sheets-write` **and**
+  `sheets-structure`. `range` carries the source column's A1
   address (not the spill span — the request log's `range` key is always
   the value that started the write for every verb in this tranche), and
   `fields_changed` the tense-neutral summary: the source, the delimiter,
@@ -277,9 +278,9 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `overwritten_cells` never carries the split pieces or the source's
   values, only the bare A1 addresses of the cells the split might reach.
   Under `--delimiter auto` the span is not even a bound (Sheets picks the
-  separator too, and may pick one the local split never tried), but the
-  key has no third state; that caveat is carried in the rendered output
-  rather than in the record.
+  separator too, and was measured picking a tab, which the local split
+  never tries), but the key has no third state; that caveat is carried in
+  the rendered output rather than in the record.
 
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
