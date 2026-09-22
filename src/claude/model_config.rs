@@ -1265,7 +1265,10 @@ mod tests {
         let registry = embedded_only();
 
         // Flagged models — including the default and a Bedrock-style prefix.
+        assert!(registry.supports_structured_output("claude-fable-5-1"));
         assert!(registry.supports_structured_output("claude-fable-5"));
+        assert!(registry.supports_structured_output("claude-opus-5-5"));
+        assert!(registry.supports_structured_output("claude-opus-5"));
         assert!(registry.supports_structured_output("claude-opus-4-8"));
         assert!(registry.supports_structured_output("claude-opus-4-7"));
         assert!(registry.supports_structured_output("claude-sonnet-5"));
@@ -1295,7 +1298,10 @@ mod tests {
         let registry = embedded_only();
 
         for id in [
+            "claude-fable-5-1",
             "claude-fable-5",
+            "claude-opus-5-5",
+            "claude-opus-5",
             "claude-opus-4-8",
             "claude-opus-4-7",
             "claude-sonnet-5",
@@ -2087,12 +2093,12 @@ providers:
     #[test]
     fn model_family_falls_back_to_the_raw_identifier_when_unregistered() {
         let registry = embedded_only();
-        // "claude-opus-5" is not yet in the embedded catalog, but its id
-        // still names its family — the registry-miss fallback must catch it
-        // rather than reporting Unknown.
-        assert!(registry.get_model_spec("claude-opus-5").is_none());
+        // "claude-opus-6" is not in the embedded catalog, but its id still
+        // names its family — the registry-miss fallback must catch it rather
+        // than reporting Unknown.
+        assert!(registry.get_model_spec("claude-opus-6").is_none());
         assert_eq!(
-            registry.get_model_family("claude-opus-5"),
+            registry.get_model_family("claude-opus-6"),
             ModelFamily::Opus
         );
     }
