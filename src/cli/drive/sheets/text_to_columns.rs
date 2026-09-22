@@ -3,9 +3,12 @@
 //!
 //! Gated by
 //! [`DriveOperation::SheetsWrite`](crate::drive::write_gate::DriveOperation::SheetsWrite)
-//! alone — see that variant's doc comment and `text_to_columns.rs`'s
-//! module docs for the live-verification item that could move it to a
-//! two-operation gate.
+//! **and**
+//! [`DriveOperation::SheetsStructure`](crate::drive::write_gate::DriveOperation::SheetsStructure)
+//! — ADR-0083 §1 proposed the first alone and §5 made that provisional
+//! on live verification, which found a split carries the source cell's
+//! formatting into the spill cells. See `text_to_columns.rs`'s module
+//! docs for the evidence.
 
 use anyhow::Result;
 use clap::Parser;
@@ -59,8 +62,9 @@ pub struct TextToColumnsCommand {
     pub source: String,
 
     /// Which separator to split on. `auto` lets Sheets detect it
-    /// itself, in which case the previewed width is an estimate rather
-    /// than an upper bound — see `--dry-run`.
+    /// itself, including separators this preview cannot try — a
+    /// tab-separated column splits under `auto` — so an `auto` preview
+    /// is a guess in both directions. See `--dry-run`.
     #[arg(long, value_enum)]
     pub delimiter: DelimiterArg,
 
@@ -78,8 +82,10 @@ pub struct TextToColumnsCommand {
     /// count and A1 locations of the non-blank cells that would be
     /// overwritten — never the values Sheets would write, which cannot be
     /// previewed. The width is a true bound for every delimiter but
-    /// `auto`, where Sheets picks the separator itself and may pick one
-    /// this preview never tried; those runs say so on their own line.
+    /// `auto`: Sheets detects separators this preview does not try (a
+    /// tab-separated column splits under `auto`), so an `auto` preview
+    /// can under-report as well as over-report, and says so on its own
+    /// line rather than printing an all-clear.
     #[arg(long)]
     pub dry_run: bool,
 

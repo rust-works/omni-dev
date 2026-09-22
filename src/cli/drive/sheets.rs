@@ -363,12 +363,12 @@ pub enum SheetsSubcommands {
     /// folder `sheets-write` operation (issue #1842, ADR-0083 §3).
     SortRange(sort_range::SortRangeCommand),
     /// Splits a single column's delimited text across the adjacent
-    /// columns to its right. Gated by the folder `sheets-write` operation
-    /// (issue #1843, ADR-0083 §1) — it writes ordinary cell content,
-    /// doing nothing a `sheets clear` followed by a `sheets write` could
-    /// not already do under the same grant. How many columns the split
-    /// needs, and the values it writes, can never be previewed; see
-    /// `text-to-columns --help`.
+    /// columns to its right. Gated by the folder `sheets-write` **and**
+    /// `sheets-structure` operations (issue #1843, ADR-0083 §§1, 5) — it
+    /// writes ordinary cell content, and carries the source cell's
+    /// formatting into the columns it spills into. How many columns the
+    /// split needs, and the values it writes, can never be previewed;
+    /// see `text-to-columns --help`.
     TextToColumns(text_to_columns::TextToColumnsCommand),
 }
 

@@ -4520,7 +4520,7 @@ Commands:
   paste-data                   Pastes delimited text into a range anchored at a destination cell, as if pasted from the clipboard (issue #1839, ADR-0083 §4). `delimiter`-form only. Same `--paste-type` gate mapping as `copy-paste`
   auto-fill                    Extends a series from source cells into an adjacent destination, using Sheets' own pattern-detection heuristics. Gated by the folder write-permission rules' `sheets-write` operation (issue #1840, ADR-0083 §1) — it writes ordinary cell content, doing nothing a `sheets clear` followed by a `sheets write` could not already do under the same grant. The filled values can never be previewed; see `auto-fill --help`
   sort-range                   Reorders rows in a range by one or more column keys. Gated by the folder `sheets-write` operation (issue #1842, ADR-0083 §3)
-  text-to-columns              Splits a single column's delimited text across the adjacent columns to its right. Gated by the folder `sheets-write` operation (issue #1843, ADR-0083 §1) — it writes ordinary cell content, doing nothing a `sheets clear` followed by a `sheets write` could not already do under the same grant. How many columns the split needs, and the values it writes, can never be previewed; see `text-to-columns --help`
+  text-to-columns              Splits a single column's delimited text across the adjacent columns to its right. Gated by the folder `sheets-write` **and** `sheets-structure` operations (issue #1843, ADR-0083 §§1, 5) — it writes ordinary cell content, and carries the source cell's formatting into the columns it spills into. How many columns the split needs, and the values it writes, can never be previewed; see `text-to-columns --help`
   help                         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -5986,9 +5986,9 @@ Options:
 
 ================================================================================
 
-omni-dev drive sheets text-to-columns - Splits a single column's delimited text across the adjacent columns to its right. Gated by the folder `sheets-write` operation (issue #1843, ADR-0083 §1) — it writes ordinary cell content, doing nothing a `sheets clear` followed by a `sheets write` could not already do under the same grant. How many columns the split needs, and the values it writes, can never be previewed; see `text-to-columns --help`
+omni-dev drive sheets text-to-columns - Splits a single column's delimited text across the adjacent columns to its right. Gated by the folder `sheets-write` **and** `sheets-structure` operations (issue #1843, ADR-0083 §§1, 5) — it writes ordinary cell content, and carries the source cell's formatting into the columns it spills into. How many columns the split needs, and the values it writes, can never be previewed; see `text-to-columns --help`
 
-Splits a single column's delimited text across the adjacent columns to its right. Gated by the folder `sheets-write` operation (issue #1843, ADR-0083 §1) — it writes ordinary cell content, doing nothing a `sheets clear` followed by a `sheets write` could not already do under the same grant. How many columns the split needs, and the values it writes, can never be previewed; see `text-to-columns --help`
+Splits a single column's delimited text across the adjacent columns to its right. Gated by the folder `sheets-write` **and** `sheets-structure` operations (issue #1843, ADR-0083 §§1, 5) — it writes ordinary cell content, and carries the source cell's formatting into the columns it spills into. How many columns the split needs, and the values it writes, can never be previewed; see `text-to-columns --help`
 
 Usage: text-to-columns [OPTIONS] --source <A1> --delimiter <DELIMITER> <SPREADSHEET_ID>
 
@@ -5998,9 +5998,9 @@ Arguments:
 Options:
       --sheet <NAME>             Sheet (tab) title. Supplies the prefix for a bare `--source`
       --source <A1>              The column to split, optionally carrying its own `Sheet!` prefix. Must resolve to a fully bounded single column (e.g. `A2:A100`)
-      --delimiter <DELIMITER>    Which separator to split on. `auto` lets Sheets detect it itself, in which case the previewed width is an estimate rather than an upper bound — see `--dry-run` [possible values: comma, semicolon, period, space, auto, custom]
+      --delimiter <DELIMITER>    Which separator to split on. `auto` lets Sheets detect it itself, including separators this preview cannot try — a tab-separated column splits under `auto` — so an `auto` preview is a guess in both directions. See `--dry-run` [possible values: comma, semicolon, period, space, auto, custom]
       --custom-delimiter <TEXT>  The separator text. Required with `--delimiter custom`, and refused with any other `--delimiter`
-      --dry-run                  Reports the gate verdict, a local upper-bound split width, and the count and A1 locations of the non-blank cells that would be overwritten — never the values Sheets would write, which cannot be previewed. The width is a true bound for every delimiter but `auto`, where Sheets picks the separator itself and may pick one this preview never tried; those runs say so on their own line
+      --dry-run                  Reports the gate verdict, a local upper-bound split width, and the count and A1 locations of the non-blank cells that would be overwritten — never the values Sheets would write, which cannot be previewed. The width is a true bound for every delimiter but `auto`: Sheets detects separators this preview does not try (a tab-separated column splits under `auto`), so an `auto` preview can under-report as well as over-report, and says so on its own line rather than printing an all-clear
       --lease <TOKEN>            The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                     Print help (see more with '--help')

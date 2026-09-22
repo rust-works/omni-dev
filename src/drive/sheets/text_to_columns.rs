@@ -3,17 +3,23 @@
 //! `textToColumns` request.
 //!
 //! Issue #1843, [ADR-0083](../../../docs/adrs/adr-0083.md). Unblocked by
-//! issue #1831. Gated by [`DriveOperation::SheetsWrite`]
-//! alone (ADR-0083 §1): the split writes ordinary cell content into
-//! however many columns to the right of `source` the split needs, doing
-//! nothing a `sheets clear` followed by a `sheets write` of the same span
-//! could not already do under the same grant. **This is provisional on one
-//! live-verification item ADR-0083 §5 names**: if Sheets is found to carry
-//! the source cell's *formatting* into the spill cells, this module's gate
-//! must move to `target_gate::resolve_all([SheetsWrite, SheetsStructure])`,
-//! the same union `pivot.rs`'s `add-pivot-table` and `auto_fill.rs` use —
-//! see that section for the fixed consequence. Until verified, the gate
-//! stays `SheetsWrite` alone.
+//! issue #1831. Gated by **both** [`DriveOperation::SheetsWrite`] and
+//! [`DriveOperation::SheetsStructure`], through
+//! [`target_gate::resolve_all`] — the same union `pivot.rs`'s
+//! `add-pivot-table` uses.
+//!
+//! ADR-0083 §1 proposed `SheetsWrite` alone, on the argument that the
+//! split writes ordinary cell content and so does nothing a `sheets
+//! clear` followed by a `sheets write` of the same span could not already
+//! do. §5 made that provisional on one live-verification item, and the
+//! live run settled it against the proposal: splitting a **bold, pink**
+//! source column on a live workbook left every spill cell bold and pink,
+//! where they had been unformatted before. A `sheets-write` grant cannot
+//! confer that — formatting is exactly what `SheetsStructure` gates — so
+//! the union is the honest gate and §5's fixed consequence applies. (The
+//! same run also saw Sheets grow the sheet from 26 to 28 columns for a
+//! spill past its last column, which `sheets append` already does under
+//! `sheets-write` alone and so is not itself the reason.)
 //!
 //! **How many columns a split writes is never knowable exactly before the
 //! request is sent, and this crate never sees the split pieces even after
@@ -92,6 +98,14 @@ use crate::request_log::{self, DriveMutationOutcome};
 /// dispatch would have nothing to dispatch on. Named once so the lease
 /// site and the request-log site can't drift.
 const LOG_OPERATION: &str = "sheets-text-to-columns";
+
+/// The operations this verb's gate is the union of, in the order a
+/// refusal reports them. Both are required: `SheetsWrite` for the cell
+/// content the split writes, `SheetsStructure` for the source cell's
+/// formatting it was measured carrying into the spill cells — see the
+/// module docs for the live-run evidence.
+const GATE_OPERATIONS: &[DriveOperation] =
+    &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure];
 
 /// Which separator to split on — the CLI/engine's own enum.
 ///
@@ -262,6 +276,10 @@ pub enum TextToColumnsResult {
     },
     /// The folder write-permission gate refused it.
     Blocked {
+        /// Which of [`GATE_OPERATIONS`] denied first — the union gate
+        /// refuses as soon as one of the two does, and which one it was
+        /// is the only actionable part of the message.
+        operation: DriveOperation,
         /// The rule that decided the refusal, if any.
         decided_by: Option<DecidingRule>,
     },
@@ -422,53 +440,48 @@ async fn text_to_columns_inner(
     }
 
     // ── Target resolution, pre-gate refusals, and the gate itself ──────
-    let (target, decision, resolved_folder_id, requires_lease) = match target_gate::resolve(
-        drive,
-        &opts.spreadsheet_id,
-        DriveOperation::SheetsWrite,
-        rules,
-    )
-    .await
-    {
-        target_gate::TargetGateOutcome::MetadataFetchFailed { detail } => {
-            return bare(TextToColumnsResult::Failed { detail })
-        }
-        target_gate::TargetGateOutcome::Refused { target, refusal } => {
-            let result = match refusal {
-                SheetTargetRefusal::Shortcut => TextToColumnsResult::RefusedShortcut,
-                SheetTargetRefusal::NotASpreadsheet { mime_type } => {
-                    TextToColumnsResult::RefusedNotASpreadsheet { mime_type }
-                }
-                SheetTargetRefusal::NoVisibleParents => {
-                    TextToColumnsResult::RefusedNoVisibleParents
-                }
-            };
-            return TextToColumnsOutcome {
-                spreadsheet_id: opts.spreadsheet_id.clone(),
-                file_name: Some(target.name),
-                resolved_folder_id: None,
-                sheet_id: None,
-                delimiter: opts.delimiter.clone(),
-                result,
-            };
-        }
-        target_gate::TargetGateOutcome::GateFetchFailed { target, detail } => {
-            return TextToColumnsOutcome {
-                spreadsheet_id: opts.spreadsheet_id.clone(),
-                file_name: Some(target.name),
-                resolved_folder_id: None,
-                sheet_id: None,
-                delimiter: opts.delimiter.clone(),
-                result: TextToColumnsResult::Failed { detail },
-            };
-        }
-        target_gate::TargetGateOutcome::Gated {
-            target,
-            decision,
-            resolved_folder_id,
-            requires_lease,
-        } => (target, decision, resolved_folder_id, requires_lease),
-    };
+    let (target, verdict, denied, resolved_folder_id, requires_lease) =
+        match target_gate::resolve_all(drive, &opts.spreadsheet_id, GATE_OPERATIONS, rules).await {
+            target_gate::TargetGateUnionOutcome::MetadataFetchFailed { detail } => {
+                return bare(TextToColumnsResult::Failed { detail })
+            }
+            target_gate::TargetGateUnionOutcome::Refused { target, refusal } => {
+                let result = match refusal {
+                    SheetTargetRefusal::Shortcut => TextToColumnsResult::RefusedShortcut,
+                    SheetTargetRefusal::NotASpreadsheet { mime_type } => {
+                        TextToColumnsResult::RefusedNotASpreadsheet { mime_type }
+                    }
+                    SheetTargetRefusal::NoVisibleParents => {
+                        TextToColumnsResult::RefusedNoVisibleParents
+                    }
+                };
+                return TextToColumnsOutcome {
+                    spreadsheet_id: opts.spreadsheet_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id: None,
+                    sheet_id: None,
+                    delimiter: opts.delimiter.clone(),
+                    result,
+                };
+            }
+            target_gate::TargetGateUnionOutcome::GateFetchFailed { target, detail } => {
+                return TextToColumnsOutcome {
+                    spreadsheet_id: opts.spreadsheet_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id: None,
+                    sheet_id: None,
+                    delimiter: opts.delimiter.clone(),
+                    result: TextToColumnsResult::Failed { detail },
+                };
+            }
+            target_gate::TargetGateUnionOutcome::Gated {
+                target,
+                verdict,
+                denied,
+                resolved_folder_id,
+                requires_lease,
+            } => (target, verdict, denied, resolved_folder_id, requires_lease),
+        };
 
     let pre_gated = |result| TextToColumnsOutcome {
         spreadsheet_id: opts.spreadsheet_id.clone(),
@@ -479,9 +492,14 @@ async fn text_to_columns_inner(
         result,
     };
 
-    if decision.verdict == write_gate::Verdict::Deny {
+    if verdict == write_gate::Verdict::Deny {
+        // `denied` is `Some` whenever the verdict is `Deny`; the fallback
+        // names the first operation rather than inventing one, matching
+        // `pivot.rs`'s own arm.
+        let (operation, decided_by) = denied.unwrap_or((GATE_OPERATIONS[0], None));
         return pre_gated(TextToColumnsResult::Blocked {
-            decided_by: decision.decided_by,
+            operation,
+            decided_by,
         });
     }
 
@@ -778,18 +796,24 @@ const PAST_GRID_EXTENT_CAVEAT: &str =
 /// is the same separator the API is told to use, and a naive
 /// `str::split` can only ever find more pieces than a quote-aware one
 /// (see [`split_width`]). `auto` is the one case where that argument
-/// does not close, because the separator itself is the API's choice —
-/// [`Delimiter::local_split_candidates`] guesses it by trying the four
-/// fixed types, and whether Sheets' own detection is confined to those
-/// four is undocumented and unverified against a live workbook
-/// (ADR-0083 §5's live-verification list). If it can detect anything
-/// else, the local width is an estimate rather than a bound, so the
-/// output says so rather than claiming a guarantee this crate cannot
-/// make.
+/// does not close, because the separator itself is the API's choice, and
+/// [`Delimiter::local_split_candidates`] can only guess it by trying the
+/// four fixed types.
+///
+/// **This is measured, not hypothetical.** On a live workbook, a column
+/// of tab-separated cells previewed under `auto` as "no row spills
+/// beyond the source" with an empty overwrite list — and the real
+/// request split it into three columns, destroying two cells the preview
+/// had just reported as safe. Sheets' detection is *not* confined to the
+/// four this preview tries, so under `auto` the overwrite list is
+/// neither an upper bound nor a lower one, and nothing rendered for an
+/// `auto` run may read as a reassurance. That is what
+/// [`overwritten_line`] suppresses and this line replaces.
 const AUTO_DELIMITER_CAVEAT: &str =
-    "  --delimiter auto lets Sheets detect the separator itself; this count comes from trying \
-     comma, semicolon, period and space locally and keeping the widest, so it is an estimate \
-     rather than an upper bound if Sheets detects some other separator";
+    "  --delimiter auto lets Sheets detect the separator itself, and it detects separators this \
+     preview does not try (a tab-separated column splits under auto, though none of comma, \
+     semicolon, period or space appears in it) — so for auto the width above and the cells \
+     listed are a guess in both directions, not a bound";
 
 /// The **tense-neutral** head of the summary: the source, the delimiter,
 /// and the upper-bound width and spill span (or the "nothing to spill"
@@ -812,6 +836,16 @@ fn describe_effect(
             "split {source_a1} on {} into up to {width_upper_bound} column(s), spill {spill_a1}",
             delimiter.describe(),
         ),
+        // Under `Auto` the local candidates found nothing to split on,
+        // which says nothing about what Sheets will detect — a live run
+        // split a tab-separated column this branch had just called
+        // single-column. Claiming "no row spills" there would be the
+        // same false all-clear `overwritten_line` suppresses.
+        None if matches!(delimiter, Delimiter::Auto) => format!(
+            "split {source_a1} on {}; no separator this preview tries appears in the source, \
+             so the spill span is unknown",
+            delimiter.describe(),
+        ),
         None => format!(
             "split {source_a1} on {} into a single column each row; no row spills beyond \
              the source under this delimiter",
@@ -825,20 +859,35 @@ fn describe_effect(
 /// upper-bound span can list cells the real split never reaches. The
 /// tense follows `dry_run`, the [`PAST_GRID_EXTENT_CAVEAT_DRY_RUN`] pair's
 /// own rule.
-fn overwritten_line(overwritten_cells: &[String], dry_run: bool) -> String {
+///
+/// The empty case is deliberately **not** rendered for
+/// [`Delimiter::Auto`]: "no non-blank cells in the spill columns" is an
+/// affirmative all-clear, and that is the exact sentence a live `auto`
+/// run printed immediately before overwriting two cells (see
+/// [`AUTO_DELIMITER_CAVEAT`]). An `auto` run with nothing to list says
+/// nothing rather than something false; its caveat line carries the
+/// meaning.
+fn overwritten_line(
+    overwritten_cells: &[String],
+    delimiter: &Delimiter,
+    dry_run: bool,
+) -> Option<String> {
     if overwritten_cells.is_empty() {
-        return "  no non-blank cells in the spill columns".to_string();
+        return match delimiter {
+            Delimiter::Auto => None,
+            _ => Some("  no non-blank cells in the spill columns".to_string()),
+        };
     }
     let tense = if dry_run {
         "would be overwritten"
     } else {
         "were overwritten"
     };
-    format!(
+    Some(format!(
         "  up to {} non-blank cell(s) {tense}: {}",
         overwritten_cells.len(),
         overwritten_cells.join(", ")
-    )
+    ))
 }
 
 /// Builds the `textToColumns` request. Placed after the `--dry-run`
@@ -864,7 +913,7 @@ fn record_attempt(outcome: &TextToColumnsOutcome, duration: Duration) {
         _ => None,
     };
     let decided_by = match &outcome.result {
-        TextToColumnsResult::Blocked { decided_by } => decided_by.as_ref(),
+        TextToColumnsResult::Blocked { decided_by, .. } => decided_by.as_ref(),
         _ => None,
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
@@ -966,7 +1015,10 @@ pub fn describe_lines(outcome: &TextToColumnsOutcome) -> Vec<String> {
         TextToColumnsResult::RefusedInvalidDelimiter { detail } => {
             vec![format!("Refused: {detail}")]
         }
-        TextToColumnsResult::Blocked { decided_by } => vec![match decided_by {
+        TextToColumnsResult::Blocked {
+            operation,
+            decided_by,
+        } => vec![match decided_by {
             Some(rule) => format!(
                 "Blocked: text-to-columns on {book} refused by rule on {} {}{}",
                 rule.kind_label(),
@@ -975,7 +1027,7 @@ pub fn describe_lines(outcome: &TextToColumnsOutcome) -> Vec<String> {
             ),
             None => format!(
                 "Blocked: text-to-columns on {book} refused by default policy (no matching rule \
-                 for sheets-write)"
+                 for {operation})"
             ),
         }],
         TextToColumnsResult::RefusedNoLease => LeaseGateRefusal::NoLease
@@ -1022,10 +1074,8 @@ fn change_lines(
     delimiter: &Delimiter,
     dry_run: bool,
 ) -> Vec<String> {
-    let mut lines = vec![
-        head.to_string(),
-        overwritten_line(overwritten_cells, dry_run),
-    ];
+    let mut lines = vec![head.to_string()];
+    lines.extend(overwritten_line(overwritten_cells, delimiter, dry_run));
     if past_grid_extent {
         lines.push(
             if dry_run {
@@ -1147,7 +1197,10 @@ mod tests {
             TextToColumnsResult::RefusedInvalidDelimiter {
                 detail: String::new(),
             },
-            TextToColumnsResult::Blocked { decided_by: None },
+            TextToColumnsResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: None,
+            },
             TextToColumnsResult::RefusedNoLease,
             TextToColumnsResult::RefusedLeaseExpired,
             TextToColumnsResult::RefusedLeaseWrongFile,
@@ -1326,16 +1379,25 @@ mod tests {
 
     #[test]
     fn overwritten_line_is_always_prefixed_up_to() {
-        let line = overwritten_line(&["B2".to_string()], true);
+        let line = overwritten_line(&["B2".to_string()], &Delimiter::Comma, true).unwrap();
         assert!(line.starts_with("  up to 1 non-blank cell(s) would be overwritten"));
     }
 
     #[test]
     fn overwritten_line_empty_case() {
         assert_eq!(
-            overwritten_line(&[], false),
-            "  no non-blank cells in the spill columns"
+            overwritten_line(&[], &Delimiter::Comma, false),
+            Some("  no non-blank cells in the spill columns".to_string())
         );
+    }
+
+    /// An `auto` run with nothing to list says nothing, rather than
+    /// printing the all-clear a live run was measured contradicting.
+    #[test]
+    fn auto_never_prints_an_all_clear() {
+        assert_eq!(overwritten_line(&[], &Delimiter::Auto, true), None);
+        // It still lists cells it did find — that half is informative.
+        assert!(overwritten_line(&["B2".to_string()], &Delimiter::Auto, true).is_some());
     }
 
     #[test]
@@ -1465,7 +1527,10 @@ mod tests {
             TextToColumnsResult::RefusedInvalidDelimiter {
                 detail: "--custom-delimiter must not be empty".to_string(),
             },
-            TextToColumnsResult::Blocked { decided_by: None },
+            TextToColumnsResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: None,
+            },
             TextToColumnsResult::RefusedNoLease,
             TextToColumnsResult::RefusedLeaseExpired,
             TextToColumnsResult::RefusedLeaseWrongFile,
@@ -1542,7 +1607,10 @@ mod tests {
             resolved_folder_id: Some("folder-1".to_string()),
             sheet_id: None,
             delimiter: Delimiter::Comma,
-            result: TextToColumnsResult::Blocked { decided_by: None },
+            result: TextToColumnsResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: None,
+            },
         };
         assert_eq!(
             describe_lines(&outcome),
@@ -1591,15 +1659,23 @@ mod tests {
         (drive, sheets)
     }
 
-    fn rule(op: DriveOperation, require_lease: bool) -> FolderPermissionRule {
+    fn rule_allowing(ops: &[DriveOperation], require_lease: bool) -> FolderPermissionRule {
         FolderPermissionRule {
             folder_id: Some("parent-1".to_string()),
             file_id: None,
             recursive: true,
-            allow: std::iter::once(op).collect(),
+            allow: ops.iter().copied().collect(),
             deny: std::collections::HashSet::default(),
             require_lease,
         }
+    }
+
+    /// The grant this verb actually needs: both halves of
+    /// [`GATE_OPERATIONS`]. Named so a test that means "allowed" does
+    /// not have to restate the union, and so the union moving would
+    /// break one helper rather than twenty tests.
+    fn rule(_op: DriveOperation, require_lease: bool) -> FolderPermissionRule {
+        rule_allowing(GATE_OPERATIONS, require_lease)
     }
 
     fn base_opts(dry_run: bool) -> TextToColumnsOptions {
@@ -1841,21 +1917,59 @@ mod tests {
         let outcome = text_to_columns(&client, &sheets, &opts, &[]).await;
         assert!(matches!(
             outcome.result,
-            TextToColumnsResult::Blocked { decided_by: None }
+            TextToColumnsResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: None,
+            }
         ));
     }
 
+    /// The gate is the **union**, so neither half alone opens it —
+    /// a live run measured the split carrying the source cell's
+    /// formatting into the spill cells, which `sheets-write` does not
+    /// confer, and the values it writes are not something
+    /// `sheets-structure` confers either. Each half is refused naming
+    /// the operation that was missing, which is the only actionable
+    /// part of the message.
     #[tokio::test]
-    async fn a_sheets_structure_only_grant_is_still_blocked() {
+    async fn neither_half_of_the_gate_opens_it_alone() {
+        for (granted, missing) in [
+            (DriveOperation::SheetsWrite, DriveOperation::SheetsStructure),
+            (DriveOperation::SheetsStructure, DriveOperation::SheetsWrite),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            let (client, sheets) = client(&server).await;
+            mount_metadata(&server).await;
+            let rules = vec![rule_allowing(&[granted], false)];
+            let outcome = text_to_columns(&client, &sheets, &base_opts(true), &rules).await;
+            match &outcome.result {
+                TextToColumnsResult::Blocked { operation, .. } => {
+                    assert_eq!(*operation, missing, "granted {granted}");
+                }
+                other => panic!("expected Blocked with {granted} granted, got {other:?}"),
+            }
+            assert!(describe_lines(&outcome)[0].contains(&missing.to_string()));
+        }
+    }
+
+    /// …and the union together does.
+    #[tokio::test]
+    async fn both_operations_together_open_the_gate() {
         let server = wiremock::MockServer::start().await;
         let (client, sheets) = client(&server).await;
         mount_metadata(&server).await;
-        let opts = base_opts(true);
-        let rules = vec![rule(DriveOperation::SheetsStructure, false)];
-        let outcome = text_to_columns(&client, &sheets, &opts, &rules).await;
+        mount_values(
+            &server,
+            "'Q1'!A2:A4",
+            serde_json::json!({"values": [["a,b"]]}),
+        )
+        .await;
+        mount_values(&server, "'Q1'!B2:B4", serde_json::json!({"values": []})).await;
+        let rules = vec![rule_allowing(GATE_OPERATIONS, false)];
+        let outcome = text_to_columns(&client, &sheets, &base_opts(true), &rules).await;
         assert!(matches!(
             outcome.result,
-            TextToColumnsResult::Blocked { .. }
+            TextToColumnsResult::WouldChange { .. }
         ));
     }
 
