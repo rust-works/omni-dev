@@ -412,7 +412,7 @@ pub fn describe_lines(outcome: &RandomizeRangeOutcome) -> Vec<String> {
             decided_by,
         } => vec![match decided_by {
             Some(rule) => format!(
-                "Blocked: randomize-range on {book} refused by rule on {} {}{}",
+                "Blocked: randomize-range on {book} refused for {operation} by rule on {} {}{}",
                 rule.kind_label(),
                 rule.id(),
                 rule.depth_suffix()
@@ -830,6 +830,9 @@ mod tests {
             &[rule_missing_sheets_structure()],
         )
         .await;
+        let lines = describe_lines(&outcome).join("\n");
+        assert!(lines.contains("sheets-structure"), "{lines}");
+        assert!(lines.contains("rule on folder parent-1"), "{lines}");
         let RandomizeRangeResult::Blocked { operation, .. } = outcome.result else {
             panic!("expected Blocked, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
