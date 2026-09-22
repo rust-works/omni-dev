@@ -58,7 +58,9 @@ pub struct TextToColumnsCommand {
     #[arg(long, value_name = "A1")]
     pub source: String,
 
-    /// Which separator to split on.
+    /// Which separator to split on. `auto` lets Sheets detect it
+    /// itself, in which case the previewed width is an estimate rather
+    /// than an upper bound — see `--dry-run`.
     #[arg(long, value_enum)]
     pub delimiter: DelimiterArg,
 
@@ -75,7 +77,9 @@ pub struct TextToColumnsCommand {
     /// Reports the gate verdict, a local upper-bound split width, and the
     /// count and A1 locations of the non-blank cells that would be
     /// overwritten — never the values Sheets would write, which cannot be
-    /// previewed.
+    /// previewed. The width is a true bound for every delimiter but
+    /// `auto`, where Sheets picks the separator itself and may pick one
+    /// this preview never tried; those runs say so on their own line.
     #[arg(long)]
     pub dry_run: bool,
 

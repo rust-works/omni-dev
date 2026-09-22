@@ -415,6 +415,19 @@ mod tests {
     }
 
     #[test]
+    fn non_blank_locations_includes_the_top_left_cell() {
+        // Unlike `format.rs::discarded_from_values`, the anchor is not
+        // skipped: every caller's written extent covers its whole read,
+        // so the top-left cell is overwritten like any other. Moved here
+        // with the function it pins, from `paste.rs`.
+        let values: ValueRange = serde_json::from_value(serde_json::json!({
+            "values": [["kept"]]
+        }))
+        .unwrap();
+        assert_eq!(non_blank_locations(&values, 0, 0), vec!["A1"]);
+    }
+
+    #[test]
     fn non_blank_locations_never_carries_a_value() {
         let values: ValueRange = serde_json::from_value(serde_json::json!({
             "values": [["a-secret-value"]]

@@ -5998,9 +5998,9 @@ Arguments:
 Options:
       --sheet <NAME>             Sheet (tab) title. Supplies the prefix for a bare `--source`
       --source <A1>              The column to split, optionally carrying its own `Sheet!` prefix. Must resolve to a fully bounded single column (e.g. `A2:A100`)
-      --delimiter <DELIMITER>    Which separator to split on [possible values: comma, semicolon, period, space, auto, custom]
+      --delimiter <DELIMITER>    Which separator to split on. `auto` lets Sheets detect it itself, in which case the previewed width is an estimate rather than an upper bound — see `--dry-run` [possible values: comma, semicolon, period, space, auto, custom]
       --custom-delimiter <TEXT>  The separator text. Required with `--delimiter custom`, and refused with any other `--delimiter`
-      --dry-run                  Reports the gate verdict, a local upper-bound split width, and the count and A1 locations of the non-blank cells that would be overwritten — never the values Sheets would write, which cannot be previewed
+      --dry-run                  Reports the gate verdict, a local upper-bound split width, and the count and A1 locations of the non-blank cells that would be overwritten — never the values Sheets would write, which cannot be previewed. The width is a true bound for every delimiter but `auto`, where Sheets picks the separator itself and may pick one this preview never tried; those runs say so on their own line
       --lease <TOKEN>            The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                     Print help (see more with '--help')
