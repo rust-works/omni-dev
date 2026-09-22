@@ -692,6 +692,71 @@ pub(crate) async fn conclude_native_leased_write<T, E>(
     outcome
 }
 
+/// The "how to recover" tail every destructive real-run message ends with.
+///
+/// Lives here, beside [`LeaseBackup`] and [`LeaseGrant`], rather than in
+/// `sheets/structure.rs` where it was written: since issue #1844,
+/// `delete_duplicates.rs` is a `SheetsDelete` verb outside that module and
+/// needs the identical tail. A second hand-written copy would eventually
+/// differ on the `None` arm below, which is the one that must never claim
+/// a backup exists.
+///
+/// There is no `files.delete` or undo anywhere in this integration
+/// (ADR-0077). ADR-0080 §9 requires `--lease` on every destructive verb
+/// alongside every other Sheets/Docs write, and acquiring that lease backs
+/// the whole file up — so the lease's own backup, not Drive's version
+/// history, is the primary recovery path, and the message names the copy
+/// (a Drive file id for a native document, a local path for bytes) so
+/// there is something to search for. Two honesty rules shape the wording:
+///
+/// - The backup is taken at *acquire* time, not immediately before this
+///   delete — a lease is multi-use (ADR-0080 §5), so earlier writes under
+///   the same token are not in the copy. The message says so.
+/// - A `require_lease: false` rule (§13) reaches the mutating call with no
+///   lease and therefore no backup; that path gets ADR-0077's original
+///   "version history is the only recovery path" wording, never a claim
+///   that a copy exists. `backup` comes from the ledger record the write
+///   was checked against, so this cannot be wrong by assumption.
+///
+/// Now that `drive lease restore` (ADR-0080 §10, Phase 4) exists, the
+/// message names it too — but only ever what it actually does: for a
+/// native document (always [`LeaseBackup::DriveCopy`] here, since every
+/// Sheets write is native) it only *locates* the Drive copy for most
+/// verbs — Phase 5 (issue #1676) added exactly one typed exception, a
+/// deleted sheet, so `is_delete_sheet` names that case for wording that
+/// tells the truth about it too (restore may already have put the sheet
+/// back automatically, rather than pointing straight at the Drive UI); the
+/// [`LeaseBackup::Bytes`] arm is kept exhaustive for a future non-native
+/// caller of this same helper, and there `drive lease restore` really does
+/// restore the content directly.
+pub(crate) fn recovery_note(backup: Option<&LeaseBackup>, is_delete_sheet: bool) -> String {
+    match backup {
+        Some(LeaseBackup::DriveCopy { file_id }) if is_delete_sheet => format!(
+            "this cannot be undone through omni-dev — the lease this write required backed the \
+             whole spreadsheet up when it was acquired (Drive copy {file_id}); run `omni-dev \
+             drive lease restore <TOKEN>` — it restores a single deleted sheet automatically, or \
+             otherwise locates the copy to restore from by hand in the Drive UI — or fall back \
+             to Google Drive's own version history"
+        ),
+        Some(LeaseBackup::DriveCopy { file_id }) => format!(
+            "this cannot be undone through omni-dev — the lease this write required backed the \
+             whole spreadsheet up when it was acquired (Drive copy {file_id}); run `omni-dev \
+             drive lease restore <TOKEN>` to locate it, restore from that copy in the Drive UI, \
+             or fall back to Google Drive's own version history"
+        ),
+        Some(LeaseBackup::Bytes { path, .. }) => format!(
+            "this cannot be undone through omni-dev — the lease this write required backed the \
+             file up when it was acquired ({}); run `omni-dev drive lease restore <TOKEN>` to \
+             restore it, or fall back to Google Drive's own version history",
+            path.display()
+        ),
+        None => "this cannot be undone through omni-dev — no lease backup was taken (the \
+                 deciding write-permission rule sets `require_lease: false`), so Google Drive's \
+                 version history is the only recovery path"
+            .to_string(),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
