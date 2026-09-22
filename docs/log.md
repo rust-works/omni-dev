@@ -292,6 +292,12 @@ types, so the log is a complete invocation history, not just an HTTP history:
   (`cellsChangedCount`, `duplicatesRemovedCount`) plus the range, or says
   the API reported no count.
 
+  Both counts are present as `0` rather than omitted when nothing
+  changed — measured live — so `fields_changed` reading "trimmed 0
+  cell(s)" is the ordinary no-op case, not a missing value. The
+  "the API reported no count" wording is reserved for a reply that
+  carried no response object at all.
+
   `delete-duplicates` deliberately records **no** cell or row list. ADR-0083
   §6 places it in the server-decided preview tier — Sheets chooses the rows
   by an equality rule this crate does not reproduce — so there is nothing
