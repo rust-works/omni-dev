@@ -28,7 +28,7 @@
 //! prefix here.
 
 use crate::drive::sheets::a1;
-use crate::drive::sheets::types::{GridRange, Sheet, Spreadsheet};
+use crate::drive::sheets::types::{GridRange, Sheet, Spreadsheet, ValueRange};
 
 /// What one `:`-delimited token names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +70,41 @@ pub(crate) fn column_index_to_letters(mut index: i64) -> String {
         }
     }
     letters.iter().rev().collect()
+}
+
+/// Every non-blank cell within a `values.get` read, as its A1 address —
+/// **never its value** (ADR-0083 §6: "counts and A1 locations, never
+/// contents"). `row_offset`/`col_offset` are the read range's own start
+/// row/column, since the API indexes a read relative to the range it was
+/// asked for, not the sheet.
+///
+/// Shared by `paste.rs` and `auto_fill.rs` (previously two independent
+/// copies) and `text_to_columns.rs`; a third private copy would let
+/// ADR-0083 §6's "never a value" rule drift into a per-file convention
+/// instead of one tested implementation. Whether the top-left/anchor cell
+/// is included in the result is the caller's own decision — every existing
+/// caller's written extent covers its whole read, so this function makes
+/// no exception for it.
+pub(crate) fn non_blank_locations(
+    values: &ValueRange,
+    row_offset: i64,
+    col_offset: i64,
+) -> Vec<String> {
+    let mut locations = Vec::new();
+    for (row_idx, row) in values.values.iter().enumerate() {
+        for (col_idx, cell) in row.iter().enumerate() {
+            let is_blank = cell.is_null() || cell.as_str().is_some_and(str::is_empty);
+            if is_blank {
+                continue;
+            }
+            locations.push(format!(
+                "{}{}",
+                column_index_to_letters(col_idx as i64 + col_offset),
+                row_idx as i64 + row_offset + 1
+            ));
+        }
+    }
+    locations
 }
 
 /// Whether every bound of `grid` is set — i.e. it names a fixed rectangle
@@ -368,6 +403,27 @@ pub(crate) fn parse_grid_range(sheet_id: i64, range: &str) -> Result<GridRange, 
 mod tests {
     use super::*;
     use crate::drive::sheets::types::{GridProperties, Sheet, SheetProperties};
+
+    #[test]
+    fn non_blank_locations_skips_blanks_and_offsets_addresses() {
+        let values: ValueRange = serde_json::from_value(serde_json::json!({
+            "values": [["a", "", "c"], [null, "d2"]]
+        }))
+        .unwrap();
+        let locations = non_blank_locations(&values, 4, 2);
+        assert_eq!(locations, vec!["C5", "E5", "D6"]);
+    }
+
+    #[test]
+    fn non_blank_locations_never_carries_a_value() {
+        let values: ValueRange = serde_json::from_value(serde_json::json!({
+            "values": [["a-secret-value"]]
+        }))
+        .unwrap();
+        let locations = non_blank_locations(&values, 0, 0);
+        assert_eq!(locations, vec!["A1"]);
+        assert!(!locations.iter().any(|loc| loc.contains("secret")));
+    }
 
     #[test]
     fn column_letters_to_index_single_and_double_letters() {

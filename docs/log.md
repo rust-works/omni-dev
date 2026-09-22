@@ -264,6 +264,19 @@ types, so the log is a complete invocation history, not just an HTTP history:
   listed cells are the source and were never touched. Absent means the list
   is exact, which is `--source` and every other verb.
 
+  `text-to-columns` (issue #1843, [ADR-0083](adrs/adr-0083.md) §1) uses the
+  same kind and keys again, with `operation` of `sheets-text-to-columns`
+  and gated `sheets-write`. `range` carries the source column's A1
+  address (not the spill span — the request log's `range` key is always
+  the value that started the write for every verb in this tranche), and
+  `fields_changed` the tense-neutral summary: the source, the delimiter,
+  and the upper-bound width and spill span. `overwritten_cells_are_upper_bound`
+  is **always** `"true"` for this verb, unlike `auto-fill`'s form-dependent
+  flag — the API decides for itself how many columns each row's split
+  needs, so the locally computed span can only ever be an upper bound, and
+  `overwritten_cells` never carries the split pieces or the source's
+  values, only the bare A1 addresses of the cells the split might reach.
+
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of

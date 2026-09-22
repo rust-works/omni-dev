@@ -84,7 +84,6 @@ use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
     AutoFillRequest, BatchUpdateRequestItem, Dimension, GridRange, Sheet, SourceAndDestination,
-    ValueRange,
 };
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -519,9 +518,9 @@ async fn auto_fill_inner(
             {
                 // Offsets are the *read* range's own start, not the
                 // destination's — clamping can only move the end, but
-                // `overwritten_cell_addresses` is indexed off whichever
-                // range was actually read.
-                Ok(values) => overwritten_cell_addresses(
+                // `grid_range::non_blank_locations` is indexed off
+                // whichever range was actually read.
+                Ok(values) => grid_range::non_blank_locations(
                     &values,
                     read_range.start_row_index.unwrap_or(0),
                     read_range.start_column_index.unwrap_or(0),
@@ -719,34 +718,6 @@ fn clamp_to_grid(sheet: &Sheet, destination: &GridRange) -> Option<GridRange> {
         return None;
     }
     Some(clamped)
-}
-
-/// The non-blank cells in a `values.get` response, as bare A1 addresses —
-/// **never their values** (ADR-0083 §6; contrast `format.rs`'s
-/// `discarded_from_values`, which carries `"A1: value"` for `merge-cells`).
-/// `row_offset`/`col_offset` are the read range's own start row/column:
-/// `values.get`'s response is indexed relative to the range it read, not
-/// the sheet, so they must be added back to get the true A1 address.
-fn overwritten_cell_addresses(
-    values: &ValueRange,
-    row_offset: i64,
-    col_offset: i64,
-) -> Vec<String> {
-    let mut cells = Vec::new();
-    for (row_idx, row) in values.values.iter().enumerate() {
-        for (col_idx, cell) in row.iter().enumerate() {
-            let is_blank = cell.is_null() || cell.as_str().is_some_and(str::is_empty);
-            if is_blank {
-                continue;
-            }
-            cells.push(format!(
-                "{}{}",
-                grid_range::column_index_to_letters(col_idx as i64 + col_offset),
-                row_idx as i64 + row_offset + 1
-            ));
-        }
-    }
-    cells
 }
 
 /// Renders a fully bounded numeric [`GridRange`] back to an A1 string.
@@ -1303,30 +1274,6 @@ mod tests {
             .grid_properties = None;
         let destination = bounded(0, 0, 9_999, 0, 1);
         assert_eq!(clamp_to_grid(&sheet, &destination), Some(destination));
-    }
-
-    #[test]
-    fn overwritten_cell_addresses_skips_blanks_and_offsets_by_the_ranges_own_start() {
-        let values = ValueRange {
-            range: None,
-            values: vec![
-                vec![serde_json::json!(""), serde_json::json!("gone")],
-                vec![serde_json::json!(null), serde_json::json!(12)],
-            ],
-        };
-        let cells = overwritten_cell_addresses(&values, 3, 2); // offset to row 4, col C
-        assert_eq!(cells, vec!["D4".to_string(), "D5".to_string()]);
-    }
-
-    #[test]
-    fn overwritten_cell_addresses_never_carries_a_value() {
-        let values = ValueRange {
-            range: None,
-            values: vec![vec![serde_json::json!("secret")]],
-        };
-        let cells = overwritten_cell_addresses(&values, 0, 0);
-        assert_eq!(cells, vec!["A1".to_string()]);
-        assert!(!cells[0].contains("secret"));
     }
 
     #[test]
