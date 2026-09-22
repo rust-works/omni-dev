@@ -509,6 +509,13 @@ line per fact, rather than one run-on sentence — which keeps a
 multi-`--ladders` issue readable. Its wording is **not** a stable contract
 and may change without notice; scripts should keep using `json` or `yaml`.
 
+On a supported terminal, the issue reference and cited open issues or pull
+requests are clickable links to their GitHub pages. Low-complexity choices and
+successful routing are green, intermediate choices yellow, and high-complexity
+choices and failures red. Colours follow each ladder's tier order, including
+custom ladders. Redirected output and unsupported terminals remain plain text;
+`NO_COLOR` suppresses colour. JSON and YAML never contain terminal styling.
+
 ```
 rust-works/omni-dev#1641 — Some issue title
   fable — design needs fable (0.52), implementation sonnet (0.83), review opus (0.21, close call — sonnet 0.41)

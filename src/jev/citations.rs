@@ -24,6 +24,8 @@ pub struct Citation {
     /// verbatim in the splitter prompt, since the splitter is asked to
     /// write `cites` "as it appears in the comment".
     pub raw: String,
+    /// Resolved web URL, populated by route's item lookup when available.
+    pub url: Option<String>,
 }
 
 fn citation_regex() -> &'static Regex {
@@ -158,6 +160,7 @@ pub fn find_citations(body: &str, default_project: &str, judged: &ItemRef) -> Ve
                     number,
                 },
                 raw: caps[0].to_string(),
+                url: None,
             });
         }
     }
