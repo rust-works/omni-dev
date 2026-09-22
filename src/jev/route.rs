@@ -108,6 +108,23 @@ const MIN_TIERS: usize = 2;
 /// stays free of GitHub-specific I/O.
 pub type OpenDependencies = BTreeMap<(String, u64), Vec<Citation>>;
 
+/// Citations whose individual GitHub lookup did not resolve.
+///
+/// Keyed by the citing issue's `(project, number)`, like
+/// [`OpenDependencies`]. These are retained in route output so a typo or
+/// stale reference is visible rather than being mistaken for no citation.
+pub type ReferenceFetchFailures = BTreeMap<(String, u64), Vec<ReferenceFetchFailure>>;
+
+/// A citation GitHub could not fetch while preparing a route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReferenceFetchFailure {
+    /// The citation exactly as written in the issue text.
+    #[serde(rename = "ref")]
+    pub item_ref: String,
+    /// Why the reference could not be fetched.
+    pub error: String,
+}
+
 /// One stage of the work on an issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -408,6 +425,10 @@ pub enum RouteOutcome {
         /// Open issues/PRs this issue's text cites (#1812). About the issue,
         /// not a provider, so it sits beside `providers` rather than inside.
         depends_on: Vec<DependencyEntry>,
+        /// Citations that could not be fetched. They are not dependencies
+        /// because their state is unknown, but remain visible to the user.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        reference_fetch_failures: Vec<ReferenceFetchFailure>,
     },
     /// The Jev call for this issue failed, or its answer was unusable. The
     /// other issues are still routed, so a long run keeps what it paid for.
@@ -476,6 +497,27 @@ pub async fn run_route(
     opts: &RouteOptions,
     dependencies: &OpenDependencies,
 ) -> Result<RouteReport> {
+    run_route_with_reference_fetch_failures(
+        jev,
+        docs,
+        ladders,
+        opts,
+        dependencies,
+        &ReferenceFetchFailures::new(),
+    )
+    .await
+}
+
+/// Like [`run_route`], while retaining per-citation fetch failures in the
+/// report. The CLI supplies this data after its blocking GitHub fetch.
+pub async fn run_route_with_reference_fetch_failures(
+    jev: &JevClient,
+    docs: &[IssueDoc],
+    ladders: &[Ladder],
+    opts: &RouteOptions,
+    dependencies: &OpenDependencies,
+    reference_fetch_failures: &ReferenceFetchFailures,
+) -> Result<RouteReport> {
     validate_options(docs, ladders, opts)?;
     let questions = build_route_questions(ladders)?;
 
@@ -519,6 +561,10 @@ pub async fn run_route(
                     Ok(providers) => RouteOutcome::Routed {
                         providers,
                         depends_on: dependency_entries(&item_ref, citations, &response.answers),
+                        reference_fetch_failures: reference_fetch_failures
+                            .get(&(doc.project.clone(), doc.number))
+                            .cloned()
+                            .unwrap_or_default(),
                     },
                     Err(err) => failed(&item_ref, &err.context("Unexpected Jev answer")),
                 }
@@ -761,11 +807,15 @@ fn render_issue_block(issue: &IssueRoute, max_input_chars: usize) -> String {
         RouteOutcome::Routed {
             providers,
             depends_on,
+            reference_fetch_failures,
         } => {
             for (provider, route) in providers {
                 lines.extend(render_provider_line(provider, route, providers.len()));
             }
             lines.extend(render_depends_on_lines(depends_on));
+            lines.extend(render_reference_fetch_failure_lines(
+                reference_fetch_failures,
+            ));
         }
         RouteOutcome::Failed { error } => lines.push(format!("  failed: {error}")),
     }
@@ -914,6 +964,19 @@ fn render_depends_on_lines(depends_on: &[DependencyEntry]) -> Vec<String> {
                 dep.item_ref
             ),
             None => format!("  cites open {}", dep.item_ref),
+        })
+        .collect()
+}
+
+/// Renders per-citation GitHub misses separately from open dependencies.
+fn render_reference_fetch_failure_lines(failures: &[ReferenceFetchFailure]) -> Vec<String> {
+    failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "  reference fetch failed: {} ({})",
+                failure.item_ref, failure.error
+            )
         })
         .collect()
 }
@@ -1606,13 +1669,21 @@ mod tests {
             ("rust-works/omni-dev".to_string(), 7),
             vec![citation("#1129", 1129)],
         )]);
+        let reference_fetch_failures = ReferenceFetchFailures::from([(
+            ("rust-works/omni-dev".to_string(), 7),
+            vec![ReferenceFetchFailure {
+                item_ref: "#404".to_string(),
+                error: "not found".to_string(),
+            }],
+        )]);
 
-        let report = run_route(
+        let report = run_route_with_reference_fetch_failures(
             &client,
             &[doc(7, ItemState::Open)],
             &ladders,
             &opts(),
             &dependencies,
+            &reference_fetch_failures,
         )
         .await
         .unwrap();
@@ -1621,6 +1692,8 @@ mod tests {
         let RouteOutcome::Routed {
             providers,
             depends_on,
+            reference_fetch_failures,
+            ..
         } = outcome
         else {
             // omni-dev: coverage ignore-line reason="guards this test's assumption; the mocked response above always answers with a routed outcome"
@@ -1635,6 +1708,7 @@ mod tests {
         assert_eq!(provider(outcome, "openai").class, "sol");
         assert_eq!(provider(outcome, "openai").close_calls, [Stage::Implement]);
         assert_eq!(depends_on.len(), 1);
+        assert_eq!(reference_fetch_failures[0].item_ref, "#404");
 
         let requests = server.received_requests().await.unwrap();
         let body: serde_json::Value = requests[0].body_json().unwrap();
@@ -1901,6 +1975,7 @@ mod tests {
                         },
                     )]),
                     depends_on: vec![],
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],
@@ -1916,6 +1991,7 @@ mod tests {
         assert!(value["issues"][0].get("stages").is_none());
         assert!(value["issues"][0].get("class").is_none());
         assert_eq!(value["issues"][0]["depends_on"], serde_json::json!([]));
+        assert!(value["issues"][0].get("reference_fetch_failures").is_none());
         assert!(value["issues"][0].get("error").is_none());
     }
 
@@ -1964,6 +2040,7 @@ mod tests {
                         state: ItemState::Open,
                         could_be_cheaper: BTreeMap::from([("design".to_string(), 0.75)]),
                     }],
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],
@@ -2012,6 +2089,7 @@ mod tests {
                             could_be_cheaper: BTreeMap::new(),
                         },
                     ],
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],
@@ -2047,6 +2125,7 @@ mod tests {
                         ("openai".to_string(), route("terra")),
                     ]),
                     depends_on: vec![],
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],
@@ -2094,6 +2173,7 @@ mod tests {
                         },
                     )]),
                     depends_on: vec![],
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],
@@ -2128,6 +2208,7 @@ mod tests {
                         state: ItemState::Open,
                         could_be_cheaper: BTreeMap::new(),
                     }],
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],
@@ -2154,6 +2235,7 @@ mod tests {
                     },
                 )]),
                 depends_on: vec![],
+                reference_fetch_failures: vec![],
             },
             truncated,
         };
@@ -2189,6 +2271,7 @@ mod tests {
                         },
                     )]),
                     depends_on: vec![],
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],
@@ -2228,6 +2311,7 @@ mod tests {
                         state: ItemState::Open,
                         could_be_cheaper: BTreeMap::from([("design".to_string(), 0.48)]),
                     }],
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],
@@ -2268,6 +2352,7 @@ mod tests {
                         },
                     )]),
                     depends_on: vec![],
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],
@@ -2309,6 +2394,7 @@ mod tests {
                         ("openai".to_string(), route("c,d")),
                     ]),
                     depends_on: vec![],
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],
@@ -2352,6 +2438,7 @@ mod tests {
                         ("openai".to_string(), compact_route),
                     ]),
                     depends_on: vec![],
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],
@@ -2388,6 +2475,7 @@ mod tests {
                         },
                     )]),
                     depends_on: vec![],
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],

@@ -444,6 +444,9 @@ issues:
   - ref: "#1129"
     state: open
     could_be_cheaper: {design: 0.75}
+  reference_fetch_failures:
+  - ref: "#404"
+    error: not found
 usage: {input_tokens: 1432, output_tokens: 61}
 ```
 
@@ -472,6 +475,11 @@ usage: {input_tokens: 1432, output_tokens: 61}
   deferred pending the same kind of validation `design` got (see
   [#1812](https://github.com/rust-works/omni-dev/issues/1812)). There is no
   suppression threshold: every open citation gets a score, unfiltered.
+- **`reference_fetch_failures`** lists citations GitHub could not fetch, so a
+  stale or mistyped reference is visible rather than being indistinguishable
+  from no citation. Each entry preserves the citation's original `ref` and
+  reports its `error`; it is not included in `depends_on` because its state is
+  unknown. The field is omitted when every cited reference resolved.
 - **`truncated: true`** appears when the issue was longer than
   `--max-input-chars` (default 60,000 characters). The first and last halves
   are kept, with a visible `[... truncated]` marker between them, and a
@@ -504,6 +512,7 @@ and may change without notice; scripts should keep using `json` or `yaml`.
 rust-works/omni-dev#1641 — Some issue title
   fable — design needs fable (0.52), implementation sonnet (0.83), review opus (0.41, close call)
   cites open #1129, which could leave less design work if resolved (0.75)
+  reference fetch failed: #404 (not found)
 
 model: jev-1.13.0, usage: 1432 input tokens, 61 output tokens
 ```

@@ -14,8 +14,9 @@ use crate::jev::citations::{find_citations, Citation};
 use crate::jev::client::JevClient;
 use crate::jev::config::JevConfig;
 use crate::jev::route::{
-    build_route_state, render_route_text, run_route, Ladder, OpenDependencies, Provider,
-    RouteOptions, RouteReport, Tiers, DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
+    build_route_state, render_route_text, run_route_with_reference_fetch_failures, Ladder,
+    OpenDependencies, Provider, ReferenceFetchFailure, ReferenceFetchFailures, RouteOptions,
+    RouteReport, Tiers, DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
 };
 use crate::provider::{GitProvider, IssueDoc, ItemKind, ItemRef, ItemState};
 
@@ -60,7 +61,8 @@ tiers loaded from a YAML file, so it can be routed alongside built-in ladders in
 cites is reported under depends_on, with a could_be_cheaper.design probability: how likely it \
 is that resolving that dependency would leave less design work remaining than the text \
 implies. One extra Jev question is asked per open citation; a closed citation is settled and \
-is not reported.\n\nClosed issues are refused unless --allow-closed is given: their comments \
+is not reported. A cited issue or pull request that cannot be fetched is listed under \
+reference_fetch_failures instead.\n\nClosed issues are refused unless --allow-closed is given: their comments \
 often describe how the work was done, which leaks the answer.\n\nAn issue whose Jev call \
 fails is reported with an `error` field instead of providers, and the rest are still routed; \
 the command then exits non-zero. An authentication failure stops the run at once."
@@ -136,11 +138,12 @@ impl RouteCommand {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let (issues, all_open, max_input_chars) =
             (self.issues, self.all_open, self.max_input_chars);
-        let (docs, dependencies) = tokio::task::spawn_blocking(move || {
-            fetch_docs(&bin, &cwd, &issues, all_open, max_input_chars)
-        })
-        .await
-        .context("Issue fetch task panicked")??;
+        let (docs, dependencies, reference_fetch_failures) =
+            tokio::task::spawn_blocking(move || {
+                fetch_docs(&bin, &cwd, &issues, all_open, max_input_chars)
+            })
+            .await
+            .context("Issue fetch task panicked")??;
 
         let opts = RouteOptions {
             model: config.model,
@@ -148,7 +151,15 @@ impl RouteCommand {
             max_input_chars: self.max_input_chars,
             allow_closed: self.allow_closed,
         };
-        let report = run_route(&client, &docs, &ladders, &opts, &dependencies).await?;
+        let report = run_route_with_reference_fetch_failures(
+            &client,
+            &docs,
+            &ladders,
+            &opts,
+            &dependencies,
+            &reference_fetch_failures,
+        )
+        .await?;
         print!(
             "{}",
             render_output(&report, self.output, self.max_input_chars)?
@@ -272,7 +283,7 @@ fn fetch_docs(
     issues: &[String],
     all_open: bool,
     max_input_chars: usize,
-) -> Result<(Vec<IssueDoc>, OpenDependencies)> {
+) -> Result<(Vec<IssueDoc>, OpenDependencies, ReferenceFetchFailures)> {
     let default_project = if all_open || issues.iter().any(|a| needs_default_project(a)) {
         Some(resolve_current_project(bin, cwd).context(
             "Failed to find the current GitHub repository; pass owner/repo#N or use -C/--repo",
@@ -309,20 +320,20 @@ fn fetch_docs(
         .filter(|r| seen.insert((r.project.clone(), r.number)))
         .collect();
     let docs = fetch_issues(bin, &refs)?;
-    let dependencies = find_open_dependencies(bin, &docs, max_input_chars)?;
-    Ok((docs, dependencies))
+    let (dependencies, reference_fetch_failures) =
+        find_open_dependencies(bin, &docs, max_input_chars)?;
+    Ok((docs, dependencies, reference_fetch_failures))
 }
 
 /// Finds each doc's citations in the text `route` sends to Jev (#1812), then
 /// batch-resolves every citation across every doc in one `gh` call, keeping
 /// only the ones still open. An unresolved citation (typo, deleted issue) is
-/// silently dropped, matching `verify-decision`'s tolerance for the same
-/// case. **Blocking.**
+/// retained as a reference-fetch failure for output. **Blocking.**
 fn find_open_dependencies(
     bin: &Path,
     docs: &[IssueDoc],
     max_input_chars: usize,
-) -> Result<OpenDependencies> {
+) -> Result<(OpenDependencies, ReferenceFetchFailures)> {
     let mut per_issue: Vec<((String, u64), Vec<Citation>)> = Vec::new();
     let mut seen = HashSet::new();
     let mut refs = Vec::new();
@@ -344,30 +355,44 @@ fn find_open_dependencies(
         per_issue.push(((doc.project.clone(), doc.number), citations));
     }
     if refs.is_empty() {
-        return Ok(OpenDependencies::new());
+        return Ok((OpenDependencies::new(), ReferenceFetchFailures::new()));
     }
 
-    let mut states: BTreeMap<(String, u64), ItemState> = BTreeMap::new();
+    let mut states: BTreeMap<(String, u64), Option<ItemState>> = BTreeMap::new();
     for (item_ref, fetched) in refs.iter().zip(fetch_items(bin, &refs)?) {
-        if let Some(fetched) = fetched {
-            states.insert((item_ref.project.clone(), item_ref.number), fetched.state);
-        }
+        states.insert(
+            (item_ref.project.clone(), item_ref.number),
+            fetched.map(|doc| doc.state),
+        );
     }
 
     let mut dependencies = OpenDependencies::new();
+    let mut reference_fetch_failures = ReferenceFetchFailures::new();
     for (key, citations) in per_issue {
         let open: Vec<_> = citations
-            .into_iter()
+            .iter()
             .filter(|c| {
                 states.get(&(c.item_ref.project.clone(), c.item_ref.number))
-                    == Some(&ItemState::Open)
+                    == Some(&Some(ItemState::Open))
             })
+            .cloned()
             .collect();
         if !open.is_empty() {
-            dependencies.insert(key, open);
+            dependencies.insert(key.clone(), open);
+        }
+        let failures = citations
+            .into_iter()
+            .filter(|c| states.get(&(c.item_ref.project.clone(), c.item_ref.number)) == Some(&None))
+            .map(|c| ReferenceFetchFailure {
+                item_ref: c.raw,
+                error: "not found".to_string(),
+            })
+            .collect::<Vec<_>>();
+        if !failures.is_empty() {
+            reference_fetch_failures.insert(key, failures);
         }
     }
-    Ok(dependencies)
+    Ok((dependencies, reference_fetch_failures))
 }
 
 #[cfg(test)]
@@ -604,6 +629,7 @@ mod tests {
                     },
                 )]),
                 depends_on: vec![],
+                reference_fetch_failures: vec![],
             })
         };
         let failed = || {
@@ -626,7 +652,8 @@ mod tests {
     fn render_output_dispatches_on_format() {
         use crate::jev::protocol::Usage;
         use crate::jev::route::{
-            IssueRoute, ProviderRoute, RouteOutcome, StageAnswer, StageAnswers,
+            IssueRoute, ProviderRoute, ReferenceFetchFailure, RouteOutcome, StageAnswer,
+            StageAnswers,
         };
         let answer = || StageAnswer {
             choice: "sonnet".to_string(),
@@ -653,6 +680,10 @@ mod tests {
                         },
                     )]),
                     depends_on: vec![],
+                    reference_fetch_failures: vec![ReferenceFetchFailure {
+                        item_ref: "#404".to_string(),
+                        error: "not found".to_string(),
+                    }],
                 },
                 truncated: false,
             }],
@@ -661,12 +692,20 @@ mod tests {
 
         let json = render_output(&report, RouteFormat::Json, DEFAULT_MAX_INPUT_CHARS).unwrap();
         assert!(json.contains("\"model\": \"jev-1.13.0\""), "{json}");
+        assert!(json.contains("\"reference_fetch_failures\""), "{json}");
+        assert!(json.contains("\"ref\": \"#404\""), "{json}");
 
         let yaml = render_output(&report, RouteFormat::Yaml, DEFAULT_MAX_INPUT_CHARS).unwrap();
         assert!(yaml.contains("model: jev-1.13.0"), "{yaml}");
+        assert!(yaml.contains("reference_fetch_failures:"), "{yaml}");
+        assert!(yaml.contains("ref: '#404'"), "{yaml}");
 
         let text = render_output(&report, RouteFormat::Text, DEFAULT_MAX_INPUT_CHARS).unwrap();
         assert!(text.starts_with("o/r#1 — t\n"), "{text}");
+        assert!(
+            text.contains("reference fetch failed: #404 (not found)"),
+            "{text}"
+        );
     }
 
     // ── fetch_docs (fake-gh shim) ────────────────────────────────────
@@ -709,7 +748,7 @@ mod tests {
     fn fetch_docs_skips_repo_lookup_for_qualified_refs() {
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(dir.path());
-        let (docs, deps) = retry_on_etxtbsy(|| {
+        let (docs, deps, _failures) = retry_on_etxtbsy(|| {
             fetch_docs(
                 &bin,
                 dir.path(),
@@ -729,7 +768,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(dir.path());
         let args = ["#1", "1", "rust-works/omni-dev#2"].map(str::to_string);
-        let (docs, _deps) = retry_on_etxtbsy(|| {
+        let (docs, _deps, _failures) = retry_on_etxtbsy(|| {
             fetch_docs(&bin, dir.path(), &args, false, DEFAULT_MAX_INPUT_CHARS)
         })
         .unwrap();
@@ -742,7 +781,7 @@ mod tests {
     fn fetch_docs_all_open_lists_the_current_repository() {
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(dir.path());
-        let (docs, _deps) =
+        let (docs, _deps, _failures) =
             retry_on_etxtbsy(|| fetch_docs(&bin, dir.path(), &[], true, DEFAULT_MAX_INPUT_CHARS))
                 .unwrap();
         let numbers: Vec<u64> = docs.iter().map(|d| d.number).collect();
@@ -798,11 +837,38 @@ mod tests {
         (path, guard)
     }
 
+    /// A fake `gh` whose cited issue is absent. The citation request models
+    /// GitHub CLI's partial GraphQL response: useful JSON on stdout and exit
+    /// status 1 because the individual node was not found.
+    fn fake_gh_with_missing_citation(dir: &Path) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
+        let guard = shim_lock();
+        let citing = serde_json::json!({
+            "__typename": "Issue",
+            "title": "t", "body": "see #2", "state": "OPEN", "url": "u",
+            "comments": {"totalCount": 0, "nodes": []},
+            "closedByPullRequestsReferences": {"nodes": []}
+        });
+        let path = dir.join("fake-gh");
+        write_exec_script(
+            &path,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n\\
+                 repo) echo rust-works/omni-dev ;;\n\\
+                 *) case \"$4\" in\n\\
+                    *'number:2'*) cat <<'JSON'\n{{\"data\": {{\"r0\": {{\"i0\": null}}}}, \"errors\": [{{\"type\": \"NOT_FOUND\", \"path\": [\"r0\", \"i0\"], \"message\": \"Could not resolve\"}}]}}\nJSON\nexit 1 ;;\n\\
+                    *) cat <<'JSON'\n{{\"data\": {{\"r0\": {{\"i0\": {citing}}}}}}}\nJSON\n;;\n\\
+                    esac ;;\n\\
+                 esac\n",
+            ),
+        );
+        (path, guard)
+    }
+
     #[test]
     fn fetch_docs_reports_an_open_citation_as_a_dependency() {
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh_with_citation(dir.path(), "OPEN");
-        let (docs, deps) = retry_on_etxtbsy(|| {
+        let (docs, deps, _failures) = retry_on_etxtbsy(|| {
             fetch_docs(
                 &bin,
                 dir.path(),
@@ -823,7 +889,7 @@ mod tests {
     fn fetch_docs_drops_a_closed_citation() {
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh_with_citation(dir.path(), "CLOSED");
-        let (_docs, deps) = retry_on_etxtbsy(|| {
+        let (_docs, deps, _failures) = retry_on_etxtbsy(|| {
             fetch_docs(
                 &bin,
                 dir.path(),
@@ -834,5 +900,30 @@ mod tests {
         })
         .unwrap();
         assert!(deps.is_empty(), "{deps:?}");
+    }
+
+    #[test]
+    fn fetch_docs_reports_a_missing_citation_as_a_reference_fetch_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh_with_missing_citation(dir.path());
+        let (docs, dependencies, failures) = retry_on_etxtbsy(|| {
+            fetch_docs(
+                &bin,
+                dir.path(),
+                &["#1".to_string()],
+                false,
+                DEFAULT_MAX_INPUT_CHARS,
+            )
+        })
+        .unwrap();
+        let key = (docs[0].project.clone(), docs[0].number);
+        assert!(dependencies.is_empty(), "{dependencies:?}");
+        assert_eq!(
+            failures.get(&key),
+            Some(&vec![ReferenceFetchFailure {
+                item_ref: "#2".to_string(),
+                error: "not found".to_string(),
+            }])
+        );
     }
 }
