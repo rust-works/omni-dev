@@ -289,9 +289,11 @@ async fn find_replace_inner(
         Err(result) => return gated(result),
     };
     let Some(scope) = target.request_scope(grid) else {
+        // omni-dev: coverage ignore reason="request_scope only returns None for a Range target paired with no grid, but resolve_target's Range arm always returns Ok with Some(grid) alongside it; this arm exists only to unwrap the shared Option"
         return gated(FindReplaceResult::Failed {
             detail: "internal error: a range scope did not resolve a GridRange".to_string(),
         });
+        // omni-dev: coverage end
     };
     let request = FindReplaceRequest {
         find: opts.find.clone(),
@@ -362,22 +364,28 @@ fn resolve_target(
     debug_assert!(validate_scope_syntax(opts).is_ok());
     if opts.all_sheets {
         if opts.sheet.is_some() {
+            // omni-dev: coverage ignore reason="validate_scope_syntax already refuses --all-sheets combined with --sheet before resolve_target is ever reached; this arm exists only as a defensive re-check"
             return Err(FindReplaceResult::RefusedInvalidRequest {
                 detail: "--all-sheets cannot be combined with --sheet".to_string(),
             });
+            // omni-dev: coverage end
         }
         return Ok((FindReplaceTarget::AllSheets, None));
     }
     if opts.whole_sheet {
         if opts.range.is_some() {
+            // omni-dev: coverage ignore reason="validate_scope_syntax's scope_count check already guarantees --range is unset whenever --whole-sheet is set, before resolve_target is ever reached; this arm exists only as a defensive re-check"
             return Err(FindReplaceResult::RefusedInvalidRequest {
                 detail: "--whole-sheet cannot be combined with --range".to_string(),
             });
+            // omni-dev: coverage end
         }
         let Some(sheet) = opts.sheet.as_deref() else {
+            // omni-dev: coverage ignore reason="validate_scope_syntax already refuses --whole-sheet without --sheet before resolve_target is ever reached; this arm exists only as a defensive re-check"
             return Err(FindReplaceResult::RefusedInvalidRequest {
                 detail: "--whole-sheet requires --sheet".to_string(),
             });
+            // omni-dev: coverage end
         };
         let sheet_id = grid_range::find_sheet_id(workbook, sheet, |title, available| {
             FindReplaceResult::RefusedSheetNotFound { title, available }
@@ -464,7 +472,7 @@ fn record_attempt(outcome: &FindReplaceOutcome, _opts: &FindReplaceOptions, dura
                 target.describe()
             )),
         ),
-        FindReplaceResult::WouldChange { target, .. } => (None, None, Some(target.describe())),
+        FindReplaceResult::WouldChange { target, .. } => (None, None, Some(target.describe())), // omni-dev: coverage ignore-line reason="record_attempt is only called when !opts.dry_run, and WouldChange is only ever returned when opts.dry_run is true, so this arm can never run"
         _ => (None, None, None),
     };
     let error = match &outcome.result {
@@ -550,12 +558,46 @@ mod tests {
             .unwrap_err()
             .contains("exactly one scope"));
 
-        let mut whole_without_sheet = opts;
+        let mut whole_without_sheet = opts.clone();
         whole_without_sheet.range = None;
         whole_without_sheet.whole_sheet = true;
         assert!(validate_scope_syntax(&whole_without_sheet)
             .unwrap_err()
             .contains("requires --sheet"));
+
+        let mut all_sheets_with_sheet = opts;
+        all_sheets_with_sheet.range = None;
+        all_sheets_with_sheet.all_sheets = true;
+        all_sheets_with_sheet.sheet = Some("Q1".to_string());
+        assert!(validate_scope_syntax(&all_sheets_with_sheet)
+            .unwrap_err()
+            .contains("--all-sheets cannot be combined with --sheet"));
+    }
+
+    #[test]
+    fn lease_refusals_map_to_their_find_replace_results() {
+        assert_eq!(
+            FindReplaceResult::from_no_lease(),
+            FindReplaceResult::RefusedNoLease
+        );
+        assert_eq!(
+            FindReplaceResult::from_lease_expired(),
+            FindReplaceResult::RefusedLeaseExpired
+        );
+        assert_eq!(
+            FindReplaceResult::from_lease_wrong_file(),
+            FindReplaceResult::RefusedLeaseWrongFile
+        );
+        assert_eq!(
+            FindReplaceResult::from_lease_stale(),
+            FindReplaceResult::RefusedLeaseStale
+        );
+        assert_eq!(
+            FindReplaceResult::from_lease_failed("ledger unavailable".into()),
+            FindReplaceResult::Failed {
+                detail: "ledger unavailable".into()
+            }
+        );
     }
 
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
@@ -754,7 +796,7 @@ mod tests {
         o.find = String::new();
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result);
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("--find"), "{detail}");
     }
@@ -767,7 +809,7 @@ mod tests {
         o.all_sheets = true; // `--range` is also set by `opts`.
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result);
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("exactly one scope"), "{detail}");
     }
@@ -781,7 +823,7 @@ mod tests {
         o.whole_sheet = true;
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result);
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("requires --sheet"), "{detail}");
     }
@@ -805,7 +847,7 @@ mod tests {
         o.sheet = Some("Q1".to_string());
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result);
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("already names a sheet"), "{detail}");
     }
@@ -825,10 +867,93 @@ mod tests {
         o.whole_sheet = true;
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::RefusedSheetNotFound { title, available } = &outcome.result else {
-            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result);
+            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert_eq!(title, "Nope");
         assert_eq!(available, &["Q1".to_string(), "Q2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_range_without_a_sheet_prefix_is_refused_as_invalid() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let mut o = opts(false);
+        o.range = Some("A1:B2".to_string()); // no `Sheet!` prefix, and no `--sheet` either.
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+        };
+        assert!(detail.contains("does not name a sheet"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn a_range_naming_an_unknown_sheet_is_refused_with_available_titles() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let mut o = opts(false);
+        o.range = Some("Nope!A1:B2".to_string());
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        let FindReplaceResult::RefusedSheetNotFound { title, available } = &outcome.result else {
+            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+        };
+        assert_eq!(title, "Nope");
+        assert_eq!(available, &["Q1".to_string(), "Q2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_metadata_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
+        assert!(matches!(outcome.result, FindReplaceResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_gate_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/parent-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
+        assert!(matches!(outcome.result, FindReplaceResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_workbook_fetch_failure_surfaces_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
+        assert!(matches!(outcome.result, FindReplaceResult::Failed { .. }));
     }
 
     // ── the gate ───────────────────────────────────────────────────────
@@ -919,7 +1044,7 @@ mod tests {
         o.include_formulas = true;
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::WouldChange { target, summary } = &outcome.result else {
-            panic!("expected WouldChange, got {:?}", outcome.result);
+            panic!("expected WouldChange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(matches!(target, FindReplaceTarget::Range { .. }));
         assert!(summary.contains("\"draft\""), "{summary}");
@@ -983,7 +1108,7 @@ mod tests {
 
         let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
         let FindReplaceResult::Changed { target, counts } = &outcome.result else {
-            panic!("expected Changed, got {:?}", outcome.result);
+            panic!("expected Changed, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(matches!(target, FindReplaceTarget::Range { .. }));
         let counts = counts.as_ref().expect("counts present");
@@ -1360,7 +1485,7 @@ mod tests {
                 lines.len(),
                 1,
                 "describe_lines emitted {} lines for {:?}: {lines:?}",
-                lines.len(),
+                lines.len(), // omni-dev: coverage ignore-line reason="assert_eq!'s message args are only evaluated on failure, and this test always passes"
                 outcome.result
             );
             assert!(
@@ -1369,6 +1494,19 @@ mod tests {
                 outcome.result
             );
         }
+    }
+
+    #[test]
+    fn describe_lines_falls_back_to_the_spreadsheet_id_with_no_file_name() {
+        let outcome = FindReplaceOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: None,
+            resolved_folder_id: None,
+            result: FindReplaceResult::RefusedShortcut,
+        };
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("'sheet-1'"), "{lines:?}");
     }
 
     #[test]
