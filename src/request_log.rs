@@ -1524,6 +1524,14 @@ pub struct DriveMutationOutcome {
     /// crate never sees them, before or after the request. Empty when the
     /// destination has no non-blank cells, and for every other verb.
     pub overwritten_cells: Vec<String>,
+    /// `auto-fill --range` only: [`Self::overwritten_cells`] is an **upper
+    /// bound**, not a list of cells that were certainly overwritten. That
+    /// form lets Sheets decide for itself which cells in the named range
+    /// are the source and which are filled, so some of the listed cells
+    /// are the source and were never touched. `false` for `--source`,
+    /// where the destination is computed client-side and the list is
+    /// exact, and for every other verb.
+    pub overwritten_cells_upper_bound: bool,
     /// The data validation condition type a `set-data-validation` applied
     /// (issue #1643) — `"ONE_OF_LIST"`, `"NUMBER_BETWEEN"`, `"BOOLEAN"`,
     /// `"CUSTOM_FORMULA"` — or `"cleared"` for `clear-data-validation`.
@@ -1706,6 +1714,14 @@ fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogCon
             "overwritten_cells".to_string(),
             outcome.overwritten_cells.join(", "),
         );
+        // Emitted only when true: absent means exact, which is every verb
+        // but `auto-fill --range` and the overwhelmingly common case.
+        if outcome.overwritten_cells_upper_bound {
+            context.insert(
+                "overwritten_cells_are_upper_bound".to_string(),
+                "true".to_string(),
+            );
+        }
     }
     if let Some(validation_type) = outcome.validation_type {
         context.insert("validation_type".to_string(), validation_type);
@@ -2926,6 +2942,37 @@ mod tests {
             Some("'Q1'!A4:A5")
         );
         assert_eq!(rec.context.get("updated_cells"), None);
+        // `--source` computes the destination client-side, so the list is
+        // exact and the upper-bound marker stays absent.
+        assert_eq!(rec.context.get("overwritten_cells_are_upper_bound"), None);
+    }
+
+    /// `auto-fill --range` lets Sheets pick the source/destination split
+    /// itself, so the same list is an upper bound — some of those cells
+    /// are the source and were never touched. The record has to say so,
+    /// or a reader takes them for cells that certainly changed.
+    #[test]
+    fn auto_fill_range_form_marks_its_overwritten_cells_as_an_upper_bound() {
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "sheets-auto-fill",
+                file_id: "sheet-1".into(),
+                file_name: "Budget".into(),
+                status: "changed".into(),
+                range: Some("'Q1'!A1:A10".into()),
+                overwritten_cells: vec!["A1".into(), "A2".into()],
+                overwritten_cells_upper_bound: true,
+                duration: Duration::from_millis(1),
+                ..Default::default()
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(
+            rec.context
+                .get("overwritten_cells_are_upper_bound")
+                .map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]

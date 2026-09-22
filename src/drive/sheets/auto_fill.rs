@@ -168,8 +168,13 @@ pub struct AutoFillOptions {
 pub enum AutoFillResult {
     /// `--dry-run`, and the gate would allow it.
     WouldChange {
-        /// A human-readable summary of the effect — also the request log's
-        /// `fields_changed`.
+        /// A human-readable, **tense-neutral** summary of the effect —
+        /// also the request log's `fields_changed`. Names the destination,
+        /// the source it extends (form B), the direction, and the
+        /// alternate-series flag; the overwrite count and the two caveats
+        /// are separate, tense-varying lines built by [`describe_lines`],
+        /// so this same string reads correctly under both `Would …` and
+        /// `Applied: …`.
         summary: String,
         /// The destination range's A1 address.
         destination: String,
@@ -184,6 +189,11 @@ pub enum AutoFillResult {
         /// fill will actually touch. `false` for form B, where the
         /// destination — and so this list — is exact.
         destination_is_upper_bound: bool,
+        /// The destination runs past the sheet's current row/column count.
+        /// Never a refusal (ADR-0083 §5) — it only earns the summary's
+        /// grid-extent caveat line, which is why it is carried here rather
+        /// than baked into the tense-neutral [`Self::WouldChange`] summary.
+        past_grid_extent: bool,
     },
     /// The target is not a Google Sheet.
     RefusedNotASpreadsheet {
@@ -225,8 +235,9 @@ pub enum AutoFillResult {
     RefusedLeaseStale,
     /// The mutation succeeded.
     Changed {
-        /// Same summary as [`Self::WouldChange`], describing what was
-        /// actually done.
+        /// The same tense-neutral summary [`Self::WouldChange`] carries,
+        /// built by the same call — which is why it reads correctly after
+        /// the fact as well as before it.
         summary: String,
         /// Same as [`Self::WouldChange`].
         destination: String,
@@ -237,6 +248,8 @@ pub enum AutoFillResult {
         overwritten_cells: Vec<String>,
         /// Same as [`Self::WouldChange`].
         destination_is_upper_bound: bool,
+        /// Same as [`Self::WouldChange`].
+        past_grid_extent: bool,
     },
     /// An API or validation error.
     Failed {
@@ -320,7 +333,7 @@ pub async fn auto_fill(
     let started = Instant::now();
     let outcome = auto_fill_inner(drive, sheets, opts, rules).await;
     if !opts.dry_run {
-        record_attempt(&outcome, opts, started.elapsed());
+        record_attempt(&outcome, started.elapsed());
     }
     outcome
 }
@@ -471,40 +484,61 @@ async fn auto_fill_inner(
         },
     };
     let destination_a1 = grid_range_to_a1(&sheet_title, &destination);
+    // Form B's summary names the source it extends: the request log's
+    // `range` key is the *destination*, so without this the record could
+    // not say what was extended. Form A's source is the range itself, and
+    // its summary says so instead.
+    let source_a1 = grid_range_to_a1(&sheet_title, &source_grid);
+
+    let sheet = grid_range::find_sheet_by_id(&workbook, source_grid.sheet_id);
+    let past_grid_extent = sheet.is_some_and(|sheet| extends_past_grid(sheet, &destination));
+    // The *read* is clamped to the grid; the request is not. A destination
+    // running past the sheet's extent is deliberately left to the server
+    // (ADR-0083 §5), but reading it back is this crate's own call — and a
+    // read that Sheets refuses would return `Failed` before `batchUpdate`
+    // was ever attempted, turning §5's "left to the server" into a
+    // client-side refusal in all but name. Clamping costs nothing, since a
+    // cell past the grid extent cannot hold a value and so can never
+    // appear in `overwritten_cells` anyway. `None` means the destination
+    // lies wholly past the extent: nothing to read, nothing to overwrite.
+    let read_range = sheet.map_or(Some(destination), |sheet| {
+        clamp_to_grid(sheet, &destination)
+    });
 
     // The destination's current values are read once, before the
     // --dry-run branch, so both paths report the same overwritten cells
     // from the same read — `merge-cells`' own `read_discarded_cells`
     // precedent.
-    let overwritten_cells = match api
-        .values_get(
-            &opts.spreadsheet_id,
-            &destination_a1,
-            ValueRenderOption::Formatted,
-        )
-        .await
-    {
-        Ok(values) => overwritten_cell_addresses(
-            &values,
-            destination.start_row_index.unwrap_or(0),
-            destination.start_column_index.unwrap_or(0),
-        ),
-        Err(err) => {
-            return gated(AutoFillResult::Failed {
-                detail: format!("{err:#}"),
-            })
+    let overwritten_cells = match read_range {
+        None => Vec::new(),
+        Some(read_range) => {
+            let read_a1 = grid_range_to_a1(&sheet_title, &read_range);
+            match api
+                .values_get(&opts.spreadsheet_id, &read_a1, ValueRenderOption::Formatted)
+                .await
+            {
+                // Offsets are the *read* range's own start, not the
+                // destination's — clamping can only move the end, but
+                // `overwritten_cell_addresses` is indexed off whichever
+                // range was actually read.
+                Ok(values) => overwritten_cell_addresses(
+                    &values,
+                    read_range.start_row_index.unwrap_or(0),
+                    read_range.start_column_index.unwrap_or(0),
+                ),
+                Err(err) => {
+                    return gated(AutoFillResult::Failed {
+                        detail: format!("{err:#}"),
+                    })
+                }
+            }
         }
     };
 
-    let sheet = grid_range::find_sheet_by_id(&workbook, source_grid.sheet_id);
-    let past_grid_extent = sheet.is_some_and(|sheet| extends_past_grid(sheet, &destination));
-
     let summary = describe_effect(
         &opts.form,
+        &source_a1,
         &destination_a1,
-        &overwritten_cells,
-        is_upper_bound,
-        past_grid_extent,
         opts.use_alternate_series,
     );
 
@@ -514,6 +548,7 @@ async fn auto_fill_inner(
             destination: destination_a1,
             overwritten_cells,
             destination_is_upper_bound: is_upper_bound,
+            past_grid_extent,
         });
     }
 
@@ -558,6 +593,7 @@ async fn auto_fill_inner(
             destination: destination_a1,
             overwritten_cells,
             destination_is_upper_bound: is_upper_bound,
+            past_grid_extent,
         },
         Err(err) => AutoFillResult::Failed {
             detail: format!("{err:#}"),
@@ -651,6 +687,40 @@ fn extends_past_grid(sheet: &Sheet, destination: &GridRange) -> bool {
     past_rows || past_columns
 }
 
+/// `destination` with each axis' end clamped to `sheet`'s current extent,
+/// or `None` when that leaves nothing — the destination lies wholly past
+/// the grid on some axis, so there is no cell to read back.
+///
+/// An axis the sheet reports no extent for is left alone: there is nothing
+/// to clamp against, the same "extent unknown ⇒ don't act on it" stance
+/// [`extends_past_grid`] takes.
+fn clamp_to_grid(sheet: &Sheet, destination: &GridRange) -> Option<GridRange> {
+    let grid = sheet
+        .properties
+        .as_ref()
+        .and_then(|props| props.grid_properties.as_ref());
+    let mut clamped = *destination;
+    if let (Some(end), Some(count)) = (destination.end_row_index, grid.and_then(|g| g.row_count)) {
+        clamped.end_row_index = Some(end.min(count));
+    }
+    if let (Some(end), Some(count)) = (
+        destination.end_column_index,
+        grid.and_then(|g| g.column_count),
+    ) {
+        clamped.end_column_index = Some(end.min(count));
+    }
+    let empty = |start: Option<i64>, end: Option<i64>| match (start, end) {
+        (Some(start), Some(end)) => start >= end,
+        _ => false,
+    };
+    if empty(clamped.start_row_index, clamped.end_row_index)
+        || empty(clamped.start_column_index, clamped.end_column_index)
+    {
+        return None;
+    }
+    Some(clamped)
+}
+
 /// The non-blank cells in a `values.get` response, as bare A1 addresses —
 /// **never their values** (ADR-0083 §6; contrast `format.rs`'s
 /// `discarded_from_values`, which carries `"A1: value"` for `merge-cells`).
@@ -694,15 +764,51 @@ fn grid_range_to_a1(sheet_title: &str, grid: &GridRange) -> String {
     };
     let start = format!("{}{}", grid_range::column_index_to_letters(c0), r0 + 1);
     let end = format!("{}{}", grid_range::column_index_to_letters(c1 - 1), r1);
-    a1::compose(Some(sheet_title), Some(&format!("{start}:{end}"))).unwrap_or_default()
+    match a1::compose(Some(sheet_title), Some(&format!("{start}:{end}"))) {
+        Ok(composed) => composed,
+        // Not `unwrap_or_default()`: an empty range here would surface as
+        // an opaque `values.get` failure rather than as itself. `compose`
+        // can only reject a sheet-prefixed or whole-sheet range, and the
+        // `{start}:{end}` built just above is neither. The marker is a
+        // *trailing* comment because `ignore-line` silences its own line
+        // only (`coverage/markers.rs`: `start: line, end: line`), so on a
+        // line of its own it would silence nothing.
+        Err(err) => unreachable!("auto-fill composes only bounded numeric ranges: {err}"), // omni-dev: coverage ignore-line reason="unreachable by construction: compose rejects only a sheet-prefixed or whole-sheet range, and the numeric {start}:{end} built just above is neither"
+    }
 }
 
+/// The caveat every auto-fill carries, in both tenses at once — the
+/// values are never reported, before *or* after the request, so unlike
+/// [`PAST_GRID_EXTENT_CAVEAT_DRY_RUN`] this is one constant rather than
+/// two ([`structure.rs`](super::structure)'s `FORMULA_CAVEAT` shape).
+const UNPREVIEWABLE_VALUES_CAVEAT: &str =
+    "  the filled values are computed by Sheets' own series detection and are never reported, \
+     before or after the request";
+
+/// Shared by the `--dry-run` and post-execution lines so the wording
+/// can't drift; tense differs, so this is two constants rather than one —
+/// `structure.rs`'s `INSERT_RANGE_EDGE_CAVEAT` pair, for the same reason.
+const PAST_GRID_EXTENT_CAVEAT_DRY_RUN: &str =
+    "  the destination extends past the sheet's current extent — Sheets may grow the sheet or \
+     refuse the request";
+const PAST_GRID_EXTENT_CAVEAT: &str =
+    "  the destination extended past the sheet's current extent, so Sheets may have grown it";
+
+/// The **tense-neutral** head of the summary: the destination, the source
+/// it extends and the direction (form B), or the server-decided-split
+/// note (form A), plus the alternate-series flag.
+///
+/// Deliberately carries neither the overwrite count nor either caveat.
+/// Both of those vary with tense, and this string is reused verbatim by
+/// [`AutoFillResult::Changed`] and by the request log's `fields_changed`,
+/// where a conditional ("would be overwritten") would describe a mutation
+/// that already happened. They are separate, indented lines instead —
+/// which also keeps `describe_lines`' trailing `in {book}` attached to the
+/// range clause rather than to a prose caveat.
 fn describe_effect(
     form: &AutoFillForm,
+    source_a1: &str,
     destination_a1: &str,
-    overwritten_cells: &[String],
-    destination_is_upper_bound: bool,
-    past_grid_extent: bool,
     use_alternate_series: bool,
 ) -> String {
     let mut summary = match form {
@@ -722,7 +828,8 @@ fn describe_effect(
                 (Dimension::Columns, false) => "left",
             };
             format!(
-                "auto-fill {destination_a1}, extending {} {}(s) {direction}",
+                "auto-fill {destination_a1} from source {source_a1}, extending {} {}(s) \
+                 {direction}",
                 fill_length.abs(),
                 dimension.noun(),
             )
@@ -731,32 +838,36 @@ fn describe_effect(
     if use_alternate_series {
         summary.push_str(", using the alternate series");
     }
-    if overwritten_cells.is_empty() {
-        summary.push_str("; no non-blank cells in the destination");
-    } else {
-        let prefix = if destination_is_upper_bound {
-            "up to"
-        } else {
-            ""
-        };
-        summary.push_str(&format!(
-            "; {prefix}{}{} non-blank cell(s) would be overwritten: {}",
-            if prefix.is_empty() { "" } else { " " },
-            overwritten_cells.len(),
-            overwritten_cells.join(", ")
-        ));
-    }
-    if past_grid_extent {
-        summary.push_str(
-            "; the destination extends past the sheet's current extent — Sheets may grow the \
-             sheet or refuse the request",
-        );
-    }
-    summary.push_str(
-        "; the values written are computed by Sheets' own series detection and cannot be \
-         previewed",
-    );
     summary
+}
+
+/// The indented overwrite line. `up to` marks form A's upper bound (Sheets
+/// picks the source/destination split itself, so some of these cells are
+/// the source and will not be touched); the tense follows `dry_run`, the
+/// [`PAST_GRID_EXTENT_CAVEAT_DRY_RUN`] pair's own rule.
+fn overwritten_line(
+    overwritten_cells: &[String],
+    destination_is_upper_bound: bool,
+    dry_run: bool,
+) -> String {
+    if overwritten_cells.is_empty() {
+        return "  no non-blank cells in the destination".to_string();
+    }
+    let bound = if destination_is_upper_bound {
+        "up to "
+    } else {
+        ""
+    };
+    let tense = if dry_run {
+        "would be overwritten"
+    } else {
+        "were overwritten"
+    };
+    format!(
+        "  {bound}{} non-blank cell(s) {tense}: {}",
+        overwritten_cells.len(),
+        overwritten_cells.join(", ")
+    )
 }
 
 /// Builds the request for `form`. Placed after the `--dry-run` branch in
@@ -791,7 +902,7 @@ fn build_request(
     BatchUpdateRequestItem::AutoFill(request)
 }
 
-fn record_attempt(outcome: &AutoFillOutcome, _opts: &AutoFillOptions, duration: Duration) {
+fn record_attempt(outcome: &AutoFillOutcome, duration: Duration) {
     let error = match &outcome.result {
         AutoFillResult::Failed { detail } => Some(detail.clone()),
         _ => None,
@@ -801,19 +912,22 @@ fn record_attempt(outcome: &AutoFillOutcome, _opts: &AutoFillOptions, duration: 
         _ => None,
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
-    let (range, fields_changed, overwritten_cells) = match &outcome.result {
-        AutoFillResult::Changed {
-            summary,
-            destination,
-            overwritten_cells,
-            ..
-        } => (
-            Some(destination.clone()),
-            Some(summary.clone()),
-            overwritten_cells.clone(),
-        ),
-        _ => (None, None, Vec::new()),
-    };
+    let (range, fields_changed, overwritten_cells, overwritten_cells_upper_bound) =
+        match &outcome.result {
+            AutoFillResult::Changed {
+                summary,
+                destination,
+                overwritten_cells,
+                destination_is_upper_bound,
+                ..
+            } => (
+                Some(destination.clone()),
+                Some(summary.clone()),
+                overwritten_cells.clone(),
+                *destination_is_upper_bound,
+            ),
+            _ => (None, None, Vec::new(), false),
+        };
 
     request_log::record_drive_mutation(DriveMutationOutcome {
         operation: LOG_OPERATION,
@@ -828,6 +942,7 @@ fn record_attempt(outcome: &AutoFillOutcome, _opts: &AutoFillOptions, duration: 
         range,
         fields_changed,
         overwritten_cells,
+        overwritten_cells_upper_bound,
         error,
         duration,
         ..Default::default()
@@ -849,9 +964,19 @@ pub fn describe_lines(outcome: &AutoFillOutcome) -> Vec<String> {
         |n| format!("'{n}'"),
     );
     match &outcome.result {
-        AutoFillResult::WouldChange { summary, .. } => {
-            vec![format!("Would {summary} in {book}")]
-        }
+        AutoFillResult::WouldChange {
+            summary,
+            overwritten_cells,
+            destination_is_upper_bound,
+            past_grid_extent,
+            ..
+        } => change_lines(
+            &format!("Would {summary} in {book}"),
+            overwritten_cells,
+            *destination_is_upper_bound,
+            *past_grid_extent,
+            true,
+        ),
         AutoFillResult::RefusedNotASpreadsheet { mime_type } => vec![format!(
             "Refused: {book} is not a Google Sheet (mimeType: {mime_type}); \
              `drive sheets auto-fill` only works on spreadsheets"
@@ -907,11 +1032,50 @@ pub fn describe_lines(outcome: &AutoFillOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
-        AutoFillResult::Changed { summary, .. } => {
-            vec![format!("Applied: {summary} in {book}")]
-        }
+        AutoFillResult::Changed {
+            summary,
+            overwritten_cells,
+            destination_is_upper_bound,
+            past_grid_extent,
+            ..
+        } => change_lines(
+            &format!("Applied: {summary} in {book}"),
+            overwritten_cells,
+            *destination_is_upper_bound,
+            *past_grid_extent,
+            false,
+        ),
         AutoFillResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
+}
+
+/// The head line plus its indented detail lines, shared by
+/// [`AutoFillResult::WouldChange`] and [`AutoFillResult::Changed`] so the
+/// two can only differ in `head` and in the tense `dry_run` selects —
+/// `structure.rs`'s `vec![summary, detail]` shape.
+fn change_lines(
+    head: &str,
+    overwritten_cells: &[String],
+    destination_is_upper_bound: bool,
+    past_grid_extent: bool,
+    dry_run: bool,
+) -> Vec<String> {
+    let mut lines = vec![
+        head.to_string(),
+        overwritten_line(overwritten_cells, destination_is_upper_bound, dry_run),
+    ];
+    if past_grid_extent {
+        lines.push(
+            if dry_run {
+                PAST_GRID_EXTENT_CAVEAT_DRY_RUN
+            } else {
+                PAST_GRID_EXTENT_CAVEAT
+            }
+            .to_string(),
+        );
+    }
+    lines.push(UNPREVIEWABLE_VALUES_CAVEAT.to_string());
+    lines
 }
 
 #[cfg(test)]
@@ -1103,6 +1267,45 @@ mod tests {
     }
 
     #[test]
+    fn clamp_to_grid_trims_a_destination_that_overhangs_the_extent() {
+        let sheet = sheet_with_extent(10, 5);
+        // Rows 8..14 against a 10-row sheet -> 8..10.
+        let clamped = clamp_to_grid(&sheet, &bounded(0, 8, 14, 0, 1)).unwrap();
+        assert_eq!(clamped.end_row_index, Some(10));
+        assert_eq!(clamped.start_row_index, Some(8));
+        // Columns 3..9 against a 5-column sheet -> 3..5.
+        let clamped = clamp_to_grid(&sheet, &bounded(0, 0, 1, 3, 9)).unwrap();
+        assert_eq!(clamped.end_column_index, Some(5));
+    }
+
+    #[test]
+    fn clamp_to_grid_leaves_a_destination_within_the_extent_untouched() {
+        let sheet = sheet_with_extent(10, 5);
+        let destination = bounded(0, 2, 5, 1, 3);
+        assert_eq!(clamp_to_grid(&sheet, &destination), Some(destination));
+    }
+
+    #[test]
+    fn clamp_to_grid_is_none_when_the_destination_lies_wholly_past_the_extent() {
+        let sheet = sheet_with_extent(10, 5);
+        // Starts at row 10 on a 10-row sheet: nothing left to read.
+        assert_eq!(clamp_to_grid(&sheet, &bounded(0, 10, 14, 0, 1)), None);
+        assert_eq!(clamp_to_grid(&sheet, &bounded(0, 0, 1, 5, 9)), None);
+    }
+
+    #[test]
+    fn clamp_to_grid_leaves_an_axis_with_no_known_extent_alone() {
+        let mut sheet = sheet_with_extent(10, 5);
+        sheet
+            .properties
+            .as_mut()
+            .expect("fixture always sets properties")
+            .grid_properties = None;
+        let destination = bounded(0, 0, 9_999, 0, 1);
+        assert_eq!(clamp_to_grid(&sheet, &destination), Some(destination));
+    }
+
+    #[test]
     fn overwritten_cell_addresses_skips_blanks_and_offsets_by_the_ranges_own_start() {
         let values = ValueRange {
             range: None,
@@ -1186,36 +1389,35 @@ mod tests {
             fill_length,
         };
         assert!(
-            describe_effect(&form(Dimension::Rows, 3), "A4:A6", &[], false, false, false)
+            describe_effect(&form(Dimension::Rows, 3), "A1:A3", "A4:A6", false)
                 .contains("3 row(s) down")
         );
-        assert!(describe_effect(
-            &form(Dimension::Rows, -3),
-            "A1:A3",
-            &[],
-            false,
-            false,
-            false
-        )
-        .contains("3 row(s) up"));
-        assert!(describe_effect(
-            &form(Dimension::Columns, 2),
-            "B1:C1",
-            &[],
-            false,
-            false,
-            false
-        )
-        .contains("2 column(s) right"));
-        assert!(describe_effect(
-            &form(Dimension::Columns, -2),
-            "A1:B1",
-            &[],
-            false,
-            false,
-            false
-        )
-        .contains("2 column(s) left"));
+        assert!(
+            describe_effect(&form(Dimension::Rows, -3), "A4:A6", "A1:A3", false)
+                .contains("3 row(s) up")
+        );
+        assert!(
+            describe_effect(&form(Dimension::Columns, 2), "A1:A1", "B1:C1", false)
+                .contains("2 column(s) right")
+        );
+        assert!(
+            describe_effect(&form(Dimension::Columns, -2), "C1:C1", "A1:B1", false)
+                .contains("2 column(s) left")
+        );
+    }
+
+    #[test]
+    fn describe_effect_names_the_source_it_extends() {
+        let form = AutoFillForm::SourceAndDestination {
+            sheet: None,
+            source: None,
+            dimension: Dimension::Rows,
+            fill_length: 7,
+        };
+        // The request log's `range` key is the destination, so without
+        // this the record could not say what was extended.
+        let summary = describe_effect(&form, "'Q1'!A1:A3", "'Q1'!A4:A10", false);
+        assert!(summary.contains("from source 'Q1'!A1:A3"), "{summary}");
     }
 
     #[test]
@@ -1224,33 +1426,8 @@ mod tests {
             sheet: None,
             range: None,
         };
-        let summary = describe_effect(&form, "A1:A10", &[], true, false, false);
+        let summary = describe_effect(&form, "A1:A10", "A1:A10", false);
         assert!(summary.contains("Sheets decides"), "{summary}");
-    }
-
-    #[test]
-    fn describe_effect_reports_overwritten_cells_never_their_values() {
-        let form = AutoFillForm::SourceAndDestination {
-            sheet: None,
-            source: None,
-            dimension: Dimension::Rows,
-            fill_length: 1,
-        };
-        let cells = vec!["A4".to_string(), "A5".to_string()];
-        let summary = describe_effect(&form, "A4:A5", &cells, false, false, false);
-        assert!(summary.contains("2 non-blank cell(s)"), "{summary}");
-        assert!(summary.contains("A4, A5"), "{summary}");
-    }
-
-    #[test]
-    fn describe_effect_marks_an_upper_bound_count_as_up_to() {
-        let form = AutoFillForm::Range {
-            sheet: None,
-            range: None,
-        };
-        let cells = vec!["A1".to_string()];
-        let summary = describe_effect(&form, "A1:A10", &cells, true, false, false);
-        assert!(summary.contains("up to 1 non-blank cell(s)"), "{summary}");
     }
 
     #[test]
@@ -1261,35 +1438,83 @@ mod tests {
             dimension: Dimension::Rows,
             fill_length: 1,
         };
-        let summary = describe_effect(&form, "A2:A2", &[], false, false, true);
+        let summary = describe_effect(&form, "A1:A1", "A2:A2", true);
         assert!(summary.contains("alternate series"), "{summary}");
     }
 
+    /// The summary is reused verbatim by `Changed` and by the request
+    /// log's `fields_changed`, so it must carry no clause that only reads
+    /// correctly before the fact.
     #[test]
-    fn describe_effect_names_the_grid_extent_caveat() {
+    fn describe_effect_is_tense_neutral() {
         let form = AutoFillForm::SourceAndDestination {
             sheet: None,
             source: None,
             dimension: Dimension::Rows,
             fill_length: 1,
         };
-        let summary = describe_effect(&form, "A2:A2", &[], false, true, false);
-        assert!(
-            summary.contains("past the sheet's current extent"),
-            "{summary}"
+        let summary = describe_effect(&form, "A1:A1", "A2:A2", true);
+        for conditional in ["would", "cannot", "may "] {
+            assert!(!summary.contains(conditional), "{summary}");
+        }
+    }
+
+    #[test]
+    fn overwritten_line_reports_cells_never_their_values() {
+        let cells = vec!["A4".to_string(), "A5".to_string()];
+        let line = overwritten_line(&cells, false, true);
+        assert_eq!(line, "  2 non-blank cell(s) would be overwritten: A4, A5");
+    }
+
+    #[test]
+    fn overwritten_line_marks_an_upper_bound_count_as_up_to() {
+        let cells = vec!["A1".to_string()];
+        let line = overwritten_line(&cells, true, true);
+        assert_eq!(line, "  up to 1 non-blank cell(s) would be overwritten: A1");
+    }
+
+    #[test]
+    fn overwritten_line_uses_the_past_tense_after_a_real_run() {
+        let cells = vec!["A4".to_string()];
+        assert_eq!(
+            overwritten_line(&cells, false, false),
+            "  1 non-blank cell(s) were overwritten: A4"
+        );
+        assert_eq!(
+            overwritten_line(&[], false, false),
+            "  no non-blank cells in the destination"
         );
     }
 
     #[test]
-    fn describe_effect_always_states_the_server_decides_the_values() {
-        let form = AutoFillForm::SourceAndDestination {
-            sheet: None,
-            source: None,
-            dimension: Dimension::Rows,
-            fill_length: 1,
-        };
-        let summary = describe_effect(&form, "A2:A2", &[], false, false, false);
-        assert!(summary.contains("cannot be previewed"), "{summary}");
+    fn change_lines_name_the_grid_extent_caveat_in_the_matching_tense() {
+        let dry = change_lines("Would x in 'B'", &[], false, true, true);
+        assert!(
+            dry.contains(&PAST_GRID_EXTENT_CAVEAT_DRY_RUN.to_string()),
+            "{dry:?}"
+        );
+        let real = change_lines("Applied: x in 'B'", &[], false, true, false);
+        assert!(
+            real.contains(&PAST_GRID_EXTENT_CAVEAT.to_string()),
+            "{real:?}"
+        );
+        // Omitted entirely when the destination fits.
+        let within = change_lines("Would x in 'B'", &[], false, false, true);
+        assert!(
+            !within.iter().any(|l| l.contains("current extent")),
+            "{within:?}"
+        );
+    }
+
+    #[test]
+    fn change_lines_always_state_the_server_decides_the_values() {
+        for dry_run in [true, false] {
+            let lines = change_lines("head", &[], false, false, dry_run);
+            assert!(
+                lines.contains(&UNPREVIEWABLE_VALUES_CAVEAT.to_string()),
+                "{lines:?}"
+            );
+        }
     }
 
     #[test]
@@ -1300,6 +1525,7 @@ mod tests {
                 destination: String::new(),
                 overwritten_cells: Vec::new(),
                 destination_is_upper_bound: false,
+                past_grid_extent: false,
             }
             .log_status(),
             "would-change"
@@ -1360,6 +1586,7 @@ mod tests {
                 destination: String::new(),
                 overwritten_cells: Vec::new(),
                 destination_is_upper_bound: false,
+                past_grid_extent: false,
             }
             .log_status(),
             "changed"
@@ -1384,14 +1611,15 @@ mod tests {
         assert_eq!(form.sheet_and_range(), (Some("Q1"), Some("A1:A3")));
     }
 
-    /// Every arm renders to exactly one line — `write.rs`'s own
+    /// No arm ever emits a literal newline of its own — `write.rs`'s own
     /// `every_describe_arm_renders_a_single_line` contract: `describe_lines`
     /// interpolates a Drive-supplied file name and server-supplied A1
     /// strings, and its CLI caller (`sanitize_for_terminal`) can only
-    /// sanitize the **whole rendered line** rather than each interpolation
-    /// because no arm here emits a literal newline of its own.
+    /// sanitize the **whole rendered line** rather than each interpolation.
+    /// `WouldChange`/`Changed` return several lines (a head plus indented
+    /// detail lines, `structure.rs`'s shape); every other arm returns one.
     #[test]
-    fn every_describe_line_renders_exactly_one_line_per_result() {
+    fn no_describe_line_contains_an_embedded_newline() {
         let base = AutoFillOutcome {
             spreadsheet_id: "sheet-1".to_string(),
             file_name: Some("Budget".to_string()),
@@ -1408,6 +1636,7 @@ mod tests {
                 destination: "'Q1'!A1:A10".to_string(),
                 overwritten_cells: vec!["A1".to_string()],
                 destination_is_upper_bound: true,
+                past_grid_extent: true,
             },
             AutoFillResult::RefusedNotASpreadsheet {
                 mime_type: "application/pdf".to_string(),
@@ -1431,6 +1660,7 @@ mod tests {
                 destination: "'Q1'!A1:A10".to_string(),
                 overwritten_cells: Vec::new(),
                 destination_is_upper_bound: true,
+                past_grid_extent: false,
             },
             AutoFillResult::Failed {
                 detail: "boom".to_string(),
@@ -1442,7 +1672,10 @@ mod tests {
                 ..base.clone()
             };
             let lines = describe_lines(&outcome);
-            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(!lines.is_empty(), "{lines:?}");
+            for line in &lines {
+                assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
+            }
         }
     }
 
@@ -1949,6 +2182,125 @@ mod tests {
         assert!(matches!(outcome.result, AutoFillResult::Changed { .. }));
     }
 
+    /// ADR-0083 §5 leaves a past-extent destination to the server. The
+    /// *read* must not pre-empt that: with no mock mounted for any
+    /// `values.get` path, a request would 404 and the run would report
+    /// `Failed` before `batchUpdate` was ever attempted. Clamping means
+    /// the read is skipped entirely, the fill still goes out, and the
+    /// grid-extent caveat is what tells the user.
+    ///
+    /// Only form A can reach this: form B extends from a source range's
+    /// own edge, so its destination always *starts* inside the grid and
+    /// can only straddle the edge (the test below), never clear it.
+    #[tokio::test]
+    async fn a_destination_wholly_past_the_grid_extent_skips_the_read_and_still_fills() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1", "replies": [{}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        // The fixture sheet has 1000 rows; this --range names rows
+        // 2000..2010, wholly past the extent.
+        let opts = AutoFillOptions {
+            lease_token,
+            ledger_path,
+            form: AutoFillForm::Range {
+                sheet: Some("Q1".to_string()),
+                range: Some("A2001:A2010".to_string()),
+            },
+            ..base_opts(range_form(), false)
+        };
+        let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
+        let AutoFillResult::Changed {
+            overwritten_cells,
+            past_grid_extent,
+            ..
+        } = &outcome.result
+        else {
+            panic!("{:?}", outcome.result);
+        };
+        assert!(overwritten_cells.is_empty(), "{overwritten_cells:?}");
+        assert!(past_grid_extent);
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.url.path().contains("/values/")),
+            "the read must be skipped, not attempted and failed"
+        );
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines[1], "  no non-blank cells in the destination");
+        assert_eq!(lines[2], PAST_GRID_EXTENT_CAVEAT);
+    }
+
+    /// The partial case: the destination straddles the grid edge, so the
+    /// read is trimmed to the in-grid part rather than skipped.
+    #[tokio::test]
+    async fn a_destination_straddling_the_grid_edge_reads_only_the_in_grid_part() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // Source A1:A3 filled 1000 rows down lands at rows 4..1003; the
+        // 1000-row sheet clamps the read to 'Q1'!A4:A1000.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A4:A1000",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [["keep"]]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = base_opts(source_and_destination_form(Dimension::Rows, 1000), true);
+        let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
+        let AutoFillResult::WouldChange {
+            destination,
+            overwritten_cells,
+            past_grid_extent,
+            ..
+        } = &outcome.result
+        else {
+            panic!("{:?}", outcome.result);
+        };
+        // The *destination* reported is the unclamped one — only the read
+        // was trimmed.
+        assert_eq!(destination, "'Q1'!A4:A1003");
+        assert_eq!(overwritten_cells, &vec!["A4".to_string()]);
+        assert!(past_grid_extent);
+    }
+
     #[tokio::test]
     async fn a_values_get_failure_is_reported_as_failed() {
         let server = wiremock::MockServer::start().await;
@@ -1973,6 +2325,173 @@ mod tests {
         let opts = base_opts(source_and_destination_form(Dimension::Rows, 7), true);
         let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
         assert!(matches!(outcome.result, AutoFillResult::Failed { .. }));
+    }
+
+    /// The fixture the three engine-level lease tests below share: an
+    /// allowed target whose destination read succeeds, so the only thing
+    /// left to refuse is the lease itself.
+    ///
+    /// Those tests are *not* duplicates of
+    /// [`lease_refusals_map_to_their_auto_fill_results`], which checks the
+    /// [`FromLeaseRefusal`] impl in isolation. A mis-wired `requires_lease`,
+    /// or a gate evaluated in the wrong order, would leave that unit test
+    /// green while the engine sailed past the lease into `batchUpdate` —
+    /// which is exactly what these assert does not happen.
+    async fn mount_leasable_fixture(server: &wiremock::MockServer) {
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(server)
+        .await;
+        mount_folder("folder-1").mount(server).await;
+        mount_workbook().mount(server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A4:A10",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(server)
+            .await;
+    }
+
+    /// Runs a real (non-dry) fill against [`mount_leasable_fixture`] with
+    /// the given lease, and asserts no `batchUpdate` was ever issued —
+    /// every refusal below must happen before the mutating call.
+    async fn run_with_lease(
+        server: &wiremock::MockServer,
+        lease_token: Option<String>,
+        ledger_path: std::path::PathBuf,
+    ) -> AutoFillOutcome {
+        let (drive, sheets) = clients(server).await;
+        mount_leasable_fixture(server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = AutoFillOptions {
+            lease_token,
+            ledger_path,
+            ..base_opts(source_and_destination_form(Dimension::Rows, 7), false)
+        };
+        let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.url.path().ends_with(":batchUpdate")),
+            "a refused lease must not reach batchUpdate"
+        );
+        outcome
+    }
+
+    fn ledger_in_a_tempdir() -> std::path::PathBuf {
+        tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl")
+    }
+
+    #[tokio::test]
+    async fn an_expired_or_unknown_lease_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        // A token this ledger has never heard of is the same refusal as an
+        // expired one (ADR-0080 §1).
+        let outcome = run_with_lease(
+            &server,
+            Some("never-issued".to_string()),
+            ledger_in_a_tempdir(),
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            AutoFillResult::RefusedLeaseExpired
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_lease_bound_to_another_file_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let ledger_path = ledger_in_a_tempdir();
+        let token = seed_lease(&ledger_path, "some-other-sheet", "1");
+        let outcome = run_with_lease(&server, Some(token), ledger_path).await;
+        assert!(matches!(
+            outcome.result,
+            AutoFillResult::RefusedLeaseWrongFile
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_stale_lease_when_the_file_has_moved() {
+        let server = wiremock::MockServer::start().await;
+        let ledger_path = ledger_in_a_tempdir();
+        // `mount_file` reports version "1"; the lease recorded "0", so the
+        // file has moved under it — ADR-0080 §6's staleness check.
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let outcome = run_with_lease(&server, Some(token), ledger_path).await;
+        assert!(matches!(outcome.result, AutoFillResult::RefusedLeaseStale));
+    }
+
+    /// The rendered `Changed` text, not just the variant — the summary is
+    /// shared with `WouldChange` and reused as the request log's
+    /// `fields_changed`, so a conditional clause leaking into it would
+    /// describe a mutation that already happened.
+    #[tokio::test]
+    async fn a_real_run_renders_in_the_past_tense_and_names_the_source() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A4:A10",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [["keep"], [], ["also"]]
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1", "replies": [{}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = AutoFillOptions {
+            lease_token,
+            ledger_path,
+            ..base_opts(source_and_destination_form(Dimension::Rows, 7), false)
+        };
+        let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
+        let lines = describe_lines(&outcome);
+        assert_eq!(
+            lines[0],
+            "Applied: auto-fill 'Q1'!A4:A10 from source 'Q1'!A1:A3, extending 7 row(s) down in \
+             'sheet-1'"
+        );
+        assert_eq!(lines[1], "  2 non-blank cell(s) were overwritten: A4, A6");
+        assert_eq!(lines[2], UNPREVIEWABLE_VALUES_CAVEAT);
+        let AutoFillResult::Changed { summary, .. } = &outcome.result else {
+            panic!("{:?}", outcome.result);
+        };
+        // The same string lands in the request log's `fields_changed`.
+        assert!(!summary.contains("would"), "{summary}");
     }
 
     #[tokio::test]

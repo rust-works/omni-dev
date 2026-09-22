@@ -243,12 +243,20 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `sheets-write`. No new context key for the destination itself: `range`
   (introduced above for `write`/`append`/`clear`) is reused for the
   destination's A1 address, and `fields_changed` for a prose summary of the
-  effect (source, direction, alternate-series flag). One new key,
-  `overwritten_cells`: the non-blank cells in the destination that were
-  overwritten, as **bare A1 addresses** — deliberately not `"A1: value"`
-  like `discarded_cells`, since a fill's values are Sheets' own series
-  detection and this crate never records them, before or after the
-  request.
+  effect — the destination, the source range it extends, the direction, and
+  the alternate-series flag. That summary is deliberately **tense-neutral**:
+  the same string is rendered under both `Would …` and `Applied: …`, so it
+  never describes a completed mutation in the conditional.
+
+  Two new keys. `overwritten_cells`: the non-blank cells in the destination
+  that were overwritten, as **bare A1 addresses** — deliberately not
+  `"A1: value"` like `discarded_cells`, since a fill's values are Sheets'
+  own series detection and this crate never records them, before or after
+  the request. `overwritten_cells_are_upper_bound`: present (and `"true"`)
+  only for `auto-fill --range`, where Sheets decides for itself which cells
+  in the named range are the source and which are filled — some of the
+  listed cells are the source and were never touched. Absent means the list
+  is exact, which is `--source` and every other verb.
 
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
