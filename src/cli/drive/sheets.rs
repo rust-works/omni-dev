@@ -29,6 +29,7 @@ pub(crate) mod protection;
 pub(crate) mod read;
 pub(crate) mod sort_range;
 pub(crate) mod structure;
+pub(crate) mod text_to_columns;
 pub(crate) mod validation;
 pub(crate) mod values;
 pub(crate) mod write;
@@ -361,6 +362,14 @@ pub enum SheetsSubcommands {
     /// Reorders rows in a range by one or more column keys. Gated by the
     /// folder `sheets-write` operation (issue #1842, ADR-0083 §3).
     SortRange(sort_range::SortRangeCommand),
+    /// Splits a single column's delimited text across the adjacent
+    /// columns to its right. Gated by the folder `sheets-write` operation
+    /// (issue #1843, ADR-0083 §1) — it writes ordinary cell content,
+    /// doing nothing a `sheets clear` followed by a `sheets write` could
+    /// not already do under the same grant. How many columns the split
+    /// needs, and the values it writes, can never be previewed; see
+    /// `text-to-columns --help`.
+    TextToColumns(text_to_columns::TextToColumnsCommand),
 }
 
 impl SheetsCommand {
@@ -452,6 +461,7 @@ impl SheetsCommand {
             SheetsSubcommands::PasteData(cmd) => cmd.execute(client).await,
             SheetsSubcommands::AutoFill(cmd) => cmd.execute(client).await,
             SheetsSubcommands::SortRange(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::TextToColumns(cmd) => cmd.execute(client).await,
         }
     }
 }

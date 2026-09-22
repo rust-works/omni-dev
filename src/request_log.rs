@@ -1524,13 +1524,16 @@ pub struct DriveMutationOutcome {
     /// crate never sees them, before or after the request. Empty when the
     /// destination has no non-blank cells, and for every other verb.
     pub overwritten_cells: Vec<String>,
-    /// `auto-fill --range` only: [`Self::overwritten_cells`] is an **upper
-    /// bound**, not a list of cells that were certainly overwritten. That
-    /// form lets Sheets decide for itself which cells in the named range
-    /// are the source and which are filled, so some of the listed cells
-    /// are the source and were never touched. `false` for `--source`,
-    /// where the destination is computed client-side and the list is
-    /// exact, and for every other verb.
+    /// `auto-fill --range` and every `text-to-columns` run:
+    /// [`Self::overwritten_cells`] is an **upper bound**, not a list of
+    /// cells that were certainly overwritten. `auto-fill --range` lets
+    /// Sheets decide for itself which cells in the named range are the
+    /// source and which are filled, so some of the listed cells are the
+    /// source and were never touched; `text-to-columns` reports the span a
+    /// locally computed, non-quote-aware split *might* need, which the API
+    /// decides for itself and may need fewer columns of. `false` for
+    /// `auto-fill --source`, where the destination is computed
+    /// client-side and the list is exact, and for every other verb.
     pub overwritten_cells_upper_bound: bool,
     /// The data validation condition type a `set-data-validation` applied
     /// (issue #1643) — `"ONE_OF_LIST"`, `"NUMBER_BETWEEN"`, `"BOOLEAN"`,
@@ -2975,6 +2978,44 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+    }
+
+    /// `text-to-columns` never knows exactly how many columns the API's
+    /// own split will need, so every run's `overwritten_cells` is an
+    /// upper bound — unlike `auto-fill`, this is unconditional rather
+    /// than form-dependent.
+    #[test]
+    fn text_to_columns_record_always_marks_its_overwritten_cells_as_an_upper_bound() {
+        let rec = build_drive_mutation_record(
+            DriveMutationOutcome {
+                operation: "sheets-text-to-columns",
+                file_id: "sheet-1".into(),
+                file_name: "Budget".into(),
+                status: "changed".into(),
+                range: Some("'Q1'!A2:A4".into()),
+                fields_changed: Some(
+                    "split 'Q1'!A2:A4 on comma into up to 2 column(s), spill 'Q1'!B2:B4".into(),
+                ),
+                overwritten_cells: vec!["B3".into()],
+                overwritten_cells_upper_bound: true,
+                duration: Duration::from_millis(1),
+                ..Default::default()
+            },
+            RequestLogContext::default(),
+        );
+        assert_eq!(
+            rec.context.get("overwritten_cells").map(String::as_str),
+            Some("B3")
+        );
+        assert_eq!(
+            rec.context
+                .get("overwritten_cells_are_upper_bound")
+                .map(String::as_str),
+            Some("true")
+        );
+        // Never the split pieces or the source's contents — only the A1
+        // address and the prose summary (ADR-0083 §6).
+        assert!(!rec.context.get("fields_changed").unwrap().contains("a,b"));
     }
 
     #[test]

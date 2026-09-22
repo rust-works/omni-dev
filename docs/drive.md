@@ -627,7 +627,7 @@ operation anywhere in a target's ancestor chain:
 | `create`            | deny    | `create`, `sheets create` |
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets sort-range` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets sort-range`, `sheets text-to-columns` — cell values; `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
 | `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
@@ -1876,6 +1876,60 @@ first. The preflight read that reports the overwritten cells is clamped to
 the grid's current extent, so it can never fail on the out-of-grid part and
 turn "left to the server" into a client-side refusal; a cell past the extent
 holds no value, so nothing is lost by not reading it.
+
+#### `drive sheets text-to-columns`
+
+Splits a single column's delimited text across the adjacent columns to its
+right. Also gated under **`sheets-write`** (issue #1843,
+[ADR-0083](adrs/adr-0083.md) §1) — it writes ordinary cell content, exactly
+what a `sheets clear` followed by a `sheets write` of the same span could
+already do under that grant.
+
+`--source` must resolve to a **fully bounded, single column** — the API's
+own "must span exactly one column" constraint, plus this v1's own
+requirement that it not be open-ended (`A2:A100`, not `A:A`):
+
+```bash
+omni-dev drive sheets text-to-columns <ID> --sheet Q1 --source A2:A100 \
+  --delimiter comma
+
+# A custom separator:
+omni-dev drive sheets text-to-columns <ID> --sheet Q1 --source A2:A100 \
+  --delimiter custom --custom-delimiter '|'
+
+# Let Sheets detect the separator itself:
+omni-dev drive sheets text-to-columns <ID> --sheet Q1 --source A2:A100 \
+  --delimiter auto --dry-run
+```
+
+**How many columns the split needs, and the values it writes, can never be
+previewed, before or after the request.** `textToColumns` carries no
+response object, and the split is entirely Sheets' own splitting
+heuristic — `--dry-run` (and the real run) instead report a local
+upper-bound width, computed by a naive, non-quote-aware split of the
+source's current values, and the count and A1 locations of the non-blank
+cells within that upper-bound span that would be (or were) overwritten,
+never their values or the split pieces:
+
+```
+$ omni-dev drive sheets text-to-columns <ID> --sheet Q1 --source A2:A4 \
+    --delimiter comma --dry-run
+Would split 'Q1'!A2:A4 on comma into up to 3 column(s), spill 'Q1'!B2:C4 in 'Budget'
+  up to 1 non-blank cell(s) would be overwritten: B3
+  the number of columns the split needs, and the values it writes, are computed by Sheets' own splitting and are never reported, before or after the request; the count above is a local upper-bound estimate only
+```
+
+The source column itself is excluded from the reported overwrite list: its
+content is what the split reads, not a cell the request overwrites. The
+overwrite count is **always** an upper bound (unlike `auto-fill`, where
+only `--range` is): the API decides for itself how many columns each row's
+split needs, and a quoted delimiter or a run of consecutive separators can
+make the local split wider than the real one.
+
+A spill that runs past the sheet's current column count is **not refused
+client-side**: `sheets append` already grows the grid under `sheets-write`,
+so `text-to-columns` follows the same rule. The summary carries a caveat
+instead, and the verb never prepends a request to grow the sheet first.
 
 #### `drive sheets create`
 

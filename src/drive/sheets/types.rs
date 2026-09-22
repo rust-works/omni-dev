@@ -802,6 +802,14 @@ pub enum BatchUpdateRequestItem {
     /// (`sort-range`, issue #1842). Gated by `SheetsWrite` alone: it is a
     /// permutation of the named cells' values, never a structural edit.
     SortRange(SortRangeRequest),
+    /// Splits a single column's delimited text across the adjacent columns
+    /// to its right (`text-to-columns`, issue #1843,
+    /// [ADR-0083](../../../docs/adrs/adr-0083.md) §1). Gated by
+    /// `DriveOperation::SheetsWrite` alone: it writes ordinary cell content
+    /// into columns the request derives from `source`, doing nothing a
+    /// `sheets clear` followed by a `sheets write` of the same span could
+    /// not already do under the same grant.
+    TextToColumns(TextToColumnsRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -3107,6 +3115,57 @@ pub struct SortRangeRequest {
     pub sort_specs: Vec<SortSpec>,
 }
 
+/// `TextToColumnsRequest` — splits a single column's delimited text across
+/// the adjacent columns to its right (issue #1843,
+/// [ADR-0083](../../../docs/adrs/adr-0083.md) §1).
+///
+/// The API requires [`Self::source`] to "span exactly one column"; this
+/// crate never sees or predicts how many columns the split needs — only an
+/// upper bound computed from a local, non-quote-aware split — see
+/// `text_to_columns.rs`'s module docs for what `--dry-run` can and cannot
+/// say about it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TextToColumnsRequest {
+    /// The column to split. Must span exactly one column; may be row-open
+    /// (`A:A`) or row-bounded (`A2:A100`).
+    pub source: GridRange,
+    /// The custom separator. Read by the API only when
+    /// [`Self::delimiter_type`] is [`DelimiterType::Custom`]; omitted
+    /// otherwise, matching `AutoFillRequest`'s optional-field convention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    /// Which separator to split on, or to detect automatically.
+    #[serde(rename = "delimiterType")]
+    pub delimiter_type: DelimiterType,
+}
+
+/// The API's `TextToColumnsRequest.delimiterType` enum.
+///
+/// No `DELIMITER_TYPE_UNSPECIFIED` variant is modelled: its behaviour is
+/// undocumented, so `text_to_columns.rs`'s CLI surface has no way to send
+/// it and no default that resolves to it.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum DelimiterType {
+    /// Split on `,`.
+    #[serde(rename = "COMMA")]
+    Comma,
+    /// Split on `;`.
+    #[serde(rename = "SEMICOLON")]
+    Semicolon,
+    /// Split on `.`.
+    #[serde(rename = "PERIOD")]
+    Period,
+    /// Split on a single space.
+    #[serde(rename = "SPACE")]
+    Space,
+    /// Split on [`TextToColumnsRequest::delimiter`].
+    #[serde(rename = "CUSTOM")]
+    Custom,
+    /// Sheets picks the separator itself.
+    #[serde(rename = "AUTODETECT")]
+    Autodetect,
+}
+
 /// [`AutoFillRequest`]'s form-B payload.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SourceAndDestination {
@@ -3843,6 +3902,61 @@ mod tests {
                         {"dimensionIndex": 1, "sortOrder": "DESCENDING"},
                         {"dimensionIndex": 0, "sortOrder": "ASCENDING"},
                     ],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn text_to_columns_omits_delimiter_for_a_fixed_type() {
+        let request = BatchUpdateRequestItem::TextToColumns(TextToColumnsRequest {
+            source: GridRange {
+                sheet_id: 0,
+                start_row_index: Some(1),
+                end_row_index: Some(100),
+                start_column_index: Some(0),
+                end_column_index: Some(1),
+            },
+            delimiter: None,
+            delimiter_type: DelimiterType::Comma,
+        });
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "textToColumns": {
+                    "source": {
+                        "sheetId": 0, "startRowIndex": 1, "endRowIndex": 100,
+                        "startColumnIndex": 0, "endColumnIndex": 1,
+                    },
+                    "delimiterType": "COMMA",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn text_to_columns_serializes_a_custom_delimiter() {
+        let request = BatchUpdateRequestItem::TextToColumns(TextToColumnsRequest {
+            source: GridRange {
+                sheet_id: 0,
+                start_row_index: Some(0),
+                end_row_index: Some(5),
+                start_column_index: Some(0),
+                end_column_index: Some(1),
+            },
+            delimiter: Some("|".to_string()),
+            delimiter_type: DelimiterType::Custom,
+        });
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "textToColumns": {
+                    "source": {
+                        "sheetId": 0, "startRowIndex": 0, "endRowIndex": 5,
+                        "startColumnIndex": 0, "endColumnIndex": 1,
+                    },
+                    "delimiter": "|",
+                    "delimiterType": "CUSTOM",
                 },
             })
         );

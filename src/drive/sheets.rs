@@ -46,6 +46,7 @@ pub mod read;
 pub mod sort_range;
 pub mod structure;
 mod target_gate;
+pub mod text_to_columns;
 pub mod types;
 pub mod validation;
 pub mod write;

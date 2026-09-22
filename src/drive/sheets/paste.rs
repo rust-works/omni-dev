@@ -90,7 +90,7 @@ use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
     BatchUpdateRequestItem, CopyPasteRequest, CutPasteRequest, GridCoordinate, GridRange,
-    PasteDataRequest, PasteOrientation, PasteType, ValueRange,
+    PasteDataRequest, PasteOrientation, PasteType,
 };
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -821,7 +821,7 @@ async fn read_non_blank(
         .values_get(spreadsheet_id, &range, ValueRenderOption::Formatted)
         .await
         .map_err(|err| format!("{err:#}"))?;
-    Ok(non_blank_locations(
+    Ok(grid_range::non_blank_locations(
         &values,
         clamped.start_row_index.unwrap_or(0),
         clamped.start_column_index.unwrap_or(0),
@@ -952,33 +952,6 @@ fn sheet_exceeds_dimensions(
         (Some(end), Some(count)) if end > count
     );
     rows_exceed || cols_exceed
-}
-
-/// Every non-blank cell within a `values.get` read, as its A1 address —
-/// never its value (ADR-0083 §6: "counts and A1 locations, never
-/// contents"). Unlike `format.rs::discarded_from_values`,
-/// the top-left cell is **not** skipped: every cell within a paste's
-/// written extent is overwritten by construction, including the one at
-/// its anchor, whereas a merge alone keeps its top-left value in place.
-/// `row_offset`/`col_offset` are the read range's own start row/column,
-/// since the API indexes a read relative to the range it was asked for,
-/// not the sheet.
-fn non_blank_locations(values: &ValueRange, row_offset: i64, col_offset: i64) -> Vec<String> {
-    let mut locations = Vec::new();
-    for (row_idx, row) in values.values.iter().enumerate() {
-        for (col_idx, cell) in row.iter().enumerate() {
-            let is_blank = cell.is_null() || cell.as_str().is_some_and(str::is_empty);
-            if is_blank {
-                continue;
-            }
-            locations.push(format!(
-                "{}{}",
-                grid_range::column_index_to_letters(col_idx as i64 + col_offset),
-                row_idx as i64 + row_offset + 1
-            ));
-        }
-    }
-    locations
 }
 
 fn record_attempt(outcome: &PasteOutcome, opts: &PasteOptions, duration: Duration) {
@@ -1309,27 +1282,6 @@ mod tests {
     #[test]
     fn paste_data_upper_bound_of_empty_data_is_zero_by_zero() {
         assert_eq!(paste_data_upper_bound("", "\t"), (0, 0));
-    }
-
-    #[test]
-    fn non_blank_locations_skips_blanks_and_offsets_addresses() {
-        let values: ValueRange = serde_json::from_value(serde_json::json!({
-            "values": [["a", "", "c"], [null, "d2"]]
-        }))
-        .unwrap();
-        let locations = non_blank_locations(&values, 4, 2);
-        assert_eq!(locations, vec!["C5", "E5", "D6"]);
-    }
-
-    #[test]
-    fn non_blank_locations_includes_the_top_left_cell() {
-        // Unlike `format.rs::discarded_from_values`, a paste preview must
-        // not skip the anchor — the whole extent is overwritten.
-        let values: ValueRange = serde_json::from_value(serde_json::json!({
-            "values": [["kept"]]
-        }))
-        .unwrap();
-        assert_eq!(non_blank_locations(&values, 0, 0), vec!["A1"]);
     }
 
     #[test]
