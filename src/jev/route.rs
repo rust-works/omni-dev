@@ -412,9 +412,11 @@ pub struct ProviderRoute {
     pub close_calls: Vec<Stage>,
 }
 
-/// What routing one issue produced. Serialised untagged and flattened into
-/// [`IssueRoute`], so a routed issue carries `providers`/`depends_on` and a
-/// failed one carries only `error`.
+/// What routing one issue produced.
+///
+/// Serialised untagged and flattened into [`IssueRoute`], so a routed issue
+/// carries `providers`/`depends_on` and a failed one carries `error` and any
+/// citation fetch failures.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum RouteOutcome {
@@ -435,6 +437,9 @@ pub enum RouteOutcome {
     Failed {
         /// The error chain, on one line.
         error: String,
+        /// Citations that could not be fetched before the Jev call failed.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        reference_fetch_failures: Vec<ReferenceFetchFailure>,
     },
 }
 
@@ -536,6 +541,10 @@ pub async fn run_route_with_reference_fetch_failures(
         let citations = dependencies
             .get(&(doc.project.clone(), doc.number))
             .map_or(&[][..], Vec::as_slice);
+        let citation_failures = reference_fetch_failures
+            .get(&(doc.project.clone(), doc.number))
+            .cloned()
+            .unwrap_or_default();
         let mut request_questions = questions.clone();
         for (i, citation) in citations.iter().enumerate() {
             request_questions.insert(
@@ -552,7 +561,11 @@ pub async fn run_route_with_reference_fetch_failures(
             Err(err) if is_auth_failure(&err) => {
                 return Err(err).with_context(|| format!("Failed to route issue {item_ref}"));
             }
-            Err(err) => failed(&item_ref, &err.context("Jev request failed")),
+            Err(err) => failed(
+                &item_ref,
+                &err.context("Jev request failed"),
+                &citation_failures,
+            ),
             Ok(response) => {
                 models.insert(response.model);
                 usage.input_tokens += response.usage.input_tokens;
@@ -561,12 +574,13 @@ pub async fn run_route_with_reference_fetch_failures(
                     Ok(providers) => RouteOutcome::Routed {
                         providers,
                         depends_on: dependency_entries(&item_ref, citations, &response.answers),
-                        reference_fetch_failures: reference_fetch_failures
-                            .get(&(doc.project.clone(), doc.number))
-                            .cloned()
-                            .unwrap_or_default(),
+                        reference_fetch_failures: citation_failures.clone(),
                     },
-                    Err(err) => failed(&item_ref, &err.context("Unexpected Jev answer")),
+                    Err(err) => failed(
+                        &item_ref,
+                        &err.context("Unexpected Jev answer"),
+                        &citation_failures,
+                    ),
                 }
             }
         };
@@ -588,10 +602,17 @@ pub async fn run_route_with_reference_fetch_failures(
 
 /// Records `err` as `item_ref`'s outcome, warning so a long run shows it as
 /// it happens.
-fn failed(item_ref: &str, err: &anyhow::Error) -> RouteOutcome {
+fn failed(
+    item_ref: &str,
+    err: &anyhow::Error,
+    reference_fetch_failures: &[ReferenceFetchFailure],
+) -> RouteOutcome {
     let error = format!("{err:#}");
     warn!("Could not route issue {item_ref}: {error}");
-    RouteOutcome::Failed { error }
+    RouteOutcome::Failed {
+        error,
+        reference_fetch_failures: reference_fetch_failures.to_vec(),
+    }
 }
 
 /// Rejects an empty run, an empty or repeated ladder list, out-of-range
@@ -817,7 +838,15 @@ fn render_issue_block(issue: &IssueRoute, max_input_chars: usize) -> String {
                 reference_fetch_failures,
             ));
         }
-        RouteOutcome::Failed { error } => lines.push(format!("  failed: {error}")),
+        RouteOutcome::Failed {
+            error,
+            reference_fetch_failures,
+        } => {
+            lines.push(format!("  failed: {error}"));
+            lines.extend(render_reference_fetch_failure_lines(
+                reference_fetch_failures,
+            ));
+        }
     }
     if issue.truncated {
         lines.push(format!(
@@ -1750,7 +1779,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let RouteOutcome::Failed { error } = &report.issues[0].outcome else {
+        let RouteOutcome::Failed { error, .. } = &report.issues[0].outcome else {
             // omni-dev: coverage ignore-line reason="guards this test's assumption; the mocked response above always leaves gemini's answers missing"
             panic!("expected a failed issue: {:?}", report.issues[0]);
         };
@@ -1785,21 +1814,44 @@ mod tests {
             .mount(&server)
             .await;
         let client = JevClient::new(&server.uri(), "key").unwrap();
-        let report = run_route(
+        let reference_fetch_failures = ReferenceFetchFailures::from([(
+            ("rust-works/omni-dev".to_string(), 1),
+            vec![ReferenceFetchFailure {
+                item_ref: "#404".to_string(),
+                error: "not found".to_string(),
+            }],
+        )]);
+        let report = run_route_with_reference_fetch_failures(
             &client,
             &[doc(1, ItemState::Open), doc(2, ItemState::Open)],
             &anthropic(),
             &opts(),
             &OpenDependencies::new(),
+            &reference_fetch_failures,
         )
         .await
         .unwrap();
 
         assert!(report.issues[0].failed());
-        let RouteOutcome::Failed { error } = &report.issues[0].outcome else {
+        let RouteOutcome::Failed {
+            error,
+            reference_fetch_failures,
+        } = &report.issues[0].outcome
+        else {
             panic!();
         };
         assert!(error.contains("500"), "{error}");
+        assert_eq!(reference_fetch_failures[0].item_ref, "#404");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["issues"][0]["reference_fetch_failures"][0]["ref"],
+            "#404"
+        );
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(
+            text.contains("  reference fetch failed: #404 (not found)"),
+            "{text}"
+        );
         assert!(!report.issues[1].failed());
         assert_eq!(report.usage.input_tokens, 5);
     }
@@ -1851,7 +1903,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let RouteOutcome::Failed { error } = &report.issues[0].outcome else {
+        let RouteOutcome::Failed { error, .. } = &report.issues[0].outcome else {
             panic!("expected a failed issue");
         };
         assert!(error.contains("Unexpected Jev answer"), "{error}");
@@ -2003,6 +2055,7 @@ mod tests {
             title: "t".to_string(),
             outcome: RouteOutcome::Failed {
                 error: "HTTP 529".to_string(),
+                reference_fetch_failures: vec![],
             },
             truncated: false,
         };
@@ -2146,6 +2199,7 @@ mod tests {
                 title: "t".to_string(),
                 outcome: RouteOutcome::Failed {
                     error: "HTTP 529".to_string(),
+                    reference_fetch_failures: vec![],
                 },
                 truncated: false,
             }],
@@ -2493,6 +2547,7 @@ mod tests {
             title: "t".to_string(),
             outcome: RouteOutcome::Failed {
                 error: "e".to_string(),
+                reference_fetch_failures: vec![],
             },
             truncated: false,
         };
