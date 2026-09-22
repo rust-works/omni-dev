@@ -652,9 +652,9 @@ backends, an unknown model is rejected before any network call:
 ```console
 $ omni-dev git branch create pr --model claude-sonnet-4-8
 Error: Unknown model 'claude-sonnet-4-8'.
-Known models: claude-fable-5, claude-haiku-4-5, claude-haiku-4-5-20251001, claude-opus-4-6,
-claude-opus-4-7, claude-opus-4-8, claude-sonnet-4-5, claude-sonnet-4-5-20250929,
-claude-sonnet-4-6, claude-sonnet-5.
+Known models: claude-fable-5, claude-fable-5-1, claude-haiku-4-5, claude-haiku-4-5-20251001,
+claude-opus-4-6, claude-opus-4-7, claude-opus-4-8, claude-opus-5, claude-opus-5-5,
+claude-sonnet-4-5, claude-sonnet-4-5-20250929, claude-sonnet-4-6, claude-sonnet-5.
 Add an entry to ~/.omni-dev/models.yaml to use a model this build does not know about, …
 ```
 

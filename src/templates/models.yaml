@@ -1,7 +1,7 @@
 # AI Model Specifications
 # This file defines the capabilities and limits for all supported AI models
 # Used by omni-dev to configure API requests correctly
-# Last updated: July 2026
+# Last updated: September 2026
 
 # Schema version. Bumped when the YAML structure changes in a backwards-
 # incompatible way. User/project files declaring a different version receive
@@ -10,17 +10,52 @@
 version: "1"
 
 models:
-  # Claude 5 / Opus 4.8 / Opus 4.7 (Current Generation)
+  # Claude 5 / 5.1 / 5.5 / Opus 4.8 / Opus 4.7 (Current Generation)
   #
   # These models expose a 1M context window natively, at standard pricing with
   # no long-context premium — so they set `input_context: 1000000` directly and
   # carry no `context-1m-2025-08-07` beta header. That header is the older
   # mechanism and is not how this generation exposes 1M context.
   - provider: "claude"
+    model: "Claude Fable 5.1"
+    api_identifier: "claude-fable-5-1"
+    input_token_price: 10.0
+    output_token_price: 50.0
+    max_output_tokens: 128000
+    input_context: 1000000
+    generation: 5.1
+    tier: "flagship"
+    supports_structured_output: true
+
+  - provider: "claude"
     model: "Claude Fable 5"
     api_identifier: "claude-fable-5"
     input_token_price: 10.0
     output_token_price: 50.0
+    max_output_tokens: 128000
+    input_context: 1000000
+    generation: 5.0
+    tier: "flagship"
+    supports_structured_output: true
+
+  # Opus 5.5 (released 2026-09-22) is priced below Opus 5 and, per
+  # Anthropic, performs at the level of Fable 5.1 on most work.
+  - provider: "claude"
+    model: "Claude Opus 5.5"
+    api_identifier: "claude-opus-5-5"
+    input_token_price: 4.0
+    output_token_price: 20.0
+    max_output_tokens: 128000
+    input_context: 1000000
+    generation: 5.5
+    tier: "flagship"
+    supports_structured_output: true
+
+  - provider: "claude"
+    model: "Claude Opus 5"
+    api_identifier: "claude-opus-5"
+    input_token_price: 5.0
+    output_token_price: 25.0
     max_output_tokens: 128000
     input_context: 1000000
     generation: 5.0
