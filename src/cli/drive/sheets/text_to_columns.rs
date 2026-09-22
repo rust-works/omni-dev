@@ -378,6 +378,50 @@ mod tests {
         .unwrap();
     }
 
+    /// `command_execute_builds_options_and_reaches_the_dry_run_engine`
+    /// only exercises `DelimiterArg::Comma`; this closes the rest of
+    /// `execute`'s own `DelimiterArg -> Delimiter` match, including the
+    /// `Custom` arm's non-empty-string path.
+    #[tokio::test]
+    async fn every_other_delimiter_variant_maps_through_to_the_engine() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        crate::utils::settings::Settings::upsert_drive_account(
+            &settings_path,
+            "work",
+            &[("write_permissions", allow_settings())],
+        )
+        .unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_dry_run_prerequisites(&server).await;
+
+        for (delimiter, custom_delimiter) in [
+            (DelimiterArg::Semicolon, None),
+            (DelimiterArg::Period, None),
+            (DelimiterArg::Space, None),
+            (DelimiterArg::Auto, None),
+            (DelimiterArg::Custom, Some("|".to_string())),
+        ] {
+            TextToColumnsCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: Some("Q1".to_string()),
+                source: "A1:A10".to_string(),
+                delimiter,
+                custom_delimiter,
+                dry_run: true,
+                lease: helpers::LeaseTokenArg { lease: None },
+                output: OutputFormat::Table,
+            }
+            .execute(&client)
+            .await
+            .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn a_fixed_delimiter_with_stray_custom_text_is_refused() {
         let server = wiremock::MockServer::start().await;
