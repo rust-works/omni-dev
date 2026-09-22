@@ -119,6 +119,81 @@ pub(crate) fn find_sheet_by_id(workbook: &Spreadsheet, sheet_id: i64) -> Option<
         .find(|sheet| sheet.sheet_id() == Some(sheet_id))
 }
 
+/// Whether `grid` names exactly one cell.
+///
+/// Shared by every verb whose API request takes a `GridCoordinate` rather
+/// than a `GridRange` — `add-pivot-table`'s anchor, `cut-paste`'s and
+/// `paste-data`'s destination — so the refusal they make of a multi-cell
+/// argument rests on one tested definition.
+pub(crate) fn is_single_cell(grid: &GridRange) -> bool {
+    is_bounded(grid)
+        && grid.end_row_index.unwrap_or(0) - grid.start_row_index.unwrap_or(0) == 1
+        && grid.end_column_index.unwrap_or(0) - grid.start_column_index.unwrap_or(0) == 1
+}
+
+/// Renders a fully-bounded, non-empty [`GridRange`] back to an A1 string
+/// for a `values.get` read, e.g. `'Q1'!A1:B2`.
+///
+/// `None` for a range that isn't fully bounded, or that is empty on either
+/// axis (`end <= start`): neither names a rectangle a read could describe,
+/// and the 1-based inclusive end this has to render would run *before* the
+/// start — `column_index_to_letters(-1)` for a zero-column range, which is
+/// not a column at all. Returning `None` rather than a bad string keeps
+/// that case a caller's decision instead of an invalid range on the wire
+/// (issue #1839).
+pub(crate) fn bounded_range_to_a1(sheet_title: &str, grid: &GridRange) -> Option<String> {
+    let (Some(r0), Some(r1), Some(c0), Some(c1)) = (
+        grid.start_row_index,
+        grid.end_row_index,
+        grid.start_column_index,
+        grid.end_column_index,
+    ) else {
+        return None;
+    };
+    if r1 <= r0 || c1 <= c0 {
+        return None;
+    }
+    let start = format!("{}{}", column_index_to_letters(c0), r0 + 1);
+    let end = format!("{}{}", column_index_to_letters(c1 - 1), r1);
+    a1::compose(Some(sheet_title), Some(&format!("{start}:{end}"))).ok()
+}
+
+/// Clips `grid` to the rows and columns its sheet currently has, or `None`
+/// when nothing of it lies inside them.
+///
+/// A `values.get` over a range past the grid's edge is refused by the API
+/// ("exceeds grid limits"), so a preview that computes an extent reaching
+/// beyond the sheet — which `paste.rs` deliberately can, since the written
+/// extent is a property of the request, not of the sheet — must read the
+/// part that exists rather than ask for the part that doesn't (issue
+/// #1839). An axis the API reports no count for is left as-is: there's
+/// nothing to clip against.
+pub(crate) fn clamp_to_sheet(workbook: &Spreadsheet, grid: &GridRange) -> Option<GridRange> {
+    let sheet = find_sheet_by_id(workbook, grid.sheet_id)?;
+    let props = sheet
+        .properties
+        .as_ref()
+        .and_then(|p| p.grid_properties.as_ref());
+    let clip = |end: Option<i64>, count: Option<i64>| match (end, count) {
+        (Some(end), Some(count)) => Some(end.min(count)),
+        (end, _) => end,
+    };
+    let clamped = GridRange {
+        sheet_id: grid.sheet_id,
+        start_row_index: grid.start_row_index,
+        end_row_index: clip(grid.end_row_index, props.and_then(|g| g.row_count)),
+        start_column_index: grid.start_column_index,
+        end_column_index: clip(grid.end_column_index, props.and_then(|g| g.column_count)),
+    };
+    let empty = |start: Option<i64>, end: Option<i64>| matches!((start, end), (Some(start), Some(end)) if end <= start);
+    if empty(clamped.start_row_index, clamped.end_row_index)
+        || empty(clamped.start_column_index, clamped.end_column_index)
+    {
+        return None;
+    }
+    Some(clamped)
+}
+
 /// Renders a numeric [`GridRange`] as a compact 1-based description for a
 /// list verb's human-readable output — e.g. `"sheetId 0, rows 1-5, cols
 /// 1-2"`, `"sheetId 0, rows 5+"` for a bound left open at one end (the
@@ -292,7 +367,7 @@ pub(crate) fn parse_grid_range(sheet_id: i64, range: &str) -> Result<GridRange, 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::drive::sheets::types::{Sheet, SheetProperties};
+    use crate::drive::sheets::types::{GridProperties, Sheet, SheetProperties};
 
     #[test]
     fn column_letters_to_index_single_and_double_letters() {
@@ -447,6 +522,102 @@ mod tests {
     fn a_range_with_one_unparseable_side_is_rejected() {
         let err = parse_grid_range(1, "A1:!!!").unwrap_err();
         assert!(err.contains("not a recognised A1 range"), "{err}");
+    }
+
+    #[test]
+    fn is_single_cell_accepts_one_cell_and_refuses_a_range_or_an_open_end() {
+        assert!(is_single_cell(&parse_grid_range(1, "A1").unwrap()));
+        assert!(!is_single_cell(&parse_grid_range(1, "A1:A2").unwrap()));
+        assert!(!is_single_cell(&parse_grid_range(1, "A1:B1").unwrap()));
+        assert!(!is_single_cell(&parse_grid_range(1, "A:A").unwrap()));
+    }
+
+    #[test]
+    fn bounded_range_to_a1_round_trips_a_rectangle() {
+        let grid = parse_grid_range(7, "B2:D5").unwrap();
+        assert_eq!(
+            bounded_range_to_a1("Q1", &grid).as_deref(),
+            Some("'Q1'!B2:D5")
+        );
+    }
+
+    #[test]
+    fn bounded_range_to_a1_refuses_an_open_ended_or_empty_range() {
+        assert_eq!(
+            bounded_range_to_a1("Q1", &parse_grid_range(1, "A:A").unwrap()),
+            None
+        );
+        // The zero-by-zero case: rendering it would ask
+        // `column_index_to_letters` for column -1.
+        let empty = GridRange {
+            sheet_id: 1,
+            start_row_index: Some(0),
+            end_row_index: Some(0),
+            start_column_index: Some(0),
+            end_column_index: Some(0),
+        };
+        assert_eq!(bounded_range_to_a1("Q1", &empty), None);
+    }
+
+    fn workbook_with_grid(sheet_id: i64, rows: i64, columns: i64) -> Spreadsheet {
+        Spreadsheet {
+            sheets: vec![Sheet {
+                properties: Some(SheetProperties {
+                    sheet_id: Some(sheet_id),
+                    title: "Q1".to_string(),
+                    grid_properties: Some(GridProperties {
+                        row_count: Some(rows),
+                        column_count: Some(columns),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn clamp_to_sheet_clips_an_extent_past_the_grids_edge() {
+        let workbook = workbook_with_grid(1, 10, 5);
+        let clamped = clamp_to_sheet(&workbook, &parse_grid_range(1, "A1:Z100").unwrap()).unwrap();
+        assert_eq!(clamped.end_row_index, Some(10));
+        assert_eq!(clamped.end_column_index, Some(5));
+    }
+
+    #[test]
+    fn clamp_to_sheet_leaves_an_extent_inside_the_grid_alone() {
+        let workbook = workbook_with_grid(1, 10, 5);
+        let grid = parse_grid_range(1, "A1:B2").unwrap();
+        assert_eq!(clamp_to_sheet(&workbook, &grid), Some(grid));
+    }
+
+    #[test]
+    fn clamp_to_sheet_is_none_when_nothing_of_the_range_exists() {
+        let workbook = workbook_with_grid(1, 10, 5);
+        // Starts past the last row: clipping leaves an empty rectangle,
+        // which is no range at all rather than a zero-height one.
+        assert_eq!(
+            clamp_to_sheet(&workbook, &parse_grid_range(1, "A20:B30").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn clamp_to_sheet_leaves_an_axis_with_no_reported_count_alone() {
+        let workbook = workbook_with_sheet(1, "Q1");
+        let grid = parse_grid_range(1, "A1:Z100").unwrap();
+        assert_eq!(clamp_to_sheet(&workbook, &grid), Some(grid));
+    }
+
+    #[test]
+    fn clamp_to_sheet_is_none_for_a_sheet_the_workbook_does_not_carry() {
+        let workbook = workbook_with_grid(1, 10, 5);
+        assert_eq!(
+            clamp_to_sheet(&workbook, &parse_grid_range(99, "A1:B2").unwrap()),
+            None
+        );
     }
 
     fn workbook_with_sheet(sheet_id: i64, title: &str) -> Spreadsheet {

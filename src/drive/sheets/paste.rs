@@ -55,7 +55,11 @@
 //! would smuggle `SheetsStructure` into a `SheetsWrite`-gated batch), and a
 //! preview whose extent exceeds the sheet's known dimensions carries a
 //! fixed caveat naming the uncertainty rather than guessing which way the
-//! API will go.
+//! API will go. The *preview read* is a separate question from the written
+//! extent and is clipped to the sheet's current grid
+//! ([`grid_range::clamp_to_sheet`]): `values.get` refuses a range past the
+//! edge outright, so reading the unclipped extent would turn the very case
+//! the caveat exists to report into an opaque failure.
 //!
 //! **Destination must be fully bounded** for every verb, the same
 //! restriction `merge-cells`/`insert-range` place on their own ranges: an
@@ -210,15 +214,17 @@ impl PasteVerb {
             Self::CutPaste { .. } => GATE_BOTH,
             Self::CopyPaste { paste_type, .. } | Self::PasteData { paste_type, .. } => {
                 match (paste_type.writes_values(), paste_type.writes_presentation()) {
-                    (true, true) => GATE_BOTH,
                     (false, true) => GATE_STRUCTURE_ONLY,
-                    // `(true, false)` is the only reachable case in this
-                    // arm; `(false, false)` — every curated `PasteType`
-                    // writes at least one of the two — falls through to the
-                    // same result rather than getting its own arm, so the
-                    // match stays exhaustive if a future `PasteType` ever
-                    // writes neither.
-                    (_, false) => GATE_WRITE_ONLY, // omni-dev: coverage ignore-line reason="the (false, false) case is unreachable while every curated PasteType writes something; kept exhaustive rather than panicking on a future variant"
+                    (true, false) => GATE_WRITE_ONLY,
+                    // `(false, false)` is unreachable while every curated
+                    // `PasteType` writes at least one of the two, and shares
+                    // this arm rather than getting its own so that the
+                    // *strictest* gate, not the weakest, is what a future
+                    // variant this table has not been taught about falls
+                    // into. Merged with `(true, true)` because they must
+                    // stay the same answer: splitting them would invite
+                    // someone to "simplify" the unreachable one downwards.
+                    (true, true) | (false, false) => GATE_BOTH,
                 }
             }
         }
@@ -301,6 +307,9 @@ pub enum PasteResult {
         /// What was wrong and why.
         detail: String,
     },
+    /// `paste-data`'s `--data`/`--data-file` resolved to an empty string,
+    /// so there is nothing to paste and no extent to preview.
+    RefusedEmptyData,
     /// The folder write-permission gate refused it.
     Blocked {
         /// Which of [`PasteVerb::gate_operations`] denied first.
@@ -353,6 +362,7 @@ impl PasteResult {
             Self::RefusedNoVisibleParents => "refused-no-visible-parents",
             Self::RefusedSheetNotFound { .. } => "refused-sheet-not-found",
             Self::RefusedInvalidRange { .. } => "refused-invalid-range",
+            Self::RefusedEmptyData => "refused-empty-data",
             Self::Blocked { .. } => "blocked",
             Self::RefusedNoLease => LeaseGateRefusal::NoLease.log_status(),
             Self::RefusedLeaseExpired => LeaseGateRefusal::Expired.log_status(),
@@ -417,6 +427,15 @@ async fn paste_inner(
         verb: opts.verb.clone(),
         result,
     };
+
+    if let PasteVerb::PasteData { data, .. } = &opts.verb {
+        if data.is_empty() {
+            return bare(PasteResult::RefusedEmptyData);
+        }
+    }
+    if let Some(sheet) = unusable_sheet_default(&opts.verb) {
+        return bare(PasteResult::RefusedInvalidRange { detail: sheet });
+    }
 
     let destination_composed = match compose_with_default_sheet(
         opts.verb.sheet(),
@@ -522,7 +541,7 @@ async fn paste_inner(
         opts.verb,
         PasteVerb::CutPaste { .. } | PasteVerb::PasteData { .. }
     );
-    if needs_single_cell_destination && !is_single_cell(&dest_grid) {
+    if needs_single_cell_destination && !grid_range::is_single_cell(&dest_grid) {
         return gated(PasteResult::RefusedInvalidRange {
             detail: format!(
                 "--destination '{}' must name a single cell, not a range",
@@ -531,7 +550,7 @@ async fn paste_inner(
         });
     }
 
-    let source_grid = match &source_composed {
+    let source_resolved = match &source_composed {
         Some(source_composed) => {
             match grid_range::resolve_grid_range(
                 &workbook,
@@ -539,7 +558,7 @@ async fn paste_inner(
                 |detail| PasteResult::RefusedInvalidRange { detail },
                 |title, available| PasteResult::RefusedSheetNotFound { title, available },
             ) {
-                Ok((_, grid)) => {
+                Ok((source_title, grid)) => {
                     if !grid_range::is_bounded(&grid) {
                         return gated(PasteResult::RefusedInvalidRange {
                             detail: format!(
@@ -549,13 +568,14 @@ async fn paste_inner(
                             ),
                         });
                     }
-                    Some(grid)
+                    Some((source_title, grid))
                 }
                 Err(result) => return gated(result),
             }
         }
         None => None,
     };
+    let source_grid = source_resolved.as_ref().map(|(_, grid)| *grid);
 
     let extent = match &opts.verb {
         PasteVerb::CutPaste { .. } => {
@@ -583,58 +603,44 @@ async fn paste_inner(
             .to_string()
     });
 
-    let extent_a1 = grid_range_to_a1(&dest_title, &extent);
+    // The extent is reported unclamped — it is what the *request* writes,
+    // and `grid_edge_caveat` above says so when that runs past the sheet.
+    // The read below is a different question, and is clamped: see
+    // `read_non_blank`.
+    let extent_a1 = grid_range::bounded_range_to_a1(&dest_title, &extent)
+        // Unreachable: every extent is anchored on a bounded destination and
+        // sized from a bounded source or a non-empty `--data`, so it is never
+        // empty. Falling back to the destination beats an `unwrap` on a value
+        // only invariants — not types — keep `Some`.
+        .unwrap_or_else(|| destination_composed.clone()); // omni-dev: coverage ignore-line reason="extents are bounded and non-empty by construction; the fallback exists so an invariant break degrades instead of panicking"
 
     let overwritten = if opts.verb.paste_type().writes_values() {
-        match api
-            .values_get(
-                &opts.spreadsheet_id,
-                &extent_a1,
-                ValueRenderOption::Formatted,
-            )
-            .await
-        {
-            Ok(values) => Some(non_blank_locations(
-                &values,
-                extent.start_row_index.unwrap_or(0),
-                extent.start_column_index.unwrap_or(0),
-            )),
-            Err(err) => {
-                return gated(PasteResult::Failed {
-                    detail: format!("{err:#}"),
-                })
-            }
+        match read_non_blank(&api, &opts.spreadsheet_id, &workbook, &dest_title, &extent).await {
+            Ok(locations) => Some(locations),
+            Err(detail) => return gated(PasteResult::Failed { detail }),
         }
     } else {
         None
     };
 
-    let cleared =
-        if let (PasteVerb::CutPaste { .. }, Some(source_grid)) = (&opts.verb, &source_grid) {
-            #[allow(clippy::unwrap_used)] // `source_composed` is always `Some` for `CutPaste`.
-            let source_a1 = source_composed.clone().unwrap();
-            match api
-                .values_get(
-                    &opts.spreadsheet_id,
-                    &source_a1,
-                    ValueRenderOption::Formatted,
-                )
-                .await
-            {
-                Ok(values) => Some(non_blank_locations(
-                    &values,
-                    source_grid.start_row_index.unwrap_or(0),
-                    source_grid.start_column_index.unwrap_or(0),
-                )),
-                Err(err) => {
-                    return gated(PasteResult::Failed {
-                        detail: format!("{err:#}"),
-                    })
-                }
-            }
-        } else {
-            None
-        };
+    let cleared = if let (PasteVerb::CutPaste { .. }, Some((source_title, source_grid))) =
+        (&opts.verb, &source_resolved)
+    {
+        match read_non_blank(
+            &api,
+            &opts.spreadsheet_id,
+            &workbook,
+            source_title,
+            source_grid,
+        )
+        .await
+        {
+            Ok(locations) => Some(locations),
+            Err(detail) => return gated(PasteResult::Failed { detail }),
+        }
+    } else {
+        None
+    };
 
     let change = PasteChange {
         destination: destination_composed.clone(),
@@ -763,12 +769,63 @@ fn compose_with_default_sheet(
     }
 }
 
-/// Whether `grid` names exactly one cell. Mirrors `pivot.rs::is_single_cell`
-/// — colocated with its own module since neither is exported.
-fn is_single_cell(grid: &GridRange) -> bool {
-    grid_range::is_bounded(grid)
-        && grid.end_row_index.unwrap_or(0) - grid.start_row_index.unwrap_or(0) == 1
-        && grid.end_column_index.unwrap_or(0) - grid.start_column_index.unwrap_or(0) == 1
+/// The `--sheet` a caller passed that no flag can use, as a refusal
+/// message — `None` when it is used, or was not passed at all.
+///
+/// `--sheet` is a *default* here, not the target's sheet: each of
+/// `--source`/`--destination` may carry its own `'Sheet'!` prefix and a
+/// paste may legitimately straddle two sheets, so a prefix on one flag
+/// beside a `--sheet` for the other is correct and stays allowed. What is
+/// refused is the case where every flag self-prefixes, leaving `--sheet`
+/// with nothing to apply to: silently ignoring it would hide a typo in
+/// whichever prefix the caller meant it to correct. The narrower cousin of
+/// `a1::compose`'s blanket "already names a sheet, so --sheet would be
+/// ambiguous" refusal, which this module cannot use as-is without losing
+/// the cross-sheet paste (issue #1839).
+fn unusable_sheet_default(verb: &PasteVerb) -> Option<String> {
+    let sheet = verb.sheet()?;
+    let prefixed = |range: &str| a1::split_sheet_prefix(range).is_some();
+    let every_range_self_prefixes =
+        prefixed(verb.destination()) && verb.source().is_none_or(prefixed);
+    every_range_self_prefixes.then(|| {
+        format!(
+            "--sheet '{sheet}' has nothing to apply to: every range already carries its own \
+             'Sheet'! prefix. Drop --sheet, or drop the prefix from the range it was meant for"
+        )
+    })
+}
+
+/// Every non-blank cell of `grid`, as A1 addresses, from one `values.get`.
+///
+/// The read range is **clipped to the sheet's current grid**: a paste's
+/// written extent is a property of the request, so it can name rows or
+/// columns the sheet does not have yet, and `values.get` refuses such a
+/// range outright ("exceeds grid limits") — which would turn the one case
+/// `grid_edge_caveat` exists to report into an opaque `Failed`. A range
+/// with nothing inside the grid at all reads as no cells, because that is
+/// the truth: cells that do not exist hold nothing to overwrite.
+async fn read_non_blank(
+    api: &SheetsApi<'_>,
+    spreadsheet_id: &str,
+    workbook: &crate::drive::sheets::types::Spreadsheet,
+    sheet_title: &str,
+    grid: &GridRange,
+) -> Result<Vec<String>, String> {
+    let Some(clamped) = grid_range::clamp_to_sheet(workbook, grid) else {
+        return Ok(Vec::new());
+    };
+    let Some(range) = grid_range::bounded_range_to_a1(sheet_title, &clamped) else {
+        return Ok(Vec::new());
+    };
+    let values = api
+        .values_get(spreadsheet_id, &range, ValueRenderOption::Formatted)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
+    Ok(non_blank_locations(
+        &values,
+        clamped.start_row_index.unwrap_or(0),
+        clamped.start_column_index.unwrap_or(0),
+    ))
 }
 
 /// `(rows, columns)` of a fully-bounded [`GridRange`]. Only ever called
@@ -835,11 +892,23 @@ pub(crate) fn copy_paste_extent(
 /// (ADR-0083 §6, a #1839 live-verification item) — this is a preview
 /// input, never sent on the wire, so an imprecise split costs nothing but
 /// preview accuracy.
+///
+/// One *terminating* newline is not a row separator: every POSIX text file
+/// and every `printf` ends with one, so counting it would add a phantom
+/// row to the extent on the commonest input there is, and the preview
+/// would then name cells in that row as overwritten when nothing touches
+/// them. A blank line in the middle, or a second trailing one, is still a
+/// row — that is data, not a terminator.
 pub(crate) fn paste_data_upper_bound(data: &str, delimiter: &str) -> (i64, i64) {
     if data.is_empty() {
         return (0, 0);
     }
-    let rows: Vec<&str> = data
+    let body = data.strip_suffix('\n').unwrap_or(data);
+    if body.is_empty() {
+        // `data` was exactly one line terminator: one empty row, not zero.
+        return (1, 1);
+    }
+    let rows: Vec<&str> = body
         .split('\n')
         .map(|line| line.trim_end_matches('\r'))
         .collect();
@@ -883,23 +952,6 @@ fn sheet_exceeds_dimensions(
         (Some(end), Some(count)) if end > count
     );
     rows_exceed || cols_exceed
-}
-
-/// Renders a numeric [`GridRange`] back to an A1 string for a `values.get`
-/// read. Only ever called on an `extent` this module has already confirmed
-/// is fully bounded.
-fn grid_range_to_a1(sheet_title: &str, grid: &GridRange) -> String {
-    let (Some(r0), Some(r1), Some(c0), Some(c1)) = (
-        grid.start_row_index,
-        grid.end_row_index,
-        grid.start_column_index,
-        grid.end_column_index,
-    ) else {
-        unreachable!("paste extents are always fully bounded by construction") // omni-dev: coverage ignore-line reason="extents are always built by anchored_extent/copy_paste_extent from grids already confirmed bounded, so all four indices are always Some here"
-    };
-    let start = format!("{}{}", grid_range::column_index_to_letters(c0), r0 + 1);
-    let end = format!("{}{}", grid_range::column_index_to_letters(c1 - 1), r1);
-    a1::compose(Some(sheet_title), Some(&format!("{start}:{end}"))).unwrap_or_default()
 }
 
 /// Every non-blank cell within a `values.get` read, as its A1 address —
@@ -957,8 +1009,14 @@ fn record_attempt(outcome: &PasteOutcome, opts: &PasteOptions, duration: Duratio
 
 /// Renders the change-specific lines of a `WouldChange`/`Changed` outcome
 /// — everything but the leading "Would "/"Applied: " the caller prepends,
-/// so both share this one builder.
-fn paste_change_lines(verb: &PasteVerb, change: &PasteChange, book: &str) -> Vec<String> {
+/// so both share this one builder. `applied` picks the tense: a real run
+/// reports what it *did*, not what it would do.
+fn paste_change_lines(
+    verb: &PasteVerb,
+    change: &PasteChange,
+    book: &str,
+    applied: bool,
+) -> Vec<String> {
     let mut lines = vec![format!(
         "{} into {} in {book}, writing {}",
         verb.label(),
@@ -968,13 +1026,28 @@ fn paste_change_lines(verb: &PasteVerb, change: &PasteChange, book: &str) -> Vec
     if let Some(source) = &change.source {
         lines.push(format!("  source: {source}"));
     }
+    // Named on every line of output, not just in the flag that set it: the
+    // paste type decides both what lands in the destination and which
+    // operations the gate consumed, so an outcome that doesn't say which
+    // one ran can't be read back afterwards.
+    lines.push(format!("  paste type: {}", verb.paste_type().as_str()));
+    if let PasteVerb::CopyPaste { orientation, .. } = verb {
+        lines.push(format!("  orientation: {}", orientation.as_str()));
+    }
+    let overwritten_verb = if applied {
+        "were overwritten"
+    } else {
+        "would be overwritten"
+    };
     match &change.overwritten {
         Some(locations) if locations.is_empty() => {
-            lines.push("  no non-blank cells in the destination would be overwritten".to_string());
+            lines.push(format!(
+                "  no non-blank cells in the destination {overwritten_verb}"
+            ));
         }
         Some(locations) => {
             lines.push(format!(
-                "  {} non-blank cell(s) in the destination would be overwritten:",
+                "  {} non-blank cell(s) in the destination {overwritten_verb}:",
                 locations.len()
             ));
             lines.extend(locations.iter().map(|loc| format!("    {loc}")));
@@ -986,11 +1059,19 @@ fn paste_change_lines(verb: &PasteVerb, change: &PasteChange, book: &str) -> Vec
     }
     if let Some(locations) = &change.cleared {
         if locations.is_empty() {
-            lines.push("  the source has no non-blank cells to clear".to_string());
+            lines.push(format!(
+                "  the source {} no non-blank cells to clear",
+                if applied { "had" } else { "has" }
+            ));
         } else {
             lines.push(format!(
-                "  {} non-blank cell(s) in the source will be cleared:",
-                locations.len()
+                "  {} non-blank cell(s) in the source {}:",
+                locations.len(),
+                if applied {
+                    "were cleared"
+                } else {
+                    "will be cleared"
+                }
             ));
             lines.extend(locations.iter().map(|loc| format!("    {loc}")));
         }
@@ -1011,12 +1092,12 @@ pub fn describe_lines(outcome: &PasteOutcome) -> Vec<String> {
     );
     match &outcome.result {
         PasteResult::WouldChange(change) => {
-            let mut lines = paste_change_lines(verb, change, &book);
+            let mut lines = paste_change_lines(verb, change, &book, false);
             lines[0] = format!("Would {}", lines[0]);
             lines
         }
         PasteResult::Changed(change) => {
-            let mut lines = paste_change_lines(verb, change, &book);
+            let mut lines = paste_change_lines(verb, change, &book, true);
             lines[0] = format!("Applied: {}", lines[0]);
             lines
         }
@@ -1052,6 +1133,10 @@ pub fn describe_lines(outcome: &PasteOutcome) -> Vec<String> {
             )]
         }
         PasteResult::RefusedInvalidRange { detail } => vec![format!("Refused: {detail}")],
+        PasteResult::RefusedEmptyData => vec![format!(
+            "Refused: `drive sheets {}` was given no data to paste (--data/--data-file is empty)",
+            verb.label()
+        )],
         PasteResult::Blocked {
             operation,
             decided_by,
@@ -1089,10 +1174,15 @@ pub fn describe_lines(outcome: &PasteOutcome) -> Vec<String> {
     }
 }
 
-/// Reads `--data`: a local file path, or `-` for stdin, capped and
+/// Reads `--data-file`: a local file path, or `-` for stdin, capped and
 /// UTF-8-validated exactly like `write.rs::read_values`'s stdin/file
 /// branches, but returning the raw text untouched — `pasteData` sends the
 /// caller's content verbatim, unlike `write`'s CSV/JSON cell parse.
+///
+/// Empty content is *not* an error here: `paste_inner` refuses it as
+/// [`PasteResult::RefusedEmptyData`], so an empty file and a literal
+/// `--data ''` are refused the same way and in the same shape as every
+/// other refusal, rather than one of them being an `anyhow` error.
 pub(crate) fn read_data_text(source: &str) -> anyhow::Result<String> {
     use anyhow::Context;
 
@@ -1101,24 +1191,24 @@ pub(crate) fn read_data_text(source: &str) -> anyhow::Result<String> {
         std::io::stdin()
             .take(crate::drive::files_api::MAX_UPLOAD_BYTES + 1)
             .read_to_end(&mut buf)
-            .context("Failed to read --data from stdin")?;
+            .context("Failed to read --data-file from stdin")?;
         anyhow::ensure!(
             buf.len() as u64 <= crate::drive::files_api::MAX_UPLOAD_BYTES,
-            "--data from stdin is over the {} byte cap",
+            "--data-file from stdin is over the {} byte cap",
             crate::drive::files_api::MAX_UPLOAD_BYTES
         );
-        String::from_utf8(buf).context("--data from stdin is not valid UTF-8")
+        String::from_utf8(buf).context("--data-file from stdin is not valid UTF-8")
     } else {
         let metadata = std::fs::metadata(source)
-            .with_context(|| format!("Failed to stat --data file {source}"))?;
+            .with_context(|| format!("Failed to stat --data-file {source}"))?;
         anyhow::ensure!(
             metadata.len() <= crate::drive::files_api::MAX_UPLOAD_BYTES,
-            "--data file {source} is {} bytes, over the {} byte cap",
+            "--data-file {source} is {} bytes, over the {} byte cap",
             metadata.len(),
             crate::drive::files_api::MAX_UPLOAD_BYTES
         );
         std::fs::read_to_string(source)
-            .with_context(|| format!("Failed to read --data file {source}"))
+            .with_context(|| format!("Failed to read --data-file {source}"))
     }
 }
 
@@ -1192,7 +1282,28 @@ mod tests {
 
     #[test]
     fn paste_data_upper_bound_tolerates_crlf_line_endings() {
-        assert_eq!(paste_data_upper_bound("a,b\r\nc,d\r\n", ","), (3, 2));
+        assert_eq!(paste_data_upper_bound("a,b\r\nc,d\r\n", ","), (2, 2));
+    }
+
+    #[test]
+    fn paste_data_upper_bound_does_not_count_a_terminating_newline_as_a_row() {
+        // What `printf '1\t2\n3\t4\n'` produces, and what every text file
+        // ends with: two rows, not three. Counting the terminator would
+        // name a row of cells as overwritten that nothing writes to.
+        assert_eq!(paste_data_upper_bound("1\t2\n3\t4\n", "\t"), (2, 2));
+        assert_eq!(paste_data_upper_bound("1\t2\n3\t4", "\t"), (2, 2));
+    }
+
+    #[test]
+    fn paste_data_upper_bound_counts_a_second_trailing_newline_as_a_blank_row() {
+        // Only the *terminator* is dropped: a blank line before it is data.
+        assert_eq!(paste_data_upper_bound("a\nb\n\n", "\t"), (3, 1));
+        assert_eq!(paste_data_upper_bound("a\n\nb\n", "\t"), (3, 1));
+    }
+
+    #[test]
+    fn paste_data_upper_bound_of_a_lone_newline_is_one_empty_row() {
+        assert_eq!(paste_data_upper_bound("\n", "\t"), (1, 1));
     }
 
     #[test]
@@ -1241,10 +1352,66 @@ mod tests {
     }
 
     #[test]
-    fn is_single_cell_accepts_one_cell_and_refuses_a_range() {
-        assert!(is_single_cell(&range(1, 0, 1, 0, 1)));
-        assert!(!is_single_cell(&range(1, 0, 2, 0, 1)));
-        assert!(!is_single_cell(&range(1, 0, 1, 0, 2)));
+    fn unusable_sheet_default_is_none_when_sheet_is_the_only_source_of_a_prefix() {
+        let verb = PasteVerb::CutPaste {
+            sheet: Some("Q1".to_string()),
+            source: "A1:B2".to_string(),
+            destination: "D1".to_string(),
+            paste_type: PasteType::Normal,
+        };
+        assert_eq!(unusable_sheet_default(&verb), None);
+    }
+
+    #[test]
+    fn unusable_sheet_default_is_none_for_a_cross_sheet_paste_that_still_uses_sheet() {
+        // The case a blanket refusal would have cost: one end prefixed,
+        // the other leaning on `--sheet`.
+        let verb = PasteVerb::CutPaste {
+            sheet: Some("Q1".to_string()),
+            source: "A1:B2".to_string(),
+            destination: "'Q2'!D1".to_string(),
+            paste_type: PasteType::Normal,
+        };
+        assert_eq!(unusable_sheet_default(&verb), None);
+    }
+
+    #[test]
+    fn unusable_sheet_default_refuses_a_sheet_no_range_can_use() {
+        let verb = PasteVerb::CutPaste {
+            sheet: Some("Q1".to_string()),
+            source: "'Q2'!A1:B2".to_string(),
+            destination: "'Q3'!D1".to_string(),
+            paste_type: PasteType::Normal,
+        };
+        let detail = unusable_sheet_default(&verb).expect("refusal");
+        assert!(detail.contains("--sheet 'Q1'"), "{detail}");
+        assert!(detail.contains("nothing to apply to"), "{detail}");
+    }
+
+    #[test]
+    fn unusable_sheet_default_refuses_a_sheet_beside_a_prefixed_paste_data_destination() {
+        // `paste-data` has only one range, so a prefix on it leaves
+        // `--sheet` with nothing at all.
+        let verb = PasteVerb::PasteData {
+            sheet: Some("Q1".to_string()),
+            destination: "'Q2'!A1".to_string(),
+            data: "1".to_string(),
+            delimiter: "\t".to_string(),
+            paste_type: PasteType::Values,
+        };
+        assert!(unusable_sheet_default(&verb).is_some());
+    }
+
+    #[test]
+    fn unusable_sheet_default_is_none_without_a_sheet_flag() {
+        let verb = PasteVerb::PasteData {
+            sheet: None,
+            destination: "'Q2'!A1".to_string(),
+            data: "1".to_string(),
+            delimiter: "\t".to_string(),
+            paste_type: PasteType::Values,
+        };
+        assert_eq!(unusable_sheet_default(&verb), None);
     }
 
     #[test]
@@ -1465,6 +1632,16 @@ mod tests {
             )
             .mount(server)
             .await;
+    }
+
+    /// Every sheets operation allowed on every folder — for the tests that
+    /// must be refused *before* the gate is ever consulted, where the rule
+    /// set is deliberately not the reason.
+    fn rules_allowing_everything() -> Vec<FolderPermissionRule> {
+        vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )]
     }
 
     /// `require_lease: false` by default — most tests here exercise the
@@ -2474,6 +2651,253 @@ mod tests {
         assert!(matches!(outcome.result, PasteResult::Failed { .. }));
     }
 
+    #[tokio::test]
+    async fn paste_data_with_empty_data_is_refused_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // No mocks at all: an empty paste must be refused before the
+        // metadata fetch, let alone before an extent is computed from it
+        // (a zero-by-zero extent names no range a read could describe).
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::PasteData {
+                sheet: Some("Q1".to_string()),
+                destination: "A1".to_string(),
+                data: String::new(),
+                delimiter: "\t".to_string(),
+                paste_type: PasteType::Values,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules_allowing_everything()).await;
+        assert_eq!(outcome.result, PasteResult::RefusedEmptyData);
+        let lines = describe_lines(&outcome).join("\n");
+        assert!(lines.contains("no data to paste"), "{lines}");
+    }
+
+    #[tokio::test]
+    async fn a_sheet_flag_no_range_can_use_is_refused_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "'Q2'!A1:B2".to_string(),
+                destination: "'Q3'!D1:E2".to_string(),
+                paste_type: PasteType::Values,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules_allowing_everything()).await;
+        match outcome.result {
+            PasteResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("--sheet 'Q1'"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_preview_read_is_clipped_to_the_grid_so_the_caveat_survives() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {"properties": {"sheetId": 0, "title": "Q1", "index": 0,
+                                         "gridProperties": {"rowCount": 5, "columnCount": 5}}},
+                    ],
+                })),
+            )
+            .mount(&server)
+            .await;
+        // The only `values.get` mock is the *clipped* range: a read of the
+        // full `'Q1'!D1:I1` extent would 404 here, exactly as the real API
+        // refuses a range past the grid's edge ("exceeds grid limits").
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!D1:E1",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!D1:E1", "values": [["x"]]})),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1", &[DriveOperation::SheetsWrite])];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                // A 6-wide source onto a 5-column sheet, anchored at D1:
+                // the extent runs to column I, three columns past the edge.
+                sheet: Some("Q1".to_string()),
+                source: "A1:F1".to_string(),
+                destination: "D1".to_string(),
+                paste_type: PasteType::Values,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            PasteResult::WouldChange(change) => {
+                // The extent is reported unclipped — it is what the request
+                // writes — and the caveat says it runs past the grid.
+                assert_eq!(change.written_extent, "'Q1'!D1:I1");
+                assert!(change.grid_edge_caveat.is_some(), "{change:?}");
+                // …while the read that backs it saw only the cells that exist.
+                assert_eq!(change.overwritten, Some(vec!["D1".to_string()]));
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_destination_entirely_past_the_grid_previews_no_overwrite_without_reading() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {"properties": {"sheetId": 0, "title": "Q1", "index": 0,
+                                         "gridProperties": {"rowCount": 5, "columnCount": 5}}},
+                    ],
+                })),
+            )
+            .mount(&server)
+            .await;
+        // No `values.get` mock: nothing of the extent lies inside the grid,
+        // so there is nothing to read and no cell that could be overwritten.
+        let rules = vec![allow_rule("folder-1", &[DriveOperation::SheetsWrite])];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:A1".to_string(),
+                destination: "A20".to_string(),
+                paste_type: PasteType::Values,
+                orientation: PasteOrientation::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            PasteResult::WouldChange(change) => {
+                assert_eq!(change.overwritten, Some(Vec::new()));
+                assert!(change.grid_edge_caveat.is_some(), "{change:?}");
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_cell_value_ever_reaches_the_rendered_output() {
+        // ADR-0083 §6: a paste preview reports counts and A1 locations, and
+        // `merge-cells` stays the one verb in this crate that prints cell
+        // contents. Asserted on the rendered lines, not on the struct, since
+        // the rendering is where a value would leak.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!D1:E2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "range": "'Q1'!D1:E2",
+                    "values": [["destination-secret", ""], ["", "another-secret"]],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A1:B2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "range": "'Q1'!A1:B2",
+                    "values": [["source-secret", "x"], ["y", "z"]],
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = rules_allowing_everything();
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CutPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1".to_string(),
+                paste_type: PasteType::Normal,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        let rendered = describe_lines(&outcome).join("\n");
+        for secret in ["destination-secret", "another-secret", "source-secret"] {
+            assert!(
+                !rendered.contains(secret),
+                "{secret} leaked into: {rendered}"
+            );
+        }
+        // The counts and locations are there instead.
+        assert!(
+            rendered.contains("2 non-blank cell(s) in the destination"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("    D1"), "{rendered}");
+        assert!(
+            rendered.contains("4 non-blank cell(s) in the source"),
+            "{rendered}"
+        );
+    }
+
     // ── real (non-dry-run) mutations ──
 
     #[tokio::test]
@@ -2595,6 +3019,236 @@ mod tests {
             matches!(outcome.result, PasteResult::Changed(_)),
             "{:?}",
             outcome.result
+        );
+    }
+
+    /// The single `batchUpdate` body the server received, as JSON.
+    async fn sent_batch_update(server: &wiremock::MockServer) -> serde_json::Value {
+        let requests = server.received_requests().await.expect("recorded requests");
+        let body = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .map(|r| r.body.clone())
+            .expect("a batchUpdate request");
+        serde_json::from_slice(&body).expect("a JSON body")
+    }
+
+    #[tokio::test]
+    async fn cut_paste_sends_the_source_range_and_a_destination_coordinate() {
+        // The engine→wire mapping: `types.rs` pins how a `CutPasteRequest`
+        // serialises, this pins that the right one is built — that the
+        // destination becomes a `GridCoordinate` at the range's top-left
+        // and the two ends are not transposed.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        for range in ["'Q1'!D1:E2", "'Q1'!A1:B2"] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!(
+                    "/v4/spreadsheets/sheet-1/values/{range}"
+                )))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"range": range, "values": []})),
+                )
+                .mount(&server)
+                .await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"replies": [{}]})),
+            )
+            .mount(&server)
+            .await;
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CutPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1".to_string(),
+                paste_type: PasteType::Values,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules_allowing_everything()).await;
+        assert!(
+            matches!(outcome.result, PasteResult::Changed(_)),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(
+            sent_batch_update(&server).await,
+            serde_json::json!({
+                "requests": [{
+                    "cutPaste": {
+                        "source": {
+                            "sheetId": 0,
+                            "startRowIndex": 0, "endRowIndex": 2,
+                            "startColumnIndex": 0, "endColumnIndex": 2,
+                        },
+                        "destination": {"sheetId": 0, "rowIndex": 0, "columnIndex": 3},
+                        "pasteType": "PASTE_VALUES",
+                    },
+                }],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_paste_sends_both_ranges_with_the_requested_orientation() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!D1:E2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!D1:E2", "values": []})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"replies": [{}]})),
+            )
+            .mount(&server)
+            .await;
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1:E2".to_string(),
+                paste_type: PasteType::Values,
+                orientation: PasteOrientation::Transpose,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules_allowing_everything()).await;
+        assert!(
+            matches!(outcome.result, PasteResult::Changed(_)),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(
+            sent_batch_update(&server).await,
+            serde_json::json!({
+                "requests": [{
+                    "copyPaste": {
+                        "source": {
+                            "sheetId": 0,
+                            "startRowIndex": 0, "endRowIndex": 2,
+                            "startColumnIndex": 0, "endColumnIndex": 2,
+                        },
+                        "destination": {
+                            "sheetId": 0,
+                            "startRowIndex": 0, "endRowIndex": 2,
+                            "startColumnIndex": 3, "endColumnIndex": 5,
+                        },
+                        "pasteType": "PASTE_VALUES",
+                        "pasteOrientation": "TRANSPOSE",
+                    },
+                }],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_data_sends_the_delimiter_form_verbatim() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A1:B2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!A1:B2", "values": []})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"replies": [{}]})),
+            )
+            .mount(&server)
+            .await;
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::PasteData {
+                sheet: Some("Q1".to_string()),
+                destination: "A1".to_string(),
+                // The trailing terminator is sent as the caller gave it —
+                // only the *preview's* row count ignores it.
+                data: "1\t2\n3\t4\n".to_string(),
+                delimiter: "\t".to_string(),
+                paste_type: PasteType::Values,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules_allowing_everything()).await;
+        assert!(
+            matches!(outcome.result, PasteResult::Changed(_)),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(
+            sent_batch_update(&server).await,
+            serde_json::json!({
+                "requests": [{
+                    "pasteData": {
+                        "coordinate": {"sheetId": 0, "rowIndex": 0, "columnIndex": 0},
+                        "data": "1\t2\n3\t4\n",
+                        "delimiter": "\t",
+                        "type": "PASTE_VALUES",
+                    },
+                }],
+            })
         );
     }
 
@@ -2917,6 +3571,7 @@ mod tests {
             PasteResult::RefusedInvalidRange {
                 detail: "bad range".to_string(),
             },
+            PasteResult::RefusedEmptyData,
             PasteResult::Blocked {
                 operation: DriveOperation::SheetsWrite,
                 decided_by: None,

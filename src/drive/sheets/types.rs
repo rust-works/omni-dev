@@ -2911,8 +2911,11 @@ pub struct DeleteDimensionGroupRequest {
 /// `PASTE_CONDITIONAL_FORMATTING` are deferred — a documented cut, not a
 /// silent gap (`docs/drive.md`'s cut-paste/copy-paste/paste-data section
 /// names it). No default arm anywhere this is matched: a variant this enum
-/// doesn't carry is unrepresentable, never a fall-through to the weakest
-/// gate.
+/// doesn't carry is unrepresentable, and the one place a `(writes_values,
+/// writes_presentation)` pair is turned into a gate resolves an
+/// unrecognised combination to *both* operations, so a type added here
+/// without updating that table can only ever be stricter than intended,
+/// never weaker.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub enum PasteType {
     /// Values, formulas, formats and merges — the API's own default and

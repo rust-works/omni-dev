@@ -2786,9 +2786,11 @@ omni-dev drive sheets copy-paste <ID> --sheet Q1 \
 # Paste a tab-separated block at A1. --paste-type defaults to values, not
 # normal, since delimited text carries no formats to add.
 omni-dev drive sheets paste-data <ID> --sheet Q1 \
-  --destination A1 --data clip.tsv
+  --destination A1 --data-file clip.tsv
+omni-dev drive sheets paste-data <ID> --sheet Q1 \
+  --destination A1 --data "$(printf '1\t2\n3\t4')"
 printf '1\t2\n3\t4\n' | omni-dev drive sheets paste-data <ID> --sheet Q1 \
-  --destination A1 --data -
+  --destination A1 --data-file -
 ```
 
 **Gate, per `--paste-type` (ADR-0083 §4).** `--paste-type` curates four of
@@ -2801,17 +2803,28 @@ and needs `sheets-structure` alone; `normal` (the default on `cut-paste`/
 always needs both operations, whatever `--paste-type` names**, because its
 source is cleared in full — values, formats and merges — regardless of
 what gets pasted. `paste-data` defaults to `values`, not `normal`: its
-`--data` input is delimited text with no formats or merges for `normal` to
+input is delimited text with no formats or merges for `normal` to
 add, though `normal` stays selectable and resolves both operations (the
 API does not document it as doing anything beyond values on delimited
-text). `paste-data` is `--data`-as-a-file/stdin, `delimiter`-form only —
-the Sheets API's `html` paste alternative is not exposed.
+text). `paste-data` takes its block either literally (`--data <TEXT>`) or
+from a file or stdin (`--data-file <PATH|->`); the two are mutually
+exclusive and exactly one is required, and an empty block is refused
+rather than pasted. It is `delimiter`-form only — the Sheets API's `html`
+paste alternative is not exposed.
 
 **`--source`/`--destination`, and `--sheet` as their shared default.** A
 reference already carrying its own `'Sheet'!` prefix is used as-is — a
 source and destination may sit on different sheets, which the API allows;
-otherwise `--sheet` supplies the prefix. `cut-paste`'s and `paste-data`'s
-`--destination` must be a single cell (the pasted block extends from
+otherwise `--sheet` supplies the prefix. A `--sheet` that *every* range
+self-prefixes past, and which therefore cannot apply to anything, is
+refused rather than ignored: silently dropping it would hide a typo in
+whichever prefix it was meant to correct. (This is narrower than the
+blanket "`--sheet` alongside an already-prefixed range is an error" rule
+`sheets read`/`write` follow, because here `--sheet` is a shared default
+for two ranges rather than the one range's own sheet — prefixing one end
+and leaving the other to `--sheet` is exactly how a cross-sheet paste is
+written.) `cut-paste`'s and `paste-data`'s `--destination` must be a
+single cell (the pasted block extends from
 there); `copy-paste`'s may be a single-cell anchor or a range. Every
 source must be a bounded rectangle — an open-ended column or row span
 (`A:A`) is refused, the same restriction `merge-cells`/`insert-range`
@@ -2827,10 +2840,12 @@ copied once at its own size, spilling past a smaller destination or only
 partly filling a larger, non-multiple one — the Sheets API's own
 spill/repeat rule. `cut-paste` never spills or repeats: the written region
 is always the source's own dimensions, anchored at the destination.
-`paste-data`'s extent is an upper bound computed by locally splitting
-`--data` on newlines and `--delimiter` — the API's own row-separator
+`paste-data`'s extent is an upper bound computed by locally splitting the
+block on newlines and `--delimiter` — the API's own row-separator
 convention for `pasteData` is undocumented, so this is a preview input,
-never sent on the wire.
+never sent on the wire. A single *terminating* newline is not counted as a
+row (every text file and every `printf` ends with one); a blank line in
+the middle, or a second trailing one, is.
 
 **`--dry-run` reports counts and A1 locations, never cell values**
 (ADR-0083 §6, ADR-0081 §2's posture — `merge-cells` remains the one
@@ -2839,13 +2854,19 @@ cells within the written extent that would be overwritten; a
 presentation-only `--paste-type format` reads no values at all, since it
 overwrites none. `cut-paste`'s preview additionally reports the non-blank
 cells in the source that will be cleared, as a separate count from the
-destination overwrite. When the written extent runs past the sheet's
-currently allocated rows or columns, the preview and the real run both
-carry a caveat: whether the Sheets API errors or silently expands the
-grid in that case is undocumented and has not been verified against a
-live workbook — this tool never prepends a structural request to grow the
-grid first, since that would smuggle `sheets-structure` into a
-`sheets-write`-gated batch.
+destination overwrite. Both also name the `--paste-type` (and, for
+`copy-paste`, the orientation) that was used, since that decides both what
+lands in the destination and which grants were consumed. When the written
+extent runs past the sheet's currently allocated rows or columns, the
+preview and the real run both carry a caveat: whether the Sheets API
+errors or silently expands the grid in that case is undocumented and has
+not been verified against a live workbook — this tool never prepends a
+structural request to grow the grid first, since that would smuggle
+`sheets-structure` into a `sheets-write`-gated batch. The extent is
+reported in full in that case, but the *read* backing the preview is
+clipped to the rows and columns the sheet actually has, since `values.get`
+refuses a range past the edge ("exceeds grid limits"); cells that don't
+exist yet hold nothing to overwrite.
 
 ## Docs
 
