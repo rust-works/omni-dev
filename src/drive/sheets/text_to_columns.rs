@@ -1436,6 +1436,73 @@ mod tests {
         assert_eq!(lines[2], PAST_GRID_EXTENT_CAVEAT);
     }
 
+    /// Every variant renders: non-empty, and never with an embedded
+    /// newline, which is [`describe_lines`]' own stated contract (the
+    /// `-o table` renderer joins the lines itself, and a `\n` inside one
+    /// would silently defeat the per-line terminal sanitising the CLI
+    /// applies).
+    #[test]
+    fn every_result_variant_renders_as_non_empty_newline_free_lines() {
+        let results = [
+            TextToColumnsResult::RefusedNotASpreadsheet {
+                mime_type: "application/pdf".to_string(),
+            },
+            TextToColumnsResult::RefusedShortcut,
+            TextToColumnsResult::RefusedNoVisibleParents,
+            TextToColumnsResult::RefusedSheetNotFound {
+                title: "Q9".to_string(),
+                available: vec!["Q1".to_string()],
+            },
+            // The workbook has no sheets at all, so there is nothing to
+            // suggest — the "none" branch of the same arm.
+            TextToColumnsResult::RefusedSheetNotFound {
+                title: "Q9".to_string(),
+                available: Vec::new(),
+            },
+            TextToColumnsResult::RefusedInvalidRange {
+                detail: "'A1:B2' spans more than one column".to_string(),
+            },
+            TextToColumnsResult::RefusedInvalidDelimiter {
+                detail: "--custom-delimiter must not be empty".to_string(),
+            },
+            TextToColumnsResult::Blocked { decided_by: None },
+            TextToColumnsResult::RefusedNoLease,
+            TextToColumnsResult::RefusedLeaseExpired,
+            TextToColumnsResult::RefusedLeaseWrongFile,
+            TextToColumnsResult::RefusedLeaseStale,
+            TextToColumnsResult::Failed {
+                detail: "HTTP 500".to_string(),
+            },
+        ];
+        for result in results {
+            let mut outcome = would_change_outcome(Vec::new(), false);
+            let status = result.log_status();
+            outcome.result = result;
+            let lines = describe_lines(&outcome);
+            assert!(!lines.is_empty(), "{status} rendered nothing");
+            for line in &lines {
+                assert!(!line.is_empty(), "{status} rendered an empty line");
+                assert!(
+                    !line.contains('\n'),
+                    "{status} rendered an embedded newline"
+                );
+            }
+            // `describe` is just the joined form of the same lines.
+            assert_eq!(describe(&outcome), lines.join("\n"), "{status}");
+        }
+    }
+
+    /// The lease helper's catch-all maps onto this module's `Failed`,
+    /// so a ledger read that blows up is reported like any other error
+    /// rather than as a refusal the user could act on.
+    #[test]
+    fn a_failed_lease_check_maps_to_failed() {
+        match TextToColumnsResult::from_lease_failed("ledger unreadable".to_string()) {
+            TextToColumnsResult::Failed { detail } => assert_eq!(detail, "ledger unreadable"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
     #[test]
     fn auto_earns_its_own_caveat_line_and_no_other_delimiter_does() {
         let mut outcome = would_change_outcome(vec!["B2".to_string()], false);
@@ -2312,6 +2379,96 @@ mod tests {
             "a refused lease must not reach batchUpdate"
         );
         outcome
+    }
+
+    /// A `--sheet` that every range self-prefixes past cannot apply to
+    /// anything, so it is refused rather than silently ignored — the
+    /// pure `a1::compose` check that runs before any request.
+    #[tokio::test]
+    async fn a_sheet_that_conflicts_with_a_prefixed_source_is_refused_before_any_request() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        let mut opts = base_opts(true);
+        opts.sheet = Some("Q1".to_string());
+        opts.source = Some("'Q2'!A2:A4".to_string());
+        let outcome = text_to_columns(&client, &sheets, &opts, &[]).await;
+        assert!(matches!(
+            outcome.result,
+            TextToColumnsResult::RefusedInvalidRange { .. }
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A range the resolver cannot parse at all, as opposed to one it
+    /// parses and this module then refuses for being open-ended or too
+    /// wide — a different arm, with the resolver's own message.
+    #[tokio::test]
+    async fn an_unparseable_source_is_refused_with_the_resolvers_own_detail() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_metadata(&server).await;
+        let mut opts = base_opts(true);
+        opts.source = Some("Q1!not-a-range".to_string());
+        let rules = vec![rule(DriveOperation::SheetsWrite, false)];
+        let outcome = text_to_columns(&client, &sheets, &opts, &rules).await;
+        match &outcome.result {
+            TextToColumnsResult::RefusedInvalidRange { detail } => {
+                assert!(
+                    !detail.is_empty(),
+                    "the resolver's detail is passed through"
+                );
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    /// No row splits under the chosen delimiter, so there is no spill
+    /// span to read or report — but the request is still sent, since
+    /// the server's own splitting rule may differ from this preview's.
+    #[tokio::test]
+    async fn a_source_that_never_splits_reads_no_spill_and_still_sends_the_request() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_metadata(&server).await;
+        mount_values(
+            &server,
+            "'Q1'!A2:A4",
+            serde_json::json!({"values": [["no separator here"]]}),
+        )
+        .await;
+        mount_batch_update(&server, 200).await;
+        let outcome = text_to_columns(
+            &client,
+            &sheets,
+            &base_opts(false),
+            &[rule(DriveOperation::SheetsWrite, false)],
+        )
+        .await;
+        match &outcome.result {
+            TextToColumnsResult::Changed {
+                summary,
+                spill,
+                width_upper_bound,
+                overwritten_cells,
+                past_grid_extent,
+                ..
+            } => {
+                assert_eq!(*width_upper_bound, 1);
+                assert!(spill.is_none());
+                assert!(overwritten_cells.is_empty());
+                assert!(!past_grid_extent);
+                assert!(summary.contains("no row spills beyond the source"));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+        let reads: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path().contains("/values/"))
+            .collect();
+        assert_eq!(reads.len(), 1, "no spill span means no second read");
     }
 
     #[tokio::test]
