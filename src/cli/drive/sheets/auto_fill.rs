@@ -39,8 +39,8 @@ pub struct AutoFillCommand {
     /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
     pub spreadsheet_id: String,
 
-    /// Sheet (tab) title. Supplies the prefix for a bare `--range`/
-    /// `--source`.
+    /// Sheet (tab) title. Supplies the prefix for a bare
+    /// `--range`/`--source`.
     #[arg(long, value_name = "NAME")]
     pub sheet: Option<String>,
 

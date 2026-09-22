@@ -4849,7 +4849,7 @@ Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
 
 Options:
-      --sheet <NAME>           Sheet (tab) title. Supplies the prefix for a bare `--range`/ `--source`
+      --sheet <NAME>           Sheet (tab) title. Supplies the prefix for a bare `--range`/`--source`
       --range <A1>             Form A: the whole region, optionally carrying its own `Sheet!` prefix. Sheets examines it and decides for itself which cells are the source and which are filled — so the destination reported by `--dry-run` is only ever an upper bound on what will be overwritten
       --source <A1>            Form B: the cells holding the series to extend, optionally carrying its own `Sheet!` prefix. Requires `--dimension` and `--fill-length`
       --dimension <DIMENSION>  Form B: which axis `--fill-length` extends `--source` along [possible values: rows, columns]

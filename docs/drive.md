@@ -1750,6 +1750,77 @@ it deliberately.
 Exit code is 0 whether the write succeeded, was blocked, or failed — inspect
 the output, not `$?`.
 
+#### `drive sheets auto-fill`
+
+Extends a series from source cells into an adjacent destination, using
+Sheets' own pattern-detection heuristics (dates, numbers, days-of-week, or
+whatever pattern the source cells show). Also gated under **`sheets-write`**
+(issue #1840, [ADR-0083](adrs/adr-0083.md) §1) — it writes ordinary cell
+content, exactly what a `sheets clear` followed by a `sheets write` of the
+same range could already do under that grant.
+
+Exactly one of `--range`/`--source` is required, mirroring the API's own
+`autoFill` oneof:
+
+```bash
+# --range: names the whole region. Sheets examines it and decides for
+# itself which cells are the source and which are filled, so the count
+# --dry-run reports is only an upper bound on what will be overwritten.
+omni-dev drive sheets auto-fill <ID> --sheet Q1 --range A1:A10 --dry-run
+
+# --source/--dimension/--fill-length: an explicit source, extended by a
+# caller-chosen length and direction. --fill-length may be negative, which
+# fills backward (up or left) instead of forward (down or right).
+omni-dev drive sheets auto-fill <ID> --sheet Q1 --source A1:A3 \
+  --dimension rows --fill-length 7
+
+# Fills using the alternate series Sheets would not otherwise choose (e.g.
+# a copy instead of a linear progression for a plain numeric run).
+omni-dev drive sheets auto-fill <ID> --sheet Q1 --source A1:A2 \
+  --dimension rows --fill-length 5 --alternate-series
+```
+
+**The filled values can never be previewed, and this crate never sees them
+even after a real run.** `autoFill` carries no response object, and which
+values it writes is entirely Sheets' own series-detection heuristic —
+`--dry-run` (and the real run) instead report the destination range and the
+count and A1 locations of the non-blank cells within it that would be (or
+were) overwritten, never their values:
+
+```
+$ omni-dev drive sheets auto-fill <ID> --sheet Q1 --source A1:A3 \
+    --dimension rows --fill-length 7 --dry-run
+Would auto-fill 'Q1'!A4:A10 from source 'Q1'!A1:A3, extending 7 row(s) down in 'Budget'
+  2 non-blank cell(s) would be overwritten: A4, A6
+  the filled values are computed by Sheets' own series detection and are never reported, before or after the request
+```
+
+The real run prints the same shape in the past tense (`Applied: …`,
+`2 non-blank cell(s) were overwritten: …`). With `--range`, the count is
+prefixed `up to`, since Sheets picks the source/destination split itself
+and some of the listed cells are the source:
+
+```
+$ omni-dev drive sheets auto-fill <ID> --sheet Q1 --range A1:A10 --dry-run
+Would auto-fill within 'Q1'!A1:A10 (Sheets decides which cells are the source and which are filled) in 'Budget'
+  up to 3 non-blank cell(s) would be overwritten: A1, A2, A3
+  the filled values are computed by Sheets' own series detection and are never reported, before or after the request
+```
+
+Both `--range` and `--source` require a **fully bounded** range (`A1:D10`,
+not `A:A` or `5:5`) — `merge-cells`' own requirement — since neither the
+destination arithmetic nor the preview read has a fixed extent to work
+from otherwise.
+
+A destination that runs past the sheet's current row/column count is **not
+refused client-side**: `sheets append` already grows the grid under
+`sheets-write`, so `auto-fill` follows the same rule. The summary carries a
+caveat instead, and the verb never prepends a request to grow the sheet
+first. The preflight read that reports the overwritten cells is clamped to
+the grid's current extent, so it can never fail on the out-of-grid part and
+turn "left to the server" into a client-side refusal; a cell past the extent
+holds no value, so nothing is lost by not reading it.
+
 #### `drive sheets create`
 
 Creates a spreadsheet, optionally seeded with values. Gated under the
