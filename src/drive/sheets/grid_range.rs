@@ -136,6 +136,29 @@ pub(crate) fn width_warning(
     }
 }
 
+/// The default number of A1 addresses [`truncate_locations`] renders
+/// before eliding the rest.
+pub(crate) const RENDERED_LOCATION_LIMIT: usize = 50;
+
+/// Joins A1 addresses for a *rendered* line, eliding past `limit`.
+///
+/// Every preview before issue #1844 joined its whole list into one line,
+/// which was fine when the list described a paste destination or a merge.
+/// `trim-whitespace --whole-sheet` names every non-blank cell in a tab, so
+/// the same join produces a multi-kilobyte line. Only the rendered line is
+/// elided: the structured outcome and the `drivemutation` record keep the
+/// full list, so nothing a machine reads is lost.
+pub(crate) fn truncate_locations(locations: &[String], limit: usize) -> String {
+    if locations.len() <= limit {
+        return locations.join(", ");
+    }
+    format!(
+        "{}, … and {} more",
+        locations[..limit].join(", "),
+        locations.len() - limit
+    )
+}
+
 /// Whether every bound of `grid` is set — i.e. it names a fixed rectangle
 /// rather than an open-ended column/row span (`A:A`, `5:5`).
 pub(crate) fn is_bounded(grid: &GridRange) -> bool {
@@ -454,6 +477,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(non_blank_locations(&values, 0, 0), vec!["A1"]);
+    }
+
+    #[test]
+    fn truncate_locations_joins_everything_under_the_limit() {
+        let cells = vec!["A1".to_string(), "B2".to_string()];
+        assert_eq!(truncate_locations(&cells, 50), "A1, B2");
+        // Exactly at the limit still renders in full.
+        assert_eq!(truncate_locations(&cells, 2), "A1, B2");
+        assert_eq!(truncate_locations(&[], 50), "");
+    }
+
+    #[test]
+    fn truncate_locations_elides_past_the_limit_and_counts_the_remainder() {
+        let cells: Vec<String> = (1..=5).map(|row| format!("A{row}")).collect();
+        assert_eq!(truncate_locations(&cells, 2), "A1, A2, … and 3 more");
     }
 
     #[test]

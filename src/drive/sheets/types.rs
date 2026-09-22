@@ -821,6 +821,21 @@ pub enum BatchUpdateRequestItem {
     /// source cell's formatting into those columns, which only the second
     /// does (§5's live-verification consequence).
     TextToColumns(TextToColumnsRequest),
+    /// Trims whitespace in every cell of a range (`trim-whitespace`, issue
+    /// #1844, [ADR-0083](../../../docs/adrs/adr-0083.md) §1). Gated by
+    /// `DriveOperation::SheetsWrite` alone: it rewrites ordinary cell
+    /// content in place, doing nothing a `sheets clear` followed by a
+    /// `sheets write` of the same range could not already do under the
+    /// same grant.
+    TrimWhitespace(TrimWhitespaceRequest),
+    /// Removes rows within a range that duplicate an earlier row
+    /// (`delete-duplicates`, issue #1844,
+    /// [ADR-0083](../../../docs/adrs/adr-0083.md) §2). The one verb in
+    /// this tranche gated by
+    /// [`crate::drive::write_gate::DriveOperation::SheetsDelete`] rather
+    /// than `SheetsWrite`: rows cease to exist and the survivors close
+    /// over the gap, which is `delete-range`'s shape, not `clear`'s.
+    DeleteDuplicates(DeleteDuplicatesRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -3189,6 +3204,43 @@ pub enum DelimiterType {
     Autodetect,
 }
 
+/// `TrimWhitespaceRequest` — trims whitespace in every cell of a range
+/// (issue #1844, [ADR-0083](../../../docs/adrs/adr-0083.md) §1).
+///
+/// The API's exact rule is deliberately not reproduced anywhere in this
+/// crate: ADR-0083 §6 forbids a preview that predicts *which* cells a trim
+/// would change, because reproducing the server's rule locally is the
+/// "preview that lies" risk it declined for `findReplace`. The count of
+/// cells actually changed comes back from the server in
+/// [`TrimWhitespaceResponse`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TrimWhitespaceRequest {
+    /// The range whose cells to trim.
+    pub range: GridRange,
+}
+
+/// `DeleteDuplicatesRequest` — removes rows within a range that duplicate
+/// an earlier row (issue #1844,
+/// [ADR-0083](../../../docs/adrs/adr-0083.md) §2).
+///
+/// This is the only request in this enum gated by
+/// [`crate::drive::write_gate::DriveOperation::SheetsDelete`] that is not
+/// built by `structure.rs`, and the only one anywhere whose removed rows
+/// are chosen by the **server** rather than named by the caller: the API
+/// keeps the first instance of each duplicate and removes the rest,
+/// counting rows with differing case, formatting or formulas as duplicates
+/// and removing filter-hidden rows along with visible ones.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DeleteDuplicatesRequest {
+    /// The range to remove duplicate rows from.
+    pub range: GridRange,
+    /// The columns compared for duplicate values. Omitted entirely when
+    /// empty, which is the API's "analyze all columns in the range"
+    /// default — sending an empty array would be a different request.
+    #[serde(rename = "comparisonColumns", skip_serializing_if = "Vec::is_empty")]
+    pub comparison_columns: Vec<DimensionRange>,
+}
+
 /// [`AutoFillRequest`]'s form-B payload.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SourceAndDestination {
@@ -3257,6 +3309,31 @@ pub struct FindReplaceResponse {
     pub occurrences_changed: i64,
 }
 
+/// The `trimWhitespace` reply's exact server count (issue #1844).
+///
+/// This is the number `trim-whitespace`'s real run reports *instead of*
+/// re-reading the range: the server knows exactly which cells it changed,
+/// where `--dry-run` can only name the non-blank cells that might be
+/// (ADR-0083 §6).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct TrimWhitespaceResponse {
+    /// The number of cells that were trimmed of whitespace.
+    #[serde(default, rename = "cellsChangedCount")]
+    pub cells_changed_count: i64,
+}
+
+/// The `deleteDuplicates` reply's exact server count (issue #1844).
+///
+/// The only thing this crate ever learns about *which* rows were removed:
+/// ADR-0083 §6 places `delete-duplicates` in the server-decided preview
+/// tier, so neither the dry run nor the real run can enumerate them.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct DeleteDuplicatesResponse {
+    /// The number of duplicate rows removed.
+    #[serde(default, rename = "duplicatesRemovedCount")]
+    pub duplicates_removed_count: i64,
+}
+
 /// Response to `spreadsheets.batchUpdate`.
 ///
 /// Only `replies` is modelled, and only the `addSheet` arm of it: the new
@@ -3318,6 +3395,12 @@ pub struct BatchUpdateReply {
     /// (issue #1832).
     #[serde(default, rename = "addBanding")]
     pub add_banding: Option<AddBandingReply>,
+    /// Present only for a `trimWhitespace` request (issue #1844).
+    #[serde(default, rename = "trimWhitespace")]
+    pub trim_whitespace: Option<TrimWhitespaceResponse>,
+    /// Present only for a `deleteDuplicates` request (issue #1844).
+    #[serde(default, rename = "deleteDuplicates")]
+    pub delete_duplicates: Option<DeleteDuplicatesResponse>,
 }
 
 /// The `addProtectedRange` arm of a [`BatchUpdateReply`].
