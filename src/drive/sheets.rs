@@ -43,6 +43,7 @@ pub mod paste;
 pub mod pivot;
 pub mod protection;
 pub mod read;
+pub mod sort_range;
 pub mod structure;
 mod target_gate;
 pub mod types;

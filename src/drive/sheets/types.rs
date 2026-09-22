@@ -798,6 +798,10 @@ pub enum BatchUpdateRequestItem {
     /// `sheets write` of the same range could not already do under the
     /// same grant.
     AutoFill(AutoFillRequest),
+    /// Reorders the rows of a range using one or more column sort keys
+    /// (`sort-range`, issue #1842). Gated by `SheetsWrite` alone: it is a
+    /// permutation of the named cells' values, never a structural edit.
+    SortRange(SortRangeRequest),
 }
 
 /// Body of `spreadsheets.batchUpdate`.
@@ -3090,6 +3094,19 @@ pub struct AutoFillRequest {
     pub use_alternate_series: bool,
 }
 
+/// `SortRangeRequest` — reorders rows within a bounded grid range.
+///
+/// Color-based sort criteria are deliberately not modelled in v1; each
+/// [`SortSpec`] therefore names a column and ascending/descending order.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SortRangeRequest {
+    /// The rows and columns to reorder.
+    pub range: GridRange,
+    /// Sort keys in precedence order.
+    #[serde(rename = "sortSpecs")]
+    pub sort_specs: Vec<SortSpec>,
+}
+
 /// [`AutoFillRequest`]'s form-B payload.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SourceAndDestination {
@@ -3788,6 +3805,44 @@ mod tests {
                         "fillLength": -2,
                     },
                     "useAlternateSeries": true,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn sort_range_serializes_its_range_and_ordered_specs() {
+        let request = BatchUpdateRequestItem::SortRange(SortRangeRequest {
+            range: GridRange {
+                sheet_id: 0,
+                start_row_index: Some(1),
+                end_row_index: Some(10),
+                start_column_index: Some(0),
+                end_column_index: Some(3),
+            },
+            sort_specs: vec![
+                SortSpec {
+                    dimension_index: 1,
+                    sort_order: SortOrder::Descending,
+                },
+                SortSpec {
+                    dimension_index: 0,
+                    sort_order: SortOrder::Ascending,
+                },
+            ],
+        });
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "sortRange": {
+                    "range": {
+                        "sheetId": 0, "startRowIndex": 1, "endRowIndex": 10,
+                        "startColumnIndex": 0, "endColumnIndex": 3,
+                    },
+                    "sortSpecs": [
+                        {"dimensionIndex": 1, "sortOrder": "DESCENDING"},
+                        {"dimensionIndex": 0, "sortOrder": "ASCENDING"},
+                    ],
                 },
             })
         );
