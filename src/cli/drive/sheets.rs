@@ -15,6 +15,7 @@ pub(crate) mod auto_fill;
 pub(crate) mod banding;
 pub(crate) mod conditional_format;
 pub(crate) mod create;
+pub(crate) mod delete_duplicates;
 pub(crate) mod developer_metadata;
 pub(crate) mod dimension_group;
 pub(crate) mod embedded_object;
@@ -31,6 +32,7 @@ pub(crate) mod read;
 pub(crate) mod sort_range;
 pub(crate) mod structure;
 pub(crate) mod text_to_columns;
+pub(crate) mod trim_whitespace;
 pub(crate) mod validation;
 pub(crate) mod values;
 pub(crate) mod write;
@@ -378,6 +380,25 @@ pub enum SheetsSubcommands {
     /// split needs, and the values it writes, can never be previewed;
     /// see `text-to-columns --help`.
     TextToColumns(text_to_columns::TextToColumnsCommand),
+    /// Trims whitespace in every cell of a range, or of a whole sheet.
+    /// Gated by the folder `sheets-write` operation (issue #1844,
+    /// ADR-0083 §1) — it rewrites ordinary cell content in place, doing
+    /// nothing a `sheets clear` followed by a `sheets write` of the same
+    /// range could not already do under the same grant. Sheets owns the
+    /// trim rule, so `--dry-run` reports the non-blank cells that may
+    /// change, never the ones that will.
+    TrimWhitespace(trim_whitespace::TrimWhitespaceCommand),
+    /// Removes rows in a bounded range that duplicate an earlier row.
+    /// Gated by the folder `sheets-delete` operation rather than
+    /// `sheets-write` (issue #1844, ADR-0083 §2): rows cease to exist and
+    /// the survivors close over the gap, which is `delete-rows`' shape.
+    /// The API selects the rows — keeping the first instance of each
+    /// duplicate, counting rows that differ only in case, formatting or
+    /// formulas, and removing filter-hidden rows — so `--dry-run` states
+    /// that rule instead of listing rows it cannot vouch for. Blank rows
+    /// duplicate one another, so a range extending past the data can
+    /// remove every blank row but the first.
+    DeleteDuplicates(delete_duplicates::DeleteDuplicatesCommand),
 }
 
 impl SheetsCommand {
@@ -471,6 +492,8 @@ impl SheetsCommand {
             SheetsSubcommands::SortRange(cmd) => cmd.execute(client).await,
             SheetsSubcommands::RandomizeRange(cmd) => cmd.execute(client).await,
             SheetsSubcommands::TextToColumns(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::TrimWhitespace(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::DeleteDuplicates(cmd) => cmd.execute(client).await,
         }
     }
 }
@@ -671,6 +694,36 @@ mod tests {
                 source: "A1:A3".to_string(),
                 delimiter: text_to_columns::DelimiterArg::Comma,
                 custom_delimiter: None,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::TrimWhitespace(trim_whitespace::TrimWhitespaceCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: Some("Sheet1".to_string()),
+                range: Some("A1:C9".to_string()),
+                whole_sheet: false,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::DeleteDuplicates(delete_duplicates::DeleteDuplicatesCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: Some("Sheet1".to_string()),
+                range: "A1:C9".to_string(),
+                comparison_column: vec![0],
                 dry_run: true,
                 lease: no_lease(),
                 output: crate::cli::drive::format::OutputFormat::Table,

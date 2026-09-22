@@ -142,6 +142,14 @@ pub enum DriveOperation {
     /// here too. (`sort-range`, #1842, predates this measurement and
     /// still gates on this operation alone — a mis-gating filed as a
     /// follow-up, #1870, not corrected by this change.)
+    ///
+    /// Since issue #1844 ([ADR-0083](../../docs/adrs/adr-0083.md) §1),
+    /// also `trim-whitespace`: it rewrites cell content in place, which a
+    /// `sheets write` of the same range could already replace outright.
+    /// Its sibling verb in that issue, `delete-duplicates`, takes
+    /// [`Self::SheetsDelete`] instead — two verbs shipped together under
+    /// two different operations, which is the per-verb mapping working as
+    /// intended, not a special case.
     SheetsWrite,
     /// Structurally edit an existing Google Sheet via `spreadsheets.batchUpdate`
     /// (issue #1613, [ADR-0075](../../docs/adrs/adr-0075.md) §1) — adding,
@@ -287,6 +295,28 @@ pub enum DriveOperation {
     ///
     /// The same argument binds future work: no other operation should later
     /// join this variant without the same re-consent reasoning.
+    ///
+    /// Since issue #1844 ([ADR-0083](../../docs/adrs/adr-0083.md) §2),
+    /// also `delete-duplicates` — the first capability to join this
+    /// variant since ADR-0077 defined it, and admitted under exactly the
+    /// re-consent reasoning the clause above demands: an operator who
+    /// granted `sheets-delete` consented to having rows removed from a
+    /// sheet by this tool, and `delete-duplicates` removes rows within a
+    /// caller-named range, shifting the survivors up. It asks for nothing
+    /// beyond that.
+    ///
+    /// One thing about it *is* new, and is recorded here rather than
+    /// buried in the verb: every other capability under this operation
+    /// removes cells the caller named **by address**, whereas
+    /// `delete-duplicates` removes rows the **server** selects from the
+    /// data — by an equality rule that ignores letter case, formatting and
+    /// formulas, and that reaches rows hidden by a filter. A
+    /// `sheets-delete` grant used through this verb therefore deletes
+    /// whatever that rule finds. ADR-0083 §2 accepts that as within the
+    /// grant's consent (rows removed from a range this tool was told to
+    /// act on) and mitigates it where it belongs — in the verb, which
+    /// states the rule in both the preview and the real run rather than
+    /// implying the caller chose the rows.
     SheetsDelete,
     /// Add, change or remove a protected range on an existing Google Sheet
     /// via `spreadsheets.batchUpdate` (issue #1643,
