@@ -92,6 +92,12 @@ pub enum TrimWhitespaceResult {
         /// **never their values**. An upper bound on what the server will
         /// actually trim, never a prediction: see the module docs.
         candidate_cells: Vec<String>,
+        /// The candidate list is always an upper bound, including when it
+        /// is empty. The server alone decides which cells actually change.
+        candidate_cells_upper_bound: bool,
+        /// The values read covered only the part of the requested range
+        /// inside the sheet's currently allocated grid.
+        read_clamped_to_sheet: bool,
     },
     Changed {
         range: String,
@@ -308,14 +314,29 @@ async fn trim_whitespace_inner(
     let request = BatchUpdateRequestItem::TrimWhitespace(TrimWhitespaceRequest { range: grid });
 
     if opts.dry_run {
+        // A bounded request can still extend past the allocated grid. The
+        // mutation keeps the caller's range, but values.get must read only
+        // its intersection with the sheet's current cells.
+        let Some(read_grid) = grid_range::clamp_to_sheet(&workbook, &grid) else {
+            return gated(TrimWhitespaceResult::RefusedInvalidRequest {
+                detail: format!("{range_a1} has no cells inside the sheet's current grid"),
+            });
+        };
+        let Some(read_a1) = grid_range::bounded_range_to_a1(&sheet_title, &read_grid) else {
+            return gated(TrimWhitespaceResult::RefusedInvalidRequest {
+                detail: format!("{range_a1} has no cells inside the sheet's current grid"),
+            });
+        };
         let candidate_cells =
-            match read_non_blank(&api, &opts.spreadsheet_id, &range_a1, &grid).await {
+            match read_non_blank(&api, &opts.spreadsheet_id, &read_a1, &read_grid).await {
                 Ok(cells) => cells,
                 Err(detail) => return gated(TrimWhitespaceResult::Failed { detail }),
             };
         return gated(TrimWhitespaceResult::WouldChange {
             range: range_a1,
             candidate_cells,
+            candidate_cells_upper_bound: true,
+            read_clamped_to_sheet: read_grid != grid,
         });
     }
 
@@ -447,9 +468,8 @@ fn materialise_bounds(grid: &GridRange, sheet: Option<&Sheet>) -> GridRange {
 
 /// The range's non-blank cells as A1 addresses, from one `values.get`.
 ///
-/// `grid` is already materialised and inside the sheet's extent, so no
-/// clamp is needed here — unlike `paste.rs`, whose written extent is a
-/// property of the request and can name cells the sheet does not have.
+/// `grid` has already been clamped to the sheet's current extent by the
+/// caller; the batch request itself retains the caller's original range.
 async fn read_non_blank(
     api: &SheetsApi<'_>,
     spreadsheet_id: &str,
@@ -513,10 +533,20 @@ pub fn describe_lines(outcome: &TrimWhitespaceOutcome) -> Vec<String> {
         TrimWhitespaceResult::WouldChange {
             range,
             candidate_cells,
-        } => vec![
-            format!("Would trim whitespace in {range} of {book}"),
-            candidate_line(candidate_cells),
-        ],
+            read_clamped_to_sheet,
+            ..
+        } => {
+            let mut lines = vec![
+                format!("Would trim whitespace in {range} of {book}"),
+                candidate_line(candidate_cells),
+            ];
+            if *read_clamped_to_sheet {
+                lines.push(
+                    "  the preview read was clipped to the sheet's current grid; the real run sends the requested range to Sheets".to_string(),
+                );
+            }
+            lines
+        }
         TrimWhitespaceResult::Changed {
             range,
             cells_changed_count,
@@ -873,10 +903,14 @@ mod tests {
             TrimWhitespaceResult::WouldChange {
                 range: "Q1!A2:C10".into(),
                 candidate_cells: vec!["A2".into()],
+                candidate_cells_upper_bound: true,
+                read_clamped_to_sheet: false,
             },
             TrimWhitespaceResult::WouldChange {
                 range: "Q1!A2:C10".into(),
                 candidate_cells: Vec::new(),
+                candidate_cells_upper_bound: true,
+                read_clamped_to_sheet: false,
             },
             TrimWhitespaceResult::Changed {
                 range: "Q1!A2:C10".into(),
@@ -1024,9 +1058,13 @@ mod tests {
         .mount(&server)
         .await;
         let outcome = trim_whitespace(&drive, &sheets, &options(true), &[rule()]).await;
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["result"]["candidate_cells_upper_bound"], true);
         let TrimWhitespaceResult::WouldChange {
             range,
             candidate_cells,
+            candidate_cells_upper_bound,
+            read_clamped_to_sheet,
         } = outcome.result
         else {
             panic!("expected would-change"); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; the mocked run always produces it"
@@ -1034,6 +1072,8 @@ mod tests {
         assert_eq!(range, "'Q1'!A2:C10");
         // Offsets are the range's own start (row 1, column 0 zero-based).
         assert_eq!(candidate_cells, vec!["A2", "C2", "B3"]);
+        assert!(candidate_cells_upper_bound);
+        assert!(!read_clamped_to_sheet);
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(
@@ -1049,6 +1089,48 @@ mod tests {
                 .any(|r| r.url.path().ends_with(":batchUpdate")),
             "a dry run mutated"
         );
+    }
+
+    #[tokio::test]
+    async fn dry_run_clamps_an_explicit_range_to_the_sheet_grid_for_its_read() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_metadata(&server).await;
+        mount_values(serde_json::json!([["  padded  "]]))
+            .mount(&server)
+            .await;
+        let mut opts = options(true);
+        opts.range = Some("E90:J120".into());
+
+        let outcome = trim_whitespace(&drive, &sheets, &opts, &[rule()]).await;
+        assert_eq!(
+            outcome.result,
+            TrimWhitespaceResult::WouldChange {
+                range: "'Q1'!E90:J120".into(),
+                candidate_cells: vec!["E90".into()],
+                candidate_cells_upper_bound: true,
+                read_clamped_to_sheet: true,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&outcome).unwrap()["result"]["read_clamped_to_sheet"],
+            true
+        );
+        assert!(describe_lines(&outcome)
+            .join("\n")
+            .contains("preview read was clipped"));
+        let requests = server.received_requests().await.unwrap();
+        let reads: Vec<_> = requests
+            .iter()
+            .filter(|request| request.url.path().contains("/values/"))
+            .collect();
+        assert_eq!(reads.len(), 1);
+        let read_path = reads[0].url.path();
+        assert!(
+            read_path.contains("E90") && read_path.contains("F100"),
+            "{read_path}"
+        );
+        assert!(!read_path.contains("J120"), "{read_path}");
     }
 
     /// The deviation from `auto_fill.rs`/`paste.rs` recorded in the module

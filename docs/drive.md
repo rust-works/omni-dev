@@ -2085,7 +2085,12 @@ will touch. Read the preview as "at most these", never as a list of cells
 that will change.
 
 Past 50 addresses the rendered line elides the remainder (`… and N more`);
-the `-o json` outcome and the request log keep the full list.
+the `-o json` outcome keeps the full list and marks it with
+`candidate_cells_upper_bound: true`. Dry runs write no mutation record.
+If an explicit range extends beyond the allocated grid, the preview read
+is clipped to existing cells and sets `read_clamped_to_sheet: true` in
+JSON. The preview says so; the mutation still sends the requested range
+to Sheets, which decides whether that range is valid.
 
 The real run reports the API's own `cellsChangedCount` — an exact count of
 what changed — and deliberately does **not** re-read the range, unlike
@@ -2101,12 +2106,12 @@ API returns the field either way.
 
 #### `drive sheets delete-duplicates`
 
-Removes rows within a bounded range that duplicate an earlier row. This is
+Removes duplicate row cells within a bounded range. This is
 the **only verb in its tranche gated by `sheets-delete`** rather than
-`sheets-write` (issue #1844, [ADR-0083](adrs/adr-0083.md) §2): rows cease
-to exist and the survivors close over the gap, which is `delete-rows`'
-shape, not `clear`'s. A `sheets-write` grant does not open it, and neither
-does `sheets-structure`.
+`sheets-write` (issue #1844, [ADR-0083](adrs/adr-0083.md) §2): cells
+inside the range are removed and its survivors shift up, which is
+`delete-range`'s shape, not `clear`'s. A `sheets-write` grant does not
+open it, and neither does `sheets-structure`.
 
 ```bash
 # Compare every column in the range.
@@ -2128,6 +2133,13 @@ column too, with `400 INVALID_ARGUMENT: A column used for determining
 duplicates is not contained in the range`, so the local refusal only buys
 a clearer message and a round trip.
 
+**Content outside the selected rectangle stays in place.** For example,
+deduplicating `A2:D100` removes and shifts cells in columns A–D only.
+Column E remains on its original rows, so records can become misaligned
+if the range is narrower than the data. Both text output and JSON report
+this range-only effect; JSON sets
+`content_outside_range_untouched: true`.
+
 **The API selects the rows, not the caller.** Every other `sheets-delete`
 verb removes cells named by address; here Sheets applies its own equality
 rule and removes whatever it finds. Because a wrong local guess would cost
@@ -2137,6 +2149,7 @@ vouch for ([ADR-0083](adrs/adr-0083.md) §6):
 ```
 $ omni-dev drive sheets delete-duplicates <ID> --sheet Q1 --range A2:D100 --dry-run
 Warning: blank rows inside the range duplicate one another, so a range extending past the data can remove every blank row but the first
+Warning: only cells inside the selected range are removed and shifted up; columns outside it stay in place, so a range narrower than the sheet can misalign records
 Would remove duplicate rows from 'Q1'!A2:D100 in 'Budget', comparing every column in the range
   the API keeps the first instance of each duplicate and removes the rest; duplicates need not be adjacent, rows differing only in letter case, formatting or formulas still count as duplicates, and rows hidden by a filter are removed along with visible ones
   which rows would be removed is decided by the API and cannot be previewed
@@ -2170,6 +2183,7 @@ that there is none when the deciding rule set `require_lease: false`:
 
 ```
 $ omni-dev drive sheets delete-duplicates <ID> --sheet Q1 --range A2:D100 --lease <TOKEN>
+Warning: only cells inside the selected range are removed and shifted up; columns outside it stay in place, so a range narrower than the sheet can misalign records
 Removed 4 duplicate row(s) from 'Q1'!A2:D100 in 'Budget', comparing every column in the range
   the API keeps the first instance of each duplicate and removes the rest; …
   this cannot be undone through omni-dev — the lease this write required backed the whole spreadsheet up when it was acquired (Drive copy 1AbC…); run `omni-dev drive lease restore <TOKEN>` to locate it, restore from that copy in the Drive UI, or fall back to Google Drive's own version history

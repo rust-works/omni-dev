@@ -392,16 +392,17 @@ pub enum SheetsSubcommands {
     /// trim rule, so `--dry-run` reports the non-blank cells that may
     /// change, never the ones that will.
     TrimWhitespace(trim_whitespace::TrimWhitespaceCommand),
-    /// Removes rows in a bounded range that duplicate an earlier row.
+    /// Removes duplicate row cells within a bounded range.
     /// Gated by the folder `sheets-delete` operation rather than
-    /// `sheets-write` (issue #1844, ADR-0083 §2): rows cease to exist and
-    /// the survivors close over the gap, which is `delete-rows`' shape.
+    /// `sheets-write` (issue #1844, ADR-0083 §2): cells inside the
+    /// selected range are removed and its survivors shift up.
     /// The API selects the rows — keeping the first instance of each
     /// duplicate, counting rows that differ only in case, formatting or
     /// formulas, and removing filter-hidden rows — so `--dry-run` states
     /// that rule instead of listing rows it cannot vouch for. Blank rows
     /// duplicate one another, so a range extending past the data can
-    /// remove every blank row but the first.
+    /// remove every blank row but the first. Columns outside the range stay
+    /// in place, so a narrow range can misalign records.
     DeleteDuplicates(delete_duplicates::DeleteDuplicatesCommand),
 }
 
