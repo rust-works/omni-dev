@@ -635,6 +635,7 @@ mod tests {
         let failed = || {
             issue(RouteOutcome::Failed {
                 error: "HTTP 529".to_string(),
+                reference_fetch_failures: vec![],
             })
         };
         let report = |issues| RouteReport {
