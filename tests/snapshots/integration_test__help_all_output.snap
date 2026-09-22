@@ -4519,6 +4519,7 @@ Commands:
   copy-paste                   Copies a range to a destination, spilling a larger source past the destination's end or repeating a smaller one to fill it. Gated by `--paste-type` (issue #1839, ADR-0083 §4): a value-only type needs `sheets-write` alone, a presentation-only type `sheets-structure` alone, and `normal` (the default) needs both
   paste-data                   Pastes delimited text into a range anchored at a destination cell, as if pasted from the clipboard (issue #1839, ADR-0083 §4). `delimiter`-form only. Same `--paste-type` gate mapping as `copy-paste`
   auto-fill                    Extends a series from source cells into an adjacent destination, using Sheets' own pattern-detection heuristics. Gated by the folder write-permission rules' `sheets-write` operation (issue #1840, ADR-0083 §1) — it writes ordinary cell content, doing nothing a `sheets clear` followed by a `sheets write` could not already do under the same grant. The filled values can never be previewed; see `auto-fill --help`
+  sort-range                   Reorders rows in a range by one or more column keys. Gated by the folder `sheets-write` operation (issue #1842, ADR-0083 §3)
   help                         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -5959,6 +5960,27 @@ Options:
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets sort-range - Reorders rows in a range by one or more column keys. Gated by the folder `sheets-write` operation (issue #1842, ADR-0083 §3)
+
+Reorders rows in a range by one or more column keys. Gated by the folder `sheets-write` operation (issue #1842, ADR-0083 §3)
+
+Usage: sort-range [OPTIONS] --range <A1> --sort-by <COLUMN:ORDER> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>            Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --range <A1>              Fully bounded A1 range to sort, optionally carrying its own `Sheet!` prefix (for example `A2:D100`)
+      --sort-by <COLUMN:ORDER>  A column sort key, as `COLUMN:asc` or `COLUMN:desc`. Repeat to add lower-precedence keys
+      --dry-run                 Reports the gate verdict and request shape without calling `spreadsheets.batchUpdate` or reading cell values
+      --lease <TOKEN>           The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>         Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                    Print help (see more with '--help')
 
 
 ================================================================================
