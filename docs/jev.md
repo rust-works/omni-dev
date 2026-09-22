@@ -430,9 +430,9 @@ issues:
       stages:
         design:    {choice: fable,  confidence: 0.52, probabilities: {fable: 0.74, none: 0.01, opus: 0.24, sonnet: 0.01}}
         implement: {choice: sonnet, confidence: 0.83, probabilities: {fable: 0.0, opus: 0.12, sonnet: 0.88}}
-        review:    {choice: opus,   confidence: 0.41, probabilities: {fable: 0.02, opus: 0.57, sonnet: 0.41}}
+        review:    {choice: opus,   confidence: 0.21, probabilities: {fable: 0.02, opus: 0.57, sonnet: 0.41}}
       class: fable
-      close_calls: []
+      close_calls: [review]
     openai:
       stages:
         design:    {choice: astra, confidence: 0.49, probabilities: {astra: 0.71, none: 0.01, sol: 0.27, terra: 0.01}}
@@ -511,12 +511,17 @@ and may change without notice; scripts should keep using `json` or `yaml`.
 
 ```
 rust-works/omni-dev#1641 — Some issue title
-  fable — design needs fable (0.52), implementation sonnet (0.83), review opus (0.41, close call)
+  fable — design needs fable (0.52), implementation sonnet (0.83), review opus (0.21, close call — sonnet 0.41)
   cites open #1129, which could leave less design work if resolved (0.75)
   reference fetch failed: #404 (not found)
 
 model: jev-1.13.0, usage: 1432 input tokens, 61 output tokens
 ```
+
+For a close call, text output adds the highest-probability alternative from
+`probabilities` after the chosen answer's confidence. It uses a stable
+alphabetical tie break and leaves the alternative out if none is available.
+Confidence and the alternative's probability are separate Jev values.
 
 Routing against several `--ladders` adds one indented line per ladder,
 labelled `<ladder>: <class> — ...` (a single ladder, the common case,
