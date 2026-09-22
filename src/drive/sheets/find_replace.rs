@@ -427,7 +427,10 @@ fn validate_scope_syntax(opts: &FindReplaceOptions) -> Result<(), String> {
 }
 
 fn preview_summary(opts: &FindReplaceOptions) -> String {
-    format!("find/replace with match-case={}, match-entire-cell={}, search-by-regex={}, include-formulas={}; Sheets computes match counts when executed", opts.match_case, opts.match_entire_cell, opts.search_by_regex, opts.include_formulas)
+    format!(
+        "find {:?}, replace with {:?} (match-case={}, match-entire-cell={}, search-by-regex={}, include-formulas={}); Sheets computes match counts when executed",
+        opts.find, opts.replacement, opts.match_case, opts.match_entire_cell, opts.search_by_regex, opts.include_formulas
+    )
 }
 
 fn record_attempt(outcome: &FindReplaceOutcome, _opts: &FindReplaceOptions, duration: Duration) {
@@ -553,5 +556,873 @@ mod tests {
         assert!(validate_scope_syntax(&whole_without_sheet)
             .unwrap_err()
             .contains("requires --sheet"));
+    }
+
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::drive::test_support::seed_lease;
+    use crate::drive::types::GOOGLE_SHEET_MIME_TYPE;
+    use crate::drive::write_gate::Verdict;
+    use crate::test_support::env::MapEnv;
+    use crate::utils::secret::Secret;
+    use std::collections::HashSet;
+
+    fn test_credentials() -> DriveCredentials {
+        DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        }
+    }
+
+    /// Both clients against one wiremock server, sharing an OAuth session.
+    /// Mirrors `write.rs::tests::clients`.
+    async fn clients(server: &wiremock::MockServer) -> (DriveClient, SheetsClient) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token", "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+        let mut drive = DriveClient::new(&server.uri(), &test_credentials()).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut drive,
+            &test_credentials(),
+            &format!("{}/token", server.uri()),
+        );
+        let env = MapEnv::new().with(SHEETS_API_URL, &server.uri());
+        let sheets = SheetsClient::from_drive_client_with(&env, &drive).unwrap();
+        (drive, sheets)
+    }
+
+    /// `version: "1"` throughout — matches [`opts`]'s default seeded lease.
+    fn mount_file(id: &str, mime_type: &str, parents: &[&str]) -> wiremock::Mock {
+        let parents: Vec<&str> = parents.to_vec();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/drive/v3/files/{id}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id, "name": id, "mimeType": mime_type, "parents": parents,
+                    "version": "1",
+                })),
+            )
+    }
+
+    fn mount_folder(id: &str) -> wiremock::Mock {
+        mount_file(id, "application/vnd.google-apps.folder", &[])
+    }
+
+    /// A `spreadsheets.get` reply with two sheets: `Q1` (sheetId 0) and
+    /// `Q2` (sheetId 42).
+    fn mount_workbook() -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {"properties": {
+                            "sheetId": 0, "title": "Q1", "index": 0,
+                            "gridProperties": {"rowCount": 1000, "columnCount": 26}}},
+                        {"properties": {
+                            "sheetId": 42, "title": "Q2", "index": 1,
+                            "gridProperties": {"rowCount": 500, "columnCount": 10}}}
+                    ],
+                })),
+            )
+    }
+
+    fn mount_batch_update(body: serde_json::Value) -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+    }
+
+    fn allow_rule(folder: &str) -> FolderPermissionRule {
+        FolderPermissionRule {
+            folder_id: Some(folder.to_string()),
+            file_id: None,
+            recursive: true,
+            allow: std::iter::once(DriveOperation::SheetsWrite).collect(),
+            deny: HashSet::default(),
+            require_lease: true,
+        }
+    }
+
+    fn allow_rule_no_lease(folder: &str) -> FolderPermissionRule {
+        FolderPermissionRule {
+            require_lease: false,
+            ..allow_rule(folder)
+        }
+    }
+
+    /// Seeds a fresh, isolated ledger with a live lease for `"sheet-1"` at
+    /// version `"1"` (matching [`mount_file`]'s default) and returns
+    /// options for a `--range Q1!A1:B2` request against it. Mirrors
+    /// `write.rs::tests::opts`'s leaked-tempdir rationale.
+    fn opts(dry_run: bool) -> FindReplaceOptions {
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "1");
+        FindReplaceOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            find: "draft".to_string(),
+            replacement: "final".to_string(),
+            sheet: None,
+            range: Some("Q1!A1:B2".to_string()),
+            whole_sheet: false,
+            all_sheets: false,
+            match_case: false,
+            match_entire_cell: false,
+            search_by_regex: false,
+            include_formulas: false,
+            dry_run,
+            lease_token: Some(token),
+            ledger_path,
+        }
+    }
+
+    // ── refusals that must precede the gate and the network ────────────
+
+    #[tokio::test]
+    async fn non_spreadsheet_is_refused_before_any_gate_or_sheets_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", "application/pdf", &["parent-1"])
+            .mount(&server)
+            .await;
+        // Deliberately no mock for parent-1 (the gate never runs) and none
+        // for any Sheets endpoint.
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
+        assert!(matches!(
+            outcome.result,
+            FindReplaceResult::RefusedNotASpreadsheet { .. }
+        ));
+        let text = describe_lines(&outcome).join("\n");
+        assert!(text.contains("is not a Google Sheet"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn shortcut_is_refused_with_its_own_message_not_the_generic_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            "application/vnd.google-apps.shortcut",
+            &["parent-1"],
+        )
+        .mount(&server)
+        .await;
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
+        assert!(matches!(outcome.result, FindReplaceResult::RefusedShortcut));
+        let text = describe_lines(&outcome).join("\n");
+        assert!(text.contains("is a shortcut"), "{text}");
+        assert!(!text.contains("is not a Google Sheet"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_sheet_with_no_visible_parents_is_refused_distinctly_from_a_blocked_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &[])
+            .mount(&server)
+            .await;
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[]).await;
+        assert!(matches!(
+            outcome.result,
+            FindReplaceResult::RefusedNoVisibleParents
+        ));
+    }
+
+    // ── scope validation, before any network call ───────────────────────
+
+    #[tokio::test]
+    async fn empty_find_is_refused_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // No mocks at all — the refusal must short-circuit before `files.get`.
+        let mut o = opts(false);
+        o.find = String::new();
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("--find"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_scope_is_refused_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let mut o = opts(false);
+        o.all_sheets = true; // `--range` is also set by `opts`.
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("exactly one scope"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn whole_sheet_without_sheet_is_refused_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let mut o = opts(false);
+        o.range = None;
+        o.whole_sheet = true;
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("requires --sheet"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_sheet_and_range_fails_before_any_batch_update() {
+        // Unlike the pure-syntax refusals above, `--range` carrying its own
+        // sheet prefix plus `--sheet` is only caught once composed via
+        // `a1::compose`, which runs after the gate and the workbook fetch
+        // have already succeeded — so this needs both mocks, but must still
+        // never reach `batchUpdate`.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // No batchUpdate mock: the refusal must short-circuit the mutation.
+        let mut o = opts(false);
+        o.sheet = Some("Q1".to_string());
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result);
+        };
+        assert!(detail.contains("already names a sheet"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn sheet_not_found_is_refused_with_available_titles() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        let mut o = opts(false);
+        o.range = None;
+        o.sheet = Some("Nope".to_string());
+        o.whole_sheet = true;
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        let FindReplaceResult::RefusedSheetNotFound { title, available } = &outcome.result else {
+            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result);
+        };
+        assert_eq!(title, "Nope");
+        assert_eq!(available, &["Q1".to_string(), "Q2".to_string()]);
+    }
+
+    // ── the gate ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn denied_target_makes_zero_sheets_calls() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        // No workbook or batchUpdate mock: either call would 404.
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[]).await;
+        assert!(
+            matches!(
+                outcome.result,
+                FindReplaceResult::Blocked { decided_by: None }
+            ),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_by_rule_names_the_deciding_folder_in_the_message() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        let deny_rule = FolderPermissionRule {
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
+            recursive: true,
+            allow: HashSet::default(),
+            deny: std::iter::once(DriveOperation::SheetsWrite).collect(),
+            require_lease: true,
+        };
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[deny_rule]).await;
+        let text = describe_lines(&outcome).join("\n");
+        assert!(
+            text.contains("refused by rule on folder parent-1"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_rule_alone_does_not_permit_find_replace() {
+        // The consequence of ADR-0083 §1, asserted end-to-end: an existing
+        // `allow: ["edit"]` rule must not silently grant find/replace.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        let edit_only = FolderPermissionRule {
+            folder_id: Some("parent-1".to_string()),
+            file_id: None,
+            recursive: true,
+            allow: std::iter::once(DriveOperation::Edit).collect(),
+            deny: HashSet::default(),
+            require_lease: true,
+        };
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[edit_only]).await;
+        assert!(matches!(outcome.result, FindReplaceResult::Blocked { .. }));
+    }
+
+    // ── dry run ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dry_run_reports_scope_terms_and_modifiers_and_calls_no_batch_update() {
+        // Regression coverage for the ADR-0083 §6 requirement that the
+        // preview name the search and replacement terms, not only the
+        // boolean modifiers.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().expect(1).mount(&server).await;
+        // No batchUpdate mock: a dry run must never send it.
+        let mut o = opts(true);
+        o.match_case = true;
+        o.include_formulas = true;
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        let FindReplaceResult::WouldChange { target, summary } = &outcome.result else {
+            panic!("expected WouldChange, got {:?}", outcome.result);
+        };
+        assert!(matches!(target, FindReplaceTarget::Range { .. }));
+        assert!(summary.contains("\"draft\""), "{summary}");
+        assert!(summary.contains("\"final\""), "{summary}");
+        assert!(summary.contains("match-case=true"), "{summary}");
+        assert!(summary.contains("include-formulas=true"), "{summary}");
+        assert!(
+            summary.contains("computes match counts when executed"),
+            "{summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_surfaces_the_same_blocked_reasoning_as_a_real_denied_run() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .expect(2)
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").expect(2).mount(&server).await;
+
+        let dry = find_replace(&drive, &sheets, &opts(true), &[]).await;
+        let real = find_replace(&drive, &sheets, &opts(false), &[]).await;
+        assert_eq!(dry.result, real.result);
+    }
+
+    // ── successful mutations ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn allowed_find_replace_sends_a_range_scope_request_and_reports_counts() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "requests": [{"findReplace": {
+                    "find": "draft", "replacement": "final",
+                    "matchCase": false, "matchEntireCell": false,
+                    "searchByRegex": false, "includeFormulas": false,
+                }}],
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{"findReplace": {
+                        "valuesChanged": 2, "formulasChanged": 0,
+                        "rowsChanged": 1, "sheetsChanged": 1, "occurrencesChanged": 3,
+                    }}],
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
+        let FindReplaceResult::Changed { target, counts } = &outcome.result else {
+            panic!("expected Changed, got {:?}", outcome.result);
+        };
+        assert!(matches!(target, FindReplaceTarget::Range { .. }));
+        let counts = counts.as_ref().expect("counts present");
+        assert_eq!(counts.occurrences_changed, 3);
+        assert_eq!(counts.values_changed, 2);
+        let text = describe_lines(&outcome).join("\n");
+        assert!(text.contains("occurrences=3"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn allowed_find_replace_sends_a_sheet_scope_request_for_whole_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "requests": [{"findReplace": {"sheetId": 42}}],
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut o = opts(false);
+        o.range = None;
+        o.sheet = Some("Q2".to_string());
+        o.whole_sheet = true;
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert!(matches!(outcome.result, FindReplaceResult::Changed { .. }));
+    }
+
+    #[tokio::test]
+    async fn allowed_find_replace_sends_an_all_sheets_scope_request() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "requests": [{"findReplace": {"allSheets": true}}],
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut o = opts(false);
+        o.range = None;
+        o.all_sheets = true;
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert!(matches!(outcome.result, FindReplaceResult::Changed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_response_omitting_the_find_replace_reply_reports_changed_with_no_counts() {
+        // `BatchUpdateReply::find_replace` deliberately tolerates a missing
+        // reply object — a successful `batchUpdate` must still report
+        // success, just with unavailable counts, rather than `Failed`.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({"replies": [{}]}))
+            .mount(&server)
+            .await;
+
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
+        assert_eq!(
+            outcome.result,
+            FindReplaceResult::Changed {
+                target: FindReplaceTarget::Range {
+                    range: "Q1!A1:B2".to_string(),
+                    sheet_id: 0,
+                },
+                counts: None,
+            }
+        );
+        let text = describe_lines(&outcome).join("\n");
+        assert!(text.contains("no change counts"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_batch_update_error_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
+        assert!(matches!(outcome.result, FindReplaceResult::Failed { .. }));
+    }
+
+    // ── the Drive write lease (ADR-0080 §9) ─────────────────────────────
+
+    #[tokio::test]
+    async fn refuses_without_a_lease_when_the_rule_requires_one() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // No batchUpdate mock: a refusal must make zero mutating calls.
+
+        let mut o = opts(false);
+        o.lease_token = None;
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(outcome.result, FindReplaceResult::RefusedNoLease);
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_lease_token() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let mut o = opts(false);
+        o.lease_token = Some("bogus-token".to_string());
+        // Never seeded — no ledger exists at this fresh path.
+        o.ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(outcome.result, FindReplaceResult::RefusedLeaseExpired);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_lease_bound_to_a_different_file() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "other-sheet", "1");
+        let mut o = opts(false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(outcome.result, FindReplaceResult::RefusedLeaseWrongFile);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_stale_lease() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // Live version "1" (`mount_file`'s default) but the lease was
+        // acquired at "0" — the file has moved since.
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let mut o = opts(false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(outcome.result, FindReplaceResult::RefusedLeaseStale);
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_does_not_require_a_lease_skips_the_check_entirely() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({}))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut o = opts(false);
+        o.lease_token = None;
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule_no_lease("parent-1")]).await;
+        assert!(matches!(outcome.result, FindReplaceResult::Changed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_does_not_require_a_lease_still_refuses_a_stale_one_if_presented() {
+        // ADR-0080 §13: `require_lease: false` relaxes the *requirement*,
+        // not the *meaning* — a token volunteered anyway is checked exactly
+        // like a required one, including staleness.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // No batchUpdate mock: a refusal must make zero mutating calls.
+
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let mut o = opts(false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = find_replace(&drive, &sheets, &o, &[allow_rule_no_lease("parent-1")]).await;
+        assert_eq!(outcome.result, FindReplaceResult::RefusedLeaseStale);
+    }
+
+    // ── the write's own audit trail (ADR-0080 §11) ─────────────────────
+
+    #[tokio::test]
+    async fn a_leased_find_replace_concludes_its_audit_pair_with_allowed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_batch_update(serde_json::json!({}))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
+        assert!(matches!(outcome.result, FindReplaceResult::Changed { .. }));
+
+        let records = audit.records();
+        assert_eq!(audit.verdicts(), ["pending", "allowed"], "{records:?}");
+        // The verb, not the engine — the same `["drive", <log_operation>]`
+        // this write's `drivemutation` record carries.
+        assert_eq!(records[0].command, ["drive", "sheets-find-replace"]);
+    }
+
+    // ── describing an outcome / metadata ────────────────────────────────
+
+    /// One of every [`FindReplaceResult`] variant.
+    ///
+    /// The `match` below is exhaustive and wildcard-free on purpose: adding
+    /// a variant breaks this build, which is what forces the new arm
+    /// through `every_describe_arm_renders_a_single_line`.
+    fn every_find_replace_result() -> Vec<FindReplaceResult> {
+        let all = vec![
+            FindReplaceResult::WouldChange {
+                target: FindReplaceTarget::AllSheets,
+                summary: "find \"a\", replace with \"b\"".to_string(),
+            },
+            FindReplaceResult::Changed {
+                target: FindReplaceTarget::Range {
+                    range: "A1:B2".to_string(),
+                    sheet_id: 0,
+                },
+                counts: Some(FindReplaceCounts {
+                    values_changed: 1,
+                    formulas_changed: 0,
+                    rows_changed: 1,
+                    sheets_changed: 1,
+                    occurrences_changed: 1,
+                }),
+            },
+            FindReplaceResult::Changed {
+                target: FindReplaceTarget::Sheet {
+                    sheet: "Q1".to_string(),
+                    sheet_id: 0,
+                },
+                counts: None,
+            },
+            FindReplaceResult::RefusedInvalidRequest {
+                detail: "bad".to_string(),
+            },
+            FindReplaceResult::RefusedNotASpreadsheet {
+                mime_type: "application/pdf".to_string(),
+            },
+            FindReplaceResult::RefusedShortcut,
+            FindReplaceResult::RefusedNoVisibleParents,
+            FindReplaceResult::RefusedSheetNotFound {
+                title: "Nope".to_string(),
+                available: vec!["Q1".to_string()],
+            },
+            FindReplaceResult::Blocked { decided_by: None },
+            FindReplaceResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".to_string(),
+                    depth: 2,
+                }),
+            },
+            FindReplaceResult::Blocked {
+                decided_by: Some(DecidingRule::File {
+                    file_id: "sheet-1".to_string(),
+                }),
+            },
+            FindReplaceResult::RefusedNoLease,
+            FindReplaceResult::RefusedLeaseExpired,
+            FindReplaceResult::RefusedLeaseWrongFile,
+            FindReplaceResult::RefusedLeaseStale,
+            FindReplaceResult::Failed {
+                detail: "boom".to_string(),
+            },
+        ];
+        for result in &all {
+            match result {
+                FindReplaceResult::WouldChange { .. }
+                | FindReplaceResult::Changed { .. }
+                | FindReplaceResult::RefusedInvalidRequest { .. }
+                | FindReplaceResult::RefusedNotASpreadsheet { .. }
+                | FindReplaceResult::RefusedShortcut
+                | FindReplaceResult::RefusedNoVisibleParents
+                | FindReplaceResult::RefusedSheetNotFound { .. }
+                | FindReplaceResult::Blocked { .. }
+                | FindReplaceResult::RefusedNoLease
+                | FindReplaceResult::RefusedLeaseExpired
+                | FindReplaceResult::RefusedLeaseWrongFile
+                | FindReplaceResult::RefusedLeaseStale
+                | FindReplaceResult::Failed { .. } => (),
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn every_describe_arm_renders_a_single_line() {
+        for result in every_find_replace_result() {
+            let outcome = FindReplaceOutcome {
+                spreadsheet_id: "sheet-1".to_string(),
+                file_name: Some("Quarterly Plan".to_string()),
+                resolved_folder_id: None,
+                result,
+            };
+            let lines = describe_lines(&outcome);
+            assert_eq!(
+                lines.len(),
+                1,
+                "describe_lines emitted {} lines for {:?}: {lines:?}",
+                lines.len(),
+                outcome.result
+            );
+            assert!(
+                !lines[0].chars().any(char::is_control),
+                "describe_lines emitted a control character for {:?}: {lines:?}",
+                outcome.result
+            );
+        }
+    }
+
+    #[test]
+    fn log_status_covers_every_variant() {
+        for result in every_find_replace_result() {
+            assert!(!result.log_status().is_empty());
+        }
+        assert_eq!(
+            FindReplaceResult::Blocked { decided_by: None }.log_status(),
+            "blocked"
+        );
+        assert_eq!(
+            FindReplaceResult::Changed {
+                target: FindReplaceTarget::AllSheets,
+                counts: None
+            }
+            .log_status(),
+            "changed"
+        );
+        assert_eq!(
+            FindReplaceResult::RefusedLeaseStale.log_status(),
+            "refused-lease-stale"
+        );
+    }
+
+    #[test]
+    fn write_jsonl_emits_one_line_of_json() {
+        let outcome = FindReplaceOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: Some("parent-1".to_string()),
+            result: FindReplaceResult::Changed {
+                target: FindReplaceTarget::AllSheets,
+                counts: Some(FindReplaceCounts {
+                    values_changed: 1,
+                    formulas_changed: 0,
+                    rows_changed: 1,
+                    sheets_changed: 1,
+                    occurrences_changed: 1,
+                }),
+            },
+        };
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(parsed["result"]["status"], "changed");
+    }
+
+    #[test]
+    fn gate_denies_sheets_write_by_default() {
+        let decision =
+            write_gate::resolve(&["folder".to_string()], DriveOperation::SheetsWrite, &[]);
+        assert_eq!(decision.verdict, Verdict::Deny);
     }
 }

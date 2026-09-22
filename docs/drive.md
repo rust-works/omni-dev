@@ -1733,10 +1733,11 @@ omni-dev drive sheets find-replace <ID> --all-sheets --search-by-regex \
 `--match-case`, `--match-entire-cell`, `--search-by-regex`, and
 `--include-formulas` map directly to the Sheets request. Formula inclusion
 adds formula cells to the search; Sheets has no formulas-only mode. A dry run
-reports the resolved scope and modifiers without reading cells or estimating
-matches, because Sheets determines matching semantics and counts. A real run
-reports values, formulas, rows, sheets, and occurrences changed; one cell can
-contain several changed occurrences.
+reports the resolved scope, the search and replacement terms, and every
+modifier, without reading cells or estimating matches, because Sheets
+determines matching semantics and counts. A real run reports values,
+formulas, rows, sheets, and occurrences changed; one cell can contain
+several changed occurrences.
 
 **`--values`** takes a file path or `-` for stdin. CSV by default; JSON (an
 array of arrays) when the path ends in `.json` or `--values-format json` is
