@@ -1926,6 +1926,25 @@ only `--range` is): the API decides for itself how many columns each row's
 split needs, and a quoted delimiter or a run of consecutive separators can
 make the local split wider than the real one.
 
+`--delimiter auto` is the one case where the count is an **estimate
+rather than a bound**, and those runs carry an extra caveat line saying
+so. For every other delimiter the local split uses the same separator the
+API is told to use, so it can only over-count; under `auto` the separator
+is Sheets' own choice, and this crate can only guess it by trying comma,
+semicolon, period and space and keeping the widest. Whether Sheets'
+detection is confined to those four is undocumented and unverified
+against a live workbook — if it can detect some other separator, the real
+split can reach cells the preview does not name:
+
+```
+$ omni-dev drive sheets text-to-columns <ID> --sheet Q1 --source A2:A4 \
+    --delimiter auto --dry-run
+Would split 'Q1'!A2:A4 on auto-detected into up to 3 column(s), spill 'Q1'!B2:C4 in 'Budget'
+  no non-blank cells in the spill columns
+  --delimiter auto lets Sheets detect the separator itself; this count comes from trying comma, semicolon, period and space locally and keeping the widest, so it is an estimate rather than an upper bound if Sheets detects some other separator
+  the number of columns the split needs, and the values it writes, are computed by Sheets' own splitting and are never reported, before or after the request; the count above is a local upper-bound estimate only
+```
+
 A spill that runs past the sheet's current column count is **not refused
 client-side**: `sheets append` already grows the grid under `sheets-write`,
 so `text-to-columns` follows the same rule. The summary carries a caveat

@@ -276,6 +276,10 @@ types, so the log is a complete invocation history, not just an HTTP history:
   needs, so the locally computed span can only ever be an upper bound, and
   `overwritten_cells` never carries the split pieces or the source's
   values, only the bare A1 addresses of the cells the split might reach.
+  Under `--delimiter auto` the span is not even a bound (Sheets picks the
+  separator too, and may pick one the local split never tried), but the
+  key has no third state; that caveat is carried in the rendered output
+  rather than in the record.
 
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),

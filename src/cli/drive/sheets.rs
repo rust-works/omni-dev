@@ -640,6 +640,22 @@ mod tests {
         )
         .await
         .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::TextToColumns(text_to_columns::TextToColumnsCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: Some("Sheet1".to_string()),
+                source: "A1:A3".to_string(),
+                delimiter: text_to_columns::DelimiterArg::Comma,
+                custom_delimiter: None,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]

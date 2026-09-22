@@ -1531,9 +1531,13 @@ pub struct DriveMutationOutcome {
     /// source and which are filled, so some of the listed cells are the
     /// source and were never touched; `text-to-columns` reports the span a
     /// locally computed, non-quote-aware split *might* need, which the API
-    /// decides for itself and may need fewer columns of. `false` for
-    /// `auto-fill --source`, where the destination is computed
-    /// client-side and the list is exact, and for every other verb.
+    /// decides for itself and may need fewer columns of — and under
+    /// `--delimiter auto`, where Sheets picks the separator as well, it
+    /// is an estimate rather than a bound in either direction (this key
+    /// has no third state; that caveat is carried in the rendered
+    /// output). `false` for `auto-fill --source`, where the destination
+    /// is computed client-side and the list is exact, and for every
+    /// other verb.
     pub overwritten_cells_upper_bound: bool,
     /// The data validation condition type a `set-data-validation` applied
     /// (issue #1643) — `"ONE_OF_LIST"`, `"NUMBER_BETWEEN"`, `"BOOLEAN"`,

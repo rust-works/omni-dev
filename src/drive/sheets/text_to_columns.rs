@@ -27,6 +27,16 @@
 //! that would be (or were) overwritten — never their values or the split
 //! pieces, matching every preview in this tranche but `merge-cells`.
 //!
+//! **`--delimiter auto` is the one exception to the bound.** For every
+//! other delimiter the local split uses the same separator the API is
+//! told to use, so it can only over-count; under `auto` the separator is
+//! the API's own choice, and [`Delimiter::local_split_candidates`] can
+//! only guess it by trying the four fixed types. Whether Sheets' own
+//! detection is confined to those four is undocumented and unverified
+//! (ADR-0083 §5's live-verification list), so an `auto` run's width is
+//! reported as an estimate — see [`AUTO_DELIMITER_CAVEAT`], the extra
+//! line those runs carry.
+//!
 //! ## `source` must span exactly one column
 //!
 //! The API's own constraint. This v1 additionally requires `source` to be
@@ -124,9 +134,12 @@ impl Delimiter {
     /// preview split tries — one for a fixed delimiter, the four fixed
     /// ones for [`Self::Auto`]. Unlike `auto_fill.rs`'s form-A upper
     /// bound, there is no fixed span to bound `Auto`'s guess against
-    /// other than trying every fixed candidate and keeping the widest —
-    /// which can only over-count relative to whatever single delimiter
-    /// Sheets actually detects.
+    /// other than trying every fixed candidate and keeping the widest.
+    /// That over-counts against whichever *one* of the four Sheets
+    /// settles on, but it is only a bound at all while Sheets' detection
+    /// stays within the four — undocumented and unverified, which is why
+    /// an `Auto` run carries [`AUTO_DELIMITER_CAVEAT`] instead of
+    /// claiming one.
     fn local_split_candidates(&self) -> Vec<&str> {
         match self {
             Self::Comma => vec![","],
@@ -200,14 +213,19 @@ pub enum TextToColumnsResult {
         spill: Option<String>,
         /// An upper bound on how many columns the split needs, computed
         /// locally with a naive, non-quote-aware split — never the
-        /// server's real answer, which this crate cannot predict.
+        /// server's real answer, which this crate cannot predict. Under
+        /// [`Delimiter::Auto`] it is an estimate rather than a bound,
+        /// and the rendered output says so
+        /// ([`AUTO_DELIMITER_CAVEAT`]).
         width_upper_bound: usize,
         /// The non-blank cells within the spill span that would be
         /// overwritten, as bare A1 addresses — **never their values**,
         /// unlike `merge-cells`' own `discarded_cells` (ADR-0083 §6).
         /// Always an upper bound: the API decides for itself how many
         /// columns the split needs, so some of the listed cells may not
-        /// actually be touched.
+        /// actually be touched — and under [`Delimiter::Auto`] it picks
+        /// the separator too, which can reach cells this list does not
+        /// name ([`AUTO_DELIMITER_CAVEAT`]).
         #[serde(skip_serializing_if = "Vec::is_empty")]
         overwritten_cells: Vec<String>,
         /// The spill span runs past the sheet's current row/column count.
@@ -659,14 +677,16 @@ fn cell_text(cell: &serde_json::Value) -> String {
 }
 
 /// Upper bound on how many columns the split needs, computed locally with
-/// a naive, non-quote-aware `str::split` over the source's values. This
-/// can only ever over-count against the server's real behaviour — a
-/// quoted delimiter or a run of consecutive separators splits further
-/// locally than Sheets may actually split it — never under-count, which
-/// is what makes the destination this computes an upper bound rather than
-/// a guess (ADR-0083 §6). A blank source row contributes no width: there
-/// is nothing in it to split. An empty source (no rows at all) is width
-/// `0`.
+/// a naive, non-quote-aware `str::split` over the source's values. For
+/// every delimiter but [`Delimiter::Auto`] this can only ever over-count
+/// against the server's real behaviour — a quoted delimiter or a run of
+/// consecutive separators splits further locally than Sheets may actually
+/// split it — never under-count, which is what makes the destination this
+/// computes an upper bound rather than a guess (ADR-0083 §6). Under
+/// `Auto` the separator is Sheets' own choice rather than a given, so the
+/// same reasoning yields an estimate; see [`AUTO_DELIMITER_CAVEAT`]. A
+/// blank source row contributes no width: there is nothing in it to
+/// split. An empty source (no rows at all) is width `0`.
 fn split_width(values: &ValueRange, delimiter: &Delimiter) -> usize {
     let candidates = delimiter.local_split_candidates();
     values
@@ -752,6 +772,25 @@ const PAST_GRID_EXTENT_CAVEAT_DRY_RUN: &str =
 const PAST_GRID_EXTENT_CAVEAT: &str =
     "  the spill extended past the sheet's current extent, so Sheets may have grown it";
 
+/// The extra caveat [`Delimiter::Auto`] earns, in both tenses at once.
+///
+/// Every other delimiter's width is a true upper bound: the local split
+/// is the same separator the API is told to use, and a naive
+/// `str::split` can only ever find more pieces than a quote-aware one
+/// (see [`split_width`]). `auto` is the one case where that argument
+/// does not close, because the separator itself is the API's choice —
+/// [`Delimiter::local_split_candidates`] guesses it by trying the four
+/// fixed types, and whether Sheets' own detection is confined to those
+/// four is undocumented and unverified against a live workbook
+/// (ADR-0083 §5's live-verification list). If it can detect anything
+/// else, the local width is an estimate rather than a bound, so the
+/// output says so rather than claiming a guarantee this crate cannot
+/// make.
+const AUTO_DELIMITER_CAVEAT: &str =
+    "  --delimiter auto lets Sheets detect the separator itself; this count comes from trying \
+     comma, semicolon, period and space locally and keeping the widest, so it is an estimate \
+     rather than an upper bound if Sheets detects some other separator";
+
 /// The **tense-neutral** head of the summary: the source, the delimiter,
 /// and the upper-bound width and spill span (or the "nothing to spill"
 /// note when the local split never exceeds one column).
@@ -774,7 +813,7 @@ fn describe_effect(
             delimiter.describe(),
         ),
         None => format!(
-            "split {source_a1} on {} into a single column each row; no row would spill beyond \
+            "split {source_a1} on {} into a single column each row; no row spills beyond \
              the source under this delimiter",
             delimiter.describe(),
         ),
@@ -858,7 +897,10 @@ fn record_attempt(outcome: &TextToColumnsOutcome, duration: Duration) {
         overwritten_cells,
         // Always an upper bound for this verb — the API decides for
         // itself how many columns each row's split needs, unlike
-        // `auto-fill`'s form B, where the destination is exact.
+        // `auto-fill`'s form B, where the destination is exact. Under
+        // `--delimiter auto` it is not even that (the separator is the
+        // API's choice too), but the key has no third state and the
+        // rendered summary carries `AUTO_DELIMITER_CAVEAT` instead.
         overwritten_cells_upper_bound: true,
         error,
         duration,
@@ -890,6 +932,7 @@ pub fn describe_lines(outcome: &TextToColumnsOutcome) -> Vec<String> {
             &format!("Would {summary} in {book}"),
             overwritten_cells,
             *past_grid_extent,
+            &outcome.delimiter,
             true,
         ),
         TextToColumnsResult::RefusedNotASpreadsheet { mime_type } => vec![format!(
@@ -960,6 +1003,7 @@ pub fn describe_lines(outcome: &TextToColumnsOutcome) -> Vec<String> {
             &format!("Applied: {summary} in {book}"),
             overwritten_cells,
             *past_grid_extent,
+            &outcome.delimiter,
             false,
         ),
         TextToColumnsResult::Failed { detail } => vec![format!("Failed: {detail}")],
@@ -969,11 +1013,13 @@ pub fn describe_lines(outcome: &TextToColumnsOutcome) -> Vec<String> {
 /// The head line plus its indented detail lines, shared by
 /// [`TextToColumnsResult::WouldChange`] and [`TextToColumnsResult::Changed`]
 /// so the two can only differ in `head` and in the tense `dry_run`
-/// selects — `structure.rs`'s `vec![summary, detail]` shape.
+/// selects — `structure.rs`'s `vec![summary, detail]` shape. `delimiter`
+/// is read only to decide whether [`AUTO_DELIMITER_CAVEAT`] applies.
 fn change_lines(
     head: &str,
     overwritten_cells: &[String],
     past_grid_extent: bool,
+    delimiter: &Delimiter,
     dry_run: bool,
 ) -> Vec<String> {
     let mut lines = vec![
@@ -989,6 +1035,9 @@ fn change_lines(
             }
             .to_string(),
         );
+    }
+    if matches!(delimiter, Delimiter::Auto) {
+        lines.push(AUTO_DELIMITER_CAVEAT.to_string());
     }
     lines.push(UNPREVIEWABLE_SPLIT_CAVEAT.to_string());
     lines
@@ -1030,6 +1079,109 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// Every constructible [`Delimiter`] maps onto exactly one
+    /// wire-representable choice, tries the separator(s) that choice
+    /// implies, and has a name for the summary. Table-driven so a new
+    /// variant cannot be added with one of the three left behind.
+    #[test]
+    fn every_delimiter_maps_to_a_wire_type_its_candidates_and_a_name() {
+        let cases = [
+            (Delimiter::Comma, DelimiterType::Comma, vec![","], "comma"),
+            (
+                Delimiter::Semicolon,
+                DelimiterType::Semicolon,
+                vec![";"],
+                "semicolon",
+            ),
+            (
+                Delimiter::Period,
+                DelimiterType::Period,
+                vec!["."],
+                "period",
+            ),
+            (Delimiter::Space, DelimiterType::Space, vec![" "], "space"),
+            (
+                Delimiter::Auto,
+                DelimiterType::Autodetect,
+                vec![",", ";", ".", " "],
+                "auto-detected",
+            ),
+            (
+                Delimiter::Custom("||".to_string()),
+                DelimiterType::Custom,
+                vec!["||"],
+                "custom (\"||\")",
+            ),
+        ];
+        for (delimiter, wire, candidates, name) in cases {
+            assert_eq!(delimiter.wire_type(), wire, "{delimiter:?}");
+            assert_eq!(
+                delimiter.local_split_candidates(),
+                candidates,
+                "{delimiter:?}"
+            );
+            assert_eq!(delimiter.describe(), name, "{delimiter:?}");
+        }
+    }
+
+    /// The log status is the only field the request log keys refusals
+    /// on, and the four lease statuses must be the shared ones rather
+    /// than this module's own spelling of them.
+    #[test]
+    fn every_result_variant_has_its_own_log_status() {
+        let statuses = [
+            TextToColumnsResult::RefusedNotASpreadsheet {
+                mime_type: String::new(),
+            },
+            TextToColumnsResult::RefusedShortcut,
+            TextToColumnsResult::RefusedNoVisibleParents,
+            TextToColumnsResult::RefusedSheetNotFound {
+                title: String::new(),
+                available: Vec::new(),
+            },
+            TextToColumnsResult::RefusedInvalidRange {
+                detail: String::new(),
+            },
+            TextToColumnsResult::RefusedInvalidDelimiter {
+                detail: String::new(),
+            },
+            TextToColumnsResult::Blocked { decided_by: None },
+            TextToColumnsResult::RefusedNoLease,
+            TextToColumnsResult::RefusedLeaseExpired,
+            TextToColumnsResult::RefusedLeaseWrongFile,
+            TextToColumnsResult::RefusedLeaseStale,
+            TextToColumnsResult::Failed {
+                detail: String::new(),
+            },
+        ];
+        let mut seen: Vec<&str> = statuses
+            .iter()
+            .map(TextToColumnsResult::log_status)
+            .collect();
+        seen.push(would_change_outcome(Vec::new(), false).result.log_status());
+        let unique: std::collections::HashSet<&str> = seen.iter().copied().collect();
+        assert_eq!(unique.len(), seen.len(), "duplicate log status in {seen:?}");
+        assert_eq!(
+            TextToColumnsResult::RefusedLeaseStale.log_status(),
+            LeaseGateRefusal::Stale.log_status()
+        );
+    }
+
+    /// The `-o jsonl` renderer writes one scalar record; the delimiter
+    /// is `#[serde(skip)]`, so a custom separator never reaches it.
+    #[test]
+    fn jsonl_writes_one_record_and_omits_the_delimiter() {
+        let mut outcome = would_change_outcome(vec!["B2".to_string()], false);
+        outcome.delimiter = Delimiter::Custom("not-in-the-record".to_string());
+        let mut out = Vec::new();
+        outcome.write_jsonl(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(!text.contains("not-in-the-record"));
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(parsed["result"]["status"], "would-change");
     }
 
     #[test]
@@ -1149,7 +1301,27 @@ mod tests {
     #[test]
     fn describe_effect_with_no_spill() {
         let summary = describe_effect("'Q1'!A2:A10", None, 1, &Delimiter::Space);
-        assert!(summary.contains("no row would spill"));
+        assert_eq!(
+            summary,
+            "split 'Q1'!A2:A10 on space into a single column each row; no row spills beyond \
+             the source under this delimiter"
+        );
+    }
+
+    /// The summary is reused verbatim by `Changed` and by the request
+    /// log's `fields_changed`, so it must read correctly *after* the
+    /// fact too — a conditional clause here would describe a mutation
+    /// that already happened. The no-spill branch is the one that used
+    /// to carry a "would".
+    #[test]
+    fn every_summary_branch_is_tense_neutral() {
+        for (spill, width) in [(Some("'Q1'!B2:B10"), 2), (None, 1)] {
+            let summary = describe_effect("'Q1'!A2:A10", spill, width, &Delimiter::Comma);
+            assert!(
+                !summary.contains("would"),
+                "summary is reused in the past tense: {summary}"
+            );
+        }
     }
 
     #[test]
@@ -1265,28 +1437,15 @@ mod tests {
     }
 
     #[test]
-    fn no_source_text_ever_reaches_the_rendered_output() {
-        // A distinctive value that would appear in the output if this
-        // module ever leaked a cell's content instead of its address.
-        const SECRET: &str = "super-secret-cell-value";
-        let outcome = TextToColumnsOutcome {
-            spreadsheet_id: "sheet-1".to_string(),
-            file_name: Some("Budget".to_string()),
-            resolved_folder_id: None,
-            sheet_id: Some(0),
-            delimiter: Delimiter::Custom(SECRET.to_string()),
-            result: TextToColumnsResult::Changed {
-                summary: "split 'Q1'!A2:A4 on custom into up to 2 column(s), spill 'Q1'!B2:B4"
-                    .to_string(),
-                source: "'Q1'!A2:A4".to_string(),
-                spill: Some("'Q1'!B2:B4".to_string()),
-                width_upper_bound: 2,
-                overwritten_cells: vec!["B2".to_string(), "B3".to_string()],
-                past_grid_extent: false,
-            },
-        };
-        let rendered = describe_lines(&outcome).join("\n");
-        assert!(!rendered.contains(SECRET));
+    fn auto_earns_its_own_caveat_line_and_no_other_delimiter_does() {
+        let mut outcome = would_change_outcome(vec!["B2".to_string()], false);
+        assert!(!describe_lines(&outcome).contains(&AUTO_DELIMITER_CAVEAT.to_string()));
+        outcome.delimiter = Delimiter::Auto;
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines[lines.len() - 2], AUTO_DELIMITER_CAVEAT);
+        // Still the last word on the subject: the unpreviewable caveat
+        // every run carries stays at the end.
+        assert_eq!(lines[lines.len() - 1], UNPREVIEWABLE_SPLIT_CAVEAT);
     }
 
     #[test]
@@ -1388,18 +1547,29 @@ mod tests {
         }
     }
 
-    async fn mount_metadata(server: &wiremock::MockServer) {
+    /// The target's own Drive metadata. Split out of
+    /// [`mount_metadata`] so the refusal tests can vary the one field
+    /// each of them turns on (`mimeType`, `shortcutDetails`, `parents`)
+    /// without restating the rest.
+    async fn mount_file_metadata(server: &wiremock::MockServer, body: serde_json::Value) {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "id": "sheet-1", "name": "Budget",
-                    "mimeType": "application/vnd.google-apps.spreadsheet",
-                    "parents": ["parent-1"], "version": "1",
-                })),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
             .mount(server)
             .await;
+    }
+
+    /// The default target: a spreadsheet in `parent-1`, at version `1`
+    /// (which is what [`seed_lease`] must record to look fresh).
+    fn spreadsheet_metadata() -> serde_json::Value {
+        serde_json::json!({
+            "id": "sheet-1", "name": "Budget",
+            "mimeType": "application/vnd.google-apps.spreadsheet",
+            "parents": ["parent-1"], "version": "1",
+        })
+    }
+
+    async fn mount_parent(server: &wiremock::MockServer) {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/drive/v3/files/parent-1"))
             .respond_with(
@@ -1410,17 +1580,66 @@ mod tests {
             )
             .mount(server)
             .await;
+    }
+
+    /// The workbook, with a caller-chosen grid extent — the grid-edge
+    /// tests below turn the sheet's `columnCount` down until the spill
+    /// runs off it.
+    async fn mount_workbook(server: &wiremock::MockServer, row_count: i64, column_count: i64) {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "spreadsheetId": "sheet-1",
                     "sheets": [{"properties": {"sheetId": 0, "title": "Q1",
-                        "gridProperties": {"rowCount": 1000, "columnCount": 26}}}],
+                        "gridProperties": {
+                            "rowCount": row_count, "columnCount": column_count,
+                        }}}],
                 })),
             )
             .mount(server)
             .await;
+    }
+
+    async fn mount_metadata(server: &wiremock::MockServer) {
+        mount_file_metadata(server, spreadsheet_metadata()).await;
+        mount_parent(server).await;
+        mount_workbook(server, 1000, 26).await;
+    }
+
+    /// Mounts a `values.get` that fails, for the two reads this engine
+    /// performs.
+    async fn mount_values_failure(server: &wiremock::MockServer, range: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/v4/spreadsheets/sheet-1/values/{range}"
+            )))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_batch_update(server: &wiremock::MockServer, status: u16) {
+        let template = if status == 200 {
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "spreadsheetId": "sheet-1", "replies": [{}],
+            }))
+        } else {
+            wiremock::ResponseTemplate::new(status)
+        };
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(template)
+            .mount(server)
+            .await;
+    }
+
+    fn batch_update_was_called(requests: &[wiremock::Request]) -> bool {
+        requests
+            .iter()
+            .any(|r| r.url.path() == "/v4/spreadsheets/sheet-1:batchUpdate")
     }
 
     /// Mounts one `values.get` response for an exact A1 range — the same
@@ -1686,6 +1905,455 @@ mod tests {
         assert!(matches!(
             outcome.result,
             TextToColumnsResult::Changed { .. }
+        ));
+    }
+
+    // ── the §6 "never a value" guard, end to end ─────────────────────────
+
+    /// The pinned form of ADR-0083 §6's rule for this verb: a
+    /// distinctive value is fed through the *whole* path — the source
+    /// read that computes the width, the spill read that names the
+    /// overwritten cells, the rendered lines and the serialized
+    /// outcome — and must appear in none of them. Asserting it against a
+    /// hand-built outcome would only prove that the fields a test
+    /// chose to fill are the fields it chose to read.
+    #[tokio::test]
+    async fn no_cell_value_from_either_read_reaches_the_output_or_the_outcome() {
+        const SECRET: &str = "super-secret-cell-value";
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_metadata(&server).await;
+        mount_values(
+            &server,
+            "'Q1'!A2:A4",
+            serde_json::json!({"values": [[format!("{SECRET},{SECRET}")]]}),
+        )
+        .await;
+        mount_values(
+            &server,
+            "'Q1'!B2:B4",
+            serde_json::json!({"values": [[SECRET]]}),
+        )
+        .await;
+        let opts = base_opts(true);
+        let rules = vec![rule(DriveOperation::SheetsWrite, false)];
+        let outcome = text_to_columns(&client, &sheets, &opts, &rules).await;
+
+        // The spill cell was seen — its *address* is reported, so the
+        // test is exercising the path that could leak, not an empty one.
+        match &outcome.result {
+            TextToColumnsResult::WouldChange {
+                overwritten_cells, ..
+            } => assert_eq!(overwritten_cells, &vec!["B2".to_string()]),
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
+        let rendered = describe_lines(&outcome).join("\n");
+        assert!(
+            !rendered.contains(SECRET),
+            "leaked into the text: {rendered}"
+        );
+        let serialized = serde_json::to_string(&outcome).unwrap();
+        assert!(
+            !serialized.contains(SECRET),
+            "leaked into the outcome: {serialized}"
+        );
+    }
+
+    // ── the grid edge ────────────────────────────────────────────────────
+
+    /// The spill runs off the sheet's last column, so the *read* is
+    /// clamped back onto the grid while the request is left alone —
+    /// ADR-0083 §5's "left to the server", `auto_fill.rs`'s own
+    /// `a_destination_straddling_the_grid_edge_reads_only_the_in_grid_part`.
+    #[tokio::test]
+    async fn a_spill_straddling_the_grid_edge_reads_only_the_in_grid_part() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_file_metadata(&server, spreadsheet_metadata()).await;
+        mount_parent(&server).await;
+        mount_workbook(&server, 1000, 3).await; // columns A..C only
+        mount_values(
+            &server,
+            "'Q1'!A2:A4",
+            serde_json::json!({"values": [["a,b,c,d,e"]]}),
+        )
+        .await;
+        // Width 5 spills into B:E, but only B:C exist — the read is
+        // clamped to those, and a cell in the clamped part still counts.
+        mount_values(
+            &server,
+            "'Q1'!B2:C4",
+            serde_json::json!({"values": [["", "old"]]}),
+        )
+        .await;
+        let opts = base_opts(true);
+        let rules = vec![rule(DriveOperation::SheetsWrite, false)];
+        let outcome = text_to_columns(&client, &sheets, &opts, &rules).await;
+        match &outcome.result {
+            TextToColumnsResult::WouldChange {
+                spill,
+                width_upper_bound,
+                overwritten_cells,
+                past_grid_extent,
+                ..
+            } => {
+                // The reported spill is the *unclamped* span: what the
+                // request may reach, not what could be read back.
+                assert_eq!(spill.as_deref(), Some("'Q1'!B2:E4"));
+                assert_eq!(*width_upper_bound, 5);
+                assert_eq!(overwritten_cells, &vec!["C2".to_string()]);
+                assert!(past_grid_extent);
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
+        assert!(describe_lines(&outcome).contains(&PAST_GRID_EXTENT_CAVEAT_DRY_RUN.to_string()));
+    }
+
+    /// Nothing of the spill is inside the grid, so there is no read to
+    /// clamp — the caveat still fires and the request is still sent.
+    #[tokio::test]
+    async fn a_spill_wholly_past_the_grid_extent_skips_the_read_and_still_splits() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_file_metadata(&server, spreadsheet_metadata()).await;
+        mount_parent(&server).await;
+        mount_workbook(&server, 1000, 3).await; // columns A..C only
+        mount_values(
+            &server,
+            "'Q1'!C2:C4",
+            serde_json::json!({"values": [["a,b"]]}),
+        )
+        .await;
+        mount_batch_update(&server, 200).await;
+        let mut opts = base_opts(false);
+        opts.source = Some("Q1!C2:C4".to_string());
+        let rules = vec![rule(DriveOperation::SheetsWrite, false)];
+        let outcome = text_to_columns(&client, &sheets, &opts, &rules).await;
+        match &outcome.result {
+            TextToColumnsResult::Changed {
+                spill,
+                overwritten_cells,
+                past_grid_extent,
+                ..
+            } => {
+                assert_eq!(spill.as_deref(), Some("'Q1'!D2:D4"));
+                assert!(overwritten_cells.is_empty());
+                assert!(past_grid_extent);
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+        // Only the source was read: there was no in-grid spill to ask about.
+        let reads: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path().contains("/values/"))
+            .collect();
+        assert_eq!(reads.len(), 1);
+        assert!(describe_lines(&outcome).contains(&PAST_GRID_EXTENT_CAVEAT.to_string()));
+    }
+
+    // ── failure paths ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_source_read_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_metadata(&server).await;
+        mount_values_failure(&server, "'Q1'!A2:A4").await;
+        let outcome = text_to_columns(
+            &client,
+            &sheets,
+            &base_opts(true),
+            &[rule(DriveOperation::SheetsWrite, false)],
+        )
+        .await;
+        assert!(matches!(outcome.result, TextToColumnsResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_spill_read_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_metadata(&server).await;
+        mount_values(
+            &server,
+            "'Q1'!A2:A4",
+            serde_json::json!({"values": [["a,b"]]}),
+        )
+        .await;
+        mount_values_failure(&server, "'Q1'!B2:B4").await;
+        let outcome = text_to_columns(
+            &client,
+            &sheets,
+            &base_opts(true),
+            &[rule(DriveOperation::SheetsWrite, false)],
+        )
+        .await;
+        assert!(matches!(outcome.result, TextToColumnsResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_batch_update_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_metadata(&server).await;
+        mount_values(
+            &server,
+            "'Q1'!A2:A4",
+            serde_json::json!({"values": [["a,b"]]}),
+        )
+        .await;
+        mount_values(&server, "'Q1'!B2:B4", serde_json::json!({"values": []})).await;
+        mount_batch_update(&server, 400).await;
+        let outcome = text_to_columns(
+            &client,
+            &sheets,
+            &base_opts(false),
+            &[rule(DriveOperation::SheetsWrite, false)],
+        )
+        .await;
+        assert!(matches!(outcome.result, TextToColumnsResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_workbook_fetch_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_file_metadata(&server, spreadsheet_metadata()).await;
+        mount_parent(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let outcome = text_to_columns(
+            &client,
+            &sheets,
+            &base_opts(true),
+            &[rule(DriveOperation::SheetsWrite, false)],
+        )
+        .await;
+        assert!(matches!(outcome.result, TextToColumnsResult::Failed { .. }));
+    }
+
+    /// The target's own metadata fetch fails, before there is even a
+    /// file name to report.
+    #[tokio::test]
+    async fn a_metadata_fetch_failure_is_reported_as_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let outcome = text_to_columns(&client, &sheets, &base_opts(true), &[]).await;
+        assert!(matches!(outcome.result, TextToColumnsResult::Failed { .. }));
+        assert!(outcome.file_name.is_none());
+    }
+
+    /// The parent lookup the gate needs fails, *after* the target
+    /// resolved — so the file name is known and the folder id is not.
+    #[tokio::test]
+    async fn a_gate_fetch_failure_is_reported_as_failed_and_still_names_the_file() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_file_metadata(&server, spreadsheet_metadata()).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/parent-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let outcome = text_to_columns(
+            &client,
+            &sheets,
+            &base_opts(true),
+            &[rule(DriveOperation::SheetsWrite, false)],
+        )
+        .await;
+        assert!(matches!(outcome.result, TextToColumnsResult::Failed { .. }));
+        assert_eq!(outcome.file_name.as_deref(), Some("Budget"));
+        assert!(outcome.resolved_folder_id.is_none());
+    }
+
+    // ── target refusals ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_target_that_is_not_a_spreadsheet_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_file_metadata(
+            &server,
+            serde_json::json!({
+                "id": "sheet-1", "name": "Budget",
+                "mimeType": "application/vnd.google-apps.document",
+                "parents": ["parent-1"], "version": "1",
+            }),
+        )
+        .await;
+        let outcome = text_to_columns(&client, &sheets, &base_opts(true), &[]).await;
+        match &outcome.result {
+            TextToColumnsResult::RefusedNotASpreadsheet { mime_type } => {
+                assert_eq!(mime_type, "application/vnd.google-apps.document");
+            }
+            other => panic!("expected RefusedNotASpreadsheet, got {other:?}"),
+        }
+        assert!(describe_lines(&outcome)[0].contains("is not a Google Sheet"));
+    }
+
+    #[tokio::test]
+    async fn a_shortcut_target_is_refused_rather_than_followed() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_file_metadata(
+            &server,
+            serde_json::json!({
+                "id": "sheet-1", "name": "Budget",
+                "mimeType": "application/vnd.google-apps.shortcut",
+                "parents": ["parent-1"], "version": "1",
+                "shortcutDetails": {
+                    "targetId": "real-sheet",
+                    "targetMimeType": "application/vnd.google-apps.spreadsheet",
+                },
+            }),
+        )
+        .await;
+        let outcome = text_to_columns(&client, &sheets, &base_opts(true), &[]).await;
+        assert!(matches!(
+            outcome.result,
+            TextToColumnsResult::RefusedShortcut
+        ));
+        assert!(describe_lines(&outcome)[0].contains("doesn't follow shortcuts"));
+    }
+
+    #[tokio::test]
+    async fn a_target_with_no_visible_parents_is_refused_with_the_by_id_hint() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_file_metadata(
+            &server,
+            serde_json::json!({
+                "id": "sheet-1", "name": "Budget",
+                "mimeType": "application/vnd.google-apps.spreadsheet",
+                "parents": [], "version": "1",
+            }),
+        )
+        .await;
+        let outcome = text_to_columns(&client, &sheets, &base_opts(true), &[]).await;
+        assert!(matches!(
+            outcome.result,
+            TextToColumnsResult::RefusedNoVisibleParents
+        ));
+        assert!(describe_lines(&outcome)[0].contains("write_permissions.rules"));
+    }
+
+    #[tokio::test]
+    async fn a_source_on_a_missing_sheet_is_refused_and_names_the_available_titles() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_metadata(&server).await;
+        let mut opts = base_opts(true);
+        opts.source = Some("Q9!A2:A4".to_string());
+        let rules = vec![rule(DriveOperation::SheetsWrite, false)];
+        let outcome = text_to_columns(&client, &sheets, &opts, &rules).await;
+        match &outcome.result {
+            TextToColumnsResult::RefusedSheetNotFound { title, available } => {
+                assert_eq!(title, "Q9");
+                assert_eq!(available, &vec!["Q1".to_string()]);
+            }
+            other => panic!("expected RefusedSheetNotFound, got {other:?}"),
+        }
+    }
+
+    // ── lease refusals ───────────────────────────────────────────────────
+
+    fn ledger_in_a_tempdir() -> PathBuf {
+        tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl")
+    }
+
+    /// Runs a real (non-dry) split against a fixture whose reads all
+    /// succeed, so the only thing left to refuse is the lease — and
+    /// asserts the refusal happened before `batchUpdate`, which a
+    /// mis-ordered gate would not.
+    async fn run_with_lease(
+        server: &wiremock::MockServer,
+        lease_token: Option<String>,
+        ledger_path: PathBuf,
+    ) -> TextToColumnsOutcome {
+        let (client, sheets) = client(server).await;
+        mount_metadata(server).await;
+        mount_values(
+            server,
+            "'Q1'!A2:A4",
+            serde_json::json!({"values": [["a,b"]]}),
+        )
+        .await;
+        mount_values(server, "'Q1'!B2:B4", serde_json::json!({"values": []})).await;
+        mount_batch_update(server, 200).await;
+        let opts = TextToColumnsOptions {
+            lease_token,
+            ledger_path,
+            ..base_opts(false)
+        };
+        let outcome = text_to_columns(
+            &client,
+            &sheets,
+            &opts,
+            &[rule(DriveOperation::SheetsWrite, true)],
+        )
+        .await;
+        assert!(
+            !batch_update_was_called(&server.received_requests().await.unwrap()),
+            "a refused lease must not reach batchUpdate"
+        );
+        outcome
+    }
+
+    #[tokio::test]
+    async fn an_expired_or_unknown_lease_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        // A token this ledger has never heard of is the same refusal as
+        // an expired one (ADR-0080 §1).
+        let outcome = run_with_lease(
+            &server,
+            Some("never-issued".to_string()),
+            ledger_in_a_tempdir(),
+        )
+        .await;
+        assert!(matches!(
+            outcome.result,
+            TextToColumnsResult::RefusedLeaseExpired
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_lease_bound_to_another_file_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        let ledger_path = ledger_in_a_tempdir();
+        let token = seed_lease(&ledger_path, "some-other-sheet", "1");
+        let outcome = run_with_lease(&server, Some(token), ledger_path).await;
+        assert!(matches!(
+            outcome.result,
+            TextToColumnsResult::RefusedLeaseWrongFile
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stale_lease_is_refused_when_the_file_has_moved() {
+        let server = wiremock::MockServer::start().await;
+        let ledger_path = ledger_in_a_tempdir();
+        // The fixture reports version "1"; the lease recorded "0", so
+        // the file has moved under it — ADR-0080 §6's staleness check.
+        let token = seed_lease(&ledger_path, "sheet-1", "0");
+        let outcome = run_with_lease(&server, Some(token), ledger_path).await;
+        assert!(matches!(
+            outcome.result,
+            TextToColumnsResult::RefusedLeaseStale
         ));
     }
 }
