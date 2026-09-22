@@ -925,12 +925,28 @@ fn render_stage_clause(stage: Stage, stages: &StageAnswers, close_calls: &[Stage
         Stage::Implement => format!("implementation {}", answer.choice),
         Stage::Review => format!("review {}", answer.choice),
     };
-    let close_call = if close_calls.contains(&stage) {
-        ", close call"
-    } else {
-        ""
-    };
-    format!("{label} ({:.2}{close_call})", answer.confidence)
+    format!(
+        "{label} ({})",
+        render_stage_confidence(answer, close_calls.contains(&stage))
+    )
+}
+
+/// Adds the highest-probability alternative to a close call in either text
+/// layout. Ties pick the alphabetically first option for stable output.
+fn render_stage_confidence(answer: &StageAnswer, close_call: bool) -> String {
+    let mut detail = format!("{:.2}", answer.confidence);
+    if close_call {
+        detail.push_str(", close call");
+        if let Some((name, probability)) = answer
+            .probabilities
+            .iter()
+            .filter(|(name, probability)| name.as_str() != answer.choice && probability.is_finite())
+            .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(a.0)))
+        {
+            detail.push_str(&format!(" — {name} {probability:.2}"));
+        }
+    }
+    detail
 }
 
 /// Renders one provider's routing as one line per fact: `class:` once, then
@@ -974,12 +990,10 @@ fn render_stage_line(stage: Stage, stages: &StageAnswers, close_calls: &[Stage])
         Stage::Implement => ("implementation", answer.choice.clone()),
         Stage::Review => ("review", answer.choice.clone()),
     };
-    let close_call = if close_calls.contains(&stage) {
-        ", close call"
-    } else {
-        ""
-    };
-    format!("{label}: {content} ({:.2}{close_call})", answer.confidence)
+    format!(
+        "{label}: {content} ({})",
+        render_stage_confidence(answer, close_calls.contains(&stage))
+    )
 }
 
 /// Renders one `  cites` line per open citation in `depends_on`, in citation
@@ -1409,6 +1423,42 @@ mod tests {
             implement: answer(implement, 0.9),
             review: answer(review, 0.9),
         }
+    }
+
+    #[test]
+    fn close_call_shows_the_best_alternative_in_compact_text() {
+        let mut stages = stages("sol", "terra", "sol");
+        stages.design.confidence = 0.21;
+        stages.design.probabilities = BTreeMap::from([
+            ("none".to_string(), 0.44),
+            ("sol".to_string(), 0.48),
+            ("terra".to_string(), 0.08),
+        ]);
+
+        assert_eq!(
+            render_stage_clause(Stage::Design, &stages, &[Stage::Design]),
+            "design needs sol (0.21, close call — none 0.44)"
+        );
+        assert_eq!(
+            render_stage_clause(Stage::Design, &stages, &[]),
+            "design needs sol (0.21)"
+        );
+    }
+
+    #[test]
+    fn close_call_uses_a_stable_tiebreaker_and_handles_missing_alternatives() {
+        let mut answer = answer("sol", 0.21);
+        answer.probabilities = BTreeMap::from([
+            ("astra".to_string(), 0.4),
+            ("sol".to_string(), 0.2),
+            ("terra".to_string(), 0.4),
+        ]);
+        assert_eq!(
+            render_stage_confidence(&answer, true),
+            "0.21, close call — astra 0.40"
+        );
+        answer.probabilities.clear();
+        assert_eq!(render_stage_confidence(&answer, true), "0.21, close call");
     }
 
     #[test]
@@ -2509,6 +2559,9 @@ mod tests {
     /// The close-call marker stays per stage in the multi-line layout too.
     #[test]
     fn render_route_text_notes_a_close_call_in_the_multi_line_layout() {
+        let mut review = answer("a,b", 0.41);
+        review.probabilities =
+            BTreeMap::from([("a,b".to_string(), 0.56), ("c,d".to_string(), 0.44)]);
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
@@ -2522,7 +2575,7 @@ mod tests {
                             stages: StageAnswers {
                                 design: answer(NO_DESIGN, 0.9),
                                 implement: answer("a,b", 0.94),
-                                review: answer("a,b", 0.41),
+                                review,
                             },
                             class: "a,b".to_string(),
                             close_calls: vec![Stage::Review],
@@ -2536,7 +2589,10 @@ mod tests {
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
-        assert!(text.contains("review: a,b (0.41, close call)"), "{text}");
+        assert!(
+            text.contains("review: a,b (0.41, close call — c,d 0.44)"),
+            "{text}"
+        );
     }
 
     #[test]
