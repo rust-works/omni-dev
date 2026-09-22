@@ -1261,6 +1261,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_find_replace_dispatch_arm_reaches_its_leaf_command() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        // No write-permission rules are configured (an unconfigured
+        // account), so the mutating leaf below is `Blocked` by default
+        // policy — enough to reach and return from the leaf without a
+        // lease or a workbook fetch, which a `Blocked` verdict never gets
+        // to (same trick as `the_update_sheet_properties_dispatch_arm_reaches_its_leaf_command`).
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1",
+                    "name": "Budget",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": ["folder-1"],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1",
+                    "name": "folder-1",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        assert!(dispatch(
+            SheetsSubcommands::FindReplace(find_replace::FindReplaceCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                find: "foo".to_string(),
+                replacement: "bar".to_string(),
+                range: Some("Q1!A1:B2".to_string()),
+                sheet: None,
+                whole_sheet: false,
+                all_sheets: false,
+                match_case: false,
+                match_entire_cell: false,
+                search_by_regex: false,
+                include_formulas: false,
+                dry_run: true,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
     async fn the_paste_dispatch_arms_reach_their_leaf_commands() {
         let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();
