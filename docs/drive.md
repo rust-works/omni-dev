@@ -2127,7 +2127,8 @@ omni-dev drive sheets delete-duplicates <ID> --sheet Q1 --range A2:D100 --dry-ru
 
 Each `--comparison-column` must fall inside the selected range, and the
 range must be fully bounded (`A2:D100`, not `A:A`) — an open-ended range
-is refused so the request cannot reach past the data. The column check is
+is refused because it automatically spans every allocated row. A bounded
+range can still include blank rows past the data. The column check is
 this tool's own, made before the request: the API rejects an out-of-range
 column too, with `400 INVALID_ARGUMENT: A column used for determining
 duplicates is not contained in the range`, so the local refusal only buys
