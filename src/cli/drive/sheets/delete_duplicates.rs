@@ -11,7 +11,7 @@ use crate::drive::sheets::delete_duplicates::{
     delete_duplicates, describe_lines, DeleteDuplicatesOptions,
 };
 
-/// Removes rows in a bounded range that duplicate an earlier row.
+/// Removes duplicate row cells within a bounded range.
 ///
 /// The API decides which rows go: it keeps the first instance of each
 /// duplicate, treats rows differing only in letter case, formatting or
@@ -21,6 +21,8 @@ use crate::drive::sheets::delete_duplicates::{
 ///
 /// The range must be fully bounded. Blank rows duplicate one another, so a
 /// range extending past the data can remove every blank row but the first.
+/// Content outside the range stays in place; selecting fewer than all sheet
+/// columns can misalign records.
 #[derive(Parser)]
 pub struct DeleteDuplicatesCommand {
     /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).

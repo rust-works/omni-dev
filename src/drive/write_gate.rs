@@ -300,10 +300,10 @@ pub enum DriveOperation {
     /// also `delete-duplicates` — the first capability to join this
     /// variant since ADR-0077 defined it, and admitted under exactly the
     /// re-consent reasoning the clause above demands: an operator who
-    /// granted `sheets-delete` consented to having rows removed from a
-    /// sheet by this tool, and `delete-duplicates` removes rows within a
-    /// caller-named range, shifting the survivors up. It asks for nothing
-    /// beyond that.
+    /// granted `sheets-delete` consented to having cells removed and
+    /// shifted up within a caller-named range by this tool, and
+    /// `delete-duplicates` does just that. Content outside the range
+    /// stays in place. It asks for nothing beyond that.
     ///
     /// One thing about it *is* new, and is recorded here rather than
     /// buried in the verb: every other capability under this operation

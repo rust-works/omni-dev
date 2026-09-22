@@ -2,11 +2,12 @@
 //! earlier row (issue #1844).
 //!
 //! [ADR-0083](../../../docs/adrs/adr-0083.md) §2 places this under
-//! `DriveOperation::SheetsDelete`, alone in this tranche: rows cease to
-//! exist and the survivors close over the gap, which is `delete-range`'s
-//! shape, not `clear`'s. It is also the **first `sheets-delete` verb
-//! outside `structure.rs`**, which is why `recovery_note` was lifted to
-//! `lease::check` rather than copied here.
+//! `DriveOperation::SheetsDelete`, alone in this tranche: cells within the
+//! selected range are removed and the survivors shift up, which is
+//! `delete-range`'s shape, not `clear`'s. Content outside the range
+//! stays in place, so a narrow selection can misalign records. It is also
+//! the **first `sheets-delete` verb outside `structure.rs`**, which is
+//! why `recovery_note` was lifted to `lease::check` rather than copied here.
 //!
 //! Two things make it unlike every other deletion this crate performs:
 //!
@@ -70,6 +71,9 @@ const EQUALITY_RULE: &str = "the API keeps the first instance of each duplicate 
 /// duplicate of it.
 const BLANK_ROW_CAVEAT: &str = "blank rows inside the range duplicate one another, so a range \
                                 extending past the data can remove every blank row but the first";
+const RANGE_ONLY_CAVEAT: &str = "only cells inside the selected range are removed and shifted up; \
+                                 columns outside it stay in place, so a range narrower than the \
+                                 sheet can misalign records";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteDuplicatesOptions {
@@ -91,10 +95,14 @@ pub enum DeleteDuplicatesResult {
         range: String,
         /// The compared columns, or empty for "every column in the range".
         comparison_columns: Vec<i64>,
+        /// The API leaves content outside the selected rectangle in place.
+        content_outside_range_untouched: bool,
     },
     Removed {
         range: String,
         comparison_columns: Vec<i64>,
+        /// The API leaves content outside the selected rectangle in place.
+        content_outside_range_untouched: bool,
         /// The server's own count. `None` when the reply carried no
         /// `deleteDuplicates` object — `find-replace`'s precedent for a
         /// response that succeeded but reported nothing.
@@ -325,6 +333,7 @@ async fn delete_duplicates_inner(
         return gated(DeleteDuplicatesResult::WouldRemove {
             range: composed,
             comparison_columns: opts.comparison_columns.clone(),
+            content_outside_range_untouched: true,
         });
     }
 
@@ -358,6 +367,7 @@ async fn delete_duplicates_inner(
         Ok(response) => DeleteDuplicatesResult::Removed {
             range: composed,
             comparison_columns: opts.comparison_columns.clone(),
+            content_outside_range_untouched: true,
             duplicates_removed_count: response
                 .replies
                 .into_iter()
@@ -465,8 +475,10 @@ pub fn describe_lines(outcome: &DeleteDuplicatesOutcome) -> Vec<String> {
         DeleteDuplicatesResult::WouldRemove {
             range,
             comparison_columns,
+            ..
         } => vec![
             format!("Warning: {BLANK_ROW_CAVEAT}"),
+            format!("Warning: {RANGE_ONLY_CAVEAT}"),
             format!(
                 "Would remove duplicate rows from {range} in {book}, comparing {}",
                 render_columns(comparison_columns)
@@ -480,7 +492,9 @@ pub fn describe_lines(outcome: &DeleteDuplicatesOutcome) -> Vec<String> {
             comparison_columns,
             duplicates_removed_count,
             backup,
+            ..
         } => vec![
+            format!("Warning: {RANGE_ONLY_CAVEAT}"),
             match duplicates_removed_count {
                 Some(count) => format!(
                     "Removed {count} duplicate row(s) from {range} in {book}, comparing {}",
@@ -717,6 +731,7 @@ mod tests {
             result: DeleteDuplicatesResult::WouldRemove {
                 range: "'Q1'!A2:C10".into(),
                 comparison_columns: vec![0],
+                content_outside_range_untouched: true,
             },
         };
         let lines = describe_lines(&outcome).join("\n");
@@ -724,6 +739,7 @@ mod tests {
         assert!(lines.contains("hidden by a filter"), "{lines}");
         assert!(lines.contains("cannot be previewed"), "{lines}");
         assert!(lines.contains("blank rows"), "{lines}");
+        assert!(lines.contains("can misalign records"), "{lines}");
     }
 
     /// ADR-0077 §5's recovery tail, from the lifted shared `recovery_note`
@@ -737,6 +753,7 @@ mod tests {
             result: DeleteDuplicatesResult::Removed {
                 range: "'Q1'!A2:C10".into(),
                 comparison_columns: Vec::new(),
+                content_outside_range_untouched: true,
                 duplicates_removed_count: Some(2),
                 backup: Some(Box::new(LeaseBackup::DriveCopy {
                     file_id: "copy-9".into(),
@@ -746,11 +763,13 @@ mod tests {
         let lines = describe_lines(&with_backup).join("\n");
         assert!(lines.contains("Drive copy copy-9"), "{lines}");
         assert!(lines.contains("drive lease restore"), "{lines}");
+        assert!(lines.contains("can misalign records"), "{lines}");
 
         let without = DeleteDuplicatesOutcome {
             result: DeleteDuplicatesResult::Removed {
                 range: "'Q1'!A2:C10".into(),
                 comparison_columns: Vec::new(),
+                content_outside_range_untouched: true,
                 duplicates_removed_count: Some(2),
                 backup: None,
             },
@@ -792,16 +811,19 @@ mod tests {
             DeleteDuplicatesResult::WouldRemove {
                 range: "'Q1'!A2:C10".into(),
                 comparison_columns: vec![0],
+                content_outside_range_untouched: true,
             },
             DeleteDuplicatesResult::Removed {
                 range: "'Q1'!A2:C10".into(),
                 comparison_columns: Vec::new(),
+                content_outside_range_untouched: true,
                 duplicates_removed_count: Some(2),
                 backup: None,
             },
             DeleteDuplicatesResult::Removed {
                 range: "'Q1'!A2:C10".into(),
                 comparison_columns: vec![1],
+                content_outside_range_untouched: true,
                 duplicates_removed_count: None,
                 backup: None,
             },
@@ -869,6 +891,7 @@ mod tests {
             result: DeleteDuplicatesResult::Removed {
                 range: "'Q1'!A2:C10".into(),
                 comparison_columns: vec![0],
+                content_outside_range_untouched: true,
                 duplicates_removed_count: Some(2),
                 backup: None,
             },
@@ -945,11 +968,14 @@ mod tests {
         let mut opts = options(true);
         opts.comparison_columns = vec![0, 2];
         let outcome = delete_duplicates(&drive, &sheets, &opts, &[rule()]).await;
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["result"]["content_outside_range_untouched"], true);
         assert_eq!(
             outcome.result,
             DeleteDuplicatesResult::WouldRemove {
                 range: "'Q1'!A2:C10".into(),
                 comparison_columns: vec![0, 2],
+                content_outside_range_untouched: true,
             }
         );
         let requests = server.received_requests().await.unwrap();
