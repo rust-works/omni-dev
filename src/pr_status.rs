@@ -1495,7 +1495,7 @@ mod tests {
     #[test]
     fn partial_graphql_runner_keeps_data_from_a_nonzero_exit_without_weakening_the_default() {
         let dir = tempfile::tempdir().unwrap();
-        let (bin, _shim) = fake_gh(
+        let (bin, shim) = fake_gh(
             dir.path(),
             r#"{"data":{"r0":{"i0":null,"i1":{"number":1871}}},"errors":[{"type":"NOT_FOUND","path":["r0","i0"]}]}"#,
             1,
@@ -1509,13 +1509,13 @@ mod tests {
         let err = retry_on_etxtbsy(|| run_gh_graphql(&bin, "query {}")).unwrap_err();
         assert!(err.to_string().contains("gh api graphql failed"), "{err}");
 
-        drop(_shim);
-        let (bin, _shim) = fake_gh(dir.path(), r#"{"data":{"r0":{}},"errors":[]}"#, 1);
+        drop(shim);
+        let (bin, shim) = fake_gh(dir.path(), r#"{"data":{"r0":{}},"errors":[]}"#, 1);
         let err =
             retry_on_etxtbsy(|| run_gh_graphql_with_partial_data(&bin, "query {}")).unwrap_err();
         assert!(err.to_string().contains("gh api graphql failed"), "{err}");
 
-        drop(_shim);
+        drop(shim);
         let (bin, _shim) = fake_gh(dir.path(), "not JSON", 1);
         let err =
             retry_on_etxtbsy(|| run_gh_graphql_with_partial_data(&bin, "query {}")).unwrap_err();
