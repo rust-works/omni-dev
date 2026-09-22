@@ -802,6 +802,16 @@ pub enum BatchUpdateRequestItem {
     /// (`sort-range`, issue #1842). Gated by `SheetsWrite` alone: it is a
     /// permutation of the named cells' values, never a structural edit.
     SortRange(SortRangeRequest),
+    /// Shuffles the row order within a bounded range into a
+    /// server-chosen, unpredictable order (`randomize-range`, issue #1845,
+    /// [ADR-0083](../../../docs/adrs/adr-0083.md) §§3, 5, 6). Gated by
+    /// **both** `SheetsWrite` and `SheetsStructure`: live verification
+    /// found a reordered row carries its formatting, notes and
+    /// data-validation rules with it — `SheetsStructure`'s own subject
+    /// matter, exactly as `text-to-columns` was measured doing — and its
+    /// in-range formulas move with their row with their relative
+    /// references rewritten to match.
+    RandomizeRange(RandomizeRangeRequest),
     /// Splits a single column's delimited text across the adjacent columns
     /// to its right (`text-to-columns`, issue #1843,
     /// [ADR-0083](../../../docs/adrs/adr-0083.md) §§1, 5). Gated by
@@ -3116,6 +3126,18 @@ pub struct SortRangeRequest {
     pub sort_specs: Vec<SortSpec>,
 }
 
+/// `RandomizeRangeRequest` — shuffles the row order within a bounded grid
+/// range into an order chosen server-side.
+///
+/// The API's own reply carries nothing this crate can report, so the
+/// resulting order can never be previewed or read back (issue #1845,
+/// [ADR-0083](../../../docs/adrs/adr-0083.md) §6).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RandomizeRangeRequest {
+    /// The rows and columns to shuffle.
+    pub range: GridRange,
+}
+
 /// `TextToColumnsRequest` — splits a single column's delimited text across
 /// the adjacent columns to its right (issue #1843,
 /// [ADR-0083](../../../docs/adrs/adr-0083.md) §1).
@@ -3903,6 +3925,30 @@ mod tests {
                         {"dimensionIndex": 1, "sortOrder": "DESCENDING"},
                         {"dimensionIndex": 0, "sortOrder": "ASCENDING"},
                     ],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn randomize_range_serializes_its_range() {
+        let request = BatchUpdateRequestItem::RandomizeRange(RandomizeRangeRequest {
+            range: GridRange {
+                sheet_id: 0,
+                start_row_index: Some(1),
+                end_row_index: Some(10),
+                start_column_index: Some(0),
+                end_column_index: Some(3),
+            },
+        });
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "randomizeRange": {
+                    "range": {
+                        "sheetId": 0, "startRowIndex": 1, "endRowIndex": 10,
+                        "startColumnIndex": 0, "endColumnIndex": 3,
+                    },
                 },
             })
         );

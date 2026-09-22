@@ -42,6 +42,7 @@ pub mod named_range;
 pub mod paste;
 pub mod pivot;
 pub mod protection;
+pub mod randomize_range;
 pub mod read;
 pub mod sort_range;
 pub mod structure;

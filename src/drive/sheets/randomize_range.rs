@@ -1,8 +1,36 @@
-//! `sort-range` — reorder rows in a caller-named range (issue #1842).
+//! `randomize-range` — shuffles the row order within a bounded range into
+//! an unpredictable, server-chosen order (issue #1845).
 //!
-//! ADR-0083 §§3 and 6 place this under `SheetsWrite`: it permutes cells in
-//! the named range and discards none. Preview intentionally does not read
-//! values or attempt to reproduce Sheets' comparison semantics.
+//! Split out of #1830, unblocked by #1831's [ADR-0083](../../../docs/adrs/adr-0083.md).
+//! `sort_range.rs`'s near-exact template, minus the sort-key machinery.
+//!
+//! ADR-0083 §3 initially placed `randomizeRange` under `SheetsWrite` alone,
+//! on a values-only reading — a permutation of the range's own cells is a
+//! strict special case of what a `sheets-write` grant already permits via
+//! `clear`+`write`. §5 made that provisional on live verification: whether
+//! the server carries a row's formatting, notes and data-validation rules
+//! along with it when reordering, and what happens to an in-range formula.
+//!
+//! Live-verified 2026-09-22 against a probe sheet in `omni-dev-test`
+//! (issue #1845's plan comments): **formatting, notes and data-validation
+//! rules move with the row**, and **an in-range formula moves with its row
+//! with its relative references rewritten** to keep pointing at its own
+//! row. Formatting is `SheetsStructure`'s own subject matter, so §5's
+//! fixed consequence applies and the gate is the union of `SheetsWrite`
+//! and `SheetsStructure` — [`target_gate::resolve_all`], the same shape
+//! `text_to_columns.rs` took. The same live run also confirmed §3's
+//! record-decoupling caveat: cells in the same rows but outside the
+//! selected columns do not move, so a range narrower than its rows can
+//! silently detach a record's other columns.
+//!
+//! **The resulting order can never be previewed, and this crate never sees
+//! it even after a real run.** `randomizeRange` carries no response
+//! object, and which order the server settles on is entirely its own
+//! choice — `--dry-run` (and the real run) instead report the range being
+//! reordered, leading with the range-width-vs-sheet-width record-integrity
+//! caveat before the smaller "references outside the range may see a
+//! different row's value" caveat, and stating plainly that the resulting
+//! order is not knowable — never a cell's contents (ADR-0083 §6).
 
 #![allow(missing_docs)]
 
@@ -21,21 +49,27 @@ use crate::drive::lease::check::{
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range::width_warning;
-use crate::drive::sheets::types::{BatchUpdateRequestItem, SortOrder, SortRangeRequest, SortSpec};
+use crate::drive::sheets::types::{BatchUpdateRequestItem, RandomizeRangeRequest};
 use crate::drive::sheets::{a1, grid_range, target_gate};
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
 
-const LOG_OPERATION: &str = "sheets-sort-range";
+const LOG_OPERATION: &str = "sheets-randomize-range";
+
+/// The operations this verb's gate is the union of, in the order a
+/// refusal reports them. `SheetsWrite` for the cell values a reorder
+/// permutes, `SheetsStructure` for the formatting, notes and
+/// data-validation rules live verification found travelling with each
+/// row — see the module docs.
+const GATE_OPERATIONS: &[DriveOperation] =
+    &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SortRangeOptions {
+pub struct RandomizeRangeOptions {
     pub spreadsheet_id: String,
     pub sheet: Option<String>,
     pub range: Option<String>,
-    /// Ordered `COLUMN:asc|desc` flags.
-    pub sort_by: Vec<String>,
     pub dry_run: bool,
     pub lease_token: Option<String>,
     pub ledger_path: PathBuf,
@@ -43,15 +77,13 @@ pub struct SortRangeOptions {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "kebab-case")]
-pub enum SortRangeResult {
+pub enum RandomizeRangeResult {
     WouldChange {
         range: String,
-        sort_specs: Vec<SortSpec>,
         width_warning: Option<String>,
     },
     Changed {
         range: String,
-        sort_specs: Vec<SortSpec>,
         width_warning: Option<String>,
     },
     RefusedInvalidRequest {
@@ -67,6 +99,10 @@ pub enum SortRangeResult {
         available: Vec<String>,
     },
     Blocked {
+        /// Which of [`GATE_OPERATIONS`] denied first — the union gate
+        /// refuses as soon as one of the two does, and which one it was
+        /// is the only actionable part of the message.
+        operation: DriveOperation,
         decided_by: Option<DecidingRule>,
     },
     RefusedNoLease,
@@ -78,7 +114,7 @@ pub enum SortRangeResult {
     },
 }
 
-impl FromLeaseRefusal for SortRangeResult {
+impl FromLeaseRefusal for RandomizeRangeResult {
     fn from_no_lease() -> Self {
         Self::RefusedNoLease
     }
@@ -96,7 +132,7 @@ impl FromLeaseRefusal for SortRangeResult {
     }
 }
 
-impl SortRangeResult {
+impl RandomizeRangeResult {
     fn log_status(&self) -> &'static str {
         match self {
             Self::WouldChange { .. } => "would-change",
@@ -117,40 +153,40 @@ impl SortRangeResult {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SortRangeOutcome {
+pub struct RandomizeRangeOutcome {
     pub spreadsheet_id: String,
     pub file_name: Option<String>,
     pub resolved_folder_id: Option<String>,
-    pub result: SortRangeResult,
+    pub result: RandomizeRangeResult,
 }
 
-impl JsonlSerialize for SortRangeOutcome {
+impl JsonlSerialize for RandomizeRangeOutcome {
     fn write_jsonl(&self, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
         write_scalar_jsonl(self, out)
     }
 }
 
-pub async fn sort_range(
+pub async fn randomize_range(
     drive: &DriveClient,
     sheets: &SheetsClient,
-    opts: &SortRangeOptions,
+    opts: &RandomizeRangeOptions,
     rules: &[FolderPermissionRule],
-) -> SortRangeOutcome {
+) -> RandomizeRangeOutcome {
     let started = Instant::now();
-    let outcome = sort_range_inner(drive, sheets, opts, rules).await;
+    let outcome = randomize_range_inner(drive, sheets, opts, rules).await;
     if !opts.dry_run {
         record_attempt(&outcome, started.elapsed());
     }
     outcome
 }
 
-async fn sort_range_inner(
+async fn randomize_range_inner(
     drive: &DriveClient,
     sheets: &SheetsClient,
-    opts: &SortRangeOptions,
+    opts: &RandomizeRangeOptions,
     rules: &[FolderPermissionRule],
-) -> SortRangeOutcome {
-    let bare = |result| SortRangeOutcome {
+) -> RandomizeRangeOutcome {
+    let bare = |result| RandomizeRangeOutcome {
         spreadsheet_id: opts.spreadsheet_id.clone(),
         file_name: None,
         resolved_folder_id: None,
@@ -159,77 +195,71 @@ async fn sort_range_inner(
     let composed = match a1::compose(opts.sheet.as_deref(), opts.range.as_deref()) {
         Ok(range) => range,
         Err(err) => {
-            return bare(SortRangeResult::RefusedInvalidRequest {
+            return bare(RandomizeRangeResult::RefusedInvalidRequest {
                 detail: err.to_string(),
             })
         }
     };
-    let sort_specs = match parse_sort_specs(&opts.sort_by) {
-        Ok(specs) if !specs.is_empty() => specs,
-        Ok(_) => {
-            return bare(SortRangeResult::RefusedInvalidRequest {
-                detail: "pass at least one --sort-by COLUMN:asc|desc".to_string(),
-            })
-        }
-        Err(detail) => return bare(SortRangeResult::RefusedInvalidRequest { detail }),
-    };
-    let (target, decision, resolved_folder_id, requires_lease) = match target_gate::resolve(
-        drive,
-        &opts.spreadsheet_id,
-        DriveOperation::SheetsWrite,
-        rules,
-    )
-    .await
-    {
-        target_gate::TargetGateOutcome::MetadataFetchFailed { detail } => {
-            return bare(SortRangeResult::Failed { detail })
-        }
-        target_gate::TargetGateOutcome::Refused { target, refusal } => {
-            let result = match refusal {
-                SheetTargetRefusal::Shortcut => SortRangeResult::RefusedShortcut,
-                SheetTargetRefusal::NotASpreadsheet { mime_type } => {
-                    SortRangeResult::RefusedNotASpreadsheet { mime_type }
-                }
-                SheetTargetRefusal::NoVisibleParents => SortRangeResult::RefusedNoVisibleParents,
-            };
-            return SortRangeOutcome {
-                spreadsheet_id: opts.spreadsheet_id.clone(),
-                file_name: Some(target.name),
-                resolved_folder_id: None,
-                result,
-            };
-        }
-        target_gate::TargetGateOutcome::GateFetchFailed { target, detail } => {
-            return SortRangeOutcome {
-                spreadsheet_id: opts.spreadsheet_id.clone(),
-                file_name: Some(target.name),
-                resolved_folder_id: None,
-                result: SortRangeResult::Failed { detail },
+
+    let (target, verdict, denied, resolved_folder_id, requires_lease) =
+        match target_gate::resolve_all(drive, &opts.spreadsheet_id, GATE_OPERATIONS, rules).await {
+            target_gate::TargetGateUnionOutcome::MetadataFetchFailed { detail } => {
+                return bare(RandomizeRangeResult::Failed { detail })
             }
-        }
-        target_gate::TargetGateOutcome::Gated {
-            target,
-            decision,
-            resolved_folder_id,
-            requires_lease,
-        } => (target, decision, resolved_folder_id, requires_lease),
-    };
-    let gated = |result| SortRangeOutcome {
+            target_gate::TargetGateUnionOutcome::Refused { target, refusal } => {
+                let result = match refusal {
+                    SheetTargetRefusal::Shortcut => RandomizeRangeResult::RefusedShortcut,
+                    SheetTargetRefusal::NotASpreadsheet { mime_type } => {
+                        RandomizeRangeResult::RefusedNotASpreadsheet { mime_type }
+                    }
+                    SheetTargetRefusal::NoVisibleParents => {
+                        RandomizeRangeResult::RefusedNoVisibleParents
+                    }
+                };
+                return RandomizeRangeOutcome {
+                    spreadsheet_id: opts.spreadsheet_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id: None,
+                    result,
+                };
+            }
+            target_gate::TargetGateUnionOutcome::GateFetchFailed { target, detail } => {
+                return RandomizeRangeOutcome {
+                    spreadsheet_id: opts.spreadsheet_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id: None,
+                    result: RandomizeRangeResult::Failed { detail },
+                }
+            }
+            target_gate::TargetGateUnionOutcome::Gated {
+                target,
+                verdict,
+                denied,
+                resolved_folder_id,
+                requires_lease,
+            } => (target, verdict, denied, resolved_folder_id, requires_lease),
+        };
+    let gated = |result| RandomizeRangeOutcome {
         spreadsheet_id: opts.spreadsheet_id.clone(),
         file_name: Some(target.name.clone()),
         resolved_folder_id: resolved_folder_id.clone(),
         result,
     };
-    if decision.verdict == write_gate::Verdict::Deny {
-        return gated(SortRangeResult::Blocked {
-            decided_by: decision.decided_by,
+    if verdict == write_gate::Verdict::Deny {
+        // `denied` is `Some` whenever the verdict is `Deny`; the fallback
+        // names the first operation rather than inventing one, matching
+        // `text_to_columns.rs`'s own arm.
+        let (operation, decided_by) = denied.unwrap_or((GATE_OPERATIONS[0], None));
+        return gated(RandomizeRangeResult::Blocked {
+            operation,
+            decided_by,
         });
     }
     let api = SheetsApi::new(sheets);
     let workbook = match api.get_spreadsheet(&opts.spreadsheet_id).await {
         Ok(book) => book,
         Err(err) => {
-            return gated(SortRangeResult::Failed {
+            return gated(RandomizeRangeResult::Failed {
                 detail: format!("{err:#}"),
             })
         }
@@ -237,50 +267,35 @@ async fn sort_range_inner(
     let (_, grid) = match grid_range::resolve_grid_range(
         &workbook,
         &composed,
-        |detail| SortRangeResult::RefusedInvalidRequest { detail },
-        |title, available| SortRangeResult::RefusedSheetNotFound { title, available },
+        |detail| RandomizeRangeResult::RefusedInvalidRequest { detail },
+        |title, available| RandomizeRangeResult::RefusedSheetNotFound { title, available },
     ) {
         Ok(value) => value,
         Err(result) => return gated(result),
     };
     if !grid_range::is_bounded(&grid) {
-        return gated(SortRangeResult::RefusedInvalidRequest {
+        return gated(RandomizeRangeResult::RefusedInvalidRequest {
             detail: format!(
-                "'{composed}' is open-ended; sort-range needs a fully bounded range (e.g. A1:D10)"
+                "'{composed}' is open-ended; randomize-range needs a fully bounded range (e.g. A1:D10)"
             ),
         });
     }
     let start_column = grid.start_column_index.unwrap_or(0);
     let end_column = grid.end_column_index.unwrap_or(0);
-    if let Some(spec) = sort_specs
-        .iter()
-        .find(|spec| spec.dimension_index < start_column || spec.dimension_index >= end_column)
-    {
-        return gated(SortRangeResult::RefusedInvalidRequest {
-            detail: format!(
-                "sort column {} is outside the selected range's columns {}..{} (zero-based, end exclusive)",
-                spec.dimension_index, start_column, end_column
-            ),
-        });
-    }
     let allocated_columns = grid_range::find_sheet_by_id(&workbook, grid.sheet_id)
         .and_then(|sheet| sheet.properties.as_ref())
         .and_then(|props| props.grid_properties.as_ref())
         .and_then(|props| props.column_count);
-    let width_warning = width_warning("sorting", start_column, end_column, allocated_columns);
-    let request = BatchUpdateRequestItem::SortRange(SortRangeRequest {
-        range: grid,
-        sort_specs: sort_specs.clone(),
-    });
+    let width_warning = width_warning("randomizing", start_column, end_column, allocated_columns);
+    let request = BatchUpdateRequestItem::RandomizeRange(RandomizeRangeRequest { range: grid });
     if opts.dry_run {
-        return gated(SortRangeResult::WouldChange {
+        return gated(RandomizeRangeResult::WouldChange {
             range: composed,
-            sort_specs,
             width_warning,
         });
     }
     let leased = LeasedWrite {
-        log_prefix: "drive sheets sort-range",
+        log_prefix: "drive sheets randomize-range",
         operation: LOG_OPERATION,
         ledger_path: &opts.ledger_path,
         file_id: &opts.spreadsheet_id,
@@ -306,63 +321,30 @@ async fn sort_range_inner(
     )
     .await
     {
-        Ok(_) => SortRangeResult::Changed {
+        Ok(_) => RandomizeRangeResult::Changed {
             range: composed,
-            sort_specs,
             width_warning,
         },
-        Err(err) => SortRangeResult::Failed {
+        Err(err) => RandomizeRangeResult::Failed {
             detail: format!("{err:#}"),
         },
     };
     gated(result)
 }
 
-fn parse_sort_specs(flags: &[String]) -> Result<Vec<SortSpec>, String> {
-    flags
-        .iter()
-        .map(|flag| {
-            let (column, order) = flag
-                .split_once(':')
-                .ok_or_else(|| format!("'{flag}' is not COLUMN:asc|desc"))?;
-            let dimension_index = column
-                .trim()
-                .parse()
-                .map_err(|_| format!("'{column}' in '{flag}' is not a column index"))?;
-            if dimension_index < 0 {
-                return Err(format!(
-                    "'{column}' in '{flag}' must be a non-negative column index"
-                ));
-            }
-            let sort_order = match order.trim().to_ascii_lowercase().as_str() {
-                "asc" | "ascending" => SortOrder::Ascending,
-                "desc" | "descending" => SortOrder::Descending,
-                other => return Err(format!("'{other}' in '{flag}' is not 'asc' or 'desc'")),
-            };
-            Ok(SortSpec {
-                dimension_index,
-                sort_order,
-            })
-        })
-        .collect()
-}
-
-fn record_attempt(outcome: &SortRangeOutcome, duration: Duration) {
+fn record_attempt(outcome: &RandomizeRangeOutcome, duration: Duration) {
     let decided_by = match &outcome.result {
-        SortRangeResult::Blocked { decided_by } => decided_by.as_ref(),
+        RandomizeRangeResult::Blocked { decided_by, .. } => decided_by.as_ref(),
         _ => None,
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
     let fields_changed = match &outcome.result {
-        SortRangeResult::Changed {
-            range, sort_specs, ..
-        } => Some(format!("sorted {range} by {}", render_specs(sort_specs))),
+        RandomizeRangeResult::Changed { range, .. } => Some(format!("randomized {range}")),
         _ => None,
     };
     let error = match &outcome.result {
-        SortRangeResult::RefusedInvalidRequest { detail } | SortRangeResult::Failed { detail } => {
-            Some(detail.clone())
-        }
+        RandomizeRangeResult::RefusedInvalidRequest { detail }
+        | RandomizeRangeResult::Failed { detail } => Some(detail.clone()),
         _ => None,
     };
     request_log::record_drive_mutation(DriveMutationOutcome {
@@ -381,70 +363,82 @@ fn record_attempt(outcome: &SortRangeOutcome, duration: Duration) {
     });
 }
 
-pub fn describe_lines(outcome: &SortRangeOutcome) -> Vec<String> {
+/// The line stating that the resulting row order can never be known ahead
+/// of, or reported after, the request — server-side randomness, the same
+/// class of limitation `auto-fill` has for a different reason.
+const ORDER_CAVEAT: &str =
+    "the resulting order is chosen by the server and cannot be previewed or reported; the previous row order is not preserved";
+
+pub fn describe_lines(outcome: &RandomizeRangeOutcome) -> Vec<String> {
     let book = outcome.file_name.as_deref().map_or_else(
         || format!("'{}'", outcome.spreadsheet_id),
         |name| format!("'{name}'"),
     );
     match &outcome.result {
-        SortRangeResult::WouldChange {
+        RandomizeRangeResult::WouldChange {
             range,
-            sort_specs,
             width_warning,
         } => change_lines(
-            format!(
-                "Would sort {range} in {book} by {}",
-                render_specs(sort_specs)
-            ),
+            format!("Would randomize the row order of {range} in {book}"),
             width_warning.as_deref(),
             false,
         ),
-        SortRangeResult::Changed {
+        RandomizeRangeResult::Changed {
             range,
-            sort_specs,
             width_warning,
         } => change_lines(
-            format!(
-                "Applied sort of {range} in {book} by {}",
-                render_specs(sort_specs)
-            ),
+            format!("Randomized the row order of {range} in {book}"),
             width_warning.as_deref(),
             true,
         ),
-        SortRangeResult::RefusedInvalidRequest { detail } => vec![format!("Refused: {detail}")],
-        SortRangeResult::RefusedNotASpreadsheet { mime_type } => vec![format!(
+        RandomizeRangeResult::RefusedInvalidRequest { detail } => {
+            vec![format!("Refused: {detail}")]
+        }
+        RandomizeRangeResult::RefusedNotASpreadsheet { mime_type } => vec![format!(
             "Refused: {book} is not a Google Sheet (mimeType: {mime_type})"
         )],
-        SortRangeResult::RefusedShortcut => vec![format!(
-            "Refused: {book} is a shortcut; sort-range doesn't follow shortcuts"
+        RandomizeRangeResult::RefusedShortcut => vec![format!(
+            "Refused: {book} is a shortcut; randomize-range doesn't follow shortcuts"
         )],
-        SortRangeResult::RefusedNoVisibleParents => {
+        RandomizeRangeResult::RefusedNoVisibleParents => {
             vec![format!("Refused: {book} has no visible parent folder")]
         }
-        SortRangeResult::RefusedSheetNotFound { title, available } => vec![format!(
+        RandomizeRangeResult::RefusedSheetNotFound { title, available } => vec![format!(
             "Refused: {book} has no sheet titled '{title}'. Available: {}",
             available.join(", ")
         )],
-        SortRangeResult::Blocked { .. } => vec![format!(
-            "Blocked: sort-range on {book} requires an allowing sheets-write rule"
-        )],
-        SortRangeResult::RefusedNoLease => LeaseGateRefusal::NoLease
+        RandomizeRangeResult::Blocked {
+            operation,
+            decided_by,
+        } => vec![match decided_by {
+            Some(rule) => format!(
+                "Blocked: randomize-range on {book} refused by rule on {} {}{}",
+                rule.kind_label(),
+                rule.id(),
+                rule.depth_suffix()
+            ),
+            None => format!(
+                "Blocked: randomize-range on {book} refused by default policy (no matching rule \
+                 for {operation})"
+            ),
+        }],
+        RandomizeRangeResult::RefusedNoLease => LeaseGateRefusal::NoLease
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
-        SortRangeResult::RefusedLeaseExpired => LeaseGateRefusal::Expired
+        RandomizeRangeResult::RefusedLeaseExpired => LeaseGateRefusal::Expired
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
-        SortRangeResult::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile
+        RandomizeRangeResult::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
-        SortRangeResult::RefusedLeaseStale => LeaseGateRefusal::Stale
+        RandomizeRangeResult::RefusedLeaseStale => LeaseGateRefusal::Stale
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
-        SortRangeResult::Failed { detail } => vec![format!("Failed: {detail}")],
+        RandomizeRangeResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
 
@@ -454,30 +448,14 @@ fn change_lines(summary: String, width_warning: Option<&str>, changed: bool) -> 
         lines.push(format!("Warning: {warning}"));
     }
     lines.push(summary);
+    lines.push(format!("  {ORDER_CAVEAT}"));
     lines.push(if changed {
         "  references outside the range may now observe values from a different row".to_string()
     } else {
-        "  references outside the range may observe values from a different row after sorting"
+        "  references outside the range may observe values from a different row after randomizing"
             .to_string()
     });
     lines
-}
-
-fn render_specs(specs: &[SortSpec]) -> String {
-    specs
-        .iter()
-        .map(|spec| {
-            format!(
-                "{} {}",
-                spec.dimension_index,
-                match spec.sort_order {
-                    SortOrder::Ascending => "asc",
-                    SortOrder::Descending => "desc",
-                }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 #[cfg(test)]
@@ -572,8 +550,9 @@ mod tests {
     }
 
     /// A `spreadsheets.get` reply for `sheet-1` with a single `Q1` sheet
-    /// (sheetId 0) whose `gridProperties` omits `columnCount` — so
-    /// [`width_warning`] can never learn the sheet's allocated width.
+    /// (sheetId 0) whose `gridProperties` omits `columnCount` — so the
+    /// shared `width_warning` helper can never learn the sheet's
+    /// allocated width.
     fn mount_workbook_no_column_count() -> wiremock::Mock {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
@@ -587,15 +566,14 @@ mod tests {
             )
     }
 
-    fn options(dry_run: bool) -> SortRangeOptions {
-        SortRangeOptions {
+    fn options(dry_run: bool) -> RandomizeRangeOptions {
+        RandomizeRangeOptions {
             spreadsheet_id: "sheet-1".into(),
             sheet: Some("Q1".into()),
             range: Some("A2:C10".into()),
-            sort_by: vec!["2:desc".into(), "0:asc".into()],
             dry_run,
             lease_token: None,
-            ledger_path: PathBuf::from("/tmp/unused-sort-range-ledger"),
+            ledger_path: PathBuf::from("/tmp/unused-randomize-range-ledger"),
         }
     }
 
@@ -604,7 +582,7 @@ mod tests {
             folder_id: Some("parent-1".into()),
             file_id: None,
             recursive: true,
-            allow: std::iter::once(DriveOperation::SheetsWrite).collect(),
+            allow: GATE_OPERATIONS.iter().copied().collect(),
             deny: HashSet::default(),
             require_lease: false,
         }
@@ -617,31 +595,34 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_ordered_sort_specs() {
-        let specs = parse_sort_specs(&["2:desc".into(), "0:ascending".into()]).unwrap();
-        assert_eq!(specs[0].dimension_index, 2);
-        assert_eq!(specs[0].sort_order, SortOrder::Descending);
-        assert_eq!(specs[1].dimension_index, 0);
+    /// Allows `sheets-write` but explicitly denies `sheets-structure` — the
+    /// union gate must refuse even though one of its two operations would
+    /// have allowed it.
+    fn rule_missing_sheets_structure() -> FolderPermissionRule {
+        FolderPermissionRule {
+            folder_id: Some("parent-1".into()),
+            file_id: None,
+            recursive: true,
+            allow: std::iter::once(DriveOperation::SheetsWrite).collect(),
+            deny: std::iter::once(DriveOperation::SheetsStructure).collect(),
+            require_lease: false,
+        }
     }
 
     #[test]
-    fn preview_never_claims_to_predict_sort_order() {
-        let outcome = SortRangeOutcome {
+    fn preview_never_claims_to_predict_the_resulting_order() {
+        let outcome = RandomizeRangeOutcome {
             spreadsheet_id: "id".into(),
             file_name: Some("Book".into()),
             resolved_folder_id: None,
-            result: SortRangeResult::WouldChange {
+            result: RandomizeRangeResult::WouldChange {
                 range: "Q1!A1:B3".into(),
-                sort_specs: vec![SortSpec {
-                    dimension_index: 0,
-                    sort_order: SortOrder::Ascending,
-                }],
-                width_warning: width_warning("sorting", 0, 2, Some(5)),
+                width_warning: width_warning("randomizing", 0, 2, Some(5)),
             },
         };
         let lines = describe_lines(&outcome).join("\n");
         assert!(lines.contains("separate records"));
+        assert!(lines.contains("cannot be previewed"));
         assert!(lines.contains("references outside"));
     }
 
@@ -650,22 +631,26 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
         mount_metadata(&server).await;
-        let outcome = sort_range(&drive, &sheets, &options(true), &[rule()]).await;
-        let SortRangeResult::WouldChange { width_warning, .. } = outcome.result else {
+        let outcome = randomize_range(&drive, &sheets, &options(true), &[rule()]).await;
+        let RandomizeRangeResult::WouldChange { width_warning, .. } = outcome.result else {
             panic!("expected would-change"); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(width_warning
             .unwrap()
             .contains("3 of the sheet's 6 allocated columns"));
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 4); // OAuth refresh plus three metadata reads.
+        // OAuth refresh, the target and workbook reads, plus the parent
+        // folder read once per gated operation: `resolve_all` walks the
+        // ancestor chain independently for each of `GATE_OPERATIONS`'s two
+        // operations, so `parent-1` is fetched twice.
+        assert_eq!(requests.len(), 5);
         assert!(requests
             .iter()
             .all(|request| { request.method.as_str() == "GET" || request.url.path() == "/token" }));
     }
 
     #[tokio::test]
-    async fn real_run_sends_one_ordered_sort_range_request() {
+    async fn real_run_sends_one_randomize_range_request() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
         mount_metadata(&server).await;
@@ -679,9 +664,9 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let outcome = sort_range(&drive, &sheets, &options(false), &[rule()]).await;
+        let outcome = randomize_range(&drive, &sheets, &options(false), &[rule()]).await;
         assert!(
-            matches!(outcome.result, SortRangeResult::Changed { .. }),
+            matches!(outcome.result, RandomizeRangeResult::Changed { .. }),
             "{outcome:?}"
         );
         let requests = server.received_requests().await.unwrap();
@@ -691,100 +676,15 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
         assert_eq!(
-            body["requests"][0]["sortRange"]["range"],
+            body["requests"][0]["randomizeRange"]["range"],
             serde_json::json!({
                 "sheetId": 0, "startRowIndex": 1, "endRowIndex": 10,
                 "startColumnIndex": 0, "endColumnIndex": 3
             })
         );
-        assert_eq!(
-            body["requests"][0]["sortRange"]["sortSpecs"],
-            serde_json::json!([
-                {"dimensionIndex": 2, "sortOrder": "DESCENDING"},
-                {"dimensionIndex": 0, "sortOrder": "ASCENDING"}
-            ])
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_sort_column_outside_the_range_before_mutating() {
-        let server = wiremock::MockServer::start().await;
-        let (drive, sheets) = clients(&server).await;
-        mount_metadata(&server).await;
-        let mut opts = options(false);
-        opts.sort_by = vec!["3:asc".into()];
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
-        assert!(matches!(
-            outcome.result,
-            SortRangeResult::RefusedInvalidRequest { .. }
-        ));
-        assert!(server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .all(|request| { request.method.as_str() == "GET" || request.url.path() == "/token" }));
     }
 
     // ── refusals before any network call ────────────────────────────────
-
-    #[tokio::test]
-    async fn rejects_a_malformed_sort_by_flag_before_any_network_call() {
-        let server = wiremock::MockServer::start().await;
-        let (drive, sheets) = clients(&server).await;
-        // No metadata mocks: a malformed flag must short-circuit first.
-        let mut opts = options(false);
-        opts.sort_by = vec!["no-colon-here".into()];
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
-        let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
-        };
-        assert!(detail.contains("COLUMN:asc|desc"), "{detail}");
-        assert!(outcome.file_name.is_none());
-        assert!(server.received_requests().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn rejects_an_empty_sort_by_list_before_any_network_call() {
-        let server = wiremock::MockServer::start().await;
-        let (drive, sheets) = clients(&server).await;
-        let mut opts = options(false);
-        opts.sort_by = vec![];
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
-        let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
-        };
-        assert!(detail.contains("pass at least one --sort-by"), "{detail}");
-        assert!(server.received_requests().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn rejects_a_negative_sort_column_index_before_any_network_call() {
-        let server = wiremock::MockServer::start().await;
-        let (drive, sheets) = clients(&server).await;
-        let mut opts = options(false);
-        opts.sort_by = vec!["-1:asc".into()];
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
-        let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
-        };
-        assert!(detail.contains("non-negative"), "{detail}");
-        assert!(server.received_requests().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn rejects_an_invalid_sort_order_word_before_any_network_call() {
-        let server = wiremock::MockServer::start().await;
-        let (drive, sheets) = clients(&server).await;
-        let mut opts = options(false);
-        opts.sort_by = vec!["0:sideways".into()];
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
-        let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
-        };
-        assert!(detail.contains("'asc' or 'desc'"), "{detail}");
-        assert!(server.received_requests().await.unwrap().is_empty());
-    }
 
     #[tokio::test]
     async fn rejects_a_range_with_conflicting_sheet_prefix_before_any_network_call() {
@@ -793,8 +693,8 @@ mod tests {
         let mut opts = options(false);
         opts.sheet = Some("Other".into());
         opts.range = Some("Sheet1!A1:B2".into());
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
-        let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
+        let outcome = randomize_range(&drive, &sheets, &opts, &[rule()]).await;
+        let RandomizeRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
             panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("already names a sheet"), "{detail}");
@@ -812,8 +712,11 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
             .mount(&server)
             .await;
-        let outcome = sort_range(&drive, &sheets, &options(false), &[rule()]).await;
-        assert!(matches!(outcome.result, SortRangeResult::Failed { .. }));
+        let outcome = randomize_range(&drive, &sheets, &options(false), &[rule()]).await;
+        assert!(matches!(
+            outcome.result,
+            RandomizeRangeResult::Failed { .. }
+        ));
     }
 
     #[tokio::test]
@@ -825,10 +728,10 @@ mod tests {
             .await;
         // Deliberately no mock for parent-1 (the gate never runs) and none
         // for any Sheets endpoint.
-        let outcome = sort_range(&drive, &sheets, &options(false), &[rule()]).await;
+        let outcome = randomize_range(&drive, &sheets, &options(false), &[rule()]).await;
         assert!(matches!(
             outcome.result,
-            SortRangeResult::RefusedNotASpreadsheet { .. }
+            RandomizeRangeResult::RefusedNotASpreadsheet { .. }
         ));
         let text = describe_lines(&outcome).join("\n");
         assert!(text.contains("is not a Google Sheet"), "{text}");
@@ -845,8 +748,11 @@ mod tests {
         )
         .mount(&server)
         .await;
-        let outcome = sort_range(&drive, &sheets, &options(false), &[rule()]).await;
-        assert!(matches!(outcome.result, SortRangeResult::RefusedShortcut));
+        let outcome = randomize_range(&drive, &sheets, &options(false), &[rule()]).await;
+        assert!(matches!(
+            outcome.result,
+            RandomizeRangeResult::RefusedShortcut
+        ));
         let text = describe_lines(&outcome).join("\n");
         assert!(text.contains("is a shortcut"), "{text}");
     }
@@ -858,10 +764,10 @@ mod tests {
         mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &[])
             .mount(&server)
             .await;
-        let outcome = sort_range(&drive, &sheets, &options(false), &[]).await;
+        let outcome = randomize_range(&drive, &sheets, &options(false), &[]).await;
         assert!(matches!(
             outcome.result,
-            SortRangeResult::RefusedNoVisibleParents
+            RandomizeRangeResult::RefusedNoVisibleParents
         ));
     }
 
@@ -877,8 +783,11 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
             .mount(&server)
             .await;
-        let outcome = sort_range(&drive, &sheets, &options(false), &[rule()]).await;
-        assert!(matches!(outcome.result, SortRangeResult::Failed { .. }));
+        let outcome = randomize_range(&drive, &sheets, &options(false), &[rule()]).await;
+        assert!(matches!(
+            outcome.result,
+            RandomizeRangeResult::Failed { .. }
+        ));
     }
 
     // ── the gate itself ───────────────────────────────────────────────────
@@ -892,15 +801,39 @@ mod tests {
             .await;
         mount_folder("parent-1").mount(&server).await;
         // No workbook or batchUpdate mock: either call would 404.
-        let outcome = sort_range(&drive, &sheets, &options(false), &[]).await;
+        let outcome = randomize_range(&drive, &sheets, &options(false), &[]).await;
         assert!(
             matches!(
                 outcome.result,
-                SortRangeResult::Blocked { decided_by: None }
+                RandomizeRangeResult::Blocked {
+                    decided_by: None,
+                    ..
+                }
             ),
             "{:?}",
             outcome.result
         );
+    }
+
+    #[tokio::test]
+    async fn a_rule_allowing_sheets_write_but_denying_sheets_structure_is_still_blocked() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        let outcome = randomize_range(
+            &drive,
+            &sheets,
+            &options(false),
+            &[rule_missing_sheets_structure()],
+        )
+        .await;
+        let RandomizeRangeResult::Blocked { operation, .. } = outcome.result else {
+            panic!("expected Blocked, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+        };
+        assert_eq!(operation, DriveOperation::SheetsStructure);
     }
 
     #[tokio::test]
@@ -916,8 +849,11 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
             .mount(&server)
             .await;
-        let outcome = sort_range(&drive, &sheets, &options(false), &[rule()]).await;
-        assert!(matches!(outcome.result, SortRangeResult::Failed { .. }));
+        let outcome = randomize_range(&drive, &sheets, &options(false), &[rule()]).await;
+        assert!(matches!(
+            outcome.result,
+            RandomizeRangeResult::Failed { .. }
+        ));
     }
 
     // ── the range itself, once the workbook is in hand ───────────────────
@@ -930,8 +866,8 @@ mod tests {
         let mut opts = options(false);
         opts.sheet = None;
         opts.range = Some("A2:C10".into()); // no `Sheet!` prefix, and no `--sheet` either.
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
-        let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
+        let outcome = randomize_range(&drive, &sheets, &opts, &[rule()]).await;
+        let RandomizeRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
             panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("does not name a sheet"), "{detail}");
@@ -951,8 +887,9 @@ mod tests {
         let mut opts = options(false);
         opts.sheet = None;
         opts.range = Some("Nope!A2:C10".into());
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
-        let SortRangeResult::RefusedSheetNotFound { title, available } = &outcome.result else {
+        let outcome = randomize_range(&drive, &sheets, &opts, &[rule()]).await;
+        let RandomizeRangeResult::RefusedSheetNotFound { title, available } = &outcome.result
+        else {
             panic!("expected RefusedSheetNotFound, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert_eq!(title, "Nope");
@@ -967,8 +904,8 @@ mod tests {
         let mut opts = options(false);
         opts.sheet = None;
         opts.range = Some("Q1!A:A".into());
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
-        let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
+        let outcome = randomize_range(&drive, &sheets, &opts, &[rule()]).await;
+        let RandomizeRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
             panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("open-ended"), "{detail}");
@@ -989,8 +926,8 @@ mod tests {
             .await;
         mount_folder("parent-1").mount(&server).await;
         mount_workbook_no_column_count().mount(&server).await;
-        let outcome = sort_range(&drive, &sheets, &options(true), &[rule()]).await;
-        let SortRangeResult::WouldChange { width_warning, .. } = outcome.result else {
+        let outcome = randomize_range(&drive, &sheets, &options(true), &[rule()]).await;
+        let RandomizeRangeResult::WouldChange { width_warning, .. } = outcome.result else {
             panic!("expected would-change"); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(width_warning.unwrap().contains("may be narrower"));
@@ -1008,8 +945,11 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
             .mount(&server)
             .await;
-        let outcome = sort_range(&drive, &sheets, &options(false), &[rule()]).await;
-        assert!(matches!(outcome.result, SortRangeResult::Failed { .. }));
+        let outcome = randomize_range(&drive, &sheets, &options(false), &[rule()]).await;
+        assert!(matches!(
+            outcome.result,
+            RandomizeRangeResult::Failed { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1032,8 +972,11 @@ mod tests {
         let mut opts = options(false);
         opts.lease_token = Some(token);
         opts.ledger_path = ledger_path;
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule_requiring_lease()]).await;
-        assert!(matches!(outcome.result, SortRangeResult::Failed { .. }));
+        let outcome = randomize_range(&drive, &sheets, &opts, &[rule_requiring_lease()]).await;
+        assert!(matches!(
+            outcome.result,
+            RandomizeRangeResult::Failed { .. }
+        ));
     }
 
     // ── the Drive write lease (ADR-0080 §9) ─────────────────────────────
@@ -1044,8 +987,9 @@ mod tests {
         let (drive, sheets) = clients(&server).await;
         mount_metadata(&server).await;
         // No batchUpdate mock: a refusal must make zero mutating calls.
-        let outcome = sort_range(&drive, &sheets, &options(false), &[rule_requiring_lease()]).await;
-        assert_eq!(outcome.result, SortRangeResult::RefusedNoLease);
+        let outcome =
+            randomize_range(&drive, &sheets, &options(false), &[rule_requiring_lease()]).await;
+        assert_eq!(outcome.result, RandomizeRangeResult::RefusedNoLease);
     }
 
     #[tokio::test]
@@ -1057,8 +1001,8 @@ mod tests {
         opts.lease_token = Some("bogus-token".into());
         // Never seeded — no ledger exists at this fresh path.
         opts.ledger_path = tempfile::tempdir().unwrap().keep().join("ledger.jsonl");
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule_requiring_lease()]).await;
-        assert_eq!(outcome.result, SortRangeResult::RefusedLeaseExpired);
+        let outcome = randomize_range(&drive, &sheets, &opts, &[rule_requiring_lease()]).await;
+        assert_eq!(outcome.result, RandomizeRangeResult::RefusedLeaseExpired);
     }
 
     #[tokio::test]
@@ -1071,8 +1015,8 @@ mod tests {
         let mut opts = options(false);
         opts.lease_token = Some(token);
         opts.ledger_path = ledger_path;
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule_requiring_lease()]).await;
-        assert_eq!(outcome.result, SortRangeResult::RefusedLeaseWrongFile);
+        let outcome = randomize_range(&drive, &sheets, &opts, &[rule_requiring_lease()]).await;
+        assert_eq!(outcome.result, RandomizeRangeResult::RefusedLeaseWrongFile);
     }
 
     #[tokio::test]
@@ -1087,33 +1031,33 @@ mod tests {
         let mut opts = options(false);
         opts.lease_token = Some(token);
         opts.ledger_path = ledger_path;
-        let outcome = sort_range(&drive, &sheets, &opts, &[rule_requiring_lease()]).await;
-        assert_eq!(outcome.result, SortRangeResult::RefusedLeaseStale);
+        let outcome = randomize_range(&drive, &sheets, &opts, &[rule_requiring_lease()]).await;
+        assert_eq!(outcome.result, RandomizeRangeResult::RefusedLeaseStale);
     }
 
     // ── pure unit coverage: lease-refusal mapping, JSONL, describe/log ──
 
     #[test]
-    fn lease_refusals_map_to_their_sort_range_results() {
+    fn lease_refusals_map_to_their_randomize_range_results() {
         assert_eq!(
-            SortRangeResult::from_no_lease(),
-            SortRangeResult::RefusedNoLease
+            RandomizeRangeResult::from_no_lease(),
+            RandomizeRangeResult::RefusedNoLease
         );
         assert_eq!(
-            SortRangeResult::from_lease_expired(),
-            SortRangeResult::RefusedLeaseExpired
+            RandomizeRangeResult::from_lease_expired(),
+            RandomizeRangeResult::RefusedLeaseExpired
         );
         assert_eq!(
-            SortRangeResult::from_lease_wrong_file(),
-            SortRangeResult::RefusedLeaseWrongFile
+            RandomizeRangeResult::from_lease_wrong_file(),
+            RandomizeRangeResult::RefusedLeaseWrongFile
         );
         assert_eq!(
-            SortRangeResult::from_lease_stale(),
-            SortRangeResult::RefusedLeaseStale
+            RandomizeRangeResult::from_lease_stale(),
+            RandomizeRangeResult::RefusedLeaseStale
         );
         assert_eq!(
-            SortRangeResult::from_lease_failed("ledger unavailable".into()),
-            SortRangeResult::Failed {
+            RandomizeRangeResult::from_lease_failed("ledger unavailable".into()),
+            RandomizeRangeResult::Failed {
                 detail: "ledger unavailable".into()
             }
         );
@@ -1121,16 +1065,12 @@ mod tests {
 
     #[test]
     fn write_jsonl_emits_one_line_of_json() {
-        let outcome = SortRangeOutcome {
+        let outcome = RandomizeRangeOutcome {
             spreadsheet_id: "sheet-1".into(),
             file_name: Some("Budget".into()),
             resolved_folder_id: Some("parent-1".into()),
-            result: SortRangeResult::Changed {
+            result: RandomizeRangeResult::Changed {
                 range: "Q1!A2:C10".into(),
-                sort_specs: vec![SortSpec {
-                    dimension_index: 0,
-                    sort_order: SortOrder::Ascending,
-                }],
                 width_warning: None,
             },
         };
@@ -1142,76 +1082,73 @@ mod tests {
         assert_eq!(parsed["result"]["status"], "changed");
     }
 
-    /// One of every [`SortRangeResult`] variant.
+    /// One of every [`RandomizeRangeResult`] variant.
     ///
     /// The `match` below is exhaustive and wildcard-free on purpose: adding
     /// a variant breaks this build, which is what forces the new arm
     /// through the tests below.
-    fn every_sort_range_result() -> Vec<SortRangeResult> {
+    fn every_randomize_range_result() -> Vec<RandomizeRangeResult> {
         let all = vec![
-            SortRangeResult::WouldChange {
+            RandomizeRangeResult::WouldChange {
                 range: "Q1!A1:B3".into(),
-                sort_specs: vec![SortSpec {
-                    dimension_index: 0,
-                    sort_order: SortOrder::Ascending,
-                }],
                 width_warning: None,
             },
-            SortRangeResult::Changed {
+            RandomizeRangeResult::Changed {
                 range: "Q1!A1:B3".into(),
-                sort_specs: vec![SortSpec {
-                    dimension_index: 0,
-                    sort_order: SortOrder::Descending,
-                }],
                 width_warning: Some("narrow".to_string()),
             },
-            SortRangeResult::RefusedInvalidRequest {
+            RandomizeRangeResult::RefusedInvalidRequest {
                 detail: "bad".into(),
             },
-            SortRangeResult::RefusedNotASpreadsheet {
+            RandomizeRangeResult::RefusedNotASpreadsheet {
                 mime_type: "application/pdf".into(),
             },
-            SortRangeResult::RefusedShortcut,
-            SortRangeResult::RefusedNoVisibleParents,
-            SortRangeResult::RefusedSheetNotFound {
+            RandomizeRangeResult::RefusedShortcut,
+            RandomizeRangeResult::RefusedNoVisibleParents,
+            RandomizeRangeResult::RefusedSheetNotFound {
                 title: "Nope".into(),
                 available: vec!["Q1".into()],
             },
-            SortRangeResult::Blocked { decided_by: None },
-            SortRangeResult::Blocked {
+            RandomizeRangeResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: None,
+            },
+            RandomizeRangeResult::Blocked {
+                operation: DriveOperation::SheetsStructure,
                 decided_by: Some(DecidingRule::Folder {
                     folder_id: "folder-1".into(),
                     depth: 2,
                 }),
             },
-            SortRangeResult::Blocked {
+            RandomizeRangeResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
                 decided_by: Some(DecidingRule::File {
                     file_id: "sheet-1".into(),
                 }),
             },
-            SortRangeResult::RefusedNoLease,
-            SortRangeResult::RefusedLeaseExpired,
-            SortRangeResult::RefusedLeaseWrongFile,
-            SortRangeResult::RefusedLeaseStale,
-            SortRangeResult::Failed {
+            RandomizeRangeResult::RefusedNoLease,
+            RandomizeRangeResult::RefusedLeaseExpired,
+            RandomizeRangeResult::RefusedLeaseWrongFile,
+            RandomizeRangeResult::RefusedLeaseStale,
+            RandomizeRangeResult::Failed {
                 detail: "boom".into(),
             },
         ];
         for result in &all {
             match result {
-                SortRangeResult::WouldChange { .. }
-                | SortRangeResult::Changed { .. }
-                | SortRangeResult::RefusedInvalidRequest { .. }
-                | SortRangeResult::RefusedNotASpreadsheet { .. }
-                | SortRangeResult::RefusedShortcut
-                | SortRangeResult::RefusedNoVisibleParents
-                | SortRangeResult::RefusedSheetNotFound { .. }
-                | SortRangeResult::Blocked { .. }
-                | SortRangeResult::RefusedNoLease
-                | SortRangeResult::RefusedLeaseExpired
-                | SortRangeResult::RefusedLeaseWrongFile
-                | SortRangeResult::RefusedLeaseStale
-                | SortRangeResult::Failed { .. } => (),
+                RandomizeRangeResult::WouldChange { .. }
+                | RandomizeRangeResult::Changed { .. }
+                | RandomizeRangeResult::RefusedInvalidRequest { .. }
+                | RandomizeRangeResult::RefusedNotASpreadsheet { .. }
+                | RandomizeRangeResult::RefusedShortcut
+                | RandomizeRangeResult::RefusedNoVisibleParents
+                | RandomizeRangeResult::RefusedSheetNotFound { .. }
+                | RandomizeRangeResult::Blocked { .. }
+                | RandomizeRangeResult::RefusedNoLease
+                | RandomizeRangeResult::RefusedLeaseExpired
+                | RandomizeRangeResult::RefusedLeaseWrongFile
+                | RandomizeRangeResult::RefusedLeaseStale
+                | RandomizeRangeResult::Failed { .. } => (),
             }
         }
         all
@@ -1219,8 +1156,8 @@ mod tests {
 
     #[test]
     fn every_describe_arm_renders_at_least_one_line_with_no_control_characters() {
-        for result in every_sort_range_result() {
-            let outcome = SortRangeOutcome {
+        for result in every_randomize_range_result() {
+            let outcome = RandomizeRangeOutcome {
                 spreadsheet_id: "sheet-1".into(),
                 file_name: Some("Quarterly Plan".into()),
                 resolved_folder_id: None,
@@ -1244,11 +1181,11 @@ mod tests {
 
     #[test]
     fn describe_lines_falls_back_to_the_spreadsheet_id_with_no_file_name() {
-        let outcome = SortRangeOutcome {
+        let outcome = RandomizeRangeOutcome {
             spreadsheet_id: "sheet-1".into(),
             file_name: None,
             resolved_folder_id: None,
-            result: SortRangeResult::RefusedShortcut,
+            result: RandomizeRangeResult::RefusedShortcut,
         };
         let lines = describe_lines(&outcome);
         assert_eq!(lines.len(), 1);
@@ -1256,25 +1193,43 @@ mod tests {
     }
 
     #[test]
+    fn blocked_with_no_deciding_rule_names_the_denied_operation() {
+        let outcome = RandomizeRangeOutcome {
+            spreadsheet_id: "sheet-1".into(),
+            file_name: Some("Budget".into()),
+            resolved_folder_id: None,
+            result: RandomizeRangeResult::Blocked {
+                operation: DriveOperation::SheetsStructure,
+                decided_by: None,
+            },
+        };
+        let lines = describe_lines(&outcome).join("\n");
+        assert!(lines.contains("sheets-structure"), "{lines}");
+    }
+
+    #[test]
     fn log_status_covers_every_variant() {
-        for result in every_sort_range_result() {
+        for result in every_randomize_range_result() {
             assert!(!result.log_status().is_empty());
         }
         assert_eq!(
-            SortRangeResult::Blocked { decided_by: None }.log_status(),
+            RandomizeRangeResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: None
+            }
+            .log_status(),
             "blocked"
         );
         assert_eq!(
-            SortRangeResult::Changed {
+            RandomizeRangeResult::Changed {
                 range: "Q1!A1:B2".into(),
-                sort_specs: vec![],
                 width_warning: None
             }
             .log_status(),
             "changed"
         );
         assert_eq!(
-            SortRangeResult::RefusedLeaseStale.log_status(),
+            RandomizeRangeResult::RefusedLeaseStale.log_status(),
             "refused-lease-stale"
         );
     }
