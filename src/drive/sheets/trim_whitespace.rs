@@ -290,13 +290,10 @@ async fn trim_whitespace_inner(
     // same rectangle. A `--whole-sheet` request could equally be sent with
     // every bound absent, but then the outcome could not name what it
     // acted on.
-    let Some(sheet) = grid_range::find_sheet_by_id(&workbook, grid.sheet_id) else {
-        // omni-dev: coverage ignore reason="resolve_scope resolved this sheet_id from the same workbook moments earlier, so the sheet is always present; this arm exists only as a defensive re-check"
-        return gated(TrimWhitespaceResult::Failed {
-            detail: format!("sheetId {} vanished from the workbook", grid.sheet_id),
-        });
-    };
-    let grid = materialise_bounds(&grid, sheet);
+    let grid = materialise_bounds(
+        &grid,
+        grid_range::find_sheet_by_id(&workbook, grid.sheet_id),
+    );
     let Some(range_a1) = grid_range::bounded_range_to_a1(&sheet_title, &grid) else {
         return gated(TrimWhitespaceResult::RefusedInvalidRequest {
             detail: format!(
@@ -425,13 +422,15 @@ fn resolve_scope(
 
 /// Fills any absent bound of `grid` from `sheet`'s current grid extent.
 ///
-/// A bound the sheet reports no count for is left absent; the caller
-/// treats a range that still isn't fully bounded as naming no cells, since
-/// it cannot be read or rendered.
-fn materialise_bounds(grid: &GridRange, sheet: &Sheet) -> GridRange {
+/// A bound the sheet reports no count for is left absent, as is every
+/// bound when `sheet` is `None`. Either way the caller treats a range that
+/// still isn't fully bounded as naming no cells, since it cannot be read
+/// or rendered — which is also why a missing sheet needs no branch of its
+/// own here: it cannot happen (the id came from this same workbook a
+/// moment earlier) and would refuse correctly if it did.
+fn materialise_bounds(grid: &GridRange, sheet: Option<&Sheet>) -> GridRange {
     let props = sheet
-        .properties
-        .as_ref()
+        .and_then(|sheet| sheet.properties.as_ref())
         .and_then(|p| p.grid_properties.as_ref());
     GridRange {
         sheet_id: grid.sheet_id,
@@ -765,7 +764,7 @@ mod tests {
             start_column_index: None,
             end_column_index: None,
         };
-        let filled = materialise_bounds(&open, &sheet_with(Some(100), Some(6)));
+        let filled = materialise_bounds(&open, Some(&sheet_with(Some(100), Some(6))));
         assert_eq!(filled.start_row_index, Some(0));
         assert_eq!(filled.end_row_index, Some(100));
         assert_eq!(filled.start_column_index, Some(0));
@@ -781,11 +780,29 @@ mod tests {
             start_column_index: Some(0),
             end_column_index: Some(3),
         };
-        let filled = materialise_bounds(&open, &sheet_with(None, Some(6)));
+        let filled = materialise_bounds(&open, Some(&sheet_with(None, Some(6))));
         // A start always materialises to 0; an end can only come from the
         // sheet, so it stays absent and the caller refuses the range.
         assert_eq!(filled.start_row_index, Some(0));
         assert_eq!(filled.end_row_index, None);
+    }
+
+    /// With no sheet the ends cannot be filled, so the range stays
+    /// unbounded and the caller refuses it as naming no cells — the
+    /// behaviour that lets the engine skip a "sheet vanished" branch.
+    #[test]
+    fn materialise_bounds_without_a_sheet_leaves_the_ends_open() {
+        let open = GridRange {
+            sheet_id: 0,
+            start_row_index: None,
+            end_row_index: None,
+            start_column_index: None,
+            end_column_index: None,
+        };
+        let filled = materialise_bounds(&open, None);
+        assert_eq!(filled.end_row_index, None);
+        assert_eq!(filled.end_column_index, None);
+        assert!(!grid_range::is_bounded(&filled));
     }
 
     #[test]
@@ -798,7 +815,7 @@ mod tests {
             end_column_index: Some(3),
         };
         assert_eq!(
-            materialise_bounds(&bounded, &sheet_with(Some(100), Some(6))),
+            materialise_bounds(&bounded, Some(&sheet_with(Some(100), Some(6)))),
             bounded
         );
     }
