@@ -373,6 +373,9 @@ pub struct DependencyEntry {
     /// whatever form the issue used.
     #[serde(rename = "ref")]
     pub item_ref: String,
+    /// Resolved GitHub URL for terminal links; not part of the data format.
+    #[serde(skip)]
+    pub url: Option<String>,
     /// Always [`ItemState::Open`]: a closed citation is settled and is not
     /// reported here.
     pub state: ItemState,
@@ -773,6 +776,7 @@ fn dependency_entries(
             if let Some(Answer::Noul { noul }) = answers.get(&could_be_cheaper_key(i)) {
                 return Some(DependencyEntry {
                     item_ref: citation.raw.clone(),
+                    url: citation.url.clone(),
                     state: ItemState::Open,
                     could_be_cheaper: BTreeMap::from([("design".to_string(), *noul)]),
                 });
@@ -805,10 +809,43 @@ fn dependency_entries(
 /// Scripts should use `json` or `yaml` instead.
 #[must_use]
 pub fn render_route_text(report: &RouteReport, max_input_chars: usize) -> String {
+    render_route_text_styled(report, max_input_chars, &[], TerminalStyle::default())
+}
+
+/// Terminal features selected by the CLI. Passing them explicitly keeps the
+/// renderer deterministic and lets callers retain plain output for pipes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalStyle {
+    /// Emit SGR colour sequences.
+    pub color: bool,
+    /// Emit OSC 8 links around issue references.
+    pub hyperlinks: bool,
+}
+
+impl TerminalStyle {
+    /// Disables escape sequences for redirected output and dumb terminals.
+    #[must_use]
+    pub fn new(tty: bool, term: &str, no_color: bool, supports_links: bool) -> Self {
+        let usable = tty && !term.is_empty() && term != "dumb";
+        Self {
+            color: usable && !no_color,
+            hyperlinks: usable && supports_links,
+        }
+    }
+}
+
+/// Renders the human report with terminal presentation when supported.
+#[must_use]
+pub fn render_route_text_styled(
+    report: &RouteReport,
+    max_input_chars: usize,
+    ladders: &[Ladder],
+    style: TerminalStyle,
+) -> String {
     let mut blocks: Vec<String> = report
         .issues
         .iter()
-        .map(|issue| render_issue_block(issue, max_input_chars))
+        .map(|issue| render_issue_block(issue, max_input_chars, ladders, style))
         .collect();
     blocks.push(format!(
         "model: {}, usage: {} input tokens, {} output tokens",
@@ -822,8 +859,19 @@ pub fn render_route_text(report: &RouteReport, max_input_chars: usize) -> String
 /// Renders one issue's block: a header line, one indented line per provider's
 /// routing (or its error), one `cites` line per open citation, and a
 /// truncation note.
-fn render_issue_block(issue: &IssueRoute, max_input_chars: usize) -> String {
-    let mut lines = vec![format!("{} — {}", issue.item_ref, issue.title)];
+fn render_issue_block(
+    issue: &IssueRoute,
+    max_input_chars: usize,
+    ladders: &[Ladder],
+    style: TerminalStyle,
+) -> String {
+    let item_ref = hyperlink(&issue.item_ref, Some(&issue.url), style);
+    let item_ref = if issue.failed() {
+        item_ref
+    } else {
+        colorize(&item_ref, Complexity::Low, style)
+    };
+    let mut lines = vec![format!("{item_ref} — {}", issue.title)];
     match &issue.outcome {
         RouteOutcome::Routed {
             providers,
@@ -831,9 +879,16 @@ fn render_issue_block(issue: &IssueRoute, max_input_chars: usize) -> String {
             reference_fetch_failures,
         } => {
             for (provider, route) in providers {
-                lines.extend(render_provider_line(provider, route, providers.len()));
+                let ladder = ladders.iter().find(|ladder| ladder.name == *provider);
+                lines.extend(render_provider_line(
+                    provider,
+                    route,
+                    providers.len(),
+                    ladder,
+                    style,
+                ));
             }
-            lines.extend(render_depends_on_lines(depends_on));
+            lines.extend(render_depends_on_lines(depends_on, style));
             lines.extend(render_reference_fetch_failure_lines(
                 reference_fetch_failures,
             ));
@@ -842,7 +897,10 @@ fn render_issue_block(issue: &IssueRoute, max_input_chars: usize) -> String {
             error,
             reference_fetch_failures,
         } => {
-            lines.push(format!("  failed: {error}"));
+            lines.push(format!(
+                "  {}",
+                colorize(&format!("failed: {error}"), Complexity::High, style)
+            ));
             lines.extend(render_reference_fetch_failure_lines(
                 reference_fetch_failures,
             ));
@@ -883,14 +941,18 @@ fn render_provider_line(
     provider: &str,
     route: &ProviderRoute,
     provider_count: usize,
+    ladder: Option<&Ladder>,
+    style: TerminalStyle,
 ) -> Vec<String> {
     if route_has_multi_model_tier(route) {
-        render_provider_block(provider, route, provider_count)
+        render_provider_block(provider, route, provider_count, ladder, style)
     } else {
         vec![render_provider_line_compact(
             provider,
             route,
             provider_count,
+            ladder,
+            style,
         )]
     }
 }
@@ -902,28 +964,41 @@ fn render_provider_line_compact(
     provider: &str,
     route: &ProviderRoute,
     provider_count: usize,
+    ladder: Option<&Ladder>,
+    style: TerminalStyle,
 ) -> String {
+    let class = color_choice(&route.class, ladder, style);
     let lead = if provider_count > 1 {
-        format!("{provider}: {}", route.class)
+        format!("{provider}: {class}")
     } else {
-        route.class.clone()
+        class
     };
     let clauses: Vec<String> = Stage::ALL
         .into_iter()
-        .map(|stage| render_stage_clause(stage, &route.stages, &route.close_calls))
+        .map(|stage| render_stage_clause(stage, &route.stages, &route.close_calls, ladder, style))
         .collect();
     format!("  {lead} — {}", clauses.join(", "))
 }
 
 /// Renders one stage's clause, e.g. `design needs fable (0.52)` or `review
 /// opus (0.41, close call)`.
-fn render_stage_clause(stage: Stage, stages: &StageAnswers, close_calls: &[Stage]) -> String {
+fn render_stage_clause(
+    stage: Stage,
+    stages: &StageAnswers,
+    close_calls: &[Stage],
+    ladder: Option<&Ladder>,
+    style: TerminalStyle,
+) -> String {
     let answer = stages.get(stage);
+    let choice = color_choice(&answer.choice, ladder, style);
     let label = match stage {
-        Stage::Design if answer.choice == NO_DESIGN => "design needs no further work".to_string(),
-        Stage::Design => format!("design needs {}", answer.choice),
-        Stage::Implement => format!("implementation {}", answer.choice),
-        Stage::Review => format!("review {}", answer.choice),
+        Stage::Design if answer.choice == NO_DESIGN => format!(
+            "design needs {}",
+            colorize("no further work", Complexity::Low, style)
+        ),
+        Stage::Design => format!("design needs {choice}"),
+        Stage::Implement => format!("implementation {choice}"),
+        Stage::Review => format!("review {choice}"),
     };
     format!(
         "{label} ({})",
@@ -958,6 +1033,8 @@ fn render_provider_block(
     provider: &str,
     route: &ProviderRoute,
     provider_count: usize,
+    ladder: Option<&Ladder>,
+    style: TerminalStyle,
 ) -> Vec<String> {
     let mut lines = Vec::with_capacity(5);
     let indent = if provider_count > 1 {
@@ -966,11 +1043,14 @@ fn render_provider_block(
     } else {
         "  "
     };
-    lines.push(format!("{indent}class: {}", route.class));
+    lines.push(format!(
+        "{indent}class: {}",
+        color_choice(&route.class, ladder, style)
+    ));
     for stage in Stage::ALL {
         lines.push(format!(
             "{indent}{}",
-            render_stage_line(stage, &route.stages, &route.close_calls)
+            render_stage_line(stage, &route.stages, &route.close_calls, ladder, style)
         ));
     }
     lines
@@ -980,15 +1060,26 @@ fn render_provider_block(
 /// `design: needs no further work (0.94)` or `review: opus (0.41, close
 /// call)` — parallel to [`render_stage_clause`] but with the stage name as a
 /// `label:` prefix rather than folded into a clause.
-fn render_stage_line(stage: Stage, stages: &StageAnswers, close_calls: &[Stage]) -> String {
+fn render_stage_line(
+    stage: Stage,
+    stages: &StageAnswers,
+    close_calls: &[Stage],
+    ladder: Option<&Ladder>,
+    style: TerminalStyle,
+) -> String {
     let answer = stages.get(stage);
+    let choice = color_choice(&answer.choice, ladder, style);
     let (label, content) = match stage {
-        Stage::Design if answer.choice == NO_DESIGN => {
-            ("design", "needs no further work".to_string())
-        }
-        Stage::Design => ("design", format!("needs {}", answer.choice)),
-        Stage::Implement => ("implementation", answer.choice.clone()),
-        Stage::Review => ("review", answer.choice.clone()),
+        Stage::Design if answer.choice == NO_DESIGN => (
+            "design",
+            format!(
+                "needs {}",
+                colorize("no further work", Complexity::Low, style)
+            ),
+        ),
+        Stage::Design => ("design", format!("needs {choice}")),
+        Stage::Implement => ("implementation", choice),
+        Stage::Review => ("review", choice),
     };
     format!(
         "{label}: {content} ({})",
@@ -998,15 +1089,17 @@ fn render_stage_line(stage: Stage, stages: &StageAnswers, close_calls: &[Stage])
 
 /// Renders one `  cites` line per open citation in `depends_on`, in citation
 /// order. Empty when there are no open citations.
-fn render_depends_on_lines(depends_on: &[DependencyEntry]) -> Vec<String> {
+fn render_depends_on_lines(depends_on: &[DependencyEntry], style: TerminalStyle) -> Vec<String> {
     depends_on
         .iter()
-        .map(|dep| match dep.could_be_cheaper.get("design") {
-            Some(prob) => format!(
-                "  cites open {}, which could leave less design work if resolved ({prob:.2})",
-                dep.item_ref
-            ),
-            None => format!("  cites open {}", dep.item_ref),
+        .map(|dep| {
+            let item_ref = hyperlink(&dep.item_ref, dep.url.as_deref(), style);
+            match dep.could_be_cheaper.get("design") {
+                Some(prob) => format!(
+                    "  cites open {item_ref}, which could leave less design work if resolved ({prob:.2})"
+                ),
+                None => format!("  cites open {item_ref}"),
+            }
         })
         .collect()
 }
@@ -1022,6 +1115,80 @@ fn render_reference_fetch_failure_lines(failures: &[ReferenceFetchFailure]) -> V
             )
         })
         .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Complexity {
+    Low,
+    Medium,
+    High,
+}
+
+/// Tier order, rather than provider-specific names, determines complexity.
+fn choice_complexity(choice: &str, ladder: &Ladder) -> Option<Complexity> {
+    if choice == NO_DESIGN {
+        return Some(Complexity::Low);
+    }
+    let tiers = ladder.tiers.as_slice();
+    let index = tiers.iter().position(|tier| tier.name == choice)?;
+    Some(if index == 0 {
+        Complexity::Low
+    } else if index == tiers.len() - 1 {
+        Complexity::High
+    } else {
+        Complexity::Medium
+    })
+}
+
+fn color_choice(choice: &str, ladder: Option<&Ladder>, style: TerminalStyle) -> String {
+    ladder
+        .and_then(|ladder| choice_complexity(choice, ladder))
+        .map_or_else(
+            || choice.to_string(),
+            |level| colorize(choice, level, style),
+        )
+}
+
+fn colorize(text: &str, level: Complexity, style: TerminalStyle) -> String {
+    if !style.color {
+        return text.to_string();
+    }
+    let code = match level {
+        Complexity::Low => 32,
+        Complexity::Medium => 33,
+        Complexity::High => 31,
+    };
+    format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+/// Link only the visible reference, and only to a GitHub issue/PR URL. OSC 8
+/// URLs must not contain characters that could terminate the control sequence.
+fn hyperlink(text: &str, url: Option<&str>, style: TerminalStyle) -> String {
+    let Some(url) = url.filter(|url| style.hyperlinks && valid_github_item_url(url)) else {
+        return text.to_string();
+    };
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
+fn valid_github_item_url(raw: &str) -> bool {
+    if raw.chars().any(char::is_control) {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    if url.scheme() != "https" || url.host_str() != Some("github.com") {
+        return false;
+    }
+    let Some(segments) = url.path_segments() else {
+        return false;
+    };
+    let parts: Vec<_> = segments.collect();
+    parts.len() == 4
+        && !parts[0].is_empty()
+        && !parts[1].is_empty()
+        && matches!(parts[2], "issues" | "pull")
+        && parts[3].parse::<u64>().is_ok()
 }
 
 /// Groups `n`'s digits by thousands, e.g. `60_000` -> `"60,000"`.
@@ -1529,6 +1696,7 @@ mod tests {
                     number: 1129,
                 },
                 raw: "#1129".to_string(),
+                url: None,
             },
             Citation {
                 item_ref: ItemRef {
@@ -1538,6 +1706,7 @@ mod tests {
                     number: 1349,
                 },
                 raw: "#1349".to_string(),
+                url: None,
             },
         ];
         let answers = BTreeMap::from([(
@@ -1969,6 +2138,7 @@ mod tests {
                 number,
             },
             raw: raw.to_string(),
+            url: None,
         }
     }
 
@@ -2140,6 +2310,7 @@ mod tests {
                     )]),
                     depends_on: vec![DependencyEntry {
                         item_ref: "#1129".to_string(),
+                        url: None,
                         state: ItemState::Open,
                         could_be_cheaper: BTreeMap::from([("design".to_string(), 0.75)]),
                     }],
@@ -2183,11 +2354,13 @@ mod tests {
                     depends_on: vec![
                         DependencyEntry {
                             item_ref: "#1830".to_string(),
+                            url: None,
                             state: ItemState::Open,
                             could_be_cheaper: BTreeMap::from([("design".to_string(), 0.46)]),
                         },
                         DependencyEntry {
                             item_ref: "#1831".to_string(),
+                            url: None,
                             state: ItemState::Open,
                             could_be_cheaper: BTreeMap::new(),
                         },
@@ -2309,6 +2482,7 @@ mod tests {
                     )]),
                     depends_on: vec![DependencyEntry {
                         item_ref: "#1129".to_string(),
+                        url: None,
                         state: ItemState::Open,
                         could_be_cheaper: BTreeMap::new(),
                     }],
@@ -2412,6 +2586,7 @@ mod tests {
                     )]),
                     depends_on: vec![DependencyEntry {
                         item_ref: "#1830".to_string(),
+                        url: None,
                         state: ItemState::Open,
                         could_be_cheaper: BTreeMap::from([("design".to_string(), 0.48)]),
                     }],
@@ -2637,6 +2812,226 @@ mod tests {
             text,
             "model: jev-1.13.0, usage: 10 input tokens, 20 output tokens\n"
         );
+    }
+
+    #[test]
+    fn terminal_style_requires_a_usable_tty() {
+        assert_eq!(
+            TerminalStyle::new(false, "xterm", false, true),
+            TerminalStyle::default()
+        );
+        assert_eq!(
+            TerminalStyle::new(true, "dumb", false, true),
+            TerminalStyle::default()
+        );
+        assert_eq!(
+            TerminalStyle::new(true, "", false, true),
+            TerminalStyle::default()
+        );
+        assert_eq!(
+            TerminalStyle::new(true, "xterm", true, true),
+            TerminalStyle {
+                color: false,
+                hyperlinks: true
+            }
+        );
+        assert_eq!(
+            TerminalStyle::new(true, "xterm", false, false),
+            TerminalStyle {
+                color: true,
+                hyperlinks: false
+            }
+        );
+    }
+
+    #[test]
+    fn complexity_uses_tier_order_for_built_in_and_custom_ladders() {
+        let anthropic = Ladder::builtin(Provider::Anthropic).unwrap();
+        assert_eq!(
+            choice_complexity(NO_DESIGN, &anthropic),
+            Some(Complexity::Low)
+        );
+        assert_eq!(
+            choice_complexity("sonnet", &anthropic),
+            Some(Complexity::Low)
+        );
+        assert_eq!(
+            choice_complexity("opus", &anthropic),
+            Some(Complexity::Medium)
+        );
+        assert_eq!(
+            choice_complexity("fable", &anthropic),
+            Some(Complexity::High)
+        );
+        let custom = |names: &[&str]| {
+            use std::fmt::Write;
+
+            let mut yaml = String::from("tiers:\n");
+            for name in names {
+                writeln!(yaml, "  - {{name: {name}, description: work}}").unwrap();
+            }
+            Ladder::named("custom".to_string(), Tiers::parse(&yaml).unwrap())
+        };
+        let two = custom(&["a", "b"]);
+        assert_eq!(choice_complexity("a", &two), Some(Complexity::Low));
+        assert_eq!(choice_complexity("b", &two), Some(Complexity::High));
+        let four = custom(&["a", "b", "c", "d"]);
+        assert_eq!(choice_complexity("b", &four), Some(Complexity::Medium));
+        assert_eq!(choice_complexity("c", &four), Some(Complexity::Medium));
+        assert_eq!(choice_complexity("d", &four), Some(Complexity::High));
+        assert_eq!(choice_complexity("unknown", &four), None);
+    }
+
+    #[test]
+    fn hyperlink_uses_exact_osc_8_framing_and_rejects_unsafe_urls() {
+        let style = TerminalStyle {
+            color: false,
+            hyperlinks: true,
+        };
+        let url = "https://github.com/other/repo/pull/42";
+        assert_eq!(
+            hyperlink("PR #42", Some(url), style),
+            format!("\x1b]8;;{url}\x1b\\PR #42\x1b]8;;\x1b\\")
+        );
+        for bad in [
+            "https://example.com/o/r/issues/1",
+            "http://github.com/o/r/issues/1",
+            "https://github.com/o/r/issues/1\x1b]8;;evil",
+            "https://github.com/o/r/issues/nope",
+        ] {
+            assert_eq!(hyperlink("#1", Some(bad), style), "#1");
+        }
+        assert_eq!(hyperlink("#1", None, style), "#1");
+    }
+
+    #[test]
+    fn styled_report_colors_classes_stages_and_failure_and_links_refs() {
+        let issue = IssueRoute {
+            item_ref: "o/r#1".to_string(),
+            url: "https://github.com/o/r/issues/1".to_string(),
+            title: "t".to_string(),
+            outcome: RouteOutcome::Routed {
+                providers: BTreeMap::from([(
+                    "anthropic".to_string(),
+                    ProviderRoute {
+                        stages: stages(NO_DESIGN, "opus", "fable"),
+                        class: "opus".to_string(),
+                        close_calls: vec![],
+                    },
+                )]),
+                depends_on: vec![DependencyEntry {
+                    item_ref: "#42".to_string(),
+                    url: Some("https://github.com/other/repo/pull/42".to_string()),
+                    state: ItemState::Open,
+                    could_be_cheaper: BTreeMap::new(),
+                }],
+                reference_fetch_failures: vec![],
+            },
+            truncated: false,
+        };
+        let failed = IssueRoute {
+            item_ref: "o/r#2".to_string(),
+            url: "https://github.com/o/r/issues/2".to_string(),
+            title: "failed".to_string(),
+            outcome: RouteOutcome::Failed {
+                error: "HTTP 529".to_string(),
+                reference_fetch_failures: vec![],
+            },
+            truncated: false,
+        };
+        let report = RouteReport {
+            model: "jev".to_string(),
+            issues: vec![issue, failed],
+            usage: Usage::default(),
+        };
+        let style = TerminalStyle {
+            color: true,
+            hyperlinks: true,
+        };
+        let text = render_route_text_styled(
+            &report,
+            DEFAULT_MAX_INPUT_CHARS,
+            &[Ladder::builtin(Provider::Anthropic).unwrap()],
+            style,
+        );
+        assert!(
+            text.contains(
+                "\x1b[32m\x1b]8;;https://github.com/o/r/issues/1\x1b\\o/r#1\x1b]8;;\x1b\\\x1b[0m"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("\x1b[33mopus\x1b[0m — design needs \x1b[32mno further work\x1b[0m"),
+            "{text}"
+        );
+        assert!(text.contains("review \x1b[31mfable\x1b[0m"), "{text}");
+        assert!(
+            text.contains("\x1b]8;;https://github.com/other/repo/pull/42\x1b\\#42\x1b]8;;\x1b\\"),
+            "{text}"
+        );
+        assert!(text.contains("\x1b[31mfailed: HTTP 529\x1b[0m"), "{text}");
+        let plain = render_route_text_styled(
+            &report,
+            DEFAULT_MAX_INPUT_CHARS,
+            &[],
+            TerminalStyle::default(),
+        );
+        assert_eq!(plain, render_route_text(&report, DEFAULT_MAX_INPUT_CHARS));
+        assert!(!plain.contains('\x1b'));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("https://github.com/other/repo/pull/42"));
+    }
+
+    #[test]
+    fn styled_multi_model_layout_colors_the_class_and_stage_choices() {
+        let tier = "model-a,model-b";
+        let ladder = Ladder::named(
+            "custom".to_string(),
+            Tiers::parse(&format!(
+                "tiers:\n  - {{name: basic, description: work}}\n  - {{name: '{tier}', description: work}}\n"
+            ))
+            .unwrap(),
+        );
+        let report = RouteReport {
+            model: "jev".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "https://github.com/o/r/issues/1".to_string(),
+                title: "t".to_string(),
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([(
+                        "custom".to_string(),
+                        ProviderRoute {
+                            stages: stages(NO_DESIGN, tier, "basic"),
+                            class: tier.to_string(),
+                            close_calls: vec![],
+                        },
+                    )]),
+                    depends_on: vec![],
+                    reference_fetch_failures: vec![],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text_styled(
+            &report,
+            DEFAULT_MAX_INPUT_CHARS,
+            &[ladder],
+            TerminalStyle {
+                color: true,
+                hyperlinks: false,
+            },
+        );
+        assert!(
+            text.contains(&format!("  class: \x1b[31m{tier}\x1b[0m")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("  implementation: \x1b[31m{tier}\x1b[0m")),
+            "{text}"
+        );
+        assert!(text.contains("  review: \x1b[32mbasic\x1b[0m"), "{text}");
     }
 
     #[test]

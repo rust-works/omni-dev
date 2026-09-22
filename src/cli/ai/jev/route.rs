@@ -1,6 +1,7 @@
 //! `ai jev route` — routes issues to model classes by stage.
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -14,9 +15,10 @@ use crate::jev::citations::{find_citations, Citation};
 use crate::jev::client::JevClient;
 use crate::jev::config::JevConfig;
 use crate::jev::route::{
-    build_route_state, render_route_text, run_route_with_reference_fetch_failures, Ladder,
-    OpenDependencies, Provider, ReferenceFetchFailure, ReferenceFetchFailures, RouteOptions,
-    RouteReport, Tiers, DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
+    build_route_state, render_route_text, render_route_text_styled,
+    run_route_with_reference_fetch_failures, Ladder, OpenDependencies, Provider,
+    ReferenceFetchFailure, ReferenceFetchFailures, RouteOptions, RouteReport, TerminalStyle, Tiers,
+    DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
 };
 use crate::provider::{GitProvider, IssueDoc, ItemKind, ItemRef, ItemState};
 
@@ -162,7 +164,13 @@ impl RouteCommand {
         .await?;
         print!(
             "{}",
-            render_output(&report, self.output, self.max_input_chars)?
+            render_output_with_style(
+                &report,
+                self.output,
+                self.max_input_chars,
+                &ladders,
+                terminal_style(),
+            )?
         );
         failure_summary(&report).map_or(Ok(()), |msg| bail!(msg))
     }
@@ -182,6 +190,48 @@ fn render_output(
         RouteFormat::Yaml => format_output(report, JevFormat::Yaml)?,
         RouteFormat::Text => render_route_text(report, max_input_chars),
     })
+}
+
+fn render_output_with_style(
+    report: &RouteReport,
+    output: RouteFormat,
+    max_input_chars: usize,
+    ladders: &[Ladder],
+    style: TerminalStyle,
+) -> Result<String> {
+    if output == RouteFormat::Text {
+        Ok(render_route_text_styled(
+            report,
+            max_input_chars,
+            ladders,
+            style,
+        ))
+    } else {
+        render_output(report, output, max_input_chars)
+    }
+}
+
+/// OSC 8 has no universal capability query, so opt in for terminals known to
+/// support it. Colour and links are independent: NO_COLOR only disables SGR.
+fn terminal_style() -> TerminalStyle {
+    let term = std::env::var("TERM").unwrap_or_default();
+    let tty = std::io::stdout().is_terminal();
+    let supports_links = matches!(
+        std::env::var("TERM_PROGRAM").as_deref(),
+        Ok("iTerm.app" | "WezTerm" | "vscode" | "Hyper")
+    ) || std::env::var_os("WT_SESSION").is_some()
+        || std::env::var_os("KITTY_WINDOW_ID").is_some()
+        || std::env::var_os("KONSOLE_VERSION").is_some()
+        || std::env::var("VTE_VERSION")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .is_some_and(|v| v >= 5000);
+    TerminalStyle::new(
+        tty,
+        &term,
+        std::env::var_os("NO_COLOR").is_some(),
+        supports_links,
+    )
 }
 
 /// Parses a `NAME=FILE` `--ladder-definition` value.
@@ -358,11 +408,11 @@ fn find_open_dependencies(
         return Ok((OpenDependencies::new(), ReferenceFetchFailures::new()));
     }
 
-    let mut states: BTreeMap<(String, u64), Option<ItemState>> = BTreeMap::new();
+    let mut resolved: BTreeMap<(String, u64), Option<(ItemState, String)>> = BTreeMap::new();
     for (item_ref, fetched) in refs.iter().zip(fetch_items(bin, &refs)?) {
-        states.insert(
+        resolved.insert(
             (item_ref.project.clone(), item_ref.number),
-            fetched.map(|doc| doc.state),
+            fetched.map(|doc| (doc.state, doc.url)),
         );
     }
 
@@ -371,18 +421,24 @@ fn find_open_dependencies(
     for (key, citations) in per_issue {
         let open: Vec<_> = citations
             .iter()
-            .filter(|c| {
-                states.get(&(c.item_ref.project.clone(), c.item_ref.number))
-                    == Some(&Some(ItemState::Open))
+            .filter_map(|c| {
+                let (_, url) = resolved
+                    .get(&(c.item_ref.project.clone(), c.item_ref.number))
+                    .and_then(Option::as_ref)
+                    .filter(|(state, _)| *state == ItemState::Open)?;
+                let mut c = c.clone();
+                c.url = Some(url.clone());
+                Some(c)
             })
-            .cloned()
             .collect();
         if !open.is_empty() {
             dependencies.insert(key.clone(), open);
         }
         let failures = citations
             .into_iter()
-            .filter(|c| states.get(&(c.item_ref.project.clone(), c.item_ref.number)) == Some(&None))
+            .filter(|c| {
+                resolved.get(&(c.item_ref.project.clone(), c.item_ref.number)) == Some(&None)
+            })
             .map(|c| ReferenceFetchFailure {
                 item_ref: c.raw,
                 error: "not found".to_string(),
@@ -707,6 +763,18 @@ mod tests {
             text.contains("reference fetch failed: #404 (not found)"),
             "{text}"
         );
+
+        let style = TerminalStyle {
+            color: true,
+            hyperlinks: true,
+        };
+        for format in [RouteFormat::Json, RouteFormat::Yaml] {
+            assert_eq!(
+                render_output_with_style(&report, format, DEFAULT_MAX_INPUT_CHARS, &[], style)
+                    .unwrap(),
+                render_output(&report, format, DEFAULT_MAX_INPUT_CHARS).unwrap()
+            );
+        }
     }
 
     // ── fetch_docs (fake-gh shim) ────────────────────────────────────
@@ -820,7 +888,8 @@ mod tests {
         });
         let cited = serde_json::json!({
             "__typename": "Issue",
-            "title": "t2", "body": "b2", "state": cited_state, "url": "u2"
+            "title": "t2", "body": "b2", "state": cited_state,
+            "url": "https://github.com/rust-works/omni-dev/issues/2"
         });
         let path = dir.join("fake-gh");
         write_exec_script(
@@ -884,6 +953,10 @@ mod tests {
             .unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].raw, "#2");
+        assert_eq!(
+            open[0].url.as_deref(),
+            Some("https://github.com/rust-works/omni-dev/issues/2")
+        );
     }
 
     #[test]
