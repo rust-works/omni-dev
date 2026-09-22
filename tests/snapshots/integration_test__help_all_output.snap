@@ -4520,6 +4520,7 @@ Commands:
   paste-data                   Pastes delimited text into a range anchored at a destination cell, as if pasted from the clipboard (issue #1839, ADR-0083 §4). `delimiter`-form only. Same `--paste-type` gate mapping as `copy-paste`
   auto-fill                    Extends a series from source cells into an adjacent destination, using Sheets' own pattern-detection heuristics. Gated by the folder write-permission rules' `sheets-write` operation (issue #1840, ADR-0083 §1) — it writes ordinary cell content, doing nothing a `sheets clear` followed by a `sheets write` could not already do under the same grant. The filled values can never be previewed; see `auto-fill --help`
   sort-range                   Reorders rows in a range by one or more column keys. Gated by the folder `sheets-write` operation (issue #1842, ADR-0083 §3)
+  randomize-range              Shuffles the row order within a range into an order chosen by the server. Gated by the folder `sheets-write` **and** `sheets-structure` operations (issue #1845, ADR-0083 §§3, 5, 6) — a reordered row was measured carrying its formatting, notes and data-validation rules with it. The resulting order can never be previewed; see `randomize-range --help`
   text-to-columns              Splits a single column's delimited text across the adjacent columns to its right. Gated by the folder `sheets-write` **and** `sheets-structure` operations (issue #1843, ADR-0083 §§1, 5) — it writes ordinary cell content, and carries the source cell's formatting into the columns it spills into. How many columns the split needs, and the values it writes, can never be previewed; see `text-to-columns --help`
   help                         Print this message or the help of the given subcommand(s)
 
@@ -5771,6 +5772,26 @@ Options:
       --lease <TOKEN>       The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>     Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets randomize-range - Shuffles the row order within a range into an order chosen by the server. Gated by the folder `sheets-write` **and** `sheets-structure` operations (issue #1845, ADR-0083 §§3, 5, 6) — a reordered row was measured carrying its formatting, notes and data-validation rules with it. The resulting order can never be previewed; see `randomize-range --help`
+
+Shuffles the row order within a range into an order chosen by the server. Gated by the folder `sheets-write` **and** `sheets-structure` operations (issue #1845, ADR-0083 §§3, 5, 6) — a reordered row was measured carrying its formatting, notes and data-validation rules with it. The resulting order can never be previewed; see `randomize-range --help`
+
+Usage: randomize-range [OPTIONS] --range <A1> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --range <A1>       Fully bounded A1 range to randomize, optionally carrying its own `Sheet!` prefix (for example `A2:D100`)
+      --dry-run          Reports the gate verdict and request shape without calling `spreadsheets.batchUpdate` or reading cell values
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================

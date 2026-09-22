@@ -26,6 +26,7 @@ pub(crate) mod named_range;
 pub(crate) mod paste;
 pub(crate) mod pivot;
 pub(crate) mod protection;
+pub(crate) mod randomize_range;
 pub(crate) mod read;
 pub(crate) mod sort_range;
 pub(crate) mod structure;
@@ -362,6 +363,13 @@ pub enum SheetsSubcommands {
     /// Reorders rows in a range by one or more column keys. Gated by the
     /// folder `sheets-write` operation (issue #1842, ADR-0083 §3).
     SortRange(sort_range::SortRangeCommand),
+    /// Shuffles the row order within a range into an order chosen by the
+    /// server. Gated by the folder `sheets-write` **and** `sheets-structure`
+    /// operations (issue #1845, ADR-0083 §§3, 5, 6) — a reordered row was
+    /// measured carrying its formatting, notes and data-validation rules
+    /// with it. The resulting order can never be previewed; see
+    /// `randomize-range --help`.
+    RandomizeRange(randomize_range::RandomizeRangeCommand),
     /// Splits a single column's delimited text across the adjacent
     /// columns to its right. Gated by the folder `sheets-write` **and**
     /// `sheets-structure` operations (issue #1843, ADR-0083 §§1, 5) — it
@@ -461,6 +469,7 @@ impl SheetsCommand {
             SheetsSubcommands::PasteData(cmd) => cmd.execute(client).await,
             SheetsSubcommands::AutoFill(cmd) => cmd.execute(client).await,
             SheetsSubcommands::SortRange(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::RandomizeRange(cmd) => cmd.execute(client).await,
             SheetsSubcommands::TextToColumns(cmd) => cmd.execute(client).await,
         }
     }
@@ -632,6 +641,20 @@ mod tests {
                 dimension: None,
                 fill_length: None,
                 alternate_series: false,
+                dry_run: true,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+
+        assert!(dispatch(
+            SheetsSubcommands::RandomizeRange(randomize_range::RandomizeRangeCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: Some("Sheet1".to_string()),
+                range: "A1:A3".to_string(),
                 dry_run: true,
                 lease: no_lease(),
                 output: crate::cli::drive::format::OutputFormat::Table,

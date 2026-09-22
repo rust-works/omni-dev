@@ -131,6 +131,17 @@ pub enum DriveOperation {
     /// formatting into the spill cells, so §5's fixed consequence
     /// applies and `text-to-columns` needs [`Self::SheetsStructure`] too,
     /// the two-operation composition `add-pivot-table` uses.
+    ///
+    /// Since issue #1845 ([ADR-0083](../../docs/adrs/adr-0083.md) §§3, 5),
+    /// also one half of `randomize-range`'s gate, alongside
+    /// [`Self::SheetsStructure`], for the cell values a reorder permutes.
+    /// ADR-0083 §3 proposed this operation alone and §5 made that
+    /// provisional on live verification, same as `text-to-columns`; the
+    /// live run found a reordered row carries its formatting, notes and
+    /// data-validation rules with it, so §5's fixed consequence applies
+    /// here too. (`sort-range`, #1842, predates this measurement and
+    /// still gates on this operation alone — a mis-gating filed as a
+    /// follow-up, #1870, not corrected by this change.)
     SheetsWrite,
     /// Structurally edit an existing Google Sheet via `spreadsheets.batchUpdate`
     /// (issue #1613, [ADR-0075](../../docs/adrs/adr-0075.md) §1) — adding,
@@ -252,6 +263,17 @@ pub enum DriveOperation {
     /// a bold, pink column left every cell it wrote bold and pink. That is
     /// this operation's own subject matter, so a `sheets-write` grant
     /// alone cannot confer it.
+    ///
+    /// Since issue #1845 ([ADR-0083](../../docs/adrs/adr-0083.md) §§3, 5),
+    /// also the second half of `randomize-range`'s gate, alongside
+    /// [`Self::SheetsWrite`]. Not because a reorder is a structural edit in
+    /// itself, but because it was measured carrying a row's **formatting,
+    /// notes and data-validation rules** with it, and rewriting the
+    /// relative references of any formula moved along with it — a live
+    /// probe reordering a bold, pink row with a note, a validation rule
+    /// and a relative formula moved all four with the row. That is this
+    /// operation's own subject matter, so a `sheets-write` grant alone
+    /// cannot confer it.
     SheetsStructure,
     /// Destructively edit an existing Google Sheet via `spreadsheets.batchUpdate`
     /// (issue #1623, [ADR-0077](../../docs/adrs/adr-0077-sheets-deletion-via-batchupdate.md)) — deleting a

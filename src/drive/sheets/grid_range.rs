@@ -107,6 +107,35 @@ pub(crate) fn non_blank_locations(
     locations
 }
 
+/// Warns when a selected column span is narrower than the sheet's
+/// allocated width — reordering (`sort-range`/`randomize-range`) only part
+/// of a wider table can detach a record's other columns from the row it
+/// moves with. `verb` names the operation in the warning text (`"sorting"`,
+/// `"randomizing"`); `start`/`end` are the selected range's zero-based,
+/// end-exclusive column bounds; `allocated` is the sheet's own
+/// `gridProperties.columnCount`, when the workbook metadata carried one.
+///
+/// Shared by `sort_range.rs` and `randomize_range.rs` (previously a private
+/// copy in the former) — the same "one tested implementation, not a
+/// per-file convention" reasoning [`non_blank_locations`]'s doc comment
+/// gives.
+pub(crate) fn width_warning(
+    verb: &str,
+    start: i64,
+    end: i64,
+    allocated: Option<i64>,
+) -> Option<String> {
+    match allocated {
+        Some(columns) if start == 0 && end >= columns => None,
+        Some(columns) => Some(format!(
+            "selected columns {start}..{end} of the sheet's {columns} allocated columns; if data exists outside the selection, {verb} can separate records from their other columns"
+        )),
+        None => Some(format!(
+            "the selected range may be narrower than its rows; {verb} can separate records from columns outside the selection"
+        )),
+    }
+}
+
 /// Whether every bound of `grid` is set — i.e. it names a fixed rectangle
 /// rather than an open-ended column/row span (`A:A`, `5:5`).
 pub(crate) fn is_bounded(grid: &GridRange) -> bool {

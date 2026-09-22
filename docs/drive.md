@@ -627,8 +627,8 @@ operation anywhere in a target's ancestor chain:
 | `create`            | deny    | `create`, `sheets create` |
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets sort-range` — cell values; `sheets text-to-columns` (also needs `sheets-structure`); `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `text-to-columns` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets sort-range` — cell values; `sheets text-to-columns` (also needs `sheets-structure`); `sheets randomize-range` (also needs `sheets-structure`); `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `text-to-columns` (also needs `sheets-write`), `randomize-range` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -1805,6 +1805,56 @@ actually contain data. Sorting only part of a wider table can detach records
 from their other columns; formulas and references outside the range may then
 observe a different row's value. Sort keys use absolute, zero-based sheet
 column indexes and must fall inside the selected range.
+
+#### `drive sheets randomize-range`
+
+Shuffles the row order within a fully bounded range into an order chosen by
+the server — the resulting order is not caller-specified or predictable.
+Gated under **both `sheets-write` and `sheets-structure`** (issue #1845,
+[ADR-0083](adrs/adr-0083.md) §§3, 5, 6).
+
+ADR-0083 §3 proposed `sheets-write` alone — a reorder permutes values
+within a caller-named range, which a `sheets-write` grant could already
+replace or clear — and §5 made that provisional on live verification,
+same as `text-to-columns`. The live run settled it the other way:
+reordering a probe row that carried bold+pink formatting, a note and a
+data-validation rule moved all three with the row, and a relative formula
+inside the range moved with its row with its reference rewritten to match
+(`=B3*2` became `=B2*2` once its row landed on row 2, so it keeps pointing
+at its own row). Formatting, notes and validation rules are
+`sheets-structure`'s own subject matter, so the union is the honest gate.
+Neither half opens it alone, and a refusal names the half that was
+missing.
+
+```bash
+omni-dev drive sheets randomize-range <ID> --sheet Q1 --range A2:D100
+
+# Preview the gate and request; this never reads values or calls batchUpdate.
+omni-dev drive sheets randomize-range <ID> --sheet Q1 --range A2:D100 --dry-run
+```
+
+The range must be bounded (`A2:D100`, not `A:A` or `2:2`) — `sort-range`'s
+own requirement.
+
+**The resulting order can never be previewed, and this crate never sees it
+even after a real run.** `randomizeRange` carries no response object, and
+which order the server settles on is entirely its own choice:
+
+```
+$ omni-dev drive sheets randomize-range <ID> --sheet Q1 --range A2:D100 --dry-run
+Would randomize the row order of 'Q1'!A2:D100 in 'Budget'
+  the resulting order is chosen by the server and cannot be previewed or reported; the previous row order is not preserved
+  references outside the range may observe values from a different row after randomizing
+```
+
+`--dry-run` leads with the range-width-vs-sheet's-allocated-width
+record-integrity caveat when the selected columns are narrower than the
+sheet, the same conservative warning `sort-range` gives: the metadata does
+not say which columns actually contain data, so reordering only part of a
+wider table can detach a record's other columns — measured live: cells in
+the same rows but outside the selected columns do not move. The smaller
+"references outside the range may see a different row's value" caveat
+follows it. Never a cell's contents.
 
 #### `drive sheets auto-fill`
 
