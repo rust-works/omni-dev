@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^(apply_patch|Edit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)\"/.codex/hooks/format-rust.sh",
+            "timeout": 30,
+            "statusMessage": "Formatting Rust"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)\"/.codex/hooks/check-snapshots.sh",
+            "timeout": 10,
+            "statusMessage": "Checking CLI snapshots"
+          }
+        ]
+      }
+    ]
+  }
+}
