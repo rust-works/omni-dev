@@ -5675,7 +5675,7 @@ omni-dev drive sheets paste-data - Pastes delimited text into a range anchored a
 
 Pastes delimited text into a range anchored at a destination cell, as if pasted from the clipboard (issue #1839, ADR-0083 §4). `delimiter`-form only. Same `--paste-type` gate mapping as `copy-paste`
 
-Usage: paste-data [OPTIONS] --destination <[SHEET!]A1> --data <PATH|-> <SPREADSHEET_ID>
+Usage: paste-data [OPTIONS] --destination <[SHEET!]A1> <SPREADSHEET_ID>
 
 Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
@@ -5683,8 +5683,9 @@ Arguments:
 Options:
       --sheet <NAME>              Default sheet for `--destination` when it lacks its own `Sheet!` prefix
       --destination <[SHEET!]A1>  The single-cell destination. May carry its own `Sheet!` prefix
-      --data <PATH|->             The delimited text to paste: a local file path, or `-` to read stdin. Sent verbatim — never parsed into cells locally
-      --delimiter <DELIMITER>     The delimiter splitting `--data` into columns [default: "\t"]
+      --data <TEXT>               The delimited text to paste, given literally. Sent verbatim — never parsed into cells locally. Mutually exclusive with `--data-file`; exactly one of the two is required
+      --data-file <PATH|->        The delimited text to paste, read from a local file, or `-` to read stdin. Sent verbatim — never parsed into cells locally
+      --delimiter <DELIMITER>     The delimiter splitting each row of the pasted block into columns [default: "\t"]
       --paste-type <PASTE_TYPE>   What to carry over. Defaults to `values`, not `normal`: delimited text carries no formats, merges or validation for `normal` to add. `normal` is still selectable — the API does not document a normal paste of delimited text as doing anything beyond values — and resolves both operations [default: values] [possible values: normal, values, formula, format]
       --dry-run                   Reports the gate verdict and the region that would be overwritten at the destination, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>             The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`

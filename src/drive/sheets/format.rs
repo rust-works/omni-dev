@@ -972,7 +972,12 @@ async fn read_discarded_cells(
     if is_single_cell {
         return Ok(Vec::new());
     }
-    let a1_range = grid_range_to_a1(sheet_title, grid);
+    // `None` only for an unbounded or empty target, neither of which
+    // reaches here: `resolve_target` refuses the first and the single-cell
+    // short-circuit above covers the second.
+    let Some(a1_range) = grid_range::bounded_range_to_a1(sheet_title, grid) else {
+        return Ok(Vec::new());
+    };
     let values = api
         .values_get(spreadsheet_id, &a1_range, ValueRenderOption::Formatted)
         .await
@@ -985,24 +990,6 @@ async fn read_discarded_cells(
         grid.start_row_index.unwrap_or(0),
         grid.start_column_index.unwrap_or(0),
     ))
-}
-
-/// Renders a numeric [`GridRange`] back to an A1 string for a `values.get`
-/// read. Only ever called on a target `resolve_target` has already refused
-/// unless fully bounded (see the `MergeCells` check there) — an unbounded
-/// range has no fixed extent this could name.
-fn grid_range_to_a1(sheet_title: &str, grid: &GridRange) -> String {
-    let (Some(r0), Some(r1), Some(c0), Some(c1)) = (
-        grid.start_row_index,
-        grid.end_row_index,
-        grid.start_column_index,
-        grid.end_column_index,
-    ) else {
-        unreachable!("merge-cells targets are refused earlier unless fully bounded")
-    };
-    let start = format!("{}{}", grid_range::column_index_to_letters(c0), r0 + 1);
-    let end = format!("{}{}", grid_range::column_index_to_letters(c1 - 1), r1);
-    a1::compose(Some(sheet_title), Some(&format!("{start}:{end}"))).unwrap_or_default()
 }
 
 /// `row_offset`/`col_offset` are the target range's own start row/column —
@@ -1727,31 +1714,6 @@ mod tests {
         // outcome would be `Failed` instead — the absence of that failure
         // is itself the assertion that the refusal happened before any
         // read of the (unbounded) target's values.
-    }
-
-    #[test]
-    fn grid_range_to_a1_round_trips_a_bounded_range() {
-        let grid = GridRange {
-            sheet_id: 1,
-            start_row_index: Some(0),
-            end_row_index: Some(3),
-            start_column_index: Some(0),
-            end_column_index: Some(2),
-        };
-        assert_eq!(grid_range_to_a1("Q1", &grid), "'Q1'!A1:B3");
-    }
-
-    #[test]
-    #[should_panic(expected = "merge-cells targets are refused earlier unless fully bounded")]
-    fn grid_range_to_a1_panics_on_an_unbounded_range() {
-        let grid = GridRange {
-            sheet_id: 1,
-            start_row_index: None,
-            end_row_index: Some(3),
-            start_column_index: Some(0),
-            end_column_index: Some(2),
-        };
-        let _ = grid_range_to_a1("Q1", &grid);
     }
 
     // ── Verb helpers ─────────────────────────────────────────────────

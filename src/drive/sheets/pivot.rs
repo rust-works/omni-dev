@@ -72,9 +72,8 @@ use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
-    BatchUpdateRequestItem, CellSnapshot, GridCoordinate, GridRange, PivotCellData,
-    PivotFilterCriteria, PivotFilterSpec, PivotGroup, PivotRowData, PivotTable, PivotValue,
-    UpdateCellsRequest,
+    BatchUpdateRequestItem, CellSnapshot, GridCoordinate, PivotCellData, PivotFilterCriteria,
+    PivotFilterSpec, PivotGroup, PivotRowData, PivotTable, PivotValue, UpdateCellsRequest,
 };
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
@@ -627,7 +626,7 @@ async fn pivot_inner(
         Err(result) => return gated(result),
     };
 
-    if !is_single_cell(&anchor_grid) {
+    if !grid_range::is_single_cell(&anchor_grid) {
         return gated(PivotResult::RefusedInvalidAnchor {
             detail: format!(
                 "--anchor '{}' must name a single cell, not a range",
@@ -844,13 +843,6 @@ async fn pivot_inner(
     };
     drop(lease_grant);
     gated(result)
-}
-
-/// Whether `grid` names exactly one cell.
-fn is_single_cell(grid: &GridRange) -> bool {
-    grid_range::is_bounded(grid)
-        && grid.end_row_index.unwrap_or(0) - grid.start_row_index.unwrap_or(0) == 1
-        && grid.end_column_index.unwrap_or(0) - grid.start_column_index.unwrap_or(0) == 1
 }
 
 /// Composes `--source` with `--sheet`: `source` carrying its own `Sheet!`
@@ -1263,6 +1255,7 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::sheets::client::SHEETS_API_URL;
+    use crate::drive::sheets::types::GridRange;
     use crate::drive::test_support::seed_lease;
     use crate::test_support::env::MapEnv;
     use crate::utils::secret::Secret;

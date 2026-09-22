@@ -217,12 +217,18 @@ pub struct PasteDataCommand {
     #[arg(long, value_name = "[SHEET!]A1")]
     pub destination: String,
 
-    /// The delimited text to paste: a local file path, or `-` to read
-    /// stdin. Sent verbatim — never parsed into cells locally.
-    #[arg(long, value_name = "PATH|-")]
-    pub data: String,
+    /// The delimited text to paste, given literally. Sent verbatim —
+    /// never parsed into cells locally. Mutually exclusive with
+    /// `--data-file`; exactly one of the two is required.
+    #[arg(long, value_name = "TEXT", required_unless_present = "data_file")]
+    pub data: Option<String>,
 
-    /// The delimiter splitting `--data` into columns.
+    /// The delimited text to paste, read from a local file, or `-` to read
+    /// stdin. Sent verbatim — never parsed into cells locally.
+    #[arg(long, value_name = "PATH|-", conflicts_with = "data")]
+    pub data_file: Option<String>,
+
+    /// The delimiter splitting each row of the pasted block into columns.
     #[arg(long, default_value = "\t")]
     pub delimiter: String,
 
@@ -250,7 +256,16 @@ pub struct PasteDataCommand {
 impl PasteDataCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let data = read_data_text(&self.data)?;
+        // clap's `required_unless_present`/`conflicts_with` pair makes
+        // exactly one of the two reachable, so the `None`/`None` arm is
+        // `unreachable` in practice — an `anyhow` error rather than a
+        // panic, since a clap attribute is a weaker guarantee than the
+        // type system.
+        let data = match (self.data, self.data_file) {
+            (Some(text), _) => text,
+            (None, Some(path)) => read_data_text(&path)?,
+            (None, None) => anyhow::bail!("one of --data or --data-file is required"),
+        };
         let opts = PasteOptions {
             spreadsheet_id: self.spreadsheet_id,
             verb: PasteVerb::PasteData {
@@ -455,7 +470,8 @@ mod tests {
             spreadsheet_id: "sheet-1".to_string(),
             sheet: Some("Q1".to_string()),
             destination: "A1".to_string(),
-            data: path.to_str().unwrap().to_string(),
+            data: None,
+            data_file: Some(path.to_str().unwrap().to_string()),
             delimiter: "\t".to_string(),
             paste_type: PasteTypeArg::Values,
             dry_run: true,
@@ -463,6 +479,60 @@ mod tests {
             output: crate::cli::drive::format::OutputFormat::Table,
         };
         assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn paste_data_command_takes_literal_text_from_data() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let cmd = PasteDataCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: Some("Q1".to_string()),
+            destination: "A1".to_string(),
+            data: Some("1\t2".to_string()),
+            data_file: None,
+            delimiter: "\t".to_string(),
+            paste_type: PasteTypeArg::Values,
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[test]
+    fn the_data_flags_are_mutually_exclusive_and_one_is_required() {
+        use clap::CommandFactory as _;
+        let cmd = || PasteDataCommand::command().no_binary_name(true);
+        assert!(cmd()
+            .try_get_matches_from(["sheet-1", "--destination", "A1", "--data", "x"])
+            .is_ok());
+        assert!(cmd()
+            .try_get_matches_from(["sheet-1", "--destination", "A1", "--data-file", "-"])
+            .is_ok());
+        // Neither: refused, rather than pasting an empty block.
+        assert!(cmd()
+            .try_get_matches_from(["sheet-1", "--destination", "A1"])
+            .is_err());
+        // Both: refused, rather than one silently winning.
+        let err = cmd()
+            .try_get_matches_from([
+                "sheet-1",
+                "--destination",
+                "A1",
+                "--data",
+                "x",
+                "--data-file",
+                "clip.tsv",
+            ])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[tokio::test]
@@ -476,7 +546,8 @@ mod tests {
             spreadsheet_id: "sheet-1".to_string(),
             sheet: Some("Q1".to_string()),
             destination: "A1".to_string(),
-            data: "/definitely/not/here.tsv".to_string(),
+            data: None,
+            data_file: Some("/definitely/not/here.tsv".to_string()),
             delimiter: "\t".to_string(),
             paste_type: PasteTypeArg::Values,
             dry_run: true,
