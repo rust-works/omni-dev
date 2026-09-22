@@ -298,14 +298,14 @@ async fn delete_duplicates_inner(
         Ok(value) => value,
         Err(result) => return gated(result),
     };
-    // Bounded-only, `sort-range`'s rule. A dedupe over an open-ended range
-    // is exactly the blank-row hazard in the module docs, made total: it
-    // would reach every allocated row of the sheet.
+    // Bounded-only, `sort-range`'s rule. An open-ended dedupe would reach
+    // every allocated row of the sheet. A bounded range can still include
+    // blank rows past the data, so the preview warns about that separately.
     if !grid_range::is_bounded(&grid) {
         return gated(DeleteDuplicatesResult::RefusedInvalidRequest {
             detail: format!(
                 "'{composed}' is open-ended; delete-duplicates needs a fully bounded range (e.g. \
-                 A1:D100) so it cannot reach past the data"
+                 A1:D100) to avoid automatically spanning every allocated row"
             ),
         });
     }
@@ -1247,7 +1247,7 @@ mod tests {
     // ── refusals ────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn an_open_ended_range_is_refused_so_it_cannot_reach_past_the_data() {
+    async fn an_open_ended_range_is_refused_to_avoid_automatically_spanning_the_sheet() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
         mount_metadata(&server).await;
@@ -1258,7 +1258,10 @@ mod tests {
             panic!("expected a refusal"); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; an open-ended range always refuses here"
         };
         assert!(detail.contains("open-ended"), "{detail}");
-        assert!(detail.contains("past the data"), "{detail}");
+        assert!(
+            detail.contains("automatically spanning every allocated row"),
+            "{detail}"
+        );
     }
 
     #[tokio::test]
