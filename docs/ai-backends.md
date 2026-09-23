@@ -646,6 +646,14 @@ field. `OMNI_DEV_STRUCTURED_OUTPUT_DISABLE=true` is the same switch for every
 model at once; use the flag when only some of the models you route are behind
 such a gateway.
 
+**Thinking and effort** — omni-dev sends neither a `thinking` nor an
+`output_config.effort` field, so each model runs with its API defaults. On
+Claude Fable 5/5.1 and Claude Opus 5.5 thinking cannot be switched off, so
+every call spends part of its `max_tokens` budget on (omitted) thinking before
+the answer; the backends skip the leading `thinking` block and read the
+`text` block after it. Claude Opus 5.5 also defaults to `medium` effort, one
+level below Claude Opus 5's `high`, and omni-dev has no knob to raise it.
+
 **Model validation at preflight** — on the **Claude API** and **Bedrock**
 backends, an unknown model is rejected before any network call:
 

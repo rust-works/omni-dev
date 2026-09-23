@@ -669,10 +669,12 @@ the mapping from rung to model instead. A reasonable starting point, which has
 | `opus`       | `claude-opus-5-5`                                                                 |
 | `fable`      | `claude-fable-5-1` for design; consider `claude-opus-5-5` for implement or review |
 
-Keep `fable` → Fable 5.1 for design. Anthropic's "most work" claim leaves room
-for open-ended design and research, which is exactly what the `fable`
-description names. For implementation, where Opus 5.5 leads on coding
-benchmarks, downgrading a `fable` answer is the cheapest change to try first.
+Keep `fable` → Fable 5.1 for design. Anthropic's announcement gives coding
+benchmarks for the Opus 5.5 lead but none for open-ended design or research,
+which is exactly what the `fable` description names, so treating "most work"
+as covering design would be our inference, not theirs. For implementation,
+where Opus 5.5 leads on coding benchmarks, downgrading a `fable` answer is the
+cheapest change to try first.
 
 To have `route` emit versioned model names directly, register a custom ladder
 that keeps the `anthropic` descriptions byte for byte and changes only the
@@ -703,8 +705,9 @@ omni-dev ai jev route '#1234' --ladders claude --ladder-definition claude=claude
 
 Jev sees tier names as criterion keys, so versioned names are the same
 untested change as the `openai` and `gemini` ladders' names; treat their
-answers the same way. Re-running the #1779 evaluation is deferred until
-Claude Sonnet 5.5 ships ("within weeks" of Opus 5.5), since that release may
+answers the same way. Re-running the #1779 evaluation ([#1885](https://github.com/rust-works/omni-dev/issues/1885)) is deferred until
+Claude Sonnet 5.5 ships (Anthropic says it will follow Opus 5.5 "in the coming
+weeks"), since that release may
 date the `sonnet` description too and one evaluation can cover both.
 
 ### Custom ladders
