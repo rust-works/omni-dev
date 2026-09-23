@@ -1,3 +1,4 @@
+# Effort capabilities checked 2026-09-23; criteria are uncalibrated routing hypotheses.
 # The `openai` model ladder for `omni-dev ai jev route` (#1820):
 # terra (gpt-5.6-terra) / sol (gpt-5.6-sol) / astra (gpt-6-astra).
 #
@@ -5,18 +6,97 @@
 # The descriptions are the anthropic ladder's, rung for rung, byte-identical:
 # that text is the only text validated against jev-1.13.0 (#1779), and
 # rewording shifts every answer. Only the tier names differ. This ladder has
-# not itself been evaluated, so treat its answers as a starting point.
+# been compared in docs/evaluations/jev-effort-1888; downstream success
+# remains uncalibrated, so treat its answers as a starting point.
 tiers:
   - name: terra
+    models:
+      - name: gpt-5.6-terra
+        verified: "2026-09-23"
+        sources: [https://developers.openai.com/api/docs/models/gpt-5.6-terra]
+        effort:
+          kind: configurable
+          control: reasoning.effort
+          supported_levels: [none, low, medium, high, xhigh, max]
+          levels:
+            - name: none
+              description: >-
+                No explicit reasoning is needed: direct mechanical edits or exact application of a supplied checklist with no unresolved interactions.
+            - name: low
+              description: >-
+                The stage is short, local and familiar, with explicit requirements and an obvious solution or review checklist.
+            - name: medium
+              description: >-
+                The stage needs several reasoning steps and checking ordinary interactions, with a clear approach and bounded scope.
+            - name: high
+              description: >-
+                The stage needs sustained reasoning about subtle behavior, multiple components, non-obvious failure modes or competing approaches.
+            - name: xhigh
+              description: >-
+                The stage needs extended exploration, long-horizon implementation or review, or repeated testing of interacting hypotheses beyond high effort.
+            - name: max
+              description: >-
+                The stage approaches this model's capability limit and requires its deepest supported analysis; lower effort would leave major unresolved risks.
     description: >-
       Reliable at executing a clear specification and following patterns that already exist in the
       codebase. Tends to miss non-obvious interactions between parts and does not question the
       specification.
   - name: sol
+    models:
+      - name: gpt-5.6-sol
+        verified: "2026-09-23"
+        sources: [https://developers.openai.com/api/docs/models/gpt-5.6-sol]
+        effort:
+          kind: configurable
+          control: reasoning.effort
+          supported_levels: [none, low, medium, high, xhigh, max]
+          levels:
+            - name: none
+              description: >-
+                No explicit reasoning is needed: direct mechanical edits or exact application of a supplied checklist with no unresolved interactions.
+            - name: low
+              description: >-
+                The stage is short, local and familiar, with explicit requirements and an obvious solution or review checklist.
+            - name: medium
+              description: >-
+                The stage needs several reasoning steps and checking ordinary interactions, with a clear approach and bounded scope.
+            - name: high
+              description: >-
+                The stage needs sustained reasoning about subtle behavior, multiple components, non-obvious failure modes or competing approaches.
+            - name: xhigh
+              description: >-
+                The stage needs extended exploration, long-horizon implementation or review, or repeated testing of interacting hypotheses beyond high effort.
+            - name: max
+              description: >-
+                The stage approaches this model's capability limit and requires its deepest supported analysis; lower effort would leave major unresolved risks.
     description: >-
       Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
       ordering, once the overall direction is set. Can under-explore a genuinely open design space.
   - name: astra
+    models:
+      - name: gpt-6-astra
+        verified: "2026-09-23"
+        sources: [https://developers.openai.com/api/docs/models/gpt-6-astra]
+        effort:
+          kind: configurable
+          control: reasoning.effort
+          supported_levels: [low, medium, high, xhigh, max]
+          levels:
+            - name: low
+              description: >-
+                The stage is short, local and familiar, with explicit requirements and an obvious solution or review checklist.
+            - name: medium
+              description: >-
+                The stage needs several reasoning steps and checking ordinary interactions, with a clear approach and bounded scope.
+            - name: high
+              description: >-
+                The stage needs sustained reasoning about subtle behavior, multiple components, non-obvious failure modes or competing approaches.
+            - name: xhigh
+              description: >-
+                The stage needs extended exploration, long-horizon implementation or review, or repeated testing of interacting hypotheses beyond high effort.
+            - name: max
+              description: >-
+                The stage approaches this model's capability limit and requires its deepest supported analysis; lower effort would leave major unresolved risks.
     description: >-
       Strongest at open-ended design and research: choosing between architectures, working in
       unfamiliar territory with no precedent in the codebase, anticipating failure modes, and

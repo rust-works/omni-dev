@@ -1,3 +1,4 @@
+# Effort capabilities checked 2026-09-23; criteria are uncalibrated routing hypotheses.
 # The `anthropic` model ladder for `omni-dev ai jev route` (#1779, #1820):
 # sonnet (Claude Sonnet) / opus (Claude Opus) / fable (Claude Fable).
 #
@@ -17,15 +18,87 @@
 # is reserved for the design stage).
 tiers:
   - name: sonnet
+    models:
+      - name: claude-sonnet-5
+        verified: "2026-09-23"
+        sources: [https://platform.claude.com/docs/en/build-with-claude/effort]
+        effort:
+          kind: configurable
+          control: output_config.effort
+          supported_levels: [low, medium, high, xhigh, max]
+          levels:
+            - name: low
+              description: >-
+                The stage is short, local and familiar, with explicit requirements and an obvious solution or review checklist.
+            - name: medium
+              description: >-
+                The stage needs several reasoning steps and checking ordinary interactions, with a clear approach and bounded scope.
+            - name: high
+              description: >-
+                The stage needs sustained reasoning about subtle behavior, multiple components, non-obvious failure modes or competing approaches.
+            - name: xhigh
+              description: >-
+                The stage needs extended exploration, long-horizon implementation or review, or repeated testing of interacting hypotheses beyond high effort.
+            - name: max
+              description: >-
+                The stage approaches this model's capability limit and requires its deepest supported analysis; lower effort would leave major unresolved risks.
     description: >-
       Reliable at executing a clear specification and following patterns that already exist in the
       codebase. Tends to miss non-obvious interactions between parts and does not question the
       specification.
   - name: opus
+    models:
+      - name: claude-opus-5-5
+        verified: "2026-09-23"
+        sources: [https://platform.claude.com/docs/en/build-with-claude/effort]
+        effort:
+          kind: configurable
+          control: output_config.effort
+          supported_levels: [low, medium, high, xhigh, max]
+          levels:
+            - name: low
+              description: >-
+                The stage is short, local and familiar, with explicit requirements and an obvious solution or review checklist.
+            - name: medium
+              description: >-
+                The stage needs several reasoning steps and checking ordinary interactions, with a clear approach and bounded scope.
+            - name: high
+              description: >-
+                The stage needs sustained reasoning about subtle behavior, multiple components, non-obvious failure modes or competing approaches.
+            - name: xhigh
+              description: >-
+                The stage needs extended exploration, long-horizon implementation or review, or repeated testing of interacting hypotheses beyond high effort.
+            - name: max
+              description: >-
+                The stage approaches this model's capability limit and requires its deepest supported analysis; lower effort would leave major unresolved risks.
     description: >-
       Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
       ordering, once the overall direction is set. Can under-explore a genuinely open design space.
   - name: fable
+    models:
+      - name: claude-fable-5-1
+        verified: "2026-09-23"
+        sources: [https://platform.claude.com/docs/en/build-with-claude/effort]
+        effort:
+          kind: configurable
+          control: output_config.effort
+          supported_levels: [low, medium, high, xhigh, max]
+          levels:
+            - name: low
+              description: >-
+                The stage is short, local and familiar, with explicit requirements and an obvious solution or review checklist.
+            - name: medium
+              description: >-
+                The stage needs several reasoning steps and checking ordinary interactions, with a clear approach and bounded scope.
+            - name: high
+              description: >-
+                The stage needs sustained reasoning about subtle behavior, multiple components, non-obvious failure modes or competing approaches.
+            - name: xhigh
+              description: >-
+                The stage needs extended exploration, long-horizon implementation or review, or repeated testing of interacting hypotheses beyond high effort.
+            - name: max
+              description: >-
+                The stage approaches this model's capability limit and requires its deepest supported analysis; lower effort would leave major unresolved risks.
     description: >-
       Strongest at open-ended design and research: choosing between architectures, working in
       unfamiliar territory with no precedent in the codebase, anticipating failure modes, and

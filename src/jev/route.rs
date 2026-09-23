@@ -29,6 +29,8 @@ use crate::provider::{IssueDoc, ItemState};
 
 pub use crate::jev::input::TRUNCATION_MARKER;
 
+pub mod effort;
+
 /// The three stage questions, each missing its per-tier criteria.
 const STAGE_QUESTIONS_YAML: &str = include_str!("../templates/jev-route-questions.yaml");
 
@@ -126,7 +128,7 @@ pub struct ReferenceFetchFailure {
 }
 
 /// One stage of the work on an issue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Stage {
     /// Choosing the approach, settling open questions, writing a plan.
@@ -165,6 +167,8 @@ pub struct Tier {
     pub name: String,
     /// What this class is reliable at, shown to Jev as the option's criterion.
     pub description: String,
+    /// Concrete downstream models and their effort capabilities; absent for legacy ladders.
+    pub models: Option<Vec<effort::Model>>,
 }
 
 /// The on-disk shape of a tiers file.
@@ -199,6 +203,11 @@ impl Tiers {
             }
             if !seen.insert(tier.name.as_str()) {
                 bail!("tier {:?} is defined more than once", tier.name);
+            }
+        }
+        for tier in &file.tiers {
+            if let Some(models) = &tier.models {
+                effort::validate(models).with_context(|| format!("rung {:?}", tier.name))?;
             }
         }
         Ok(Self(file.tiers))
@@ -256,9 +265,10 @@ impl Ladder {
     }
 }
 
-/// Builds the stage questions for every ladder: the embedded wording, with
-/// one criterion per tier added, keyed `<provider>.stage_<stage>` so one
-/// request carries every ladder's three questions.
+/// Builds class and per-model effort questions for every ladder.
+///
+/// Class questions use the embedded wording with one criterion per tier,
+/// keyed `<provider>.stage_<stage>`. All questions share one request.
 pub fn build_route_questions(ladders: &[Ladder]) -> Result<BTreeMap<String, Question>> {
     let templates: BTreeMap<String, Question> = serde_yaml::from_str(STAGE_QUESTIONS_YAML)
         .context("Failed to parse the embedded stage questions")?;
@@ -297,6 +307,9 @@ pub fn build_route_questions(ladders: &[Ladder]) -> Result<BTreeMap<String, Ques
                 .with_context(|| format!("stage question {key:?} for {:?}", ladder.name))?;
             questions.insert(format!("{}.{key}", ladder.name), question);
         }
+    }
+    for ladder in ladders {
+        effort::add_questions(ladder, &mut questions);
     }
     Ok(questions)
 }
@@ -341,6 +354,9 @@ pub struct StageAnswer {
     pub confidence: f64,
     /// The probability of every option offered.
     pub probabilities: BTreeMap<String, f64>,
+    /// Effort advice for every rung and its concrete models, independent of the selected rung.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub effort_by_model: BTreeMap<String, Vec<effort::ModelEffort>>,
 }
 
 /// The answers for all three stages of one issue.
@@ -670,7 +686,15 @@ fn provider_routes(
     ladders
         .iter()
         .map(|ladder| {
-            let stages = stage_answers(answers, ladder)?;
+            let mut stages = stage_answers(answers, ladder)?;
+            for (stage, answer) in [
+                (Stage::Design, &mut stages.design),
+                (Stage::Implement, &mut stages.implement),
+                (Stage::Review, &mut stages.review),
+            ] {
+                answer.effort_by_model =
+                    effort::decode(ladder, stage, answer, answers, close_call)?;
+            }
             let route = ProviderRoute {
                 class: issue_class(&stages, &ladder.tiers),
                 close_calls: close_calls(&stages, close_call),
@@ -707,6 +731,7 @@ fn stage_answers(answers: &BTreeMap<String, Answer>, ladder: &Ladder) -> Result<
             choice: choice.clone(),
             confidence: *confidence,
             probabilities: probabilities.clone(),
+            effort_by_model: BTreeMap::new(),
         })
     };
     Ok(StageAnswers {
@@ -944,7 +969,7 @@ fn render_provider_line(
     ladder: Option<&Ladder>,
     style: TerminalStyle,
 ) -> Vec<String> {
-    if route_has_multi_model_tier(route) {
+    let mut lines = if route_has_multi_model_tier(route) {
         render_provider_block(provider, route, provider_count, ladder, style)
     } else {
         vec![render_provider_line_compact(
@@ -954,7 +979,15 @@ fn render_provider_line(
             ladder,
             style,
         )]
+    };
+    for stage in Stage::ALL {
+        lines.extend(effort::render(
+            stage,
+            &route.stages.get(stage).effort_by_model,
+            ladder,
+        ));
     }
+    lines
 }
 
 /// Renders one provider's routing as an indented line, e.g. `  sonnet —
@@ -1238,8 +1271,17 @@ mod tests {
         Provider::Anthropic.tiers().unwrap()
     }
 
+    // Existing class-only fixtures exercise backward compatibility; effort tests use real built-ins.
+    fn class_only(provider: Provider) -> Result<Ladder> {
+        let mut ladder = Ladder::builtin(provider)?;
+        for tier in &mut ladder.tiers.0 {
+            tier.models = None;
+        }
+        Ok(ladder)
+    }
+
     fn anthropic() -> Vec<Ladder> {
-        vec![Ladder::builtin(Provider::Anthropic).unwrap()]
+        vec![class_only(Provider::Anthropic).unwrap()]
     }
 
     fn tier_names(tiers: &Tiers) -> Vec<&str> {
@@ -1312,7 +1354,7 @@ mod tests {
 
     #[test]
     fn ladders_are_named_by_provider_or_a_custom_name() {
-        let ladder = Ladder::builtin(Provider::Gemini).unwrap();
+        let ladder = class_only(Provider::Gemini).unwrap();
         assert_eq!(ladder.name, "gemini");
         let custom = Ladder::named("mine".to_string(), default_tiers());
         assert_eq!(custom.name, "mine");
@@ -1456,8 +1498,8 @@ mod tests {
     #[test]
     fn questions_are_keyed_per_provider_in_one_map() {
         let ladders = [
-            Ladder::builtin(Provider::Anthropic).unwrap(),
-            Ladder::builtin(Provider::OpenAi).unwrap(),
+            class_only(Provider::Anthropic).unwrap(),
+            class_only(Provider::OpenAi).unwrap(),
         ];
         let questions = build_route_questions(&ladders).unwrap();
         let keys: Vec<&String> = questions.keys().collect();
@@ -1578,6 +1620,7 @@ mod tests {
 
     fn answer(choice: &str, confidence: f64) -> StageAnswer {
         StageAnswer {
+            effort_by_model: BTreeMap::new(),
             choice: choice.to_string(),
             confidence,
             probabilities: BTreeMap::new(),
@@ -1767,7 +1810,7 @@ mod tests {
             ("anthropic.stage_implement".to_string(), choice("sonnet")),
             ("anthropic.stage_review".to_string(), choice("opus")),
         ]);
-        let err = stage_answers(&answers, &Ladder::builtin(Provider::OpenAi).unwrap()).unwrap_err();
+        let err = stage_answers(&answers, &class_only(Provider::OpenAi).unwrap()).unwrap_err();
         assert!(err.to_string().contains("openai.stage_design"), "{err}");
     }
 
@@ -1804,8 +1847,8 @@ mod tests {
         let err = validate_options(&[doc(1, ItemState::Open)], &[], &opts()).unwrap_err();
         assert!(err.to_string().contains("no ladders"), "{err}");
         let twice = [
-            Ladder::builtin(Provider::Gemini).unwrap(),
-            Ladder::builtin(Provider::Gemini).unwrap(),
+            class_only(Provider::Gemini).unwrap(),
+            class_only(Provider::Gemini).unwrap(),
         ];
         let err = validate_options(&[doc(1, ItemState::Open)], &twice, &opts()).unwrap_err();
         assert!(
@@ -1916,8 +1959,8 @@ mod tests {
             .await;
         let client = JevClient::new(&server.uri(), "key").unwrap();
         let ladders = [
-            Ladder::builtin(Provider::Anthropic).unwrap(),
-            Ladder::builtin(Provider::OpenAi).unwrap(),
+            class_only(Provider::Anthropic).unwrap(),
+            class_only(Provider::OpenAi).unwrap(),
         ];
         let dependencies = OpenDependencies::from([(
             ("rust-works/omni-dev".to_string(), 7),
@@ -1992,8 +2035,8 @@ mod tests {
             .await;
         let client = JevClient::new(&server.uri(), "key").unwrap();
         let ladders = [
-            Ladder::builtin(Provider::Anthropic).unwrap(),
-            Ladder::builtin(Provider::Gemini).unwrap(),
+            class_only(Provider::Anthropic).unwrap(),
+            class_only(Provider::Gemini).unwrap(),
         ];
         let report = run_route(
             &client,
@@ -2852,7 +2895,7 @@ mod tests {
 
     #[test]
     fn complexity_uses_tier_order_for_built_in_and_custom_ladders() {
-        let anthropic = Ladder::builtin(Provider::Anthropic).unwrap();
+        let anthropic = class_only(Provider::Anthropic).unwrap();
         assert_eq!(
             choice_complexity(NO_DESIGN, &anthropic),
             Some(Complexity::Low)
@@ -2958,7 +3001,7 @@ mod tests {
         let text = render_route_text_styled(
             &report,
             DEFAULT_MAX_INPUT_CHARS,
-            &[Ladder::builtin(Provider::Anthropic).unwrap()],
+            &[class_only(Provider::Anthropic).unwrap()],
             style,
         );
         assert!(

@@ -45,11 +45,11 @@ pub(super) enum RouteFormat {
     Text,
 }
 
-/// Routes issues to model classes for their design, implement and review stages.
+/// Routes issues to model classes and per-model effort for design, implement and review.
 #[derive(Parser)]
 #[command(
     long_about = "Routes issues to model classes for their design, implement and review \
-stages.\n\nMakes one Jev call per issue. Jev judges the issue's title, body and human \
+stages, with effort advice for every model in each requested ladder.\n\nMakes one Jev call per issue. Jev judges the issue's title, body and human \
 comments (never the issues or pull requests it references) and picks, for each stage, the \
 least capable class likely to do it correctly with no rework. The issue's class is the \
 higher of its design and implement choices, and a stage whose confidence is below \
@@ -60,7 +60,11 @@ still in one Jev call per issue, and the output nests stages, class and close_ca
 each ladder's name. --ladder-definition NAME=FILE registers a custom ladder under NAME, its \
 tiers loaded from a YAML file, so it can be routed alongside built-in ladders in the same \
 --ladders list; a built-in name cannot be redefined, and a definition never listed in \
---ladders is an error.\n\nEach open issue or pull request the text \
+--ladders is an error.\n\nEach stage also reports effort_by_model for every rung, using each model's supported native \
+levels. Legacy custom ladders without effort metadata report unspecified. A stage with no \
+remaining work reports not_needed; a model that cannot meet the reliability bar reports \
+insufficient. Effort advice does not execute or configure a model. See docs/jev.md for the \
+ladder schema and calibration limits.\n\nEach open issue or pull request the text \
 cites is reported under depends_on, with a could_be_cheaper.design probability: how likely it \
 is that resolving that dependency would leave less design work remaining than the text \
 implies. One extra Jev question is asked per open citation; a closed citation is settled and \
@@ -94,12 +98,12 @@ pub struct RouteCommand {
     )]
     pub ladders: Vec<String>,
 
-    /// Registers a custom ladder as NAME=FILE, its tiers loaded from FILE (same YAML shape
-    /// as a tiers file: `tiers: [{name, description}, ...]`). Repeatable.
+    /// Registers a custom ladder as NAME=FILE. Tiers contain name, description, and optional
+    /// model-specific effort profiles (see docs/jev.md). Repeatable.
     #[arg(long, value_name = "NAME=FILE", value_parser = parse_ladder_definition)]
     pub ladder_definition: Vec<(String, PathBuf)>,
 
-    /// Confidence below which a stage is reported as a close call.
+    /// Confidence below which a model-class or effort answer is reported as a close call.
     #[arg(long, value_name = "CONFIDENCE", default_value_t = DEFAULT_CLOSE_CALL)]
     pub close_call: f64,
 
@@ -679,6 +683,7 @@ mod tests {
             IssueRoute, ProviderRoute, RouteOutcome, StageAnswer, StageAnswers,
         };
         let answer = || StageAnswer {
+            effort_by_model: BTreeMap::new(),
             choice: "sonnet".to_string(),
             confidence: 0.9,
             probabilities: BTreeMap::new(),
@@ -733,6 +738,7 @@ mod tests {
             StageAnswers,
         };
         let answer = || StageAnswer {
+            effort_by_model: BTreeMap::new(),
             choice: "sonnet".to_string(),
             confidence: 0.9,
             probabilities: BTreeMap::new(),

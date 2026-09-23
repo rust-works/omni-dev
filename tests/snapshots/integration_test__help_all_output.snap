@@ -352,8 +352,8 @@ Arguments:
 Options:
       --all-open                       Routes every open issue in the current repository
       --ladders <NAMES>                Ladder names to route against (comma-separated, repeatable): a built-in provider name or one registered via --ladder-definition [default: anthropic]
-      --ladder-definition <NAME=FILE>  Registers a custom ladder as NAME=FILE, its tiers loaded from FILE (same YAML shape as a tiers file: `tiers: [{name, description}, ...]`). Repeatable
-      --close-call <CONFIDENCE>        Confidence below which a stage is reported as a close call [default: 0.3]
+      --ladder-definition <NAME=FILE>  Registers a custom ladder as NAME=FILE. Tiers contain name, description, and optional model-specific effort profiles (see docs/jev.md). Repeatable
+      --close-call <CONFIDENCE>        Confidence below which a model-class or effort answer is reported as a close call [default: 0.3]
       --max-input-chars <CHARS>        Longest issue text, in characters, sent to Jev; longer text is cut with a marker [default: 60000]
       --allow-closed                   Routes closed issues instead of refusing them
   -o, --output <OUTPUT>                Output format [default: json] [possible values: json, yaml, text]
