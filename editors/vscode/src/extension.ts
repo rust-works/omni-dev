@@ -4,7 +4,10 @@
 // silent no-op. See docs/worktrees-service.md for the contract.
 
 import { randomUUID } from "crypto";
+import { execFile } from "child_process";
+import { constants as fsConstants, promises as fs } from "fs";
 import * as path from "path";
+import { promisify } from "util";
 import * as vscode from "vscode";
 import {
   Envelope,
@@ -41,6 +44,7 @@ import { SessionEntry, tallyByWorktree, tallyModelsByWorktree } from "./sessionC
 import { copyPullRequestUrls, openPullRequest, openPullRequestInBrowser } from "./prCommands";
 import { openGithubRepository } from "./repoCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
+import { checkPiLaunch, nextPiTerminalName } from "./pi";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
 import { pushForceWithLease } from "./pushCommand";
 import { rebaseOnMain } from "./rebaseCommand";
@@ -71,6 +75,7 @@ import { ITEM_CLICKED_COMMAND, WorktreesTreeDataProvider } from "./treeDataProvi
 import { WorktreeDecorationProvider } from "./decorations";
 
 const CONFIG_SECTION = "omniDevWorktrees";
+const execFileAsync = promisify(execFile);
 
 /** The tree view id, matching the `views` contribution in `package.json`. */
 const TREE_VIEW_ID = "omniDevWorktrees.tree";
@@ -547,10 +552,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.onDidCloseTerminal(() => void reportSessionWindow()),
   );
 
-  // The window-level "Open Claude Code" title-bar button (#1322) is independent of
-  // the tree view below, so it is wired here and works regardless of tree state.
+  // The window-level Agent title-bar menu is independent of the tree view below,
+  // so its launchers work regardless of tree state.
   context.subscriptions.push(
     vscode.commands.registerCommand("omniDevWorktrees.openClaude", () => openClaude()),
+    vscode.commands.registerCommand("omniDevWorktrees.openPi", () => void openPi()),
   );
 
   // The reporter above runs regardless; the tree view is the new UI layer.
@@ -1179,6 +1185,91 @@ function openClaude(): void {
   });
   terminal.show();
   terminal.sendText(command, true);
+}
+
+/**
+ * Finds an executable named `name` in the extension host's PATH. Terminal shell
+ * paths must be absolute, so this resolves `zsh` before passing it to VS Code.
+ */
+async function findExecutable(name: string): Promise<string | undefined> {
+  if (process.platform === "win32") {
+    return undefined;
+  }
+
+  // GUI-launched VS Code can inherit a truncated PATH. The standard Unix and
+  // Homebrew locations cover zsh even in that case, while PATH still wins when a
+  // user intentionally supplies a different zsh build.
+  const directories = [
+    ...(process.env.PATH ?? "").split(path.delimiter).filter(Boolean),
+    "/bin",
+    "/usr/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+  ];
+  for (const directory of directories) {
+    const candidate = path.join(directory, name);
+    try {
+      await fs.access(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch {
+      // Try the next PATH entry.
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Uses the same interactive login zsh configuration as the terminal to check
+ * whether it can start pi. `command -v` is a shell builtin, so aliases and
+ * functions available to zsh are accepted just as they are at the prompt.
+ */
+async function zshCanRunPi(zshPath: string): Promise<boolean> {
+  try {
+    await execFileAsync(zshPath, ["-lic", "command -v pi >/dev/null"], { timeout: 5_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Launches a fresh pi.dev session in an editor-area zsh terminal (#1895). The
+ * preflight happens before terminal creation so missing dependencies produce an
+ * actionable VS Code error instead of an empty terminal tab.
+ */
+async function openPi(): Promise<void> {
+  const launch = await checkPiLaunch(() => findExecutable("zsh"), zshCanRunPi);
+  if (launch.kind === "missing-zsh") {
+    void vscode.window.showErrorMessage(
+      "omni-dev: zsh is unavailable. Install zsh or add it to PATH to launch pi.dev.",
+    );
+    return;
+  }
+  if (launch.kind === "missing-pi") {
+    void vscode.window.showErrorMessage(
+      "omni-dev: pi is unavailable in zsh. Install pi from https://pi.dev/ and restart VS Code.",
+    );
+    return;
+  }
+
+  const folders = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
+  const activeUri = vscode.window.activeTextEditor?.document.uri;
+  const activeFolder =
+    activeUri && activeUri.scheme === "file"
+      ? vscode.workspace.getWorkspaceFolder(activeUri)?.uri.fsPath
+      : undefined;
+  const cwd = resolveClaudeCwd(folders, activeFolder);
+  const name = nextPiTerminalName(vscode.window.terminals.map((terminal) => terminal.name));
+  const terminal = vscode.window.createTerminal({
+    name,
+    cwd,
+    shellPath: launch.zshPath,
+    shellArgs: ["-l"],
+    location: vscode.TerminalLocation.Editor,
+    iconPath: new vscode.ThemeIcon("rocket"),
+  });
+  terminal.show();
+  terminal.sendText("pi", true);
 }
 
 /**

@@ -172,9 +172,22 @@
       },
       {
         "command": "omniDevWorktrees.openClaude",
-        "title": "Open Claude Code",
+        "title": "Launch Claude Code",
         "category": "omni-dev",
         "icon": "media/claude.svg"
+      },
+      {
+        "command": "omniDevWorktrees.openPi",
+        "title": "Launch pi.dev",
+        "category": "omni-dev",
+        "icon": "$(rocket)"
+      }
+    ],
+    "submenus": [
+      {
+        "id": "omniDevWorktrees.agent",
+        "label": "Agent",
+        "icon": "$(sparkle)"
       }
     ],
     "menus": {
@@ -366,8 +379,18 @@
       ],
       "editor/title": [
         {
-          "command": "omniDevWorktrees.openClaude",
+          "submenu": "omniDevWorktrees.agent",
           "group": "navigation@9"
+        }
+      ],
+      "omniDevWorktrees.agent": [
+        {
+          "command": "omniDevWorktrees.openClaude",
+          "group": "navigation@1"
+        },
+        {
+          "command": "omniDevWorktrees.openPi",
+          "group": "navigation@2"
         }
       ]
     },
@@ -453,7 +476,7 @@
         "omniDevWorktrees.claudeCommand": {
           "type": "string",
           "default": "claude",
-          "markdownDescription": "Command run in the terminal opened by the **Open Claude Code** title-bar button (default `claude`). A shell prefix is allowed, e.g. `proxy && claude`."
+          "markdownDescription": "Command run by **Agent: Launch Claude Code** (default `claude`). A shell prefix is allowed, e.g. `proxy && claude`."
         }
       }
     }
