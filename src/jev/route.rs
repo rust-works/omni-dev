@@ -1181,7 +1181,7 @@ fn valid_github_item_url(raw: &str) -> bool {
         return false;
     }
     let Some(segments) = url.path_segments() else {
-        return false;
+        return false; // omni-dev: coverage ignore-line reason="unreachable: https is a special scheme per the WHATWG URL spec, so a URL that already passed the scheme check above can never be cannot-be-a-base and path_segments() is always Some"
     };
     let parts: Vec<_> = segments.collect();
     parts.len() == 4
@@ -2898,6 +2898,7 @@ mod tests {
             "http://github.com/o/r/issues/1",
             "https://github.com/o/r/issues/1\x1b]8;;evil",
             "https://github.com/o/r/issues/nope",
+            "not a valid url",
         ] {
             assert_eq!(hyperlink("#1", Some(bad), style), "#1");
         }
@@ -3032,6 +3033,18 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("  review: \x1b[32mbasic\x1b[0m"), "{text}");
+    }
+
+    #[test]
+    fn design_stage_with_a_named_tier_renders_needs_prefix() {
+        let line = render_stage_line(
+            Stage::Design,
+            &stages("fable", "sonnet", "sonnet"),
+            &[],
+            None,
+            TerminalStyle::default(),
+        );
+        assert_eq!(line, "design: needs fable (0.90)");
     }
 
     #[test]
