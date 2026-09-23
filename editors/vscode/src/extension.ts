@@ -44,7 +44,7 @@ import { SessionEntry, tallyByWorktree, tallyModelsByWorktree } from "./sessionC
 import { copyPullRequestUrls, openPullRequest, openPullRequestInBrowser } from "./prCommands";
 import { openGithubRepository } from "./repoCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
-import { checkPiLaunch, nextPiTerminalName } from "./pi";
+import { checkPiLaunch, nextPiTerminalName, zshSearchPaths } from "./pi";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
 import { pushForceWithLease } from "./pushCommand";
 import { rebaseOnMain } from "./rebaseCommand";
@@ -1188,27 +1188,15 @@ function openClaude(): void {
 }
 
 /**
- * Finds an executable named `name` in the extension host's PATH. Terminal shell
- * paths must be absolute, so this resolves `zsh` before passing it to VS Code.
+ * Finds zsh in the extension host's PATH or standard Unix locations. Terminal
+ * shell paths must be absolute, so resolve it before passing it to VS Code.
  */
-async function findExecutable(name: string): Promise<string | undefined> {
-  if (process.platform === "win32") {
-    return undefined;
-  }
-
-  // GUI-launched VS Code can inherit a truncated PATH. The standard Unix and
-  // Homebrew locations cover zsh even in that case, while PATH still wins when a
-  // user intentionally supplies a different zsh build.
-  const directories = [
-    ...(process.env.PATH ?? "").split(path.delimiter).filter(Boolean),
-    "/bin",
-    "/usr/bin",
-    "/usr/local/bin",
-    "/opt/homebrew/bin",
-  ];
-  for (const directory of directories) {
-    const candidate = path.join(directory, name);
+async function findZshExecutable(): Promise<string | undefined> {
+  for (const candidate of zshSearchPaths(process.platform, process.env.PATH)) {
     try {
+      if (!(await fs.stat(candidate)).isFile()) {
+        continue;
+      }
       await fs.access(candidate, fsConstants.X_OK);
       return candidate;
     } catch {
@@ -1227,8 +1215,14 @@ async function zshCanRunPi(zshPath: string): Promise<boolean> {
   try {
     await execFileAsync(zshPath, ["-lic", "command -v pi >/dev/null"], { timeout: 5_000 });
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if (error && typeof error === "object" && "killed" in error && error.killed) {
+      throw new Error("zsh startup exceeded 5 seconds; check your shell startup files.");
+    }
+    if (error && typeof error === "object" && "code" in error && error.code === 1) {
+      return false;
+    }
+    throw error;
   }
 }
 
@@ -1238,7 +1232,14 @@ async function zshCanRunPi(zshPath: string): Promise<boolean> {
  * actionable VS Code error instead of an empty terminal tab.
  */
 async function openPi(): Promise<void> {
-  const launch = await checkPiLaunch(() => findExecutable("zsh"), zshCanRunPi);
+  let launch: Awaited<ReturnType<typeof checkPiLaunch>>;
+  try {
+    launch = await checkPiLaunch(findZshExecutable, zshCanRunPi);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    void vscode.window.showErrorMessage(`omni-dev: Could not check pi in zsh: ${detail}`);
+    return;
+  }
   if (launch.kind === "missing-zsh") {
     void vscode.window.showErrorMessage(
       "omni-dev: zsh is unavailable. Install zsh or add it to PATH to launch pi.dev.",

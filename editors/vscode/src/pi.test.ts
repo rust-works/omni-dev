@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { PI_TERMINAL_NAME, checkPiLaunch, nextPiTerminalName } from "./pi";
+import { PI_TERMINAL_NAME, checkPiLaunch, nextPiTerminalName, zshSearchPaths } from "./pi";
+
+test("zshSearchPaths finds Windows zsh.exe on PATH", () => {
+  assert.deepEqual(zshSearchPaths("win32", "C:\\msys64\\usr\\bin;D:\\tools"), [
+    "C:\\msys64\\usr\\bin\\zsh.exe",
+    "D:\\tools\\zsh.exe",
+  ]);
+});
+
+test("zshSearchPaths uses absolute Unix paths and standard fallbacks", () => {
+  const candidates = zshSearchPaths("darwin", "/custom/bin:/bin");
+  assert.equal(candidates[0], "/custom/bin/zsh");
+  assert.equal(candidates.filter((candidate) => candidate === "/bin/zsh").length, 1);
+  assert.ok(candidates.includes("/opt/homebrew/bin/zsh"));
+});
 
 test("nextPiTerminalName uses and reuses the lowest available name", () => {
   assert.equal(nextPiTerminalName([]), PI_TERMINAL_NAME);
