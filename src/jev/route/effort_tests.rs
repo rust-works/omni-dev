@@ -1,5 +1,13 @@
 use super::*;
-use crate::jev::route::{build_route_questions, provider_routes, Provider, Tiers};
+use crate::jev::route::{build_route_questions, Provider, ProviderRoute, Tiers};
+
+fn provider_routes(
+    answers: &BTreeMap<String, Answer>,
+    ladders: &[Ladder],
+    close_call: f64,
+) -> anyhow::Result<BTreeMap<String, ProviderRoute>> {
+    super::super::provider_routes(answers, ladders, close_call, true)
+}
 
 const CUSTOM: &str = r"
 tiers:
@@ -473,6 +481,7 @@ async fn all_ladders_and_efforts_share_one_request_and_fail_only_the_bad_issue()
     let options = RouteOptions {
         model: "jev-test".into(),
         close_call: 0.3,
+        effort_advice: true,
         max_input_chars: 60000,
         allow_closed: false,
     };
@@ -511,9 +520,114 @@ async fn all_ladders_and_efforts_share_one_request_and_fail_only_the_bad_issue()
     };
     assert_eq!(depends_on.len(), 1);
     assert_eq!(report.usage.input_tokens, 300);
+    let json = serde_json::to_value(&report).unwrap();
+    assert!(json["issues"][0]["providers"]["openai"]["stages"]["design"]
+        .get("effort_by_model")
+        .is_some());
+    let text = super::super::render_route_text_styled(
+        &report,
+        60000,
+        &ladders,
+        super::super::TerminalStyle::default(),
+    );
+    assert!(text.contains("Model / effort"), "{text}");
     let requests = server.received_requests().await.unwrap();
     let request: serde_json::Value = requests[0].body_json().unwrap();
     assert_eq!(request["questions"].as_object().unwrap().len(), 46);
+    assert!(request["questions"].get("could_be_cheaper_0").is_some());
+}
+
+#[tokio::test]
+async fn class_only_route_omits_effort_questions_and_output_for_builtin_and_custom_ladders() {
+    use crate::jev::route::{run_route, OpenDependencies, RouteOptions, RouteOutcome};
+    use crate::provider::{GitProvider, IssueDoc, ItemKind, ItemRef, ItemState};
+
+    let ladders = [
+        Ladder::builtin(Provider::OpenAi).unwrap(),
+        Ladder::builtin(Provider::Anthropic).unwrap(),
+        custom(),
+    ];
+    let questions = super::super::build_route_questions_for_mode(&ladders, false).unwrap();
+    assert_eq!(questions.len(), 9);
+    assert!(questions.keys().all(|key| key.contains(".stage_")));
+    let mut answers = response(&ladders);
+    answers.retain(|key, _| questions.contains_key(key));
+    assert_eq!(answers.len(), 9);
+    answers.insert("could_be_cheaper_0".into(), Answer::Noul { noul: 0.4 });
+
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "jev-test", "answers": answers,
+                "usage": {"input_tokens": 10, "output_tokens": 2}
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = crate::jev::client::JevClient::new(&server.uri(), "test").unwrap();
+    let doc = IssueDoc {
+        provider: GitProvider::GitHub,
+        project: "owner/repo".into(),
+        number: 1,
+        kind: ItemKind::Issue,
+        title: "A change".into(),
+        state: ItemState::Open,
+        body: "Remaining work".into(),
+        comments: vec![],
+        closed_by: vec![],
+        url: "https://github.com/owner/repo/issues/1".into(),
+    };
+    let dependencies = OpenDependencies::from([(
+        ("owner/repo".into(), 1),
+        crate::jev::citations::find_citations(
+            "#9",
+            "owner/repo",
+            &ItemRef {
+                provider: GitProvider::GitHub,
+                project: "owner/repo".into(),
+                kind: ItemKind::Issue,
+                number: 1,
+            },
+        ),
+    )]);
+    let report = run_route(
+        &client,
+        &[doc],
+        &ladders,
+        &RouteOptions {
+            model: "jev-test".into(),
+            close_call: 0.3,
+            effort_advice: false,
+            max_input_chars: 60000,
+            allow_closed: false,
+        },
+        &dependencies,
+    )
+    .await
+    .unwrap();
+    let RouteOutcome::Routed { depends_on, .. } = &report.issues[0].outcome else {
+        panic!("expected a routed issue");
+    };
+    assert_eq!(depends_on.len(), 1);
+    let json = serde_json::to_value(&report).unwrap();
+    let yaml: serde_json::Value =
+        serde_yaml::from_str(&serde_yaml::to_string(&report).unwrap()).unwrap();
+    assert_eq!(json, yaml);
+    for provider in ["openai", "anthropic", "custom"] {
+        for stage in ["design", "implement", "review"] {
+            assert!(json["issues"][0]["providers"][provider]["stages"][stage]
+                .get("effort_by_model")
+                .is_none());
+        }
+    }
+    let text = super::super::render_route_text(&report, 60000);
+    assert!(!text.contains("Model / effort"), "{text}");
+    assert!(text.contains("openai:") && text.contains("anthropic:") && text.contains("custom:"));
+    let requests = server.received_requests().await.unwrap();
+    let request: serde_json::Value = requests[0].body_json().unwrap();
+    assert_eq!(request["questions"].as_object().unwrap().len(), 10);
     assert!(request["questions"].get("could_be_cheaper_0").is_some());
 }
 
