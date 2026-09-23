@@ -791,6 +791,23 @@ mod tests {
                 render_output(&report, format, DEFAULT_MAX_INPUT_CHARS).unwrap()
             );
         }
+
+        let styled_text = render_output_with_style(
+            &report,
+            RouteFormat::Text,
+            DEFAULT_MAX_INPUT_CHARS,
+            &[],
+            style,
+        )
+        .unwrap();
+        assert_eq!(
+            styled_text,
+            render_route_text_styled(&report, DEFAULT_MAX_INPUT_CHARS, &[], style)
+        );
+        assert_ne!(
+            styled_text, text,
+            "styled text should differ from the plain rendering"
+        );
     }
 
     // ── terminal_style_with (env seam) ───────────────────────────────
