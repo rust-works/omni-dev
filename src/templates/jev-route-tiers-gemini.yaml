@@ -1,3 +1,4 @@
+# Effort capabilities checked 2026-09-23; criteria are uncalibrated routing hypotheses.
 # The `gemini` model ladder for `omni-dev ai jev route` (#1820):
 # flash (gemini-3-flash-preview) / pro (gemini-3.1-pro-preview) /
 # deep-think (Gemini 3 Deep Think).
@@ -6,18 +7,65 @@
 # The descriptions are the anthropic ladder's, rung for rung, byte-identical:
 # that text is the only text validated against jev-1.13.0 (#1779), and
 # rewording shifts every answer. Only the tier names differ. This ladder has
-# not itself been evaluated, so treat its answers as a starting point.
+# been compared in docs/evaluations/jev-effort-1888; downstream success
+# remains uncalibrated, so treat its answers as a starting point.
 tiers:
   - name: flash
+    models:
+      - name: gemini-3-flash-preview
+        verified: "2026-09-23"
+        sources: [https://ai.google.dev/gemini-api/docs/thinking]
+        effort:
+          kind: configurable
+          control: generation_config.thinking_level
+          supported_levels: [minimal, low, medium, high]
+          levels:
+            - name: minimal
+              description: >-
+                Minimal thinking suffices for a small mechanical change or checking a fully specified, local result.
+            - name: low
+              description: >-
+                The stage is short, local and familiar, with explicit requirements and an obvious solution or review checklist.
+            - name: medium
+              description: >-
+                The stage needs several reasoning steps and checking ordinary interactions, with a clear approach and bounded scope.
+            - name: high
+              description: >-
+                The stage needs sustained reasoning about subtle behavior, multiple components, non-obvious failure modes or competing approaches.
     description: >-
       Reliable at executing a clear specification and following patterns that already exist in the
       codebase. Tends to miss non-obvious interactions between parts and does not question the
       specification.
   - name: pro
+    models:
+      - name: gemini-3.1-pro-preview
+        verified: "2026-09-23"
+        sources: [https://ai.google.dev/gemini-api/docs/thinking]
+        effort:
+          kind: configurable
+          control: generation_config.thinking_level
+          supported_levels: [low, medium, high]
+          levels:
+            - name: low
+              description: >-
+                The stage is short, local and familiar, with explicit requirements and an obvious solution or review checklist.
+            - name: medium
+              description: >-
+                The stage needs several reasoning steps and checking ordinary interactions, with a clear approach and bounded scope.
+            - name: high
+              description: >-
+                The stage needs sustained reasoning about subtle behavior, multiple components, non-obvious failure modes or competing approaches.
     description: >-
       Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
       ordering, once the overall direction is set. Can under-explore a genuinely open design space.
   - name: deep-think
+    models:
+      - name: Gemini 3 Deep Think
+        verified: "2026-09-23"
+        sources: [https://ai.google.dev/gemini-api/docs/thinking]
+        effort:
+          kind: unavailable
+          reason: No configurable effort vocabulary for the Deep Think product was verified in the Gemini API thinking documentation.
     description: >-
       Strongest at open-ended design and research: choosing between architectures, working in
       unfamiliar territory with no precedent in the codebase, anticipating failure modes, and

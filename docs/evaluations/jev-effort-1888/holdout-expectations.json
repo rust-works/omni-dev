@@ -1,0 +1,27 @@
+{
+  "note": "Assigned before running or inspecting holdout outputs. One implementer's expectations, not independent human ground truth or downstream-model performance measurements. No tuning on these cases.",
+  "1870": {
+    "design": "not_needed for every model",
+    "implement": "recommended none/minimal/low/medium for configurable models",
+    "review": "recommended medium or above, or insufficient for configurable models"
+  },
+  "1880": {
+    "design": "recommended medium or above, or insufficient for configurable models"
+  },
+  "1861": {
+    "design": "recommended high or above, or insufficient for configurable models"
+  },
+  "1858": {
+    "design": "recommended medium or above, or insufficient for configurable models"
+  },
+  "900001": {
+    "design": "not_needed for every model",
+    "implement": "not_needed for every model",
+    "review": "not_needed for every model"
+  },
+  "900002": {
+    "design": "not_needed for every model",
+    "implement": "recommended none/minimal/low/medium for configurable models",
+    "review": "recommended none/minimal/low/medium for configurable models"
+  }
+}

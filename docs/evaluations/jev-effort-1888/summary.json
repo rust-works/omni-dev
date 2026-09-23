@@ -1,0 +1,238 @@
+{
+  "models": [
+    "jev-1.13.0"
+  ],
+  "failures": [
+    {
+      "dataset": "jev-effort-holdout-results",
+      "run": "combined-baseline-0.json",
+      "issue": "rust-works/omni-dev#1858",
+      "error": "Jev request failed: Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (SendRequest): connection error: timed out"
+    }
+  ],
+  "variants": {
+    "anthropic": {
+      "changed": {
+        "class": 1,
+        "design": 1,
+        "implement": 4,
+        "review": 0
+      },
+      "comparisons": {
+        "class": 40,
+        "design": 40,
+        "implement": 40,
+        "review": 40
+      },
+      "class_repeat_changes": {
+        "baseline": 0,
+        "effort": 1
+      },
+      "effort_repeat_changes": {
+        "changed": 5
+      },
+      "effort_repeat_comparisons": 180,
+      "label_agreement": {
+        "baseline": [
+          16,
+          16
+        ],
+        "effort": [
+          17,
+          16
+        ]
+      },
+      "metrics": {
+        "baseline": {
+          "seconds": 11.67,
+          "input_tokens": 62458,
+          "output_tokens": 5451
+        },
+        "effort": {
+          "seconds": 12.56,
+          "input_tokens": 218098,
+          "output_tokens": 34143
+        }
+      }
+    },
+    "openai": {
+      "changed": {
+        "class": 4,
+        "design": 4,
+        "implement": 1,
+        "review": 4
+      },
+      "comparisons": {
+        "class": 40,
+        "design": 40,
+        "implement": 40,
+        "review": 40
+      },
+      "class_repeat_changes": {
+        "baseline": 2,
+        "effort": 2
+      },
+      "effort_repeat_changes": {
+        "changed": 4
+      },
+      "effort_repeat_comparisons": 180,
+      "label_agreement": {},
+      "metrics": {
+        "baseline": {
+          "seconds": 11.4,
+          "input_tokens": 62218,
+          "output_tokens": 5040
+        },
+        "effort": {
+          "seconds": 13.31,
+          "input_tokens": 225538,
+          "output_tokens": 35056
+        }
+      }
+    },
+    "gemini": {
+      "changed": {
+        "class": 3,
+        "design": 3,
+        "implement": 2,
+        "review": 1
+      },
+      "comparisons": {
+        "class": 40,
+        "design": 40,
+        "implement": 40,
+        "review": 40
+      },
+      "class_repeat_changes": {
+        "baseline": 1,
+        "effort": 0
+      },
+      "effort_repeat_changes": {
+        "changed": 2
+      },
+      "effort_repeat_comparisons": 180,
+      "label_agreement": {},
+      "metrics": {
+        "baseline": {
+          "seconds": 11.99,
+          "input_tokens": 62458,
+          "output_tokens": 5306
+        },
+        "effort": {
+          "seconds": 14.47,
+          "input_tokens": 163258,
+          "output_tokens": 25504
+        }
+      }
+    },
+    "combined": {
+      "changed": {
+        "class": 5,
+        "design": 5,
+        "implement": 7,
+        "review": 4
+      },
+      "comparisons": {
+        "class": 120,
+        "design": 120,
+        "implement": 120,
+        "review": 120
+      },
+      "class_repeat_changes": {
+        "baseline": 4,
+        "effort": 3
+      },
+      "effort_repeat_changes": {
+        "changed": 12
+      },
+      "effort_repeat_comparisons": 540,
+      "label_agreement": {},
+      "metrics": {
+        "baseline": {
+          "seconds": 12.81,
+          "input_tokens": 118218,
+          "output_tokens": 15554
+        },
+        "effort": {
+          "seconds": 16.0,
+          "input_tokens": 537978,
+          "output_tokens": 94456
+        }
+      }
+    },
+    "versioned": {
+      "changed": {
+        "class": 1,
+        "design": 1,
+        "implement": 0,
+        "review": 4
+      },
+      "comparisons": {
+        "class": 40,
+        "design": 40,
+        "implement": 40,
+        "review": 40
+      },
+      "class_repeat_changes": {
+        "baseline": 0,
+        "effort": 1
+      },
+      "effort_repeat_changes": {
+        "changed": 1
+      },
+      "effort_repeat_comparisons": 180,
+      "label_agreement": {},
+      "metrics": {
+        "baseline": {
+          "seconds": 12.23,
+          "input_tokens": 64498,
+          "output_tokens": 8032
+        },
+        "effort": {
+          "seconds": 16.53,
+          "input_tokens": 220138,
+          "output_tokens": 36366
+        }
+      }
+    }
+  },
+  "single_combined": {
+    "anthropic": {
+      "changed": {
+        "class": 2,
+        "effort": 11
+      },
+      "comparisons": {
+        "class": 40,
+        "effort": 360
+      }
+    },
+    "openai": {
+      "changed": {
+        "class": 5,
+        "effort": 4
+      },
+      "comparisons": {
+        "class": 40,
+        "effort": 360
+      }
+    },
+    "gemini": {
+      "changed": {
+        "class": 3,
+        "effort": 4
+      },
+      "comparisons": {
+        "class": 40,
+        "effort": 360
+      }
+    }
+  },
+  "holdout": {
+    "counts": {
+      "checks": 476,
+      "passed": 476
+    },
+    "misses": []
+  }
+}

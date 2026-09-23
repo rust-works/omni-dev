@@ -419,6 +419,10 @@ changes), `owner/repo#N`, or an issue URL. `--all-open` routes every open issue
 in the current repository instead. Quote `#N` in the shell, where an unquoted
 `#` starts a comment.
 
+This historical class/dependency excerpt omits each stage's new
+`effort_by_model` field; see [Reading effort advice](#reading-effort-advice)
+for its shape. The usage numbers below predate the extra effort questions.
+
 ```yaml
 model: jev-1.13.0
 issues:
@@ -509,6 +513,9 @@ line per fact, rather than one run-on sentence — which keeps a
 multi-`--ladders` issue readable. Its wording is **not** a stable contract
 and may change without notice; scripts should keep using `json` or `yaml`.
 
+The class-summary examples below omit the additional per-model effort lines;
+[Reading effort advice](#reading-effort-advice) shows those separately.
+
 On a supported terminal, the issue reference and cited open issues or pull
 requests are clickable links to their GitHub pages. Low-complexity choices and
 successful routing are green, intermediate choices yellow, and high-complexity
@@ -569,7 +576,8 @@ headed by its provider name (`  anthropic:`, with the fact lines nested one
 indent level deeper) rather than prefixing every line, and the layout is
 decided per ladder — one multi-model ladder does not force another,
 single-model ladder into the block form too. Single-word tiers (every
-built-in ladder) keep the compact line unchanged, with no output churn.
+built-in ladder) keep the compact class summary. Effort advice follows that
+summary as separate indented lines for every stage, rung and concrete model.
 
 ### What Jev sees
 
@@ -636,87 +644,130 @@ over one state, so the three stage questions are keyed per ladder name
 the issue, not a ladder, so its `could_be_cheaper` question is asked once
 per open citation, not once per ladder.
 
-Only the `anthropic` ladder was validated (see
+The inherited #1779 evidence covered only the `anthropic` ladder (see
 [Evidence and its limits](#evidence-and-its-limits)). Because rewording a
 description shifts answers across the board, the `openai` and `gemini`
 ladders reuse the `anthropic` descriptions **rung for rung, byte for byte**;
-only the tier names differ, and a test pins the equality. Two things are
-therefore untested: the effect of the new tier names, which Jev sees as
-criterion keys, and keying several ladders' questions into one call. Treat
-a non-`anthropic` answer as a starting point until an evaluation like
-#1779's is repeated for it, and if `anthropic`'s answers in a multi-ladder
-run drift from a single-ladder run, route one ladder per run instead.
+a test pins that equality. The [#1888 comparison](evaluations/jev-effort-1888/README.md)
+now exercises all three, separately and together, including effort questions.
+It finds some single-versus-combined class differences. It does not provide
+independent model-class labels for OpenAI or Gemini, or downstream success
+measurements. Treat those answers as starting points and do not expect
+batching to produce identical judgements to separate runs.
 
-A fourth, cheapest rung (Haiku 4.5, gpt-5.6-luna, gemini-3.1-flash-lite), an
-effort/reasoning-level knob, and the Chinese-lab and open-weight providers are
-out of scope: each changes the validated `anthropic` question or needs its own
-validation.
+A fourth, cheapest rung (Haiku 4.5, gpt-5.6-luna, gemini-3.1-flash-lite) and
+the Chinese-lab and open-weight providers remain out of scope. Effort advice
+is now included; the additional questions require fresh evaluation even
+though the original class-question wording remains unchanged.
 
-### Rungs and model versions
+### Rungs, model versions and effort
 
-A rung names a model **family**, not a version, and its description describes
-a **capability level**, not a particular model. Jev reads only the
-description, so its answer says what kind of capability the work needs. Which
-current model supplies that capability is for the consumer to decide.
+A rung still describes a capability class. Its `models` bindings now identify
+the concrete versions for which effort advice is given. The binding and effort
+vocabulary live entirely in `src/templates/jev-route-tiers-<provider>.yaml`;
+updating a model does not require a provider-specific routing branch.
 
-That distinction matters whenever a new model reorders the families. Claude
-Opus 5.5 (released 2026-09-22) is the first such case. Anthropic reports it
-performs at the level of Claude Fable 5.1 on most work, and ahead of it on
-coding benchmarks, at $4/$20 per MTok against Fable 5.1's $10/$50. The
-`opus` description's caveat, *"Can under-explore a genuinely open design
-space"*, may therefore understate Opus 5.5.
+Capabilities checked on 2026-09-23:
 
-The descriptions are deliberately **left unchanged**. They are the only text
-validated against `jev-1.13.0`, and rewording one shifts every answer. Adjust
-the mapping from rung to model instead. A reasonable starting point, which has
-**not** been evaluated:
+- Anthropic `sonnet` → `claude-sonnet-5`, `opus` → `claude-opus-5-5`, and
+  `fable` → `claude-fable-5-1`: `low`, `medium`, `high`, `xhigh`, `max`.
+  [Official effort documentation](https://platform.claude.com/docs/en/build-with-claude/effort).
+- OpenAI `terra` → `gpt-5.6-terra` and `sol` → `gpt-5.6-sol`: `none`, `low`,
+  `medium`, `high`, `xhigh`, `max`. `astra` → `gpt-6-astra` supports the same
+  list except `none`. See the official model pages for
+  [Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra),
+  [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol), and
+  [Astra](https://developers.openai.com/api/docs/models/gpt-6-astra).
+- Gemini `flash` → `gemini-3-flash-preview`: `minimal`, `low`, `medium`,
+  `high`; `pro` → `gemini-3.1-pro-preview`: `low`, `medium`, `high`.
+  The control is `generation_config.thinking_level` in the Interactions API.
+  No configurable vocabulary for the `deep-think` product was verified in
+  the [Gemini thinking documentation](https://ai.google.dev/gemini-api/docs/thinking),
+  so it reports `unavailable`, rather than borrowing Pro's levels.
 
-| Stage answer | Hand the work to                                                                  |
-|--------------|-----------------------------------------------------------------------------------|
-| `sonnet`     | `claude-sonnet-5`                                                                 |
-| `opus`       | `claude-opus-5-5`                                                                 |
-| `fable`      | `claude-fable-5-1` for design; consider `claude-opus-5-5` for implement or review |
+Native `none` (OpenAI: no explicit reasoning) is a valid effort setting. It
+is distinct from `not_needed` (no remaining stage work), and from the
+existing design-class answer `none`.
 
-Keep `fable` → Fable 5.1 for design. Anthropic's announcement gives coding
-benchmarks for the Opus 5.5 lead but none for open-ended design or research,
-which is exactly what the `fable` description names, so treating "most work"
-as covering design would be our inference, not theirs. For implementation,
-where Opus 5.5 leads on coding benchmarks, downgrading a `fable` answer is the
-cheapest change to try first.
+The class descriptions remain the original #1779 wording. #1885 tracks
+reassessing those descriptions as model capabilities change; the binding
+above does not itself validate that a version matches its rung. Custom
+bindings can select different models for different stages. For example, a
+`fable` rung can bind Fable for design and another model for implementation
+and review, but that substitution requires its own evaluation.
 
-To have `route` emit versioned model names directly, register a custom ladder
-that keeps the `anthropic` descriptions byte for byte and changes only the
-tier names:
+### Reading effort advice
+
+Every stage gains `effort_by_model`, a map from **rung name to a list of
+concrete model results**, including rungs other than the class winner.
+A list allows different versions sharing one rung to have different native
+controls. Existing `choice`, `confidence`, `probabilities`, `class`, and
+class `close_calls` retain their meanings.
+
+Illustrative excerpt (numbers are not evaluation results):
 
 ```yaml
-# claude-versions.yaml — the anthropic descriptions, versioned tier names
-tiers:
-  - name: claude-sonnet-5
-    description: >-
-      Reliable at executing a clear specification and following patterns that already exist in the
-      codebase. Tends to miss non-obvious interactions between parts and does not question the
-      specification.
-  - name: claude-opus-5-5
-    description: >-
-      Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
-      ordering, once the overall direction is set. Can under-explore a genuinely open design space.
-  - name: claude-fable-5-1
-    description: >-
-      Strongest at open-ended design and research: choosing between architectures, working in
-      unfamiliar territory with no precedent in the codebase, anticipating failure modes, and
-      security-critical judgement.
+implement:
+  choice: opus
+  confidence: 0.74
+  probabilities: {sonnet: 0.1, opus: 0.8, fable: 0.1}
+  effort_by_model:
+    sonnet:
+      - model: claude-sonnet-5
+        control: output_config.effort
+        status: recommended
+        level: high
+        assessment:
+          choice: high
+          confidence: 0.65
+          probabilities:
+            low: 0.01
+            medium: 0.12
+            high: 0.65
+            xhigh: 0.15
+            max: 0.05
+            not_needed: 0.01
+            insufficient: 0.01
+        close_call: false
+    # opus and fable each have their own model results here too
 ```
 
-```bash
-omni-dev ai jev route '#1234' --ladders claude --ladder-definition claude=claude-versions.yaml
+`recommended` carries a native `level` and the complete Jev `assessment`.
+`insufficient` means even the highest supported level is unlikely to meet
+the reliability bar; no level is recommended. `not_needed` means no work
+remains. Design class `none` overrides all design effort results, removes
+the effort assessments, and never claims that effort is required.
+Implementation/review can also report `not_needed` without changing their
+existing class answers. The parallel questions judge remaining work
+independently; disagreement between model-specific answers is possible and
+is part of the evaluation, not a reason to overwrite Jev's evidence.
+
+`fixed` carries the declared fixed `level`; `unavailable` carries a reason
+for absent capability information. Those profiles share one applicability
+question per stage and ladder. Their assessment concerns whether work
+remains, **not confidence in the fixed level or provider support**. Legacy
+rungs without `models` report `unspecified` with migration guidance; they
+add no questions. Metadata and normalized design-`none` results do not
+invent confidence values.
+
+Text adds lines such as:
+
+```text
+    implement effort: sonnet [claude-sonnet-5]: high (0.65)
+    implement effort: opus [claude-opus-5-5]: medium (0.20, close call — high 0.45)
+    implement effort: fable [claude-fable-5-1]: low (0.82)
 ```
 
-Jev sees tier names as criterion keys, so versioned names are the same
-untested change as the `openai` and `gemini` ladders' names; treat their
-answers the same way. Re-running the #1779 evaluation ([#1885](https://github.com/rust-works/omni-dev/issues/1885)) is deferred until
-Claude Sonnet 5.5 ships (Anthropic says it will follow Opus 5.5 "in the coming
-weeks"), since that release may
-date the `sonnet` description too and one evaluation can cover both.
+These appear beneath their ladder's class summary. Every rung is shown in
+ladder order; long/multi-model names keep the expanded class layout. Effort
+close calls use `--close-call`, independently of class close calls, and show
+the strongest alternative (alphabetical tie break). Confidence and option
+probability are distinct Jev values.
+
+All class, effort and dependency questions share **one Jev call per issue**.
+Internal effort keys use rung/model indices, so punctuation in custom model
+names cannot collide with another question. The advice never configures the
+Jev evaluator or a downstream AI backend.
 
 ### Custom ladders
 
@@ -739,6 +790,67 @@ tiers:
 A tiers file needs at least two tiers, unique non-empty names and
 descriptions, and no tier named `none`, which is reserved for "no design work
 remains". Rank comes from the order in the file.
+
+To add effort advice, give each rung a non-empty `models` list. The following
+is a complete custom ladder; names and criteria are illustrative:
+
+```yaml
+tiers:
+  - name: small
+    description: Executes a clear local specification.
+    models:
+      - name: vendor-small-v1
+        effort:
+          kind: configurable
+          control: reasoning.effort
+          supported_levels: [low, high]
+          levels:
+            - name: low
+              description: Routine local work with an explicit checklist.
+              criteria:
+                review: A local change with an exhaustive review checklist.
+            - name: high
+              description: Interacting constraints need sustained reasoning.
+  - name: large
+    description: Explores open designs and subtle cross-component behavior.
+    models:
+      - name: vendor-large-v2
+        stages: [design]
+        effort:
+          kind: unavailable
+          reason: No supported control has been verified for this model.
+      - name: vendor-large-coding-v2
+        stages: [implement, review]
+        effort:
+          kind: fixed
+          control: thinking_mode
+          level: adaptive
+          reason: This model always uses adaptive thinking.
+```
+
+`stages` defaults to all three. Every stage must have at least one model
+binding, and a model cannot appear twice in the same rung/stage. Models may
+include `sources` (official URLs) and `verified` (a quoted date). Built-ins
+record both. YAML anchors can share profiles without requiring a separate
+profile registry. Comma-joined rung names remain opaque; explicitly list
+their individual model versions under `models` to obtain separate advice.
+
+A configurable profile declares its vocabulary in `levels`, and selects
+at least two of those native values in `supported_levels` (least effort
+first). Each level requires a non-empty shared `description` or a criterion
+for every stage where the model is bound. `criteria` overrides the shared
+description by stage. A sole supported setting uses `kind: fixed` instead
+of a degenerate one-option choice. `not_needed` and `insufficient` are
+reserved outcome names, never native levels.
+
+Duplicate/unknown levels, missing criteria, unsupported references, unknown
+fields and invalid bindings fail while loading the ladder. Missing or
+malformed Jev answers, unsupported choices, or probability keys that do not
+match the offered options fail that issue clearly; other issues continue.
+Adding arbitrary custom level names declares that custom vocabulary; it
+does not verify vendor support. Keep capability sources current and rerun
+evaluation when versions, criteria or bindings change.
+
 
 A ladder name must be non-empty and match `[a-z0-9_-]+`; a built-in provider's
 name (`anthropic`/`openai`/`gemini`) is reserved and cannot be redefined. A
@@ -786,6 +898,16 @@ would under-route the issue. After adding one, re-run `route` to check that the
 design work has actually gone away.
 
 ### Evidence and its limits
+
+Effort routing adds questions to the previously tested request. Its criteria
+are routing hypotheses, not provider-measured reliability guarantees. The
+[frozen #1888 evaluation inputs and harness](evaluations/jev-effort-1888/README.md)
+compare class-only and effort-aware single/multiple-ladder requests. The
+recorded 520-request run found no invalid effort answers and stable overall
+Anthropic class agreement, but some class/effort shifts and substantially
+higher token use. The small holdout is implementer-labeled; downstream task
+success is unmeasured. Treat effort answers as uncalibrated advice.
+
 
 The design comes from experiments on this repository's issues with
 `jev-1.13.0` (September 2026), recorded in
@@ -984,6 +1106,16 @@ per-statement check passes it (0.52–0.98) and only coverage objects. The
 dropped-claim row is why the check cannot be trusted to reject on its own.
 
 ### Evidence and its limits
+
+Effort routing adds questions to the previously tested request. Its criteria
+are routing hypotheses, not provider-measured reliability guarantees. The
+[frozen #1888 evaluation inputs and harness](evaluations/jev-effort-1888/README.md)
+compare class-only and effort-aware single/multiple-ladder requests. The
+recorded 520-request run found no invalid effort answers and stable overall
+Anthropic class agreement, but some class/effort shifts and substantially
+higher token use. The small holdout is implementer-labeled; downstream task
+success is unmeasured. Treat effort answers as uncalibrated advice.
+
 
 The per-statement check is validated against five sources and 25
 constructed claims (five accurate, twenty wrong in four different ways) in

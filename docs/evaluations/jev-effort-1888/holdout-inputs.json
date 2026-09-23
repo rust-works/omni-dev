@@ -1,0 +1,74 @@
+[
+  {
+    "provider": "github",
+    "project": "rust-works/omni-dev",
+    "number": 1880,
+    "kind": "issue",
+    "title": "refactor(drive): adopt truncate_locations across the remaining sheets previews",
+    "state": "open",
+    "body": "## Context\n\n#1872 (`trim-whitespace`, #1844) added `grid_range::truncate_locations`, which renders an A1 address list and elides past a limit (`RENDERED_LOCATION_LIMIT`, 50):\n\n```\n  1284 non-blank cell(s) may be trimmed: A1, A2, \u2026 (50 shown) \u2026 and 1234 more\n```\n\nOnly the **rendered** line is elided \u2014 the structured `-o json` outcome and the `drivemutation` record keep the full list, so nothing a machine reads is lost.\n\nIt was added there because `trim-whitespace --whole-sheet` can name every non-blank cell in a tab, where every earlier preview described a paste destination or a merge. It was deliberately **not** retrofitted onto the existing verbs in that PR, to keep the change reviewable. That retrofit is this issue.\n\n## Sites still joining an unbounded list\n\n| site | shape | notes |\n|---|---|---|\n| `auto_fill.rs:840` | `overwritten_cells.join(\", \")` | one long line |\n| `text_to_columns.rs:889` | `overwritten_cells.join(\", \")` | one long line |\n| `paste.rs:1026` | `lines.extend(locations.iter()\u2026)` | **one output line per address** \u2014 a wide `copy-paste` destination prints thousands of lines |\n| `format.rs:1065` | `discarded_cells.join(\"; \")` | `merge-cells`, and the entries are `\"A1: value\"` \u2014 see below |\n| `named_range.rs:816` area | referencing formula locations | bounded by formulas naming the range; smallest risk |\n\n`paste.rs` is arguably the worst of these, since a line per address scrolls the useful summary off the terminal entirely.\n\n## The one that needs a decision, not a retrofit\n\n`merge-cells` (`format.rs`) is the **only** preview in the integration that prints cell *contents* \u2014 ADR-0078 \u00a74 made it the deliberate outlier, and ADR-0077 \u00a75 drew the \"no cell content ever appears\" line for everything else. Truncating it is therefore not a cosmetic change: it decides how much of the data a merge would discard the operator gets to see before confirming.\n\nOptions worth stating explicitly rather than defaulting:\n\n- Leave `merge-cells` uncapped, on the grounds that its whole purpose is to show what is about to be lost, and a merge range is caller-chosen and usually small.\n- Cap it with a much higher limit than the address-only previews, since each entry is longer but the information is more valuable per entry.\n- Cap it identically and accept that a very large merge preview stops being exhaustive.\n\nThe address-only sites have no such tension and can simply adopt the helper.\n\n## Suggested shape\n\n- Move the limit into one place (it currently lives beside `truncate_locations` in `grid_range.rs`) and have the address-only sites call it.\n- `paste.rs` needs the small extra step of collapsing its per-line rendering into the joined-and-elided form, which is also what makes its output consistent with its siblings.\n- Decide `merge-cells` separately and record the reasoning wherever it lands, since it is an ADR-0078 \u00a74 question rather than a formatting one.\n",
+    "comments": [],
+    "closed_by": [],
+    "url": "https://github.com/rust-works/omni-dev/issues/1880"
+  },
+  {
+    "provider": "github",
+    "project": "rust-works/omni-dev",
+    "number": 1870,
+    "kind": "issue",
+    "title": "fix(drive): sort-range moves formatting with rows \u2014 gate on sheets-structure too (ADR-0083 \u00a75)",
+    "state": "open",
+    "body": "Split out of #1845's live verification (ADR-0083 \u00a75). `sort-range` shipped in #1866 under `sheets-write` alone, with the formatting/formula question deferred (\"live verification of formatting/formula movement remain outside this version\"). The verification has now been run and it moves the gate.\n\n## What was measured\n\nLive probe, 2026-09-22, one test sheet in `omni-dev-test`: rows A2:C6 with one bold+pink row, one row carrying a note, one cell carrying a data-validation rule, a relative formula per row in column C, and an absolute + a relative reference in column D (inside the rows, outside the sorted columns). A `sortRange` (by column B ascending) then a `randomizeRange` over A2:C6:\n\n- **Formatting moves with the row.** The bold+pink cells followed their row under both requests. This is exactly the trigger ADR-0083 \u00a75 fixed in advance: *\"a verb live-verified to move or write formatting resolves both `sheets-write` and `sheets-structure`, \u00a74's composition.\"*\n- **Notes and data-validation rules move with the row** as well.\n- **In-range formulas move with their row and have their relative references rewritten** (`=B3*2` became `=B2*2` after its row moved to row 2), so each formula keeps pointing at its own row.\n- **Cells in the same rows but outside the selected columns do not move** \u2014 the D-column references stayed in place and now read a different record's value. That confirms \u00a73's record-decoupling caveat, which the preview already leads with.\n\n## What to change\n\n- Gate `sort-range` on **both** `sheets-write` and `sheets-structure` via `target_gate::resolve_all`, the shape `text-to-columns` took in #1867 (`6541f705`) when its own live run found the same thing.\n- Extend the `SheetsStructure` doc comment in `src/drive/write_gate.rs` and the `docs/drive.md` default-policy table + `sort-range` section with the finding (formatting, notes and validation travel with rows; relative references inside the range are rewritten).\n- Tests: a rule that allows `sheets-write` but denies `sheets-structure` must yield `Blocked` (see #1843's note that the denying rule has to name the second operation explicitly, or the union gate falls through to \"no matching rule\").\n\n#1845 (`randomize-range`) ships on the union gate from the start and documents the same facts; this issue is the fix-forward for the verb that predates the measurement. No ADR change: ADR-0083 \u00a75 pre-decided the consequence.\n",
+    "comments": [],
+    "closed_by": [],
+    "url": "https://github.com/rust-works/omni-dev/issues/1870"
+  },
+  {
+    "provider": "github",
+    "project": "rust-works/omni-dev",
+    "number": 1861,
+    "kind": "issue",
+    "title": "Investigate Codex hooks as a daemon sessions state feed",
+    "state": "open",
+    "body": "## Is your feature request related to a problem?\n\nThe daemon's `sessions` service tracks Claude Code sessions, but it does not report the state of Codex sessions in the worktree tree, tray, or `omni-dev sessions` output. Codex now exposes lifecycle hooks that may provide a low latency feed for session identity and coarse state.\n\n## Describe the solution you'd like\n\nInvestigate a Codex hook feed for the existing daemon sessions service and produce a concrete implementation decision. In particular:\n\n- Validate which hooks fire in the installed Codex CLI and desktop/IDE surfaces for startup, resume, prompt submission, tool use, approval requests and outcomes, interruption, turn completion, and session closure.\n- Map the usable events to `starting`, `working`, `idle`, `waiting_for_permission`, `waiting_for_input`, and `ended`. Record where a hook reports only an inference rather than the current state.\n- Evaluate a dedicated, fail-open `omni-dev sessions codex-hook` sink that sends only session ID, working directory, model, and state to the daemon. Check Codex's required JSON output for `Stop`/`Interrupt`, event ordering, timeouts, hook trust, and idempotent installation/removal without disturbing other hooks.\n- Determine how Codex and Claude entries should coexist in the registry and UI, including provider-qualified identity, labels, model badges, and source/focus behavior.\n- Test liveness while a Codex session is idle, approval resolution or cancellation, automatic approvals, and sessions that end without a prompt hook. Decide what supplementary signal is needed where hooks are incomplete.\n\nThe investigation is complete when it includes a tested event/state matrix, a proposed daemon and UI data contract, documented accuracy limits for each Codex surface, and follow-up implementation issues or a scoped implementation plan.\n\n## Describe alternatives you've considered\n\n- Herdr uses Codex hooks for session identity but treats its live terminal screen as the state authority because hooks miss some transitions. This is relevant to terminal Codex, but does not directly cover desktop chats.\n- Huginn combines hooks with Codex local state, rollout logs, and process liveness.\n- Codex App Server exposes structured thread status, including `waitingOnApproval` and `waitingOnUserInput`; a read-only observer may offer more accurate state where access to the owning server is available. Avoid subscribing to or interfering with an unrelated live client.\n\n## Use Case\n\nShow Codex sessions alongside Claude Code sessions on the correct repository/worktree, with a useful indication of which sessions are working or need the user's attention.\n\n## Priority\n\nMedium - Would be helpful.\n\n## Additional Context\n\n- Current code: `src/cli/sessions.rs`, `src/sessions.rs`, `src/daemon/services/sessions.rs`, `editors/vscode/src/sessionCounts.ts`.\n- Codex hooks: https://learn.chatgpt.com/docs/hooks\n- Codex App Server status: https://learn.chatgpt.com/docs/app-server\n- Herdr's status authority: https://herdr.dev/docs/agents/\n- Huginn: https://github.com/tohuw/huginn\n- App Server precedent: https://github.com/morgadoronan/codex-agents\n\n## Code of Conduct\n\n- [x] I agree to follow this project's Code of Conduct.\n",
+    "comments": [],
+    "closed_by": [],
+    "url": "https://github.com/rust-works/omni-dev/issues/1861"
+  },
+  {
+    "provider": "github",
+    "project": "rust-works/omni-dev",
+    "number": 1858,
+    "kind": "issue",
+    "title": "ai jev route/verify-decision: cache GitHub issue fetches to avoid redundant re-querying",
+    "state": "open",
+    "body": "`omni-dev ai jev route` and `verify-decision` each fetch their GitHub issues/PRs\nby shelling out directly to `gh api graphql` (`src/github_issues.rs::fetch_items`\n\u2192 `pr_status::run_gh_graphql`), once per CLI invocation, with no caching layer.\nBoth humans iterating (re-running `route` while tuning `--ladders`, re-running\n`verify-decision` while tuning the splitter prompt) and AI agents driving the\nCLI repeatedly are likely to re-query the same issue/PR/comment thread within\na short window, each time paying a fresh GraphQL round trip (and rate-limit\nbudget) for identical data.\n\n## What\n\nAdd a caching layer so repeated `route`/`verify-decision` invocations against\nthe same issue reuse a recent fetch instead of re-hitting the GitHub API:\n\n- Most likely shape: a small TTL'd cache keyed by `ItemRef`\n  (owner/repo/number), served by the **daemon** \u2014 following the precedent\n  already in `src/daemon/services/worktrees.rs`'s `TreeSnapshotCache` /\n  `PrBadge` staleness handling, and the existing `github_metrics::run_gh`\n  call-counting choke point that both worktrees and `github_issues.rs`\n  already funnel through.\n- `route`/`verify-decision` would become daemon socket clients for this fetch,\n  with a **required fallback to today's direct `gh api graphql` path** when\n  the daemon isn't running \u2014 mirroring `worktrees rebase`'s local-fallback\n  design \u2014 so neither command gains a hard daemon dependency.\n- Alternative worth weighing first: a simpler flat-file TTL cache (no daemon\n  involvement), similar in spirit to the request log's on-disk state. Lower\n  complexity, but doesn't dedupe concurrent invocations across processes the\n  way a resident daemon cache would, and doesn't reuse the rate-limit\n  awareness (`github_rate_limit`, `WARN_PERCENT`) that already lives in the\n  daemon.\n\n## Why now\n\nNot urgent \u2014 no reported rate-limit incident yet \u2014 but `route`/`verify-decision`\nare new (#1779, #1787) and their expected usage pattern (iterative tuning by\nboth humans and AI agents) makes redundant re-fetching likely enough to be\nworth designing for before it becomes a real API budget problem.\n",
+    "comments": [],
+    "closed_by": [],
+    "url": "https://github.com/rust-works/omni-dev/issues/1858"
+  },
+  {
+    "provider": "github",
+    "project": "evaluation/synthetic",
+    "number": 900001,
+    "kind": "issue",
+    "title": "Completed change \u2014 synthetic control",
+    "state": "open",
+    "body": "The approach was settled, code and tests were implemented, documentation updated, and the final review completed with all findings fixed and verified. The change is merged. No design, implementation, documentation, testing, or review work remains. Do not invent follow-up work.",
+    "comments": [],
+    "closed_by": [],
+    "url": ""
+  },
+  {
+    "provider": "github",
+    "project": "evaluation/synthetic",
+    "number": 900002,
+    "kind": "issue",
+    "title": "Mechanical spelling fix \u2014 synthetic control",
+    "state": "open",
+    "body": "Change exactly one occurrence of teh to the in docs/example.md. The file and location are verified. There are no code changes. The approach is fully settled. Implementation is the single replacement. Review should only confirm this exact replacement and that no other text changed.",
+    "comments": [],
+    "closed_by": [],
+    "url": ""
+  }
+]
