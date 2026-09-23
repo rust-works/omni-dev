@@ -139,11 +139,12 @@ impl RouteCommand {
     /// Executes the route command.
     pub async fn execute(self) -> Result<()> {
         let mut config = JevConfig::from_env()?;
-        if let Some(model) = self.jev_model {
-            config.model = model;
+        if let Some(model) = &self.jev_model {
+            config.model = model.clone();
         }
         let ladders = build_ladders(&self.ladders, &self.ladder_definition)?;
         let client = JevClient::from_config(&config)?;
+        let opts = self.route_options(config.model);
 
         let bin = crate::pr_status::resolve_gh_binary();
         let cwd = self
@@ -159,13 +160,6 @@ impl RouteCommand {
             .await
             .context("Issue fetch task panicked")??;
 
-        let opts = RouteOptions {
-            model: config.model,
-            close_call: self.close_call,
-            effort_advice: self.effort_advice,
-            max_input_chars: self.max_input_chars,
-            allow_closed: self.allow_closed,
-        };
         let report = run_route_with_reference_fetch_failures(
             &client,
             &docs,
@@ -188,6 +182,16 @@ impl RouteCommand {
         );
         failure_summary(&report).map_or(Ok(()), |msg| bail!(msg))
         // omni-dev: coverage end
+    }
+
+    fn route_options(&self, model: String) -> RouteOptions {
+        RouteOptions {
+            model,
+            close_call: self.close_call,
+            effort_advice: self.effort_advice,
+            max_input_chars: self.max_input_chars,
+            allow_closed: self.allow_closed,
+        }
     }
 }
 
@@ -535,6 +539,35 @@ mod tests {
             assert_eq!(cmd.output, expected);
             assert!(cmd.effort_advice);
         }
+    }
+
+    #[test]
+    fn route_options_forward_parsed_flags_in_both_effort_modes() {
+        let default = parse(&["#1"])
+            .unwrap()
+            .route_options("configured-model".into());
+        assert_eq!(default.model, "configured-model");
+        assert!(!default.effort_advice);
+        assert!(!default.allow_closed);
+        assert_eq!(default.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
+        assert!((default.close_call - DEFAULT_CLOSE_CALL).abs() < f64::EPSILON);
+
+        let enabled = parse(&[
+            "#1",
+            "--effort-advice",
+            "--allow-closed",
+            "--max-input-chars",
+            "1234",
+            "--close-call",
+            "0.42",
+        ])
+        .unwrap()
+        .route_options("override-model".into());
+        assert_eq!(enabled.model, "override-model");
+        assert!(enabled.effort_advice);
+        assert!(enabled.allow_closed);
+        assert_eq!(enabled.max_input_chars, 1234);
+        assert!((enabled.close_call - 0.42).abs() < f64::EPSILON);
     }
 
     #[test]

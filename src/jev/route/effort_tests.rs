@@ -797,6 +797,49 @@ fn text_preserves_all_statuses_and_scopes_numbered_notes_to_the_table() {
 }
 
 #[test]
+fn text_uses_short_status_labels_for_close_call_notes() {
+    let ladder = custom();
+    let mut routes = provider_routes(
+        &response(std::slice::from_ref(&ladder)),
+        std::slice::from_ref(&ladder),
+        0.3,
+    )
+    .unwrap();
+    let stages = &mut routes.get_mut("custom").unwrap().stages;
+    for (status, level, short) in [
+        (Status::Recommended, Some("quick"), "quick"),
+        (Status::Fixed, Some("automatic"), "automatic (fixed)"),
+        (Status::Unavailable, None, "unavailable"),
+        (Status::Insufficient, None, "insufficient capability"),
+        (Status::NotNeeded, None, "not needed"),
+        (Status::Unspecified, None, "unspecified"),
+    ] {
+        let entry = &mut stages
+            .design
+            .effort_by_model
+            .get_mut("small,alternative")
+            .unwrap()[0];
+        entry.status = status;
+        entry.level = level.map(str::to_string);
+        entry.close_call = true;
+
+        let lines = render(stages, Some(&ladder));
+        let row = lines
+            .iter()
+            .find(|line| line.contains("small,alternative [vendor.small.v1]"))
+            .unwrap();
+        assert!(row.contains(&format!("{short} [")), "{status:?}: {row}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("vendor.small.v1], design:")
+                    && line.contains("close call")),
+            "{status:?}: {lines:#?}"
+        );
+    }
+}
+
+#[test]
 fn text_omits_empty_effort_tables() {
     let ladder = custom();
     let mut routes = provider_routes(
