@@ -2,8 +2,21 @@
 // VS Code layer makes terminal naming and missing-tool handling testable under
 // plain Node.
 
+import * as path from "path";
+
 /** The base name used for editor-area pi.dev terminals. */
 export const PI_TERMINAL_NAME = "pi.dev";
+
+/** Absolute zsh paths to try, including standard Unix locations outside GUI PATH. */
+export function zshSearchPaths(platform: NodeJS.Platform, pathValue: string | undefined): string[] {
+  const paths = platform === "win32" ? path.win32 : path.posix;
+  const directories = (pathValue ?? "").split(paths.delimiter).filter(Boolean);
+  if (platform !== "win32") {
+    directories.push("/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin");
+  }
+  const executable = platform === "win32" ? "zsh.exe" : "zsh";
+  return [...new Set(directories.map((directory) => paths.resolve(directory, executable)))];
+}
 
 /**
  * Picks the lowest available pi.dev terminal name so concurrent editor tabs stay
