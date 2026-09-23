@@ -13,6 +13,7 @@ use serde_json::Value;
 use super::{
     AiClient, AiClientCapabilities, AiClientMetadata, AiResponse, InvocationMetrics, RequestOptions,
 };
+use crate::claude::backend::EffortLevel;
 use crate::claude::error::ClaudeError;
 use crate::claude::model_config::get_model_registry;
 
@@ -23,17 +24,16 @@ struct Message {
     content: String,
 }
 
-/// Structured-output request envelope for the Anthropic Messages API.
+/// Optional output controls for the Anthropic Messages API.
 ///
-/// Serialises to `{"output_config": {"format": {"type": "json_schema",
-/// "schema": {...}}}}`. This is the GA structured-outputs surface (no beta
-/// header required), so the API re-prompts the model until it emits a JSON
-/// object validating against `schema`. Only attached for models the registry
-/// flags via [`ModelRegistry::supports_structured_output`](crate::claude::model_config::ModelRegistry::supports_structured_output);
-/// unsupported models `400` on the field, so they keep the YAML path.
+/// Carries `format` for schema-constrained responses and/or `effort` for an
+/// explicit reasoning level. Both controls are gated by model capabilities.
 #[derive(Serialize)]
 struct OutputConfig {
-    format: OutputFormat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<OutputFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<EffortLevel>,
 }
 
 /// Inner `format` block of an [`OutputConfig`]. `kind` is always the literal
@@ -52,8 +52,8 @@ struct ClaudeRequest {
     max_tokens: i32,
     system: String,
     messages: Vec<Message>,
-    /// Optional structured-output constraint. Omitted from the wire body when
-    /// `None` (`skip_serializing_if`) so the default request stays
+    /// Optional output controls. Omitted from the wire body when `None` so
+    /// the default request stays
     /// byte-identical to the pre-#1119 shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     output_config: Option<OutputConfig>,
@@ -108,6 +108,8 @@ pub struct ClaudeAiClient {
     model: String,
     /// Active beta header (key, value) if enabled.
     active_beta: Option<(String, String)>,
+    /// Explicit effort level, or the model's API default when absent.
+    effort: Option<EffortLevel>,
     /// Messages API endpoint (defaults to [`API_URL`]; overridable in tests).
     api_url: String,
 }
@@ -126,8 +128,16 @@ impl ClaudeAiClient {
             api_key,
             model,
             active_beta,
+            effort: None,
             api_url: API_URL.to_string(),
         })
+    }
+
+    /// Configures an explicit effort level for every request on this client.
+    #[must_use]
+    pub fn with_effort(mut self, effort: Option<EffortLevel>) -> Self {
+        self.effort = effort;
+        self
     }
 
     /// Returns the max tokens from the model registry.
@@ -174,11 +184,12 @@ impl ClaudeAiClient {
                 role: "user".to_string(),
                 content: user_prompt.to_string(),
             }],
-            output_config: schema.map(|schema| OutputConfig {
-                format: OutputFormat {
+            output_config: (schema.is_some() || self.effort.is_some()).then(|| OutputConfig {
+                format: schema.map(|schema| OutputFormat {
                     kind: "json_schema",
                     schema: schema.clone(),
-                },
+                }),
+                effort: self.effort,
             }),
         };
 
@@ -643,6 +654,47 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");
         assert_eq!(body["output_config"]["format"]["schema"], schema);
+    }
+
+    #[tokio::test]
+    async fn explicit_effort_serializes_with_and_without_schema() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"content":[{"type":"text","text":"ok"}]}"#),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut client =
+            ClaudeAiClient::new("claude-opus-5-5".to_string(), "key".to_string(), None)
+                .unwrap()
+                .with_effort(Some(EffortLevel::Xhigh));
+        client.api_url = format!("{}/v1/messages", server.uri());
+        client.send_request("system", "user").await.unwrap();
+        let schema = serde_json::json!({"type": "object"});
+        client
+            .send_request_with_options(
+                "system",
+                "user",
+                RequestOptions::default().with_response_schema(schema.clone()),
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let plain: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let constrained: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(plain["output_config"]["effort"], "xhigh");
+        assert!(plain["output_config"].get("format").is_none());
+        assert_eq!(constrained["output_config"]["effort"], "xhigh");
+        assert_eq!(constrained["output_config"]["format"]["schema"], schema);
     }
 
     /// The no-schema path must not emit `output_config` on the wire — the

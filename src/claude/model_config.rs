@@ -35,6 +35,8 @@ use std::sync::OnceLock;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::claude::backend::EffortLevel;
+
 /// Embedded models YAML configuration, loaded at compile time.
 pub(crate) const MODELS_YAML: &str = include_str!("../templates/models.yaml");
 
@@ -235,6 +237,11 @@ pub struct ModelSpec {
     /// `false`, so unmarked and unknown models are never sent the field.
     #[serde(default)]
     pub supports_structured_output: bool,
+    /// Explicit `output_config.effort` levels accepted by this model.
+    /// Empty means effort is unsupported. A list is necessary because some
+    /// models support `max` but not `xhigh`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effort_levels: Vec<EffortLevel>,
     /// Price per million *input* tokens in USD, if known.
     ///
     /// Used to compute per-invocation cost for backends that report token
@@ -564,6 +571,14 @@ impl ModelRegistry {
     pub fn supports_structured_output(&self, api_identifier: &str) -> bool {
         self.get_model_spec(api_identifier)
             .is_some_and(|spec| spec.supports_structured_output)
+    }
+
+    /// Returns the model's accepted effort levels, including for normalized
+    /// Bedrock identifiers. Unknown models support no explicit levels.
+    #[must_use]
+    pub fn effort_levels(&self, api_identifier: &str) -> &[EffortLevel] {
+        self.get_model_spec(api_identifier)
+            .map_or(&[], |spec| spec.effort_levels.as_slice())
     }
 
     /// Infers the provider from a model identifier.
@@ -1288,6 +1303,74 @@ mod tests {
 
         // Unknown identifiers are conservatively unsupported.
         assert!(!registry.supports_structured_output("totally-unknown-model"));
+    }
+
+    #[test]
+    fn effort_levels_follow_model_and_bedrock_identifiers() {
+        use EffortLevel::{High, Low, Max, Medium, Xhigh};
+
+        let registry = embedded_only();
+        let all = &[Low, Medium, High, Xhigh, Max];
+        for id in [
+            "claude-fable-5-1",
+            "claude-fable-5",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+        ] {
+            assert_eq!(registry.effort_levels(id), all, "{id}");
+        }
+        assert_eq!(
+            registry.effort_levels("claude-opus-4-6"),
+            &[Low, Medium, High, Max]
+        );
+        assert_eq!(
+            registry.effort_levels("claude-sonnet-4-6"),
+            &[Low, Medium, High, Max]
+        );
+        assert_eq!(
+            registry.effort_levels("claude-opus-4-5"),
+            &[Low, Medium, High]
+        );
+        assert_eq!(
+            registry.effort_levels("claude-opus-4-5-20251101"),
+            &[Low, Medium, High]
+        );
+        assert_eq!(
+            registry.effort_levels("us.anthropic.claude-opus-4-6-v1:0"),
+            &[Low, Medium, High, Max]
+        );
+        for id in [
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "claude-3-opus-20240229",
+            "unknown",
+        ] {
+            assert!(registry.effort_levels(id).is_empty(), "{id}");
+        }
+    }
+
+    #[test]
+    fn user_layer_can_override_effort_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = write_yaml(
+            dir.path(),
+            "effort.yaml",
+            r#"
+version: "1"
+models:
+  - provider: "claude"
+    model: "Claude Opus 4.6"
+    api_identifier: "claude-opus-4-6"
+    effort_levels: [low, medium, high, xhigh, max]
+"#,
+        );
+        let registry = ModelRegistry::load_layered_from_paths(None, Some(&user), None).unwrap();
+        assert!(registry
+            .effort_levels("claude-opus-4-6")
+            .contains(&EffortLevel::Xhigh));
     }
 
     /// The current-generation Claude models carry a 1M context window natively,

@@ -26,6 +26,7 @@ models:
     generation: 5.1
     tier: "flagship"
     supports_structured_output: true
+    effort_levels: [low, medium, high, xhigh, max]
 
   - provider: "claude"
     model: "Claude Fable 5"
@@ -37,6 +38,7 @@ models:
     generation: 5.0
     tier: "flagship"
     supports_structured_output: true
+    effort_levels: [low, medium, high, xhigh, max]
 
   # Opus 5.5 (released 2026-09-22) is priced below Opus 5 and, per
   # Anthropic, performs at the level of Fable 5.1 on most work.
@@ -50,6 +52,7 @@ models:
     generation: 5.5
     tier: "flagship"
     supports_structured_output: true
+    effort_levels: [low, medium, high, xhigh, max]
 
   - provider: "claude"
     model: "Claude Opus 5"
@@ -61,6 +64,7 @@ models:
     generation: 5.0
     tier: "flagship"
     supports_structured_output: true
+    effort_levels: [low, medium, high, xhigh, max]
 
   - provider: "claude"
     model: "Claude Opus 4.8"
@@ -72,6 +76,7 @@ models:
     generation: 4.8
     tier: "flagship"
     supports_structured_output: true
+    effort_levels: [low, medium, high, xhigh, max]
 
   - provider: "claude"
     model: "Claude Opus 4.7"
@@ -83,6 +88,7 @@ models:
     generation: 4.7
     tier: "flagship"
     supports_structured_output: true
+    effort_levels: [low, medium, high, xhigh, max]
 
   # Sonnet 5 has introductory pricing of $2.00/$10.00 per MTok through
   # 2026-08-31. The schema has no way to express a time-bounded price, so the
@@ -98,6 +104,7 @@ models:
     generation: 5.0
     tier: "balanced"
     supports_structured_output: true
+    effort_levels: [low, medium, high, xhigh, max]
 
   # Claude 4.6 Series
   #
@@ -118,6 +125,7 @@ models:
     generation: 4.6
     tier: "flagship"
     supports_structured_output: true
+    effort_levels: [low, medium, high, max]
     beta_headers:
       - key: "anthropic-beta"
         value: "context-1m-2025-08-07"
@@ -133,6 +141,7 @@ models:
     generation: 4.6
     tier: "balanced"
     supports_structured_output: true
+    effort_levels: [low, medium, high, max]
     beta_headers:
       - key: "anthropic-beta"
         value: "context-1m-2025-08-07"
@@ -211,6 +220,7 @@ models:
     tier: "flagship"
     legacy: true
     supports_structured_output: true
+    effort_levels: [low, medium, high]
 
   - provider: "claude"
     model: "Claude Opus 4.5"
@@ -223,6 +233,7 @@ models:
     tier: "flagship"
     legacy: true
     supports_structured_output: true
+    effort_levels: [low, medium, high]
 
   # Claude 4.x Series (Deprecated)
   #

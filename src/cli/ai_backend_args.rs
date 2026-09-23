@@ -21,7 +21,7 @@
 
 use clap::Args;
 
-use crate::claude::backend::AiBackend;
+use crate::claude::backend::{AiBackend, EffortLevel};
 
 /// `--models-yaml`: the one AI flag also read by a non-AI command
 /// (`config models show`), so it is its own group.
@@ -67,6 +67,11 @@ pub struct AiBackendArgs {
     /// setting `OMNI_DEV_MODEL`.
     #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
+
+    /// Anthropic/Bedrock effort level for this command. Other AI backends
+    /// warn and ignore it. Equivalent to `OMNI_DEV_AI_EFFORT`.
+    #[arg(long, value_enum)]
+    pub effort: Option<EffortLevel>,
 
     /// Beta header to send with AI API requests (format: key:value).
     ///
@@ -139,6 +144,10 @@ impl AiBackendArgs {
             std::env::set_var(crate::claude::backend::MODEL_ENV, model);
         }
 
+        if let Some(effort) = self.effort {
+            std::env::set_var(crate::claude::backend::AI_EFFORT_ENV, effort.as_str());
+        }
+
         if let Some(beta_header) = &self.beta_header {
             std::env::set_var(crate::claude::backend::BETA_HEADER_ENV, beta_header);
         }
@@ -198,6 +207,8 @@ mod tests {
             "claude-cli",
             "--model",
             "claude-opus-4-6",
+            "--effort",
+            "xhigh",
             "--beta-header",
             "anthropic-beta:output-128k-2025-02-19",
             "--claude-cli-allow-tools",
@@ -209,6 +220,7 @@ mod tests {
         ]);
         assert_eq!(ai.ai_backend, Some(AiBackend::ClaudeCli));
         assert_eq!(ai.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(ai.effort, Some(EffortLevel::Xhigh));
         assert_eq!(
             ai.beta_header.as_deref(),
             Some("anthropic-beta:output-128k-2025-02-19")
@@ -227,6 +239,7 @@ mod tests {
         let ai = parse_twiddle(&[]);
         assert!(ai.ai_backend.is_none());
         assert!(ai.model.is_none());
+        assert!(ai.effort.is_none());
         assert!(ai.beta_header.is_none());
         assert!(!ai.claude_cli_allow_tools);
         assert!(!ai.claude_cli_allow_mcp);
@@ -261,6 +274,16 @@ mod tests {
         assert!(err.to_string().contains("invalid"));
     }
 
+    #[test]
+    fn effort_rejects_unknown_level() {
+        let argv: Vec<&str> = TWIDDLE
+            .iter()
+            .chain(&["--effort", "extreme"])
+            .copied()
+            .collect();
+        assert!(Cli::try_parse_from(argv).is_err());
+    }
+
     /// Every AI leaf accepts the group.
     #[test]
     fn every_ai_command_accepts_the_flags() {
@@ -274,7 +297,14 @@ mod tests {
         ] {
             let argv: Vec<&str> = std::iter::once("omni-dev")
                 .chain(leaf.iter().copied())
-                .chain(["--ai-backend", "claude-cli", "--model", "m"])
+                .chain([
+                    "--ai-backend",
+                    "claude-cli",
+                    "--model",
+                    "m",
+                    "--effort",
+                    "low",
+                ])
                 .collect();
             assert!(
                 Cli::try_parse_from(&argv).is_ok(),
@@ -292,6 +322,7 @@ mod tests {
             &["--model", "claude-opus-4-6"][..],
             &["--ai-backend", "claude-cli"],
             &["--beta-header", "k:v"],
+            &["--effort", "high"],
             &["--claude-cli-allow-tools"],
             &["--models-yaml", "/tmp/m.yaml"],
         ] {
@@ -318,6 +349,7 @@ mod tests {
             &["--ai-backend", "claude-cli"],
             &["--model", "claude-opus-4-6"],
             &["--beta-header", "k:v"],
+            &["--effort", "high"],
             &["--models-yaml", "/tmp/m.yaml"],
         ] {
             let argv: Vec<&str> = [
@@ -440,6 +472,7 @@ mod tests {
 
     const BACKEND_VAR: &str = "OMNI_DEV_AI_BACKEND";
     const MODEL_VAR: &str = "OMNI_DEV_MODEL";
+    const EFFORT_VAR: &str = "OMNI_DEV_AI_EFFORT";
     const BETA_HEADER_VAR: &str = "OMNI_DEV_BETA_HEADER";
     const ALLOW_TOOLS_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS";
     const ALLOW_MCP_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_MCP";
@@ -450,7 +483,7 @@ mod tests {
     /// may touch.
     struct AiEnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
-        saved: [(&'static str, Option<String>); 7],
+        saved: [(&'static str, Option<String>); 8],
     }
 
     impl AiEnvGuard {
@@ -461,6 +494,7 @@ mod tests {
             let names = [
                 BACKEND_VAR,
                 MODEL_VAR,
+                EFFORT_VAR,
                 BETA_HEADER_VAR,
                 ALLOW_TOOLS_VAR,
                 ALLOW_MCP_VAR,
@@ -493,6 +527,7 @@ mod tests {
         for var in [
             BACKEND_VAR,
             MODEL_VAR,
+            EFFORT_VAR,
             BETA_HEADER_VAR,
             ALLOW_TOOLS_VAR,
             ALLOW_MCP_VAR,
@@ -548,6 +583,17 @@ mod tests {
             std::env::var(MODEL_VAR).ok().as_deref(),
             Some("claude-opus-4-6")
         );
+    }
+
+    #[test]
+    fn apply_sets_effort() {
+        let _g = AiEnvGuard::new();
+        AiBackendArgs {
+            effort: Some(EffortLevel::Max),
+            ..Default::default()
+        }
+        .apply();
+        assert_eq!(std::env::var(EFFORT_VAR).ok().as_deref(), Some("max"));
     }
 
     #[test]

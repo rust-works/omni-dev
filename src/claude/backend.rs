@@ -46,6 +46,9 @@ pub const MODEL_ENV: &str = "OMNI_DEV_MODEL";
 /// Env var carrying a `key:value` beta header; set by the global
 /// `--beta-header` flag.
 pub const BETA_HEADER_ENV: &str = "OMNI_DEV_BETA_HEADER";
+/// Env var carrying an explicit Anthropic/Bedrock effort level; set by the
+/// per-command `--effort` flag.
+pub const AI_EFFORT_ENV: &str = "OMNI_DEV_AI_EFFORT";
 /// Highest-precedence Claude-family model variable.
 pub const CLAUDE_MODEL_ENV: &str = "CLAUDE_MODEL";
 /// Claude-family model variable, read after [`CLAUDE_MODEL_ENV`].
@@ -105,6 +108,94 @@ pub enum AiBackend {
     /// `OMNI_DEV_AI_BACKEND=bedrock` (legacy: `CLAUDE_CODE_USE_BEDROCK=true`).
     #[value(name = "bedrock")]
     Bedrock,
+}
+
+/// Anthropic Messages API `output_config.effort` level.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lower")]
+pub enum EffortLevel {
+    /// Minimize token use and latency.
+    Low,
+    /// Balance quality and token use.
+    Medium,
+    /// Spend more tokens on careful reasoning.
+    High,
+    /// Extended effort on models that support it.
+    Xhigh,
+    /// Maximum effort on models that support it.
+    Max,
+}
+
+impl EffortLevel {
+    /// The wire and environment value for this level.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl std::fmt::Display for EffortLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Resolves an explicitly selected effort level; an unset value preserves the
+/// model's API default. Invalid environment values are hard errors.
+pub fn resolve_effort(env: &impl EnvSource) -> Result<Option<EffortLevel>> {
+    let Some(raw) = non_empty_var(env, AI_EFFORT_ENV) else {
+        return Ok(None);
+    };
+    let level = match raw.as_str() {
+        "low" => EffortLevel::Low,
+        "medium" => EffortLevel::Medium,
+        "high" => EffortLevel::High,
+        "xhigh" => EffortLevel::Xhigh,
+        "max" => EffortLevel::Max,
+        _ => {
+            return Err(anyhow!(
+                "Invalid {AI_EFFORT_ENV} value '{raw}'. Valid values: low, medium, high, xhigh, max"
+            ));
+        }
+    };
+    Ok(Some(level))
+}
+
+/// Rejects an effort level unavailable on the resolved Anthropic model.
+/// The registry lookup also normalizes Bedrock model identifiers.
+pub fn validate_effort_for_model(
+    model: &str,
+    effort: Option<EffortLevel>,
+    registry: &ModelRegistry,
+) -> Result<()> {
+    let Some(effort) = effort else {
+        return Ok(());
+    };
+    let supported = registry.effort_levels(model);
+    if supported.contains(&effort) {
+        return Ok(());
+    }
+    if supported.is_empty() {
+        return Err(anyhow!(
+            "Model '{model}' does not support --effort ({effort}). Choose a model that supports effort or omit --effort."
+        ));
+    }
+    let allowed = supported
+        .iter()
+        .map(|level| level.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(anyhow!(
+        "Model '{model}' does not support --effort {effort}. Supported levels: {allowed}"
+    ))
 }
 
 impl AiBackend {
@@ -172,10 +263,10 @@ pub fn resolve_backend(env: &impl EnvSource) -> Result<AiBackend> {
 /// (`ModelRegistry::supports_structured_output`), which cannot express "this
 /// *endpoint* won't accept the field" — the case a gateway named by
 /// `ANTHROPIC_BEDROCK_BASE_URL` creates when it rejects `output_config`
-/// outright (issue #1561). This is the endpoint-level off-switch: it applies
-/// to every backend
-/// and every model, so a run against such a gateway never sends the field at
-/// all rather than paying one rejected round-trip to discover it.
+/// outright (issue #1561). This is the endpoint-level schema off-switch: it
+/// applies to every backend and every model. An explicit effort still sends
+/// `output_config.effort`, so a gateway that rejects the whole object also
+/// requires omitting `--effort` (#1886).
 ///
 /// Truthy values are `1`, `true`, and `yes` (trimmed, case-insensitive);
 /// anything else — including an unset or empty var — leaves structured output
@@ -518,6 +609,47 @@ mod tests {
         let env = MapEnv::new().with(BETA_HEADER_ENV, "no-colon-here");
         let err = resolve_beta_header(None, &env).unwrap_err().to_string();
         assert!(err.contains("no-colon-here"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_effort_accepts_only_explicit_levels() {
+        assert_eq!(resolve_effort(&MapEnv::new()).unwrap(), None);
+        assert_eq!(
+            resolve_effort(&MapEnv::new().with(AI_EFFORT_ENV, "")).unwrap(),
+            None
+        );
+        for (raw, level) in [
+            ("low", EffortLevel::Low),
+            ("medium", EffortLevel::Medium),
+            ("high", EffortLevel::High),
+            ("xhigh", EffortLevel::Xhigh),
+            ("max", EffortLevel::Max),
+        ] {
+            assert_eq!(
+                resolve_effort(&MapEnv::new().with(AI_EFFORT_ENV, raw)).unwrap(),
+                Some(level)
+            );
+        }
+        assert!(
+            resolve_effort(&MapEnv::new().with(AI_EFFORT_ENV, "extreme"))
+                .unwrap_err()
+                .to_string()
+                .contains("Valid values")
+        );
+    }
+
+    #[test]
+    fn effort_validation_uses_exact_supported_set() {
+        let registry = get_model_registry();
+        validate_effort_for_model("claude-opus-4-6", Some(EffortLevel::Max), registry).unwrap();
+        let err = validate_effort_for_model("claude-opus-4-6", Some(EffortLevel::Xhigh), registry)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("low, medium, high, max"), "{err}");
+        let err = validate_effort_for_model("claude-haiku-4-5", Some(EffortLevel::Low), registry)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not support"), "{err}");
     }
 
     #[test]

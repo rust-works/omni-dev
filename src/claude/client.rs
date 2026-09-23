@@ -186,24 +186,31 @@ impl ClaudeClient {
         {
             Ok(content) => Ok(content),
             Err(e) if ai_error_is_schema_rejection(&e) => {
-                self.schema_disabled
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 warn!(
                     error = %e,
                     "The AI endpoint rejected the structured-output field `output_config`; \
-                     retrying on the YAML response path and disabling it for the rest of this \
-                     run. A gateway in front of Bedrock/Anthropic that does not pass \
+                     retrying on the YAML response path. A successful retry disables \
+                     structured output for the rest of this run. A gateway in front of \
+                     Bedrock/Anthropic that does not pass \
                      `output_config` through is the usual cause. Set \
                      OMNI_DEV_STRUCTURED_OUTPUT_DISABLE=true, or \
                      `supports_structured_output: false` for this model in \
-                     ~/.omni-dev/models.yaml, to skip the rejected request entirely."
+                     ~/.omni-dev/models.yaml, to skip the schema-bearing request. \
+                     An explicit --effort remains on the YAML retry; omit it if this \
+                     endpoint rejects effort or all of `output_config`."
                 );
-                self.ai_client
+                let fallback = self
+                    .ai_client
                     .send_request(Self::yaml_system_prompt(system_prompt), user_prompt)
                     .await
                     .with_context(|| {
                         format!("YAML fallback after the endpoint rejected `output_config` ({e})")
-                    })
+                    });
+                if fallback.is_ok() {
+                    self.schema_disabled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                fallback
             }
             Err(e) => Err(e),
         }
@@ -1854,6 +1861,21 @@ fn warn_beta_header_ignored(
     }
 }
 
+/// Warns once during client construction when a backend does not accept
+/// Anthropic's `output_config.effort` control.
+fn warn_effort_ignored(
+    backend: crate::claude::backend::AiBackend,
+    effort: Option<crate::claude::backend::EffortLevel>,
+) {
+    if let Some(effort) = effort {
+        warn!(
+            "--effort {effort} is ignored when OMNI_DEV_AI_BACKEND={} \
+             (this backend does not use Anthropic's output_config.effort)",
+            backend.env_value()
+        );
+    }
+}
+
 /// Creates a default Claude client using environment variables and settings.
 ///
 /// Async because the Ollama branch probes the local server for its
@@ -1896,13 +1918,18 @@ pub(crate) async fn create_default_claude_client_with(
     let beta_header = backend::resolve_beta_header(beta_header, env)?;
     let registry = crate::claude::model_config::get_model_registry();
     let model = backend::resolve_model(ai_backend, model.as_deref(), env, registry);
+    let effort = backend::resolve_effort(env)?;
+    if matches!(ai_backend, AiBackend::Default | AiBackend::Bedrock) {
+        backend::validate_effort_for_model(&model, effort, registry)?;
+    }
     // Resolved once, applied once below: the off-switch is a property of the
     // endpoint, not of any one backend, so every arm honours it (#1561).
     let schema_disabled = backend::resolve_structured_output_disabled(env);
-    debug!(backend = ?ai_backend, model = %model, schema_disabled, "Resolved AI backend");
+    debug!(backend = ?ai_backend, model = %model, ?effort, schema_disabled, "Resolved AI backend");
 
     let ai_client: Box<dyn AiClient> = match ai_backend {
         AiBackend::ClaudeCli => {
+            warn_effort_ignored(AiBackend::ClaudeCli, effort);
             // The `claude -p` subprocess negotiates betas itself, so the
             // beta header is deliberately not forwarded (and, uniquely, not
             // validated — this backend accepts short model aliases like
@@ -1917,6 +1944,7 @@ pub(crate) async fn create_default_claude_client_with(
             Box::new(ClaudeCliAiClient::new(model))
         }
         AiBackend::Ollama => {
+            warn_effort_ignored(AiBackend::Ollama, effort);
             warn_beta_header_ignored(AiBackend::Ollama, beta_header.as_ref());
             let base_url = env.var("OLLAMA_BASE_URL");
             let mut ai_client = OpenAiAiClient::new_ollama(model, base_url, None)?;
@@ -1939,6 +1967,7 @@ pub(crate) async fn create_default_claude_client_with(
             Box::new(ai_client)
         }
         AiBackend::OpenAi => {
+            warn_effort_ignored(AiBackend::OpenAi, effort);
             debug!("Creating OpenAI client");
             warn_beta_header_ignored(AiBackend::OpenAi, beta_header.as_ref());
 
@@ -1964,12 +1993,9 @@ pub(crate) async fn create_default_claude_client_with(
                 .var("ANTHROPIC_BEDROCK_BASE_URL")
                 .ok_or(ClaudeError::ApiKeyNotFound)?;
 
-            Box::new(BedrockAiClient::new(
-                model,
-                auth_token,
-                base_url,
-                beta_header,
-            )?)
+            Box::new(
+                BedrockAiClient::new(model, auth_token, base_url, beta_header)?.with_effort(effort),
+            )
         }
         AiBackend::Default => {
             debug!("Creating direct Claude API client");
@@ -1982,7 +2008,7 @@ pub(crate) async fn create_default_claude_client_with(
                 ])
                 .ok_or(ClaudeError::ApiKeyNotFound)?;
 
-            let ai_client = ClaudeAiClient::new(model, api_key, beta_header)?;
+            let ai_client = ClaudeAiClient::new(model, api_key, beta_header)?.with_effort(effort);
             debug!("Claude client created successfully");
             Box::new(ai_client)
         }
@@ -2313,6 +2339,37 @@ mod tests {
         let chain = format!("{err:#}");
         assert!(chain.contains("output_config"), "{chain}");
         assert!(chain.contains("connection reset"), "{chain}");
+        assert!(
+            client.schema_if_supported(&schema).is_some(),
+            "failed fallback must not latch"
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_rejection_does_not_retry_or_disable_schema() {
+        let inner =
+            SchemaRecordingMockAiClient::new(true).failing_options(ClaudeError::ApiHttpError {
+                status: 400,
+                body: "output_config.effort: unsupported".to_string(),
+            });
+        let plain_log = inner.recorded_plain.clone();
+        let options_log = inner.recorded_options.clone();
+        let client = ClaudeClient::new(Box::new(inner));
+        let schema = schema_fixture();
+
+        for _ in 0..2 {
+            let error = client
+                .send_with_optional_schema("sys", "usr", client.schema_if_supported(&schema))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("output_config.effort"));
+        }
+        assert!(plain_log.lock().unwrap().is_empty());
+        assert_eq!(
+            options_log.lock().unwrap().len(),
+            2,
+            "schema path must remain available"
+        );
     }
 
     /// The strip is exact and idempotent: it removes the override when present
@@ -2389,6 +2446,62 @@ mod tests {
         let retried: serde_json::Value = serde_json::from_slice(&received[1].body).unwrap();
         assert!(retried.get("output_config").is_none());
         assert_eq!(retried["system"], "base system prompt");
+    }
+
+    #[tokio::test]
+    async fn bedrock_schema_retry_preserves_supported_effort() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        fn has_format(request: &Request) -> bool {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .is_ok_and(|body| body["output_config"].get("format").is_some())
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(has_format)
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"message":"output_config.format: Extra inputs are not permitted"}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(|request: &Request| !has_format(request))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"id":"m","type":"message","role":"assistant","model":"m",
+                    "content":[{"type":"text","text":"answer: ok"}],"stop_reason":"end_turn"}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ai_client = BedrockAiClient::new(
+            "claude-opus-5-5".to_string(),
+            "token".to_string(),
+            server.uri(),
+            None,
+        )
+        .unwrap()
+        .with_effort(Some(crate::claude::backend::EffortLevel::High));
+        let client = ClaudeClient::new(Box::new(ai_client));
+        let schema = schema_fixture();
+        let result = client
+            .send_with_optional_schema("system", "user", client.schema_if_supported(&schema))
+            .await
+            .unwrap();
+        assert_eq!(result, "answer: ok");
+        assert!(client.schema_if_supported(&schema).is_none());
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["output_config"]["effort"], "high");
+        }
+        let retried: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(retried["output_config"].get("format").is_none());
     }
 
     /// The env off-switch reaches the client, so an endpoint known to reject
@@ -5142,6 +5255,33 @@ mod tests {
             .await
             .expect("factory should succeed");
         assert_eq!(client.get_ai_client_metadata().model, "claude-opus-4-6");
+    }
+
+    #[tokio::test]
+    async fn factory_rejects_unsupported_effort_without_preflight() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_MODEL", "claude-opus-4-6")
+            .with("OMNI_DEV_AI_EFFORT", "xhigh");
+        let Err(error) = create_default_claude_client_with(&env, None, None).await else {
+            panic!("unsupported effort should fail");
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("Supported levels: low, medium, high, max"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_ignores_effort_for_openai() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "openai")
+            .with("OMNI_DEV_AI_EFFORT", "xhigh")
+            .with("OPENAI_API_KEY", "sk-test");
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .unwrap();
+        assert_eq!(client.get_ai_client_metadata().provider, "OpenAI");
     }
 
     #[tokio::test]

@@ -42,9 +42,10 @@ its own credentials and model knob (`--jev-model`, not `--model`). See
 
 ## Dispatch Order and Model Selection
 
-The `--ai-backend` flag is a per-command flag, accepted only by the five AI
+The `--ai-backend` flag is a per-command flag, accepted only by the six AI
 commands (`git commit message twiddle`, `git commit message check`,
-`git commit message staged`, `git branch create pr`, `ai chat`) and placed
+`git commit message staged`, `git branch create pr`, `ai chat`,
+`ai jev verify-decision`) and placed
 *after* the subcommand, e.g. `omni-dev git commit message twiddle
 --ai-backend claude-cli ...`. It accepts `default`, `claude-cli`, `openai`,
 `ollama`, and `bedrock`, and is equivalent to setting `OMNI_DEV_AI_BACKEND`
@@ -80,6 +81,20 @@ precedence chain, stopping at the first non-empty value:
 The Claude-family variables are deliberately scoped to Claude-family
 backends: an exported `CLAUDE_MODEL` can never leak a Claude model id into
 the OpenAI or Ollama backends.
+
+**Effort.** On the Claude API and Bedrock backends, pass per-command
+`--effort low|medium|high|xhigh|max` (or set `OMNI_DEV_AI_EFFORT`) to send
+`output_config.effort`. For example:
+
+```console
+omni-dev git branch create pr --model claude-opus-5-5 --effort xhigh
+```
+
+The flag overrides the environment value. When neither is set, omni-dev
+sends no effort field and the model uses its API default. Preflight rejects
+a level the selected model does not support. `claude-cli`, OpenAI, and Ollama
+warn and ignore explicit effort; their different effort controls are not
+mapped to this flag.
 
 **Beta headers.** The per-command `--beta-header key:value` flag (equivalent to
 `OMNI_DEV_BETA_HEADER`) attaches an `anthropic-beta` header to requests on the
@@ -639,20 +654,34 @@ request `output_config.format` for that model — set it `true` in a user or
 project `models.yaml` entry to opt a newer model into the schema path, or
 leave it unset to keep a model on the YAML response path.
 
+**Effort capability** is a per-model `effort_levels` list, empty by default.
+The current Claude Fable 5/5.1, Opus 5/5.5/4.7/4.8, and Sonnet 5 entries
+accept all five levels. Opus 4.6 and Sonnet 4.6 accept `low`, `medium`,
+`high`, and `max` (not `xhigh`); Opus 4.5 accepts `low`, `medium`, and
+`high`. Sonnet 4.5, Haiku 4.5, and older models do not accept explicit
+effort. The registry normalizes Bedrock identifiers before this lookup.
+User or project `models.yaml` entries can override the list, for example
+`effort_levels: [low, medium, high, xhigh, max]` for a newly supported model.
+
 Set it explicitly to `false` when the *model* supports structured output but
 the **endpoint** you reach it through does not — a gateway named by
 `ANTHROPIC_BEDROCK_BASE_URL` that rejects `output_config` as an unknown
 field. `OMNI_DEV_STRUCTURED_OUTPUT_DISABLE=true` is the same switch for every
 model at once; use the flag when only some of the models you route are behind
-such a gateway.
+such a gateway. These switches remove `output_config.format` only. If that
+gateway rejects the entire `output_config` object, also omit `--effort` so
+the request does not send `output_config.effort`.
 
-**Thinking and effort** — omni-dev sends neither a `thinking` nor an
-`output_config.effort` field, so each model runs with its API defaults. On
+**Thinking and effort** — omni-dev sends no `thinking` field and sends
+`output_config.effort` only when `--effort` or `OMNI_DEV_AI_EFFORT` is set. On
 Claude Fable 5/5.1 and Claude Opus 5.5 thinking cannot be switched off, so
 every call spends part of its `max_tokens` budget on (omitted) thinking before
 the answer; the backends skip the leading `thinking` block and read the
-`text` block after it. Claude Opus 5.5 also defaults to `medium` effort, one
-level below Claude Opus 5's `high`, and omni-dev has no knob to raise it.
+`text` block after it. Claude Opus 5.5 defaults to `medium` effort, one
+level below Claude Opus 5's `high`; `--effort` can raise or lower it. Higher
+effort can spend more of the same `max_tokens` ceiling on thinking, leaving
+less room for the visible answer. Anthropic documents the supported levels
+and their tradeoffs in its [effort guide](https://platform.claude.com/docs/en/build-with-claude/effort).
 
 **Model validation at preflight** — on the **Claude API** and **Bedrock**
 backends, an unknown model is rejected before any network call:

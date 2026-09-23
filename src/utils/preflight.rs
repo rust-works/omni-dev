@@ -104,6 +104,10 @@ pub(crate) fn check_ai_credentials_with(
     let ai_backend = backend::resolve_backend(env)?;
     let model = backend::resolve_model(ai_backend, model_override, env, get_model_registry());
     validate_model(ai_backend, &model)?;
+    let effort = backend::resolve_effort(env)?;
+    if matches!(ai_backend, AiBackend::Default | AiBackend::Bedrock) {
+        backend::validate_effort_for_model(&model, effort, get_model_registry())?;
+    }
 
     match ai_backend {
         // Credentials for the `claude -p` subprocess backend live inside the
@@ -687,6 +691,44 @@ mod tests {
         let info = check_ai_credentials_with(&env, None).unwrap();
         assert_eq!(info.provider, AiProvider::Bedrock);
         assert_eq!(info.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn effort_is_checked_before_claude_credentials() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_MODEL", "claude-haiku-4-5")
+            .with("OMNI_DEV_AI_EFFORT", "high");
+        let err = check_ai_credentials_with(&env, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not support --effort"), "{err}");
+    }
+
+    #[test]
+    fn bedrock_effort_validation_normalizes_model_id() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "bedrock")
+            .with("OMNI_DEV_MODEL", "us.anthropic.claude-opus-4-6-v1:0")
+            .with("OMNI_DEV_AI_EFFORT", "xhigh");
+        let err = check_ai_credentials_with(&env, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Supported levels: low, medium, high, max"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn non_anthropic_backend_ignores_valid_effort() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "openai")
+            .with("OMNI_DEV_AI_EFFORT", "xhigh")
+            .with("OPENAI_API_KEY", "sk-test-dummy");
+        assert_eq!(
+            check_ai_credentials_with(&env, None).unwrap().provider,
+            AiProvider::OpenAi
+        );
     }
 
     #[test]

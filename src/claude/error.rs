@@ -112,8 +112,8 @@ impl ClaudeError {
     }
 
     /// Returns `true` when the endpoint rejected the structured-output field
-    /// `output_config` itself, rather than anything about the request's
-    /// content.
+    /// `output_config.format` or `output_config` itself, rather than effort
+    /// or anything about the request's content.
     ///
     /// Anthropic's Messages API takes `output_config.format` on models the
     /// registry flags via `supports_structured_output`, but a gateway named by
@@ -124,9 +124,12 @@ impl ClaudeError {
     /// per-model registry gate cannot know, so callers use this to drop to the
     /// YAML response path instead of failing the run.
     ///
-    /// The field-name match is the load-bearing half, keeping this narrow
-    /// enough that no ordinary `400` (bad model, oversized prompt, malformed
-    /// body) can trip it. `422` is accepted alongside `400` because
+    /// The field-name match keeps this narrow enough that no ordinary `400`
+    /// (bad model, oversized prompt, malformed body) can trip it. Once
+    /// `output_config.effort` is possible, an error naming effort must not
+    /// disable the schema path (#1886). Ambiguous whole-field errors still
+    /// attempt the YAML fallback, which latches only if it succeeds.
+    /// `422` is accepted alongside `400` because
     /// pydantic-style gateways conventionally use it for exactly this
     /// unrecognised-field rejection.
     #[must_use]
@@ -135,7 +138,10 @@ impl ClaudeError {
             Self::ApiHttpError {
                 status: 400 | 422,
                 body,
-            } => body.to_ascii_lowercase().contains("output_config"),
+            } => {
+                let body = body.to_ascii_lowercase();
+                body.contains("output_config") && !body.contains("effort")
+            }
             _ => false,
         }
     }
@@ -238,6 +244,21 @@ mod tests {
             );
         }
         assert!(http_body(400, "OUTPUT_CONFIG is not supported").is_structured_output_rejection());
+    }
+
+    #[test]
+    fn effort_rejections_are_not_schema_rejections() {
+        for status in [400, 422] {
+            for body in [
+                "output_config.effort: Extra inputs are not permitted",
+                "OUTPUT_CONFIG: effort is unsupported",
+            ] {
+                assert!(
+                    !http_body(status, body).is_structured_output_rejection(),
+                    "{status}: {body}"
+                );
+            }
+        }
     }
 
     /// The predicate must stay narrow: an ordinary `4xx`, and a `5xx` that

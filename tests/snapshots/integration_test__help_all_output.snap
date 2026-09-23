@@ -70,6 +70,8 @@ AI backend:
           Selects the AI backend used by this command [possible values: default, claude-cli, openai, ollama, bedrock]
       --model <MODEL>
           AI model to use for this command
+      --effort <EFFORT>
+          Anthropic/Bedrock effort level for this command. Other AI backends warn and ignore it. Equivalent to `OMNI_DEV_AI_EFFORT` [possible values: low, medium, high, xhigh, max]
       --beta-header <KEY:VALUE>
           Beta header to send with AI API requests (format: key:value)
       --claude-cli-allow-tools
@@ -418,6 +420,8 @@ AI backend:
           Selects the AI backend used by this command [possible values: default, claude-cli, openai, ollama, bedrock]
       --model <MODEL>
           AI model to use for this command
+      --effort <EFFORT>
+          Anthropic/Bedrock effort level for this command. Other AI backends warn and ignore it. Equivalent to `OMNI_DEV_AI_EFFORT` [possible values: low, medium, high, xhigh, max]
       --beta-header <KEY:VALUE>
           Beta header to send with AI API requests (format: key:value)
       --claude-cli-allow-tools
@@ -6610,6 +6614,8 @@ AI backend:
           Selects the AI backend used by this command [possible values: default, claude-cli, openai, ollama, bedrock]
       --model <MODEL>
           AI model to use for this command
+      --effort <EFFORT>
+          Anthropic/Bedrock effort level for this command. Other AI backends warn and ignore it. Equivalent to `OMNI_DEV_AI_EFFORT` [possible values: low, medium, high, xhigh, max]
       --beta-header <KEY:VALUE>
           Beta header to send with AI API requests (format: key:value)
       --claude-cli-allow-tools
@@ -6720,6 +6726,8 @@ AI backend:
           Selects the AI backend used by this command [possible values: default, claude-cli, openai, ollama, bedrock]
       --model <MODEL>
           AI model to use for this command
+      --effort <EFFORT>
+          Anthropic/Bedrock effort level for this command. Other AI backends warn and ignore it. Equivalent to `OMNI_DEV_AI_EFFORT` [possible values: low, medium, high, xhigh, max]
       --beta-header <KEY:VALUE>
           Beta header to send with AI API requests (format: key:value)
       --claude-cli-allow-tools
@@ -6777,6 +6785,8 @@ AI backend:
           Selects the AI backend used by this command [possible values: default, claude-cli, openai, ollama, bedrock]
       --model <MODEL>
           AI model to use for this command
+      --effort <EFFORT>
+          Anthropic/Bedrock effort level for this command. Other AI backends warn and ignore it. Equivalent to `OMNI_DEV_AI_EFFORT` [possible values: low, medium, high, xhigh, max]
       --beta-header <KEY:VALUE>
           Beta header to send with AI API requests (format: key:value)
       --claude-cli-allow-tools
@@ -6839,6 +6849,8 @@ AI backend:
           Selects the AI backend used by this command [possible values: default, claude-cli, openai, ollama, bedrock]
       --model <MODEL>
           AI model to use for this command
+      --effort <EFFORT>
+          Anthropic/Bedrock effort level for this command. Other AI backends warn and ignore it. Equivalent to `OMNI_DEV_AI_EFFORT` [possible values: low, medium, high, xhigh, max]
       --beta-header <KEY:VALUE>
           Beta header to send with AI API requests (format: key:value)
       --claude-cli-allow-tools

@@ -11,6 +11,7 @@ use tracing::{debug, info};
 use url::Url;
 
 use super::{AiClient, AiClientCapabilities, AiClientMetadata, RequestOptions};
+use crate::claude::backend::EffortLevel;
 use crate::claude::error::ClaudeError;
 use crate::claude::model_config::get_model_registry;
 
@@ -21,16 +22,16 @@ struct Message {
     content: String,
 }
 
-/// Structured-output request envelope for the Bedrock Messages API.
+/// Optional output controls for the Bedrock Messages API.
 ///
-/// Mirrors the direct-API shape (`{"output_config": {"format": {"type":
-/// "json_schema", "schema": {...}}}}`); Bedrock exposes GA structured output
-/// on the same recent models as the direct API. Only attached for models the
-/// registry flags via
-/// [`ModelRegistry::supports_structured_output`](crate::claude::model_config::ModelRegistry::supports_structured_output).
+/// Mirrors the direct-API shape: `format` constrains a response to a schema,
+/// while `effort` selects a supported reasoning level.
 #[derive(Serialize)]
 struct OutputConfig {
-    format: OutputFormat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<OutputFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<EffortLevel>,
 }
 
 /// Inner `format` block of an [`OutputConfig`]. `kind` is always
@@ -49,7 +50,7 @@ struct BedrockRequest {
     max_tokens: i32,
     system: Option<String>,
     messages: Vec<Message>,
-    /// Optional structured-output constraint. Omitted from the wire body when
+    /// Optional output controls. Omitted from the wire body when
     /// `None` so the default request stays byte-identical to the pre-#1119
     /// shape.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,6 +110,8 @@ pub struct BedrockAiClient {
     base_url: String,
     /// Active beta header (key, value) if enabled.
     active_beta: Option<(String, String)>,
+    /// Explicit effort level, or the model's API default when absent.
+    effort: Option<EffortLevel>,
 }
 
 impl BedrockAiClient {
@@ -127,7 +130,15 @@ impl BedrockAiClient {
             model,
             base_url,
             active_beta,
+            effort: None,
         })
+    }
+
+    /// Configures an explicit effort level for every request on this client.
+    #[must_use]
+    pub fn with_effort(mut self, effort: Option<EffortLevel>) -> Self {
+        self.effort = effort;
+        self
     }
 
     /// Returns the max tokens from the model registry.
@@ -213,11 +224,12 @@ impl BedrockAiClient {
                 None
             },
             messages,
-            output_config: schema.map(|schema| OutputConfig {
-                format: OutputFormat {
+            output_config: (schema.is_some() || self.effort.is_some()).then(|| OutputConfig {
+                format: schema.map(|schema| OutputFormat {
                     kind: "json_schema",
                     schema: schema.clone(),
-                },
+                }),
+                effort: self.effort,
             }),
         };
 
@@ -594,6 +606,49 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");
         assert_eq!(body["output_config"]["format"]["schema"], schema);
+    }
+
+    #[tokio::test]
+    async fn explicit_effort_serializes_with_and_without_schema() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"id":"m","type":"message","role":"assistant","model":"m",
+                    "content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#,
+            ))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = BedrockAiClient::new(
+            "claude-opus-5-5".to_string(),
+            "token".to_string(),
+            server.uri(),
+            None,
+        )
+        .unwrap()
+        .with_effort(Some(EffortLevel::Max));
+        client.send_request("system", "user").await.unwrap();
+        let schema = serde_json::json!({"type": "object"});
+        client
+            .send_request_with_options(
+                "system",
+                "user",
+                RequestOptions::default().with_response_schema(schema.clone()),
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let plain: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let constrained: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(plain["output_config"]["effort"], "max");
+        assert!(plain["output_config"].get("format").is_none());
+        assert_eq!(constrained["output_config"]["effort"], "max");
+        assert_eq!(constrained["output_config"]["format"]["schema"], schema);
     }
 
     #[tokio::test]
