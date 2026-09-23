@@ -176,6 +176,11 @@ fn strict_ladder_validation_rejects_bad_metadata() {
             "supported_levels: [quick, quick]",
             "duplicate supported level",
         ),
+        (
+            "supported_levels: [quick, thorough]",
+            "supported_levels: [thorough, quick]",
+            "must follow the order",
+        ),
         ("- name: thorough", "- name: quick", "duplicate level"),
         (
             "description: Work with interacting constraints.",
@@ -218,6 +223,17 @@ fn strict_ladder_validation_rejects_bad_metadata() {
         Tiers::parse("tiers: [{name: a, description: A, models: []}, {name: b, description: B}]")
             .unwrap_err();
     assert!(format!("{err:#}").contains("models must not be empty"));
+
+    let err =
+        Tiers::parse(&CUSTOM.replace("name: vendor.large\n", "name: vendor.fixed\n")).unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("vendor.fixed")
+            && message.contains("small,alternative")
+            && message.contains("large")
+            && message.contains("Design"),
+        "{message}"
+    );
 }
 
 #[test]

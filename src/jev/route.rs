@@ -205,9 +205,22 @@ impl Tiers {
                 bail!("tier {:?} is defined more than once", tier.name);
             }
         }
+        let mut model_rungs = BTreeMap::new();
         for tier in &file.tiers {
             if let Some(models) = &tier.models {
                 effort::validate(models).with_context(|| format!("rung {:?}", tier.name))?;
+                for model in models {
+                    for &stage in &model.stages {
+                        if let Some(previous) = model_rungs.insert((&model.name, stage), &tier.name)
+                        {
+                            bail!(
+                                "model {:?} is bound to both rungs {previous:?} and {:?} for {stage:?}",
+                                model.name,
+                                tier.name
+                            );
+                        }
+                    }
+                }
             }
         }
         Ok(Self(file.tiers))

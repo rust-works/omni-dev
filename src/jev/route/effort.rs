@@ -205,13 +205,18 @@ fn validate_profile(model: &Model) -> Result<()> {
                 bail!("configurable effort needs at least two supported levels; use kind: fixed for one");
             }
             let mut supported = BTreeSet::new();
+            let mut previous_index = None;
             for name in supported_levels {
-                if !names.contains(name) {
+                let Some(index) = levels.iter().position(|level| &level.name == name) else {
                     bail!("unknown supported level {name:?}");
-                }
+                };
                 if !supported.insert(name) {
                     bail!("duplicate supported level {name:?}");
                 }
+                if previous_index.is_some_and(|previous| index < previous) {
+                    bail!("supported levels must follow the order declared in levels");
+                }
+                previous_index = Some(index);
             }
         }
         Profile::Fixed {
