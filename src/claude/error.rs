@@ -140,7 +140,11 @@ impl ClaudeError {
                 body,
             } => {
                 let body = body.to_ascii_lowercase();
-                body.contains("output_config") && !body.contains("effort")
+                // A gateway may echo the complete output_config request while
+                // naming `format` as the rejected field. In that mixed body,
+                // the explicit rejection wins over an incidental effort value.
+                body.contains("output_config.format")
+                    || (body.contains("output_config") && !body.contains("effort"))
             }
             _ => false,
         }
@@ -258,6 +262,18 @@ mod tests {
                     "{status}: {body}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn explicit_format_rejection_wins_when_the_body_also_mentions_effort() {
+        for status in [400, 422] {
+            let body = "output_config.format: Extra inputs are not permitted; \
+                        request used output_config.effort=high";
+            assert!(
+                http_body(status, body).is_structured_output_rejection(),
+                "{status}: {body}"
+            );
         }
     }
 

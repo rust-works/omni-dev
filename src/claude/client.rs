@@ -2372,6 +2372,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn format_rejection_falls_back_when_error_body_echoes_effort() {
+        let inner = SchemaRecordingMockAiClient::with_response(true, "answer: ok".to_string())
+            .failing_options(ClaudeError::ApiHttpError {
+                status: 400,
+                body: "output_config.format: unsupported; request used \
+                       output_config.effort=high"
+                    .to_string(),
+            });
+        let plain_log = inner.recorded_plain.clone();
+        let options_log = inner.recorded_options.clone();
+        let client = ClaudeClient::new(Box::new(inner));
+        let schema = schema_fixture();
+
+        let result = client
+            .send_with_optional_schema("sys", "usr", client.schema_if_supported(&schema))
+            .await
+            .unwrap();
+
+        assert_eq!(result, "answer: ok");
+        assert_eq!(options_log.lock().unwrap().len(), 1);
+        assert_eq!(plain_log.lock().unwrap().len(), 1);
+        assert!(client.schema_if_supported(&schema).is_none());
+    }
+
     /// The strip is exact and idempotent: it removes the override when present
     /// and leaves an unadorned YAML prompt untouched.
     #[test]
