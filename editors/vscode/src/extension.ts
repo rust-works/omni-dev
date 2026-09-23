@@ -45,6 +45,7 @@ import { copyPullRequestUrls, openPullRequest, openPullRequestInBrowser } from "
 import { openGithubRepository } from "./repoCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
 import { checkPiLaunch, nextPiTerminalName, zshSearchPaths } from "./pi";
+import { agentTerminalIdentity, agentTerminalOptions } from "./agentTerminal";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
 import { pushForceWithLease } from "./pushCommand";
 import { rebaseOnMain } from "./rebaseCommand";
@@ -460,7 +461,8 @@ function claudeEmbeddings(): { tabs: number; terminals: number } {
       }
     }
   }
-  const terminalNames = vscode.window.terminals.map((t) => t.name);
+  const terminalNames = vscode.window.terminals.map((t) =>
+    agentTerminalIdentity(t.name, t.creationOptions));
   return {
     tabs: countClaudeTabs(viewTypes),
     terminals: countClaudeTerminals(terminalNames, process.env.CLAUDE_CODE_TERMINAL_TITLE),
@@ -1159,8 +1161,8 @@ async function runOne(
  * The "Open Claude Code" title-bar button (#1322, #1347). On **every** click opens
  * a new terminal docked as an **editor tab** (not the bottom panel) running the
  * Claude Code CLI — concurrent sessions in one window are a normal way to work, so
- * the button never caps at one or focuses an existing tab. Each terminal gets a
- * distinguishable name (`Claude Code`, `Claude Code 2`, …) via
+ * the button never caps at one or focuses an existing tab. Each terminal gets an
+ * initial title (`Claude Code`, `Claude Code 2`, …) via
  * {@link nextClaudeTerminalName}. The cwd is the active window's workspace folder
  * (falling back to the first folder); the launch command is
  * `omniDevWorktrees.claudeCommand` (default `claude`). This is window-level and
@@ -1178,7 +1180,7 @@ function openClaude(): void {
   const name = nextClaudeTerminalName(vscode.window.terminals.map((t) => t.name));
 
   const terminal = vscode.window.createTerminal({
-    name,
+    ...agentTerminalOptions("claude", name),
     cwd,
     location: vscode.TerminalLocation.Editor,
     iconPath: new vscode.ThemeIcon("sparkle"),
@@ -1262,7 +1264,7 @@ async function openPi(): Promise<void> {
   const cwd = resolveClaudeCwd(folders, activeFolder);
   const name = nextPiTerminalName(vscode.window.terminals.map((terminal) => terminal.name));
   const terminal = vscode.window.createTerminal({
-    name,
+    ...agentTerminalOptions("pi", name),
     cwd,
     shellPath: launch.zshPath,
     shellArgs: ["-l"],

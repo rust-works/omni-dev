@@ -199,13 +199,31 @@ effects. Every launch creates a fresh terminal docked as an **editor tab**.
 - The terminal's working directory is the active window's workspace folder — the
   folder of the focused editor when it sits in one, else the first folder.
 - **Launch Claude Code** runs `omniDevWorktrees.claudeCommand` (default
-  `claude`); a shell prefix such as `proxy && claude` is allowed. Concurrent
-  terminals are named `Claude Code`, `Claude Code 2`, and so on.
+  `claude`); a shell prefix such as `proxy && claude` is allowed. Initial
+  titles are `Claude Code`, `Claude Code 2`, and so on, until the shell or CLI
+  supplies a title. Use `/rename Blah` inside Claude Code to name the session
+  and update its tab title.
 - **Launch pi.dev** starts `pi` in an explicit interactive login **zsh** shell,
   regardless of the configured default terminal profile. Concurrent terminals
-  are named `pi.dev`, `pi.dev 2`, and so on. It checks that both zsh and pi are
+  initially use `pi.dev`, `pi.dev 2`, and so on. Use `/name Blah` inside pi to
+  update its session name; pi's title includes the name and working directory
+  (for example, `pi - Blah - my-project`). It checks that both zsh and pi are
   available before creating a terminal and explains how to install the missing
   tool if either check fails.
+
+The extension defaults **Terminal › Integrated › Tabs: Title**
+(`terminal.integrated.tabs.title`) to `${sequence}`, so tabs follow titles
+emitted by their applications. This default applies to all terminal tabs;
+VS Code falls back to the process name when no title is available. Explicit
+user or workspace settings take precedence. If you have set this to `${process}`,
+change it to `${sequence}` to see session names. Using VS Code's **Rename**
+terminal action pins a manual title; clear that title to follow the CLI again.
+
+These updates use the CLIs' native terminal-title support. Use a recent CLI
+version and allow it to update titles (for Claude Code, do not enable
+`CLAUDE_CODE_DISABLE_TERMINAL_TITLE` or disable `terminalTitleFromRename`).
+Custom launch wrappers must also pass title updates through. Close and relaunch
+tabs created by an older extension version to remove their fixed launch names.
 
 The menu is window-level and **daemon-independent** — plain terminals, no socket
 involved — so it works even when the omni-dev daemon is not running.

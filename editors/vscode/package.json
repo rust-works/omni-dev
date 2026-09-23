@@ -26,6 +26,9 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "configurationDefaults": {
+      "terminal.integrated.tabs.title": "${sequence}"
+    },
     "viewsContainers": {
       "activitybar": [
         {
