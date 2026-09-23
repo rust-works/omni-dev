@@ -403,7 +403,9 @@ ladder (see [Built-in ladders](#built-in-ladders) and
 [Custom ladders](#custom-ladders)); `--ladders` routes against several at
 once. It makes one Jev call per issue, with three `choice` questions per
 ladder plus one `noul` question per open issue/PR the text cites, and
-fetches the issues through `gh`.
+fetches the issues through `gh`. Per-model effort advice is opt-in with
+`--effort-advice`; it adds questions to that same Jev call and increases
+token use. `-o` selects the output format independently.
 
 ```bash
 omni-dev ai jev route '#1779' rust-works/omni-dev#1641 -o yaml
@@ -412,6 +414,7 @@ omni-dev ai jev route --all-open -C ~/src/omni-dev
 omni-dev ai jev route '#1820' --ladders anthropic,openai,gemini
 omni-dev ai jev route '#1826' --ladders anthropic,mine --ladder-definition mine=my-tiers.yaml
 omni-dev ai jev route --all-open -o text
+omni-dev ai jev route '#1893' -o text --ladders openai,anthropic --effort-advice
 ```
 
 `<ISSUE>` is `#N` or `N` (in the current repository, which `-C/--repo`
@@ -419,9 +422,10 @@ changes), `owner/repo#N`, or an issue URL. `--all-open` routes every open issue
 in the current repository instead. Quote `#N` in the shell, where an unquoted
 `#` starts a comment.
 
-This historical class/dependency excerpt omits each stage's new
-`effort_by_model` field; see [Reading effort advice](#reading-effort-advice)
-for its shape. The usage numbers below predate the extra effort questions.
+This class/dependency excerpt shows the default output. Without
+`--effort-advice`, each stage omits `effort_by_model`; see
+[Reading effort advice](#reading-effort-advice) for the opt-in shape.
+The usage numbers below predate the extra effort questions.
 
 ```yaml
 model: jev-1.13.0
@@ -513,8 +517,9 @@ line per fact, rather than one run-on sentence — which keeps a
 multi-`--ladders` issue readable. Its wording is **not** a stable contract
 and may change without notice; scripts should keep using `json` or `yaml`.
 
-The class-summary examples below omit the additional per-model effort lines;
-[Reading effort advice](#reading-effort-advice) shows those separately.
+The class-summary examples below show the default text output. With
+`--effort-advice`, a per-model table follows each summary; see
+[Reading effort advice](#reading-effort-advice).
 
 On a supported terminal, the issue reference and cited open issues or pull
 requests are clickable links to their GitHub pages. Low-complexity choices and
@@ -576,8 +581,8 @@ headed by its provider name (`  anthropic:`, with the fact lines nested one
 indent level deeper) rather than prefixing every line, and the layout is
 decided per ladder — one multi-model ladder does not force another,
 single-model ladder into the block form too. Single-word tiers (every
-built-in ladder) keep the compact class summary. Effort advice follows that
-summary as separate indented lines for every stage, rung and concrete model.
+built-in ladder) keep the compact class summary. With `--effort-advice`, a
+per-model effort table follows that summary.
 
 ### What Jev sees
 
@@ -698,8 +703,9 @@ and review, but that substitution requires its own evaluation.
 
 ### Reading effort advice
 
-Every stage gains `effort_by_model`, a map from **rung name to a list of
-concrete model results**, including rungs other than the class winner.
+With `--effort-advice`, every stage gains `effort_by_model`, a map from
+**rung name to a list of concrete model results**, including rungs other
+than the class winner.
 A list allows different versions sharing one rung to have different native
 controls. Existing `choice`, `confidence`, `probabilities`, `class`, and
 class `close_calls` retain their meanings.
@@ -750,8 +756,8 @@ rungs without `models` report `unspecified` with migration guidance; they
 add no questions. Metadata and normalized design-`none` results do not
 invent confidence values.
 
-Text groups effort advice into one row per concrete model beneath each
-ladder's class summary (illustrative values):
+Text with `--effort-advice` groups effort advice into one row per concrete
+model beneath each ladder's class summary (illustrative values):
 
 ```text
     Model / effort               Design       Implement    Review
@@ -769,7 +775,13 @@ independently of class close calls, and show the strongest alternative
 (alphabetical tie break). Confidence and option probability are distinct Jev
 values. JSON and YAML retain the complete structured evidence.
 
-All class, effort and dependency questions share **one Jev call per issue**.
+When enabled, class, effort and dependency questions share **one Jev call
+per issue**.
+Without `--effort-advice`, no effort questions are asked, the text tables are
+absent, and JSON/YAML omit `effort_by_model`. Effort advice is an uncalibrated
+judgment that can affect class answers when its extra questions are present;
+the [#1888 comparison](evaluations/jev-effort-1888/README.md) also records
+substantially higher token use with effort enabled.
 Internal effort keys use rung/model indices, so punctuation in custom model
 names cannot collide with another question. The advice never configures the
 Jev evaluator or a downstream AI backend.

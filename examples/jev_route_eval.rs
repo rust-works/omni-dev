@@ -46,9 +46,10 @@ async fn main() -> Result<()> {
     )?;
     let config = JevConfig::from_env()?;
     let client = JevClient::from_config(&config)?;
-    let options = RouteOptions {
+    let mut options = RouteOptions {
         model: config.model,
         close_call: DEFAULT_CLOSE_CALL,
+        effort_advice: false,
         max_input_chars: DEFAULT_MAX_INPUT_CHARS,
         allow_closed: true,
     };
@@ -79,6 +80,7 @@ async fn main() -> Result<()> {
     ));
     for (name, ladders) in variants {
         for with_effort in [false, true] {
+            options.effort_advice = with_effort;
             let selected = if with_effort {
                 ladders.clone()
             } else {

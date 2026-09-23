@@ -45,11 +45,11 @@ pub(super) enum RouteFormat {
     Text,
 }
 
-/// Routes issues to model classes and per-model effort for design, implement and review.
+/// Routes issues to model classes for design, implement and review.
 #[derive(Parser)]
 #[command(
     long_about = "Routes issues to model classes for their design, implement and review \
-stages, with effort advice for every model in each requested ladder.\n\nMakes one Jev call per issue. Jev judges the issue's title, body and human \
+stages. Add --effort-advice for per-model effort recommendations.\n\nMakes one Jev call per issue. Jev judges the issue's title, body and human \
 comments (never the issues or pull requests it references) and picks, for each stage, the \
 least capable class likely to do it correctly with no rework. The issue's class is the \
 higher of its design and implement choices, and a stage whose confidence is below \
@@ -60,10 +60,13 @@ still in one Jev call per issue, and the output nests stages, class and close_ca
 each ladder's name. --ladder-definition NAME=FILE registers a custom ladder under NAME, its \
 tiers loaded from a YAML file, so it can be routed alongside built-in ladders in the same \
 --ladders list; a built-in name cannot be redefined, and a definition never listed in \
---ladders is an error.\n\nEach stage also reports effort_by_model for every rung, using each model's supported native \
-levels. Legacy custom ladders without effort metadata report unspecified. A stage with no \
+--ladders is an error.\n\nWith --effort-advice, each stage also reports effort_by_model for every rung, \
+using each model's supported native levels. This asks additional Jev questions and increases \
+token use. Without the flag, no effort questions are asked and effort_by_model is omitted. \
+Legacy custom ladders without effort metadata report unspecified when enabled. A stage with no \
 remaining work reports not_needed; a model that cannot meet the reliability bar reports \
-insufficient. Effort advice does not execute or configure a model. See docs/jev.md for the \
+insufficient. Effort advice does not execute or configure a model or Jev's own effort. See \
+docs/jev.md for the \
 ladder schema and calibration limits.\n\nEach open issue or pull request the text \
 cites is reported under depends_on, with a could_be_cheaper.design probability: how likely it \
 is that resolving that dependency would leave less design work remaining than the text \
@@ -102,6 +105,10 @@ pub struct RouteCommand {
     /// model-specific effort profiles (see docs/jev.md). Repeatable.
     #[arg(long, value_name = "NAME=FILE", value_parser = parse_ladder_definition)]
     pub ladder_definition: Vec<(String, PathBuf)>,
+
+    /// Ask for per-model effort advice in text, JSON, or YAML output.
+    #[arg(long)]
+    pub effort_advice: bool,
 
     /// Confidence below which a model-class or effort answer is reported as a close call.
     #[arg(long, value_name = "CONFIDENCE", default_value_t = DEFAULT_CLOSE_CALL)]
@@ -155,6 +162,7 @@ impl RouteCommand {
         let opts = RouteOptions {
             model: config.model,
             close_call: self.close_call,
+            effort_advice: self.effort_advice,
             max_input_chars: self.max_input_chars,
             allow_closed: self.allow_closed,
         };
@@ -507,15 +515,26 @@ mod tests {
         assert!((cmd.close_call - DEFAULT_CLOSE_CALL).abs() < f64::EPSILON);
         assert_eq!(cmd.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
         assert!(!cmd.allow_closed);
+        assert!(!cmd.effort_advice);
         assert_eq!(cmd.output, RouteFormat::Json);
         assert_eq!(cmd.ladders, ["anthropic"]);
         assert!(cmd.ladder_definition.is_empty());
     }
 
     #[test]
-    fn route_parses_text_output() {
+    fn route_parses_output_format_and_effort_advice_independently() {
         let cmd = parse(&["#1", "-o", "text"]).unwrap();
         assert_eq!(cmd.output, RouteFormat::Text);
+        assert!(!cmd.effort_advice);
+        for (format, expected) in [
+            ("text", RouteFormat::Text),
+            ("json", RouteFormat::Json),
+            ("yaml", RouteFormat::Yaml),
+        ] {
+            let cmd = parse(&["#1", "-o", format, "--effort-advice"]).unwrap();
+            assert_eq!(cmd.output, expected);
+            assert!(cmd.effort_advice);
+        }
     }
 
     #[test]

@@ -281,8 +281,16 @@ impl Ladder {
 /// Builds class and per-model effort questions for every ladder.
 ///
 /// Class questions use the embedded wording with one criterion per tier,
-/// keyed `<provider>.stage_<stage>`. All questions share one request.
+/// keyed `<provider>.stage_<stage>`. All questions share one request. The
+/// route command uses a class-only subset unless effort advice is requested.
 pub fn build_route_questions(ladders: &[Ladder]) -> Result<BTreeMap<String, Question>> {
+    build_route_questions_for_mode(ladders, true)
+}
+
+fn build_route_questions_for_mode(
+    ladders: &[Ladder],
+    effort_advice: bool,
+) -> Result<BTreeMap<String, Question>> {
     let templates: BTreeMap<String, Question> = serde_yaml::from_str(STAGE_QUESTIONS_YAML)
         .context("Failed to parse the embedded stage questions")?;
     for stage in Stage::ALL {
@@ -321,8 +329,10 @@ pub fn build_route_questions(ladders: &[Ladder]) -> Result<BTreeMap<String, Ques
             questions.insert(format!("{}.{key}", ladder.name), question);
         }
     }
-    for ladder in ladders {
-        effort::add_questions(ladder, &mut questions);
+    if effort_advice {
+        for ladder in ladders {
+            effort::add_questions(ladder, &mut questions);
+        }
     }
     Ok(questions)
 }
@@ -502,6 +512,8 @@ pub struct RouteOptions {
     pub model: String,
     /// Confidence below which a stage is a close call.
     pub close_call: f64,
+    /// Ask for per-model effort advice as well as class routing.
+    pub effort_advice: bool,
     /// Cap, in characters, on each issue's text.
     pub max_input_chars: usize,
     /// Route closed issues instead of refusing them.
@@ -556,7 +568,7 @@ pub async fn run_route_with_reference_fetch_failures(
     reference_fetch_failures: &ReferenceFetchFailures,
 ) -> Result<RouteReport> {
     validate_options(docs, ladders, opts)?;
-    let questions = build_route_questions(ladders)?;
+    let questions = build_route_questions_for_mode(ladders, opts.effort_advice)?;
 
     let mut models = BTreeSet::new();
     let mut usage = Usage::default();
@@ -602,7 +614,12 @@ pub async fn run_route_with_reference_fetch_failures(
                 models.insert(response.model);
                 usage.input_tokens += response.usage.input_tokens;
                 usage.output_tokens += response.usage.output_tokens;
-                match provider_routes(&response.answers, ladders, opts.close_call) {
+                match provider_routes(
+                    &response.answers,
+                    ladders,
+                    opts.close_call,
+                    opts.effort_advice,
+                ) {
                     Ok(providers) => RouteOutcome::Routed {
                         providers,
                         depends_on: dependency_entries(&item_ref, citations, &response.answers),
@@ -695,18 +712,21 @@ fn provider_routes(
     answers: &BTreeMap<String, Answer>,
     ladders: &[Ladder],
     close_call: f64,
+    effort_advice: bool,
 ) -> Result<BTreeMap<String, ProviderRoute>> {
     ladders
         .iter()
         .map(|ladder| {
             let mut stages = stage_answers(answers, ladder)?;
-            for (stage, answer) in [
-                (Stage::Design, &mut stages.design),
-                (Stage::Implement, &mut stages.implement),
-                (Stage::Review, &mut stages.review),
-            ] {
-                answer.effort_by_model =
-                    effort::decode(ladder, stage, answer, answers, close_call)?;
+            if effort_advice {
+                for (stage, answer) in [
+                    (Stage::Design, &mut stages.design),
+                    (Stage::Implement, &mut stages.implement),
+                    (Stage::Review, &mut stages.review),
+                ] {
+                    answer.effort_by_model =
+                        effort::decode(ladder, stage, answer, answers, close_call)?;
+                }
             }
             let route = ProviderRoute {
                 class: issue_class(&stages, &ladder.tiers),
@@ -1269,6 +1289,7 @@ mod tests {
         RouteOptions {
             model: "jev-latest".to_string(),
             close_call: DEFAULT_CLOSE_CALL,
+            effort_advice: false,
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             allow_closed: false,
         }
