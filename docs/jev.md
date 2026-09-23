@@ -829,17 +829,17 @@ tiers:
 ```
 
 `stages` defaults to all three. Every stage must have at least one model
-binding, and a model cannot appear twice in the same rung/stage. Models may
-include `sources` (official URLs) and `verified` (a quoted date). Built-ins
-record both. YAML anchors can share profiles without requiring a separate
+binding per rung, and a model cannot appear in two rungs for the same stage.
+Models may include `sources` (official URLs) and `verified` (a quoted date).
+Built-ins record both. YAML anchors can share profiles without requiring a separate
 profile registry. Comma-joined rung names remain opaque; explicitly list
 their individual model versions under `models` to obtain separate advice.
 
-A configurable profile declares its vocabulary in `levels`, and selects
-at least two of those native values in `supported_levels` (least effort
-first). Each level requires a non-empty shared `description` or a criterion
-for every stage where the model is bound. `criteria` overrides the shared
-description by stage. A sole supported setting uses `kind: fixed` instead
+A configurable profile declares its vocabulary in `levels` (least effort
+first), and selects at least two of those native values in `supported_levels`
+in the same order. Each level requires a non-empty shared `description` or a
+criterion for every stage where the model is bound. `criteria` overrides the
+shared description by stage. A sole supported setting uses `kind: fixed` instead
 of a degenerate one-option choice. `not_needed` and `insufficient` are
 reserved outcome names, never native levels.
 
