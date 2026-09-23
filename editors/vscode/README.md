@@ -190,22 +190,25 @@ own main checkout, current is one gesture instead of one `cd` and one
   which does the whole job locally using your own shell's SSH agent and
   credential helper.
 
-## Open Claude Code
+## Agent menu
 
-A **Claude-in-a-box** button in the **editor title bar** (the top-right icon
-cluster, alongside the Claude Code extension's own icon) opens the **Claude Code
-CLI** in a terminal docked as an **editor tab** — one click instead of opening a
-terminal, re-docking it to the editor area, and typing `claude` by hand.
+The **Agent** button in the **editor title bar** (the top-right icon cluster)
+opens a menu of agent launchers. Opening or dismissing the menu has no side
+effects. Every launch creates a fresh terminal docked as an **editor tab**.
 
 - The terminal's working directory is the active window's workspace folder — the
   folder of the focused editor when it sits in one, else the first folder.
-- Clicking again while it is still open **focuses** that terminal instead of
-  spawning a duplicate; once you close it, the next click starts a fresh one.
-- The launch command is `omniDevWorktrees.claudeCommand` (default `claude`); a
-  shell prefix such as `proxy && claude` is allowed.
+- **Launch Claude Code** runs `omniDevWorktrees.claudeCommand` (default
+  `claude`); a shell prefix such as `proxy && claude` is allowed. Concurrent
+  terminals are named `Claude Code`, `Claude Code 2`, and so on.
+- **Launch pi.dev** starts `pi` in an explicit interactive login **zsh** shell,
+  regardless of the configured default terminal profile. Concurrent terminals
+  are named `pi.dev`, `pi.dev 2`, and so on. It checks that both zsh and pi are
+  available before creating a terminal and explains how to install the missing
+  tool if either check fails.
 
-The button is window-level and **daemon-independent** — a plain terminal, no
-socket involved — so it works even when the omni-dev daemon is not running.
+The menu is window-level and **daemon-independent** — plain terminals, no socket
+involved — so it works even when the omni-dev daemon is not running.
 
 ## Requirements
 
@@ -236,7 +239,7 @@ socket involved — so it works even when the omni-dev daemon is not running.
 |---------|---------|-------------|
 | `omniDevWorktrees.socketPath` | `""` | Override the daemon control-socket path (mirrors the daemon's `--socket`). Empty uses the computed default `<data_dir>/omni-dev/daemon.sock`. |
 | `omniDevWorktrees.heartbeatSeconds` | `10` | Seconds between heartbeats. The daemon reaps a window after 30s of silence, so keep this well under 30. |
-| `omniDevWorktrees.claudeCommand` | `"claude"` | Command run by the **Open Claude Code** title-bar button. A shell prefix such as `proxy && claude` is allowed. |
+| `omniDevWorktrees.claudeCommand` | `"claude"` | Command run by **Agent: Launch Claude Code**. A shell prefix such as `proxy && claude` is allowed. |
 
 ## Development
 

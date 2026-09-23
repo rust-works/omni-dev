@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Agent menu with pi.dev launcher** ([#1895](https://github.com/rust-works/omni-dev/issues/1895)): the editor title-bar's direct Claude action is now an **Agent** menu, which holds **Launch Claude Code** and **Launch pi.dev**. Opening or dismissing the menu does not start a terminal. Each pi selection starts a new `pi` session in its own editor-area terminal named `pi.dev`, `pi.dev 2`, and so on, using the focused workspace folder or the first workspace folder as its working directory.
+  - pi always runs in an explicit interactive login zsh shell, independent of the user's default VS Code terminal profile. The extension checks zsh and pi before creating a terminal and shows an actionable error when either is unavailable.
+
 ## [0.9.0] - 2026-08-21
 
 ### Added
