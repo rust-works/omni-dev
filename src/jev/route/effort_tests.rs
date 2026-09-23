@@ -396,8 +396,14 @@ fn serialization_and_text_keep_native_levels_and_close_call_evidence() {
     );
     let text = lines.join("\n");
     assert!(text.starts_with("  custom:\n"));
-    assert!(text.contains("implement effort: small,alternative [vendor.small.v1]: quick (0.20, close call — insufficient 0.40)"), "{text}");
-    assert!(text.contains("vendor.large.coding]: deep (fixed)"));
+    assert!(text.contains("quick [1]"), "{text}");
+    assert!(
+        text.contains("    [1] small,alternative [vendor.small.v1], implement:"),
+        "{text}"
+    );
+    assert!(text.contains("small,alternative [vendor.small.v1], implement: quick (0.20, close call — insufficient 0.40)"), "{text}");
+    assert!(text.contains("vendor.large.coding]"));
+    assert!(text.contains("deep (fixed)"));
     assert!(!text.contains('\x1b'));
 }
 
@@ -419,6 +425,9 @@ fn legacy_custom_ladders_are_explicitly_unspecified() {
         routes["old"].stages.implement.effort_by_model["a"][0].status,
         Status::Unspecified
     );
+    let text = render(&routes["old"].stages, None).join("\n");
+    assert!(text.contains("not needed"), "{text}");
+    assert!(text.contains("unspecified (add effort metadata)"), "{text}");
 }
 
 #[tokio::test]
@@ -506,4 +515,178 @@ async fn all_ladders_and_efforts_share_one_request_and_fail_only_the_bad_issue()
     let request: serde_json::Value = requests[0].body_json().unwrap();
     assert_eq!(request["questions"].as_object().unwrap().len(), 46);
     assert!(request["questions"].get("could_be_cheaper_0").is_some());
+}
+
+#[test]
+fn text_groups_builtin_models_in_ladder_order_with_three_stage_columns() {
+    let ladder = Ladder::builtin(Provider::OpenAi).unwrap();
+    let routes = provider_routes(
+        &response(std::slice::from_ref(&ladder)),
+        std::slice::from_ref(&ladder),
+        0.3,
+    )
+    .unwrap();
+    let lines = render(&routes["openai"].stages, Some(&ladder));
+    assert_eq!(lines.len(), 4, "{lines:#?}");
+    assert_eq!(
+        lines[0].split_whitespace().collect::<Vec<_>>(),
+        ["Model", "/", "effort", "Design", "Implement", "Review"]
+    );
+    for (line, tier) in lines[1..].iter().zip(ladder.tiers.as_slice()) {
+        assert!(line.trim_start().starts_with(&tier.name), "{line}");
+        assert_eq!(line.matches("(0.90)").count(), 3, "{line}");
+    }
+}
+
+#[test]
+fn text_handles_stage_specific_models_and_missing_ladder_metadata() {
+    let ladder = custom();
+    let routes = provider_routes(
+        &response(std::slice::from_ref(&ladder)),
+        std::slice::from_ref(&ladder),
+        0.3,
+    )
+    .unwrap();
+    let lines = render(&routes["custom"].stages, None);
+    let design_only = lines
+        .iter()
+        .find(|line| line.contains("large [vendor.large]"))
+        .unwrap();
+    assert_eq!(
+        design_only
+            .split_whitespace()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>(),
+        ["—", "—"]
+    );
+    let coding = lines
+        .iter()
+        .find(|line| line.contains("large [vendor.large.coding]"))
+        .unwrap();
+    assert_eq!(coding.matches("deep (fixed)").count(), 2, "{coding}");
+    assert!(lines
+        .iter()
+        .any(|line| line.contains("No verified control.")));
+}
+
+#[test]
+fn text_uses_declared_model_order_even_if_stage_results_are_reordered() {
+    let ladder = custom();
+    let mut routes = provider_routes(
+        &response(std::slice::from_ref(&ladder)),
+        std::slice::from_ref(&ladder),
+        0.3,
+    )
+    .unwrap();
+    let stages = &mut routes.get_mut("custom").unwrap().stages;
+    stages
+        .design
+        .effort_by_model
+        .get_mut("small,alternative")
+        .unwrap()
+        .reverse();
+    let lines = render(stages, Some(&ladder));
+    let labels: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("small,alternative ["))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(labels.len(), 2);
+    assert!(labels[0].contains("[vendor.small.v1]"), "{lines:#?}");
+    assert!(labels[1].contains("[vendor.fixed]"), "{lines:#?}");
+}
+
+#[test]
+fn text_preserves_all_statuses_and_scopes_numbered_notes_to_the_table() {
+    let ladder = custom();
+    let mut routes = provider_routes(
+        &response(std::slice::from_ref(&ladder)),
+        std::slice::from_ref(&ladder),
+        0.3,
+    )
+    .unwrap();
+    let stages = &mut routes.get_mut("custom").unwrap().stages;
+    let design = &mut stages
+        .design
+        .effort_by_model
+        .get_mut("small,alternative")
+        .unwrap()[0];
+    design.status = Status::NotNeeded;
+    design.level = None;
+    design.assessment = None;
+    let implement = &mut stages
+        .implement
+        .effort_by_model
+        .get_mut("small,alternative")
+        .unwrap()[0];
+    implement.status = Status::Insufficient;
+    implement.level = None;
+    let review = &mut stages
+        .review
+        .effort_by_model
+        .get_mut("small,alternative")
+        .unwrap()[0];
+    review.status = Status::Unspecified;
+    review.level = None;
+    review.assessment = None;
+    let lines = render(stages, Some(&ladder));
+    let small = lines
+        .iter()
+        .find(|line| line.contains("[vendor.small.v1]"))
+        .unwrap();
+    assert!(small.contains("not needed"), "{small}");
+    assert!(small.contains("insufficient capability"), "{small}");
+    assert!(small.contains("unspecified"), "{small}");
+    let unavailable = lines
+        .iter()
+        .find(|line| line.contains("large [vendor.large] "))
+        .unwrap();
+    assert!(unavailable.contains("unavailable [1]"), "{unavailable}");
+    assert!(lines
+        .iter()
+        .any(|line| line.starts_with("    [1] ") && line.contains("No verified control.")));
+    assert_eq!(render(stages, Some(&ladder)), lines);
+}
+
+#[test]
+fn text_omits_empty_effort_tables() {
+    let ladder = custom();
+    let mut routes = provider_routes(
+        &response(std::slice::from_ref(&ladder)),
+        std::slice::from_ref(&ladder),
+        0.3,
+    )
+    .unwrap();
+    let stages = &mut routes.get_mut("custom").unwrap().stages;
+    stages.design.effort_by_model.clear();
+    stages.implement.effort_by_model.clear();
+    stages.review.effort_by_model.clear();
+    assert!(render(stages, Some(&ladder)).is_empty());
+}
+
+#[test]
+fn text_keeps_each_providers_effort_table_below_its_class_summary() {
+    let ladders = [
+        Ladder::builtin(Provider::OpenAi).unwrap(),
+        Ladder::builtin(Provider::Anthropic).unwrap(),
+    ];
+    let routes = provider_routes(&response(&ladders), &ladders, 0.3).unwrap();
+    let mut lines = Vec::new();
+    for ladder in &ladders {
+        lines.extend(super::super::render_provider_line(
+            &ladder.name,
+            &routes[&ladder.name],
+            ladders.len(),
+            Some(ladder),
+            super::super::TerminalStyle::default(),
+        ));
+    }
+    let text = lines.join("\n");
+    let openai = text.find("  openai:").unwrap();
+    let anthropic = text.find("  anthropic:").unwrap();
+    assert!(openai < text.find("terra [gpt-5.6-terra]").unwrap());
+    assert!(text.find("astra [gpt-6-astra]").unwrap() < anthropic);
+    assert!(anthropic < text.find("sonnet [claude-sonnet-5]").unwrap());
+    assert_eq!(text.matches("Model / effort").count(), 2);
 }

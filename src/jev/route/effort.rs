@@ -456,66 +456,181 @@ pub(super) fn decode(
     Ok(output)
 }
 
-pub(super) fn render(
-    stage: Stage,
-    answers: &BTreeMap<String, Vec<ModelEffort>>,
-    ladder: Option<&Ladder>,
-) -> Vec<String> {
-    let names: Vec<&str> = ladder.map_or_else(
-        || answers.keys().map(String::as_str).collect(),
-        |l| l.tiers.as_slice().iter().map(|t| t.name.as_str()).collect(),
-    );
-    let mut lines = Vec::new();
-    for name in names {
-        for entry in answers.get(name).into_iter().flatten() {
-            let status = match entry.status {
-                Status::Recommended | Status::Fixed => entry.level.as_deref().unwrap_or("unknown"),
-                Status::NotNeeded => "not needed",
-                Status::Insufficient => "insufficient capability",
-                Status::Unavailable => "unavailable",
-                Status::Unspecified => "unspecified (add effort metadata)",
-            };
-            let mut detail = status.to_string();
-            if entry.status == Status::Fixed {
-                detail.push_str(" (fixed)");
+/// Group all stage advice by concrete model so each binding is printed once.
+pub(super) fn render(stages: &super::StageAnswers, ladder: Option<&Ladder>) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(ladder) = ladder {
+        names.extend(
+            ladder
+                .tiers
+                .as_slice()
+                .iter()
+                .map(|tier| tier.name.as_str()),
+        );
+    }
+    for stage in Stage::ALL {
+        for name in stages.get(stage).effort_by_model.keys() {
+            if !names.contains(&name.as_str()) {
+                names.push(name);
             }
-            if entry.status == Status::Unavailable {
-                if let Some(reason) = &entry.reason {
-                    detail.push_str(&format!(" — {reason}"));
-                }
-            }
-            if let Some(a) = &entry.assessment {
-                let label = if matches!(entry.status, Status::Fixed | Status::Unavailable) {
-                    "remaining work "
-                } else {
-                    ""
-                };
-                detail.push_str(&format!(" ({label}{:.2}", a.confidence));
-                if entry.close_call {
-                    detail.push_str(", close call");
-                    if let Some((name, p)) = a
-                        .probabilities
-                        .iter()
-                        .filter(|(k, _)| *k != &a.choice)
-                        .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(a.0)))
-                    {
-                        detail.push_str(&format!(" — {name} {p:.2}"));
-                    }
-                }
-                detail.push(')');
-            }
-            let model = if entry.model == name {
-                String::new()
-            } else {
-                format!(" [{}]", entry.model)
-            };
-            lines.push(format!(
-                "    {} effort: {name}{model}: {detail}",
-                stage.template_key().trim_start_matches("stage_")
-            ));
         }
     }
+    let mut rows = vec![[
+        "Model / effort".to_string(),
+        "Design".to_string(),
+        "Implement".to_string(),
+        "Review".to_string(),
+    ]];
+    let mut notes = Vec::new();
+    for name in names {
+        let mut models = Vec::new();
+        if let Some(tier) = ladder.and_then(|ladder| {
+            ladder
+                .tiers
+                .as_slice()
+                .iter()
+                .find(|tier| tier.name == name)
+        }) {
+            models.extend(
+                tier.models
+                    .iter()
+                    .flatten()
+                    .map(|model| model.name.as_str()),
+            );
+        }
+        for stage in Stage::ALL {
+            for entry in stages
+                .get(stage)
+                .effort_by_model
+                .get(name)
+                .into_iter()
+                .flatten()
+            {
+                if !models.contains(&entry.model.as_str()) {
+                    models.push(entry.model.as_str());
+                }
+            }
+        }
+        for model in models {
+            if !Stage::ALL.into_iter().any(|stage| {
+                stages
+                    .get(stage)
+                    .effort_by_model
+                    .get(name)
+                    .is_some_and(|entries| entries.iter().any(|entry| entry.model == model))
+            }) {
+                continue;
+            }
+            let label = if model == name {
+                name.to_string()
+            } else {
+                format!("{name} [{model}]")
+            };
+            let mut row = [label.clone(), "—".into(), "—".into(), "—".into()];
+            for (index, stage) in Stage::ALL.into_iter().enumerate() {
+                if let Some(entry) = stages
+                    .get(stage)
+                    .effort_by_model
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .find(|entry| entry.model == model)
+                {
+                    let detail = render_detail(entry);
+                    // Keep exceptional explanations below the table instead of widening every row.
+                    if entry.close_call || entry.status == Status::Unavailable {
+                        notes.push(format!(
+                            "    [{}] {label}, {}: {detail}",
+                            notes.len() + 1,
+                            stage.template_key().trim_start_matches("stage_")
+                        ));
+                        let short = match entry.status {
+                            Status::Recommended => {
+                                entry.level.as_deref().unwrap_or("unknown").to_string()
+                            }
+                            Status::Fixed => {
+                                format!("{} (fixed)", entry.level.as_deref().unwrap_or("unknown"))
+                            }
+                            Status::Unavailable => "unavailable".to_string(),
+                            Status::Insufficient => "insufficient capability".to_string(),
+                            Status::NotNeeded => "not needed".to_string(),
+                            Status::Unspecified => "unspecified".to_string(),
+                        };
+                        row[index + 1] = format!("{short} [{}]", notes.len());
+                    } else {
+                        row[index + 1] = detail;
+                    }
+                }
+            }
+            rows.push(row);
+        }
+    }
+    if rows.len() == 1 {
+        return Vec::new();
+    }
+    let widths: [usize; 3] = std::array::from_fn(|column| {
+        rows.iter()
+            .map(|row| row[column].chars().count())
+            .max()
+            .unwrap_or(0)
+    });
+    let mut lines: Vec<String> = rows
+        .into_iter()
+        .map(|row| {
+            format!(
+                "    {:<w0$}  {:<w1$}  {:<w2$}  {}",
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                w0 = widths[0],
+                w1 = widths[1],
+                w2 = widths[2],
+            )
+        })
+        .collect();
+    lines.extend(notes);
     lines
+}
+
+fn render_detail(entry: &ModelEffort) -> String {
+    let status = match entry.status {
+        Status::Recommended | Status::Fixed => entry.level.as_deref().unwrap_or("unknown"),
+        Status::NotNeeded => "not needed",
+        Status::Insufficient => "insufficient capability",
+        Status::Unavailable => "unavailable",
+        Status::Unspecified => "unspecified (add effort metadata)",
+    };
+    let mut detail = status.to_string();
+    if entry.status == Status::Fixed {
+        detail.push_str(" (fixed)");
+    }
+    if entry.status == Status::Unavailable {
+        if let Some(reason) = &entry.reason {
+            detail.push_str(&format!(" — {reason}"));
+        }
+    }
+    if let Some(a) = &entry.assessment {
+        let label = if matches!(entry.status, Status::Fixed | Status::Unavailable) {
+            "remaining work "
+        } else {
+            ""
+        };
+        detail.push_str(&format!(" ({label}{:.2}", a.confidence));
+        if entry.close_call {
+            detail.push_str(", close call");
+            if let Some((name, p)) = a
+                .probabilities
+                .iter()
+                .filter(|(k, _)| *k != &a.choice)
+                .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(a.0)))
+            {
+                detail.push_str(&format!(" — {name} {p:.2}"));
+            }
+        }
+        detail.push(')');
+    }
+    detail
 }
 
 #[cfg(test)]

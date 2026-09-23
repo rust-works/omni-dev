@@ -993,13 +993,7 @@ fn render_provider_line(
             style,
         )]
     };
-    for stage in Stage::ALL {
-        lines.extend(effort::render(
-            stage,
-            &route.stages.get(stage).effort_by_model,
-            ladder,
-        ));
-    }
+    lines.extend(effort::render(&route.stages, ladder));
     lines
 }
 
