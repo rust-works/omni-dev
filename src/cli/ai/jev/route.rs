@@ -163,6 +163,7 @@ impl RouteCommand {
             &reference_fetch_failures,
         )
         .await?;
+        // omni-dev: coverage ignore reason="RouteCommand::execute is the process-bound wiring shell; render_output_with_style and terminal_style_with provide its deterministic seams"
         print!(
             "{}",
             render_output_with_style(
@@ -174,6 +175,7 @@ impl RouteCommand {
             )?
         );
         failure_summary(&report).map_or(Ok(()), |msg| bail!(msg))
+        // omni-dev: coverage end
     }
 }
 
@@ -212,10 +214,12 @@ fn render_output_with_style(
     }
 }
 
+// omni-dev: coverage ignore reason="the SystemEnv/stdout probe is process-bound; terminal_style_with is exhaustively covered through its injected environment and TTY seam"
 /// Whether stdout may carry colour and OSC 8 links.
 fn terminal_style() -> TerminalStyle {
     terminal_style_with(&SystemEnv, std::io::stdout().is_terminal())
 }
+// omni-dev: coverage end
 
 /// The env-parsing seam behind [`terminal_style`] (STYLE-0028): given these
 /// variables and whether stdout is a terminal, what may be emitted?

@@ -1603,11 +1603,17 @@ mod tests {
         ]);
 
         assert_eq!(
-            render_stage_clause(Stage::Design, &stages, &[Stage::Design]),
+            render_stage_clause(
+                Stage::Design,
+                &stages,
+                &[Stage::Design],
+                None,
+                TerminalStyle::default(),
+            ),
             "design needs sol (0.21, close call — none 0.44)"
         );
         assert_eq!(
-            render_stage_clause(Stage::Design, &stages, &[]),
+            render_stage_clause(Stage::Design, &stages, &[], None, TerminalStyle::default(),),
             "design needs sol (0.21)"
         );
     }
