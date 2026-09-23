@@ -5,6 +5,7 @@ use crate::jev::protocol::{Answer, Question};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use unicode_width::UnicodeWidthStr;
 
 const NOT_NEEDED: &str = "not_needed";
 const INSUFFICIENT: &str = "insufficient";
@@ -570,7 +571,7 @@ pub(super) fn render(stages: &super::StageAnswers, ladder: Option<&Ladder>) -> V
     }
     let widths: [usize; 3] = std::array::from_fn(|column| {
         rows.iter()
-            .map(|row| row[column].chars().count())
+            .map(|row| UnicodeWidthStr::width(row[column].as_str()))
             .max()
             .unwrap_or(0)
     });
@@ -578,19 +579,23 @@ pub(super) fn render(stages: &super::StageAnswers, ladder: Option<&Ladder>) -> V
         .into_iter()
         .map(|row| {
             format!(
-                "    {:<w0$}  {:<w1$}  {:<w2$}  {}",
-                row[0],
-                row[1],
-                row[2],
+                "    {}  {}  {}  {}",
+                pad_to_width(&row[0], widths[0]),
+                pad_to_width(&row[1], widths[1]),
+                pad_to_width(&row[2], widths[2]),
                 row[3],
-                w0 = widths[0],
-                w1 = widths[1],
-                w2 = widths[2],
             )
         })
         .collect();
     lines.extend(notes);
     lines
+}
+
+fn pad_to_width(value: &str, width: usize) -> String {
+    format!(
+        "{value}{}",
+        " ".repeat(width.saturating_sub(UnicodeWidthStr::width(value)))
+    )
 }
 
 fn render_detail(entry: &ModelEffort) -> String {
