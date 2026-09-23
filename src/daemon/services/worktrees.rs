@@ -8797,13 +8797,13 @@ mod tests {
         let _guard = shim_lock();
         let failing = bin_dir.path().join("fake-gh-fails");
         write_exec_script(&failing, "#!/bin/sh\necho 'boom' >&2\nexit 1\n");
-        let err = open_pr_list(&failing, "rust-works/omni-dev").unwrap_err();
+        let err = retry_on_etxtbsy(|| open_pr_list(&failing, "rust-works/omni-dev")).unwrap_err();
         assert!(err.to_string().contains("gh pr list failed"), "{err:#}");
         assert!(err.to_string().contains("boom"), "{err:#}");
 
         let object = bin_dir.path().join("fake-gh-object");
         write_exec_script(&object, "#!/bin/sh\necho '{}'\n");
-        let err = open_pr_list(&object, "rust-works/omni-dev").unwrap_err();
+        let err = retry_on_etxtbsy(|| open_pr_list(&object, "rust-works/omni-dev")).unwrap_err();
         assert!(
             err.to_string().contains("did not return a JSON array"),
             "{err:#}"
