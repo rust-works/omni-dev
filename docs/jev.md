@@ -750,19 +750,24 @@ rungs without `models` report `unspecified` with migration guidance; they
 add no questions. Metadata and normalized design-`none` results do not
 invent confidence values.
 
-Text adds lines such as:
+Text groups effort advice into one row per concrete model beneath each
+ladder's class summary (illustrative values):
 
 ```text
-    implement effort: sonnet [claude-sonnet-5]: high (0.65)
-    implement effort: opus [claude-opus-5-5]: medium (0.20, close call — high 0.45)
-    implement effort: fable [claude-fable-5-1]: low (0.82)
+    Model / effort               Design       Implement    Review
+    sonnet [claude-sonnet-5]      high (0.62)  high (0.68)  high (0.60)
+    opus [claude-opus-5-5]        high (0.66)  medium [1]   high (0.71)
+    fable [claude-fable-5-1]       high (0.65)  low (0.82)   high (0.68)
+    [1] opus [claude-opus-5-5], implement: medium (0.20, close call — high 0.45)
 ```
 
-These appear beneath their ladder's class summary. Every rung is shown in
-ladder order; long/multi-model names keep the expanded class layout. Effort
-close calls use `--close-call`, independently of class close calls, and show
-the strongest alternative (alphabetical tie break). Confidence and option
-probability are distinct Jev values.
+Every rung is shown in ladder order; long/multi-model names keep the expanded
+class layout. A dash means the model has no binding for that stage. Close-call
+evidence and unavailable-control explanations appear in numbered notes below
+the table to keep columns compact. Effort close calls use `--close-call`,
+independently of class close calls, and show the strongest alternative
+(alphabetical tie break). Confidence and option probability are distinct Jev
+values. JSON and YAML retain the complete structured evidence.
 
 All class, effort and dependency questions share **one Jev call per issue**.
 Internal effort keys use rung/model indices, so punctuation in custom model
