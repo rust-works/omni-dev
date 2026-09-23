@@ -653,6 +653,39 @@ fn text_groups_builtin_models_in_ladder_order_with_three_stage_columns() {
 }
 
 #[test]
+fn text_aligns_columns_when_a_custom_model_name_is_wide() {
+    use unicode_width::UnicodeWidthStr;
+
+    let ladder = Ladder::builtin(Provider::OpenAi).unwrap();
+    let mut routes = provider_routes(
+        &response(std::slice::from_ref(&ladder)),
+        std::slice::from_ref(&ladder),
+        0.3,
+    )
+    .unwrap();
+    let stages = &mut routes.get_mut("openai").unwrap().stages;
+    for stage in [
+        &mut stages.design,
+        &mut stages.implement,
+        &mut stages.review,
+    ] {
+        stage.effort_by_model.get_mut("terra").unwrap()[0].model = "模型".into();
+    }
+    let detail = render_detail(&stages.design.effort_by_model["terra"][0]);
+    let lines = render(stages, Some(&ladder));
+    let row = lines
+        .iter()
+        .find(|line| line.contains("terra [模型]"))
+        .unwrap();
+    let header_prefix = lines[0].split_once("Design").unwrap().0;
+    let row_prefix = row.split_once(&detail).unwrap().0;
+    assert_eq!(
+        UnicodeWidthStr::width(header_prefix),
+        UnicodeWidthStr::width(row_prefix)
+    );
+}
+
+#[test]
 fn text_handles_stage_specific_models_and_missing_ladder_metadata() {
     let ladder = custom();
     let routes = provider_routes(
