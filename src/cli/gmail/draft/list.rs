@@ -24,9 +24,9 @@ const HEADERS: [&str; 7] = [
 
 /// Lists Gmail drafts, showing each one's draft id.
 ///
-/// The draft id is what `gmail draft show`/`update` take. It is not the
-/// message id: `gmail search in:drafts` finds the messages but can't
-/// return their draft ids, which is why this command exists.
+/// Every drafts endpoint is addressed by the draft id, not the message id.
+/// `gmail search in:drafts` finds the messages but can't return their
+/// draft ids, which is why this command exists.
 ///
 /// Each row costs one `messages.get` on top of the listing, since
 /// `drafts.list` returns only ids. They run at `gmail search --enrich`'s

@@ -502,7 +502,10 @@ underneath.
 (5 quota units). That is the same cost as `gmail search --enrich`, and
 these calls run at the same fixed concurrency (4); see
 [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour).
-`draft list` has no `--concurrency` flag.
+`draft list` has no `--concurrency` flag. Saving a draft replaces its
+message. If a draft is saved while `draft list` runs, the old message it
+was about to fetch is gone. That row still appears, with its ids but blank
+headers, and running the command again shows it in full.
 
 **Read-only scope is enough.** `drafts.list` and `messages.get` both
 accept `gmail.readonly`, so `draft list` works for an account authorised

@@ -19,6 +19,7 @@ use serde::Serialize;
 use url::Url;
 
 use crate::gmail::client::GmailClient;
+use crate::gmail::error::GmailError;
 use crate::gmail::messages_api::{
     effective_cap, header_value, hydrate_in_order, MessageFormat, MessagesApi, MAX_PAGE_LIMIT,
 };
@@ -33,9 +34,9 @@ const SUMMARY_HEADERS: [&str; 5] = ["To", "Cc", "Bcc", "Subject", "Date"];
 /// threadId}}`, so this is assembled client-side by
 /// [`DraftsApi::list_summaries`] from one `messages.get(format=metadata)` per
 /// draft. The two ids are named `draft_id` and `message_id` rather than a
-/// bare `id` so machine output can't confuse them: the draft id is what
-/// `gmail draft show`/`update` take, and the message id changes every time
-/// the draft is updated.
+/// bare `id` so machine output can't confuse them: every drafts endpoint is
+/// addressed by the draft id, and the message id changes every time the
+/// draft is saved.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct DraftSummary {
     /// Gmail draft id.
@@ -167,7 +168,10 @@ impl<'a> DraftsApi<'a> {
     /// to 1 through
     /// [`MAX_CONCURRENCY`](crate::gmail::messages_api::MAX_CONCURRENCY)),
     /// results in listing order, and any one failure aborts the whole call.
-    /// Both endpoints accept `gmail.readonly`.
+    /// The one exception is a 404 on a draft's message: the draft was saved
+    /// again after the listing, which replaced that message. It keeps its
+    /// row, with the listing's ids and blank headers. Both endpoints accept
+    /// `gmail.readonly`.
     pub async fn list_summaries(
         &self,
         query: Option<&str>,
@@ -178,13 +182,30 @@ impl<'a> DraftsApi<'a> {
         let messages = MessagesApi::new(self.client);
         let messages = &messages;
         hydrate_in_order(list.drafts, concurrency, |draft| async move {
-            let message = messages
+            let message = match messages
                 .get(&draft.message.id, MessageFormat::Metadata, &SUMMARY_HEADERS)
-                .await?;
+                .await
+            {
+                Ok(message) => message,
+                // Saving a draft gives it a new message and deletes the old
+                // one, so a draft autosaved between the listing and this
+                // fetch 404s. Keep its row with the listing's ids and blank
+                // headers rather than failing every other draft.
+                Err(err) if is_not_found(&err) => Message::default(),
+                Err(err) => return Err(err),
+            };
             Ok(DraftSummary::from_draft(&draft, &message))
         })
         .await
     }
+}
+
+/// Whether `err` is Gmail's HTTP 404.
+fn is_not_found(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<GmailError>(),
+        Some(GmailError::ApiRequestFailed { status: 404, .. })
+    )
 }
 
 fn build_drafts_list_url(
@@ -607,6 +628,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn list_summaries_keeps_a_draft_whose_message_was_replaced() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/drafts"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(page_body(&["1", "2"], None)),
+            )
+            .mount(&server)
+            .await;
+        // Draft r1 was saved again after the listing: its old message is gone.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("gone"))
+            .mount(&server)
+            .await;
+        mount_message(&server, "2", "Still here").await;
+
+        let summaries = DraftsApi::new(&client)
+            .list_summaries(None, 10, 1)
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].draft_id, "r1");
+        assert_eq!(summaries[0].message_id, "m1");
+        assert_eq!(summaries[0].thread_id, "t1");
+        assert!(summaries[0].subject.is_empty());
+        assert_eq!(summaries[1].subject, "Still here");
     }
 
     // ── DraftSummary::from_draft ─────────────────────────────────────
