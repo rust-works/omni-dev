@@ -134,15 +134,26 @@ best-effort:
 |---|---|
 | `SessionStart` | `starting` |
 | `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / transcript grew | `working` |
+| `PostToolUseFailure` / `PostToolBatch` / `PermissionDenied` / `ElicitationResult` / `SubagentStart` / `PreCompact` | `working` |
 | transcript grew — while already `waiting_for_*` or `ended` | *unchanged* |
-| `Stop` | `idle` |
-| `Notification` — permission prompt | `waiting_for_permission` |
-| `Notification` — idle/input prompt | `waiting_for_input` |
-| `Notification` — unclassified / transcript discovered | *unchanged* |
+| `Stop` / `StopFailure` | `idle` |
+| `PermissionRequest` / `Notification` — permission prompt | `waiting_for_permission` |
+| `Elicitation` / `Notification` — idle, input, or elicitation prompt | `waiting_for_input` |
+| `Notification` — unclassified / `SubagentStop` / `PostCompact` / transcript discovered | *unchanged* |
 | `SessionEnd` | `ended` (reaped shortly after) |
 | **stream state** (Feed 4) | **exactly what was reported** |
 
-`waiting_for_*` are **reliable** (a `Notification` hook fires them directly).
+`waiting_for_*` are **reliable**: a dedicated hook fires them directly.
+`PermissionRequest` and `Elicitation` are events of their own. A `Notification`
+is classified by Claude Code's `notification_type` field (`permission_prompt`,
+`idle_prompt`, `elicitation_dialog`), and by a substring match on its message
+only when the type is missing or unrecognised, as on older versions.
+`StopFailure` covers a turn that ends on an API error, which fires no `Stop`.
+Without it the row stayed `working` until the TTL expired.
+`SubagentStop` and `PostCompact` refresh liveness without changing the state.
+Both report that something *finished*. A background subagent can finish after
+the turn's `Stop`, and a manual `/compact` can run from idle, so treating either
+as `working` would leave an idle row showing `working`.
 `working` vs `idle` is best-effort, with the transcript-growth backstop covering
 the ~5–15s "thinking window" between a prompt and the first tool call, where no
 hook fires.
@@ -165,6 +176,13 @@ deliberate trade: a stale "blocked on you" is a nag you can see, a stale "workin
 is the alert you never got. Feed 4 has no such gap, reporting `working` off the
 `control_response` the moment the prompt is answered. Failing both,
 `Stop` / `UserPromptSubmit` / `SessionEnd` or the TTL releases it.
+
+The newer events (#1915) **narrow** this gap without closing it. An approved tool
+that *fails* now releases the wait at `PostToolUseFailure`, and a parallel batch
+releases it at `PostToolBatch`. The approval itself still fires no hook. Neither
+does **denying** a prompt: the wait is released by whatever Claude does next
+(`PreToolUse`, `Stop`, or your next `UserPromptSubmit`). `PermissionDenied` is not
+that event. It fires only when **auto mode** refuses a call.
 
 Feed 4 is the exception: it reads the state out of Claude's own stream rather
 than guessing from a lifecycle event, so it wins outright over anything inferred
@@ -232,9 +250,25 @@ omni-dev sessions install-hooks --settings /path/to/settings.json
 
 `install-hooks` writes a `command` hook running `omni-dev sessions hook` for
 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`,
-`Stop`, and `SessionEnd`. It uses the absolute path of the running binary so
-Claude Code invokes *this* omni-dev regardless of its hook `PATH`. The portable
-manual form is `omni-dev sessions hook`.
+`Stop`, `SessionEnd`, `PermissionRequest`, `PermissionDenied`,
+`PostToolUseFailure`, `PostToolBatch`, `StopFailure`, `Elicitation`,
+`ElicitationResult`, `SubagentStart`, `SubagentStop`, `PreCompact`, and
+`PostCompact`. The tool events (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
+`PermissionRequest`, `PermissionDenied`) use the `*` matcher. It uses the absolute
+path of the running binary so Claude Code invokes *this* omni-dev regardless of
+its hook `PATH`. The portable manual form is `omni-dev sessions hook`.
+
+Re-running `install-hooks` over an older install adds only the events it lacks,
+and `uninstall-hooks` removes the sink from every event. Claude Code 2.1.280 drops
+a hook event it doesn't know with a warning, not an error
+(`Unknown hook event "…" was ignored`). How older versions treat an unknown event
+hasn't been verified.
+
+The sink **never answers a `PermissionRequest`**. Claude Code reads that hook's
+stdout as a decision, and a `"behavior": "allow"` would approve the tool call on
+your behalf. The sink writes nothing to stdout and exits 0, so the prompt always
+reaches you unchanged. `tests/sessions_hook_test.rs` pins this through the real
+binary.
 
 The `hook` subcommand is the **feed sink** — Claude Code runs it, not you. It
 reads one hook event's JSON on stdin, maps it to an `observe`/`end` op, and

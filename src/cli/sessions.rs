@@ -278,9 +278,13 @@ struct HookPayload {
     #[serde(default)]
     hook_event_name: Option<String>,
     /// Present on `Notification` events — the message classified into a
-    /// [`NotificationKind`].
+    /// [`NotificationKind`] when `notification_type` is absent or unrecognised.
     #[serde(default)]
     message: Option<String>,
+    /// Present on `Notification` events — Claude Code's own classification
+    /// (`permission_prompt`, `idle_prompt`, …), preferred over `message`.
+    #[serde(default)]
+    notification_type: Option<String>,
     /// Present on `SessionEnd` — why the session ended.
     #[serde(default)]
     reason: Option<String>,
@@ -307,7 +311,11 @@ impl HookPayload {
             return Some(("end", payload));
         }
         let event = match agent {
-            HookAgent::Claude => session_event_for(event_name, self.message.as_deref())?,
+            HookAgent::Claude => session_event_for(
+                event_name,
+                self.notification_type.as_deref(),
+                self.message.as_deref(),
+            )?,
             HookAgent::Codex => codex_session_event_for(event_name, self.tool_name.as_deref())?,
         };
         let request = ObserveRequest {
@@ -326,14 +334,48 @@ impl HookPayload {
 /// Maps a Claude Code hook event name to the [`SessionEvent`] it implies, or
 /// `None` for an event the tracker does not act on. `SessionEnd` is handled
 /// separately (it maps to the `end` op, not `observe`).
-fn session_event_for(event_name: &str, message: Option<&str>) -> Option<SessionEvent> {
+///
+/// Everything lands on the **existing** events, so the engine's state machine
+/// is unchanged (the Codex precedent, ADR-0087):
+///
+/// - `PermissionRequest` is the dedicated "a prompt is about to be shown"
+///   event, so it sets the permission wait without matching `Notification`
+///   text. The sink must never answer it — a `PermissionRequest` hook that
+///   prints a decision approves or denies on the user's behalf — and it cannot:
+///   [`HookCommand`] writes nothing to stdout;
+/// - `Elicitation` (an MCP server asking the user a question) is a wait for
+///   input, released by its `ElicitationResult`;
+/// - `PostToolUseFailure`, `PostToolBatch` and `PermissionDenied` (auto mode
+///   refused a call and the turn goes on) are post-tool signals: `working`;
+/// - `StopFailure` ends a turn on an API error, which fires no `Stop`;
+/// - `SubagentStart` and `PreCompact` mean work is starting: `working`;
+/// - `SubagentStop` and `PostCompact` mean only that something *finished*. A
+///   background subagent can finish after the turn's `Stop`, and a manual
+///   `/compact` can run from idle, so reading either as `working` would strand
+///   an idle row. They are the state-preserving
+///   [`TranscriptDiscovered`](SessionEvent::TranscriptDiscovered) sighting,
+///   which refreshes liveness alone.
+///
+/// No event fires when the user answers a permission prompt, either way; the
+/// wait is released by whatever hook comes next.
+fn session_event_for(
+    event_name: &str,
+    notification_type: Option<&str>,
+    message: Option<&str>,
+) -> Option<SessionEvent> {
     Some(match event_name {
         "SessionStart" => SessionEvent::SessionStart,
         "UserPromptSubmit" => SessionEvent::UserPromptSubmit,
         "PreToolUse" => SessionEvent::PreToolUse,
-        "PostToolUse" => SessionEvent::PostToolUse,
-        "Stop" => SessionEvent::Stop,
-        "Notification" => SessionEvent::Notification(classify_notification(message)),
+        "PostToolUse" | "PostToolUseFailure" | "PostToolBatch" | "PermissionDenied"
+        | "ElicitationResult" | "SubagentStart" | "PreCompact" => SessionEvent::PostToolUse,
+        "SubagentStop" | "PostCompact" => SessionEvent::TranscriptDiscovered,
+        "Stop" | "StopFailure" => SessionEvent::Stop,
+        "PermissionRequest" => SessionEvent::Notification(NotificationKind::PermissionPrompt),
+        "Elicitation" => SessionEvent::Notification(NotificationKind::AgentNeedsInput),
+        "Notification" => {
+            SessionEvent::Notification(classify_notification(notification_type, message))
+        }
         _ => return None,
     })
 }
@@ -371,11 +413,22 @@ fn codex_session_event_for(event_name: &str, tool_name: Option<&str>) -> Option<
     })
 }
 
-/// Classifies a `Notification` message into a [`NotificationKind`]. Best-effort
-/// substring matching — the message text is version-unstable, so an unrecognised
-/// message falls back to [`NotificationKind::Other`] (which carries no state
-/// signal and leaves the session's state unchanged).
-fn classify_notification(message: Option<&str>) -> NotificationKind {
+/// Classifies a `Notification` into a [`NotificationKind`]: by Claude Code's own
+/// `notification_type` when it names a kind we know, else by best-effort
+/// substring matching on the message. The message text is version-unstable, and
+/// older versions send no type, so an unrecognised notification falls back to
+/// [`NotificationKind::Other`] (which carries no state signal and leaves the
+/// session's state unchanged).
+fn classify_notification(
+    notification_type: Option<&str>,
+    message: Option<&str>,
+) -> NotificationKind {
+    match notification_type {
+        Some("permission_prompt") => return NotificationKind::PermissionPrompt,
+        Some("idle_prompt") => return NotificationKind::IdlePrompt,
+        Some("elicitation_dialog") => return NotificationKind::AgentNeedsInput,
+        _ => {}
+    }
     let Some(message) = message else {
         return NotificationKind::Other;
     };
@@ -819,8 +872,10 @@ fn manual_setup_hint(error: &anyhow::Error, shim: &str) -> anyhow::Error {
 struct HookSpec {
     /// The event name, as the settings file keys it.
     event: &'static str,
-    /// Whether the event's group needs a tool `matcher` (`PreToolUse` /
-    /// `PostToolUse` match on tool name; the rest have none).
+    /// Whether the event's group gets the `*` tool `matcher` (the tool events —
+    /// `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`,
+    /// `PermissionDenied` — match on tool name; the rest are left unmatched,
+    /// which matches every occurrence).
     matcher: bool,
     /// A per-hook `timeout` in seconds, where the agent caps the event below
     /// its default.
@@ -852,7 +907,9 @@ impl HookSpec {
 }
 
 /// The Claude Code hook events the tracker installs. `SessionEnd` is included —
-/// it maps to the `end` op in the sink.
+/// it maps to the `end` op in the sink. The events after `SessionEnd` narrow
+/// the hooks-only state gaps (#1915); a Claude Code version that predates one
+/// drops it with a warning rather than rejecting the settings file.
 const HOOK_EVENTS: &[HookSpec] = &[
     HookSpec::new("SessionStart"),
     HookSpec::new("UserPromptSubmit"),
@@ -861,6 +918,17 @@ const HOOK_EVENTS: &[HookSpec] = &[
     HookSpec::new("Notification"),
     HookSpec::new("Stop"),
     HookSpec::new("SessionEnd"),
+    HookSpec::matched("PermissionRequest"),
+    HookSpec::matched("PermissionDenied"),
+    HookSpec::matched("PostToolUseFailure"),
+    HookSpec::new("PostToolBatch"),
+    HookSpec::new("StopFailure"),
+    HookSpec::new("Elicitation"),
+    HookSpec::new("ElicitationResult"),
+    HookSpec::new("SubagentStart"),
+    HookSpec::new("SubagentStop"),
+    HookSpec::new("PreCompact"),
+    HookSpec::new("PostCompact"),
 ];
 
 /// The Codex hook events the tracker installs into `$CODEX_HOME/hooks.json`:
@@ -1407,6 +1475,7 @@ fn age_secs(ts: Option<&str>) -> i64 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::sessions::SessionState;
 
     /// Mirrors the `omni-dev sessions` argv surface for parse tests.
     #[derive(Parser)]
@@ -1525,7 +1594,7 @@ mod tests {
         // Blank session_id → no op.
         assert!(hook_op(r#"{"session_id":"  ","hook_event_name":"Stop"}"#).is_none());
         // Unknown event → no op.
-        assert!(hook_op(r#"{"session_id":"s1","hook_event_name":"PreCompact"}"#).is_none());
+        assert!(hook_op(r#"{"session_id":"s1","hook_event_name":"CwdChanged"}"#).is_none());
         // Garbage that still parses as an (empty) payload → no op.
         assert!(hook_op("{}").is_none());
     }
@@ -1597,8 +1666,8 @@ mod tests {
 
     #[test]
     fn the_claude_sink_ignores_codex_only_events() {
-        // The untagged sink keeps its Claude mapping, which predates Codex.
-        assert!(hook_op(r#"{"session_id":"s1","hook_event_name":"PermissionRequest"}"#).is_none());
+        // Codex's `Interrupt` and its `request_user_input` tool have no Claude
+        // equivalent, so the untagged sink keeps its own mapping for both.
         assert!(hook_op(r#"{"session_id":"s1","hook_event_name":"Interrupt"}"#).is_none());
         assert_eq!(
             hook_op(r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"request_user_input"}"#)
@@ -1606,6 +1675,98 @@ mod tests {
                 .1["event"],
             "pre_tool_use"
         );
+    }
+
+    fn claude_event(event: &str) -> Value {
+        let hook = json!({ "session_id": "s1", "hook_event_name": event });
+        hook_op(&hook.to_string()).unwrap().1["event"].clone()
+    }
+
+    #[test]
+    fn claude_newer_events_map_onto_the_existing_session_events() {
+        assert_eq!(
+            claude_event("PermissionRequest")["notification"],
+            "permission_prompt"
+        );
+        assert_eq!(
+            claude_event("Elicitation")["notification"],
+            "agent_needs_input"
+        );
+        for working in [
+            "PostToolUseFailure",
+            "PostToolBatch",
+            "PermissionDenied",
+            "ElicitationResult",
+            "SubagentStart",
+            "PreCompact",
+        ] {
+            assert_eq!(claude_event(working), "post_tool_use", "{working}");
+        }
+        assert_eq!(claude_event("StopFailure"), "stop");
+        // A finish is a liveness-only sighting: it must not turn an idle
+        // session back to working (a background subagent, a manual /compact).
+        for preserving in ["SubagentStop", "PostCompact"] {
+            assert_eq!(
+                claude_event(preserving),
+                "transcript_discovered",
+                "{preserving}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_installed_claude_event_is_mapped_by_the_sink() {
+        // An installed event the sink ignores would spawn a process per event
+        // for nothing.
+        for HookSpec { event, .. } in HOOK_EVENTS {
+            let hook = json!({ "session_id": "s1", "hook_event_name": event });
+            assert!(hook_op(&hook.to_string()).is_some(), "{event} is unmapped");
+        }
+    }
+
+    #[test]
+    fn a_finished_subagent_or_compaction_leaves_an_idle_session_idle() {
+        for preserving in ["SubagentStop", "PostCompact"] {
+            let hook = json!({ "session_id": "s1", "hook_event_name": preserving });
+            let (_, payload) = hook_op(&hook.to_string()).unwrap();
+            let event: SessionEvent = serde_json::from_value(payload["event"].clone()).unwrap();
+            assert_eq!(
+                SessionState::for_event(&event, Some(SessionState::Idle)),
+                SessionState::Idle,
+                "{preserving}"
+            );
+            assert_eq!(
+                SessionState::for_event(&event, Some(SessionState::WaitingForPermission)),
+                SessionState::WaitingForPermission,
+                "{preserving}"
+            );
+        }
+    }
+
+    #[test]
+    fn hook_classifies_notifications_by_type_before_message() {
+        let typed = |ty: &str, msg: &str| {
+            let hook = json!({
+                "session_id": "s1",
+                "hook_event_name": "Notification",
+                "notification_type": ty,
+                "message": msg,
+            });
+            hook_op(&hook.to_string()).unwrap().1["event"]["notification"].clone()
+        };
+        // The type wins over a message the substring match would misread.
+        assert_eq!(
+            typed("permission_prompt", "something else"),
+            "permission_prompt"
+        );
+        assert_eq!(typed("idle_prompt", "Please approve"), "idle_prompt");
+        assert_eq!(typed("elicitation_dialog", "x"), "agent_needs_input");
+        // An unrecognised type falls back to the message, as before types.
+        assert_eq!(
+            typed("worker_permission_prompt", "Claude needs your permission"),
+            "permission_prompt"
+        );
+        assert_eq!(typed("auth_success", "Signed in"), "other");
     }
 
     #[test]
@@ -1930,14 +2091,18 @@ mod tests {
     #[test]
     fn classify_notification_covers_cases() {
         assert_eq!(
-            classify_notification(Some("Please approve this")),
+            classify_notification(None, Some("Please approve this")),
             NotificationKind::PermissionPrompt
         );
         assert_eq!(
-            classify_notification(Some("Claude is idle")),
+            classify_notification(None, Some("Claude is idle")),
             NotificationKind::IdlePrompt
         );
-        assert_eq!(classify_notification(None), NotificationKind::Other);
+        assert_eq!(classify_notification(None, None), NotificationKind::Other);
+        assert_eq!(
+            classify_notification(Some("idle_prompt"), None),
+            NotificationKind::IdlePrompt
+        );
     }
 
     // --- install / uninstall hooks ------------------------------------------
@@ -1971,6 +2136,31 @@ mod tests {
 
         // A second merge is a no-op.
         assert_eq!(merge_hooks(&mut settings, cmd, HOOK_EVENTS), 0);
+    }
+
+    #[test]
+    fn reinstalling_over_the_original_seven_events_adds_only_the_new_ones() {
+        // An install from before #1915 carries only the first seven events.
+        let cmd = "/usr/bin/omni-dev sessions hook";
+        let original = &HOOK_EVENTS[..7];
+        assert_eq!(original.last().unwrap().event, "SessionEnd");
+        let mut settings = json!({});
+        merge_hooks(&mut settings, cmd, original);
+        let before = settings.clone();
+
+        let added = merge_hooks(&mut settings, cmd, HOOK_EVENTS);
+        assert_eq!(added, HOOK_EVENTS.len() - 7);
+        // The existing groups are untouched: one group each, as before.
+        for HookSpec { event, .. } in original {
+            assert_eq!(settings["hooks"][event], before["hooks"][event], "{event}");
+        }
+        // Tool events get the `*` matcher; the others none.
+        assert_eq!(settings["hooks"]["PermissionRequest"][0]["matcher"], "*");
+        assert!(settings["hooks"]["StopFailure"][0].get("matcher").is_none());
+
+        // Uninstall removes every event, old and new.
+        assert_eq!(remove_hooks(&mut settings, cmd), HOOK_EVENTS.len());
+        assert!(settings["hooks"].as_object().unwrap().is_empty());
     }
 
     #[test]
@@ -2745,7 +2935,7 @@ mod tests {
         // A per-event value that is not an array is skipped, not indexed.
         assert_eq!(
             merge_hooks(&mut json!({ "hooks": { "Stop": 5 } }), cmd, HOOK_EVENTS),
-            6
+            HOOK_EVENTS.len() - 1
         );
         assert_eq!(remove_hooks(&mut json!({ "hooks": { "Stop": 5 } }), cmd), 0);
     }
