@@ -1,19 +1,26 @@
 # Effort capabilities checked 2026-09-23; criteria are uncalibrated routing hypotheses.
 # The `anthropic` model ladder for `omni-dev ai jev route` (#1779, #1820):
-# sonnet (Claude Sonnet) / opus (Claude Opus) / fable (Claude Fable).
+# sonnet (Claude Sonnet) / opus (Claude Opus).
 #
 # A rung names a model family and its description a capability level, not a
 # version: Jev reads only the description, and mapping a rung to a current
-# model is the consumer's job. When a release reorders the families (Claude
-# Opus 5.5, 2026-09-22, is reported at Fable 5.1's level on most work), change
-# that mapping, not these descriptions. See docs/jev.md, "Rungs and model
-# versions".
+# model is the consumer's job. See docs/jev.md, "Rungs, model versions and
+# effort".
+#
+# The `fable` rung is commented out, not deleted (#1903): Anthropic's own
+# comparison reports Claude Opus 5.5 (released 2026-09-22) performing "at the
+# level of Claude Fable 5.1 on most work" and beating it on published coding
+# benchmarks, so a distinct, more-capable-than-`opus` class is no longer
+# supported by the evidence. Restore it by uncommenting the block below if
+# that changes. This is a routing-ladder change only: `claude-fable-5-1`
+# remains registered in src/templates/models.yaml for other, unrelated uses.
 #
 # Tiers are listed from least to most capable; `route` ranks them by position.
 # The descriptions are the text validated against jev-1.13.0 — rewording them
 # shifts every answer, so re-run the evaluation before changing a word. The
-# other providers' ladders (`jev-route-tiers-<provider>.yaml`) reuse these
-# descriptions rung for rung, so an edit here is an edit to every ladder.
+# other providers' ladders (`jev-route-tiers-<provider>.yaml`) still carry
+# three rungs and reuse these descriptions rung for rung where they overlap —
+# an edit to a rung kept here is an edit to every ladder's matching rung.
 # `--tiers FILE` replaces the ladder (at least two tiers, unique names; `none`
 # is reserved for the design stage).
 tiers:
@@ -74,32 +81,33 @@ tiers:
     description: >-
       Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
       ordering, once the overall direction is set. Can under-explore a genuinely open design space.
-  - name: fable
-    models:
-      - name: claude-fable-5-1
-        verified: "2026-09-23"
-        sources: [https://platform.claude.com/docs/en/build-with-claude/effort]
-        effort:
-          kind: configurable
-          control: output_config.effort
-          supported_levels: [low, medium, high, xhigh, max]
-          levels:
-            - name: low
-              description: >-
-                The stage is short, local and familiar, with explicit requirements and an obvious solution or review checklist.
-            - name: medium
-              description: >-
-                The stage needs several reasoning steps and checking ordinary interactions, with a clear approach and bounded scope.
-            - name: high
-              description: >-
-                The stage needs sustained reasoning about subtle behavior, multiple components, non-obvious failure modes or competing approaches.
-            - name: xhigh
-              description: >-
-                The stage needs extended exploration, long-horizon implementation or review, or repeated testing of interacting hypotheses beyond high effort.
-            - name: max
-              description: >-
-                The stage approaches this model's capability limit and requires its deepest supported analysis; lower effort would leave major unresolved risks.
-    description: >-
-      Strongest at open-ended design and research: choosing between architectures, working in
-      unfamiliar territory with no precedent in the codebase, anticipating failure modes, and
-      security-critical judgement.
+  # Retired #1903 — see the header comment above. Kept for reference/rollback.
+  # - name: fable
+  #   models:
+  #     - name: claude-fable-5-1
+  #       verified: "2026-09-23"
+  #       sources: [https://platform.claude.com/docs/en/build-with-claude/effort]
+  #       effort:
+  #         kind: configurable
+  #         control: output_config.effort
+  #         supported_levels: [low, medium, high, xhigh, max]
+  #         levels:
+  #           - name: low
+  #             description: >-
+  #               The stage is short, local and familiar, with explicit requirements and an obvious solution or review checklist.
+  #           - name: medium
+  #             description: >-
+  #               The stage needs several reasoning steps and checking ordinary interactions, with a clear approach and bounded scope.
+  #           - name: high
+  #             description: >-
+  #               The stage needs sustained reasoning about subtle behavior, multiple components, non-obvious failure modes or competing approaches.
+  #           - name: xhigh
+  #             description: >-
+  #               The stage needs extended exploration, long-horizon implementation or review, or repeated testing of interacting hypotheses beyond high effort.
+  #           - name: max
+  #             description: >-
+  #               The stage approaches this model's capability limit and requires its deepest supported analysis; lower effort would leave major unresolved risks.
+  #   description: >-
+  #     Strongest at open-ended design and research: choosing between architectures, working in
+  #     unfamiliar territory with no precedent in the codebase, anticipating failure modes, and
+  #     security-critical judgement.

@@ -54,7 +54,7 @@ comments (never the issues or pull requests it references) and picks, for each s
 least capable class likely to do it correctly with no rework. The issue's class is the \
 higher of its design and implement choices, and a stage whose confidence is below \
 --close-call is listed under close_calls.\n\nThe classes come from a named model ladder: \
-built-in ladders are anthropic (sonnet/opus/fable, the default), openai (terra/sol/astra) \
+built-in ladders are anthropic (sonnet/opus, the default), openai (terra/sol/astra) \
 and gemini (flash/pro/deep-think). --ladders NAMES routes against several ladders at once, \
 still in one Jev call per issue, and the output nests stages, class and close_calls under \
 each ladder's name. --ladder-definition NAME=FILE registers a custom ladder under NAME, its \

@@ -41,14 +41,15 @@ pub const NO_DESIGN: &str = "none";
 /// An AI provider with an embedded model ladder (#1820).
 ///
 /// Each variant's ladder lives in `src/templates/jev-route-tiers-<name>.yaml`,
-/// three rungs, least capable first, named by the abbreviated model name so
-/// the consumer gets a model to hand the work to rather than a rung to
-/// translate. Only `anthropic`'s text was validated against Jev (#1779); the
-/// other ladders reuse its descriptions rung for rung, differing only in
-/// the tier names Jev sees as criterion keys.
+/// least capable first, named by the abbreviated model name so the consumer
+/// gets a model to hand the work to rather than a rung to translate. Only
+/// `anthropic`'s text was validated against Jev (#1779); the other ladders
+/// reuse its descriptions rung for rung, differing only in the tier names
+/// Jev sees as criterion keys. `anthropic` has two rungs (#1903 dropped
+/// `fable` as redundant with `opus`); `openai`/`gemini` still have three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Provider {
-    /// `sonnet` / `opus` / `fable`.
+    /// `sonnet` / `opus`.
     #[value(name = "anthropic")]
     Anthropic,
     /// `terra` / `sol` / `astra` (gpt-5.6-terra / gpt-5.6-sol / gpt-6-astra).
@@ -1018,8 +1019,8 @@ fn render_provider_line(
 }
 
 /// Renders one provider's routing as an indented line, e.g. `  sonnet —
-/// design needs fable (0.52), ...` or, with more than one provider requested,
-/// `  anthropic: sonnet — design needs fable (0.52), ...`.
+/// design needs opus (0.52), ...` or, with more than one provider requested,
+/// `  anthropic: sonnet — design needs opus (0.52), ...`.
 fn render_provider_line_compact(
     provider: &str,
     route: &ProviderRoute,
@@ -1040,8 +1041,8 @@ fn render_provider_line_compact(
     format!("  {lead} — {}", clauses.join(", "))
 }
 
-/// Renders one stage's clause, e.g. `design needs fable (0.52)` or `review
-/// opus (0.41, close call)`.
+/// Renders one stage's clause, e.g. `design needs opus (0.52)` or `review
+/// sonnet (0.41, close call)`.
 fn render_stage_clause(
     stage: Stage,
     stages: &StageAnswers,
@@ -1318,20 +1319,22 @@ mod tests {
 
     // ── Tiers and providers ──────────────────────────────────────────
 
+    /// #1903 dropped `fable` as redundant with `opus`; the ladder is now two
+    /// rungs.
     #[test]
-    fn anthropic_tiers_are_sonnet_opus_fable_in_order() {
-        assert_eq!(tier_names(&default_tiers()), ["sonnet", "opus", "fable"]);
+    fn anthropic_tiers_are_sonnet_opus_in_order() {
+        assert_eq!(tier_names(&default_tiers()), ["sonnet", "opus"]);
     }
 
     #[test]
     fn anthropic_tier_descriptions_are_the_tested_text() {
         let tiers = default_tiers();
-        let fable = &tiers.as_slice()[2];
+        let opus = &tiers.as_slice()[1];
         assert_eq!(
-            fable.description,
-            "Strongest at open-ended design and research: choosing between architectures, \
-             working in unfamiliar territory with no precedent in the codebase, anticipating \
-             failure modes, and security-critical judgement."
+            opus.description,
+            "Reliable at reasoning across many files, subtle library or platform semantics, \
+             concurrency and ordering, once the overall direction is set. Can under-explore a \
+             genuinely open design space."
         );
     }
 
@@ -1358,14 +1361,28 @@ mod tests {
     }
 
     /// Only the anthropic text was validated (#1779), and rewording shifts
-    /// answers, so the other ladders copy it rung for rung. A ladder that
-    /// diverges must do so deliberately, by editing this test too.
+    /// answers, so the other ladders copy it rung for rung where they
+    /// overlap. A ladder that diverges must do so deliberately, by editing
+    /// this test too.
+    ///
+    /// #1903 dropped `anthropic`'s third rung (`fable`) as redundant with
+    /// its second (`opus`), on evidence specific to those two Claude
+    /// families; `openai`/`gemini` keep three rungs each, since no
+    /// equivalent case has been made for `astra`/`deep-think` shrinking
+    /// their own top rungs. Their third rung's description therefore still
+    /// reuses the retired `fable` text verbatim, pinned here as a literal
+    /// since it is no longer present in `anthropic`'s own (now two-rung)
+    /// tiers.
     #[test]
     fn openai_and_gemini_ladders_reuse_the_anthropic_descriptions_rung_for_rung() {
         let anthropic = default_tiers();
+        const RETIRED_ANTHROPIC_THIRD_RUNG: &str =
+            "Strongest at open-ended design and research: choosing between architectures, \
+             working in unfamiliar territory with no precedent in the codebase, anticipating \
+             failure modes, and security-critical judgement.";
         for provider in [Provider::OpenAi, Provider::Gemini] {
             let tiers = provider.tiers().unwrap();
-            assert_eq!(tiers.as_slice().len(), anthropic.as_slice().len());
+            assert_eq!(tiers.as_slice().len(), 3);
             for (rung, reference) in tiers.as_slice().iter().zip(anthropic.as_slice()) {
                 assert_eq!(
                     rung.description,
@@ -1377,6 +1394,14 @@ mod tests {
                     reference.name
                 );
             }
+            assert_eq!(
+                tiers.as_slice()[2].description,
+                RETIRED_ANTHROPIC_THIRD_RUNG,
+                "{}: {} no longer matches the retired anthropic fable rung",
+                // omni-dev: coverage ignore-line reason="assert_eq!'s message args are only evaluated on failure, and this test always passes"
+                provider.name(),
+                tiers.as_slice()[2].name
+            );
         }
     }
 
@@ -1501,15 +1526,15 @@ mod tests {
         let questions = build_route_questions(&anthropic()).unwrap();
         assert_eq!(
             options(&questions, "anthropic.stage_design"),
-            ["fable", "none", "opus", "sonnet"]
+            ["none", "opus", "sonnet"]
         );
         assert_eq!(
             options(&questions, "anthropic.stage_implement"),
-            ["fable", "opus", "sonnet"]
+            ["opus", "sonnet"]
         );
         assert_eq!(
             options(&questions, "anthropic.stage_review"),
-            ["fable", "opus", "sonnet"]
+            ["opus", "sonnet"]
         );
         let Question::Choice { criteria, .. } = &questions["anthropic.stage_design"] else {
             panic!();
@@ -1709,8 +1734,8 @@ mod tests {
     fn class_is_the_higher_of_design_and_implement() {
         let tiers = default_tiers();
         assert_eq!(
-            issue_class(&stages("fable", "sonnet", "sonnet"), &tiers),
-            "fable"
+            issue_class(&stages("opus", "sonnet", "sonnet"), &tiers),
+            "opus"
         );
         assert_eq!(
             issue_class(&stages("sonnet", "opus", "sonnet"), &tiers),
@@ -1722,14 +1747,14 @@ mod tests {
     fn class_ignores_review_and_none() {
         let tiers = default_tiers();
         assert_eq!(
-            issue_class(&stages("none", "sonnet", "fable"), &tiers),
+            issue_class(&stages("none", "sonnet", "opus"), &tiers),
             "sonnet"
         );
     }
 
     #[test]
     fn close_calls_are_below_the_threshold_in_stage_order() {
-        let mut s = stages("fable", "sonnet", "opus");
+        let mut s = stages("opus", "sonnet", "opus");
         s.review.confidence = 0.1;
         s.design.confidence = 0.29;
         s.implement.confidence = 0.3;
@@ -1916,7 +1941,7 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "model": "jev-1.13.0",
                     "answers": {
-                        "anthropic.stage_design": choice_json("fable", 0.52),
+                        "anthropic.stage_design": choice_json("opus", 0.52),
                         "anthropic.stage_implement": choice_json("sonnet", 0.83),
                         "anthropic.stage_review": choice_json("opus", 0.21),
                     },
@@ -1944,7 +1969,7 @@ mod tests {
         let issue = &report.issues[0];
         assert_eq!(issue.item_ref, "rust-works/omni-dev#7");
         let route = provider(&issue.outcome, "anthropic");
-        assert_eq!(route.class, "fable");
+        assert_eq!(route.class, "opus");
         assert_eq!(route.close_calls, [Stage::Review]);
         assert!(!issue.truncated);
 
@@ -1971,7 +1996,7 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "model": "jev-1.13.0",
                     "answers": {
-                        "anthropic.stage_design": choice_json("fable", 0.52),
+                        "anthropic.stage_design": choice_json("opus", 0.52),
                         "anthropic.stage_implement": choice_json("sonnet", 0.83),
                         "anthropic.stage_review": choice_json("opus", 0.9),
                         "openai.stage_design": choice_json("none", 0.9),
@@ -2028,7 +2053,7 @@ mod tests {
             providers.keys().collect::<Vec<_>>(),
             ["anthropic", "openai"]
         );
-        assert_eq!(provider(outcome, "anthropic").class, "fable");
+        assert_eq!(provider(outcome, "anthropic").class, "opus");
         assert!(provider(outcome, "anthropic").close_calls.is_empty());
         assert_eq!(provider(outcome, "openai").class, "sol");
         assert_eq!(provider(outcome, "openai").close_calls, [Stage::Implement]);
@@ -2377,11 +2402,11 @@ mod tests {
                         "anthropic".to_string(),
                         ProviderRoute {
                             stages: StageAnswers {
-                                design: answer("fable", 0.52),
+                                design: answer("opus", 0.52),
                                 implement: answer("sonnet", 0.83),
                                 review: answer("opus", 0.41),
                             },
-                            class: "fable".to_string(),
+                            class: "opus".to_string(),
                             close_calls: vec![Stage::Review],
                         },
                     )]),
@@ -2404,7 +2429,7 @@ mod tests {
         assert_eq!(
             text,
             "rust-works/omni-dev#1641 — Some issue title\n\
-             \x20\x20fable — design needs fable (0.52), implementation sonnet (0.83), review \
+             \x20\x20opus — design needs opus (0.52), implementation sonnet (0.83), review \
              opus (0.41, close call)\n\
              \x20\x20cites open #1129, which could leave less design work if resolved (0.75)\n\n\
              model: jev-1.13.0, usage: 1432 input tokens, 61 output tokens\n"
@@ -2702,8 +2727,8 @@ mod tests {
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
                         ProviderRoute {
-                            stages: stages("fable", "sonnet", "opus"),
-                            class: "fable".to_string(),
+                            stages: stages("opus", "sonnet", "opus"),
+                            class: "opus".to_string(),
                             close_calls: vec![],
                         },
                     )]),
@@ -2717,7 +2742,7 @@ mod tests {
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
         assert!(
             text.contains(
-                "  fable — design needs fable (0.90), implementation sonnet (0.90), review \
+                "  opus — design needs opus (0.90), implementation sonnet (0.90), review \
                  opus (0.90)"
             ),
             "{text}"
@@ -2934,10 +2959,6 @@ mod tests {
         );
         assert_eq!(
             choice_complexity("opus", &anthropic),
-            Some(Complexity::Medium)
-        );
-        assert_eq!(
-            choice_complexity("fable", &anthropic),
             Some(Complexity::High)
         );
         let custom = |names: &[&str]| {
@@ -2992,7 +3013,7 @@ mod tests {
                 providers: BTreeMap::from([(
                     "anthropic".to_string(),
                     ProviderRoute {
-                        stages: stages(NO_DESIGN, "opus", "fable"),
+                        stages: stages(NO_DESIGN, "opus", "sonnet"),
                         class: "opus".to_string(),
                         close_calls: vec![],
                     },
@@ -3039,10 +3060,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("\x1b[33mopus\x1b[0m — design needs \x1b[32mno further work\x1b[0m"),
+            text.contains("\x1b[31mopus\x1b[0m — design needs \x1b[32mno further work\x1b[0m"),
             "{text}"
         );
-        assert!(text.contains("review \x1b[31mfable\x1b[0m"), "{text}");
+        assert!(text.contains("review \x1b[32msonnet\x1b[0m"), "{text}");
         assert!(
             text.contains("\x1b]8;;https://github.com/other/repo/pull/42\x1b\\#42\x1b]8;;\x1b\\"),
             "{text}"
@@ -3116,12 +3137,12 @@ mod tests {
     fn design_stage_with_a_named_tier_renders_needs_prefix() {
         let line = render_stage_line(
             Stage::Design,
-            &stages("fable", "sonnet", "sonnet"),
+            &stages("opus", "sonnet", "sonnet"),
             &[],
             None,
             TerminalStyle::default(),
         );
-        assert_eq!(line, "design: needs fable (0.90)");
+        assert_eq!(line, "design: needs opus (0.90)");
     }
 
     #[test]
