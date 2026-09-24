@@ -293,6 +293,16 @@ pub enum Agent {
 }
 
 impl Agent {
+    /// The agent's display name, for the tray and other human-facing labels.
+    #[must_use]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Pi => "pi",
+            Self::Codex => "Codex",
+        }
+    }
+
     /// Whether this is the default agent, so [`ObserveRequest`] can omit it.
     #[must_use]
     pub fn is_claude(&self) -> bool {
@@ -1250,6 +1260,13 @@ mod tests {
             pi.event,
             SessionEvent::StreamState(SessionState::WaitingForInput)
         );
+    }
+
+    #[test]
+    fn agents_have_display_names() {
+        assert_eq!(Agent::Claude.display_name(), "Claude");
+        assert_eq!(Agent::Pi.display_name(), "pi");
+        assert_eq!(Agent::Codex.display_name(), "Codex");
     }
 
     #[test]

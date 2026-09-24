@@ -58,6 +58,9 @@ export function worktreeResourceUri(
 ): vscode.Uri {
   const query = new URLSearchParams({ checks });
   if (sessions) {
+    // Keyed `claude` for wire compatibility with URIs minted before sessions
+    // gained an agent tag (#1908); it now carries every agent's tally. Debt: a
+    // rename would need both keys read for one release.
     query.set("claude", encodeSessionTally(sessions));
   }
   return vscode.Uri.from({ scheme: WORKTREE_URI_SCHEME, path, query: query.toString() });

@@ -1,4 +1,4 @@
-// Unit tests for the pure Claude-session cue model. Nothing here imports
+// Unit tests for the pure agent-session cue model. Nothing here imports
 // `vscode`, so it runs under a plain Node process (`node --test out/`).
 
 import assert from "node:assert/strict";
@@ -9,6 +9,7 @@ import {
   SessionEntry,
   SessionTally,
   classifyModel,
+  sessionAgent,
   decodeSessionTally,
   encodeSessionTally,
   formatModelMarker,
@@ -29,8 +30,9 @@ function session(
   cwd: string | undefined,
   state: SessionEntry["state"],
   model?: string,
+  agent?: string,
 ): SessionEntry {
-  return { session_id: `s-${cwd ?? "none"}-${state}`, cwd, state, model };
+  return { session_id: `s-${cwd ?? "none"}-${state}`, cwd, state, model, agent };
 }
 
 test("tallyByWorktree buckets each state onto its worktree", () => {
@@ -44,7 +46,7 @@ test("tallyByWorktree buckets each state onto its worktree", () => {
     ],
     PATHS,
   );
-  assert.deepEqual(tallies["/w/repo"], { working: 2, waiting: 2, idle: 1 });
+  assert.deepEqual(tallies["/w/repo"], { working: 2, waiting: 2, idle: 1, agents: ["claude"] });
 });
 
 test("tallyByWorktree drops sessions it cannot or should not attribute", () => {
@@ -70,14 +72,14 @@ test("tallyByWorktree matches on a path boundary, longest first", () => {
     ],
     PATHS,
   );
-  assert.deepEqual(tallies["/w/repo-two"], { working: 1, waiting: 0, idle: 0 });
-  assert.deepEqual(tallies["/w/repo/nested"], { working: 1, waiting: 0, idle: 0 });
-  assert.deepEqual(tallies["/w/repo"], { working: 0, waiting: 0, idle: 1 });
+  assert.deepEqual(tallies["/w/repo-two"], { working: 1, waiting: 0, idle: 0, agents: ["claude"] });
+  assert.deepEqual(tallies["/w/repo/nested"], { working: 1, waiting: 0, idle: 0, agents: ["claude"] });
+  assert.deepEqual(tallies["/w/repo"], { working: 0, waiting: 0, idle: 1, agents: ["claude"] });
 });
 
 test("tallyByWorktree attributes a session sitting exactly at the worktree root", () => {
   const tallies = tallyByWorktree([session("/w/repo", "working")], ["/w/repo/"]);
-  assert.deepEqual(tallies["/w/repo/"], { working: 1, waiting: 0, idle: 0 });
+  assert.deepEqual(tallies["/w/repo/"], { working: 1, waiting: 0, idle: 0, agents: ["claude"] });
 });
 
 test("sessionGlyphs renders non-empty buckets, most urgent first", () => {
@@ -220,4 +222,63 @@ test("sameModelFamilies compares maps by value", () => {
   assert.ok(sameModelFamilies(a, { "/w/repo": new Set<Family>(["o", "s"]) }));
   assert.ok(!sameModelFamilies(a, { "/w/repo": new Set<Family>(["s"]) }));
   assert.ok(!sameModelFamilies(a, {}));
+});
+
+test("sessionAgent reads the tag, treating absent or unknown as claude (#1908)", () => {
+  assert.equal(sessionAgent({}), "claude");
+  assert.equal(sessionAgent({ agent: "claude" }), "claude");
+  assert.equal(sessionAgent({ agent: "pi" }), "pi");
+  assert.equal(sessionAgent({ agent: "codex" }), "codex");
+  assert.equal(sessionAgent({ agent: "future-agent" }), "claude");
+});
+
+test("tallyByWorktree records each worktree's agents in a fixed order (#1908)", () => {
+  const tallies = tallyByWorktree(
+    [
+      session("/w/repo", "working", undefined, "pi"),
+      session("/w/repo/src", "idle", undefined, "codex"),
+      session("/w/repo", "waiting_for_input"),
+      session("/w/repo-two", "idle", undefined, "codex"),
+    ],
+    PATHS,
+  );
+  assert.deepEqual(tallies["/w/repo"]?.agents, ["claude", "codex", "pi"]);
+  assert.deepEqual(tallies["/w/repo-two"]?.agents, ["codex"]);
+});
+
+test("sessionTooltipLine is prefixed by the tally's agents (#1908)", () => {
+  assert.equal(
+    sessionTooltipLine({ working: 1, waiting: 0, idle: 0, agents: ["codex"] }),
+    "Codex: 1 working",
+  );
+  assert.equal(
+    sessionTooltipLine({ working: 1, waiting: 1, idle: 0, agents: ["claude", "pi"] }),
+    "Claude, pi: 1 waiting on you, 1 working",
+  );
+  // An empty agent list (never produced by a tally) still reads as Claude.
+  assert.equal(sessionTooltipLine({ working: 1, waiting: 0, idle: 0, agents: [] }), "Claude: 1 working");
+});
+
+test("a tally's agents round-trip through the resourceUri query (#1908)", () => {
+  const tally: SessionTally = { working: 0, waiting: 1, idle: 2, agents: ["claude", "codex"] };
+  assert.equal(encodeSessionTally(tally), "0-1-2-claude.codex");
+  assert.deepEqual(decodeSessionTally("0-1-2-claude.codex"), tally);
+  // A pre-#1908 URI still decodes, with no agents (so the tooltip says Claude).
+  assert.deepEqual(decodeSessionTally("0-1-2"), { working: 0, waiting: 1, idle: 2 });
+  assert.equal(sessionDecoration(decodeSessionTally("0-1-2"))?.tooltip, "Claude: 1 waiting on you, 2 idle");
+  assert.equal(sessionDecoration(decodeSessionTally("1-0-0-codex"))?.tooltip, "Codex: 1 working");
+  // An unknown agent name decodes to nothing rather than garbage.
+  assert.deepEqual(decodeSessionTally("1-0-0-zeta")?.agents, []);
+});
+
+test("sameTallies sees a change of agents as a change (#1908)", () => {
+  const a = { "/w": { working: 1, waiting: 0, idle: 0, agents: ["claude" as const] } };
+  assert.ok(sameTallies(a, { "/w": { working: 1, waiting: 0, idle: 0, agents: ["claude"] } }));
+  assert.ok(!sameTallies(a, { "/w": { working: 1, waiting: 0, idle: 0, agents: ["codex"] } }));
+});
+
+test("classifyModel puts Codex's gpt-* ids in the g family (#1908)", () => {
+  assert.equal(classifyModel("gpt-5.5"), "g");
+  assert.equal(classifyModel("GPT-5-codex"), "g");
+  assert.equal(formatModelMarker(new Set<Family>(["*", "g", "s"])), "[sg*]");
 });

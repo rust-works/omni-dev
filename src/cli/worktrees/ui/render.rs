@@ -246,7 +246,7 @@ fn color_for_tag(tag: &str) -> Color {
     }
 }
 
-/// Summarizes a worktree's live Claude sessions as `"N session(s) (model,
+/// Summarizes a worktree's live agent sessions as `"N session(s) (agent model,
 /// source)"` off the most recently active one — a compact stand-in for the
 /// full per-session badge layer a later phase adds (issue #1585 §2's
 /// `[s o *]` model-family marker and `!`/`⚙`/`◦` state glyphs).
@@ -259,7 +259,11 @@ fn sessions_summary(sessions: &[SessionBadge]) -> String {
         SessionSourceRow::VsCode { .. } => "vscode",
     };
     let model = latest.model.as_deref().unwrap_or("?");
-    format!("{} session(s) ({model}, {source})", sessions.len())
+    format!(
+        "{} session(s) ({} {model}, {source})",
+        sessions.len(),
+        latest.agent
+    )
 }
 
 /// Draws the one-line status bar: feed states, mark count, and `hint` —
@@ -615,6 +619,7 @@ mod tests {
             state,
             source: SessionSourceRow::Terminal,
             model: None,
+            agent: "Claude".to_string(),
             last_seen: chrono::Utc::now(),
         };
         // The most demanding state on the row wins: one waiting session
@@ -632,6 +637,31 @@ mod tests {
         // An ended session is not a cue at all.
         wt.sessions = vec![session(SessionState::Ended)];
         assert_eq!(session_glyph(&wt, GlyphMode::Unicode), " ");
+    }
+
+    #[test]
+    fn the_sessions_summary_names_the_latest_sessions_agent() {
+        let now = chrono::Utc::now();
+        let badge = |agent: &str, model: Option<&str>, age: i64| SessionBadge {
+            session_id: "s".to_string(),
+            state: SessionState::Working,
+            source: SessionSourceRow::Terminal,
+            model: model.map(str::to_string),
+            agent: agent.to_string(),
+            last_seen: now - chrono::Duration::seconds(age),
+        };
+        assert_eq!(
+            sessions_summary(&[
+                badge("Claude", Some("claude-opus-4-8"), 30),
+                badge("Codex", Some("gpt-5.5"), 1),
+            ]),
+            "2 session(s) (Codex gpt-5.5, terminal)"
+        );
+        assert_eq!(
+            sessions_summary(&[badge("pi", None, 0)]),
+            "1 session(s) (pi ?, terminal)"
+        );
+        assert_eq!(sessions_summary(&[]), "");
     }
 
     #[test]
