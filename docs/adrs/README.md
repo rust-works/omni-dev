@@ -110,4 +110,4 @@ by Michael Nygard.
 | [ADR-0084](adr-0084-dimension-groups.md)                | ✅ Accepted                              | 2026-09-21 | Dimension Groups (Row/Column Outlining) via `spreadsheets.batchUpdate`                      |
 | [ADR-0085](adr-0085.md)                                 | ✅ Accepted                              | 2026-09-21 | Sheet View Properties via `updateSheetProperties`                                           |
 | [ADR-0086](adr-0086-workbook-properties.md)             | ✅ Accepted                              | 2026-09-22 | Workbook Properties via `updateSpreadsheetProperties`                                       |
-| [ADR-0087](adr-0087.md)                                 | 🟡 Proposed                              | 2026-09-22 | Provider-Qualified Sessions with Codex as a Second Hook Feed                                |
+| [ADR-0087](adr-0087.md)                                 | 🟡 Proposed                              | 2026-09-22 | Codex as a Second Hook Feed of the Agent-Tagged Sessions Service                            |
