@@ -7492,10 +7492,10 @@ Sessions: track Claude Code sessions running across all terminals and windows
 Usage: sessions <COMMAND>
 
 Commands:
-  list               List the Claude Code and pi.dev sessions currently running across all windows
-  hook               Claude Code hook sink: read a hook event on stdin and report it to the daemon (run by Claude Code, not by hand)
-  install-hooks      Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json`, plus the pi.dev extension when pi is installed (idempotent)
-  uninstall-hooks    Remove the sessions-tracker hooks from `~/.claude/settings.json` and the pi.dev extension
+  list               List the Claude Code, Codex and pi.dev sessions currently running across all windows
+  hook               Claude Code / Codex hook sink: read a hook event on stdin and report it to the daemon (run by the agent, not by hand)
+  install-hooks      Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json`, plus the pi.dev extension when pi is installed and the Codex hooks when Codex is (idempotent)
+  uninstall-hooks    Remove the sessions-tracker hooks from `~/.claude/settings.json`, the pi.dev extension, and the Codex hooks
   install-wrapper    Install the `claude-wrap` shim and point VS Code's Claude extension at it (idempotent)
   uninstall-wrapper  Remove the `claude-wrap` shim and VS Code's wrapper setting
   window             Report a window's Claude tab/terminal counts (companion feed op)
@@ -7508,28 +7508,30 @@ Options:
 
 ================================================================================
 
-omni-dev sessions hook - Claude Code hook sink: read a hook event on stdin and report it to the daemon (run by Claude Code, not by hand)
+omni-dev sessions hook - Claude Code / Codex hook sink: read a hook event on stdin and report it to the daemon (run by the agent, not by hand)
 
-Claude Code hook sink: read a hook event on stdin and report it to the daemon (run by Claude Code, not by hand)
+Claude Code / Codex hook sink: read a hook event on stdin and report it to the daemon (run by the agent, not by hand)
 
 Usage: hook [OPTIONS]
 
 Options:
       --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
-  -h, --help           Print help
+      --agent <AGENT>  Which agent runs this hook. The payloads share field names, so the agent cannot be inferred from them; it selects the event mapping and tags the session [default: claude] [possible values: claude, codex]
+  -h, --help           Print help (see more with '--help')
 
 
 ================================================================================
 
-omni-dev sessions install-hooks - Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json`, plus the pi.dev extension when pi is installed (idempotent)
+omni-dev sessions install-hooks - Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json`, plus the pi.dev extension when pi is installed and the Codex hooks when Codex is (idempotent)
 
-Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json`, plus the pi.dev extension when pi is installed (idempotent)
+Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json`, plus the pi.dev extension when pi is installed and the Codex hooks when Codex is (idempotent)
 
 Usage: install-hooks [OPTIONS]
 
 Options:
       --settings <PATH>      Path to the Claude settings file. Defaults to `~/.claude/settings.json` (respecting `$CLAUDE_CONFIG_DIR`)
       --pi-agent-dir <PATH>  pi.dev's agent directory. Defaults to `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`. Passing it installs the pi extension even when pi is not detected
+      --codex-home <PATH>    Codex's home directory, holding `hooks.json`. Defaults to `$CODEX_HOME`, else `~/.codex`. Passing it installs the Codex hooks even when Codex is not detected
   -h, --help                 Print help
 
 
@@ -7549,9 +7551,9 @@ Options:
 
 ================================================================================
 
-omni-dev sessions list - List the Claude Code and pi.dev sessions currently running across all windows
+omni-dev sessions list - List the Claude Code, Codex and pi.dev sessions currently running across all windows
 
-List the Claude Code and pi.dev sessions currently running across all windows
+List the Claude Code, Codex and pi.dev sessions currently running across all windows
 
 Usage: list [OPTIONS]
 
@@ -7563,15 +7565,16 @@ Options:
 
 ================================================================================
 
-omni-dev sessions uninstall-hooks - Remove the sessions-tracker hooks from `~/.claude/settings.json` and the pi.dev extension
+omni-dev sessions uninstall-hooks - Remove the sessions-tracker hooks from `~/.claude/settings.json`, the pi.dev extension, and the Codex hooks
 
-Remove the sessions-tracker hooks from `~/.claude/settings.json` and the pi.dev extension
+Remove the sessions-tracker hooks from `~/.claude/settings.json`, the pi.dev extension, and the Codex hooks
 
 Usage: uninstall-hooks [OPTIONS]
 
 Options:
       --settings <PATH>      Path to the Claude settings file. Defaults to `~/.claude/settings.json` (respecting `$CLAUDE_CONFIG_DIR`)
       --pi-agent-dir <PATH>  pi.dev's agent directory. Defaults to `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`
+      --codex-home <PATH>    Codex's home directory, holding `hooks.json`. Defaults to `$CODEX_HOME`, else `~/.codex`
   -h, --help                 Print help
 
 

@@ -1,6 +1,6 @@
 # Codex Sessions Feed
 
-**Status:** Aspirational — investigation complete (#1861), revised 2026-09-24 to build on the `agent` tag #1901 added; implementation not started, tracked in #1907–#1910 (listed at the end)
+**Status:** In progress — investigation complete (#1861), revised 2026-09-24 to build on the `agent` tag #1901 added; the hook feed shipped in #1907, the rest is tracked in #1908–#1910 (listed at the end)
 **ADRs:** [ADR-0052](../adrs/adr-0052.md) · [ADR-0057](../adrs/adr-0057.md) · [ADR-0087](../adrs/adr-0087.md)
 
 ## Overview
@@ -11,7 +11,7 @@ now ships lifecycle hooks with a payload shaped like Claude Code's, and #1861 as
 whether they can feed the same service. This document is the answer: a tested
 event/state matrix per Codex surface, the accuracy limits each surface carries, the
 sink and wire-contract changes needed, and the follow-up issues. The decisions
-themselves are in [ADR-0087](../adrs/adr-0087.md) (Proposed).
+themselves are in [ADR-0087](../adrs/adr-0087.md) (Accepted).
 
 The headline finding is that **Codex sessions are already reaching the daemon**:
 wiring `omni-dev sessions hook` into `~/.codex/hooks.json` works today because the

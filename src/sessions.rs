@@ -34,6 +34,10 @@
 //! Feed 5 is pi.dev's: a generated extension in `~/.pi/agent/extensions/` maps
 //! pi's lifecycle events to a state and reports it the same way, tagged
 //! [`Agent::Pi`] (#1901).
+//!
+//! Codex is a second hook feed: `omni-dev sessions hook --agent codex`, run from
+//! `$CODEX_HOME/hooks.json`, maps Codex's events onto the same [`SessionEvent`]s
+//! and tags its sessions [`Agent::Codex`] (#1907, ADR-0087).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -262,12 +266,18 @@ pub enum Source {
 
 /// Which coding agent a session belongs to.
 ///
-/// The registry is keyed by `session_id` alone: Claude Code's ids are UUID v4
-/// and pi.dev's are UUID v7, and the differing version nibble makes the two id
-/// spaces disjoint, so they cannot collide. The tag lets a consumer tell the two
-/// apart. Serialized `snake_case`; absent on the wire means [`Claude`](Self::Claude),
-/// so the Claude feeds (hooks, watcher, `claude-wrap`) send it by omission and stay
+/// The registry is keyed by `session_id` alone. Claude Code's ids are UUID v4,
+/// while pi.dev's and Codex's are both UUID v7, so the version nibble no longer
+/// separates every pair (#1907): single-key identity instead rests on v7's 74
+/// random bits, which make a pi/Codex collision improbable — not impossible, and
+/// not worth a re-key (ADR-0087). The tag lets a consumer tell the agents apart.
+/// Serialized `snake_case`; absent on the wire means [`Claude`](Self::Claude), so
+/// the Claude feeds (hooks, watcher, `claude-wrap`) send it by omission and stay
 /// byte-identical to senders that predate it (#1901).
+///
+/// A daemon built with an older variant set rejects an unknown value
+/// (`unknown variant`), so a newer sink's `observe` is dropped until the daemon
+/// is upgraded — the sinks are fail-open, so that is silent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Agent {
@@ -277,6 +287,9 @@ pub enum Agent {
     /// pi.dev's coding agent, reported by the extension `sessions install-hooks`
     /// writes into `~/.pi/agent/extensions/`.
     Pi,
+    /// OpenAI Codex (CLI, VS Code extension and Desktop), reported by
+    /// `sessions hook --agent codex` from `$CODEX_HOME/hooks.json` (#1907).
+    Codex,
 }
 
 impl Agent {
@@ -1237,6 +1250,20 @@ mod tests {
             pi.event,
             SessionEvent::StreamState(SessionState::WaitingForInput)
         );
+    }
+
+    #[test]
+    fn codex_is_a_tagged_agent_on_the_wire() {
+        let codex: ObserveRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "019a0000-0000-7000-8000-000000000001",
+            "agent": "codex",
+            "event": { "notification": "permission_prompt" },
+        }))
+        .unwrap();
+        assert_eq!(codex.agent, Agent::Codex);
+        assert!(!codex.agent.is_claude());
+        let json = serde_json::to_value(&codex).unwrap();
+        assert_eq!(json["agent"], "codex");
     }
 
     #[test]
