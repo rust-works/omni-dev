@@ -7492,10 +7492,10 @@ Sessions: track Claude Code sessions running across all terminals and windows
 Usage: sessions <COMMAND>
 
 Commands:
-  list               List the Claude Code sessions currently running across all windows
+  list               List the Claude Code and pi.dev sessions currently running across all windows
   hook               Claude Code hook sink: read a hook event on stdin and report it to the daemon (run by Claude Code, not by hand)
-  install-hooks      Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json` (idempotent)
-  uninstall-hooks    Remove the sessions-tracker hooks from `~/.claude/settings.json`
+  install-hooks      Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json`, plus the pi.dev extension when pi is installed (idempotent)
+  uninstall-hooks    Remove the sessions-tracker hooks from `~/.claude/settings.json` and the pi.dev extension
   install-wrapper    Install the `claude-wrap` shim and point VS Code's Claude extension at it (idempotent)
   uninstall-wrapper  Remove the `claude-wrap` shim and VS Code's wrapper setting
   window             Report a window's Claude tab/terminal counts (companion feed op)
@@ -7521,15 +7521,16 @@ Options:
 
 ================================================================================
 
-omni-dev sessions install-hooks - Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json` (idempotent)
+omni-dev sessions install-hooks - Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json`, plus the pi.dev extension when pi is installed (idempotent)
 
-Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json` (idempotent)
+Install the Claude Code hooks that feed the sessions tracker into `~/.claude/settings.json`, plus the pi.dev extension when pi is installed (idempotent)
 
 Usage: install-hooks [OPTIONS]
 
 Options:
-      --settings <PATH>  Path to the Claude settings file. Defaults to `~/.claude/settings.json` (respecting `$CLAUDE_CONFIG_DIR`)
-  -h, --help             Print help
+      --settings <PATH>      Path to the Claude settings file. Defaults to `~/.claude/settings.json` (respecting `$CLAUDE_CONFIG_DIR`)
+      --pi-agent-dir <PATH>  pi.dev's agent directory. Defaults to `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`. Passing it installs the pi extension even when pi is not detected
+  -h, --help                 Print help
 
 
 ================================================================================
@@ -7548,9 +7549,9 @@ Options:
 
 ================================================================================
 
-omni-dev sessions list - List the Claude Code sessions currently running across all windows
+omni-dev sessions list - List the Claude Code and pi.dev sessions currently running across all windows
 
-List the Claude Code sessions currently running across all windows
+List the Claude Code and pi.dev sessions currently running across all windows
 
 Usage: list [OPTIONS]
 
@@ -7562,15 +7563,16 @@ Options:
 
 ================================================================================
 
-omni-dev sessions uninstall-hooks - Remove the sessions-tracker hooks from `~/.claude/settings.json`
+omni-dev sessions uninstall-hooks - Remove the sessions-tracker hooks from `~/.claude/settings.json` and the pi.dev extension
 
-Remove the sessions-tracker hooks from `~/.claude/settings.json`
+Remove the sessions-tracker hooks from `~/.claude/settings.json` and the pi.dev extension
 
 Usage: uninstall-hooks [OPTIONS]
 
 Options:
-      --settings <PATH>  Path to the Claude settings file. Defaults to `~/.claude/settings.json` (respecting `$CLAUDE_CONFIG_DIR`)
-  -h, --help             Print help
+      --settings <PATH>      Path to the Claude settings file. Defaults to `~/.claude/settings.json` (respecting `$CLAUDE_CONFIG_DIR`)
+      --pi-agent-dir <PATH>  pi.dev's agent directory. Defaults to `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`
+  -h, --help                 Print help
 
 
 ================================================================================

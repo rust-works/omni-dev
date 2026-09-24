@@ -30,6 +30,10 @@
 //! `omni-dev claude-wrap`: it reads the exact state out of Claude's stream-json
 //! stdio and reports it as [`SessionEvent::StreamState`], which
 //! [`SessionState::for_event`] applies verbatim. See ADR-0057.
+//!
+//! Feed 5 is pi.dev's: a generated extension in `~/.pi/agent/extensions/` maps
+//! pi's lifecycle events to a state and reports it the same way, tagged
+//! [`Agent::Pi`] (#1901).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -256,6 +260,33 @@ pub enum Source {
     },
 }
 
+/// Which coding agent a session belongs to.
+///
+/// The registry is keyed by `session_id` alone: Claude Code's ids are UUID v4
+/// and pi.dev's are UUID v7, and the differing version nibble makes the two id
+/// spaces disjoint, so they cannot collide. The tag lets a consumer tell the two
+/// apart. Serialized `snake_case`; absent on the wire means [`Claude`](Self::Claude),
+/// so the Claude feeds (hooks, watcher, `claude-wrap`) send it by omission and stay
+/// byte-identical to senders that predate it (#1901).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Agent {
+    /// Claude Code — every feed but the pi extension.
+    #[default]
+    Claude,
+    /// pi.dev's coding agent, reported by the extension `sessions install-hooks`
+    /// writes into `~/.pi/agent/extensions/`.
+    Pi,
+}
+
+impl Agent {
+    /// Whether this is the default agent, so [`ObserveRequest`] can omit it.
+    #[must_use]
+    pub fn is_claude(&self) -> bool {
+        *self == Self::Claude
+    }
+}
+
 /// An idempotent session sighting sent to the registry — the wire payload of the
 /// `observe` op, and the argument to [`SessionsRegistry::observe`].
 ///
@@ -283,6 +314,9 @@ pub struct ObserveRequest {
     /// The model id, when a hook reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Which agent the session belongs to; omitted for Claude Code.
+    #[serde(default, skip_serializing_if = "Agent::is_claude")]
+    pub agent: Agent,
 }
 
 /// A companion report of one VS Code window's embedded Claude sessions.
@@ -337,6 +371,9 @@ pub struct SessionEntry {
     /// The model id, when reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Which agent the session belongs to. Set by the first sighting and never
+    /// changed, since a session id belongs to exactly one agent.
+    pub agent: Agent,
     /// The current inferred state.
     pub state: SessionState,
     /// Where the session runs, resolved on read.
@@ -492,6 +529,7 @@ impl SessionsRegistry {
                         transcript_path: req.transcript_path,
                         repo: req.repo,
                         model: req.model,
+                        agent: req.agent,
                         state,
                         source: Source::Terminal,
                         last_event: req.event,
@@ -764,6 +802,7 @@ mod tests {
 
     fn observe_request(session_id: &str, event: SessionEvent, cwd: Option<&str>) -> ObserveRequest {
         ObserveRequest {
+            agent: Agent::Claude,
             session_id: session_id.to_string(),
             cwd: cwd.map(PathBuf::from),
             transcript_path: None,
@@ -1067,6 +1106,7 @@ mod tests {
             sessions.insert(
                 id.to_string(),
                 SessionEntry {
+                    agent: Agent::Claude,
                     session_id: id.to_string(),
                     cwd: None,
                     transcript_path: None,
@@ -1091,6 +1131,7 @@ mod tests {
         let reg = SessionsRegistry::new();
         for (id, repo) in [("z", "repo-a"), ("a", "repo-b"), ("m", "repo-a")] {
             reg.observe(ObserveRequest {
+                agent: Agent::Claude,
                 session_id: id.to_string(),
                 cwd: None,
                 transcript_path: None,
@@ -1120,6 +1161,7 @@ mod tests {
         // tagged source, and omitted `None` fields.
         let reg = SessionsRegistry::new();
         reg.observe(ObserveRequest {
+            agent: Agent::Claude,
             session_id: "s1".to_string(),
             cwd: Some(PathBuf::from("/p")),
             transcript_path: None,
@@ -1173,6 +1215,55 @@ mod tests {
     }
 
     #[test]
+    fn agent_is_omitted_for_claude_and_tagged_for_pi_on_the_wire() {
+        // Claude senders stay byte-identical: no `agent` key.
+        let claude = serde_json::to_value(observe_request("s", SessionEvent::Stop, None)).unwrap();
+        assert!(claude.get("agent").is_none(), "{claude}");
+        // An absent `agent` reads back as Claude.
+        let parsed: ObserveRequest =
+            serde_json::from_value(serde_json::json!({ "session_id": "s", "event": "stop" }))
+                .unwrap();
+        assert_eq!(parsed.agent, Agent::Claude);
+        // The exact payload the pi extension sends.
+        let pi: ObserveRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "019a0000-0000-7000-8000-000000000000",
+            "cwd": "/work/repo",
+            "agent": "pi",
+            "event": { "stream_state": "waiting_for_input" },
+        }))
+        .unwrap();
+        assert_eq!(pi.agent, Agent::Pi);
+        assert_eq!(
+            pi.event,
+            SessionEvent::StreamState(SessionState::WaitingForInput)
+        );
+    }
+
+    #[test]
+    fn a_pi_session_is_listed_with_its_agent_and_reported_state() {
+        let reg = SessionsRegistry::new();
+        let mut req = observe_request(
+            "pi-1",
+            SessionEvent::StreamState(SessionState::Working),
+            Some("/work/repo"),
+        );
+        req.agent = Agent::Pi;
+        reg.observe(req);
+        // A later sighting without the tag cannot re-label the session.
+        reg.observe(observe_request(
+            "pi-1",
+            SessionEvent::StreamState(SessionState::Idle),
+            None,
+        ));
+        let listed = reg.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].agent, Agent::Pi);
+        assert_eq!(listed[0].state, SessionState::Idle);
+        let json = serde_json::to_value(&listed[0]).unwrap();
+        assert_eq!(json["agent"], "pi");
+    }
+
+    #[test]
     fn fill_only_overwrites_with_a_present_value() {
         // `None` leaves the slot; `Some` overwrites it — the re-`observe`
         // never-clobber contract.
@@ -1200,6 +1291,7 @@ mod tests {
                 sessions.insert(
                     id.clone(),
                     SessionEntry {
+                        agent: Agent::Claude,
                         session_id: id.clone(),
                         cwd: None,
                         transcript_path: None,

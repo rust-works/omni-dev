@@ -69,6 +69,7 @@ impl Sighting {
     /// `model` are unknown to the watcher and left for the hook feed to fill.
     fn into_observe(self) -> ObserveRequest {
         ObserveRequest {
+            agent: crate::sessions::Agent::Claude,
             session_id: self.session_id,
             cwd: None,
             transcript_path: Some(self.transcript_path),

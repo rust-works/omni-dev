@@ -1,10 +1,10 @@
 # Sessions service
 
 Track, for the logged-in user and across **every** terminal and VS Code window,
-the Claude Code sessions running right now and each one's coarse live state
-(working, idle, or waiting on you). It is the omni-dev daemon's **fourth
-service** (after the browser bridge, Snowflake, and worktrees), fed by four
-independent sources that each degrade gracefully.
+the Claude Code and [pi.dev](https://pi.dev) sessions running right now and each
+one's coarse live state (working, idle, or waiting on you). It is the omni-dev
+daemon's **fourth service** (after the browser bridge, Snowflake, and worktrees),
+fed by five independent sources that each degrade gracefully.
 
 This guide is the operator-facing contract. The design rationale is
 [ADR-0052](adrs/adr-0052.md) — plus [ADR-0057](adrs/adr-0057.md) for the stream
@@ -26,8 +26,10 @@ No single vantage point sees all your sessions:
 - A **stream wrapper** sees one Claude process exactly, and only the ones it was
   configured to launch.
 
+- A **pi extension** runs inside one `pi` process and knows only that session.
+
 A single resident process — the daemon — is the rendezvous point that aggregates
-all four into one consistent view served back to the CLI, the tray, and the
+all five into one consistent view served back to the CLI, the tray, and the
 extension.
 
 ## Architecture
@@ -45,10 +47,14 @@ extension.
   │   (editors/vscode, extended: reports its window's Claude        │
   │    tab/terminal counts so the daemon can tag a session's source)│
   │                                                                 │
-  └─ Feed 4: stream wrapper ────────────────────────────────────────┘
-      omni-dev claude-wrap, launched by the Claude VS Code extension
-      in place of `claude`; tees its stream-json stdio and reports the
-      *exact* state (authoritative, unlike Feeds 1–3)
+  ├─ Feed 4: stream wrapper ────────────────────────────────────────┤
+  │   omni-dev claude-wrap, launched by the Claude VS Code extension │
+  │   in place of `claude`; tees its stream-json stdio and reports the│
+  │   *exact* state (authoritative, unlike Feeds 1–3)               │
+  │                                                                 │
+  └─ Feed 5: pi.dev extension ──────────────────────────────────────┘
+      ~/.pi/agent/extensions/omni-dev-sessions.ts, loaded by every
+      `pi`; maps pi's lifecycle events to the *exact* state (#1901)
 
               daemon ──► `omni-dev sessions list` / tray submenu
                      ──► the companion's Worktrees tree cues
@@ -94,7 +100,9 @@ Each live session is:
 
 ```
 session_id       the Claude UUID — also the transcript filename stem and the
-                 VS Code extension's per-tab key, so the feeds join on it
+                 VS Code extension's per-tab key, so the feeds join on it.
+                 pi's ids are UUID v7 and Claude's v4, so they cannot collide
+agent            claude | pi
 cwd, repo        working directory (from a hook) and its git repo name (git2)
 transcript_path  the ~/.claude/projects/**/<id>.jsonl path
 state            starting | working | idle | waiting_for_input |
@@ -286,6 +294,66 @@ first. It updates live again if the model changes mid-session (`/model`). Set
 title unchanged, if it ever misrenders in a given terminal or font. See the
 [ADR-0057](adrs/adr-0057.md) amendment for how this stays fail-open.
 
+### The pi.dev extension (Feed 5)
+
+[pi](https://pi.dev) has no hook-command block like Claude Code's
+`settings.json`. Its extension point is a TypeScript module, auto-discovered from
+`~/.pi/agent/extensions/` (or `$PI_CODING_AGENT_DIR/extensions/`) and loaded into
+every `pi` process. `install-hooks` writes one there:
+
+```bash
+# Also writes ~/.pi/agent/extensions/omni-dev-sessions.ts, but only when pi is
+# installed: its agent dir exists, or a `pi` executable is on PATH.
+omni-dev sessions install-hooks
+
+# Also removes that file (whether or not pi is still installed).
+omni-dev sessions uninstall-hooks
+
+# A non-default pi agent directory; passing it installs even if pi is not detected.
+omni-dev sessions install-hooks --pi-agent-dir /path/to/agent
+```
+
+When pi is not detected, `install-hooks` says so and creates nothing under
+`~/.pi`. The file carries a generated-by header. Install replaces only a file that
+has that header, and refuses to overwrite a same-named one that lacks it.
+Uninstall likewise removes only a file with the header. Other extensions in the
+directory are never touched. The daemon socket path is baked into the file at
+install time, just as the Claude hooks bake in the absolute binary path. Re-run
+`install-hooks` if the socket moves. New `pi` sessions pick up the extension when
+they start.
+
+pi's events are first-class lifecycle events rather than side effects, so the
+extension reports the **exact** state, as `{ "stream_state": … }` (the Feed 4
+form), rather than having the daemon infer it:
+
+| pi event | Reported |
+|---|---|
+| `session_start` | `starting` |
+| `before_agent_start`, `agent_start`, `turn_start`, `tool_execution_start` | `working` |
+| `agent_settled` | `idle` (pi documents it as the event for status integrations) |
+| `ui_prompt_start` | `waiting_for_input` |
+| `ui_prompt_end` | `working` if an agent run is in flight, else `idle` |
+| `session_shutdown` | the `end` op, with pi's `reason` (`quit`, `new`, `resume`, `fork`, `reload`) |
+
+**No `waiting_for_permission`.** pi has no per-tool approval prompt, because its
+approval model is project trust. The only blocking prompts are extension dialogs
+(`ctx.ui.confirm`/`select`/…), and those carry nothing that separates a permission
+question from any other. So every one reads as `waiting_for_input`.
+
+`/new`, `/resume` and `/fork` end the old session and start a new one, so they
+show up as an `end` followed by a fresh `starting`.
+
+The extension talks to the socket directly from pi's own Node process. It does not
+spawn a sink per event, because `tool_execution_start` fires on every tool call.
+It sends only on a state change. Reports go out one at a time, in order, and each
+connection is bounded to 2s. At most 32 can be queued. It is **fail-open**: no
+handler awaits the daemon and every error is swallowed, so a missing daemon costs
+one refused connect and never delays a turn. On `session_shutdown` it waits at
+most 1.5s for the `end` to leave. Like the wrapper, it re-reports its state every
+30s, so an idle pi session does not age out on the 5-minute TTL. It sends **only**
+state, `session_id`, `cwd`, the session-file path and the model id, never a
+prompt, a message or a tool argument.
+
 ## Tray
 
 The macOS menu bar gains a **"Claude Sessions"** submenu: one line per session
@@ -326,6 +394,10 @@ a window/cwd is unambiguous, but several in the same cwd cannot be told apart.
   local user.
 - Hooks are **opt-in** user config; `sessions hook` writes nothing except the
   fire-and-forget socket POST.
+- The pi extension is **opt-in** (written only by `install-hooks`, and only when
+  pi is installed). It runs with pi's own permissions, as every pi extension
+  does, and sends only state and identifiers, over the same fire-and-forget socket
+  POST.
 - The stream wrapper is **opt-in** too, and is the one component that *sees* your
   conversation as it streams. It extracts only the state, `session_id`, `cwd` and
   model, and logs and persists nothing — a design constraint, not a convention
@@ -374,14 +446,16 @@ The hook `observe`/`end` ops (for reference; the sink builds these, not you):
 
 | Op | Payload | Reply |
 |---|---|---|
-| `observe` | `{ session_id, cwd?, transcript_path?, event, model? }` | `{ ok: true }` |
+| `observe` | `{ session_id, cwd?, transcript_path?, event, model?, agent? }` | `{ ok: true }` |
 | `end` | `{ session_id, reason? }` | `{ ended: bool }` |
 
 where `event` is one of `session_start`, `user_prompt_submit`, `pre_tool_use`,
 `post_tool_use`, `stop`, `{ "notification": "permission_prompt" \| "idle_prompt" \|
 "agent_needs_input" \| "other" }`, `transcript_grew`, `transcript_discovered`, or
 `{ "stream_state": "<state>" }` — the authoritative Feed 4 form, applied verbatim
-rather than inferred.
+rather than inferred. `agent` is `claude` (the default, omitted by every Claude
+feed) or `pi`. It is fixed by a session's first sighting, and `list` always
+includes it.
 
 ## Scope and follow-ups
 
@@ -398,6 +472,14 @@ rather than inferred.
   riskier proposition.
 - **Only new tabs are wrapped.** Coverage is prospective — sessions already
   running when the setting is applied keep the inferred feeds until they restart.
+- **pi sessions are always `terminal`.** Tagging one `vscode` would need the
+  companion to count pi terminals, but the pi.dev launcher renames those tabs to
+  the session's `/name` (#1899), so a name match is unreliable and needs its own
+  design. pi rows still get their worktree cues, since those are tallied by `cwd`.
+- **No pi transcript watcher or RPC wrapper.** A Feed 2 analogue over
+  `~/.pi/agent/sessions/` and a Feed 4 analogue over `pi --mode rpc` would each
+  cover pi processes that do not load global extensions, but the extension
+  already reports exact state for the ones that do.
 - **Windows** support waits on the broader daemon Windows work (#1363); the hook
   sink and transcript scheme are already portable, only the socket transport is
   Unix-only.
