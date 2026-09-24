@@ -1,14 +1,16 @@
 # Sessions service
 
 Track, for the logged-in user and across **every** terminal and VS Code window,
-the Claude Code and [pi.dev](https://pi.dev) sessions running right now and each
-one's coarse live state (working, idle, or waiting on you). It is the omni-dev
-daemon's **fourth service** (after the browser bridge, Snowflake, and worktrees),
-fed by five independent sources that each degrade gracefully.
+the Claude Code, [Codex](https://developers.openai.com/codex) and
+[pi.dev](https://pi.dev) sessions running right now and each one's coarse live
+state (working, idle, or waiting on you). It is the omni-dev daemon's **fourth
+service** (after the browser bridge, Snowflake, and worktrees), fed by six
+independent sources that each degrade gracefully.
 
 This guide is the operator-facing contract. The design rationale is
 [ADR-0052](adrs/adr-0052.md) — plus [ADR-0057](adrs/adr-0057.md) for the stream
-wrapper (Feed 4); the daemon framework is [ADR-0039](adrs/adr-0039.md) and the
+wrapper (Feed 4) and [ADR-0087](adrs/adr-0087.md) for the Codex hooks (Feed 6);
+the daemon framework is [ADR-0039](adrs/adr-0039.md) and the
 rendezvous pattern it reuses is [ADR-0040](adrs/adr-0040.md).
 
 > **Distinct from history search (#876).** That searches your *past*
@@ -27,9 +29,11 @@ No single vantage point sees all your sessions:
   configured to launch.
 
 - A **pi extension** runs inside one `pi` process and knows only that session.
+- A **Codex hook** runs inside one Codex process (CLI, VS Code extension or
+  Desktop) and knows only that session.
 
 A single resident process — the daemon — is the rendezvous point that aggregates
-all five into one consistent view served back to the CLI, the tray, and the
+all six into one consistent view served back to the CLI, the tray, and the
 extension.
 
 ## Architecture
@@ -52,9 +56,13 @@ extension.
   │   in place of `claude`; tees its stream-json stdio and reports the│
   │   *exact* state (authoritative, unlike Feeds 1–3)               │
   │                                                                 │
-  └─ Feed 5: pi.dev extension ──────────────────────────────────────┘
-      ~/.pi/agent/extensions/omni-dev-sessions.ts, loaded by every
-      `pi`; maps pi's lifecycle events to the *exact* state (#1901)
+  ├─ Feed 5: pi.dev extension ──────────────────────────────────────┤
+  │   ~/.pi/agent/extensions/omni-dev-sessions.ts, loaded by every   │
+  │   `pi`; maps pi's lifecycle events to the *exact* state (#1901)  │
+  │                                                                 │
+  └─ Feed 6: Codex hooks ──────►  omni-dev sessions hook --agent codex
+      $CODEX_HOME/hooks.json; the Feed 1 sink with Codex's event
+      mapping, tagging sessions `codex` (#1907)
 
               daemon ──► `omni-dev sessions list` / tray submenu
                      ──► the companion's Worktrees tree cues
@@ -101,8 +109,9 @@ Each live session is:
 ```
 session_id       the Claude UUID — also the transcript filename stem and the
                  VS Code extension's per-tab key, so the feeds join on it.
-                 pi's ids are UUID v7 and Claude's v4, so they cannot collide
-agent            claude | pi
+                 Claude's ids are UUID v4; pi's and Codex's are UUID v7, whose
+                 74 random bits make a collision improbable
+agent            claude | pi | codex
 cwd, repo        working directory (from a hook) and its git repo name (git2)
 transcript_path  the ~/.claude/projects/**/<id>.jsonl path
 state            starting | working | idle | waiting_for_input |
@@ -363,6 +372,94 @@ most 1.5s for the `end` to leave. Like the wrapper, it re-reports its state ever
 state, `session_id`, `cwd`, the session-file path and the model id, never a
 prompt, a message or a tool argument.
 
+### Codex hooks (Feed 6)
+
+[Codex](https://developers.openai.com/codex) — the CLI, its VS Code extension,
+and Codex Desktop — runs lifecycle hooks from `$CODEX_HOME/hooks.json` (default
+`~/.codex/hooks.json`), in the same `{ "hooks": { "<Event>": [ … ] } }` shape as
+Claude Code's settings and with a payload that uses Claude Code's field names. So
+the Feed 1 sink serves it too, with `--agent codex` selecting Codex's event
+mapping and tagging the session `codex`. The investigation behind it is
+[docs/plan/codex-sessions-feed.md](plan/codex-sessions-feed.md).
+
+```bash
+# Also installs into ~/.codex/hooks.json, but only when Codex is installed: its
+# home directory exists, or a `codex` executable is on PATH. Honors $CODEX_HOME.
+omni-dev sessions install-hooks
+
+# Also removes our Codex hooks (whether or not Codex is still installed).
+omni-dev sessions uninstall-hooks
+
+# A non-default Codex home; passing it installs even if Codex is not detected.
+omni-dev sessions install-hooks --codex-home /path/to/.codex
+```
+
+**Trust it once.** Codex **silently skips** a hook it has not been told to trust,
+so after `install-hooks` open the Codex CLI, run `/hooks` and trust the omni-dev
+entries. Trust lives in `~/.codex/config.toml`, so one approval covers the VS Code
+extension and Desktop too. It is keyed by each hook's *position and content*, so
+you must trust the entries again whenever the installed command changes (a moved
+`omni-dev` binary, say). Both commands print this reminder.
+
+The installed command is `<absolute omni-dev path> sessions hook --agent codex`
+on these events:
+
+| Codex event | Reported | Notes |
+|---|---|---|
+| `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` | the same-named event | `PreToolUse`/`PostToolUse` use the `*` matcher |
+| `PermissionRequest` | `{ "notification": "permission_prompt" }` → `waiting_for_permission` | Codex's dedicated approval event |
+| `PreToolUse` of `request_user_input` | `{ "notification": "agent_needs_input" }` → `waiting_for_input` | the clarifying-question UI is a tool call |
+| `Interrupt` | `stop` → `idle` | Esc/Ctrl-C mid-turn, or a declined approval in the TUI; `timeout: 3` |
+| `SubagentStart`, `SubagentStop`, `PreCompact`, `PostCompact` | `post_tool_use` → `working` | a heartbeat; subagents report the parent's `session_id` |
+| `SessionEnd` | the `end` op, with Codex's `reason` | `timeout: 3` (Codex caps it at 3 s) |
+
+**Position-stable install and uninstall.** Because Codex trusts a hook by its
+`<event>:<group>:<hook>` index, removing a group would shift every later group in
+that event down one index and silently untrust it. So for `hooks.json`:
+
+- install only **appends** new groups, and rewrites any other
+  `omni-dev sessions hook` entry (any path to an `omni-dev` binary, any
+  arguments) to the current tagged command **where it sits**. That covers an
+  untagged entry you added by hand — left beside the tagged one it would race it
+  to be the session's first sighting, which fixes the agent tag, and could label a
+  Codex session `claude` for good — and a tagged one left behind by an upgrade
+  that moved the binary. Extra arguments such as `--socket` are not kept;
+- uninstall removes every such entry and, where that empties a
+  group that other groups follow, leaves an inert `{ "hooks": [] }` placeholder in
+  its place rather than dropping it. Trailing empty groups, and then an empty
+  event, are dropped, since nothing can shift into them. Placeholders accumulate
+  across install/uninstall cycles; you can delete them by hand and re-trust what
+  follows.
+
+One case is not position-stable: if you put the sink in the same group as another
+hook, ahead of it, removing it shifts that hook's index within the group. A hook
+list has no placeholder form, so uninstall says when this happened and asks you to
+trust that hook again.
+
+**Accuracy limits.** Hooks remain an inference feed for Codex:
+
+- Approving a prompt fires no event of its own; the next `PostToolUse` is the
+  first sign. A declined prompt ends the turn (`Interrupt` in the TUI, `Stop` in
+  VS Code), which reads `idle` either way.
+- Automatic review ("Approve for me", `--approve-for-me`) fires
+  `PermissionRequest` exactly like a human prompt and resolves it seconds later,
+  so a brief false `waiting_for_permission` is unavoidable. `codex exec` under its
+  default `approval: never` never fires it.
+- SIGHUP (closing a terminal tab), SIGTERM and SIGKILL fire no `SessionEnd`, and
+  Codex's documented 30-minute idle end did not fire in testing, so such a session
+  ages out on the 5-minute TTL.
+- In the TUI, `request_user_input` needs Codex's still-under-development
+  `default_mode_request_user_input` feature; Desktop offers it by default.
+- A Desktop chat started from the app lives under `~/Documents/Codex/…`, which no
+  VS Code window has open, so its `source` is `terminal`.
+
+**Version skew.** A daemon from before the `agent` tag (#1901) ignores it and
+lists Codex sessions as Claude's. A daemon with only `claude | pi` rejects
+`"codex"` (`unknown variant`), and because the sink is fail-open that rejection is
+silent: Codex sessions simply do not appear until you `omni-dev daemon restart`
+onto the upgraded binary. `omni-dev daemon status` warns when the CLI and the
+resident daemon versions differ.
+
 ## Tray
 
 The macOS menu bar gains a **"Claude Sessions"** submenu: one line per session
@@ -402,7 +499,8 @@ a window/cwd is unambiguous, but several in the same cwd cannot be told apart.
   write it can inject fake sessions — but both already require being the owning
   local user.
 - Hooks are **opt-in** user config; `sessions hook` writes nothing except the
-  fire-and-forget socket POST.
+  fire-and-forget socket POST. That holds for the Codex hooks too, which also
+  need Codex's own `/hooks` trust before they run.
 - The pi extension is **opt-in** (written only by `install-hooks`, and only when
   pi is installed). It runs with pi's own permissions, as every pi extension
   does, and sends only state and identifiers, over the same fire-and-forget socket
@@ -463,8 +561,8 @@ where `event` is one of `session_start`, `user_prompt_submit`, `pre_tool_use`,
 "agent_needs_input" \| "other" }`, `transcript_grew`, `transcript_discovered`, or
 `{ "stream_state": "<state>" }` — the authoritative Feed 4 form, applied verbatim
 rather than inferred. `agent` is `claude` (the default, omitted by every Claude
-feed) or `pi`. It is fixed by a session's first sighting, and `list` always
-includes it.
+feed), `pi` or `codex`. It is fixed by a session's first sighting, and `list`
+always includes it.
 
 ## Scope and follow-ups
 

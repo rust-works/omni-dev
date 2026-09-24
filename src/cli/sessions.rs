@@ -1,10 +1,11 @@
-//! `omni-dev sessions` — track the Claude Code and pi.dev sessions running across every
-//! terminal and VS Code window, via the daemon's `sessions` service.
+//! `omni-dev sessions` — track the Claude Code, Codex and pi.dev sessions running
+//! across every terminal and VS Code window, via the daemon's `sessions` service.
 //!
 //! The subcommands split by role:
 //! - `list` is a **read** client (like `omni-dev worktrees list`): it asks the
 //!   daemon's `sessions` service for the live set and renders it.
-//! - `hook` is the **feed sink**: Claude Code runs it per hook event; it reads
+//! - `hook` is the **feed sink**: Claude Code (or Codex, with `--agent codex`)
+//!   runs it per hook event; it reads
 //!   the hook JSON on stdin, maps it to an `observe`/`end` op, and fire-and-forgets
 //!   it to the daemon socket. It must **never** block or fail a Claude turn — a
 //!   missing daemon, a bad payload, or any other error is swallowed and it always
@@ -12,7 +13,10 @@
 //! - `install-hooks` / `uninstall-hooks` idempotently merge (or remove) the hook
 //!   block in `~/.claude/settings.json`, preserving any hooks already there. When
 //!   pi.dev is installed they also write (or remove) the generated pi extension
-//!   in `~/.pi/agent/extensions/`, which reports straight to the socket (#1901).
+//!   in `~/.pi/agent/extensions/`, which reports straight to the socket (#1901),
+//!   and when Codex is installed the same hook block, tagged `--agent codex`, in
+//!   `$CODEX_HOME/hooks.json` — position-stably, since Codex trusts a hook by
+//!   its index (#1907).
 //! - `install-wrapper` / `uninstall-wrapper` are the same idea for Feed 4: they
 //!   write the shim that VS Code's Claude extension launches
 //!   [`omni-dev claude-wrap`](crate::cli::claude_wrap) through, and point the
@@ -27,7 +31,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -36,7 +40,7 @@ use crate::daemon::client::DaemonClient;
 use crate::daemon::paths;
 use crate::daemon::protocol::{DaemonEnvelope, DaemonReply};
 use crate::daemon::server;
-use crate::sessions::{NotificationKind, ObserveRequest, SessionEvent};
+use crate::sessions::{Agent, NotificationKind, ObserveRequest, SessionEvent};
 
 /// The `sessions` service routing key on the daemon control socket.
 const SERVICE: &str = "sessions";
@@ -57,18 +61,18 @@ pub struct SessionsCommand {
 /// Sessions subcommands.
 #[derive(Subcommand)]
 pub enum SessionsSubcommands {
-    /// List the Claude Code and pi.dev sessions currently running across all
-    /// windows.
+    /// List the Claude Code, Codex and pi.dev sessions currently running across
+    /// all windows.
     List(ListCommand),
-    /// Claude Code hook sink: read a hook event on stdin and report it to the
-    /// daemon (run by Claude Code, not by hand).
+    /// Claude Code / Codex hook sink: read a hook event on stdin and report it to
+    /// the daemon (run by the agent, not by hand).
     Hook(HookCommand),
     /// Install the Claude Code hooks that feed the sessions tracker into
     /// `~/.claude/settings.json`, plus the pi.dev extension when pi is installed
-    /// (idempotent).
+    /// and the Codex hooks when Codex is (idempotent).
     InstallHooks(InstallHooksCommand),
-    /// Remove the sessions-tracker hooks from `~/.claude/settings.json` and the
-    /// pi.dev extension.
+    /// Remove the sessions-tracker hooks from `~/.claude/settings.json`, the
+    /// pi.dev extension, and the Codex hooks.
     UninstallHooks(UninstallHooksCommand),
     /// Install the `claude-wrap` shim and point VS Code's Claude extension at it
     /// (idempotent).
@@ -193,13 +197,39 @@ impl WindowUnregisterCommand {
 
 // --- hook --------------------------------------------------------------------
 
-/// The Claude Code hook sink: reads one hook event's JSON on stdin and reports it
-/// to the daemon. Fire-and-forget and infallible-by-design.
+/// The Claude Code / Codex hook sink: reads one hook event's JSON on stdin and
+/// reports it to the daemon. Fire-and-forget and infallible-by-design.
 #[derive(Parser)]
 pub struct HookCommand {
     /// Control-socket path. Defaults to the per-user runtime location.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
+
+    /// Which agent runs this hook. The payloads share field names, so the agent
+    /// cannot be inferred from them; it selects the event mapping and tags the
+    /// session.
+    #[arg(long, value_enum, default_value_t = HookAgent::Claude)]
+    pub agent: HookAgent,
+}
+
+/// The agents whose hooks run [`HookCommand`]. pi.dev reports through its own
+/// extension, so it has no hook variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HookAgent {
+    /// Claude Code (`~/.claude/settings.json`).
+    Claude,
+    /// OpenAI Codex (`$CODEX_HOME/hooks.json`).
+    Codex,
+}
+
+impl HookAgent {
+    /// The registry tag sessions reported by this agent's hooks carry.
+    fn agent(self) -> Agent {
+        match self {
+            Self::Claude => Agent::Claude,
+            Self::Codex => Agent::Codex,
+        }
+    }
 }
 
 impl HookCommand {
@@ -221,7 +251,7 @@ impl HookCommand {
         let Ok(hook) = serde_json::from_str::<HookPayload>(input) else {
             return;
         };
-        let Some((op, payload)) = hook.to_op() else {
+        let Some((op, payload)) = hook.to_op(self.agent) else {
             return;
         };
         let Ok(socket) = server::resolve_socket(self.socket.clone()) else {
@@ -251,6 +281,13 @@ struct HookPayload {
     /// [`NotificationKind`].
     #[serde(default)]
     message: Option<String>,
+    /// Present on `SessionEnd` — why the session ended.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Present on tool events. Codex's clarifying-question UI is the
+    /// `request_user_input` tool, so its `PreToolUse` is a wait for input.
+    #[serde(default)]
+    tool_name: Option<String>,
     /// Best-effort model id, when a payload carries one.
     #[serde(default)]
     model: Option<String>,
@@ -259,19 +296,22 @@ struct HookPayload {
 impl HookPayload {
     /// Maps this hook payload to a `(op, payload)` for the daemon, or `None` when
     /// it carries no `session_id` or names an event the tracker ignores.
-    fn to_op(&self) -> Option<(&'static str, Value)> {
+    fn to_op(&self, agent: HookAgent) -> Option<(&'static str, Value)> {
         let session_id = self.session_id.clone().filter(|s| !s.trim().is_empty())?;
         let event_name = self.hook_event_name.as_deref()?;
         if event_name == "SessionEnd" {
             let mut payload = json!({ "session_id": session_id });
-            if let Some(reason) = &self.message {
+            if let Some(reason) = self.reason.as_ref().or(self.message.as_ref()) {
                 payload["reason"] = Value::String(reason.clone());
             }
             return Some(("end", payload));
         }
-        let event = session_event_for(event_name, self.message.as_deref())?;
+        let event = match agent {
+            HookAgent::Claude => session_event_for(event_name, self.message.as_deref())?,
+            HookAgent::Codex => codex_session_event_for(event_name, self.tool_name.as_deref())?,
+        };
         let request = ObserveRequest {
-            agent: crate::sessions::Agent::Claude,
+            agent: agent.agent(),
             session_id,
             cwd: self.cwd.clone(),
             transcript_path: self.transcript_path.clone(),
@@ -294,6 +334,39 @@ fn session_event_for(event_name: &str, message: Option<&str>) -> Option<SessionE
         "PostToolUse" => SessionEvent::PostToolUse,
         "Stop" => SessionEvent::Stop,
         "Notification" => SessionEvent::Notification(classify_notification(message)),
+        _ => return None,
+    })
+}
+
+/// Maps a Codex hook event name to the [`SessionEvent`] it implies, or `None` for
+/// an event the tracker does not act on (ADR-0087). Codex's payload uses Claude
+/// Code's field names, but adds events Claude lacks, and all of them land on the
+/// **existing** events so the engine's state machine is unchanged:
+///
+/// - `PermissionRequest` is Codex's dedicated "waiting on an approval" event, so
+///   it is the reliable permission signal (its resolution is inferred from the
+///   next `PostToolUse`, or from the turn ending);
+/// - `PreToolUse` of the `request_user_input` tool is the clarifying-question UI,
+///   a wait for input until its `PostToolUse`;
+/// - `Interrupt` (Esc / Ctrl-C mid-turn, or a declined approval in the TUI) ends
+///   the turn without a `Stop`, so it is one;
+/// - the compaction and subagent events carry the parent session's id and mean
+///   only that the session is busy — a working-state heartbeat.
+///
+/// `SessionEnd` is handled by the caller, as for Claude.
+fn codex_session_event_for(event_name: &str, tool_name: Option<&str>) -> Option<SessionEvent> {
+    Some(match event_name {
+        "SessionStart" => SessionEvent::SessionStart,
+        "UserPromptSubmit" => SessionEvent::UserPromptSubmit,
+        "PreToolUse" if tool_name == Some("request_user_input") => {
+            SessionEvent::Notification(NotificationKind::AgentNeedsInput)
+        }
+        "PreToolUse" => SessionEvent::PreToolUse,
+        "PostToolUse" | "SubagentStart" | "SubagentStop" | "PreCompact" | "PostCompact" => {
+            SessionEvent::PostToolUse
+        }
+        "PermissionRequest" => SessionEvent::Notification(NotificationKind::PermissionPrompt),
+        "Stop" | "Interrupt" => SessionEvent::Stop,
         _ => return None,
     })
 }
@@ -322,7 +395,7 @@ fn classify_notification(message: Option<&str>) -> NotificationKind {
 // --- install-hooks / uninstall-hooks ----------------------------------------
 
 /// Installs the sessions-tracker hooks into `~/.claude/settings.json`, plus the
-/// pi.dev extension when pi is installed.
+/// pi.dev extension when pi is installed and the Codex hooks when Codex is.
 #[derive(Parser)]
 pub struct InstallHooksCommand {
     /// Path to the Claude settings file. Defaults to `~/.claude/settings.json`
@@ -335,16 +408,23 @@ pub struct InstallHooksCommand {
     /// detected.
     #[arg(long, value_name = "PATH")]
     pub pi_agent_dir: Option<PathBuf>,
+
+    /// Codex's home directory, holding `hooks.json`. Defaults to `$CODEX_HOME`,
+    /// else `~/.codex`. Passing it installs the Codex hooks even when Codex is
+    /// not detected.
+    #[arg(long, value_name = "PATH")]
+    pub codex_home: Option<PathBuf>,
 }
 
 impl InstallHooksCommand {
     /// Executes the install: merges the hook block idempotently, preserving any
-    /// hooks already present, then writes the pi extension if pi is present.
+    /// hooks already present, then writes the pi extension if pi is present and
+    /// the Codex hooks if Codex is.
     pub fn execute(self) -> Result<()> {
         let path = settings_path(self.settings)?;
         let mut settings = read_settings(&path)?;
         let command = hook_command();
-        let added = merge_hooks(&mut settings, &command);
+        let added = merge_hooks(&mut settings, &command, HOOK_EVENTS);
         write_settings(&path, &settings)?;
         if added == 0 {
             println!(
@@ -357,12 +437,13 @@ impl InstallHooksCommand {
                 path.display()
             );
         }
-        install_pi_extension(self.pi_agent_dir)
+        install_pi_extension(self.pi_agent_dir)?;
+        install_codex_hooks(self.codex_home)
     }
 }
 
-/// Removes the sessions-tracker hooks from `~/.claude/settings.json` and the
-/// pi.dev extension.
+/// Removes the sessions-tracker hooks from `~/.claude/settings.json`, the pi.dev
+/// extension, and the Codex hooks.
 #[derive(Parser)]
 pub struct UninstallHooksCommand {
     /// Path to the Claude settings file. Defaults to `~/.claude/settings.json`
@@ -374,11 +455,17 @@ pub struct UninstallHooksCommand {
     /// `~/.pi/agent`.
     #[arg(long, value_name = "PATH")]
     pub pi_agent_dir: Option<PathBuf>,
+
+    /// Codex's home directory, holding `hooks.json`. Defaults to `$CODEX_HOME`,
+    /// else `~/.codex`.
+    #[arg(long, value_name = "PATH")]
+    pub codex_home: Option<PathBuf>,
 }
 
 impl UninstallHooksCommand {
     /// Executes the uninstall: removes any hook entries whose command is ours,
-    /// leaving every other hook untouched, then removes our pi extension.
+    /// leaving every other hook untouched, then removes our pi extension and
+    /// Codex hooks.
     pub fn execute(self) -> Result<()> {
         let path = settings_path(self.settings)?;
         if path.exists() {
@@ -392,7 +479,8 @@ impl UninstallHooksCommand {
         } else {
             println!("no settings file at {} (nothing to remove)", path.display());
         }
-        uninstall_pi_extension(self.pi_agent_dir)
+        uninstall_pi_extension(self.pi_agent_dir)?;
+        uninstall_codex_hooks(self.codex_home)
     }
 }
 
@@ -726,18 +814,72 @@ fn manual_setup_hint(error: &anyhow::Error, shim: &str) -> anyhow::Error {
     )
 }
 
-/// The Claude Code hook events the tracker installs, paired with whether the
-/// event's hook group needs a tool `matcher` (`PreToolUse`/`PostToolUse` match on
-/// tool name; the rest have no matcher). `SessionEnd` is included — it maps to
-/// the `end` op in the sink.
-const HOOK_EVENTS: &[(&str, bool)] = &[
-    ("SessionStart", false),
-    ("UserPromptSubmit", false),
-    ("PreToolUse", true),
-    ("PostToolUse", true),
-    ("Notification", false),
-    ("Stop", false),
-    ("SessionEnd", false),
+/// One hook event the tracker installs.
+#[derive(Debug, Clone, Copy)]
+struct HookSpec {
+    /// The event name, as the settings file keys it.
+    event: &'static str,
+    /// Whether the event's group needs a tool `matcher` (`PreToolUse` /
+    /// `PostToolUse` match on tool name; the rest have none).
+    matcher: bool,
+    /// A per-hook `timeout` in seconds, where the agent caps the event below
+    /// its default.
+    timeout: Option<u64>,
+}
+
+impl HookSpec {
+    const fn new(event: &'static str) -> Self {
+        Self {
+            event,
+            matcher: false,
+            timeout: None,
+        }
+    }
+
+    const fn matched(event: &'static str) -> Self {
+        Self {
+            matcher: true,
+            ..Self::new(event)
+        }
+    }
+
+    const fn capped(event: &'static str, secs: u64) -> Self {
+        Self {
+            timeout: Some(secs),
+            ..Self::new(event)
+        }
+    }
+}
+
+/// The Claude Code hook events the tracker installs. `SessionEnd` is included —
+/// it maps to the `end` op in the sink.
+const HOOK_EVENTS: &[HookSpec] = &[
+    HookSpec::new("SessionStart"),
+    HookSpec::new("UserPromptSubmit"),
+    HookSpec::matched("PreToolUse"),
+    HookSpec::matched("PostToolUse"),
+    HookSpec::new("Notification"),
+    HookSpec::new("Stop"),
+    HookSpec::new("SessionEnd"),
+];
+
+/// The Codex hook events the tracker installs into `$CODEX_HOME/hooks.json`:
+/// Claude's set minus `Notification` (Codex has none), plus Codex's
+/// `PermissionRequest` and `Interrupt` and the compaction and subagent events
+/// (ADR-0087). Codex caps `SessionEnd` and `Interrupt` hooks at 3 s.
+const CODEX_HOOK_EVENTS: &[HookSpec] = &[
+    HookSpec::new("SessionStart"),
+    HookSpec::new("UserPromptSubmit"),
+    HookSpec::matched("PreToolUse"),
+    HookSpec::matched("PostToolUse"),
+    HookSpec::new("PermissionRequest"),
+    HookSpec::new("Stop"),
+    HookSpec::capped("Interrupt", 3),
+    HookSpec::capped("SessionEnd", 3),
+    HookSpec::new("PreCompact"),
+    HookSpec::new("PostCompact"),
+    HookSpec::new("SubagentStart"),
+    HookSpec::new("SubagentStop"),
 ];
 
 /// The hook command string written into settings.json: the absolute path of the
@@ -805,11 +947,11 @@ fn write_settings(path: &Path, settings: &Value) -> Result<()> {
 }
 
 /// Merges the sessions-tracker hook `command` into a settings object under each
-/// event in [`HOOK_EVENTS`], returning how many events were newly added.
-/// Idempotent (an event that already has a group running `command` is skipped)
-/// and additive (it never touches other hooks). Creates `hooks` and any per-event
-/// array as needed.
-fn merge_hooks(settings: &mut Value, command: &str) -> usize {
+/// event in `specs`, returning how many events were newly added. Idempotent (an
+/// event that already has a group running `command` is skipped) and additive (it
+/// never touches other hooks, and appending moves no existing group). Creates
+/// `hooks` and any per-event array as needed.
+fn merge_hooks(settings: &mut Value, command: &str, specs: &[HookSpec]) -> usize {
     // `read_settings` guarantees an object, but degrade gracefully rather than
     // panic if a caller passes something else.
     let Some(root) = settings.as_object_mut() else {
@@ -825,9 +967,9 @@ fn merge_hooks(settings: &mut Value, command: &str) -> usize {
         return 0;
     };
     let mut added = 0;
-    for (event, needs_matcher) in HOOK_EVENTS {
+    for spec in specs {
         let groups = hooks
-            .entry((*event).to_string())
+            .entry(spec.event.to_string())
             .or_insert_with(|| json!([]));
         let Some(groups) = groups.as_array_mut() else {
             continue;
@@ -835,7 +977,7 @@ fn merge_hooks(settings: &mut Value, command: &str) -> usize {
         if groups.iter().any(|g| group_has_command(g, command)) {
             continue; // already installed for this event
         }
-        groups.push(hook_group(command, *needs_matcher));
+        groups.push(hook_group(command, spec));
         added += 1;
     }
     added
@@ -883,15 +1025,23 @@ fn remove_hooks(settings: &mut Value, command: &str) -> usize {
 
 /// One hook group as written into an event array: `{ "hooks": [{ "type":
 /// "command", "command": … }] }`, with a `"matcher": "*"` when the event matches
-/// on tool name.
-fn hook_group(command: &str, needs_matcher: bool) -> Value {
-    let mut group = json!({
-        "hooks": [{ "type": "command", "command": command }],
-    });
-    if needs_matcher {
+/// on tool name and a `timeout` where the spec caps one.
+fn hook_group(command: &str, spec: &HookSpec) -> Value {
+    let mut group = json!({ "hooks": [hook_entry(command, spec)] });
+    if spec.matcher {
         group["matcher"] = Value::String("*".to_string());
     }
     group
+}
+
+/// One hook entry: `{ "type": "command", "command": … }`, plus a `timeout`
+/// where the spec caps one.
+fn hook_entry(command: &str, spec: &HookSpec) -> Value {
+    let mut hook = json!({ "type": "command", "command": command });
+    if let Some(secs) = spec.timeout {
+        hook["timeout"] = json!(secs);
+    }
+    hook
 }
 
 /// Whether a hook `group` already contains a hook running `command`.
@@ -905,6 +1055,251 @@ fn group_has_command(group: &Value, command: &str) -> bool {
 /// Whether a single hook entry runs `command`.
 fn hook_has_command(hook: &Value, command: &str) -> bool {
     hook.get("command").and_then(Value::as_str) == Some(command)
+}
+
+// --- Codex hooks.json ----------------------------------------------------------
+
+/// The one-time trust step every Codex install needs. Codex skips an untrusted
+/// hook without any message, and trusts a hook by its position *and* content, so
+/// a changed command string needs trusting again.
+const CODEX_TRUST_STEP: &str =
+    "Codex skips untrusted hooks silently: open the Codex CLI, run `/hooks`, \
+and trust the omni-dev entries (once, and again after the command changes). \
+One approval covers the VS Code extension and Codex Desktop.";
+
+/// The Codex hook command: [`hook_command`] tagged `--agent codex`.
+fn codex_hook_command() -> String {
+    format!("{} --agent codex", hook_command())
+}
+
+/// Codex's home directory: `$CODEX_HOME`, else `~/.codex`.
+fn default_codex_home() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("CODEX_HOME").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    let home = dirs::home_dir().context("could not resolve the home directory")?;
+    Ok(home.join(".codex"))
+}
+
+/// Whether Codex is installed: its home directory exists (Codex has run), or a
+/// `codex` executable is on `path`.
+fn codex_is_present(codex_home: &Path, path: Option<&std::ffi::OsStr>) -> bool {
+    codex_home.is_dir()
+        || path.is_some_and(|path| {
+            std::env::split_paths(path).any(|dir| is_executable(&dir.join("codex")))
+        })
+}
+
+/// Whether `command` runs the `omni-dev sessions hook` sink, from any path to an
+/// `omni-dev` binary and with any arguments. In Codex's `hooks.json` every such
+/// entry other than the current [`codex_hook_command`] is stale: an untagged or
+/// `--agent claude` one (a user who wired Codex by hand) reports Codex sessions
+/// as Claude's, and a tagged one from another path is left by an upgrade that
+/// moved the binary.
+fn is_sessions_sink(command: &str) -> bool {
+    let command = command.trim();
+    let Some(at) = command.find(" sessions hook") else {
+        return false;
+    };
+    let rest = &command[at + " sessions hook".len()..];
+    (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        && Path::new(command[..at].trim())
+            .file_name()
+            .is_some_and(|name| name == "omni-dev")
+}
+
+/// Rewrites every stale sink entry (see [`is_sessions_sink`]) in `settings` to
+/// `command` **where it sits**, returning how many it rewrote. Left beside the
+/// tagged entry, an untagged one would race it to be a session's first sighting
+/// and could fix the session's tag as `claude` for good; replacing it in place
+/// moves no other hook, so nothing else loses its Codex trust (ADR-0087). The
+/// replaced entry takes the spec's `timeout` for its event. Extra arguments on
+/// the old entry (a `--socket`, say) are not carried over: the canonical command
+/// is what makes a second install recognise it.
+fn replace_stale_sinks(settings: &mut Value, command: &str, specs: &[HookSpec]) -> usize {
+    let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return 0;
+    };
+    let mut replaced = 0;
+    for (event, groups) in hooks.iter_mut() {
+        let spec = specs.iter().find(|s| s.event == event);
+        let Some(groups) = groups.as_array_mut() else {
+            continue;
+        };
+        for hook in groups
+            .iter_mut()
+            .filter_map(|g| g.get_mut("hooks").and_then(Value::as_array_mut))
+            .flatten()
+        {
+            let stale = hook
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|c| c != command && is_sessions_sink(c));
+            if !stale {
+                continue;
+            }
+            hook["command"] = Value::String(command.to_string());
+            if let Some(secs) = spec.and_then(|s| s.timeout) {
+                hook["timeout"] = json!(secs);
+            }
+            replaced += 1;
+        }
+    }
+    replaced
+}
+
+/// What [`remove_hooks_stable`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Removal {
+    /// How many hook entries were removed.
+    removed: usize,
+    /// Whether a surviving hook moved to a lower index **within its group** — the
+    /// one shift a group placeholder cannot prevent, since a hook list has no
+    /// empty-entry form. That hook needs trusting again.
+    shifted: bool,
+}
+
+/// Removes every hook entry `is_ours` matches, **without shifting any surviving
+/// group** — the position-stable counterpart of [`remove_hooks`] for Codex, which
+/// trusts a hook by its `<event>:<group>:<hook>` index. A group this empties keeps
+/// its slot as an inert `{ "hooks": [] }` placeholder unless no group follows it,
+/// so a later group never moves into its index and silently loses its trust;
+/// trailing empty groups (and then an empty event) are dropped, since nothing
+/// can shift into them.
+fn remove_hooks_stable(settings: &mut Value, is_ours: impl Fn(&str) -> bool) -> Removal {
+    let mut outcome = Removal::default();
+    let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return outcome;
+    };
+    let mut empty_events = Vec::new();
+    for (event, groups) in hooks.iter_mut() {
+        let Some(groups) = groups.as_array_mut() else {
+            continue;
+        };
+        for group in groups.iter_mut() {
+            let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let mut removed_before = false;
+            inner.retain(|h| {
+                let ours = h
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(&is_ours);
+                if ours {
+                    removed_before = true;
+                    outcome.removed += 1;
+                } else if removed_before {
+                    outcome.shifted = true;
+                }
+                !ours
+            });
+            if removed_before && inner.is_empty() {
+                *group = json!({ "hooks": [] });
+            }
+        }
+        while groups.last().is_some_and(is_empty_group) {
+            groups.pop();
+        }
+        if groups.is_empty() {
+            empty_events.push(event.clone());
+        }
+    }
+    for event in empty_events {
+        hooks.remove(&event);
+    }
+    outcome
+}
+
+/// Whether `group` is a group with an empty `hooks` list.
+fn is_empty_group(group: &Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+}
+
+/// The Codex half of `install-hooks`. Without `--codex-home` it installs only
+/// when Codex is present, so a machine without Codex gets nothing under
+/// `~/.codex`.
+fn install_codex_hooks(explicit: Option<PathBuf>) -> Result<()> {
+    let codex_home = if let Some(dir) = explicit {
+        dir
+    } else {
+        let dir = default_codex_home()?;
+        if !codex_is_present(&dir, std::env::var_os("PATH").as_deref()) {
+            println!(
+                "Codex not found (no {} and no `codex` on PATH); skipped its hooks",
+                dir.display()
+            );
+            return Ok(());
+        }
+        dir
+    };
+    let path = codex_home.join("hooks.json");
+    let mut hooks = read_settings(&path)?;
+    let command = codex_hook_command();
+    let replaced = replace_stale_sinks(&mut hooks, &command, CODEX_HOOK_EVENTS);
+    let added = merge_hooks(&mut hooks, &command, CODEX_HOOK_EVENTS);
+    if replaced == 0 && added == 0 {
+        println!(
+            "Codex sessions hooks already installed in {} (no change)",
+            path.display()
+        );
+        return Ok(());
+    }
+    write_settings(&path, &hooks)?;
+    if replaced > 0 {
+        println!(
+            "rewrote {replaced} existing `sessions hook` entry(ies) in {} in place",
+            path.display()
+        );
+    }
+    if added > 0 {
+        println!(
+            "installed {added} Codex sessions hook event(s) into {}",
+            path.display()
+        );
+    }
+    println!("command: {command}\n{CODEX_TRUST_STEP}");
+    Ok(())
+}
+
+/// The Codex half of `uninstall-hooks`. Runs whether or not Codex is present, so
+/// an uninstalled Codex does not strand the entries. Removes every sink entry,
+/// tagged or not and from any path (install would have rewritten it),
+/// position-stably.
+fn uninstall_codex_hooks(explicit: Option<PathBuf>) -> Result<()> {
+    let codex_home = match explicit {
+        Some(dir) => dir,
+        None => default_codex_home()?,
+    };
+    let path = codex_home.join("hooks.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut hooks = read_settings(&path)?;
+    // The exact current command too, in case this binary is not named `omni-dev`.
+    let current = codex_hook_command();
+    let Removal { removed, shifted } =
+        remove_hooks_stable(&mut hooks, |c| c == current || is_sessions_sink(c));
+    if removed == 0 {
+        return Ok(());
+    }
+    write_settings(&path, &hooks)?;
+    println!(
+        "removed {removed} Codex sessions hook entry(ies) from {}",
+        path.display()
+    );
+    if shifted {
+        println!(
+            "a hook that shared a group with ours moved up within it, so Codex no \
+             longer trusts it: run `/hooks` in the Codex CLI to trust it again"
+        );
+    } else {
+        println!("no other Codex hook moved, so their `/hooks` trust stands");
+    }
+    Ok(())
 }
 
 // --- shared socket + rendering ----------------------------------------------
@@ -973,11 +1368,13 @@ fn state_display(state: &str) -> String {
     }
 }
 
-/// The agent label for a session: `pi` for pi.dev, else `claude` (a daemon that
-/// predates the `agent` field only ever reports Claude Code sessions).
+/// The agent label for a session: `pi` for pi.dev, `codex` for Codex, else
+/// `claude` (a daemon that predates the `agent` field only ever reports Claude
+/// Code sessions).
 fn agent_label(session: &Value) -> &'static str {
     match session.get("agent").and_then(Value::as_str) {
         Some("pi") => "pi",
+        Some("codex") => "codex",
         _ => "claude",
     }
 }
@@ -1059,7 +1456,7 @@ mod tests {
     fn hook_op(json_str: &str) -> Option<(&'static str, Value)> {
         serde_json::from_str::<HookPayload>(json_str)
             .unwrap()
-            .to_op()
+            .to_op(HookAgent::Claude)
     }
 
     #[test]
@@ -1133,6 +1530,403 @@ mod tests {
         assert!(hook_op("{}").is_none());
     }
 
+    fn codex_op(json_str: &str) -> Option<(&'static str, Value)> {
+        serde_json::from_str::<HookPayload>(json_str)
+            .unwrap()
+            .to_op(HookAgent::Codex)
+    }
+
+    fn codex_event(event: &str, tool: Option<&str>) -> Value {
+        let mut hook = json!({ "session_id": "c1", "hook_event_name": event });
+        if let Some(tool) = tool {
+            hook["tool_name"] = json!(tool);
+        }
+        codex_op(&hook.to_string()).unwrap().1["event"].clone()
+    }
+
+    #[test]
+    fn codex_hooks_are_tagged_from_the_first_event() {
+        let (op, payload) = codex_op(
+            r#"{"session_id":"c1","cwd":"/p","model":"gpt-5.5","hook_event_name":"SessionStart","source":"startup"}"#,
+        )
+        .unwrap();
+        assert_eq!(op, "observe");
+        assert_eq!(payload["agent"], "codex");
+        assert_eq!(payload["model"], "gpt-5.5");
+        assert_eq!(payload["event"], "session_start");
+        // The Claude sink stays untagged on the wire.
+        let claude = hook_op(r#"{"session_id":"s1","hook_event_name":"Stop"}"#).unwrap();
+        assert!(claude.1.get("agent").is_none());
+    }
+
+    #[test]
+    fn codex_events_map_onto_the_existing_session_events() {
+        assert_eq!(codex_event("UserPromptSubmit", None), "user_prompt_submit");
+        assert_eq!(codex_event("PreToolUse", Some("Bash")), "pre_tool_use");
+        assert_eq!(codex_event("PostToolUse", Some("Bash")), "post_tool_use");
+        assert_eq!(codex_event("Stop", None), "stop");
+        assert_eq!(
+            codex_event("PermissionRequest", Some("Bash"))["notification"],
+            "permission_prompt"
+        );
+        assert_eq!(
+            codex_event("PreToolUse", Some("request_user_input"))["notification"],
+            "agent_needs_input"
+        );
+        // Its resolution is an ordinary PostToolUse.
+        assert_eq!(
+            codex_event("PostToolUse", Some("request_user_input")),
+            "post_tool_use"
+        );
+        assert_eq!(codex_event("Interrupt", None), "stop");
+        for heartbeat in ["SubagentStart", "SubagentStop", "PreCompact", "PostCompact"] {
+            assert_eq!(codex_event(heartbeat, None), "post_tool_use", "{heartbeat}");
+        }
+        // Codex has no Notification event; an unknown one is ignored.
+        assert!(codex_op(r#"{"session_id":"c1","hook_event_name":"Notification"}"#).is_none());
+    }
+
+    #[test]
+    fn codex_session_end_is_the_end_op_with_its_reason() {
+        let (op, payload) =
+            codex_op(r#"{"session_id":"c1","hook_event_name":"SessionEnd","reason":"other"}"#)
+                .unwrap();
+        assert_eq!(op, "end");
+        assert_eq!(payload["reason"], "other");
+    }
+
+    #[test]
+    fn the_claude_sink_ignores_codex_only_events() {
+        // The untagged sink keeps its Claude mapping, which predates Codex.
+        assert!(hook_op(r#"{"session_id":"s1","hook_event_name":"PermissionRequest"}"#).is_none());
+        assert!(hook_op(r#"{"session_id":"s1","hook_event_name":"Interrupt"}"#).is_none());
+        assert_eq!(
+            hook_op(r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"request_user_input"}"#)
+                .unwrap()
+                .1["event"],
+            "pre_tool_use"
+        );
+    }
+
+    #[test]
+    fn hook_parses_the_agent_flag() {
+        match parse(&["hook", "--agent", "codex"]) {
+            SessionsSubcommands::Hook(cmd) => assert_eq!(cmd.agent, HookAgent::Codex),
+            _ => panic!("expected hook"),
+        }
+        match parse(&["hook"]) {
+            SessionsSubcommands::Hook(cmd) => assert_eq!(cmd.agent, HookAgent::Claude),
+            _ => panic!("expected hook"),
+        }
+        match parse(&["install-hooks", "--codex-home", "/x/codex"]) {
+            SessionsSubcommands::InstallHooks(cmd) => {
+                assert_eq!(cmd.codex_home, Some(PathBuf::from("/x/codex")));
+            }
+            _ => panic!("expected install-hooks"),
+        }
+    }
+
+    // --- Codex hooks.json ---------------------------------------------------
+
+    const TAGGED: &str = "/bin/omni-dev sessions hook --agent codex";
+
+    /// The `(group index, commands)` layout of one event, for position checks.
+    fn layout(hooks: &Value, event: &str) -> Vec<Vec<String>> {
+        hooks["hooks"][event]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .map(|g| {
+                        g["hooks"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|h| h["command"].as_str().unwrap().to_string())
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn is_sessions_sink_matches_any_omni_dev_sink_and_nothing_else() {
+        assert!(is_sessions_sink(
+            "/Users/me/.cargo/bin/omni-dev sessions hook"
+        ));
+        assert!(is_sessions_sink("omni-dev sessions hook"));
+        assert!(is_sessions_sink(TAGGED));
+        assert!(is_sessions_sink("omni-dev sessions hook --socket /x"));
+        assert!(is_sessions_sink(
+            "/old/omni-dev sessions hook --agent codex"
+        ));
+        assert!(!is_sessions_sink("/bin/other sessions hook"));
+        assert!(!is_sessions_sink("omni-dev sessions list"));
+        assert!(!is_sessions_sink("omni-dev sessions hooks"));
+        assert!(!is_sessions_sink("my-omni-dev sessions hook"));
+    }
+
+    #[test]
+    fn codex_install_rewrites_a_moved_binarys_tagged_entry_in_place() {
+        let mut hooks = json!({ "hooks": { "Stop": [
+            { "hooks": [{ "type": "command", "command": "/old/omni-dev sessions hook --agent codex" }] },
+            { "hooks": [{ "type": "command", "command": "omni-dev sessions hook --socket /x" }] },
+            { "hooks": [{ "type": "command", "command": "mine" }] }
+        ] } });
+        assert_eq!(
+            replace_stale_sinks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS),
+            2
+        );
+        assert_eq!(
+            layout(&hooks, "Stop"),
+            vec![vec![TAGGED], vec![TAGGED], vec!["mine"]]
+        );
+        // Already tagged by the current binary: nothing added under Stop.
+        merge_hooks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS);
+        assert_eq!(layout(&hooks, "Stop").len(), 3);
+    }
+
+    #[test]
+    fn codex_install_replaces_untagged_sinks_in_place_and_never_reorders() {
+        let mut hooks = json!({ "hooks": {
+            "PreToolUse": [
+                { "matcher": "Bash", "hooks": [{ "type": "command", "command": "guard" }] },
+                { "matcher": "*", "hooks": [{ "type": "command", "command": "/old/omni-dev sessions hook" }] },
+                { "hooks": [{ "type": "command", "command": "audit" }] }
+            ],
+            "SessionEnd": [
+                { "hooks": [{ "type": "command", "command": "omni-dev sessions hook" }] }
+            ]
+        }});
+        let replaced = replace_stale_sinks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS);
+        assert_eq!(replaced, 2);
+        let added = merge_hooks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS);
+        // Only the events without a (now tagged) sink got a new group.
+        assert_eq!(added, CODEX_HOOK_EVENTS.len() - 2);
+        // The untagged sink became the tagged one where it sat; nothing moved.
+        assert_eq!(
+            layout(&hooks, "PreToolUse"),
+            vec![vec!["guard"], vec![TAGGED], vec!["audit"]]
+        );
+        assert_eq!(hooks["hooks"]["PreToolUse"][1]["matcher"], "*");
+        // The capped event picked up its timeout in place.
+        assert_eq!(hooks["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        // Appended groups carry the matcher and timeout their event needs.
+        assert_eq!(hooks["hooks"]["PostToolUse"][0]["matcher"], "*");
+        assert_eq!(hooks["hooks"]["Interrupt"][0]["hooks"][0]["timeout"], 3);
+        assert!(hooks["hooks"]["Stop"][0]["hooks"][0]
+            .get("timeout")
+            .is_none());
+        assert!(hooks["hooks"].get("Notification").is_none());
+        // Idempotent.
+        assert_eq!(
+            replace_stale_sinks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS),
+            0
+        );
+        assert_eq!(merge_hooks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS), 0);
+    }
+
+    #[test]
+    fn codex_uninstall_never_shifts_a_surviving_group() {
+        let mut hooks = json!({ "hooks": {
+            "Stop": [
+                { "hooks": [{ "type": "command", "command": TAGGED }] },
+                { "hooks": [{ "type": "command", "command": "user-a" }] },
+                { "hooks": [{ "type": "command", "command": "omni-dev sessions hook" }] },
+                { "hooks": [{ "type": "command", "command": "user-b" }] },
+                { "hooks": [{ "type": "command", "command": TAGGED }] }
+            ],
+            "PreToolUse": [
+                { "hooks": [
+                    { "type": "command", "command": TAGGED },
+                    { "type": "command", "command": "shared" }
+                ] }
+            ],
+            "Interrupt": [
+                { "hooks": [] },
+                { "hooks": [{ "type": "command", "command": TAGGED }] }
+            ],
+            "PostToolUse": [
+                { "hooks": [{ "type": "command", "command": "keep" }] }
+            ]
+        }});
+        let removal = remove_hooks_stable(&mut hooks, is_sessions_sink);
+        assert_eq!(removal.removed, 5);
+        // `shared` moved from hook index 1 to 0 within its group.
+        assert!(removal.shifted);
+        // Emptied non-trailing groups stay as placeholders, so user-a and user-b
+        // keep their indices (1 and 3); the trailing emptied group is dropped.
+        let stop = hooks["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 4);
+        assert_eq!(stop[0], json!({ "hooks": [] }));
+        assert_eq!(layout(&hooks, "Stop")[1], vec!["user-a"]);
+        assert_eq!(stop[2], json!({ "hooks": [] }));
+        assert_eq!(layout(&hooks, "Stop")[3], vec!["user-b"]);
+        // A group with other hooks keeps them.
+        assert_eq!(layout(&hooks, "PreToolUse"), vec![vec!["shared"]]);
+        // Trailing placeholders, then the empty event, are dropped.
+        assert!(hooks["hooks"].get("Interrupt").is_none());
+        assert_eq!(layout(&hooks, "PostToolUse"), vec![vec!["keep"]]);
+        // A second pass removes nothing.
+        assert_eq!(
+            remove_hooks_stable(&mut hooks, is_sessions_sink),
+            Removal::default()
+        );
+    }
+
+    #[test]
+    fn remove_hooks_stable_does_not_report_a_shift_for_a_trailing_hook() {
+        let mut hooks = json!({ "hooks": { "Stop": [ { "hooks": [
+            { "type": "command", "command": "shared" },
+            { "type": "command", "command": TAGGED }
+        ] } ] } });
+        let removal = remove_hooks_stable(&mut hooks, is_sessions_sink);
+        assert_eq!(
+            removal,
+            Removal {
+                removed: 1,
+                shifted: false
+            }
+        );
+        assert_eq!(layout(&hooks, "Stop"), vec![vec!["shared"]]);
+    }
+
+    #[test]
+    fn remove_hooks_stable_tolerates_malformed_shapes() {
+        let none = Removal::default();
+        assert_eq!(remove_hooks_stable(&mut json!([]), |_| true), none);
+        assert_eq!(remove_hooks_stable(&mut json!({}), |_| true), none);
+        let mut odd = json!({ "hooks": { "Stop": 5, "Start": [ { "matcher": "x" } ] } });
+        assert_eq!(remove_hooks_stable(&mut odd, |_| true), none);
+        assert_eq!(odd["hooks"]["Stop"], 5);
+        assert_eq!(
+            replace_stale_sinks(&mut json!({}), TAGGED, CODEX_HOOK_EVENTS),
+            0
+        );
+        assert_eq!(
+            replace_stale_sinks(
+                &mut json!({ "hooks": { "Stop": 5 } }),
+                TAGGED,
+                CODEX_HOOK_EVENTS
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn codex_is_present_via_its_home_or_a_codex_executable_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("codex-home");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = std::env::join_paths([&bin]).unwrap();
+        assert!(!codex_is_present(&home, Some(&path)));
+        assert!(!codex_is_present(&home, None));
+        let exe = bin.join("codex");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(codex_is_present(&home, Some(&path)));
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(codex_is_present(&home, None));
+    }
+
+    #[test]
+    fn codex_hook_command_is_the_sink_tagged_codex() {
+        assert_eq!(
+            codex_hook_command(),
+            format!("{} --agent codex", hook_command())
+        );
+        assert!(codex_hook_command().ends_with(" sessions hook --agent codex"));
+    }
+
+    #[test]
+    fn codex_install_and_uninstall_round_trip_through_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let file = home.join("hooks.json");
+        std::fs::write(
+            &file,
+            json!({ "hooks": { "Stop": [
+                { "hooks": [{ "type": "command", "command": "omni-dev sessions hook" }] },
+                { "hooks": [{ "type": "command", "command": "mine" }] }
+            ] } })
+            .to_string(),
+        )
+        .unwrap();
+        install_codex_hooks(Some(home.clone())).unwrap();
+        let tagged = codex_hook_command();
+        let installed = read_settings(&file).unwrap();
+        assert_eq!(
+            layout(&installed, "Stop"),
+            vec![vec![tagged.clone()], vec!["mine".to_string()]]
+        );
+        assert_eq!(layout(&installed, "Interrupt"), vec![vec![tagged]]);
+        // A second install is the no-change branch and leaves the file as is.
+        install_codex_hooks(Some(home.clone())).unwrap();
+        assert_eq!(read_settings(&file).unwrap(), installed);
+
+        uninstall_codex_hooks(Some(home.clone())).unwrap();
+        let removed = read_settings(&file).unwrap();
+        assert_eq!(
+            removed,
+            json!({ "hooks": { "Stop": [ { "hooks": [] }, { "hooks": [{ "type": "command", "command": "mine" }] } ] } })
+        );
+        // Nothing left to remove, and a missing home is a no-op.
+        uninstall_codex_hooks(Some(home)).unwrap();
+        uninstall_codex_hooks(Some(tmp.path().join("absent"))).unwrap();
+    }
+
+    #[test]
+    fn install_codex_hooks_via_the_default_home_skips_absent_and_writes_present() {
+        let _guard = PI_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved = ["CODEX_HOME", "PATH", "HOME"].map(|k| (k, std::env::var_os(k)));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("codex-home");
+        let empty_bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&empty_bin).unwrap();
+        std::env::set_var("CODEX_HOME", &home);
+        std::env::set_var("PATH", std::env::join_paths([&empty_bin]).unwrap());
+
+        assert_eq!(default_codex_home().unwrap(), home);
+        install_codex_hooks(None).unwrap();
+        assert!(
+            !home.exists(),
+            "install must not create an absent Codex home"
+        );
+        uninstall_codex_hooks(None).unwrap();
+
+        std::fs::create_dir_all(&home).unwrap();
+        install_codex_hooks(None).unwrap();
+        assert!(home.join("hooks.json").exists());
+        uninstall_codex_hooks(None).unwrap();
+        assert_eq!(
+            read_settings(&home.join("hooks.json")).unwrap(),
+            json!({ "hooks": {} })
+        );
+
+        // An empty CODEX_HOME falls back to `$HOME/.codex`.
+        std::env::set_var("CODEX_HOME", "");
+        std::env::set_var("HOME", "/home/tester");
+        assert_eq!(
+            default_codex_home().unwrap(),
+            PathBuf::from("/home/tester/.codex")
+        );
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
     #[test]
     fn classify_notification_covers_cases() {
         assert_eq!(
@@ -1160,11 +1954,11 @@ mod tests {
             "model": "sonnet"
         });
         let cmd = "/usr/bin/omni-dev sessions hook";
-        let added = merge_hooks(&mut settings, cmd);
+        let added = merge_hooks(&mut settings, cmd, HOOK_EVENTS);
         assert_eq!(added, HOOK_EVENTS.len());
 
         // Our command landed under every event, and the unrelated hook stands.
-        for (event, _) in HOOK_EVENTS {
+        for HookSpec { event, .. } in HOOK_EVENTS {
             let groups = settings["hooks"][event].as_array().unwrap();
             assert!(
                 groups.iter().any(|g| group_has_command(g, cmd)),
@@ -1176,7 +1970,7 @@ mod tests {
         assert_eq!(settings["model"], "sonnet");
 
         // A second merge is a no-op.
-        assert_eq!(merge_hooks(&mut settings, cmd), 0);
+        assert_eq!(merge_hooks(&mut settings, cmd, HOOK_EVENTS), 0);
     }
 
     #[test]
@@ -1189,12 +1983,12 @@ mod tests {
             }
         });
         let cmd = "/usr/bin/omni-dev sessions hook";
-        merge_hooks(&mut settings, cmd);
+        merge_hooks(&mut settings, cmd, HOOK_EVENTS);
         let removed = remove_hooks(&mut settings, cmd);
         assert_eq!(removed, HOOK_EVENTS.len());
 
         // Every one of our entries is gone...
-        for (event, _) in HOOK_EVENTS {
+        for HookSpec { event, .. } in HOOK_EVENTS {
             let empty = settings["hooks"]
                 .get(event)
                 .and_then(Value::as_array)
@@ -1210,7 +2004,7 @@ mod tests {
     fn remove_hooks_prunes_empty_events_entirely() {
         let mut settings = json!({});
         let cmd = "cmd sessions hook";
-        merge_hooks(&mut settings, cmd);
+        merge_hooks(&mut settings, cmd, HOOK_EVENTS);
         remove_hooks(&mut settings, cmd);
         // With no other hooks, every event array empties and is pruned.
         let hooks = settings["hooks"].as_object().unwrap();
@@ -1223,7 +2017,7 @@ mod tests {
         let path = tmp.path().join("settings.json");
         // Install into a missing file, then uninstall.
         let mut settings = read_settings(&path).unwrap();
-        merge_hooks(&mut settings, "cmd sessions hook");
+        merge_hooks(&mut settings, "cmd sessions hook", HOOK_EVENTS);
         write_settings(&path, &settings).unwrap();
         assert!(path.exists());
 
@@ -1577,6 +2371,7 @@ mod tests {
     #[test]
     fn agent_label_defaults_to_claude() {
         assert_eq!(agent_label(&json!({ "agent": "pi" })), "pi");
+        assert_eq!(agent_label(&json!({ "agent": "codex" })), "codex");
         assert_eq!(agent_label(&json!({ "agent": "claude" })), "claude");
         assert_eq!(agent_label(&json!({})), "claude");
     }
@@ -1591,6 +2386,7 @@ mod tests {
         InstallHooksCommand {
             settings: Some(path.clone()),
             pi_agent_dir: Some(tmp.path().join("pi-agent")),
+            codex_home: Some(tmp.path().join("codex-home")),
         }
         .execute()
         .unwrap();
@@ -1604,6 +2400,7 @@ mod tests {
         InstallHooksCommand {
             settings: Some(path.clone()),
             pi_agent_dir: Some(tmp.path().join("pi-agent")),
+            codex_home: Some(tmp.path().join("codex-home")),
         }
         .execute()
         .unwrap();
@@ -1611,6 +2408,7 @@ mod tests {
         UninstallHooksCommand {
             settings: Some(path.clone()),
             pi_agent_dir: Some(tmp.path().join("pi-agent")),
+            codex_home: Some(tmp.path().join("codex-home")),
         }
         .execute()
         .unwrap();
@@ -1786,6 +2584,7 @@ mod tests {
         UninstallHooksCommand {
             settings: Some(path.clone()),
             pi_agent_dir: Some(tmp.path().join("pi-agent")),
+            codex_home: Some(tmp.path().join("codex-home")),
         }
         .execute()
         .unwrap();
@@ -1801,6 +2600,7 @@ mod tests {
             command: SessionsSubcommands::InstallHooks(InstallHooksCommand {
                 settings: Some(path.clone()),
                 pi_agent_dir: Some(tmp.path().join("pi-agent")),
+                codex_home: Some(tmp.path().join("codex-home")),
             }),
         }
         .execute()
@@ -1810,6 +2610,7 @@ mod tests {
             command: SessionsSubcommands::UninstallHooks(UninstallHooksCommand {
                 settings: Some(path.clone()),
                 pi_agent_dir: Some(tmp.path().join("pi-agent")),
+                codex_home: Some(tmp.path().join("codex-home")),
             }),
         }
         .execute()
@@ -1836,7 +2637,10 @@ mod tests {
         // swallowed (never panics, never errors).
         let tmp = tempfile::tempdir_in("/tmp").unwrap();
         let sock = tmp.path().join("nope.sock");
-        let cmd = HookCommand { socket: Some(sock) };
+        let cmd = HookCommand {
+            socket: Some(sock),
+            agent: HookAgent::Claude,
+        };
         cmd.report(r#"{"session_id":"s1","hook_event_name":"Stop"}"#)
             .await;
         // Unmappable input returns before any socket work.
@@ -1932,14 +2736,17 @@ mod tests {
     fn merge_and_remove_hooks_tolerate_malformed_shapes() {
         let cmd = "cmd sessions hook";
         // Non-object settings: both are no-ops rather than panics.
-        assert_eq!(merge_hooks(&mut json!([]), cmd), 0);
+        assert_eq!(merge_hooks(&mut json!([]), cmd, HOOK_EVENTS), 0);
         assert_eq!(remove_hooks(&mut json!([]), cmd), 0);
         // `hooks` present but not an object → merge leaves it alone.
-        assert_eq!(merge_hooks(&mut json!({ "hooks": 5 }), cmd), 0);
+        assert_eq!(merge_hooks(&mut json!({ "hooks": 5 }), cmd, HOOK_EVENTS), 0);
         // No `hooks` key → remove has nothing to do.
         assert_eq!(remove_hooks(&mut json!({}), cmd), 0);
         // A per-event value that is not an array is skipped, not indexed.
-        assert_eq!(merge_hooks(&mut json!({ "hooks": { "Stop": 5 } }), cmd), 6);
+        assert_eq!(
+            merge_hooks(&mut json!({ "hooks": { "Stop": 5 } }), cmd, HOOK_EVENTS),
+            6
+        );
         assert_eq!(remove_hooks(&mut json!({ "hooks": { "Stop": 5 } }), cmd), 0);
     }
 
