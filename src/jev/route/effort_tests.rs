@@ -98,8 +98,9 @@ fn builtins_offer_only_their_native_levels_and_keep_original_stage_questions() {
         .map(|p| Ladder::builtin(p).unwrap())
         .collect();
     let q = build_route_questions(&ladders).unwrap();
-    // 9 class + 24 configurable-model effort + 3 Deep Think applicability questions.
-    assert_eq!(q.len(), 36);
+    // 9 class + 21 configurable-model effort (anthropic 2 rungs since #1903,
+    // openai 3, gemini 2) + 3 Deep Think applicability questions.
+    assert_eq!(q.len(), 33);
     let keys = |key: &str| {
         let Question::Choice { criteria, .. } = &q[key] else {
             panic!()
@@ -257,7 +258,7 @@ fn decoding_preserves_class_data_and_reports_every_rung_in_every_stage() {
         assert_eq!(route.class, ladder.tiers.as_slice()[0].name);
         for stage in Stage::ALL {
             let a = route.stages.get(stage);
-            assert_eq!(a.effort_by_model.len(), 3);
+            assert_eq!(a.effort_by_model.len(), ladder.tiers.as_slice().len());
             let Answer::Choice {
                 choice,
                 confidence,
@@ -533,7 +534,7 @@ async fn all_ladders_and_efforts_share_one_request_and_fail_only_the_bad_issue()
     assert!(text.contains("Model / effort"), "{text}");
     let requests = server.received_requests().await.unwrap();
     let request: serde_json::Value = requests[0].body_json().unwrap();
-    assert_eq!(request["questions"].as_object().unwrap().len(), 46);
+    assert_eq!(request["questions"].as_object().unwrap().len(), 43);
     assert!(request["questions"].get("could_be_cheaper_0").is_some());
 }
 

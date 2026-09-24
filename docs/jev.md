@@ -436,10 +436,10 @@ issues:
   providers:
     anthropic:
       stages:
-        design:    {choice: fable,  confidence: 0.52, probabilities: {fable: 0.74, none: 0.01, opus: 0.24, sonnet: 0.01}}
-        implement: {choice: sonnet, confidence: 0.83, probabilities: {fable: 0.0, opus: 0.12, sonnet: 0.88}}
-        review:    {choice: opus,   confidence: 0.21, probabilities: {fable: 0.02, opus: 0.57, sonnet: 0.41}}
-      class: fable
+        design:    {choice: opus,   confidence: 0.52, probabilities: {none: 0.06, opus: 0.52, sonnet: 0.42}}
+        implement: {choice: sonnet, confidence: 0.83, probabilities: {opus: 0.17, sonnet: 0.83}}
+        review:    {choice: opus,   confidence: 0.41, probabilities: {opus: 0.41, sonnet: 0.59}}
+      class: opus
       close_calls: [review]
     openai:
       stages:
@@ -531,7 +531,7 @@ styling.
 
 ```
 rust-works/omni-dev#1641 — Some issue title
-  fable — design needs fable (0.52), implementation sonnet (0.83), review opus (0.21, close call — sonnet 0.41)
+  opus — design needs opus (0.52), implementation sonnet (0.83), review opus (0.41, close call — sonnet 0.59)
   cites open #1129, which could leave less design work if resolved (0.75)
   reference fetch failed: #404 (not found)
 
@@ -554,7 +554,7 @@ citation, in citation order, rather than one line joining every clause with
 
 ```
 rust-works/omni-dev#1845 — feat(drive): randomizeRange for drive sheets (#1830)
-  fable — design needs fable (0.42), implementation sonnet (0.66), review opus (0.36)
+  opus — design needs opus (0.42), implementation sonnet (0.66), review opus (0.36)
   cites open #1830, which could leave less design work if resolved (0.46)
   cites open #1831, which could leave less design work if resolved (0.52)
 ```
@@ -631,16 +631,18 @@ you already know.
 `--ladders <NAMES>` is a comma-separated list of ladder names to route
 against (default `anthropic`; an unknown name is an error listing the known
 built-in and `--ladder-definition`-registered ones). A built-in name selects
-one of three embedded three-rung ladders, least capable first, named by the
+one of three embedded ladders, least capable first, named by the
 **abbreviated model name** so a consumer that drives that provider's agents
 gets a model to hand the work to rather than a rung it has to translate.
-There is deliberately no provider-neutral rung name.
+There is deliberately no provider-neutral rung name. `anthropic` has two
+rungs; `openai` and `gemini` have three ([#1903](https://github.com/rust-works/omni-dev/issues/1903) dropped `anthropic`'s
+`fable` rung as redundant with `opus` — see below).
 
-| Provider    | Rungs, least capable first          | Expansions                                                          |
-|-------------|-------------------------------------|---------------------------------------------------------------------|
-| `anthropic` | `sonnet` / `opus` / `fable`         | Claude Sonnet / Claude Opus / Claude Fable                          |
-| `openai`    | `terra` / `sol` / `astra`           | gpt-5.6-terra / gpt-5.6-sol / gpt-6-astra                           |
-| `gemini`    | `flash` / `pro` / `deep-think`      | gemini-3-flash-preview / gemini-3.1-pro-preview / Gemini 3 Deep Think |
+| Provider    | Rungs, least capable first     | Expansions                                                            |
+|-------------|--------------------------------|-----------------------------------------------------------------------|
+| `anthropic` | `sonnet` / `opus`              | Claude Sonnet / Claude Opus                                           |
+| `openai`    | `terra` / `sol` / `astra`      | gpt-5.6-terra / gpt-5.6-sol / gpt-6-astra                             |
+| `gemini`    | `flash` / `pro` / `deep-think` | gemini-3-flash-preview / gemini-3.1-pro-preview / Gemini 3 Deep Think |
 
 The ladders live in `src/templates/jev-route-tiers-<provider>.yaml`. Several
 ladders still cost **one Jev call per issue**: Jev takes a map of questions
@@ -652,13 +654,26 @@ per open citation, not once per ladder.
 The inherited #1779 evidence covered only the `anthropic` ladder (see
 [Evidence and its limits](#evidence-and-its-limits)). Because rewording a
 description shifts answers across the board, the `openai` and `gemini`
-ladders reuse the `anthropic` descriptions **rung for rung, byte for byte**;
-a test pins that equality. The [#1888 comparison](evaluations/jev-effort-1888/README.md)
+ladders reuse the `anthropic` descriptions **rung for rung, byte for byte**,
+including the retired `fable` text for their own still-present third rung
+(`astra` / `deep-think`); a test pins that equality. The [#1888 comparison](evaluations/jev-effort-1888/README.md)
 now exercises all three, separately and together, including effort questions.
 It finds some single-versus-combined class differences. It does not provide
 independent model-class labels for OpenAI or Gemini, or downstream success
 measurements. Treat those answers as starting points and do not expect
 batching to produce identical judgements to separate runs.
+
+**`anthropic`'s `fable` rung** ([#1903](https://github.com/rust-works/omni-dev/issues/1903)):
+commented out, not deleted, in `src/templates/jev-route-tiers-anthropic.yaml`.
+Anthropic's own comparison reported Claude Opus 5.5 (released 2026-09-22)
+performing "at the level of Claude Fable 5.1 on most work" and beating it on
+published coding benchmarks, so a distinct, more-capable-than-`opus` class
+was no longer supported by the evidence. `openai`/`gemini` keep their third
+rung (`astra`/`deep-think`) unchanged: no equivalent case has been made for
+those, so this was deliberately scoped to `anthropic` only, at the cost of
+the three ladders no longer having the same rung count. `claude-fable-5-1`
+remains registered in `src/templates/models.yaml` for other, unrelated uses —
+only the routing ladder entry was disabled.
 
 A fourth, cheapest rung (Haiku 4.5, gpt-5.6-luna, gemini-3.1-flash-lite) and
 the Chinese-lab and open-weight providers remain out of scope. Effort advice
@@ -674,8 +689,8 @@ updating a model does not require a provider-specific routing branch.
 
 Capabilities checked on 2026-09-23:
 
-- Anthropic `sonnet` → `claude-sonnet-5`, `opus` → `claude-opus-5-5`, and
-  `fable` → `claude-fable-5-1`: `low`, `medium`, `high`, `xhigh`, `max`.
+- Anthropic `sonnet` → `claude-sonnet-5` and `opus` → `claude-opus-5-5`:
+  `low`, `medium`, `high`, `xhigh`, `max`.
   [Official effort documentation](https://platform.claude.com/docs/en/build-with-claude/effort).
 - OpenAI `terra` → `gpt-5.6-terra` and `sol` → `gpt-5.6-sol`: `none`, `low`,
   `medium`, `high`, `xhigh`, `max`. `astra` → `gpt-6-astra` supports the same
@@ -697,9 +712,10 @@ existing design-class answer `none`.
 The class descriptions remain the original #1779 wording. #1885 tracks
 reassessing those descriptions as model capabilities change; the binding
 above does not itself validate that a version matches its rung. Custom
-bindings can select different models for different stages. For example, a
-`fable` rung can bind Fable for design and another model for implementation
-and review, but that substitution requires its own evaluation.
+bindings can select different models for different stages. For example, an
+`opus` rung can bind one model for design and another model for
+implementation and review, but that substitution requires its own
+evaluation.
 
 ### Reading effort advice
 
@@ -716,7 +732,7 @@ Illustrative excerpt (numbers are not evaluation results):
 implement:
   choice: opus
   confidence: 0.74
-  probabilities: {sonnet: 0.1, opus: 0.8, fable: 0.1}
+  probabilities: {sonnet: 0.2, opus: 0.8}
   effort_by_model:
     sonnet:
       - model: claude-sonnet-5
@@ -735,7 +751,7 @@ implement:
             not_needed: 0.01
             insufficient: 0.01
         close_call: false
-    # opus and fable each have their own model results here too
+    # opus has its own model results here too
 ```
 
 `recommended` carries a native `level` and the complete Jev `assessment`.
@@ -763,7 +779,6 @@ model beneath each ladder's class summary (illustrative values):
     Model / effort               Design       Implement    Review
     sonnet [claude-sonnet-5]      high (0.62)  high (0.68)  high (0.60)
     opus [claude-opus-5-5]        high (0.66)  medium [1]   high (0.71)
-    fable [claude-fable-5-1]       high (0.65)  low (0.82)   high (0.68)
     [1] opus [claude-opus-5-5], implement: medium (0.20, close call — high 0.45)
 ```
 
