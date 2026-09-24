@@ -1398,9 +1398,8 @@ mod tests {
                 tiers.as_slice()[2].description,
                 RETIRED_ANTHROPIC_THIRD_RUNG,
                 "{}: {} no longer matches the retired anthropic fable rung",
-                // omni-dev: coverage ignore-line reason="assert_eq!'s message args are only evaluated on failure, and this test always passes"
-                provider.name(),
-                tiers.as_slice()[2].name
+                provider.name(), // omni-dev: coverage ignore-line reason="assert_eq!'s message args are only evaluated on failure, and this test always passes"
+                tiers.as_slice()[2].name // omni-dev: coverage ignore-line reason="assert_eq!'s message args are only evaluated on failure, and this test always passes"
             );
         }
     }
@@ -3001,6 +3000,21 @@ mod tests {
             assert_eq!(hyperlink("#1", Some(bad), style), "#1");
         }
         assert_eq!(hyperlink("#1", None, style), "#1");
+    }
+
+    #[test]
+    fn colorize_applies_ansi_codes_per_complexity_when_color_enabled() {
+        let color = TerminalStyle {
+            color: true,
+            hyperlinks: false,
+        };
+        assert_eq!(colorize("x", Complexity::Low, color), "\x1b[32mx\x1b[0m");
+        assert_eq!(colorize("x", Complexity::Medium, color), "\x1b[33mx\x1b[0m");
+        assert_eq!(colorize("x", Complexity::High, color), "\x1b[31mx\x1b[0m");
+        assert_eq!(
+            colorize("x", Complexity::Medium, TerminalStyle::default()),
+            "x"
+        );
     }
 
     #[test]
