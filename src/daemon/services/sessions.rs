@@ -494,6 +494,7 @@ mod tests {
     async fn status_summarizes_states() {
         let svc = service();
         svc.registry().observe(ObserveRequest {
+            agent: crate::sessions::Agent::Claude,
             session_id: "w".to_string(),
             cwd: None,
             transcript_path: None,
@@ -502,6 +503,7 @@ mod tests {
             model: None,
         });
         svc.registry().observe(ObserveRequest {
+            agent: crate::sessions::Agent::Claude,
             session_id: "p".to_string(),
             cwd: None,
             transcript_path: None,
@@ -531,6 +533,7 @@ mod tests {
     fn menu_item_is_clickable_only_for_vscode_sessions() {
         let now = chrono::Utc::now();
         let base = |source: Source| SessionEntry {
+            agent: crate::sessions::Agent::Claude,
             session_id: "sid-12345678".to_string(),
             cwd: Some(PathBuf::from("/p")),
             transcript_path: None,
@@ -579,6 +582,7 @@ mod tests {
     fn entry(id: &str, state: SessionState, repo: Option<&str>, cwd: Option<&str>) -> SessionEntry {
         let now = chrono::Utc::now();
         SessionEntry {
+            agent: crate::sessions::Agent::Claude,
             session_id: id.to_string(),
             cwd: cwd.map(PathBuf::from),
             transcript_path: None,
@@ -677,6 +681,7 @@ mod tests {
     /// A small `observe` builder for the adapter tests.
     fn observe_req(id: &str, event: SessionEvent, cwd: Option<&str>) -> ObserveRequest {
         ObserveRequest {
+            agent: crate::sessions::Agent::Claude,
             session_id: id.to_string(),
             cwd: cwd.map(PathBuf::from),
             transcript_path: None,

@@ -1,4 +1,4 @@
-//! `omni-dev sessions` — track the Claude Code sessions running across every
+//! `omni-dev sessions` — track the Claude Code and pi.dev sessions running across every
 //! terminal and VS Code window, via the daemon's `sessions` service.
 //!
 //! The subcommands split by role:
@@ -10,7 +10,9 @@
 //!   missing daemon, a bad payload, or any other error is swallowed and it always
 //!   exits 0.
 //! - `install-hooks` / `uninstall-hooks` idempotently merge (or remove) the hook
-//!   block in `~/.claude/settings.json`, preserving any hooks already there.
+//!   block in `~/.claude/settings.json`, preserving any hooks already there. When
+//!   pi.dev is installed they also write (or remove) the generated pi extension
+//!   in `~/.pi/agent/extensions/`, which reports straight to the socket (#1901).
 //! - `install-wrapper` / `uninstall-wrapper` are the same idea for Feed 4: they
 //!   write the shim that VS Code's Claude extension launches
 //!   [`omni-dev claude-wrap`](crate::cli::claude_wrap) through, and point the
@@ -55,15 +57,18 @@ pub struct SessionsCommand {
 /// Sessions subcommands.
 #[derive(Subcommand)]
 pub enum SessionsSubcommands {
-    /// List the Claude Code sessions currently running across all windows.
+    /// List the Claude Code and pi.dev sessions currently running across all
+    /// windows.
     List(ListCommand),
     /// Claude Code hook sink: read a hook event on stdin and report it to the
     /// daemon (run by Claude Code, not by hand).
     Hook(HookCommand),
     /// Install the Claude Code hooks that feed the sessions tracker into
-    /// `~/.claude/settings.json` (idempotent).
+    /// `~/.claude/settings.json`, plus the pi.dev extension when pi is installed
+    /// (idempotent).
     InstallHooks(InstallHooksCommand),
-    /// Remove the sessions-tracker hooks from `~/.claude/settings.json`.
+    /// Remove the sessions-tracker hooks from `~/.claude/settings.json` and the
+    /// pi.dev extension.
     UninstallHooks(UninstallHooksCommand),
     /// Install the `claude-wrap` shim and point VS Code's Claude extension at it
     /// (idempotent).
@@ -266,6 +271,7 @@ impl HookPayload {
         }
         let event = session_event_for(event_name, self.message.as_deref())?;
         let request = ObserveRequest {
+            agent: crate::sessions::Agent::Claude,
             session_id,
             cwd: self.cwd.clone(),
             transcript_path: self.transcript_path.clone(),
@@ -315,18 +321,25 @@ fn classify_notification(message: Option<&str>) -> NotificationKind {
 
 // --- install-hooks / uninstall-hooks ----------------------------------------
 
-/// Installs the sessions-tracker hooks into `~/.claude/settings.json`.
+/// Installs the sessions-tracker hooks into `~/.claude/settings.json`, plus the
+/// pi.dev extension when pi is installed.
 #[derive(Parser)]
 pub struct InstallHooksCommand {
     /// Path to the Claude settings file. Defaults to `~/.claude/settings.json`
     /// (respecting `$CLAUDE_CONFIG_DIR`).
     #[arg(long, value_name = "PATH")]
     pub settings: Option<PathBuf>,
+
+    /// pi.dev's agent directory. Defaults to `$PI_CODING_AGENT_DIR`, else
+    /// `~/.pi/agent`. Passing it installs the pi extension even when pi is not
+    /// detected.
+    #[arg(long, value_name = "PATH")]
+    pub pi_agent_dir: Option<PathBuf>,
 }
 
 impl InstallHooksCommand {
     /// Executes the install: merges the hook block idempotently, preserving any
-    /// hooks already present.
+    /// hooks already present, then writes the pi extension if pi is present.
     pub fn execute(self) -> Result<()> {
         let path = settings_path(self.settings)?;
         let mut settings = read_settings(&path)?;
@@ -344,37 +357,189 @@ impl InstallHooksCommand {
                 path.display()
             );
         }
-        Ok(())
+        install_pi_extension(self.pi_agent_dir)
     }
 }
 
-/// Removes the sessions-tracker hooks from `~/.claude/settings.json`.
+/// Removes the sessions-tracker hooks from `~/.claude/settings.json` and the
+/// pi.dev extension.
 #[derive(Parser)]
 pub struct UninstallHooksCommand {
     /// Path to the Claude settings file. Defaults to `~/.claude/settings.json`
     /// (respecting `$CLAUDE_CONFIG_DIR`).
     #[arg(long, value_name = "PATH")]
     pub settings: Option<PathBuf>,
+
+    /// pi.dev's agent directory. Defaults to `$PI_CODING_AGENT_DIR`, else
+    /// `~/.pi/agent`.
+    #[arg(long, value_name = "PATH")]
+    pub pi_agent_dir: Option<PathBuf>,
 }
 
 impl UninstallHooksCommand {
     /// Executes the uninstall: removes any hook entries whose command is ours,
-    /// leaving every other hook untouched.
+    /// leaving every other hook untouched, then removes our pi extension.
     pub fn execute(self) -> Result<()> {
         let path = settings_path(self.settings)?;
-        if !path.exists() {
+        if path.exists() {
+            let mut settings = read_settings(&path)?;
+            let removed = remove_hooks(&mut settings, &hook_command());
+            write_settings(&path, &settings)?;
+            println!(
+                "removed {removed} sessions hook entry(ies) from {}",
+                path.display()
+            );
+        } else {
             println!("no settings file at {} (nothing to remove)", path.display());
+        }
+        uninstall_pi_extension(self.pi_agent_dir)
+    }
+}
+
+// --- pi.dev extension ---------------------------------------------------------
+
+/// Filename of the generated extension inside pi's global extensions directory.
+const PI_EXTENSION_NAME: &str = "omni-dev-sessions.ts";
+
+/// The generated extension's source, with [`PI_SOCKET_PLACEHOLDER`] still in it.
+const PI_EXTENSION_TEMPLATE: &str = include_str!("../templates/pi-sessions-extension.ts");
+
+/// Stands in for the socket path (a JSON string literal) in the template.
+const PI_SOCKET_PLACEHOLDER: &str = "__OMNI_DEV_SOCKET__";
+
+/// The template's first line. A file that does not start with it is not ours, so
+/// install refuses to overwrite it and uninstall leaves it alone.
+fn pi_extension_marker() -> &'static str {
+    PI_EXTENSION_TEMPLATE.lines().next().unwrap_or_default()
+}
+
+/// The extension source with the daemon socket baked in, as `install-hooks`
+/// bakes in the absolute exe path: pi's Node process has no other way to find
+/// the socket, and resolving it there would duplicate `dirs::data_dir()`.
+fn render_pi_extension(socket: &Path) -> String {
+    let literal =
+        serde_json::to_string(&socket.display().to_string()).unwrap_or_else(|_| "\"\"".to_string());
+    PI_EXTENSION_TEMPLATE.replace(PI_SOCKET_PLACEHOLDER, &literal)
+}
+
+/// pi's default agent directory: `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+fn default_pi_agent_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("PI_CODING_AGENT_DIR").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    let home = dirs::home_dir().context("could not resolve the home directory")?;
+    Ok(home.join(".pi").join("agent"))
+}
+
+/// Whether pi.dev is installed: its agent directory exists (pi has run), or a
+/// `pi` executable is on `path` (installed but never run).
+fn pi_is_present(agent_dir: &Path, path: Option<&std::ffi::OsStr>) -> bool {
+    agent_dir.is_dir()
+        || path.is_some_and(|path| {
+            std::env::split_paths(path).any(|dir| is_executable(&dir.join("pi")))
+        })
+}
+
+/// Whether `path` is a file with an execute bit set.
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// What [`write_pi_extension`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum PiInstall {
+    /// Wrote a new or updated extension.
+    Written,
+    /// The file already had exactly this content.
+    Unchanged,
+}
+
+/// Writes `contents` to `<agent_dir>/extensions/omni-dev-sessions.ts`, creating
+/// the directory. Refuses to replace a file of that name that is not ours.
+fn write_pi_extension(agent_dir: &Path, contents: &str) -> Result<(PathBuf, PiInstall)> {
+    let dir = agent_dir.join("extensions");
+    let file = dir.join(PI_EXTENSION_NAME);
+    if file.exists() {
+        let existing = std::fs::read_to_string(&file)
+            .with_context(|| format!("failed to read {}", file.display()))?;
+        if existing == contents {
+            return Ok((file, PiInstall::Unchanged));
+        }
+        if !existing.starts_with(pi_extension_marker()) {
+            bail!(
+                "{} exists and was not written by omni-dev; refusing to overwrite it",
+                file.display()
+            );
+        }
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    std::fs::write(&file, contents)
+        .with_context(|| format!("failed to write {}", file.display()))?;
+    Ok((file, PiInstall::Written))
+}
+
+/// Removes our extension from `<agent_dir>/extensions/`, returning its path when
+/// it removed it. A file of that name that is not ours is left alone.
+fn remove_pi_extension(agent_dir: &Path) -> Result<Option<PathBuf>> {
+    let file = agent_dir.join("extensions").join(PI_EXTENSION_NAME);
+    let Ok(existing) = std::fs::read_to_string(&file) else {
+        return Ok(None);
+    };
+    if !existing.starts_with(pi_extension_marker()) {
+        return Ok(None);
+    }
+    std::fs::remove_file(&file).with_context(|| format!("failed to remove {}", file.display()))?;
+    Ok(Some(file))
+}
+
+/// The pi half of `install-hooks`. Without `--pi-agent-dir` it installs only when
+/// pi is present, so a machine without pi gets nothing under `~/.pi`.
+fn install_pi_extension(explicit: Option<PathBuf>) -> Result<()> {
+    let agent_dir = if let Some(dir) = explicit {
+        dir
+    } else {
+        let dir = default_pi_agent_dir()?;
+        if !pi_is_present(&dir, std::env::var_os("PATH").as_deref()) {
+            println!(
+                "pi.dev not found (no {} and no `pi` on PATH); skipped its extension",
+                dir.display()
+            );
             return Ok(());
         }
-        let mut settings = read_settings(&path)?;
-        let removed = remove_hooks(&mut settings, &hook_command());
-        write_settings(&path, &settings)?;
-        println!(
-            "removed {removed} sessions hook entry(ies) from {}",
-            path.display()
-        );
-        Ok(())
+        dir
+    };
+    let socket = server::resolve_socket(None)?;
+    let (file, outcome) = write_pi_extension(&agent_dir, &render_pi_extension(&socket))?;
+    match outcome {
+        PiInstall::Unchanged => println!(
+            "pi.dev extension already installed at {} (no change)",
+            file.display()
+        ),
+        PiInstall::Written => {
+            println!(
+                "installed the pi.dev sessions extension at {}",
+                file.display()
+            );
+            println!("pi sessions started after this report their state");
+        }
     }
+    Ok(())
+}
+
+/// The pi half of `uninstall-hooks`. Runs whether or not pi is present, so an
+/// uninstalled pi does not strand the file.
+fn uninstall_pi_extension(explicit: Option<PathBuf>) -> Result<()> {
+    let agent_dir = match explicit {
+        Some(dir) => dir,
+        None => default_pi_agent_dir()?,
+    };
+    if let Some(file) = remove_pi_extension(&agent_dir)? {
+        println!("removed {}", file.display());
+    }
+    Ok(())
 }
 
 // --- install-wrapper / uninstall-wrapper -------------------------------------
@@ -776,21 +941,22 @@ fn render_sessions(result: &Value) -> String {
         .map(Vec::as_slice)
         .unwrap_or_default();
     if sessions.is_empty() {
-        return "No active Claude Code sessions.".to_string();
+        return "No active agent sessions.".to_string();
     }
     // CWD is last so a long path never misaligns the columns after it.
     let mut out = format!(
-        "{:<13} {:<8} {:<20} {:>5}  {}",
-        "STATE", "SOURCE", "REPO", "AGE", "CWD"
+        "{:<13} {:<6} {:<8} {:<20} {:>5}  {}",
+        "STATE", "AGENT", "SOURCE", "REPO", "AGE", "CWD"
     );
     for session in sessions {
         let state = state_display(session.get("state").and_then(Value::as_str).unwrap_or("-"));
+        let agent = agent_label(session);
         let source = source_label(session);
         let repo = sanitize(session.get("repo").and_then(Value::as_str).unwrap_or("-"));
         let cwd = sanitize(session.get("cwd").and_then(Value::as_str).unwrap_or("-"));
         let age = age_secs(session.get("last_seen").and_then(Value::as_str));
         out.push_str(&format!(
-            "\n{state:<13} {source:<8} {repo:<20} {age:>4}s  {cwd}"
+            "\n{state:<13} {agent:<6} {source:<8} {repo:<20} {age:>4}s  {cwd}"
         ));
     }
     out
@@ -804,6 +970,15 @@ fn state_display(state: &str) -> String {
         "waiting_for_permission" => "waiting-perm".to_string(),
         "waiting_for_input" => "waiting-input".to_string(),
         other => sanitize(other),
+    }
+}
+
+/// The agent label for a session: `pi` for pi.dev, else `claude` (a daemon that
+/// predates the `agent` field only ever reports Claude Code sessions).
+fn agent_label(session: &Value) -> &'static str {
+    match session.get("agent").and_then(Value::as_str) {
+        Some("pi") => "pi",
+        _ => "claude",
     }
 }
 
@@ -1095,12 +1270,9 @@ mod tests {
     fn render_sessions_handles_empty() {
         assert_eq!(
             render_sessions(&json!({ "sessions": [] })),
-            "No active Claude Code sessions."
+            "No active agent sessions."
         );
-        assert_eq!(
-            render_sessions(&json!({})),
-            "No active Claude Code sessions."
-        );
+        assert_eq!(render_sessions(&json!({})), "No active agent sessions.");
     }
 
     #[test]
@@ -1117,6 +1289,7 @@ mod tests {
         assert!(table.contains("working"), "{table}");
         assert!(table.contains("vscode"), "{table}");
         assert!(table.contains("omni-dev"), "{table}");
+        assert!(table.contains("claude"), "{table}");
         // Header plus one data row.
         assert_eq!(table.lines().count(), 2, "{table}");
     }
@@ -1163,6 +1336,153 @@ mod tests {
         assert!(err.to_string().contains("boom"), "{err}");
     }
 
+    // --- pi.dev extension ----------------------------------------------------
+
+    #[test]
+    fn render_pi_extension_bakes_in_the_socket_as_a_json_string() {
+        let rendered = render_pi_extension(Path::new("/tmp/we \"ird\"/daemon.sock"));
+        assert!(
+            !rendered.contains(PI_SOCKET_PLACEHOLDER),
+            "placeholder left behind"
+        );
+        assert!(
+            rendered.contains(r#"const SOCKET: string = "/tmp/we \"ird\"/daemon.sock";"#),
+            "socket not escaped as a JSON string"
+        );
+        assert!(rendered.starts_with(pi_extension_marker()));
+    }
+
+    #[test]
+    fn the_template_reports_only_state_and_tags_the_agent() {
+        // Each state the mapping can produce, the agent tag, and the `end` op.
+        for needle in [
+            r#""starting""#,
+            r#""working""#,
+            r#""idle""#,
+            r#""waiting_for_input""#,
+            r#"agent: "pi""#,
+            "stream_state: next",
+            r#"send("end""#,
+            r#""agent_settled""#,
+            r#""ui_prompt_start""#,
+            r#""session_shutdown""#,
+        ] {
+            assert!(
+                PI_EXTENSION_TEMPLATE.contains(needle),
+                "template lacks {needle}"
+            );
+        }
+        // pi has no permission prompt, so the template must never claim one.
+        assert!(!PI_EXTENSION_TEMPLATE.contains("waiting_for_permission"));
+        assert_eq!(
+            PI_EXTENSION_TEMPLATE.matches(PI_SOCKET_PLACEHOLDER).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pi_is_present_via_its_agent_dir_or_a_pi_executable_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = std::env::join_paths([bin.clone()]).unwrap();
+
+        // Neither: absent.
+        assert!(!pi_is_present(&agent, Some(&path)));
+        assert!(!pi_is_present(&agent, None));
+
+        // A non-executable `pi` does not count.
+        let pi = bin.join("pi");
+        std::fs::write(&pi, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!pi_is_present(&agent, Some(&path)));
+
+        // An executable one does.
+        std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(pi_is_present(&agent, Some(&path)));
+
+        // So does the agent directory alone.
+        std::fs::create_dir_all(&agent).unwrap();
+        assert!(pi_is_present(&agent, None));
+    }
+
+    #[test]
+    fn write_pi_extension_is_idempotent_and_updates_its_own_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v1 = render_pi_extension(Path::new("/a.sock"));
+        let (file, outcome) = write_pi_extension(tmp.path(), &v1).unwrap();
+        assert_eq!(outcome, PiInstall::Written);
+        assert_eq!(file, tmp.path().join("extensions").join(PI_EXTENSION_NAME));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), v1);
+
+        assert_eq!(
+            write_pi_extension(tmp.path(), &v1).unwrap().1,
+            PiInstall::Unchanged
+        );
+
+        // A new socket path (or a newer template) replaces our own file.
+        let v2 = render_pi_extension(Path::new("/b.sock"));
+        assert_eq!(
+            write_pi_extension(tmp.path(), &v2).unwrap().1,
+            PiInstall::Written
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), v2);
+    }
+
+    #[test]
+    fn pi_extension_install_and_remove_leave_foreign_files_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("extensions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = dir.join("someone-elses.ts");
+        std::fs::write(&other, "export default () => {};\n").unwrap();
+
+        // A same-named file that is not ours is neither overwritten nor removed.
+        let ours = dir.join(PI_EXTENSION_NAME);
+        std::fs::write(&ours, "// hand-written\n").unwrap();
+        let err = write_pi_extension(tmp.path(), &render_pi_extension(Path::new("/s")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not written by omni-dev"), "{err}");
+        assert_eq!(remove_pi_extension(tmp.path()).unwrap(), None);
+        assert_eq!(std::fs::read_to_string(&ours).unwrap(), "// hand-written\n");
+
+        // Ours is removed; the neighbour survives.
+        std::fs::remove_file(&ours).unwrap();
+        write_pi_extension(tmp.path(), &render_pi_extension(Path::new("/s"))).unwrap();
+        assert_eq!(remove_pi_extension(tmp.path()).unwrap(), Some(ours.clone()));
+        assert!(!ours.exists());
+        assert!(other.exists());
+
+        // Removing again, or from a directory that never existed, is a no-op.
+        assert_eq!(remove_pi_extension(tmp.path()).unwrap(), None);
+        assert_eq!(remove_pi_extension(&tmp.path().join("nope")).unwrap(), None);
+    }
+
+    #[test]
+    fn hook_commands_parse_the_pi_agent_dir_flag() {
+        match parse(&["install-hooks", "--pi-agent-dir", "/x/agent"]) {
+            SessionsSubcommands::InstallHooks(cmd) => {
+                assert_eq!(cmd.pi_agent_dir, Some(PathBuf::from("/x/agent")));
+            }
+            _ => panic!("expected install-hooks"),
+        }
+        match parse(&["uninstall-hooks"]) {
+            SessionsSubcommands::UninstallHooks(cmd) => assert_eq!(cmd.pi_agent_dir, None),
+            _ => panic!("expected uninstall-hooks"),
+        }
+    }
+
+    #[test]
+    fn agent_label_defaults_to_claude() {
+        assert_eq!(agent_label(&json!({ "agent": "pi" })), "pi");
+        assert_eq!(agent_label(&json!({ "agent": "claude" })), "claude");
+        assert_eq!(agent_label(&json!({})), "claude");
+    }
+
     // --- command execute() paths -------------------------------------------
 
     #[test]
@@ -1172,19 +1492,27 @@ mod tests {
         // Install into a missing file: the hook block lands.
         InstallHooksCommand {
             settings: Some(path.clone()),
+            pi_agent_dir: Some(tmp.path().join("pi-agent")),
         }
         .execute()
         .unwrap();
         assert!(read_settings(&path).unwrap()["hooks"]["Stop"].is_array());
+        let extension = tmp
+            .path()
+            .join("pi-agent/extensions")
+            .join(PI_EXTENSION_NAME);
+        assert!(extension.exists());
         // A second install is the idempotent "no change" branch.
         InstallHooksCommand {
             settings: Some(path.clone()),
+            pi_agent_dir: Some(tmp.path().join("pi-agent")),
         }
         .execute()
         .unwrap();
         // Uninstall removes our block, leaving an empty hooks object.
         UninstallHooksCommand {
             settings: Some(path.clone()),
+            pi_agent_dir: Some(tmp.path().join("pi-agent")),
         }
         .execute()
         .unwrap();
@@ -1192,6 +1520,7 @@ mod tests {
             .as_object()
             .unwrap()
             .is_empty());
+        assert!(!extension.exists());
     }
 
     // --- install-wrapper / uninstall-wrapper --------------------------------
@@ -1358,6 +1687,7 @@ mod tests {
         // The no-file branch: nothing to remove, still Ok, and no file created.
         UninstallHooksCommand {
             settings: Some(path.clone()),
+            pi_agent_dir: Some(tmp.path().join("pi-agent")),
         }
         .execute()
         .unwrap();
@@ -1372,6 +1702,7 @@ mod tests {
         SessionsCommand {
             command: SessionsSubcommands::InstallHooks(InstallHooksCommand {
                 settings: Some(path.clone()),
+                pi_agent_dir: Some(tmp.path().join("pi-agent")),
             }),
         }
         .execute()
@@ -1380,6 +1711,7 @@ mod tests {
         SessionsCommand {
             command: SessionsSubcommands::UninstallHooks(UninstallHooksCommand {
                 settings: Some(path.clone()),
+                pi_agent_dir: Some(tmp.path().join("pi-agent")),
             }),
         }
         .execute()
