@@ -242,7 +242,7 @@ pub(crate) fn render_search_table(summaries: &[MessageSummary], out: &mut dyn Wr
     Ok(())
 }
 
-fn truncate(text: &str) -> String {
+pub(crate) fn truncate(text: &str) -> String {
     if text.chars().count() <= SNIPPET_TRUNCATE_AT {
         text.to_string()
     } else {

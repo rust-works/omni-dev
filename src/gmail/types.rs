@@ -104,6 +104,44 @@ pub struct MessageListResponse {
     pub result_size_estimate: Option<i64>,
 }
 
+/// A Gmail draft, as returned by `drafts.list`.
+///
+/// `message` carries only `{id, threadId}` — `drafts.list` never returns
+/// more, so a useful row costs one `messages.get` per draft (see
+/// [`crate::gmail::drafts_api::DraftsApi::list_summaries`]). `id` is the
+/// **draft** id every other drafts endpoint is addressed by; it is distinct
+/// from `message.id`, which changes each time the draft is updated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Draft {
+    /// Gmail draft id.
+    pub id: String,
+    /// The draft's current message.
+    #[serde(default)]
+    pub message: MessageRef,
+}
+
+/// Response envelope for `GET /gmail/v1/users/{userId}/drafts`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DraftListResponse {
+    /// Drafts on this page. Gmail omits the key entirely when there are none.
+    #[serde(default)]
+    pub drafts: Vec<Draft>,
+    /// Cursor for the next page, when more results are available.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "nextPageToken"
+    )]
+    pub next_page_token: Option<String>,
+    /// Gmail's estimate of the total number of drafts.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "resultSizeEstimate"
+    )]
+    pub result_size_estimate: Option<i64>,
+}
+
 /// A Gmail thread.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Thread {
