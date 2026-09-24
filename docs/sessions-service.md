@@ -462,8 +462,9 @@ resident daemon versions differ.
 
 ## Tray
 
-The macOS menu bar gains a **"Claude Sessions"** submenu: one line per session
-(`<name> <glyph> <state>`). A session embedded in a VS Code window is a clickable
+The macOS menu bar gains an **"Agent Sessions"** submenu (titled "Claude
+Sessions" before #1908): one line per session, prefixed with its agent
+(`<agent> · <name> <glyph> <state>`, e.g. `Codex · omni-dev ⚙ working`). A session embedded in a VS Code window is a clickable
 `focus:` action that opens/focuses that window (reusing the worktrees launcher);
 a terminal session — with no window to focus — is a plain status line.
 

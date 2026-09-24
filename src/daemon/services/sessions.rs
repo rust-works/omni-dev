@@ -39,8 +39,9 @@ use crate::sessions::{ObserveRequest, SessionEntry, SessionState, SessionsRegist
 /// The sessions service name (the control-socket routing key).
 pub const SERVICE_NAME: &str = "sessions";
 
-/// The tray submenu title.
-const SUBMENU_TITLE: &str = "Claude Sessions";
+/// The tray submenu title. Not "Claude Sessions": the service tracks every
+/// agent the `agent` tag names, and each row says which (#1908).
+const SUBMENU_TITLE: &str = "Agent Sessions";
 
 /// A running background transcript-watcher task and the token that stops it.
 struct WatcherTask {
@@ -350,7 +351,7 @@ fn display_name(entry: &SessionEntry) -> String {
 }
 
 /// The tray items for the session set: a placeholder when empty, else one line
-/// per session (`<name> <glyph> <state>`). A session embedded in a VS Code window
+/// per session (`<agent> · <name> <glyph> <state>`). A session embedded in a VS Code window
 /// is clickable (its click focuses that window via the `focus:` action); a
 /// terminal session is a non-clickable status line, since the daemon has no
 /// window to focus.
@@ -363,7 +364,8 @@ fn menu_items_for(sessions: &[SessionEntry]) -> Vec<MenuItem> {
         .iter()
         .map(|entry| {
             let label = format!(
-                "{} {} {}",
+                "{} · {} {} {}",
+                entry.agent.display_name(),
                 display_name(entry),
                 state_glyph(entry.state),
                 state_label(entry.state),
@@ -666,6 +668,27 @@ mod tests {
         assert!(labels[3].contains("waiting"));
         assert!(labels[4].contains("permission"));
         assert!(labels[5].contains("ended"));
+    }
+
+    #[test]
+    fn menu_rows_are_prefixed_with_their_agent() {
+        let mut pi = entry("p1", SessionState::Idle, Some("repo-p"), None);
+        pi.agent = crate::sessions::Agent::Pi;
+        let mut codex = entry("c1", SessionState::Working, Some("repo-c"), None);
+        codex.agent = crate::sessions::Agent::Codex;
+        let claude = entry("s1", SessionState::Idle, Some("repo-a"), None);
+        let items = menu_items_for(&[claude, pi, codex]);
+        let labels: Vec<&str> = items
+            .iter()
+            .map(|i| match i {
+                MenuItem::Label(l) => l.as_str(),
+                _ => panic!("terminal sessions render as labels"),
+            })
+            .collect();
+        assert_eq!(labels[0], "Claude · repo-a ◦ idle");
+        assert_eq!(labels[1], "pi · repo-p ◦ idle");
+        assert_eq!(labels[2], "Codex · repo-c ⚙ working");
+        assert_eq!(SUBMENU_TITLE, "Agent Sessions");
     }
 
     #[test]

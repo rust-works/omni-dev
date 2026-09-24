@@ -132,7 +132,23 @@ pub struct SessionBadge {
     pub state: SessionState,
     pub source: SessionSourceRow,
     pub model: Option<String>,
+    /// The agent's display name (`Claude`, `Codex`, `pi`, or an unknown tag
+    /// verbatim), for the row summary (#1908).
+    pub agent: String,
     pub last_seen: DateTime<Utc>,
+}
+
+/// The display name for a wire `agent` tag: absent means Claude, a known tag
+/// takes [`crate::sessions::Agent::display_name`], and one this build does not
+/// know is shown as sent (it is already sanitized at the wire boundary).
+fn agent_display(tag: Option<&str>) -> String {
+    use crate::sessions::Agent;
+    match tag {
+        None | Some("claude") => Agent::Claude.display_name().to_string(),
+        Some("pi") => Agent::Pi.display_name().to_string(),
+        Some("codex") => Agent::Codex.display_name().to_string(),
+        Some(other) => other.to_string(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +357,7 @@ fn merge_worktree(wt: &TreeWorktreeWire, ctx: &MergeContext<'_>) -> WorktreeRow 
                     },
                 },
                 model: s.model.clone(),
+                agent: agent_display(s.agent.as_deref()),
                 last_seen: s.last_seen,
             })
             .collect()
@@ -385,10 +402,20 @@ mod tests {
             cwd: Some(PathBuf::from(cwd)),
             repo: repo.map(str::to_string),
             model: None,
+            agent: None,
             state: SessionState::Working,
             source: Source::Terminal,
             last_seen: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn agent_display_defaults_to_claude_and_keeps_unknown_tags() {
+        assert_eq!(agent_display(None), "Claude");
+        assert_eq!(agent_display(Some("claude")), "Claude");
+        assert_eq!(agent_display(Some("pi")), "pi");
+        assert_eq!(agent_display(Some("codex")), "Codex");
+        assert_eq!(agent_display(Some("newagent")), "newagent");
     }
 
     fn worktree_wire(path: &str) -> TreeWorktreeWire {

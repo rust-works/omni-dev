@@ -1,4 +1,4 @@
-// The pure Claude-session cue model for the Worktrees tree (#1406): tally the
+// The pure agent-session cue model for the Worktrees tree (#1406): tally the
 // daemon's live sessions onto the worktrees they are running in, and decide the
 // row's glyph summary and colored badge.
 //
@@ -26,12 +26,40 @@ export type SessionState =
   | "ended";
 
 /**
- * One entry of the sessions service's `list` reply. Only the three fields the
- * cues need are declared; the daemon sends more.
+ * Which coding agent a session belongs to, as the daemon serializes it
+ * (mirroring the Rust `Agent`). A daemon that predates the tag (#1901) omits
+ * it, and so does every Claude feed, so an absent `agent` means `"claude"`.
+ */
+export type Agent = "claude" | "pi" | "codex";
+
+/** {@link Agent}s in the order a tooltip lists them. */
+const AGENT_ORDER: readonly Agent[] = ["claude", "codex", "pi"];
+
+/** The human-facing name of an agent, matching the daemon tray's rows. */
+const AGENT_NAMES: Record<Agent, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  pi: "pi",
+};
+
+/**
+ * The agent a session belongs to: its `agent` tag, or `"claude"` when absent or
+ * unrecognised (a value from a daemon newer than this extension).
+ */
+export function sessionAgent(session: { agent?: string }): Agent {
+  const agent = session.agent;
+  return agent === "pi" || agent === "codex" ? agent : "claude";
+}
+
+/**
+ * One entry of the sessions service's `list` reply. Only the fields the cues
+ * need are declared; the daemon sends more.
  */
 export interface SessionEntry {
-  /** The Claude session id. */
+  /** The agent's session id. */
   session_id: string;
+  /** Which agent the session belongs to; absent means `"claude"` (#1908). */
+  agent?: string;
   /** The session's working directory, when the daemon has learned one. */
   cwd?: string;
   /** The session's live state. */
@@ -48,13 +76,21 @@ export interface SessionTally {
   waiting: number;
   /** Sitting at the prompt. */
   idle: number;
+  /**
+   * The agents the counted sessions belong to, in {@link AGENT_ORDER}, for the
+   * tooltip (#1908). Absent (a tally decoded from an older URI) reads as Claude.
+   */
+  agents?: Agent[];
 }
+
+/** The three counted buckets of a {@link SessionTally}. */
+type Bucket = "working" | "waiting" | "idle";
 
 /** Per-worktree-path tallies, keyed by the path the daemon reported. */
 export type SessionTallyMap = Record<string, SessionTally>;
 
 /** The glyphs, matching the daemon tray's own vocabulary. */
-const GLYPHS: Record<keyof SessionTally, string> = {
+const GLYPHS: Record<Bucket, string> = {
   waiting: "!",
   working: "⚙",
   idle: "◦",
@@ -64,11 +100,18 @@ const GLYPHS: Record<keyof SessionTally, string> = {
  * The order buckets are rendered and ranked in, most urgent first: a worktree
  * that is waiting on you should say so even while other sessions in it work.
  */
-const BY_URGENCY: (keyof SessionTally)[] = ["waiting", "working", "idle"];
+const BY_URGENCY: (Bucket)[] = ["waiting", "working", "idle"];
 
 /** An empty tally, the identity every accumulation starts from. */
 function emptyTally(): SessionTally {
-  return { working: 0, waiting: 0, idle: 0 };
+  return { working: 0, waiting: 0, idle: 0, agents: [] };
+}
+
+/** Adds `agent` to a tally's agent list, keeping {@link AGENT_ORDER}. */
+function addAgent(tally: SessionTally, agent: Agent): void {
+  const agents = new Set(tally.agents ?? []);
+  agents.add(agent);
+  tally.agents = AGENT_ORDER.filter((a) => agents.has(a));
 }
 
 /**
@@ -79,7 +122,7 @@ function emptyTally(): SessionTally {
  * visible for ~10s so `sessions list` can show it, which is useful in a table
  * and misleading as a row badge.
  */
-function bucketFor(state: SessionState): keyof SessionTally | undefined {
+function bucketFor(state: SessionState): Bucket | undefined {
   switch (state) {
     case "starting":
     case "working":
@@ -95,14 +138,15 @@ function bucketFor(state: SessionState): keyof SessionTally | undefined {
 }
 
 /**
- * One letter of the `[hsof*]` model-family marker (#1448), in the fixed order
- * the marker always renders them: h(aiku), s(onnet), o(pus), f(able), then
- * *(anything else, including a model the daemon never learned).
+ * One letter of the `[hsofg*]` model-family marker (#1448), in the fixed order
+ * the marker always renders them: h(aiku), s(onnet), o(pus), f(able), g(pt —
+ * Codex's models, #1908), then *(anything else, including a model the daemon
+ * never learned).
  */
-export type Family = "h" | "s" | "o" | "f" | "*";
+export type Family = "h" | "s" | "o" | "f" | "g" | "*";
 
 /** {@link Family} letters in the marker's fixed rendering order. */
-const FAMILY_ORDER: readonly Family[] = ["h", "s", "o", "f", "*"];
+const FAMILY_ORDER: readonly Family[] = ["h", "s", "o", "f", "g", "*"];
 
 /** Substring needles, checked in {@link FAMILY_ORDER} order. */
 const FAMILY_NEEDLES: readonly { family: Family; needle: string }[] = [
@@ -110,6 +154,7 @@ const FAMILY_NEEDLES: readonly { family: Family; needle: string }[] = [
   { family: "s", needle: "sonnet" },
   { family: "o", needle: "opus" },
   { family: "f", needle: "fable" },
+  { family: "g", needle: "gpt-" },
 ];
 
 /**
@@ -175,6 +220,7 @@ export function tallyByWorktree(
     }
     const tally = tallies[worktree] ?? emptyTally();
     tally[bucket] += 1;
+    addAgent(tally, sessionAgent(session));
     tallies[worktree] = tally;
   }
   return tallies;
@@ -262,13 +308,14 @@ export function formatModelMarker(families: ReadonlySet<Family> | undefined): st
 }
 
 /** The word for a bucket, used in the tooltip. */
-function bucketWord(bucket: keyof SessionTally): string {
+function bucketWord(bucket: Bucket): string {
   return bucket === "waiting" ? "waiting on you" : bucket;
 }
 
 /**
- * The tooltip's Claude line, e.g. `Claude: 1 waiting on you, 2 working`, or
- * `undefined` when the worktree runs no sessions.
+ * The tooltip's sessions line, e.g. `Claude: 1 waiting on you, 2 working`, or
+ * `undefined` when the worktree runs no sessions. Prefixed with the agents the
+ * sessions belong to (`Claude, Codex: …`), Claude when the tally names none.
  */
 export function sessionTooltipLine(tally: SessionTally | undefined): string | undefined {
   if (tally === undefined || sessionTotal(tally) === 0) {
@@ -277,7 +324,8 @@ export function sessionTooltipLine(tally: SessionTally | undefined): string | un
   const parts = BY_URGENCY.filter((bucket) => tally[bucket] > 0).map(
     (bucket) => `${tally[bucket]} ${bucketWord(bucket)}`,
   );
-  return `Claude: ${parts.join(", ")}`;
+  const agents = tally.agents?.length ? tally.agents : (["claude"] as const);
+  return `${agents.map((a) => AGENT_NAMES[a]).join(", ")}: ${parts.join(", ")}`;
 }
 
 /**
@@ -335,11 +383,15 @@ export function sessionDecoration(tally: SessionTally | undefined): CheckDecorat
  * trick the `checks=<state>` parameter plays.
  */
 export function encodeSessionTally(tally: SessionTally): string {
-  return `${tally.working}-${tally.waiting}-${tally.idle}`;
+  const counts = `${tally.working}-${tally.waiting}-${tally.idle}`;
+  return tally.agents?.length ? `${counts}-${tally.agents.join(".")}` : counts;
 }
 
-/** The exact shape {@link encodeSessionTally} writes; anything else is garbage. */
-const ENCODED_TALLY = /^(\d+)-(\d+)-(\d+)$/;
+/**
+ * The exact shape {@link encodeSessionTally} writes, with the agent list
+ * optional so a URI from before #1908 still decodes; anything else is garbage.
+ */
+const ENCODED_TALLY = /^(\d+)-(\d+)-(\d+)(?:-([a-z.]+))?$/;
 
 /** Reads back what {@link encodeSessionTally} wrote, tolerating any garbage. */
 export function decodeSessionTally(encoded: string | null | undefined): SessionTally | undefined {
@@ -347,11 +399,16 @@ export function decodeSessionTally(encoded: string | null | undefined): SessionT
   if (!match) {
     return undefined;
   }
-  return {
+  const tally: SessionTally = {
     working: Number(match[1]),
     waiting: Number(match[2]),
     idle: Number(match[3]),
   };
+  if (match[4]) {
+    const named = new Set(match[4].split("."));
+    tally.agents = AGENT_ORDER.filter((a) => named.has(a));
+  }
+  return tally;
 }
 
 /**
@@ -370,7 +427,11 @@ export function sameTallies(left: SessionTallyMap, right: SessionTallyMap): bool
     const a = left[key];
     const b = right[key];
     return (
-      b !== undefined && a.working === b.working && a.waiting === b.waiting && a.idle === b.idle
+      b !== undefined &&
+      a.working === b.working &&
+      a.waiting === b.waiting &&
+      a.idle === b.idle &&
+      (a.agents ?? []).join(".") === (b.agents ?? []).join(".")
     );
   });
 }

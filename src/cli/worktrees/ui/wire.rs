@@ -149,6 +149,12 @@ pub struct SessionEntryWire {
     pub repo: Option<String>,
     #[serde(default, deserialize_with = "sanitized_opt")]
     pub model: Option<String>,
+    /// The session's agent (`claude`, `pi`, `codex`, …), absent from Claude
+    /// feeds and from daemons that predate the tag (#1901) — both mean Claude.
+    /// A string rather than [`crate::sessions::Agent`] so an agent this build
+    /// does not know still parses, rather than failing the whole entry.
+    #[serde(default, deserialize_with = "sanitized_opt")]
+    pub agent: Option<String>,
     pub state: SessionState,
     #[serde(default = "default_source")]
     pub source: Source,
@@ -435,5 +441,21 @@ mod tests {
         assert_eq!(entry.repo.as_deref(), Some("evilrepo"));
         assert_eq!(entry.model.as_deref(), Some("claude-sonnet"));
         assert_eq!(entry.state, SessionState::Working);
+        assert_eq!(entry.agent, None);
+    }
+
+    #[test]
+    fn session_entry_wire_mirrors_the_agent_tag_including_unknown_ones() {
+        let entry = |agent: &str| -> SessionEntryWire {
+            serde_json::from_value(serde_json::json!({
+                "session_id": "abc",
+                "agent": agent,
+                "state": "idle",
+                "last_seen": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap()
+        };
+        assert_eq!(entry("codex").agent.as_deref(), Some("codex"));
+        assert_eq!(entry("new\u{1b}agent").agent.as_deref(), Some("newagent"));
     }
 }
