@@ -1356,7 +1356,6 @@ mod tests {
     fn the_template_reports_only_state_and_tags_the_agent() {
         // Each state the mapping can produce, the agent tag, and the `end` op.
         for needle in [
-            r#""starting""#,
             r#""working""#,
             r#""idle""#,
             r#""waiting_for_input""#,
@@ -1374,6 +1373,11 @@ mod tests {
         }
         // pi has no permission prompt, so the template must never claim one.
         assert!(!PI_EXTENSION_TEMPLATE.contains("waiting_for_permission"));
+        // pi's chat input is already live at `session_start`, so the template
+        // must report `idle` there, never the hook-only `starting` state (it
+        // buckets as working everywhere it renders, which left every pi
+        // session showing as busy from launch until the first prompt finished).
+        assert!(!PI_EXTENSION_TEMPLATE.contains("\"starting\""));
         assert_eq!(
             PI_EXTENSION_TEMPLATE.matches(PI_SOCKET_PLACEHOLDER).count(),
             1
