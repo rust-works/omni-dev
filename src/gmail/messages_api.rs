@@ -64,6 +64,11 @@ pub const MESSAGES_INSERT_COST_UNITS: u32 = 25;
 /// size, including attachments.
 pub const MAX_INSERT_BYTES: u64 = 35 * 1024 * 1024;
 
+/// Default bound on concurrent `messages.get` hydration calls: `gmail
+/// search --enrich`'s `--concurrency` default and the fixed bound `gmail
+/// draft list` hydrates at, so the two can't drift apart.
+pub const DEFAULT_ENRICH_CONCURRENCY: usize = 4;
+
 /// Default `limit` for a search when the caller doesn't specify one.
 ///
 /// Shared between the CLI (`gmail search`'s `--limit` default) and the MCP
@@ -138,7 +143,7 @@ impl MessageSummary {
 /// Looks up a header's value from a message's raw `payload.headers` array
 /// (`[{"name": "...", "value": "..."}]`), matching `name` case-insensitively
 /// — Gmail's `metadataHeaders` filter matches case-insensitively too.
-fn header_value(payload: Option<&serde_json::Value>, name: &str) -> Option<String> {
+pub(crate) fn header_value(payload: Option<&serde_json::Value>, name: &str) -> Option<String> {
     payload?
         .get("headers")?
         .as_array()?
@@ -365,46 +370,18 @@ impl<'a> MessagesApi<'a> {
         concurrency: usize,
     ) -> Result<Vec<MessageSummary>> {
         let list = self.search_all(query, label_ids, limit).await?;
-        let concurrency = effective_concurrency(concurrency);
         // Collect owned ids first: a closure borrowing `list.messages`
         // directly ties its returned future to that borrow's lifetime,
         // which `buffered` then can't unify into a `for<'a> FnMut(&'a _)`
         // shape — this is what the `implementation of FnOnce is not
         // general enough` error was pointing at.
         let ids: Vec<String> = list.messages.into_iter().map(|m| m.id).collect();
-        // `buffered` refills its concurrency window from `ids` as each slot
-        // frees, regardless of whether the item that just freed it errored —
-        // left unchecked, one failed hydration wouldn't stop the remaining
-        // fetches from firing, defeating the point of bounding concurrency
-        // against Gmail's per-second quota. `failed` is checked once per
-        // item before its network call: only fetches not yet dispatched at
-        // the time of the first failure are skipped, so already in-flight
-        // ones (up to `concurrency` many) still run to completion.
-        let failed = Arc::new(AtomicBool::new(false));
-        futures::stream::iter(ids)
-            .map(|id| {
-                let failed = Arc::clone(&failed);
-                async move {
-                    if failed.load(Ordering::Acquire) {
-                        return Err(anyhow::anyhow!(
-                            "skipped hydrating message {id}: an earlier hydration request failed"
-                        ));
-                    }
-                    let result = self
-                        .get(&id, MessageFormat::Metadata, &["From", "Subject", "Date"])
-                        .await
-                        .map(|message| MessageSummary::from_message(&message));
-                    if result.is_err() {
-                        failed.store(true, Ordering::Release);
-                    }
-                    result
-                }
-            })
-            .buffered(concurrency)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect()
+        hydrate_in_order(ids, concurrency, |id| async move {
+            self.get(&id, MessageFormat::Metadata, &["From", "Subject", "Date"])
+                .await
+                .map(|message| MessageSummary::from_message(&message))
+        })
+        .await
     }
 
     /// Adds/removes labels on up to 1000 messages in one call.
@@ -558,8 +535,9 @@ fn build_message_insert_url(base_url: &str) -> Result<Url> {
 }
 
 /// Clamps a caller-supplied limit to [`HARD_CAP`], treating `0` as "fetch
-/// as many as the cap allows".
-fn effective_cap(limit: usize) -> usize {
+/// as many as the cap allows". Shared with `DraftsApi::list_all`, whose
+/// caps are deliberately `search`'s (#1921).
+pub(crate) fn effective_cap(limit: usize) -> usize {
     if limit == 0 {
         HARD_CAP
     } else {
@@ -573,6 +551,63 @@ fn effective_cap(limit: usize) -> usize {
 /// burst past Gmail's per-second quota.
 fn effective_concurrency(concurrency: usize) -> usize {
     concurrency.clamp(1, MAX_CONCURRENCY)
+}
+
+/// Hydrates `items` with at most `concurrency` (clamped by
+/// [`effective_concurrency`]) `fetch` calls in flight, returning the results
+/// in `items`' order.
+///
+/// The list-then-hydrate fan-out shared by [`MessagesApi::search_summaries`]
+/// and `DraftsApi::list_summaries` (#1921), so both bound their
+/// `messages.get` calls against Gmail's per-second quota the same way. Order
+/// is preserved (`buffered`, not `buffer_unordered`). A failure on any one
+/// item aborts the whole call with that error, once every already-in-flight
+/// fetch in its concurrency batch completes — it is never silently dropped
+/// from the results.
+pub(crate) async fn hydrate_in_order<I, T, F, Fut>(
+    items: Vec<I>,
+    concurrency: usize,
+    fetch: F,
+) -> Result<Vec<T>>
+where
+    I: Send,
+    T: Send,
+    F: Fn(I) -> Fut + Sync,
+    Fut: std::future::Future<Output = Result<T>> + Send,
+{
+    // `buffered` refills its concurrency window from `items` as each slot
+    // frees, regardless of whether the item that just freed it errored —
+    // left unchecked, one failed hydration wouldn't stop the remaining
+    // fetches from firing, defeating the point of bounding concurrency
+    // against Gmail's per-second quota. `failed` is checked once per item
+    // before its network call: only fetches not yet dispatched at the time
+    // of the first failure are skipped, so already in-flight ones (up to
+    // `concurrency` many) still run to completion. A skipped item always
+    // sorts after the failure that caused it (`buffered` dispatches in
+    // order), so the error `collect` returns is always the real one.
+    let failed = Arc::new(AtomicBool::new(false));
+    let fetch = &fetch;
+    futures::stream::iter(items)
+        .map(|item| {
+            let failed = Arc::clone(&failed);
+            async move {
+                if failed.load(Ordering::Acquire) {
+                    return Err(anyhow::anyhow!(
+                        "skipped hydration: an earlier hydration request failed"
+                    ));
+                }
+                let result = fetch(item).await;
+                if result.is_err() {
+                    failed.store(true, Ordering::Release);
+                }
+                result
+            }
+        })
+        .buffered(effective_concurrency(concurrency))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
