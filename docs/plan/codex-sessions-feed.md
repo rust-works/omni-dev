@@ -1,6 +1,6 @@
 # Codex Sessions Feed
 
-**Status:** Aspirational — investigation complete (#1861), revised 2026-09-24 to build on the `agent` tag #1901 added; implementation not started, tracked in the follow-up issues listed at the end
+**Status:** Aspirational — investigation complete (#1861), revised 2026-09-24 to build on the `agent` tag #1901 added; implementation not started, tracked in #1907–#1910 (listed at the end)
 **ADRs:** [ADR-0052](../adrs/adr-0052.md) · [ADR-0057](../adrs/adr-0057.md) · [ADR-0087](../adrs/adr-0087.md)
 
 ## Overview
@@ -297,11 +297,12 @@ UI:
 
 ## Follow-ups
 
-1. `Agent::Codex`, the `PermissionRequest`/`Interrupt`/`request_user_input`
+1. #1907 — `Agent::Codex`, the `PermissionRequest`/`Interrupt`/`request_user_input`
    mapping, `sessions hook --agent codex`, and Codex detection in
    `install-hooks`/`uninstall-hooks` with `--codex-home`, replacing untagged
    entries and keeping positions stable (docs/sessions-service.md, snapshots).
-2. Agent labels where #1901 did not add them: the tray (and its title), VS Code
+2. #1908 — agent labels where #1901 did not add them: the tray (and its title), VS Code
    (`classifyModel`, tooltip) and the TUI. These cover pi as well.
-3. Codex rollout watcher with subagent filtering.
-4. (Optional) App Server `thread/list` observer for sessions omni-dev launches.
+3. #1909 — Codex rollout watcher with subagent filtering (depends on #1907).
+4. #1910 — (optional) App Server `thread/list` observer for sessions omni-dev
+   launches (depends on #1907).
