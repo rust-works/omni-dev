@@ -1,6 +1,6 @@
 # Codex Sessions Feed
 
-**Status:** In progress — investigation complete (#1861), revised 2026-09-24 to build on the `agent` tag #1901 added; the hook feed shipped in #1907 and the agent labels in #1908; the rest is tracked in #1909–#1910 (listed at the end)
+**Status:** In progress — investigation complete (#1861), revised 2026-09-24 to build on the `agent` tag #1901 added; the hook feed shipped in #1907, the agent labels in #1908 and the rollout watcher in #1909; #1910 remains (listed at the end)
 **ADRs:** [ADR-0052](../adrs/adr-0052.md) · [ADR-0057](../adrs/adr-0057.md) · [ADR-0087](../adrs/adr-0087.md)
 
 ## Overview

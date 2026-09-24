@@ -446,12 +446,50 @@ trust that hook again.
   so a brief false `waiting_for_permission` is unavoidable. `codex exec` under its
   default `approval: never` never fires it.
 - SIGHUP (closing a terminal tab), SIGTERM and SIGKILL fire no `SessionEnd`, and
-  Codex's documented 30-minute idle end did not fire in testing, so such a session
-  ages out on the 5-minute TTL.
+  Codex's documented 30-minute idle end did not fire in testing. The rollout
+  watcher (below) ends such a session within seconds; without it, the session ages
+  out on the 5-minute TTL.
 - In the TUI, `request_user_input` needs Codex's still-under-development
   `default_mode_request_user_input` feature; Desktop offers it by default.
 - A Desktop chat started from the app lives under `~/Documents/Codex/…`, which no
   VS Code window has open, so its `source` is `terminal`.
+
+**The rollout watcher** (#1909) runs in the daemon beside the Claude transcript
+watcher (Feed 2), with nothing to install. Every 5 seconds it scans
+`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (default `~/.codex`) and
+supplements the hooks in three ways:
+
+- **Discovery.** A rollout modified in the last 5 minutes is read once, and only
+  its first line, Codex's `session_meta` record. That gives the session's id and
+  `cwd`, so a session started before the daemon, or before the hooks were
+  trusted, still lands on its worktree row. A subagent thread's `source` is an
+  object (`{"subagent": …}`); those rollouts are skipped, since their hook events
+  already carry the parent's id. Older rollouts are recorded by size and read only
+  if they grow again (`codex resume` appends to the same file).
+- **Ends.** Archiving a chat in the VS Code extension or Desktop *moves* its
+  rollout to `archived_sessions/`, outside the watched tree, so a rollout that
+  disappears ends its session. A killed process is caught through Codex's thread
+  locks. While a thread is loaded, Codex holds an exclusive `flock` on
+  `$CODEX_HOME/thread-writer-locks/<session-id>.lock`, and the kernel releases it
+  when the process dies however it dies. A lock the watcher has seen held that is
+  later free, or gone, ends the session. On first sight, a rollout whose lock is
+  already free or gone is recorded but not listed, so a daemon restart does not
+  show sessions that ended while it was down. Without a `thread-writer-locks`
+  directory at all (a Codex without these locks) the locks say nothing and the
+  watcher relies on the rollouts alone.
+- **Idle liveness.** While the lock is held (or the rollout grows) the session is
+  re-reported once a minute, keeping the state it has, so an idle Codex session no
+  longer ages out on the TTL while its process lives. A thread Codex unloads
+  releases its lock, and so ends too.
+
+It never reports a state of its own: a session only the watcher knows about reads
+`idle`, since rollout growth continues around a turn's end and cannot say
+`working`, and the rollout records no approval requests. It reads no conversation
+line and logs nothing. The lock probe is a non-blocking *shared* `flock`, taken
+and released at once: on a session's first sight, then once per scan while the
+session is tracked and not ended. Against a live holder it simply fails, so the
+only possible collision is Codex acquiring that same thread's lock in the same
+instant. A watcher heartbeat never refreshes a session that has already ended.
 
 **Version skew.** A daemon from before the `agent` tag (#1901) ignores it and
 lists Codex sessions as Claude's. A daemon with only `claude | pi` rejects
@@ -506,6 +544,10 @@ a window/cwd is unambiguous, but several in the same cwd cannot be told apart.
   pi is installed). It runs with pi's own permissions, as every pi extension
   does, and sends only state and identifiers, over the same fire-and-forget socket
   POST.
+- The Codex rollout watcher reads only the first line of each recent rollout
+  file (Codex's session metadata, never a conversation line) plus file sizes, and
+  probes Codex's thread-lock files with a non-blocking shared `flock`. It writes
+  nothing outside the daemon's memory.
 - The stream wrapper is **opt-in** too, and is the one component that *sees* your
   conversation as it streams. It extracts only the state, `session_id`, `cwd` and
   model, and logs and persists nothing — a design constraint, not a convention
