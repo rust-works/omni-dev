@@ -134,26 +134,30 @@ best-effort:
 |---|---|
 | `SessionStart` | `starting` |
 | `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / transcript grew | `working` |
-| `PostToolUseFailure` / `PostToolBatch` / `PermissionDenied` / `ElicitationResult` / `SubagentStart` / `PreCompact` | `working` |
+| `PostToolUseFailure` / `PermissionDenied` / `ElicitationResult` / `SubagentStart` | `working` |
 | transcript grew — while already `waiting_for_*` or `ended` | *unchanged* |
 | `Stop` / `StopFailure` | `idle` |
 | `PermissionRequest` / `Notification` — permission prompt | `waiting_for_permission` |
 | `Elicitation` / `Notification` — idle, input, or elicitation prompt | `waiting_for_input` |
-| `Notification` — unclassified / `SubagentStop` / `PostCompact` / transcript discovered | *unchanged* |
+| `Notification` — unclassified / `SubagentStop` / `PreCompact` / `PostCompact` / transcript discovered | *unchanged* |
 | `SessionEnd` | `ended` (reaped shortly after) |
 | **stream state** (Feed 4) | **exactly what was reported** |
 
 `waiting_for_*` are **reliable**: a dedicated hook fires them directly.
 `PermissionRequest` and `Elicitation` are events of their own. A `Notification`
 is classified by Claude Code's `notification_type` field (`permission_prompt`,
-`idle_prompt`, `elicitation_dialog`), and by a substring match on its message
-only when the type is missing or unrecognised, as on older versions.
+`idle_prompt`, `elicitation_dialog`). Any other type, such as `auth_success`, is
+unclassified. A substring match on the message is used only when there is no
+type at all, as on older versions.
 `StopFailure` covers a turn that ends on an API error, which fires no `Stop`.
 Without it the row stayed `working` until the TTL expired.
-`SubagentStop` and `PostCompact` refresh liveness without changing the state.
-Both report that something *finished*. A background subagent can finish after
-the turn's `Stop`, and a manual `/compact` can run from idle, so treating either
-as `working` would leave an idle row showing `working`.
+`SubagentStop`, `PreCompact` and `PostCompact` refresh liveness without changing
+the state. Each can fire while the session is idle: a background subagent can
+finish after the turn's `Stop`, and a manual `/compact` can run from idle. No
+event afterwards would release a `working`, so treating them as `working` would
+leave an idle row showing `working`. `PostToolBatch` is not installed. Every tool
+in a batch has already sent its own `PostToolUse` or `PostToolUseFailure`, so it
+would only add a process spawn per batch.
 `working` vs `idle` is best-effort, with the transcript-growth backstop covering
 the ~5–15s "thinking window" between a prompt and the first tool call, where no
 hook fires.
@@ -178,8 +182,8 @@ is the alert you never got. Feed 4 has no such gap, reporting `working` off the
 `Stop` / `UserPromptSubmit` / `SessionEnd` or the TTL releases it.
 
 The newer events (#1915) **narrow** this gap without closing it. An approved tool
-that *fails* now releases the wait at `PostToolUseFailure`, and a parallel batch
-releases it at `PostToolBatch`. The approval itself still fires no hook. Neither
+that *fails* now releases the wait at `PostToolUseFailure`. Before, it waited
+for the next hook. The approval itself still fires no hook. Neither
 does **denying** a prompt: the wait is released by whatever Claude does next
 (`PreToolUse`, `Stop`, or your next `UserPromptSubmit`). `PermissionDenied` is not
 that event. It fires only when **auto mode** refuses a call.
@@ -251,9 +255,8 @@ omni-dev sessions install-hooks --settings /path/to/settings.json
 `install-hooks` writes a `command` hook running `omni-dev sessions hook` for
 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`,
 `Stop`, `SessionEnd`, `PermissionRequest`, `PermissionDenied`,
-`PostToolUseFailure`, `PostToolBatch`, `StopFailure`, `Elicitation`,
-`ElicitationResult`, `SubagentStart`, `SubagentStop`, `PreCompact`, and
-`PostCompact`. The tool events (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
+`PostToolUseFailure`, `StopFailure`, `Elicitation`, `ElicitationResult`,
+`SubagentStart`, `SubagentStop`, `PreCompact`, and `PostCompact`. The tool events (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
 `PermissionRequest`, `PermissionDenied`) use the `*` matcher. It uses the absolute
 path of the running binary so Claude Code invokes *this* omni-dev regardless of
 its hook `PATH`. The portable manual form is `omni-dev sessions hook`.

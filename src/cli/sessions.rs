@@ -345,16 +345,20 @@ impl HookPayload {
 ///   [`HookCommand`] writes nothing to stdout;
 /// - `Elicitation` (an MCP server asking the user a question) is a wait for
 ///   input, released by its `ElicitationResult`;
-/// - `PostToolUseFailure`, `PostToolBatch` and `PermissionDenied` (auto mode
-///   refused a call and the turn goes on) are post-tool signals: `working`;
+/// - `PostToolUseFailure` and `PermissionDenied` (auto mode refused a call and
+///   the turn goes on) are post-tool signals: `working`;
 /// - `StopFailure` ends a turn on an API error, which fires no `Stop`;
-/// - `SubagentStart` and `PreCompact` mean work is starting: `working`;
-/// - `SubagentStop` and `PostCompact` mean only that something *finished*. A
-///   background subagent can finish after the turn's `Stop`, and a manual
-///   `/compact` can run from idle, so reading either as `working` would strand
-///   an idle row. They are the state-preserving
+/// - `SubagentStart` means a subagent is being spawned inside a turn: `working`;
+/// - `SubagentStop`, `PreCompact` and `PostCompact` can all fire while the
+///   session is idle — a background subagent finishing after the turn's `Stop`,
+///   a manual `/compact` — and nothing after them would release a `working`, so
+///   they are the state-preserving
 ///   [`TranscriptDiscovered`](SessionEvent::TranscriptDiscovered) sighting,
 ///   which refreshes liveness alone.
+///
+/// `PostToolBatch` is deliberately not installed: every tool in a batch has
+/// already reported its own `PostToolUse` / `PostToolUseFailure`, so it would be
+/// a process spawn per batch carrying no new state.
 ///
 /// No event fires when the user answers a permission prompt, either way; the
 /// wait is released by whatever hook comes next.
@@ -367,9 +371,9 @@ fn session_event_for(
         "SessionStart" => SessionEvent::SessionStart,
         "UserPromptSubmit" => SessionEvent::UserPromptSubmit,
         "PreToolUse" => SessionEvent::PreToolUse,
-        "PostToolUse" | "PostToolUseFailure" | "PostToolBatch" | "PermissionDenied"
-        | "ElicitationResult" | "SubagentStart" | "PreCompact" => SessionEvent::PostToolUse,
-        "SubagentStop" | "PostCompact" => SessionEvent::TranscriptDiscovered,
+        "PostToolUse" | "PostToolUseFailure" | "PermissionDenied" | "ElicitationResult"
+        | "SubagentStart" => SessionEvent::PostToolUse,
+        "SubagentStop" | "PreCompact" | "PostCompact" => SessionEvent::TranscriptDiscovered,
         "Stop" | "StopFailure" => SessionEvent::Stop,
         "PermissionRequest" => SessionEvent::Notification(NotificationKind::PermissionPrompt),
         "Elicitation" => SessionEvent::Notification(NotificationKind::AgentNeedsInput),
@@ -413,12 +417,14 @@ fn codex_session_event_for(event_name: &str, tool_name: Option<&str>) -> Option<
     })
 }
 
-/// Classifies a `Notification` into a [`NotificationKind`]: by Claude Code's own
-/// `notification_type` when it names a kind we know, else by best-effort
-/// substring matching on the message. The message text is version-unstable, and
-/// older versions send no type, so an unrecognised notification falls back to
-/// [`NotificationKind::Other`] (which carries no state signal and leaves the
-/// session's state unchanged).
+/// Classifies a `Notification` into a [`NotificationKind`]. A version that sends
+/// Claude Code's own `notification_type` is classified by it alone — a type we
+/// do not map (`auth_success`, …) is [`NotificationKind::Other`] rather than a
+/// guess at its message, which could mention "allow" or "permission" without
+/// asking for anything. Only an older version that sends no type falls back to
+/// best-effort substring matching on the version-unstable message text, where an
+/// unrecognised message is likewise [`NotificationKind::Other`] (which carries no
+/// state signal and leaves the session's state unchanged).
 fn classify_notification(
     notification_type: Option<&str>,
     message: Option<&str>,
@@ -427,7 +433,8 @@ fn classify_notification(
         Some("permission_prompt") => return NotificationKind::PermissionPrompt,
         Some("idle_prompt") => return NotificationKind::IdlePrompt,
         Some("elicitation_dialog") => return NotificationKind::AgentNeedsInput,
-        _ => {}
+        Some(_) => return NotificationKind::Other,
+        None => {}
     }
     let Some(message) = message else {
         return NotificationKind::Other;
@@ -908,8 +915,9 @@ impl HookSpec {
 
 /// The Claude Code hook events the tracker installs. `SessionEnd` is included —
 /// it maps to the `end` op in the sink. The events after `SessionEnd` narrow
-/// the hooks-only state gaps (#1915); a Claude Code version that predates one
-/// drops it with a warning rather than rejecting the settings file.
+/// the hooks-only state gaps (#1915). Claude Code 2.1.280 drops a hook event it
+/// does not know with a warning rather than rejecting the settings file; how
+/// older versions treat one is unverified (docs/sessions-service.md).
 const HOOK_EVENTS: &[HookSpec] = &[
     HookSpec::new("SessionStart"),
     HookSpec::new("UserPromptSubmit"),
@@ -921,7 +929,6 @@ const HOOK_EVENTS: &[HookSpec] = &[
     HookSpec::matched("PermissionRequest"),
     HookSpec::matched("PermissionDenied"),
     HookSpec::matched("PostToolUseFailure"),
-    HookSpec::new("PostToolBatch"),
     HookSpec::new("StopFailure"),
     HookSpec::new("Elicitation"),
     HookSpec::new("ElicitationResult"),
@@ -1694,18 +1701,16 @@ mod tests {
         );
         for working in [
             "PostToolUseFailure",
-            "PostToolBatch",
             "PermissionDenied",
             "ElicitationResult",
             "SubagentStart",
-            "PreCompact",
         ] {
             assert_eq!(claude_event(working), "post_tool_use", "{working}");
         }
         assert_eq!(claude_event("StopFailure"), "stop");
-        // A finish is a liveness-only sighting: it must not turn an idle
-        // session back to working (a background subagent, a manual /compact).
-        for preserving in ["SubagentStop", "PostCompact"] {
+        // Liveness-only sightings: each can fire while the session is idle (a
+        // background subagent, a manual /compact) and must not turn it working.
+        for preserving in ["SubagentStop", "PreCompact", "PostCompact"] {
             assert_eq!(
                 claude_event(preserving),
                 "transcript_discovered",
@@ -1726,7 +1731,7 @@ mod tests {
 
     #[test]
     fn a_finished_subagent_or_compaction_leaves_an_idle_session_idle() {
-        for preserving in ["SubagentStop", "PostCompact"] {
+        for preserving in ["SubagentStop", "PreCompact", "PostCompact"] {
             let hook = json!({ "session_id": "s1", "hook_event_name": preserving });
             let (_, payload) = hook_op(&hook.to_string()).unwrap();
             let event: SessionEvent = serde_json::from_value(payload["event"].clone()).unwrap();
@@ -1761,12 +1766,14 @@ mod tests {
         );
         assert_eq!(typed("idle_prompt", "Please approve"), "idle_prompt");
         assert_eq!(typed("elicitation_dialog", "x"), "agent_needs_input");
-        // An unrecognised type falls back to the message, as before types.
-        assert_eq!(
-            typed("worker_permission_prompt", "Claude needs your permission"),
-            "permission_prompt"
-        );
-        assert_eq!(typed("auth_success", "Signed in"), "other");
+        // A type we do not map is `other`, never a guess at its message.
+        assert_eq!(typed("auth_success", "You can now allow access"), "other");
+        // With no type at all (an older version), the message is classified.
+        let untyped = hook_op(
+            r#"{"session_id":"s1","hook_event_name":"Notification","message":"Claude needs your permission"}"#,
+        )
+        .unwrap();
+        assert_eq!(untyped.1["event"]["notification"], "permission_prompt");
     }
 
     #[test]
