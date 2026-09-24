@@ -480,6 +480,19 @@
           "type": "string",
           "default": "claude",
           "markdownDescription": "Command run by **Agent: Launch Claude Code** (default `claude`). A shell prefix is allowed, e.g. `proxy && claude`."
+        },
+        "omniDevWorktrees.piTabTitle": {
+          "type": "string",
+          "enum": [
+            "name",
+            "native"
+          ],
+          "enumDescriptions": [
+            "Show only the session name set with `/name` (the launcher's `pi.dev` title until one is set).",
+            "Show pi's own title, `pi - <name> - <directory>`."
+          ],
+          "default": "name",
+          "markdownDescription": "Tab title for terminals started by **Agent: Launch pi.dev**. `name` shows exactly the value set with `/name` inside pi, by launching pi with a small bundled pi extension (`pi -e`) that retitles the terminal; unnamed sessions keep the launcher's `pi.dev`, `pi.dev 2`, … title. `native` runs plain `pi` and shows pi's own title, which also includes the working directory's name. Applies to newly launched terminals."
         }
       }
     }

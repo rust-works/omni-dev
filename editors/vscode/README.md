@@ -206,10 +206,14 @@ effects. Every launch creates a fresh terminal docked as an **editor tab**.
 - **Launch pi.dev** starts `pi` in an explicit interactive login **zsh** shell,
   regardless of the configured default terminal profile. Concurrent terminals
   initially use `pi.dev`, `pi.dev 2`, and so on. Use `/name Blah` inside pi to
-  update its session name; pi's title includes the name and working directory
-  (for example, `pi - Blah - my-project`). It checks that both zsh and pi are
-  available before creating a terminal and explains how to install the missing
-  tool if either check fails.
+  name the session; the tab then shows exactly `Blah`. pi's own title also
+  includes the working directory's name (`pi - Blah - my-project`), so the
+  launcher starts pi with a small bundled pi extension (`pi -e …/pi-title.mjs`)
+  that retitles the terminal with the name alone. Set
+  `omniDevWorktrees.piTabTitle` to `native` to run plain `pi` and keep pi's
+  own title instead. It checks that both zsh and pi are available before
+  creating a terminal and explains how to install the missing tool if either
+  check fails.
 
 The extension defaults **Terminal › Integrated › Tabs: Title**
 (`terminal.integrated.tabs.title`) to `${sequence}`, so tabs follow titles
