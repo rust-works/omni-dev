@@ -37,7 +37,9 @@
 //!
 //! Codex is a second hook feed: `omni-dev sessions hook --agent codex`, run from
 //! `$CODEX_HOME/hooks.json`, maps Codex's events onto the same [`SessionEvent`]s
-//! and tags its sessions [`Agent::Codex`] (#1907, ADR-0087).
+//! and tags its sessions [`Agent::Codex`] (#1907, ADR-0087). The
+//! [`codex_watcher`] supplements it from Codex's rollout files and thread locks:
+//! discovery, archive and killed-process ends, and idle liveness (#1909).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +50,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+pub mod codex_watcher;
 pub mod relocate;
 pub mod stream;
 pub mod watcher;
@@ -526,41 +529,53 @@ impl SessionsRegistry {
         let changed = {
             let mut sessions = self.lock_sessions();
             let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, now);
-            let mutated = if let Some(entry) = sessions.get_mut(&req.session_id) {
-                let next = SessionState::for_event(&req.event, Some(entry.state));
-                let state_changed = next != entry.state;
-                entry.state = next;
-                entry.last_event = req.event;
-                entry.last_seen = now;
-                // Bound to locals rather than folded into the `||` below: every
-                // field must be filled, and short-circuiting would skip the rest.
-                let filled_cwd = fill(&mut entry.cwd, req.cwd);
-                let filled_transcript = fill(&mut entry.transcript_path, req.transcript_path);
-                let filled_repo = fill(&mut entry.repo, req.repo);
-                let filled_model = fill(&mut entry.model, req.model);
-                state_changed || filled_cwd || filled_transcript || filled_repo || filled_model
-            } else {
-                if sessions.len() >= MAX_SESSIONS {
-                    evict_oldest_session(&mut sessions);
+            let mutated = match sessions.get_mut(&req.session_id) {
+                // A passive re-sighting (the Codex rollout watcher's heartbeat)
+                // must not refresh an ended session, or it would outlive its
+                // short ended-linger window (#1909).
+                Some(entry)
+                    if entry.state == SessionState::Ended
+                        && req.event == SessionEvent::TranscriptDiscovered =>
+                {
+                    false
                 }
-                let state = SessionState::for_event(&req.event, None);
-                sessions.insert(
-                    req.session_id.clone(),
-                    SessionEntry {
-                        session_id: req.session_id,
-                        cwd: req.cwd,
-                        transcript_path: req.transcript_path,
-                        repo: req.repo,
-                        model: req.model,
-                        agent: req.agent,
-                        state,
-                        source: Source::Terminal,
-                        last_event: req.event,
-                        started_at: now,
-                        last_seen: now,
-                    },
-                );
-                true
+                Some(entry) => {
+                    let next = SessionState::for_event(&req.event, Some(entry.state));
+                    let state_changed = next != entry.state;
+                    entry.state = next;
+                    entry.last_event = req.event;
+                    entry.last_seen = now;
+                    // Bound to locals rather than folded into the `||` below: every
+                    // field must be filled, and short-circuiting would skip the rest.
+                    let filled_cwd = fill(&mut entry.cwd, req.cwd);
+                    let filled_transcript = fill(&mut entry.transcript_path, req.transcript_path);
+                    let filled_repo = fill(&mut entry.repo, req.repo);
+                    let filled_model = fill(&mut entry.model, req.model);
+                    state_changed || filled_cwd || filled_transcript || filled_repo || filled_model
+                }
+                None => {
+                    if sessions.len() >= MAX_SESSIONS {
+                        evict_oldest_session(&mut sessions);
+                    }
+                    let state = SessionState::for_event(&req.event, None);
+                    sessions.insert(
+                        req.session_id.clone(),
+                        SessionEntry {
+                            session_id: req.session_id,
+                            cwd: req.cwd,
+                            transcript_path: req.transcript_path,
+                            repo: req.repo,
+                            model: req.model,
+                            agent: req.agent,
+                            state,
+                            source: Source::Terminal,
+                            last_event: req.event,
+                            started_at: now,
+                            last_seen: now,
+                        },
+                    );
+                    true
+                }
             };
             mutated || reaped > 0
         };
@@ -579,19 +594,23 @@ impl SessionsRegistry {
             let mut sessions = self.lock_sessions();
             let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, now);
             let known = match sessions.get_mut(session_id) {
+                // Already ended (a hook and a watcher can both end it): leave the
+                // linger window alone rather than restart it.
+                Some(entry) if entry.state == SessionState::Ended => (true, false),
                 Some(entry) => {
                     entry.state = SessionState::Ended;
                     entry.last_event = SessionEvent::Stop;
                     entry.last_seen = now;
-                    true
+                    (true, true)
                 }
-                None => false,
+                None => (false, false),
             };
             (known, reaped)
         };
-        // A known session flipped to `ended`; an unknown one changed nothing, so
-        // only this call's inline reap could have.
-        if known || reaped > 0 {
+        let (known, flipped) = known;
+        // A known session flipped to `ended`; otherwise only this call's inline
+        // reap could have changed anything.
+        if flipped || reaped > 0 {
             self.bump();
         }
         known
@@ -1267,6 +1286,36 @@ mod tests {
         assert_eq!(Agent::Claude.display_name(), "Claude");
         assert_eq!(Agent::Pi.display_name(), "pi");
         assert_eq!(Agent::Codex.display_name(), "Codex");
+    }
+
+    #[test]
+    fn an_ended_session_is_not_refreshed_by_a_passive_sighting_or_a_second_end() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request("s", SessionEvent::Stop, None));
+        assert!(reg.end("s", None));
+        let ended_at = reg.list()[0].last_seen;
+        let mut changes = reg.subscribe_changes();
+        changes.mark_unchanged();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        reg.observe(observe_request(
+            "s",
+            SessionEvent::TranscriptDiscovered,
+            None,
+        ));
+        assert!(reg.end("s", None), "still a known session");
+        let listed = reg.list();
+        assert_eq!(listed[0].state, SessionState::Ended);
+        assert_eq!(
+            listed[0].last_seen, ended_at,
+            "the linger window did not restart"
+        );
+        assert!(
+            !changes.has_changed().unwrap(),
+            "no consumer-visible change"
+        );
+        // A hook event still revives it, as before.
+        reg.observe(observe_request("s", SessionEvent::UserPromptSubmit, None));
+        assert_eq!(reg.list()[0].state, SessionState::Working);
     }
 
     #[test]

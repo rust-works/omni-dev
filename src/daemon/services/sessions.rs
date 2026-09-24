@@ -43,12 +43,13 @@ pub const SERVICE_NAME: &str = "sessions";
 /// agent the `agent` tag names, and each row says which (#1908).
 const SUBMENU_TITLE: &str = "Agent Sessions";
 
-/// A running background transcript-watcher task and the token that stops it.
+/// The running background watcher tasks — the Claude transcript watcher and the
+/// Codex rollout watcher — and the one token that stops them both.
 struct WatcherTask {
-    /// Cancelled by `shutdown` to end the watch loop.
+    /// Cancelled by `shutdown` to end the watch loops.
     token: CancellationToken,
-    /// The spawned loop, awaited on shutdown so it fully unwinds.
-    handle: JoinHandle<()>,
+    /// The spawned loops, awaited on shutdown so they fully unwind.
+    handles: Vec<JoinHandle<()>>,
 }
 
 /// Hosts the cross-window [`SessionsRegistry`] as a [`DaemonService`].
@@ -77,7 +78,9 @@ impl SessionsService {
     /// that scans `~/.claude/projects/**/*.jsonl` for new/growing transcripts and
     /// feeds the registry, so a session started before the daemon — or working
     /// through the hook-silent thinking window — is still discovered and marked
-    /// active. Idempotent, and a no-op outside a tokio runtime (mirroring the
+    /// active. Alongside it runs the Codex rollout watcher (#1909), which
+    /// discovers Codex sessions from `$CODEX_HOME/sessions/` and ends archived
+    /// or killed ones. Idempotent, and a no-op outside a tokio runtime (mirroring the
     /// worktrees menu-refresh and Snowflake keep-alive tasks), so unit tests that
     /// build a bare service start no watcher.
     pub fn start_watcher(&self) {
@@ -90,8 +93,11 @@ impl SessionsService {
             return;
         }
         let token = CancellationToken::new();
-        let handle = crate::sessions::watcher::spawn(self.registry.clone(), token.clone());
-        *guard = Some(WatcherTask { token, handle });
+        let handles = vec![
+            crate::sessions::watcher::spawn(self.registry.clone(), token.clone()),
+            crate::sessions::codex_watcher::spawn(self.registry.clone(), token.clone()),
+        ];
+        *guard = Some(WatcherTask { token, handles });
     }
 
     /// The registry, for tests driving the service directly.
@@ -216,7 +222,9 @@ impl DaemonService for SessionsService {
             .take();
         if let Some(task) = task {
             task.token.cancel();
-            let _ = task.handle.await;
+            for handle in task.handles {
+                let _ = handle.await;
+            }
         }
     }
 }
