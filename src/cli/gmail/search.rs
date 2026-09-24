@@ -7,14 +7,13 @@ use clap::Parser;
 
 use crate::cli::gmail::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::gmail::client::GmailClient;
-use crate::gmail::messages_api::{MessageSummary, MessagesApi, DEFAULT_SEARCH_LIMIT};
+use crate::gmail::messages_api::{
+    MessageSummary, MessagesApi, DEFAULT_ENRICH_CONCURRENCY, DEFAULT_SEARCH_LIMIT,
+};
 use crate::gmail::types::MessageRef;
 
 /// Maximum snippet length shown in the table view before truncation.
 const SNIPPET_TRUNCATE_AT: usize = 60;
-
-/// Default bound on concurrent `messages.get` calls when `--enrich` is set.
-const DEFAULT_ENRICH_CONCURRENCY: usize = 4;
 
 /// Searches Gmail messages (mirrors the `gmail_search` MCP tool).
 ///
