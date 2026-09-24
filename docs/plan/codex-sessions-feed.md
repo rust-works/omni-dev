@@ -56,6 +56,16 @@ not per surface. Each entry is keyed by **position and content** — a
 (#1868 found the path half for project hooks) — so moving a hook to another
 group index, or changing its command string, makes it untrusted again.
 
+Verified on 0.155.1 (2026-09-25) with project hooks in a scratch repo, two
+trusted `UserPromptSubmit` groups A and B, and one `codex exec` per layout:
+
+| `hooks.json` layout            | Fired   | Reading                                        |
+|--------------------------------|---------|------------------------------------------------|
+| `[A, B]`                       | A, B    | baseline                                       |
+| `[B]` (A's group removed)      | nothing | B moved to index 0 and is silently untrusted   |
+| `[A, B, C]` (C appended)       | A, B    | appending moves nothing; new C awaits trust    |
+| `[{ "hooks": [] }, B]`         | B       | an empty placeholder group keeps B's position  |
+
 ## Event/state matrix
 
 Columns: whether the event fired on that surface; the state it should drive; and
@@ -202,15 +212,18 @@ compaction/subagent events. `PreToolUse`/`PostToolUse` keep the `*` matcher.
 
 Three trust and tagging details shape the install:
 
-- **Replace untagged entries.** A user who already points Codex at
+- **Replace untagged entries in place.** A user who already points Codex at
   `omni-dev sessions hook` has untagged commands in `hooks.json`. Left beside the
   tagged ones, they race to be a session's first sighting and can fix its tag as
-  `claude`, so install must replace them rather than add alongside.
+  `claude`, so install must replace them rather than add alongside — rewriting
+  the command where it sits, so no other hook moves.
 - **Stay position-stable.** `merge_hooks` appends a group, which moves no existing
   entry. `remove_hooks` drops groups it empties, which shifts every later group in
-  that event down one index and silently untrusts those hooks. Uninstall should
-  say which events had hooks after ours; the tests should pin that install never
-  reorders.
+  that event down one index and silently untrusts those hooks (verified above).
+  The Codex path should instead leave an empty `{ "hooks": [] }` group wherever
+  it empties one that is not last in its event; a trailing group can still be
+  dropped. The tests should pin both: install never reorders, uninstall never
+  shifts a surviving group's index.
 - **Print the trust step.** After install the user must trust the hooks once via
   `/hooks`, and again after any change to the installed command string. Both
   commands must say so, since an untrusted hook is skipped without any message.
@@ -229,7 +242,9 @@ Daemon (`src/sessions.rs`, additive on the wire):
   impossible, and not worth a re-key.
 - Version skew: a daemon older than #1901 ignores the field and shows Codex
   sessions as Claude's; one with the two-value `Agent` fails to deserialise
-  `"codex"`, so the fail-open sink's POST is dropped until the daemon is upgraded.
+  `"codex"` (checked against the current `ObserveRequest`: `` unknown variant
+  `codex`, expected `claude` or `pi` ``), so the fail-open sink's POST is dropped
+  until the daemon is upgraded.
 - `Source` is unchanged: the `cwd` join already places an IDE Codex session on
   its VS Code window. A Desktop chat started from the app lives under
   `~/Documents/Codex/<date>/<slug>/`, which no window has open, so it falls to
