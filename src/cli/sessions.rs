@@ -1468,12 +1468,106 @@ mod tests {
             SessionsSubcommands::InstallHooks(cmd) => {
                 assert_eq!(cmd.pi_agent_dir, Some(PathBuf::from("/x/agent")));
             }
-            _ => panic!("expected install-hooks"),
+            _ => panic!("expected install-hooks"), // omni-dev: coverage ignore-line reason="the arm above always matches: parse() above always parses an install-hooks argv into SessionsSubcommands::InstallHooks"
         }
         match parse(&["uninstall-hooks"]) {
             SessionsSubcommands::UninstallHooks(cmd) => assert_eq!(cmd.pi_agent_dir, None),
-            _ => panic!("expected uninstall-hooks"),
+            _ => panic!("expected uninstall-hooks"), // omni-dev: coverage ignore-line reason="the arm above always matches: parse() above always parses an uninstall-hooks argv into SessionsSubcommands::UninstallHooks"
         }
+    }
+
+    /// Env-isolation lock for tests that mutate `PI_CODING_AGENT_DIR`, `PATH`,
+    /// or `HOME` to exercise [`default_pi_agent_dir`]'s and
+    /// [`install_pi_extension`]'s env-driven branches. Aliases the crate-wide
+    /// [`crate::test_support::HOME_ENV_MUTEX`] per its own doc comment
+    /// (issue #1465), rather than a module-local `Mutex<()>`.
+    static PI_ENV_LOCK: &std::sync::Mutex<()> = &crate::test_support::HOME_ENV_MUTEX;
+
+    fn snapshot_pi_env() -> [(&'static str, Option<std::ffi::OsString>); 3] {
+        ["PI_CODING_AGENT_DIR", "PATH", "HOME"].map(|k| (k, std::env::var_os(k)))
+    }
+
+    fn restore_pi_env(snap: [(&'static str, Option<std::ffi::OsString>); 3]) {
+        for (k, v) in snap {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn default_pi_agent_dir_honors_the_env_var_and_falls_back_to_home() {
+        let _guard = PI_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snap = snapshot_pi_env();
+
+        // An explicit, non-empty env var wins.
+        std::env::set_var("PI_CODING_AGENT_DIR", "/explicit/agent");
+        assert_eq!(
+            default_pi_agent_dir().unwrap(),
+            PathBuf::from("/explicit/agent")
+        );
+
+        // An empty env var is treated as unset, falling back to `$HOME/.pi/agent`.
+        std::env::set_var("PI_CODING_AGENT_DIR", "");
+        std::env::set_var("HOME", "/home/tester");
+        assert_eq!(
+            default_pi_agent_dir().unwrap(),
+            PathBuf::from("/home/tester/.pi/agent")
+        );
+
+        // A wholly unset env var falls back the same way.
+        std::env::remove_var("PI_CODING_AGENT_DIR");
+        assert_eq!(
+            default_pi_agent_dir().unwrap(),
+            PathBuf::from("/home/tester/.pi/agent")
+        );
+
+        restore_pi_env(snap);
+    }
+
+    #[test]
+    fn install_pi_extension_via_the_default_dir_skips_absent_and_writes_present() {
+        let _guard = PI_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snap = snapshot_pi_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("nonexistent-agent");
+        let empty_bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&empty_bin).unwrap();
+
+        std::env::set_var("PI_CODING_AGENT_DIR", &agent_dir);
+        std::env::set_var("PATH", std::env::join_paths([&empty_bin]).unwrap());
+
+        // Neither the agent dir exists nor is `pi` on PATH: install skips,
+        // via default_pi_agent_dir()'s env-var branch.
+        install_pi_extension(None).unwrap();
+        assert!(
+            !agent_dir.exists(),
+            "install must not create the agent dir when pi is absent"
+        );
+
+        // Uninstall with no explicit dir also resolves via default_pi_agent_dir()
+        // and is a no-op since nothing was ever installed there.
+        uninstall_pi_extension(None).unwrap();
+
+        // Once the agent dir exists, pi counts as present: install falls
+        // through to actually write the extension, still via the env-resolved
+        // default dir (no explicit `--pi-agent-dir`).
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        install_pi_extension(None).unwrap();
+        let extension = agent_dir.join("extensions").join(PI_EXTENSION_NAME);
+        assert!(extension.exists());
+
+        // Uninstall with no explicit dir removes what install just wrote.
+        uninstall_pi_extension(None).unwrap();
+        assert!(!extension.exists());
+
+        restore_pi_env(snap);
     }
 
     #[test]
