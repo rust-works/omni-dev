@@ -1,6 +1,6 @@
 # Codex Sessions Feed
 
-**Status:** Aspirational — investigation complete (#1861); implementation not started, tracked in the follow-up issues listed at the end
+**Status:** Aspirational — investigation complete (#1861), revised 2026-09-24 to build on the `agent` tag #1901 added; implementation not started, tracked in the follow-up issues listed at the end
 **ADRs:** [ADR-0052](../adrs/adr-0052.md) · [ADR-0057](../adrs/adr-0057.md) · [ADR-0087](../adrs/adr-0087.md)
 
 ## Overview
@@ -20,6 +20,14 @@ tray, CLI and both UIs present every entry as a Claude session — and the two
 Codex-only events that carry the most useful signal (`PermissionRequest`,
 `Interrupt`) are silently dropped by the sink
 ([`session_event_for`](../../src/cli/sessions.rs)).
+
+Since the investigation, #1901 (PR #1902) added pi.dev as a fifth feed and, with
+it, most of the identity half of this plan: an `agent` tag on `ObserveRequest` and
+`SessionEntry` (`claude` by default and omitted on the wire, or `pi`), fixed by a
+session's first sighting, plus an `AGENT` column in `sessions list`, with the
+registry still keyed by `session_id` alone. This plan therefore adds Codex as a
+third value of that tag rather than the separate "provider" dimension the first
+draft proposed.
 
 ## Test setup
 
@@ -42,8 +50,11 @@ exercised the current sink.
 
 Trust: an untrusted hook is **silently skipped** — `codex exec` ran it zero times
 and printed no warning. One `/hooks` approval in the CLI covered the VS Code
-extension without a second prompt (trust is stored per hook hash under
-`~/.codex`, not per surface).
+extension without a second prompt: trust lives in the one `~/.codex/config.toml`,
+not per surface. Each entry is keyed by **position and content** — a
+`trusted_hash` under `[hooks.state."<hooks.json path>:<event>:<group>:<hook>"]`
+(#1868 found the path half for project hooks) — so moving a hook to another
+group index, or changing its command string, makes it untrusted again.
 
 ## Event/state matrix
 
@@ -155,14 +166,16 @@ CLI event for event wherever the same scenario was run, which is what the shared
 
 ## Sink design
 
-Recommend **one sink with an explicit provider**, `omni-dev sessions hook
---provider codex`, rather than a separate `codex-hook` subcommand:
+Recommend **one sink with an explicit agent**, `omni-dev sessions hook
+--agent codex`, rather than a separate `codex-hook` subcommand:
 
-- The provider cannot be inferred from the payload safely — the field names are
+- The agent cannot be inferred from the payload safely — the field names are
   Claude's, and the one Codex-only field (`turn_id`) is absent on `SessionStart`
   and `SessionEnd`, exactly the two events that create and end an entry.
 - `report`, `HookPayload` and the fire-and-forget POST are reused verbatim; only
-  `session_event_for` grows a provider-aware arm.
+  `session_event_for` grows an agent-aware arm, and the request carries
+  `agent: codex` from the first event, since the tag is fixed by a session's
+  first sighting.
 - Required stdout: none. Exit 0 with empty stdout is a no-op for every event —
   verified for `PermissionRequest` (the prompt still appeared) and for
   `Stop`/`Interrupt` (no continuation was injected).
@@ -177,28 +190,46 @@ unchanged): `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
 over the diff being minimal, a `SessionEvent::Activity` variant is the honest
 spelling of the last group.
 
-Install/uninstall: `omni-dev sessions install-hooks --provider codex` (or
-`install-codex-hooks`) targets `$CODEX_HOME/hooks.json`, defaulting to
-`~/.codex/hooks.json`. The file has the **same shape** as Claude's `settings.json`
-`hooks` object, so `merge_hooks`/`remove_hooks`/`read_settings`/`write_settings`
-apply unchanged with a Codex event list: the seven Claude events minus
-`Notification`, plus `PermissionRequest` and `Interrupt` (with `timeout: 3`) and
-the four compaction/subagent events. `PreToolUse`/`PostToolUse` keep the `*`
-matcher. After install the user must trust the hook once via `/hooks`; the
-command must document that, since an untrusted hook is skipped without any
-message.
+Install/uninstall follow the pattern #1901 set for pi: `omni-dev sessions
+install-hooks` also installs into `$CODEX_HOME/hooks.json` (default
+`~/.codex/hooks.json`) when Codex is present — its home directory exists or
+`codex` is on `PATH` — and `--codex-home` forces it; `uninstall-hooks` removes it.
+The file has the **same shape** as Claude's `settings.json` `hooks` object, so
+`merge_hooks`/`remove_hooks`/`read_settings`/`write_settings` apply with a Codex
+event list: the seven Claude events minus `Notification`, plus
+`PermissionRequest` and `Interrupt` (with `timeout: 3`) and the four
+compaction/subagent events. `PreToolUse`/`PostToolUse` keep the `*` matcher.
+
+Three trust and tagging details shape the install:
+
+- **Replace untagged entries.** A user who already points Codex at
+  `omni-dev sessions hook` has untagged commands in `hooks.json`. Left beside the
+  tagged ones, they race to be a session's first sighting and can fix its tag as
+  `claude`, so install must replace them rather than add alongside.
+- **Stay position-stable.** `merge_hooks` appends a group, which moves no existing
+  entry. `remove_hooks` drops groups it empties, which shifts every later group in
+  that event down one index and silently untrusts those hooks. Uninstall should
+  say which events had hooks after ours; the tests should pin that install never
+  reorders.
+- **Print the trust step.** After install the user must trust the hooks once via
+  `/hooks`, and again after any change to the installed command string. Both
+  commands must say so, since an untrusted hook is skipped without any message.
 
 ## Data contract
 
 Daemon (`src/sessions.rs`, additive on the wire):
 
-- `provider: "claude" | "codex"` on `ObserveRequest`, `EndRequest` and
-  `SessionEntry`; `#[serde(default)]` to `claude`, always serialised. An old sink
-  or client keeps working; an old daemon ignores the field.
-- Registry key becomes `(provider, session_id)`. Both providers use UUIDs, so a
-  collision is improbable, but the key is the contract that makes a provider a
-  first-class dimension rather than a label; it ripples into `focus_folder`,
-  eviction and the tray action id (`focus:<provider>:<session_id>`).
+- `Agent::Codex` (`"codex"`) on #1901's existing `agent` field of
+  `ObserveRequest` and `SessionEntry`; absent still means `claude`. `EndRequest`
+  needs nothing, since `end` addresses a session by id.
+- The registry stays keyed by `session_id`; `focus_folder`, eviction and the tray
+  action id (`focus:<session_id>`) are untouched. #1901 justified single-key
+  identity by version nibble (Claude v4, pi v7), but Codex ids are v7 too, so the
+  `Agent` doc comment should instead cite v7's 74 random bits: improbable, not
+  impossible, and not worth a re-key.
+- Version skew: a daemon older than #1901 ignores the field and shows Codex
+  sessions as Claude's; one with the two-value `Agent` fails to deserialise
+  `"codex"`, so the fail-open sink's POST is dropped until the daemon is upgraded.
 - `Source` is unchanged: the `cwd` join already places an IDE Codex session on
   its VS Code window. A Desktop chat started from the app lives under
   `~/Documents/Codex/<date>/<slug>/`, which no window has open, so it falls to
@@ -211,13 +242,15 @@ Daemon (`src/sessions.rs`, additive on the wire):
 
 UI:
 
-- Tray: title `Agent Sessions`; each row prefixed by a provider glyph.
-- `omni-dev sessions list`: a `PROVIDER` column.
+- `omni-dev sessions list`: done — #1901's `AGENT` column; `agent_label` gains
+  the `codex` arm.
+- Tray: title `Agent Sessions` (the current `Claude Sessions` already
+  misdescribes pi); each row prefixed by its agent.
 - VS Code (`sessionCounts.ts`): `classifyModel` gains a `g` family for `gpt-*`
-  ids (today they fall to `*`); the tooltip prefix `Claude:` becomes the provider
+  ids (today they fall to `*`); the tooltip prefix `Claude:` becomes the agent
   name; `decorations.ts` keeps its `claude` query key for wire compatibility (noted
   as debt). Glyphs and colours stay state-driven, so nothing changes there.
-- TUI (`render.rs::sessions_summary`): `({provider} {model}, {source})`.
+- TUI (`render.rs::sessions_summary`): `({agent} {model}, {source})`.
 
 ## Supplementary signals
 
@@ -249,10 +282,11 @@ UI:
 
 ## Follow-ups
 
-1. Provider tag on the wire, `PermissionRequest`/`Interrupt`/`request_user_input`
-   mapping, `sessions hook --provider codex`, `install-hooks --provider codex`
-   (docs/sessions-service.md, snapshots).
-2. Provider labels in the tray, `sessions list`, VS Code (`classifyModel`,
-   tooltip) and the TUI.
+1. `Agent::Codex`, the `PermissionRequest`/`Interrupt`/`request_user_input`
+   mapping, `sessions hook --agent codex`, and Codex detection in
+   `install-hooks`/`uninstall-hooks` with `--codex-home`, replacing untagged
+   entries and keeping positions stable (docs/sessions-service.md, snapshots).
+2. Agent labels where #1901 did not add them: the tray (and its title), VS Code
+   (`classifyModel`, tooltip) and the TUI. These cover pi as well.
 3. Codex rollout watcher with subagent filtering.
 4. (Optional) App Server `thread/list` observer for sessions omni-dev launches.
