@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { PI_TERMINAL_NAME, checkPiLaunch, nextPiTerminalName, zshSearchPaths } from "./pi";
+import {
+  PI_TERMINAL_NAME,
+  checkPiLaunch,
+  nextPiTerminalName,
+  piLaunchCommand,
+  quoteForZsh,
+  resolvePiTitleMode,
+  zshSearchPaths,
+} from "./pi";
 
 test("zshSearchPaths finds Windows zsh.exe on PATH", () => {
   assert.deepEqual(zshSearchPaths("win32", "C:\\msys64\\usr\\bin;D:\\tools"), [
@@ -54,4 +62,31 @@ test("checkPiLaunch verifies pi in the resolved zsh environment", async () => {
 test("checkPiLaunch returns the zsh path when pi is available", async () => {
   const result = await checkPiLaunch(async () => "/usr/local/bin/zsh", async () => true);
   assert.deepEqual(result, { kind: "ready", zshPath: "/usr/local/bin/zsh" });
+});
+
+test("resolvePiTitleMode defaults anything but native to name", () => {
+  assert.equal(resolvePiTitleMode("native"), "native");
+  assert.equal(resolvePiTitleMode("name"), "name");
+  assert.equal(resolvePiTitleMode(undefined), "name");
+  assert.equal(resolvePiTitleMode("bogus"), "name");
+});
+
+test("piLaunchCommand runs plain pi in native mode", () => {
+  assert.equal(piLaunchCommand("native", "/ext/dist/pi-title.mjs"), "pi");
+});
+
+test("piLaunchCommand loads the quoted title extension in name mode", () => {
+  assert.equal(
+    piLaunchCommand("name", "/Users/me/.vscode/extensions/rust-works.omni-dev-0.9.0/dist/pi-title.mjs"),
+    "pi -e '/Users/me/.vscode/extensions/rust-works.omni-dev-0.9.0/dist/pi-title.mjs'",
+  );
+  assert.equal(
+    piLaunchCommand("name", "C:\\Users\\Jo Bloggs\\ext\\dist\\pi-title.mjs"),
+    "pi -e 'C:\\Users\\Jo Bloggs\\ext\\dist\\pi-title.mjs'",
+  );
+});
+
+test("quoteForZsh keeps metacharacters literal and escapes single quotes", () => {
+  assert.equal(quoteForZsh("a b$c`d"), "'a b$c`d'");
+  assert.equal(quoteForZsh("it's"), "'it'\\''s'");
 });

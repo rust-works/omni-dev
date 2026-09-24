@@ -44,7 +44,14 @@ import { SessionEntry, tallyByWorktree, tallyModelsByWorktree } from "./sessionC
 import { copyPullRequestUrls, openPullRequest, openPullRequestInBrowser } from "./prCommands";
 import { openGithubRepository } from "./repoCommands";
 import { nextClaudeTerminalName, resolveClaudeCommand, resolveClaudeCwd } from "./claude";
-import { checkPiLaunch, nextPiTerminalName, zshSearchPaths } from "./pi";
+import {
+  checkPiLaunch,
+  nextPiTerminalName,
+  piLaunchCommand,
+  resolvePiTitleMode,
+  zshSearchPaths,
+} from "./pi";
+import { PI_TITLE_FALLBACK_ENV } from "./piTitle";
 import { agentTerminalIdentity, agentTerminalOptions } from "./agentTerminal";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
 import { pushForceWithLease } from "./pushCommand";
@@ -130,6 +137,8 @@ const EMPTY_MESSAGE = "No worktrees are open in any VS Code window yet.";
  * whose per-window uniqueness is unverified.
  */
 let windowKey: string;
+/** Absolute path of the bundled pi title extension, dist/pi-title.mjs (#1899). */
+let piTitleExtensionPath: string;
 let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 let output: vscode.OutputChannel | undefined;
 
@@ -509,6 +518,7 @@ async function heartbeat(): Promise<void> {
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   windowKey = randomUUID();
+  piTitleExtensionPath = context.asAbsolutePath("dist/pi-title.mjs");
   output = vscode.window.createOutputChannel("omni-dev");
   context.subscriptions.push(output);
 
@@ -1263,8 +1273,11 @@ async function openPi(): Promise<void> {
       : undefined;
   const cwd = resolveClaudeCwd(folders, activeFolder);
   const name = nextPiTerminalName(vscode.window.terminals.map((terminal) => terminal.name));
+  const titleMode = resolvePiTitleMode(config().get<string>("piTabTitle"));
+  const agentOptions = agentTerminalOptions("pi", name);
   const terminal = vscode.window.createTerminal({
-    ...agentTerminalOptions("pi", name),
+    ...agentOptions,
+    env: { ...agentOptions.env, [PI_TITLE_FALLBACK_ENV]: name },
     cwd,
     shellPath: launch.zshPath,
     shellArgs: ["-l"],
@@ -1272,7 +1285,7 @@ async function openPi(): Promise<void> {
     iconPath: new vscode.ThemeIcon("rocket"),
   });
   terminal.show();
-  terminal.sendText("pi", true);
+  terminal.sendText(piLaunchCommand(titleMode, piTitleExtensionPath), true);
 }
 
 /**

@@ -35,6 +35,28 @@ export function nextPiTerminalName(existing: readonly string[]): string {
   }
 }
 
+/** `omniDevWorktrees.piTabTitle`: the `/name` value only, or pi's own title. */
+export type PiTitleMode = "name" | "native";
+
+/** Reads the setting, treating anything unrecognised as the default. */
+export function resolvePiTitleMode(value: unknown): PiTitleMode {
+  return value === "native" ? "native" : "name";
+}
+
+/** Single-quotes a word for zsh; `'` becomes `'\''`. */
+export function quoteForZsh(word: string): string {
+  return `'${word.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * The line typed into the pi terminal. `name` mode loads the bundled title
+ * extension (dist/pi-title.mjs); `native` runs plain `pi`, exactly as before
+ * #1899, so pi's own `pi - <name> - <cwd>` title is untouched.
+ */
+export function piLaunchCommand(mode: PiTitleMode, titleExtensionPath: string): string {
+  return mode === "native" ? "pi" : `pi -e ${quoteForZsh(titleExtensionPath)}`;
+}
+
 export type PiLaunchCheck =
   | { readonly kind: "ready"; readonly zshPath: string }
   | { readonly kind: "missing-zsh" }
