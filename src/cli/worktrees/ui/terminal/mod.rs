@@ -47,6 +47,10 @@ pub enum TabKind {
     /// reports authoritative state to the daemon (ADR-0057) — the one thing
     /// the TUI can do that the VS Code companion cannot.
     Claude,
+    /// `codex`, launched through `omni-dev codex-wrap`, which runs it against a
+    /// private app-server and reports that server's exact thread status
+    /// (ADR-0088).
+    Codex,
 }
 
 impl TabKind {
@@ -54,8 +58,22 @@ impl TabKind {
         match self {
             Self::Shell => "shell",
             Self::Claude => "claude",
+            Self::Codex => "codex",
         }
     }
+}
+
+/// `omni-dev <wrapper> -- <program>` — how an agent tab launches its agent,
+/// through this binary's own wrapper so the session reports its state.
+fn wrapped(wrapper: &str, program: &str) -> (String, Vec<String>) {
+    let exe = std::env::current_exe().map_or_else(
+        |_| "omni-dev".to_string(),
+        |p| p.to_string_lossy().into_owned(),
+    );
+    (
+        exe,
+        vec![wrapper.to_string(), "--".to_string(), program.to_string()],
+    )
 }
 
 /// What the app should do after a tab has absorbed one emulator event.
@@ -96,20 +114,8 @@ impl TerminalTab {
     ) -> Result<Self> {
         let program = match kind {
             TabKind::Shell => None,
-            TabKind::Claude => {
-                let exe = std::env::current_exe().map_or_else(
-                    |_| "omni-dev".to_string(),
-                    |p| p.to_string_lossy().into_owned(),
-                );
-                Some((
-                    exe,
-                    vec![
-                        "claude-wrap".to_string(),
-                        "--".to_string(),
-                        "claude".to_string(),
-                    ],
-                ))
-            }
+            TabKind::Claude => Some(wrapped("claude-wrap", "claude")),
+            TabKind::Codex => Some(wrapped("codex-wrap", "codex")),
         };
         let request = pty::SpawnRequest {
             tab: id,

@@ -45,6 +45,7 @@ pub enum SavedTabKind {
     #[default]
     Shell,
     Claude,
+    Codex,
 }
 
 impl From<TabKind> for SavedTabKind {
@@ -52,6 +53,7 @@ impl From<TabKind> for SavedTabKind {
         match kind {
             TabKind::Shell => Self::Shell,
             TabKind::Claude => Self::Claude,
+            TabKind::Codex => Self::Codex,
         }
     }
 }
@@ -61,6 +63,7 @@ impl From<SavedTabKind> for TabKind {
         match kind {
             SavedTabKind::Shell => Self::Shell,
             SavedTabKind::Claude => Self::Claude,
+            SavedTabKind::Codex => Self::Codex,
         }
     }
 }
@@ -299,7 +302,7 @@ mod tests {
 
     #[test]
     fn tab_kinds_map_both_ways_and_an_absent_kind_defaults_to_shell() {
-        for kind in [TabKind::Shell, TabKind::Claude] {
+        for kind in [TabKind::Shell, TabKind::Claude, TabKind::Codex] {
             assert_eq!(TabKind::from(SavedTabKind::from(kind)), kind);
         }
         let parsed: SavedTab = serde_yaml::from_str("path: /a\n").unwrap();

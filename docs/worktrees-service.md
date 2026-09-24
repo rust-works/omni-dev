@@ -414,7 +414,8 @@ Phase 3 (this release) hosts **one embedded terminal tab** on the right
 ([ADR-0072](adrs/adr-0072.md)): `enter` or `alt-t` on a worktree row opens the
 user's shell in it, `alt-⇧t` opens `claude` there — launched through
 `omni-dev claude-wrap`, so the session reports *authoritative* state to the
-daemon ([ADR-0057](adrs/adr-0057.md)) — and the tree's `here` cue lights for
+daemon ([ADR-0057](adrs/adr-0057.md)) — `alt-⇧x` opens `codex` the same way
+through `omni-dev codex-wrap` ([ADR-0088](adrs/adr-0088.md)), and the tree's `here` cue lights for
 that worktree, computed locally with no daemon registration. Focus decides
 who gets a key: a focused terminal takes everything verbatim (including
 `Esc`) except `Alt`-chords — `alt-e` back to the tree, `alt-l` to the

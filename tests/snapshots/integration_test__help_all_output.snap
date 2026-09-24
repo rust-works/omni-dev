@@ -23,6 +23,7 @@ Commands:
   worktrees    Worktrees: list the repos/worktrees open across all VS Code windows
   sessions     Sessions: track Claude Code sessions running across all terminals and windows
   claude-wrap  Wrap the Claude process, reporting its exact session state to the daemon
+  codex-wrap   Run the Codex TUI against a private app-server, reporting its exact session state to the daemon
   coverage     Coverage: diff/patch coverage analysis for PR comments
   transcript   Transcript and caption fetching from media platforms
   log          Search the local invocation + HTTP request log
@@ -2946,6 +2947,22 @@ Usage: claude-wrap [OPTIONS] [CMD]...
 
 Arguments:
   [CMD]...  The command to run and its arguments, after a `--` separator
+
+Options:
+      --socket <PATH>  Path to the daemon control socket. Defaults to the standard per-user path
+  -h, --help           Print help
+
+
+================================================================================
+
+omni-dev codex-wrap - Run the Codex TUI against a private app-server, reporting its exact session state to the daemon
+
+Run the Codex TUI against a private app-server, reporting its exact session state to the daemon
+
+Usage: codex-wrap [OPTIONS] [CMD]...
+
+Arguments:
+  [CMD]...  The Codex command and its arguments, after a `--` separator (e.g. `-- codex`, `-- codex resume <id>`)
 
 Options:
       --socket <PATH>  Path to the daemon control socket. Defaults to the standard per-user path

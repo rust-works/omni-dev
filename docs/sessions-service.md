@@ -4,12 +4,13 @@ Track, for the logged-in user and across **every** terminal and VS Code window,
 the Claude Code, [Codex](https://developers.openai.com/codex) and
 [pi.dev](https://pi.dev) sessions running right now and each one's coarse live
 state (working, idle, or waiting on you). It is the omni-dev daemon's **fourth
-service** (after the browser bridge, Snowflake, and worktrees), fed by six
+service** (after the browser bridge, Snowflake, and worktrees), fed by seven
 independent sources that each degrade gracefully.
 
 This guide is the operator-facing contract. The design rationale is
 [ADR-0052](adrs/adr-0052.md) — plus [ADR-0057](adrs/adr-0057.md) for the stream
-wrapper (Feed 4) and [ADR-0087](adrs/adr-0087.md) for the Codex hooks (Feed 6);
+wrapper (Feed 4), [ADR-0087](adrs/adr-0087.md) for the Codex hooks (Feed 6) and
+[ADR-0088](adrs/adr-0088.md) for the Codex wrapper (Feed 7);
 the daemon framework is [ADR-0039](adrs/adr-0039.md) and the
 rendezvous pattern it reuses is [ADR-0040](adrs/adr-0040.md).
 
@@ -33,7 +34,7 @@ No single vantage point sees all your sessions:
   Desktop) and knows only that session.
 
 A single resident process — the daemon — is the rendezvous point that aggregates
-all six into one consistent view served back to the CLI, the tray, and the
+all seven into one consistent view served back to the CLI, the tray, and the
 extension.
 
 ## Architecture
@@ -63,6 +64,8 @@ extension.
   └─ Feed 6: Codex hooks ──────►  omni-dev sessions hook --agent codex
       $CODEX_HOME/hooks.json; the Feed 1 sink with Codex's event
       mapping, tagging sessions `codex` (#1907)
+  (Feed 7: omni-dev codex-wrap — polls a private Codex app-server
+      for the *exact* state of the sessions omni-dev launches, #1910)
 
               daemon ──► `omni-dev sessions list` / tray submenu
                      ──► the companion's Worktrees tree cues
@@ -498,6 +501,57 @@ silent: Codex sessions simply do not appear until you `omni-dev daemon restart`
 onto the upgraded binary. `omni-dev daemon status` warns when the CLI and the
 resident daemon versions differ.
 
+### The Codex wrapper (Feed 7)
+
+Hooks only *infer* a Codex session's state. Codex's app-server knows it exactly,
+but the VS Code extension and Desktop each run a private one that nothing else
+can reach. For the Codex sessions **omni-dev launches**, `codex-wrap` runs one it
+owns ([ADR-0088](adrs/adr-0088.md)):
+
+```bash
+# Instead of `codex`: the same TUI, with exact state in the tree and tray.
+omni-dev codex-wrap -- codex
+omni-dev codex-wrap -- codex resume --last
+```
+
+`omni-dev worktrees ui` opens a Codex tab this way with `alt-⇧x` (or **New Codex
+Tab** in the menus), as `alt-⇧t` opens a Claude tab through `claude-wrap`.
+
+The wrapper starts `codex app-server --listen unix://<runtime-dir>/codex-wrap-<pid>.sock`
+and runs `codex --remote unix://… <args>` on your terminal. Once a second, it
+reads each loaded thread's status from that server and reports it in the
+authoritative `{ "stream_state": … }` form, tagged `codex`:
+
+| App-server status | Reported |
+|---|---|
+| `active`, no flags | `working` |
+| `active` + `waitingOnApproval` | `waiting_for_permission` |
+| `active` + `waitingOnUserInput` | `waiting_for_input` |
+| `idle`, `systemError` | `idle` |
+| unloaded, or `notLoaded` | the `end` op |
+
+It re-asserts every session's state on every poll, so a hook's inferred report
+is overridden within a second and an idle session never ages out. When the TUI exits it
+ends the sessions, stops the server and removes the socket. Subagent threads and
+the system's own side threads (`ephemeral`, such as the one that titles the chat)
+are not reported.
+
+It is an **observer only**. It calls `initialize`, `thread/loaded/list` and
+`thread/read` and nothing else. It never starts, resumes or subscribes to a
+thread, which is what routes approval requests to a client, and it drops any
+server request unanswered. So it cannot see, answer or duplicate an approval. It
+attaches only to the server it started.
+
+**Fail-open.** An invocation the remote TUI does not serve is passed straight to
+`codex`: a non-interactive subcommand (`exec`, `login`, `mcp`, …), no terminal, or
+your own `--remote`. So is one whose server does not start within 10 s. If the
+observer cannot connect, the TUI still runs, unobserved. On exit the TUI prints a
+"Reconnect: codex --remote …" hint; the server it names is already stopped.
+
+Hooks still fire for a wrapped session, from the private server that runs the
+thread, so its hook reports arrive too. The wrapper's exact state corrects them
+within a second.
+
 ## Tray
 
 The macOS menu bar gains an **"Agent Sessions"** submenu (titled "Claude
@@ -548,6 +602,11 @@ a window/cwd is unambiguous, but several in the same cwd cannot be told apart.
   file (Codex's session metadata, never a conversation line) plus file sizes, and
   probes Codex's thread-lock files with a non-blocking shared `flock`. It writes
   nothing outside the daemon's memory.
+- The Codex wrapper is **opt-in** (it runs only when you launch through it). It
+  starts a Codex app-server of its own on a socket in the `0700` runtime
+  directory and only ever polls it: it never subscribes to a thread or answers a
+  server request, so it cannot act on an approval. It reads thread status, `cwd`
+  and model id, never a conversation, and persists nothing.
 - The stream wrapper is **opt-in** too, and is the one component that *sees* your
   conversation as it streams. It extracts only the state, `session_id`, `cwd` and
   model, and logs and persists nothing — a design constraint, not a convention
