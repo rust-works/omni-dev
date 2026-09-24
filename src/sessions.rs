@@ -50,6 +50,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+#[cfg(unix)]
+pub mod codex_app_server;
 pub mod codex_watcher;
 pub mod relocate;
 pub mod stream;

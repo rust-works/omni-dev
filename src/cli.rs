@@ -18,6 +18,8 @@ pub mod coverage;
 #[cfg(unix)]
 pub mod claude_wrap;
 #[cfg(unix)]
+pub mod codex_wrap;
+#[cfg(unix)]
 pub mod daemon;
 pub mod datadog;
 pub mod drive;
@@ -113,6 +115,11 @@ pub enum Commands {
     #[cfg(unix)]
     #[command(name = "claude-wrap")]
     ClaudeWrap(claude_wrap::ClaudeWrapCommand),
+    /// Run the Codex TUI against a private app-server, reporting its exact
+    /// session state to the daemon.
+    #[cfg(unix)]
+    #[command(name = "codex-wrap")]
+    CodexWrap(codex_wrap::CodexWrapCommand),
     /// Coverage: diff/patch coverage analysis for PR comments.
     Coverage(coverage::CoverageCommand),
     /// Transcript and caption fetching from media platforms.
@@ -201,6 +208,8 @@ impl Cli {
             Commands::Sessions(cmd) => cmd.execute().await,
             #[cfg(unix)]
             Commands::ClaudeWrap(cmd) => cmd.execute().await,
+            #[cfg(unix)]
+            Commands::CodexWrap(cmd) => cmd.execute().await,
             Commands::Coverage(cmd) => cmd.execute(),
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Log(log_cmd) => log_cmd.execute(),

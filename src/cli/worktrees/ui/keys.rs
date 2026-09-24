@@ -26,6 +26,8 @@ pub enum ChromeKey {
     NewShellTab,
     /// `alt-⇧t`: open a Claude tab in the cursor worktree.
     NewClaudeTab,
+    /// `alt-⇧x`: open a Codex tab in the cursor worktree.
+    NewCodexTab,
     /// `alt-s`: open a shell tab in a new group below (a split).
     SplitShellTab,
     /// `alt-w`: close the tab.
@@ -99,6 +101,9 @@ pub fn chrome_key(key: &KeyEvent) -> Option<ChromeKey> {
         KeyCode::Char('T') if alt => Some(ChromeKey::NewClaudeTab),
         KeyCode::Char('t') if alt && shift => Some(ChromeKey::NewClaudeTab),
         KeyCode::Char('t') if alt => Some(ChromeKey::NewShellTab),
+        // Shift-x, likewise; plain `alt-x` stays with the child.
+        KeyCode::Char('X') if alt => Some(ChromeKey::NewCodexTab),
+        KeyCode::Char('x') if alt && shift => Some(ChromeKey::NewCodexTab),
         KeyCode::Char('s') if alt => Some(ChromeKey::SplitShellTab),
         KeyCode::Char('w') if alt => Some(ChromeKey::CloseTab),
         // Shift-c arrives as `Char('C')`, with or without the SHIFT bit —
@@ -297,6 +302,16 @@ mod tests {
                 KeyCode::Char('T'),
                 KeyModifiers::ALT | KeyModifiers::SHIFT,
                 ChromeKey::NewClaudeTab,
+            ),
+            (
+                KeyCode::Char('X'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+                ChromeKey::NewCodexTab,
+            ),
+            (
+                KeyCode::Char('X'),
+                KeyModifiers::ALT,
+                ChromeKey::NewCodexTab,
             ),
             (KeyCode::Char('w'), KeyModifiers::ALT, ChromeKey::CloseTab),
             (KeyCode::Char('c'), KeyModifiers::ALT, ChromeKey::Copy),
@@ -497,6 +512,18 @@ mod tests {
                 KeyModifiers::ALT | KeyModifiers::SHIFT
             )),
             Some(ChromeKey::NewClaudeTab)
+        );
+        assert_eq!(
+            chrome_key(&key(
+                KeyCode::Char('x'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            )),
+            Some(ChromeKey::NewCodexTab)
+        );
+        // Plain `alt-x` is not chrome: a child (emacs's `M-x`) keeps it.
+        assert_eq!(
+            chrome_key(&key(KeyCode::Char('x'), KeyModifiers::ALT)),
+            None
         );
     }
 

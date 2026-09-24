@@ -546,7 +546,7 @@ fn status_hint(app: &App) -> String {
             "alt-e tree  alt-t tab  alt-s split  alt-[/] cycle  alt-w close  alt-c copy".to_string()
         }
         (_, Focus::Tree) => {
-            "↑↓ move  space mark  enter/alt-t shell tab  alt-⇧t claude tab  a/alt-m actions  c/C colour  q quit".to_string()
+            "↑↓ move  space mark  enter/alt-t shell tab  alt-⇧t claude tab  alt-⇧x codex tab  a/alt-m actions  c/C colour  q quit".to_string()
         }
     }
 }
@@ -1544,6 +1544,7 @@ fn handle_chrome_key(app: &mut App, view: &WorktreesViewModel, chrome: ChromeKey
         }
         ChromeKey::NewShellTab => open_tab_for_cursor(app, view, TabKind::Shell, false),
         ChromeKey::NewClaudeTab => open_tab_for_cursor(app, view, TabKind::Claude, false),
+        ChromeKey::NewCodexTab => open_tab_for_cursor(app, view, TabKind::Codex, false),
         ChromeKey::SplitShellTab => open_tab_for_cursor(app, view, TabKind::Shell, true),
         ChromeKey::CloseTab => app.close_tab(),
         ChromeKey::NextTab => app.panes.cycle_tab(1),

@@ -112,6 +112,10 @@ pub fn strip_menu(groups: usize, group: usize, tabs: usize, tab: usize) -> Vec<M
         MenuCommand::Chrome(ChromeKey::NewClaudeTab),
         "New Claude Tab",
     )));
+    entries.push(MenuEntry::Item(MenuItem::new(
+        MenuCommand::Chrome(ChromeKey::NewCodexTab),
+        "New Codex Tab",
+    )));
     entries
 }
 

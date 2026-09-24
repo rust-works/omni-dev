@@ -1,6 +1,6 @@
 # Codex Sessions Feed
 
-**Status:** In progress — investigation complete (#1861), revised 2026-09-24 to build on the `agent` tag #1901 added; the hook feed shipped in #1907, the agent labels in #1908 and the rollout watcher in #1909; #1910 remains (listed at the end)
+**Status:** In progress — investigation complete (#1861), revised 2026-09-24 to build on the `agent` tag #1901 added; the hook feed shipped in #1907, the agent labels in #1908, the rollout watcher in #1909 and the app-server observer for omni-dev-launched sessions in #1910 ([ADR-0088](../adrs/adr-0088.md)) (listed at the end)
 **ADRs:** [ADR-0052](../adrs/adr-0052.md) · [ADR-0057](../adrs/adr-0057.md) · [ADR-0087](../adrs/adr-0087.md)
 
 ## Overview
