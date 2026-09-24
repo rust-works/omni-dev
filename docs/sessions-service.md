@@ -328,7 +328,7 @@ form), rather than having the daemon infer it:
 
 | pi event | Reported |
 |---|---|
-| `session_start` | `starting` |
+| `session_start` | `idle` (pi's chat input is already live, so this is not `starting` — see below) |
 | `before_agent_start`, `agent_start`, `turn_start`, `tool_execution_start` | `working` |
 | `agent_settled` | `idle` (pi documents it as the event for status integrations) |
 | `ui_prompt_start` | `waiting_for_input` |
@@ -341,7 +341,16 @@ approval model is project trust. The only blocking prompts are extension dialogs
 question from any other. So every one reads as `waiting_for_input`.
 
 `/new`, `/resume` and `/fork` end the old session and start a new one, so they
-show up as an `end` followed by a fresh `starting`.
+show up as an `end` followed by a fresh `idle`.
+
+`starting` is never reported for pi — it exists only for Feeds 1–3's
+hook-inferred Claude Code sessions, where it means "the process just launched,
+before its chat surface exists yet". pi's extension only loads once pi's UI is
+already interactive, so by the time `session_start` fires there is nothing left
+to distinguish from `idle`; reporting `starting` there previously left every
+pi session showing as busy from launch until the first prompt finished, since
+`starting` buckets as working everywhere it renders (the tray, `sessions list`,
+and the VS Code tree).
 
 The extension talks to the socket directly from pi's own Node process. It does not
 spawn a sink per event, because `tool_execution_start` fires on every tool call.
