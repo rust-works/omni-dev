@@ -2,6 +2,7 @@
 
 pub(crate) mod account;
 pub(crate) mod auth;
+pub(crate) mod draft;
 pub(crate) mod extract_attachments;
 pub(crate) mod format;
 pub(crate) mod helpers;
@@ -59,6 +60,9 @@ pub enum GmailSubcommands {
     Thread(thread::ThreadCommand),
     /// Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1).
     Label(label::LabelCommand),
+    /// Manages Gmail drafts; never sends or deletes one (CLI-only; no MCP
+    /// equivalent yet; #1920).
+    Draft(draft::DraftCommand),
     /// Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent).
     Sync(sync::SyncCommand),
     /// Maintains durable local archives for every account in
@@ -179,6 +183,7 @@ impl GmailSubcommands {
             Self::Read(cmd) => cmd.execute(client).await,
             Self::Thread(cmd) => cmd.execute(client).await,
             Self::Label(cmd) => cmd.execute(client).await,
+            Self::Draft(cmd) => cmd.execute(client).await,
             Self::Sync(cmd) => cmd.execute(client).await,
             Self::Insert(cmd) => cmd.execute(client).await,
         }
@@ -421,6 +426,18 @@ mod tests {
     async fn dispatch_routes_label_list() {
         let cmd = GmailSubcommands::Label(label::LabelCommand {
             command: label::LabelSubcommands::List(label::list::ListCommand {
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_draft_list() {
+        let cmd = GmailSubcommands::Draft(draft::DraftCommand {
+            command: draft::DraftSubcommands::List(draft::list::ListCommand {
+                query: None,
+                limit: 10,
                 output: OutputFormat::Table,
             }),
         });

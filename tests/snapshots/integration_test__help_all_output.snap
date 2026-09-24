@@ -7016,6 +7016,7 @@ Commands:
   read                 Reads a single Gmail message (mirrors the `gmail_message_read` MCP tool)
   thread               Reads a Gmail thread (mirrors the `gmail_thread_read` MCP tool)
   label                Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1)
+  draft                Manages Gmail drafts; never sends or deletes one (CLI-only; no MCP equivalent yet; #1920)
   sync                 Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent)
   sync-all             Maintains durable local archives for every account in `.omni-dev/gmail-sync.yaml`, concurrently (CLI-only; no MCP equivalent; ADR-0068)
   extract-attachments  Retroactively extracts attachments for already-archived messages, without re-fetching from Gmail (CLI-only; no MCP equivalent; purely local, no client/credentials needed; #1510)
@@ -7158,6 +7159,37 @@ Usage: status [OPTIONS]
 Options:
       --all   Reports status for every configured Gmail account instead of just the resolved one. Degenerates to today's single-account output when no named accounts are configured (issue #1500)
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev gmail draft - Manages Gmail drafts; never sends or deletes one (CLI-only; no MCP equivalent yet; #1920)
+
+Manages Gmail drafts; never sends or deletes one (CLI-only; no MCP equivalent yet; #1920)
+
+Usage: draft <COMMAND>
+
+Commands:
+  list  Lists drafts with their draft ids (`gmail.readonly` is enough)
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev gmail draft list - Lists drafts with their draft ids (`gmail.readonly` is enough)
+
+Lists drafts with their draft ids (`gmail.readonly` is enough)
+
+Usage: list [OPTIONS]
+
+Options:
+      --query <QUERY>    Only list drafts matching this Gmail search query (same syntax as the Gmail search box, e.g. `to:alice subject:report`)
+      --limit <LIMIT>    Maximum drafts to return. `0` means "every draft" (capped at the same hard ceiling as `gmail search`) [default: 50]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================

@@ -21,14 +21,15 @@ walkthrough — this page is the topic-by-topic reference.
 6. [Messages](#messages)
 7. [Threads](#threads)
 8. [Labels](#labels)
-9. [Sync](#sync)
-10. [Sync all accounts](#sync-all-accounts)
-11. [Extract attachments](#extract-attachments)
-12. [Render](#render)
-13. [Insert](#insert)
-14. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-15. [Troubleshooting](#troubleshooting)
-16. [See also](#see-also)
+9. [Drafts](#drafts)
+10. [Sync](#sync)
+11. [Sync all accounts](#sync-all-accounts)
+12. [Extract attachments](#extract-attachments)
+13. [Render](#render)
+14. [Insert](#insert)
+15. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+16. [Troubleshooting](#troubleshooting)
+17. [See also](#see-also)
 
 ## Prerequisites
 
@@ -342,7 +343,7 @@ failure. See [ADR-0067](adrs/adr-0067.md) for the full design rationale.
 ## Output formats
 
 Every subcommand that renders a list or record (`search`, `read`, `thread`,
-`label list`, `sync`, `sync-all`, `extract-attachments`, `render`, `account
+`label list`, `draft list`, `sync`, `sync-all`, `extract-attachments`, `render`, `account
 list`) accepts `-o <format>` (`table` / `json` / `yaml` / `yamls` / `jsonl`,
 default `table`) — the same convention as every other `omni-dev` domain
 (see [ADR-0046](adrs/adr-0046.md)). `auth login`/`auth logout`/`auth
@@ -471,6 +472,52 @@ calling the API (`--dry-run` wins if both are set).
 `gmail_label_list` ships in this release. A mutating `gmail_label_modify`
 tool (add/remove) is planned as a fast-follow — until then, label mutation
 is CLI-only.
+
+## Drafts
+
+```bash
+$ omni-dev gmail draft list
+$ omni-dev gmail draft list --query 'to:alice subject:report' --limit 10
+$ omni-dev gmail --account work draft list -o yaml
+```
+
+`draft list` lists the mailbox's drafts. Each row shows the **draft id**,
+the id of the draft's current message, its thread id, the `To` header,
+the subject, the date and a snippet. `-o yaml`/`json` also carry `cc` and
+`bcc`.
+
+The draft id and the message id are different things, and the output
+labels them `DRAFT_ID` / `MESSAGE_ID` (`draft_id` / `message_id` in machine
+output) so they can't be confused. Every drafts endpoint is addressed by the
+draft id. The message id changes each time a draft is saved. `gmail search
+--query in:drafts` finds draft *messages*, but it cannot return their draft
+ids. That is what this command is for.
+
+`--query` takes the same [Gmail search syntax][Gmail's own search syntax]
+as `gmail search`. `--limit` also works the same way: the default is 50,
+and `0` fetches every draft up to the 10,000 hard cap, auto-paginating
+underneath.
+
+`drafts.list` returns only ids, so each row costs one extra `messages.get`
+(5 quota units). That is the same cost as `gmail search --enrich`, and
+these calls run at the same fixed concurrency (4); see
+[Rate limits and retry behaviour](#rate-limits-and-retry-behaviour).
+`draft list` has no `--concurrency` flag.
+
+**Read-only scope is enough.** `drafts.list` and `messages.get` both
+accept `gmail.readonly`, so `draft list` works for an account authorised
+without `--modify`.
+
+**Drafts are never sent or deleted.** omni-dev can only stage a draft for a
+person to review. It deliberately has no `draft send` and no `draft delete`:
+Gmail's `drafts.send` delivers mail that can't be recalled, and
+`drafts.delete` skips Trash, so a deleted draft can't be recovered. Send
+or discard drafts in Gmail itself. A unit test fails the build if either
+endpoint is ever added to the drafts client (#1920).
+
+### MCP equivalent(s)
+
+None yet. `draft list` is CLI-only.
 
 ## Sync
 
@@ -1037,11 +1084,11 @@ same `Retry-After`-then-exponential-backoff schedule; any other 403 (e.g.
 `insufficientPermissions`) is never retried. `gmail sync` additionally
 paces its own `messages.get` requests against the 250-units/second budget
 with a proactive token-bucket limiter, rather than relying on this reactive
-retry — see [Sync](#sync) above. `search --enrich`/`thread` still rely on
-`--concurrency` alone (a concurrency bound, not a rate limiter) plus this
+retry — see [Sync](#sync) above. `search --enrich`/`thread`/`draft list` still rely on
+`--concurrency` (or `draft list`'s fixed bound of 4) alone (a concurrency bound, not a rate limiter) plus this
 retry driver as their only quota protection.
 
-The list endpoints (`search`, `thread`'s underlying calls) auto-paginate
+The list endpoints (`search`, `draft list`, `thread`'s underlying calls) auto-paginate
 when `--limit 0` is passed, capped at **10,000 records** per invocation.
 Any non-zero `--limit` is upper-bounded by the same cap.
 
