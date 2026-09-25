@@ -227,9 +227,9 @@ Read-only access to Datadog v1/v2 endpoints. Authentication uses
 | `datadog_hosts_list` | List active hosts |
 | `datadog_downtime_list` | List downtimes; supports `active_only` |
 
-### Gmail (6 tools)
+### Gmail (8 tools)
 
-Read access (search, messages, threads, labels) via OAuth2. Authentication
+Read access (search, messages, threads, labels, drafts) via OAuth2. Authentication
 uses `GMAIL_CLIENT_ID` + `GMAIL_CLIENT_SECRET` + a refresh token stored by
 `omni-dev gmail auth login`. See [Gmail Guide](gmail.md) and
 [ADR-0063](adrs/adr-0063.md).
@@ -248,6 +248,8 @@ valid names.
 | `gmail_thread_read` | Read a full thread (every message); always truncation-guarded |
 | `gmail_label_list` | List labels with unread/total counts. Label add/remove is CLI-only in this release |
 | `gmail_account_list` | List configured Gmail accounts — name, cached email, scope, default. Never a secret |
+| `gmail_draft_list` | List drafts with their `draft_id` (plus `message_id`, `thread_id`, recipients, subject, date, snippet); `query`, `limit` (default 50) |
+| `gmail_draft_show` | Read one draft by `draft_id` (`format`: `minimal`/`metadata`/`full`/`raw`); `output_file` writes the YAML to disk. Draft create/update is CLI-only |
 
 ### Drive (7 tools)
 

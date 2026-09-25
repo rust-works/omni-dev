@@ -866,6 +866,114 @@ async fn jira_tool_handlers_surface_tool_error_without_credentials() -> Result<(
     Ok(())
 }
 
+/// Both draft tools are advertised with a description and a described
+/// schema for every parameter, including the required `draft_id` (#1957).
+#[tokio::test]
+async fn list_tools_includes_gmail_draft_tools() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let tools = client.list_tools(Option::default()).await?;
+
+    for (name, params) in [
+        ("gmail_draft_list", &["query", "limit", "account"][..]),
+        (
+            "gmail_draft_show",
+            &["draft_id", "format", "output_file", "account"][..],
+        ),
+    ] {
+        let tool = tools
+            .tools
+            .iter()
+            .find(|t| t.name.as_ref() == name)
+            .unwrap_or_else(|| panic!("{name} not advertised"));
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("draft id"),
+            "{name}: description should talk about draft ids: {description}"
+        );
+        let props = tool
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap_or_else(|| panic!("{name}: no properties in schema"));
+        for param in params {
+            assert!(props.contains_key(*param), "{name}: missing param {param}");
+        }
+    }
+
+    let show = tools
+        .tools
+        .iter()
+        .find(|t| t.name.as_ref() == "gmail_draft_show")
+        .unwrap();
+    let required = show
+        .input_schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(required, vec![serde_json::json!("draft_id")]);
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+/// Without Gmail credentials, both draft tools return a tool error through
+/// the real transport rather than a protocol failure or a panic (#1957).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn gmail_draft_tools_surface_tool_error_without_credentials() -> Result<()> {
+    // Shares the Atlassian env lock: it guards every HOME-mutating test here.
+    let _lock = ATLASSIAN_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let keys = [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "OMNI_DEV_PROFILE",
+        "OMNI_DEV_GMAIL_ACCOUNT",
+        "GMAIL_CLIENT_ID",
+        "GMAIL_CLIENT_SECRET",
+        "GMAIL_REFRESH_TOKEN",
+        "GMAIL_SCOPE",
+    ];
+    let snapshot: Vec<(&str, Option<String>)> =
+        keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+    let tmp = tempfile::tempdir()?;
+    for key in &keys[2..] {
+        std::env::remove_var(key);
+    }
+    std::env::set_var("HOME", tmp.path());
+    std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("xdg"));
+
+    let (client, server_handle) = spawn_server().await;
+    for (name, args) in [
+        ("gmail_draft_list", serde_json::json!({})),
+        ("gmail_draft_show", serde_json::json!({"draft_id": "r1"})),
+    ] {
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone()),
+            )
+            .await;
+        let failed = match result {
+            Ok(result) => {
+                let text = tool_call_text(&result);
+                result.is_error.unwrap_or(false) && text.contains("not configured")
+            }
+            Err(err) => err.to_string().contains("not configured"),
+        };
+        assert!(failed, "{name} should fail with a credentials error");
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+
+    for (key, prev) in &snapshot {
+        restore_env(key, prev.as_deref());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn atlassian_convert_to_adf_roundtrip() -> Result<()> {
     let (client, server_handle) = spawn_server().await;

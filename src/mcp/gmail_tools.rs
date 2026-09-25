@@ -1,19 +1,26 @@
-//! MCP tool handlers for Gmail read (and label-list) operations.
+//! MCP tool handlers for Gmail read (label-list and draft-read) operations.
 //!
 //! Each tool builds a fresh [`GmailClient`] via
 //! [`crate::cli::gmail::helpers::create_client_for`] and then delegates to
-//! the same API façade (`MessagesApi`, `ThreadsApi`, `LabelsApi`) that the
-//! CLI uses under `src/cli/gmail/`. Tool outputs are YAML serialisations of
+//! the same API façade (`MessagesApi`, `ThreadsApi`, `LabelsApi`,
+//! `DraftsApi`) that the CLI uses under `src/cli/gmail/`. Tool outputs are YAML serialisations of
 //! the typed response structs, matching the CLI `-o yaml` output.
 //!
 //! `gmail auth login` has no MCP equivalent — it's an interactive browser
 //! flow with no non-interactive analogue. `gmail_label_modify`
 //! (`label add`/`remove`) is deferred to a fast-follow issue: the issue's
-//! own "Initial tools" list names exactly five of the six tools below —
+//! own "Initial tools" list names exactly five of the first six tools below —
 //! `gmail_account_list` (issue #1500) is the one addition, letting a client
 //! discover account names before passing one to the other five. The
 //! mutating `label add`/`remove` tool's confirm-gating deserves its own
 //! focused review.
+//!
+//! `gmail_draft_list` and `gmail_draft_show` (issue #1957) mirror the
+//! read-only `gmail draft list`/`show`, bringing the count to eight tools.
+//! `draft create`/`update` stay CLI-only for now: they would be the first
+//! Gmail MCP tools needing `gmail.modify`, and their local-file inputs
+//! (`--attach`, `--body-file`, `--raw`) are a trust surface that deserves
+//! its own review. `send`/`delete` stay out regardless (#1920).
 //!
 //! Every tool below takes an optional `account` parameter (issue #1500,
 //! [ADR-0066](../../docs/adrs/adr-0066.md)): `Some(name)` forces that
@@ -34,8 +41,11 @@ use crate::cli::gmail::helpers::create_client_for;
 use crate::gmail::account;
 use crate::gmail::auth;
 use crate::gmail::client::GmailClient;
+use crate::gmail::drafts_api::DraftsApi;
 use crate::gmail::labels_api::LabelsApi;
-use crate::gmail::messages_api::{MessageFormat, MessagesApi, DEFAULT_SEARCH_LIMIT};
+use crate::gmail::messages_api::{
+    MessageFormat, MessagesApi, DEFAULT_ENRICH_CONCURRENCY, DEFAULT_SEARCH_LIMIT,
+};
 use crate::gmail::threads_api::{ThreadFormat, ThreadsApi};
 use crate::utils::settings::Settings;
 
@@ -47,7 +57,7 @@ use super::server::OmniDevServer;
 // ── Parameter structs ───────────────────────────────────────────────
 
 /// Doc comment shared by every `account` parameter below (issue #1500) —
-/// kept as one string so the five copies can't drift.
+/// kept as one string so the copies can't drift.
 macro_rules! account_param_doc {
     () => {
         "Selects a named Gmail account instead of the ambient \
@@ -126,6 +136,48 @@ pub struct GmailThreadReadParams {
 /// Parameters for `gmail_label_list`.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct GmailLabelListParams {
+    #[doc = account_param_doc!()]
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Parameters for `gmail_draft_list`.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct GmailDraftListParams {
+    /// Only list drafts matching this Gmail search query (same syntax as the
+    /// Gmail search box), e.g. `to:alice subject:report`. Omit to list every
+    /// draft.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Maximum drafts to return. Defaults to 50 when omitted; `0` explicitly
+    /// means every draft, up to the hard cap (10000). Each draft costs one
+    /// extra `messages.get` request (5 quota units).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[doc = account_param_doc!()]
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// Parameters for `gmail_draft_show`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GmailDraftShowParams {
+    /// Gmail draft id, e.g. `r-1234567890` — the `draft_id` field of a
+    /// `gmail_draft_list` row. NOT a message id: a message id from
+    /// `gmail_search` or `gmail_message_read` fails with "No draft with id".
+    /// Required.
+    pub draft_id: String,
+    /// `minimal` (ids/labels only), `metadata` (headers + snippet), `full`
+    /// (default; parsed MIME structure), or `raw` (base64url RFC 2822
+    /// source) — the same values as `gmail_message_read`'s `format`.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// When set, writes the rendered draft to this path as YAML and returns
+    /// a short YAML summary (path/bytes/format) instead of the inline body.
+    /// Even with `format: raw` the file is the YAML envelope, not a decoded
+    /// `.eml`.
+    #[serde(default)]
+    pub output_file: Option<String>,
     #[doc = account_param_doc!()]
     #[serde(default)]
     pub account: Option<String>,
@@ -254,7 +306,8 @@ impl OmniDevServer {
                        cached email address (if known), granted scope, and which one is the \
                        default. Call this first to discover valid `account` values before \
                        passing one to `gmail_search`/`gmail_message_read`/`gmail_thread_read`/\
-                       `gmail_label_list`/`gmail_auth_status`. Never returns a secret. \
+                       `gmail_label_list`/`gmail_draft_list`/`gmail_draft_show`/\
+                       `gmail_auth_status`. Never returns a secret. \
                        Read-only, no parameters. Mirrors `omni-dev gmail account list`."
     )]
     pub async fn gmail_account_list(
@@ -263,6 +316,55 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let yaml = run_account_list().map_err(tool_error)?;
         Ok(build_truncated_result(yaml))
+    }
+
+    /// Tool: list Gmail drafts with their draft ids.
+    #[tool(
+        description = "List Gmail drafts with each one's draft id, which `gmail_search` with \
+                       `in:drafts` cannot return and which `gmail_draft_show` requires. Each row \
+                       has `draft_id`, `message_id`, `thread_id`, `to`/`cc`/`bcc`, `subject`, \
+                       `date` and `snippet`. The `message_id` changes every time the draft is \
+                       saved, so address a draft by `draft_id`. `query` filters with Gmail \
+                       search syntax (e.g. `to:alice subject:report`); omit it to list every \
+                       draft. `limit` defaults to 50; pass `0` for every draft up to a hard cap \
+                       (10000). Each row costs one extra `messages.get` request. Read-only \
+                       (`gmail.readonly` is enough). Mirrors `omni-dev gmail draft list`. \
+                       Output is YAML."
+    )]
+    pub async fn gmail_draft_list(
+        &self,
+        Parameters(params): Parameters<GmailDraftListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = create_client_for(params.account.as_deref()).map_err(tool_error)?;
+        let yaml = run_draft_list(&client, &params).await.map_err(tool_error)?;
+        Ok(build_truncated_result(yaml))
+    }
+
+    /// Tool: read one Gmail draft by its draft id.
+    #[tool(
+        description = "Read one Gmail draft by its draft id (e.g. `r-1234567890`, the \
+                       `draft_id` from `gmail_draft_list`). Use this rather than \
+                       `gmail_message_read` on the draft's message id, which goes stale on the \
+                       next save. Returns Gmail's `drafts.get` response: the draft `id` plus its \
+                       `message`, rendered at `format` — `minimal`, `metadata`, `full` (default) \
+                       or `raw`, the same values as `gmail_message_read`. When `output_file` is \
+                       set, writes the YAML to that path and returns a short summary instead \
+                       (always YAML, even for `raw` — not a decoded `.eml`). Read-only \
+                       (`gmail.readonly` is enough). Mirrors `omni-dev gmail draft show`. \
+                       Output is YAML."
+    )]
+    pub async fn gmail_draft_show(
+        &self,
+        Parameters(params): Parameters<GmailDraftShowParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let client = create_client_for(params.account.as_deref()).map_err(tool_error)?;
+        let wrote_to_file = params.output_file.is_some();
+        let text = run_draft_show(&client, &params).await.map_err(tool_error)?;
+        if wrote_to_file {
+            Ok(CallToolResult::success(vec![Content::text(text)]))
+        } else {
+            Ok(build_truncated_result(text))
+        }
     }
 }
 
@@ -330,6 +432,29 @@ async fn run_thread_read(client: &GmailClient, params: &GmailThreadReadParams) -
 async fn run_label_list(client: &GmailClient) -> Result<String> {
     let response = LabelsApi::new(client).list().await?;
     yaml_result(&response.labels)
+}
+
+/// Lists drafts at the CLI's fixed hydration concurrency: `gmail draft
+/// list` has no `--concurrency` flag, so neither does the tool.
+async fn run_draft_list(client: &GmailClient, params: &GmailDraftListParams) -> Result<String> {
+    let summaries = DraftsApi::new(client)
+        .list_summaries(
+            params.query.as_deref(),
+            params.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
+            DEFAULT_ENRICH_CONCURRENCY,
+        )
+        .await?;
+    yaml_result(&summaries)
+}
+
+async fn run_draft_show(client: &GmailClient, params: &GmailDraftShowParams) -> Result<String> {
+    let format = parse_message_format(params.format.as_deref())?;
+    let draft = DraftsApi::new(client).get(&params.draft_id, format).await?;
+    let yaml = yaml_result(&draft)?;
+    match params.output_file.as_deref() {
+        Some(path) => write_to_file_yaml(path, &yaml, message_format_label(format)),
+        None => Ok(yaml),
+    }
 }
 
 /// Parses an MCP-supplied message format string.
@@ -775,6 +900,216 @@ mod tests {
         assert!(yaml.contains("INBOX"));
     }
 
+    // ── run_draft_list / run_draft_show (issue #1957) ──────────────────
+
+    fn draft_list_params(query: Option<&str>, limit: Option<usize>) -> GmailDraftListParams {
+        GmailDraftListParams {
+            query: query.map(str::to_string),
+            limit,
+            account: None,
+        }
+    }
+
+    fn draft_show_params(
+        draft_id: &str,
+        format: Option<&str>,
+        output_file: Option<String>,
+    ) -> GmailDraftShowParams {
+        GmailDraftShowParams {
+            draft_id: draft_id.to_string(),
+            format: format.map(str::to_string),
+            output_file,
+            account: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_draft_list_forwards_query_and_limit_and_hydrates_each_draft() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/drafts"))
+            .and(wiremock::matchers::query_param("q", "to:bob"))
+            .and(wiremock::matchers::query_param("maxResults", "10"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "drafts": [{"id": "r1", "message": {"id": "m1", "threadId": "t1"}}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .and(wiremock::matchers::query_param("format", "metadata"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m1",
+                    "threadId": "t1",
+                    "snippet": "Draft body",
+                    "payload": {"headers": [
+                        {"name": "To", "value": "bob@example.com"},
+                        {"name": "Subject", "value": "Report"}
+                    ]}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = run_draft_list(&client, &draft_list_params(Some("to:bob"), Some(10)))
+            .await
+            .unwrap();
+        assert!(yaml.contains("draft_id: r1"), "{yaml}");
+        assert!(yaml.contains("message_id: m1"), "{yaml}");
+        assert!(yaml.contains("thread_id: t1"), "{yaml}");
+        assert!(yaml.contains("to: bob@example.com"), "{yaml}");
+        assert!(yaml.contains("subject: Report"), "{yaml}");
+        assert!(yaml.contains("snippet: Draft body"), "{yaml}");
+    }
+
+    #[tokio::test]
+    async fn run_draft_list_omitted_limit_defaults_to_50_not_hard_cap() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/drafts"))
+            .and(wiremock::matchers::query_param("maxResults", "50"))
+            .and(wiremock::matchers::query_param_is_missing("q"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No mock matching any other `maxResults` — falling back to 0
+        // (fetch-to-HARD_CAP) would miss the mock above and 404.
+
+        let yaml = run_draft_list(&client, &draft_list_params(None, None))
+            .await
+            .unwrap();
+        assert_eq!(yaml.trim(), "[]");
+    }
+
+    #[tokio::test]
+    async fn run_draft_list_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/drafts"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
+
+        let err = run_draft_list(&client, &draft_list_params(None, None))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("403"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn run_draft_show_maps_each_format_onto_drafts_get() {
+        for format in ["minimal", "metadata", "full", "raw"] {
+            let server = wiremock::MockServer::start().await;
+            let client = client_with_bootstrapped_token(&server).await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/gmail/v1/users/me/drafts/r1"))
+                .and(wiremock::matchers::query_param("format", format))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "id": "r1",
+                        "message": {"id": "m1", "threadId": "t1", "snippet": "Hi"}
+                    }),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let yaml = run_draft_show(&client, &draft_show_params("r1", Some(format), None))
+                .await
+                .unwrap();
+            assert!(yaml.contains("id: r1"), "{format}: {yaml}");
+            assert!(yaml.contains("message:"), "{format}: {yaml}");
+            assert!(yaml.contains("id: m1"), "{format}: {yaml}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_draft_show_omitted_format_defaults_to_full() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/drafts/r1"))
+            .and(wiremock::matchers::query_param("format", "full"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "r1", "message": {"id": "m1"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = run_draft_show(&client, &draft_show_params("r1", None, None))
+            .await
+            .unwrap();
+        assert!(yaml.contains("id: r1"), "{yaml}");
+    }
+
+    #[tokio::test]
+    async fn run_draft_show_writes_to_output_file() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/drafts/r1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "r1", "message": {"id": "m1"}})),
+            )
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("draft.yaml");
+        let summary_yaml = run_draft_show(
+            &client,
+            &draft_show_params("r1", Some("raw"), Some(path.to_str().unwrap().to_string())),
+        )
+        .await
+        .unwrap();
+
+        assert!(summary_yaml.contains("bytes:"), "{summary_yaml}");
+        assert!(summary_yaml.contains("raw"), "{summary_yaml}");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("id: r1"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn run_draft_show_rejects_invalid_format() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let err = run_draft_show(&client, &draft_show_params("r1", Some("bogus"), None))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("format"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn run_draft_show_not_found_points_at_draft_list() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/drafts/nope"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let err = run_draft_show(&client, &draft_show_params("nope", None, None))
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("No draft with id \"nope\""), "{message}");
+        assert!(message.contains("gmail draft list"), "{message}");
+    }
+
     // ── Tool handler bodies (smoke + auth-status full path) ───────────
 
     #[tokio::test(flavor = "current_thread")]
@@ -876,6 +1211,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.contains("unknown Gmail account 'bogus'"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gmail_draft_list_handler_propagates_credentials_error() {
+        let guard = EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = OmniDevServer::new();
+        let err = server
+            .gmail_draft_list(Parameters(GmailDraftListParams::default()))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not configured"), "{}", err.message);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gmail_draft_show_handler_propagates_credentials_error() {
+        let guard = EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = OmniDevServer::new();
+        let err = server
+            .gmail_draft_show(Parameters(draft_show_params("r1", None, None)))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not configured"), "{}", err.message);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gmail_draft_handlers_honor_named_account_param() {
+        let guard = EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        Settings::upsert_gmail_account(
+            &settings_path,
+            "work",
+            &[("client_id", serde_json::Value::String("id".to_string()))],
+        )
+        .unwrap();
+
+        let server = OmniDevServer::new();
+        let err = server
+            .gmail_draft_list(Parameters(GmailDraftListParams {
+                account: Some("bogus".to_string()),
+                ..GmailDraftListParams::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("unknown Gmail account 'bogus'"),
+            "{}",
+            err.message
+        );
+
+        let err = server
+            .gmail_draft_show(Parameters(GmailDraftShowParams {
+                account: Some("bogus".to_string()),
+                ..draft_show_params("r1", None, Some("/unused".to_string()))
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("unknown Gmail account 'bogus'"),
+            "{}",
+            err.message
+        );
     }
 
     // ── run_account_list / gmail_account_list (issue #1500) ────────────
