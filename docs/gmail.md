@@ -613,7 +613,7 @@ endpoint is ever added to the drafts client (#1920).
 
 ```bash
 $ omni-dev gmail draft update r-1234567890 --subject 'Quarterly report (final)'
-$ omni-dev gmail draft update r-1234567890 --cc bob@example.com carol@example.com
+$ omni-dev gmail draft update r-1234567890 --cc bob@example.com --cc carol@example.com
 $ omni-dev gmail draft update r-1234567890 --body-file revised.txt --remove-attachment q3-draft.pdf \
     --attach q3.pdf
 $ omni-dev gmail draft update r-1234567890 --raw draft.eml --if-message-id 18c2f0a1b2c3d4e5
@@ -634,7 +634,10 @@ you didn't name.
 - **Recipients and subject.** `--to`, `--cc`, `--bcc` and `--subject`
   replace just that header, encoded the way `draft create` encodes it. Each
   recipient flag replaces that header's **whole** list, so pass every
-  recipient you want to keep. There is no way to clear a header yet.
+  recipient you want to keep, repeating the flag for each one (unlike
+  `draft create`, one flag takes one value, so the draft id can follow it).
+  `--subject ''` removes the subject. A recipient header can't be cleared
+  yet.
 - **Body.** `--body TEXT` or `--body-file PATH` replaces the body with plain
   text. There's no standard-input fallback, unlike `draft create`, because
   the body is optional here. A draft written in the Gmail UI also has an
@@ -643,9 +646,12 @@ you didn't name.
   shows the HTML version when there is one.
 - **Attachments.** `--attach PATH` adds files after the existing
   attachments, with the same on-disk size check as `draft create`.
-  `--remove-attachment NAME` removes the attachment with that filename, as
-  `draft show` prints it. A name the draft doesn't have is an error that
-  lists the names it does have.
+  `--remove-attachment NAME` removes one attachment: the one
+  `draft show -o markdown` lists under `NAME` (sanitised, with `-1`, `-2`… added to repeated
+  names and `attachment-N` for an unnamed part), or else the one stored
+  under that exact filename, if only one is. Two attachments both called
+  `image.png` are removed as `image.png` and `image-1.png`. A name the draft
+  doesn't have is an error that lists the names it does have.
 - **`--raw FILE`** replaces the whole message with an `.eml` file, uploaded
   byte for byte. `draft show --detail raw --out-file` writes such a file.
   Use this for anything the flags can't express, such as an HTML body. It

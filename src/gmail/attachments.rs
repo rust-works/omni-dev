@@ -72,7 +72,7 @@ pub(crate) fn extract_attachments(raw: &[u8]) -> Vec<ExtractedAttachment> {
 /// so `Report.PDF` and `report.pdf` name the same directory entry there and
 /// a case-sensitive check would let the second silently overwrite the
 /// first.
-fn dedupe_filename(seen: &mut HashSet<String>, name: String) -> String {
+pub(crate) fn dedupe_filename(seen: &mut HashSet<String>, name: String) -> String {
     if seen.insert(name.to_ascii_lowercase()) {
         return name;
     }
