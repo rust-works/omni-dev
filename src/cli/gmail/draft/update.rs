@@ -8,7 +8,8 @@ use clap::{ArgGroup, Parser};
 use serde::Serialize;
 
 use crate::cli::gmail::draft::create::{
-    load_attachments, plain_alternative, read_limited, read_text_file, resolve_html_body,
+    fetch_send_as, load_attachments, plain_alternative, read_limited, read_text_file,
+    resolve_html_body,
 };
 use crate::cli::gmail::format::{
     output_as, sanitize_for_terminal, write_scalar_jsonl, JsonlSerialize, OutputFormat,
@@ -20,12 +21,14 @@ use crate::gmail::draft_edit::DraftEdit;
 use crate::gmail::drafts_api::DraftsApi;
 use crate::gmail::messages_api::MessageFormat;
 use crate::gmail::raw_message::decode_raw_message;
+use crate::gmail::send_as_api::resolve_from;
 
 /// What `draft update` does with a message, for size-limit refusals.
 const UPDATE_ACTION: &str = "update a draft to";
 
 /// Every field-editing flag, which `--raw` conflicts with.
-const EDIT_ARGS: [&str; 10] = [
+const EDIT_ARGS: [&str; 11] = [
+    "from",
     "to",
     "cc",
     "bcc",
@@ -44,7 +47,10 @@ const EDIT_ARGS: [&str; 10] = [
 /// the stored message, changes only what the flags name, and uploads the
 /// result. Every other header, the body, each attachment and the thread
 /// membership are kept exactly as they were. `--to`, `--cc` and `--bcc`
-/// replace that header's whole list. `--body` replaces the body with plain
+/// replace that header's whole list. `--from` replaces `From` with one of
+/// the account's send-as addresses, checked (`users.settings.sendAs.list`)
+/// before the draft is read, so an unknown or unverified alias changes
+/// nothing. `--body` replaces the body with plain
 /// text; a draft written in Gmail loses its HTML version, with a warning.
 /// `--html-body` replaces the body with HTML plus a plain-text alternative,
 /// which is `--body` when given and otherwise derived from the HTML (never
@@ -66,6 +72,13 @@ const EDIT_ARGS: [&str; 10] = [
 pub struct UpdateCommand {
     /// Gmail draft id (the `DRAFT_ID` column of `gmail draft list`).
     pub draft_id: String,
+
+    /// Send as this address: one of the account's verified send-as aliases,
+    /// or its primary address, as `addr@example.com` or
+    /// `"Name <addr@example.com>"`. Without a name, Gmail's name for the
+    /// address is used.
+    #[arg(long, value_name = "ADDR")]
+    pub from: Option<String>,
 
     /// Replace the `To` recipients: `addr@example.com` or
     /// `"Name <addr@example.com>"`. Repeat the flag for more recipients.
@@ -152,7 +165,13 @@ impl UpdateCommand {
             };
             let body_len =
                 body.as_ref().map_or(0, String::len) + html_body.as_ref().map_or(0, String::len);
-            Change::Edit(DraftEdit {
+            Change::Edit(Box::new(DraftEdit {
+                from: self
+                    .from
+                    .as_deref()
+                    .map(Mailbox::parse)
+                    .transpose()?
+                    .map(Some),
                 to: parse_mailboxes(&self.to)?,
                 cc: parse_mailboxes(&self.cc)?,
                 bcc: parse_mailboxes(&self.bcc)?,
@@ -161,7 +180,7 @@ impl UpdateCommand {
                 html_body,
                 attach: load_attachments(&self.attach, body_len)?,
                 remove_attachments: self.remove_attachment,
-            })
+            }))
         };
         let updated = run_update(
             client,
@@ -195,8 +214,8 @@ fn parse_mailboxes(values: &[String]) -> Result<Option<Vec<Mailbox>>> {
 enum Change {
     /// A complete message, uploaded unchanged.
     Raw(Vec<u8>),
-    /// Edits to apply to the stored message.
-    Edit(DraftEdit),
+    /// Edits to apply to the stored message (boxed: far larger than `Raw`).
+    Edit(Box<DraftEdit>),
 }
 
 /// The ids of an updated draft.
@@ -227,10 +246,20 @@ impl JsonlSerialize for UpdatedDraft {
 async fn run_update(
     client: &GmailClient,
     draft_id: &str,
-    change: Change,
+    mut change: Change,
     if_message_id: Option<&str>,
     warn: &mut (dyn Write + Send),
 ) -> Result<UpdatedDraft> {
+    // Checked before the draft is read, so a bad alias costs no draft reads.
+    let from = match &mut change {
+        Change::Edit(edit) => edit.from.as_mut(),
+        Change::Raw(_) => None,
+    };
+    if let Some(slot) = from {
+        if let Some(requested) = slot.take() {
+            *slot = resolve_from(&fetch_send_as(client).await?, &requested)?;
+        }
+    }
     let drafts = DraftsApi::new(client);
     let format = match change {
         Change::Raw(_) => MessageFormat::Minimal,
@@ -470,13 +499,138 @@ JVBERi0xLjQK\r\n\
     }
 
     fn subject_edit(subject: &str) -> Change {
-        Change::Edit(DraftEdit {
+        Change::Edit(Box::new(DraftEdit {
             subject: Some(subject.to_string()),
             ..DraftEdit::default()
-        })
+        }))
     }
 
     // ── run_update ───────────────────────────────────────────────────
+
+    const SEND_AS_PATH: &str = "/gmail/v1/users/me/settings/sendAs";
+
+    /// `users.settings.sendAs.list`: the primary address, one verified alias
+    /// and one awaiting verification.
+    async fn mount_send_as(server: &wiremock::MockServer, times: u64) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(SEND_AS_PATH))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "sendAs": [
+                        {"sendAsEmail": "me@example.org", "isPrimary": true},
+                        {
+                            "sendAsEmail": "sales@example.org",
+                            "displayName": "Sales",
+                            "verificationStatus": "accepted",
+                        },
+                        {"sendAsEmail": "new@example.org", "verificationStatus": "pending"},
+                    ],
+                })),
+            )
+            .expect(times)
+            .mount(server)
+            .await;
+    }
+
+    fn from_edit(from: &str) -> Change {
+        Change::Edit(Box::new(DraftEdit {
+            from: Some(Some(Mailbox::parse(from).unwrap())),
+            ..DraftEdit::default()
+        }))
+    }
+
+    #[tokio::test]
+    async fn run_update_sets_a_checked_from_and_keeps_everything_else() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_send_as(&server, 1).await;
+        mount_get_raw(&server, "m-1", REPLY_DRAFT, 1).await;
+        mount_get_minimal(&server, "m-1", 1).await;
+        mount_update(&server, "t-1", 1).await;
+
+        let mut warn = Vec::new();
+        run_update(
+            &client,
+            "r-1",
+            from_edit("SALES@example.org"),
+            None,
+            &mut warn,
+        )
+        .await
+        .unwrap();
+        let (_, message) = uploaded(&server).await;
+        // The stored draft had no From; the new one goes first.
+        let without_from = message
+            .strip_prefix("From: \"Sales\" <sales@example.org>\r\n")
+            .unwrap_or_else(|| panic!("From not first: {message}"));
+        assert_eq!(without_from, REPLY_DRAFT, "{message}");
+    }
+
+    #[tokio::test]
+    async fn run_update_to_the_nameless_primary_leaves_from_to_gmail() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_send_as(&server, 1).await;
+        let stored = format!("From: Sales <sales@example.org>\r\n{REPLY_DRAFT}");
+        mount_get_raw(&server, "m-1", &stored, 1).await;
+        mount_get_minimal(&server, "m-1", 1).await;
+        mount_update(&server, "t-1", 1).await;
+
+        run_update(
+            &client,
+            "r-1",
+            from_edit("me@example.org"),
+            None,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        let (_, message) = uploaded(&server).await;
+        assert_eq!(message, REPLY_DRAFT);
+    }
+
+    #[tokio::test]
+    async fn run_update_refuses_a_bad_from_before_reading_the_draft() {
+        for (from, expected) in [
+            (
+                "stranger@example.com",
+                "not one of this account's send-as addresses",
+            ),
+            ("new@example.org", "awaiting verification"),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            let client = client_with_bootstrapped_token(&server).await;
+            mount_send_as(&server, 1).await;
+            mount_get_raw(&server, "m-1", REPLY_DRAFT, 0).await;
+            mount_get_minimal(&server, "m-1", 0).await;
+            mount_update(&server, "t-1", 0).await;
+
+            let err = run_update(&client, "r-1", from_edit(from), None, &mut Vec::new())
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_update_without_from_skips_the_send_as_lookup() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_send_as(&server, 0).await;
+        mount_get_raw(&server, "m-1", REPLY_DRAFT, 1).await;
+        mount_get_minimal(&server, "m-1", 1).await;
+        mount_update(&server, "t-1", 1).await;
+
+        run_update(
+            &client,
+            "r-1",
+            subject_edit("Re: Report"),
+            None,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn run_update_edits_one_field_and_keeps_the_reply_in_its_thread() {
@@ -486,10 +640,10 @@ JVBERi0xLjQK\r\n\
         mount_get_minimal(&server, "m-1", 1).await;
         mount_update(&server, "t-1", 1).await;
 
-        let change = Change::Edit(DraftEdit {
+        let change = Change::Edit(Box::new(DraftEdit {
             cc: Some(vec![Mailbox::parse("carol@example.com").unwrap()]),
             ..DraftEdit::default()
-        });
+        }));
         let mut warn = Vec::new();
         let updated = run_update(&client, "r-1", change, None, &mut warn)
             .await
@@ -639,11 +793,11 @@ JVBERi0xLjQK\r\n\
         // Gmail filed the result under a new thread.
         mount_update(&server, "t-new", 1).await;
 
-        let change = Change::Edit(DraftEdit {
+        let change = Change::Edit(Box::new(DraftEdit {
             subject: Some("Something else".to_string()),
             body: Some("Plain now.".to_string()),
             ..DraftEdit::default()
-        });
+        }));
         let mut warn = Vec::new();
         run_update(&client, "r-1", change, None, &mut warn)
             .await
@@ -683,10 +837,10 @@ JVBERi0xLjQK\r\n\
         mount_get_minimal(&server, "m-1", 0).await;
         mount_update(&server, "t-1", 0).await;
 
-        let change = Change::Edit(DraftEdit {
+        let change = Change::Edit(Box::new(DraftEdit {
             remove_attachments: vec!["nope.pdf".to_string()],
             ..DraftEdit::default()
-        });
+        }));
         let err = run_update(&client, "r-1", change, None, &mut Vec::new())
             .await
             .unwrap_err();
@@ -748,6 +902,7 @@ JVBERi0xLjQK\r\n\
     fn update_command(output: OutputFormat) -> UpdateCommand {
         UpdateCommand {
             draft_id: "r-1".to_string(),
+            from: None,
             to: vec![],
             cc: vec![],
             bcc: vec![],
@@ -1040,6 +1195,7 @@ JVBERi0xLjQK\r\n\
             &["--html-body-file", "b.html"],
             &["--attach", "f"],
             &["--remove-attachment", "f"],
+            &["--from", "a@example.com"],
             &["--raw", "m.eml"],
         ] {
             let mut args = vec!["r-1"];
@@ -1059,6 +1215,7 @@ JVBERi0xLjQK\r\n\
             ["--html-body-file", "b.html"],
             ["--attach", "f"],
             ["--remove-attachment", "f"],
+            ["--from", "a@example.com"],
         ] {
             let mut args = vec!["r-1", "--raw", "m.eml"];
             args.extend(flag);

@@ -7189,6 +7189,7 @@ Creates a draft to review and send from Gmail (needs `gmail.modify`)
 Usage: create [OPTIONS]
 
 Options:
+      --from <ADDR>            Send as this address: one of the account's verified send-as aliases, or its primary address, as `addr@example.com` or `"Name <addr@example.com>"`. Without a name, Gmail's name for the address is used
       --to <ADDR>...           A `To` recipient: `addr@example.com` or `"Name <addr@example.com>"`. Repeat the flag (or list several after it) for more recipients. Required unless `--reply-to` is given, which defaults it from the original
       --cc <ADDR>...           A `Cc` recipient, in the same form as `--to`
       --bcc <ADDR>...          A `Bcc` recipient, in the same form as `--to`
@@ -7245,12 +7246,13 @@ omni-dev gmail draft update - Updates a draft in place, keeping its id and threa
 
 Updates a draft in place, keeping its id and thread (needs `gmail.modify`)
 
-Usage: update [OPTIONS] <--to <ADDR>|--cc <ADDR>|--bcc <ADDR>|--subject <SUBJECT>|--body <BODY>|--body-file <PATH>|--html-body <HTML>|--html-body-file <PATH>|--attach <PATH>|--remove-attachment <NAME>|--raw <FILE>> <DRAFT_ID>
+Usage: update [OPTIONS] <--from <ADDR>|--to <ADDR>|--cc <ADDR>|--bcc <ADDR>|--subject <SUBJECT>|--body <BODY>|--body-file <PATH>|--html-body <HTML>|--html-body-file <PATH>|--attach <PATH>|--remove-attachment <NAME>|--raw <FILE>> <DRAFT_ID>
 
 Arguments:
   <DRAFT_ID>  Gmail draft id (the `DRAFT_ID` column of `gmail draft list`)
 
 Options:
+      --from <ADDR>               Send as this address: one of the account's verified send-as aliases, or its primary address, as `addr@example.com` or `"Name <addr@example.com>"`. Without a name, Gmail's name for the address is used
       --to <ADDR>                 Replace the `To` recipients: `addr@example.com` or `"Name <addr@example.com>"`. Repeat the flag for more recipients
       --cc <ADDR>                 Replace the `Cc` recipients, in the same form as `--to`
       --bcc <ADDR>                Replace the `Bcc` recipients, in the same form as `--to`

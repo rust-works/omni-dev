@@ -29,7 +29,9 @@
 //!   part when the caller has none, and [`inline_image_warning`] flags HTML
 //!   that expects inline images nothing here attaches.
 //!
-//! `From` is never set: Gmail fills in the authenticated account's address.
+//! `From` is set only when the caller names one ([`Composition::from`],
+//! checked against the account's send-as aliases by the caller, #1956);
+//! otherwise Gmail fills in the authenticated account's address.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -468,6 +470,11 @@ fn parse_address_header(name: &str, value: &str) -> (Vec<Mailbox>, Vec<String>) 
 /// an HTML body.
 #[derive(Debug, Clone, Default)]
 pub struct Composition {
+    /// The `From` mailbox. `None` leaves the header out, and Gmail fills in
+    /// the account's primary address. Gmail only sends as a verified
+    /// send-as alias, so the caller checks it first (see
+    /// [`crate::gmail::send_as_api::resolve_from`]).
+    pub from: Option<Mailbox>,
     /// `To` recipients.
     pub to: Vec<Mailbox>,
     /// `Cc` recipients.
@@ -559,6 +566,9 @@ impl Composition {
                 "invalid Message-ID domain {domain:?}"
             );
             builder = builder.message_id(format!("{}@{domain}", make_boundary(".")));
+        }
+        if let Some(from) = &self.from {
+            builder = builder.from(from.to_address());
         }
         for (header, mailboxes) in [("To", &self.to), ("Cc", &self.cc), ("Bcc", &self.bcc)] {
             if mailboxes.is_empty() {
@@ -863,6 +873,23 @@ mod tests {
             ["dave@example.com", "erin@example.com"]
         );
         assert_eq!(parsed.cc().unwrap().first().unwrap().name(), Some("Carol"));
+    }
+
+    #[test]
+    fn build_writes_an_encoded_from_when_one_is_given() {
+        let composition = Composition {
+            from: Some(mailbox("Zoë Ångström <zoe@example.org>")),
+            ..plain("Hi")
+        };
+        let message = built(&composition);
+        assert!(message.is_ascii());
+        let raw_from = raw_header(&message, "From").unwrap();
+        assert!(raw_from.contains("=?utf-8?"), "{raw_from}");
+        assert!(raw_from.ends_with("<zoe@example.org>"), "{raw_from}");
+        let parsed = MessageParser::default().parse(message.as_bytes()).unwrap();
+        let from = parsed.from().unwrap().first().unwrap();
+        assert_eq!(from.name(), Some("Zoë Ångström"));
+        assert_eq!(from.address(), Some("zoe@example.org"));
     }
 
     #[test]

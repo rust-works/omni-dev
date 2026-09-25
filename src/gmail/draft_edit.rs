@@ -9,7 +9,7 @@
 //! nothing here needs to touch. [`DraftEdit::apply`] instead edits the bytes
 //! **in place**, and everything not named survives byte for byte:
 //!
-//! - **Header edits** (`To`, `Cc`, `Bcc`, `Subject`) replace just those
+//! - **Header edits** (`From`, `To`, `Cc`, `Bcc`, `Subject`) replace just those
 //!   header fields, encoded by `mail-builder` exactly as `draft create`
 //!   encodes them. The body is not touched.
 //! - **Structural edits** (the body, adding or removing attachments) work on
@@ -21,8 +21,9 @@
 //!   `multipart/alternative` of plain text and HTML (#1955). Neither half of
 //!   an existing alternative is ever kept, so the two can't drift apart.
 //!
-//! Every top-level header that isn't a `Content-*` header (`From`, `Date`,
-//! `Message-ID`, `In-Reply-To`, `References`, …) is always kept.
+//! Every other top-level header that isn't a `Content-*` header (`From`
+//! unless it is edited, `Date`, `Message-ID`, `In-Reply-To`, `References`,
+//! …) is always kept.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -45,6 +46,11 @@ use crate::utils::path::attachment_filename;
 /// that part of the message exactly as it is.
 #[derive(Debug, Clone, Default)]
 pub struct DraftEdit {
+    /// Replaces the `From` mailbox. `Some(None)` removes the header, so
+    /// Gmail fills in the primary address and the account's name. Checking
+    /// the mailbox against the account's send-as aliases is the caller's
+    /// job.
+    pub from: Option<Option<Mailbox>>,
     /// Replaces the whole `To` list. An empty list removes the header.
     pub to: Option<Vec<Mailbox>>,
     /// Replaces the whole `Cc` list. An empty list removes the header.
@@ -120,6 +126,18 @@ impl DraftEdit {
             }
         }
         let eol = split.eol;
+        if let Some(from) = &self.from {
+            let field = from
+                .as_ref()
+                .map(|from| encode_field("From", &to_address(from), eol));
+            match field {
+                // A new `From` goes first, where `draft create` puts it.
+                Some(field) if !fields.iter().any(|f| f.is_named("From")) => {
+                    fields.insert(0, field);
+                }
+                field => set_field(&mut fields, "From", field),
+            }
+        }
         for (name, mailboxes) in [("To", &self.to), ("Cc", &self.cc), ("Bcc", &self.bcc)] {
             if let Some(mailboxes) = mailboxes {
                 let field = (!mailboxes.is_empty()).then(|| {
@@ -856,6 +874,62 @@ Content-Type: text/html; charset=\"UTF-8\"\r\n\
     }
 
     #[test]
+    fn a_from_edit_replaces_only_the_from_field_in_place() {
+        let original = GMAIL_UI_DRAFT.as_bytes();
+        let edited = DraftEdit {
+            from: Some(Some(mailbox("Zoë <sales@example.org>"))),
+            ..DraftEdit::default()
+        }
+        .apply(original)
+        .unwrap();
+
+        assert_eq!(body_of(&edited.raw), body_of(original));
+        assert_eq!(
+            other_fields(&edited.raw, &["From"]),
+            other_fields(original, &["From"])
+        );
+        let fields = other_fields(&edited.raw, &[]);
+        let from_index = other_fields(original, &[])
+            .iter()
+            .position(|f| f.starts_with("From:"))
+            .unwrap();
+        assert!(fields[from_index].starts_with("From: "));
+        assert!(fields[from_index].is_ascii());
+        let parsed = parse(&edited.raw);
+        let from = parsed.from().unwrap().first().unwrap();
+        assert_eq!(from.name(), Some("Zoë"));
+        assert_eq!(from.address(), Some("sales@example.org"));
+        assert!(edited.warnings.is_empty(), "{:?}", edited.warnings);
+    }
+
+    #[test]
+    fn a_from_edit_adds_the_header_to_a_draft_without_one() {
+        let original = b"To: a@example.com\r\nSubject: Hi\r\n\r\nbody\r\n";
+        let edited = DraftEdit {
+            from: Some(Some(mailbox("sales@example.org"))),
+            ..DraftEdit::default()
+        }
+        .apply(original)
+        .unwrap();
+        assert_eq!(
+            edited.raw,
+            b"From: <sales@example.org>\r\nTo: a@example.com\r\nSubject: Hi\r\n\r\nbody\r\n"
+        );
+    }
+
+    #[test]
+    fn a_from_edit_of_none_removes_the_header() {
+        let original = b"From: Alias <a@example.org>\r\nTo: b@example.com\r\n\r\nbody\r\n";
+        let edited = DraftEdit {
+            from: Some(None),
+            ..DraftEdit::default()
+        }
+        .apply(original)
+        .unwrap();
+        assert_eq!(edited.raw, b"To: b@example.com\r\n\r\nbody\r\n");
+    }
+
+    #[test]
     fn a_recipient_edit_replaces_the_whole_list_in_place() {
         let original = GMAIL_UI_DRAFT.as_bytes();
         let edited = DraftEdit {
@@ -1416,6 +1490,7 @@ Content-Type: text/html\r\n\r\n<p>x</p>\r\n--r--\r\n"
     fn edits_combine_in_one_pass() {
         let original = GMAIL_UI_DRAFT.as_bytes();
         let edited = DraftEdit {
+            from: Some(Some(mailbox("sales@example.org"))),
             to: Some(vec![mailbox("bob@example.com")]),
             body: Some("New.".to_string()),
             attach: vec![attachment("n.txt", "text/plain", b"note")],
@@ -1425,6 +1500,10 @@ Content-Type: text/html\r\n\r\n<p>x</p>\r\n--r--\r\n"
         .apply(original)
         .unwrap();
         let parsed = parse(&edited.raw);
+        assert_eq!(
+            parsed.from().unwrap().first().unwrap().address(),
+            Some("sales@example.org")
+        );
         assert_eq!(
             parsed.to().unwrap().first().unwrap().address(),
             Some("bob@example.com")

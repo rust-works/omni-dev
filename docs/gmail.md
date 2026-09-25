@@ -555,6 +555,8 @@ $ omni-dev gmail draft create --to alice@example.com --subject 'Quarterly report
     --html-body-file note.html --attach q3.pdf
 $ omni-dev gmail draft create --to alice@example.com --reply-to 18c2f0a1b2c3d4e5 --body 'Thanks!'
 $ omni-dev gmail draft create --reply-to 18c2f0a1b2c3d4e5 --reply-all --body 'Thanks, all!'
+$ omni-dev gmail draft create --from 'Sales Team <sales@example.com>' --to alice@example.com \
+    --subject 'Your order' --body 'It shipped today.'
 $ omni-dev gmail draft create --raw message.eml
 ```
 
@@ -593,13 +595,29 @@ review and send.
 - **Attachments.** Each `--attach PATH` becomes a base64 part of a
   `multipart/mixed` message. Its type is guessed from the file extension,
   defaulting to `application/octet-stream`.
-- **From.** Not set. Gmail fills in the account's own address. Sending
-  from a send-as alias isn't supported yet.
-- **Message-ID.** Ends in the account's own domain (for example
-  `<…@gmail.com>`), looked up with one `users.getProfile` call, which
-  `gmail.readonly` allows, alongside any `--reply-to` lookup. If that call
-  fails, the id ends in `@localhost` instead and a warning is printed once
-  the draft has been created. `--raw`
+- **From.** Not set by default, so Gmail fills in the account's own
+  address. `--from ADDR` (`addr@example.com` or `Name <addr@example.com>`)
+  sends as one of the account's **send-as addresses** instead: the primary
+  address or an alias added under Gmail's *Settings → Accounts → Send mail
+  as*. `draft create` checks it first with one `users.settings.sendAs.list`
+  call and refuses, before anything is created, an address that isn't one
+  of them or an alias still awaiting verification. The error lists the
+  addresses the account can use. The check is there because Gmail is
+  reported to send from the primary address instead when a draft's `From`
+  isn't a verified alias, so the draft would look right and go out wrong.
+  The address is matched case-insensitively and written as Gmail stores it.
+  Without a name, the name is the one Gmail has for that address, else the
+  primary address's, as Gmail itself does for a nameless alias. When that
+  leaves the primary address with no name at all, `From` is left out, so
+  Gmail fills in the address and your account name rather than a bare
+  address. The `Message-ID` then ends in the `From` address's domain. No new
+  scope is needed: `gmail.modify` (and even `gmail.readonly`) allows the
+  call. `--from` doesn't change who a `--reply-to` draft is addressed to.
+- **Message-ID.** Ends in the `--from` address's domain, or else the
+  account's own domain (for example `<…@gmail.com>`), looked up with one
+  `users.getProfile` call, which `gmail.readonly` allows, alongside any
+  `--reply-to` lookup. If that call fails, the id ends in `@localhost`
+  instead and a warning is printed once the draft has been created. `--raw`
   messages keep whatever `Message-ID` they carry, and so does every
   [`draft update`](#updating-drafts).
 - **Replies.** `--reply-to` takes the **Gmail message id** of the message
@@ -633,7 +651,7 @@ review and send.
   makes. `--reply-all` also leaves out your send-as aliases, found with one
   `users.settings.sendAs.list` call. If that call fails, the command fails
   rather than risk putting an alias in its own reply. A plain reply doesn't
-  make that call, so it only recognises the primary address.
+  use that call, so it only recognises the primary address.
 
   An explicit `--to` or `--cc` **replaces** that header's default rather than
   adding to it, so you can drop someone. A defaulted header also leaves out
@@ -658,7 +676,8 @@ review and send.
   as yours. `Mail-Followup-To`/`Mail-Reply-To` are ignored.
 - **`--raw FILE`** uploads a complete RFC 5322 message byte for byte, with
   no parsing or line-ending changes. It can't be combined with any of the
-  composing flags.
+  composing flags, `--from` included: the file's own `From` is uploaded
+  unchecked.
 - **Size.** Messages over Gmail's 35 MB per-message limit are refused
   before any request is sent. This is the same limit as [Insert](#insert).
   Attachments are checked on disk before they're read, with base64's growth
@@ -686,6 +705,7 @@ $ omni-dev gmail draft update r-1234567890 --cc bob@example.com --cc carol@examp
 $ omni-dev gmail draft update r-1234567890 --body-file revised.txt --remove-attachment q3-draft.pdf \
     --attach q3.pdf
 $ omni-dev gmail draft update r-1234567890 --html-body-file revised.html
+$ omni-dev gmail draft update r-1234567890 --from sales@example.com
 $ omni-dev gmail draft update r-1234567890 --raw draft.eml --if-message-id 18c2f0a1b2c3d4e5
 ```
 
@@ -697,9 +717,9 @@ edit is required. Nothing is sent.
 Gmail's `drafts.update` has no partial form: every update replaces the whole
 message. So `draft update` reads the stored message
 (`drafts.get?format=raw`), changes only what the flags name, and uploads the result.
-**Everything else is kept byte for byte**: `From`, `Date`, `Message-ID`,
-`In-Reply-To`/`References`, any other header, the body, and every attachment
-you didn't name.
+**Everything else is kept byte for byte**: `From` (unless `--from` is
+given), `Date`, `Message-ID`, `In-Reply-To`/`References`, any other header,
+the body, and every attachment you didn't name.
 
 - **Recipients and subject.** `--to`, `--cc`, `--bcc` and `--subject`
   replace just that header, encoded the way `draft create` encodes it. Each
@@ -708,6 +728,12 @@ you didn't name.
   `draft create`, one flag takes one value, so the draft id can follow it).
   `--subject ''` removes the subject. A recipient header can't be cleared
   yet.
+- **From.** `--from ADDR` replaces `From` with one of the account's send-as
+  addresses, checked and named exactly as in `draft create`. The check runs
+  before the draft is read, so a refused address changes nothing and costs
+  no draft reads. `--from` with your primary address and no name known for
+  it removes `From`, so Gmail fills it in with your account name; otherwise
+  there's no way to remove `From`.
 - **Body.** `--body TEXT` or `--body-file PATH` replaces the body with plain
   text. There's no standard-input fallback, unlike `draft create`, because
   the body is optional here. A draft written in the Gmail UI also has an
@@ -1308,9 +1334,10 @@ for up to 1000 ids. Gmail doesn't document a separate cost for
 `drafts.create`, so assume the `messages.insert` cost (25 units) until it's
 verified. `draft create` makes one such call and one `users.getProfile`
 (1 unit), plus one `messages.get` with `--reply-to` and one
-`users.settings.sendAs.list` (1 unit) with `--reply-all`. `draft update`
-makes one `drafts.update` (assume the same 25 units) plus two `drafts.get`
-calls, or one with `--raw`. `gmail search`'s ids-only default costs a flat
+`users.settings.sendAs.list` (1 unit) with `--reply-all` or `--from`.
+`draft update` makes one `drafts.update` (assume the same 25 units) plus two
+`drafts.get` calls, or one with `--raw`, and one `users.settings.sendAs.list`
+with `--from`. `gmail search`'s ids-only default costs a flat
 5 units regardless of `--limit` (auto-pagination is still one `messages.list` call
 per page). `--enrich` adds one `messages.get` (5 units) **per hit**, so
 `--enrich --limit 50` can cost up to 255 units — nearly the entire
