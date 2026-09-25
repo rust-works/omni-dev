@@ -27,9 +27,10 @@
 //!   `SessionEnd` uses, instead of waiting out the TTL.
 //! - **A pid is alive, its identity token still matches (or is being captured
 //!   for the first time), the session has had at least one `UserPromptSubmit`,
-//!   and it is the most recently started `session_id` among every candidate
-//!   sharing that pid:** refresh `last_seen`, keeping the ordinary
-//!   [`reap_sessions`](super::reap_sessions) TTL from ever seeing it go stale.
+//!   and it is the most recently *active* (by `last_seen`, not creation order)
+//!   `session_id` among every candidate sharing that pid:** refresh
+//!   `last_seen`, keeping the ordinary [`reap_sessions`](super::reap_sessions)
+//!   TTL from ever seeing it go stale.
 //!
 //! **Why a pid must be independently confirmed alive before its death is ever
 //! trusted.** #1948's docs allow for a hook command wrapped in a shell, whose
@@ -144,16 +145,20 @@ fn plan(
         status.entry(c.pid).or_insert_with(|| probe(c.pid));
     }
 
-    // The most recently started session_id among the candidates sharing each
-    // pid: `/clear` (and possibly `/resume`) can start a new session_id in the
-    // same process without necessarily firing `SessionEnd` for the old one, so
-    // only the newest may be exempted — an older one falls back to the TTL.
-    let mut newest_started_at: HashMap<u32, DateTime<Utc>> = HashMap::new();
+    // The most recently *active* session_id among the candidates sharing each
+    // pid, by `last_seen` rather than creation order: `/clear` (and possibly
+    // `/resume`) can start a new session_id in the same process without
+    // necessarily firing `SessionEnd` for the old one, so only the currently
+    // active one may be exempted — an abandoned one falls back to the TTL.
+    // `last_seen` (not `started_at`) is what lets a later `/resume` of the
+    // older session_id correctly reclaim this over one `/clear` merely created
+    // more recently but which has since gone quiet.
+    let mut most_recently_seen: HashMap<u32, DateTime<Utc>> = HashMap::new();
     for c in candidates {
-        newest_started_at
+        most_recently_seen
             .entry(c.pid)
-            .and_modify(|t| *t = (*t).max(c.started_at))
-            .or_insert(c.started_at);
+            .and_modify(|t| *t = (*t).max(c.last_seen))
+            .or_insert(c.last_seen);
     }
 
     let mut actions = Vec::new();
@@ -183,8 +188,9 @@ fn plan(
                     }
                     _ => {
                         confirmed.insert(c.pid);
-                        let is_newest = newest_started_at.get(&c.pid) == Some(&c.started_at);
-                        if c.prompted && is_newest {
+                        let is_most_recently_seen =
+                            most_recently_seen.get(&c.pid) == Some(&c.last_seen);
+                        if c.prompted && is_most_recently_seen {
                             if let Some(token) = start_token {
                                 actions.push(Action::Confirm {
                                     session_id: c.session_id.clone(),
@@ -247,7 +253,7 @@ mod tests {
             pid,
             pid_start: pid_start.map(str::to_string),
             prompted,
-            started_at: Utc::now(),
+            last_seen: Utc::now(),
         }
     }
 
@@ -321,11 +327,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_newest_session_under_a_shared_pid_is_confirmed() {
-        // The `/clear`-style guard: an older session_id under a pid a newer
-        // one has since taken over falls back to the ordinary TTL.
+    fn only_the_most_recently_active_session_under_a_shared_pid_is_confirmed() {
+        // The `/clear`-style guard: an abandoned session_id under a pid a
+        // newer one has since taken over falls back to the ordinary TTL.
         let mut old = candidate("old", 100, Some("tok"), true);
-        old.started_at = Utc::now() - chrono::Duration::seconds(100);
+        old.last_seen = Utc::now() - chrono::Duration::seconds(100);
         let new = candidate("new", 100, Some("tok"), true);
         let candidates = vec![old, new];
         let mut confirmed = HashSet::new();
@@ -340,6 +346,33 @@ mod tests {
             actions,
             vec![Action::Confirm {
                 session_id: "new".to_string(),
+                pid_start: "tok".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_resumed_older_session_id_reclaims_the_exemption_by_last_seen() {
+        // `new` (`/clear`) was created after `old`, but the user then
+        // `/resume`d `old` in the same process and it is the one actually
+        // receiving hooks now — `started_at` would wrongly keep favouring the
+        // abandoned `new` forever; `last_seen` correctly follows the activity.
+        let old = candidate("old", 100, Some("tok"), true);
+        let mut new = candidate("new", 100, Some("tok"), true);
+        new.last_seen = Utc::now() - chrono::Duration::seconds(100);
+        let candidates = vec![old, new];
+        let mut confirmed = HashSet::new();
+        let probe = probe_of(&HashMap::from([(
+            100,
+            PidStatus::Alive {
+                start_token: Some("tok".to_string()),
+            },
+        )]));
+        let actions = plan(&candidates, &mut confirmed, probe);
+        assert_eq!(
+            actions,
+            vec![Action::Confirm {
+                session_id: "old".to_string(),
                 pid_start: "tok".to_string()
             }]
         );
