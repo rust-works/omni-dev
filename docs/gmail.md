@@ -579,8 +579,9 @@ review and send.
   from a send-as alias isn't supported yet.
 - **Message-ID.** Ends in the account's own domain (for example
   `<…@gmail.com>`), looked up with one `users.getProfile` call, which
-  `gmail.readonly` allows. If that call fails, a warning is printed and the
-  id ends in `@localhost` instead; the draft is still created. `--raw`
+  `gmail.readonly` allows, alongside any `--reply-to` lookup. If that call
+  fails, the id ends in `@localhost` instead and a warning is printed once
+  the draft has been created. `--raw`
   messages keep whatever `Message-ID` they carry, and so does every
   [`draft update`](#updating-drafts).
 - **Replies.** `--reply-to` takes the **Gmail message id** of the message

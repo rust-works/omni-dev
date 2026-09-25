@@ -288,12 +288,17 @@ pub fn message_id_domain(email: &str) -> Option<String> {
     is_plain_domain(domain).then(|| domain.to_ascii_lowercase())
 }
 
-/// Whether `domain` is non-empty dot-separated labels of letters, digits
-/// and hyphens.
+/// Whether `domain` is an RFC 1035 host name: at most 253 characters of
+/// dot-separated labels, each 1 to 63 letters, digits and hyphens that
+/// neither starts nor ends with a hyphen.
 fn is_plain_domain(domain: &str) -> bool {
-    domain.split('.').all(|label| {
-        !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-    })
+    domain.len() <= 253
+        && domain.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
 }
 
 impl Composition {
@@ -533,12 +538,20 @@ mod tests {
             message_id_domain("\"a@b\"@mail.example.com").as_deref(),
             Some("mail.example.com")
         );
+        let longest = format!("me@{}.org", "a".repeat(63));
+        assert!(message_id_domain(&longest).is_some());
+        let long_label = format!("me@{}.org", "a".repeat(64));
+        let long_domain = format!("me@{}org", "a.".repeat(126));
         for email in [
             "no-at-sign",
             "me@",
             "me@[127.0.0.1]",
             "me@a..b",
             "me@exa mple.org",
+            "me@-example.org",
+            "me@example-.org",
+            &long_label,
+            &long_domain,
         ] {
             assert_eq!(message_id_domain(email), None, "{email}");
         }
