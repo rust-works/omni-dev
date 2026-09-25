@@ -1705,7 +1705,7 @@ omni-dev gmail sync --output-dir ~/mail-archive --query 'label:finance'
 ```
 
 Every read-only Gmail CLI subcommand except `sync` has a matching
-`gmail_*` MCP tool — see [docs/mcp.md](mcp.md#gmail-6-tools). Label
+`gmail_*` MCP tool — see [docs/mcp.md](mcp.md#gmail-8-tools). Label
 mutation and `sync` (a long-running bulk filesystem operation, a poor fit
 for a synchronous MCP call) are CLI-only in this release.
 

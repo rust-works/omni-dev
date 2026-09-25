@@ -7016,7 +7016,7 @@ Commands:
   read                 Reads a single Gmail message (mirrors the `gmail_message_read` MCP tool)
   thread               Reads a Gmail thread (mirrors the `gmail_thread_read` MCP tool)
   label                Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1)
-  draft                Manages Gmail drafts; never sends or deletes one (CLI-only; no MCP equivalent yet; #1920)
+  draft                Manages Gmail drafts; never sends or deletes one (mirrors the `gmail_draft_list`/`gmail_draft_show` MCP tools for `list`/`show`; `create`/`update` are CLI-only; #1920)
   sync                 Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent)
   sync-all             Maintains durable local archives for every account in `.omni-dev/gmail-sync.yaml`, concurrently (CLI-only; no MCP equivalent; ADR-0068)
   extract-attachments  Retroactively extracts attachments for already-archived messages, without re-fetching from Gmail (CLI-only; no MCP equivalent; purely local, no client/credentials needed; #1510)
@@ -7163,17 +7163,17 @@ Options:
 
 ================================================================================
 
-omni-dev gmail draft - Manages Gmail drafts; never sends or deletes one (CLI-only; no MCP equivalent yet; #1920)
+omni-dev gmail draft - Manages Gmail drafts; never sends or deletes one (mirrors the `gmail_draft_list`/`gmail_draft_show` MCP tools for `list`/`show`; `create`/`update` are CLI-only; #1920)
 
-Manages Gmail drafts; never sends or deletes one (CLI-only; no MCP equivalent yet; #1920)
+Manages Gmail drafts; never sends or deletes one (mirrors the `gmail_draft_list`/`gmail_draft_show` MCP tools for `list`/`show`; `create`/`update` are CLI-only; #1920)
 
 Usage: draft <COMMAND>
 
 Commands:
-  list    Lists drafts with their draft ids (`gmail.readonly` is enough)
-  show    Shows one draft by its draft id (`gmail.readonly` is enough)
-  create  Creates a draft to review and send from Gmail (needs `gmail.modify`)
-  update  Updates a draft in place, keeping its id and thread (needs `gmail.modify`)
+  list    Lists drafts with their draft ids (`gmail.readonly` is enough; mirrors the `gmail_draft_list` MCP tool)
+  show    Shows one draft by its draft id (`gmail.readonly` is enough; mirrors the `gmail_draft_show` MCP tool)
+  create  Creates a draft to review and send from Gmail (needs `gmail.modify`; CLI-only)
+  update  Updates a draft in place, keeping its id and thread (needs `gmail.modify`; CLI-only)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -7182,9 +7182,9 @@ Options:
 
 ================================================================================
 
-omni-dev gmail draft create - Creates a draft to review and send from Gmail (needs `gmail.modify`)
+omni-dev gmail draft create - Creates a draft to review and send from Gmail (needs `gmail.modify`; CLI-only)
 
-Creates a draft to review and send from Gmail (needs `gmail.modify`)
+Creates a draft to review and send from Gmail (needs `gmail.modify`; CLI-only)
 
 Usage: create [OPTIONS]
 
@@ -7208,9 +7208,9 @@ Options:
 
 ================================================================================
 
-omni-dev gmail draft list - Lists drafts with their draft ids (`gmail.readonly` is enough)
+omni-dev gmail draft list - Lists drafts with their draft ids (`gmail.readonly` is enough; mirrors the `gmail_draft_list` MCP tool)
 
-Lists drafts with their draft ids (`gmail.readonly` is enough)
+Lists drafts with their draft ids (`gmail.readonly` is enough; mirrors the `gmail_draft_list` MCP tool)
 
 Usage: list [OPTIONS]
 
@@ -7223,9 +7223,9 @@ Options:
 
 ================================================================================
 
-omni-dev gmail draft show - Shows one draft by its draft id (`gmail.readonly` is enough)
+omni-dev gmail draft show - Shows one draft by its draft id (`gmail.readonly` is enough; mirrors the `gmail_draft_show` MCP tool)
 
-Shows one draft by its draft id (`gmail.readonly` is enough)
+Shows one draft by its draft id (`gmail.readonly` is enough; mirrors the `gmail_draft_show` MCP tool)
 
 Usage: show [OPTIONS] <DRAFT_ID>
 
@@ -7242,9 +7242,9 @@ Options:
 
 ================================================================================
 
-omni-dev gmail draft update - Updates a draft in place, keeping its id and thread (needs `gmail.modify`)
+omni-dev gmail draft update - Updates a draft in place, keeping its id and thread (needs `gmail.modify`; CLI-only)
 
-Updates a draft in place, keeping its id and thread (needs `gmail.modify`)
+Updates a draft in place, keeping its id and thread (needs `gmail.modify`; CLI-only)
 
 Usage: update [OPTIONS] <--from <ADDR>|--to <ADDR>|--cc <ADDR>|--bcc <ADDR>|--subject <SUBJECT>|--body <BODY>|--body-file <PATH>|--html-body <HTML>|--html-body-file <PATH>|--attach <PATH>|--remove-attachment <NAME>|--raw <FILE>> <DRAFT_ID>
 

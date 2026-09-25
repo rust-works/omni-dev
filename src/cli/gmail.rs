@@ -60,8 +60,9 @@ pub enum GmailSubcommands {
     Thread(thread::ThreadCommand),
     /// Manages Gmail labels (mirrors the `gmail_label_list` MCP tool; `add`/`remove` are CLI-only in Phase 1).
     Label(label::LabelCommand),
-    /// Manages Gmail drafts; never sends or deletes one (CLI-only; no MCP
-    /// equivalent yet; #1920).
+    /// Manages Gmail drafts; never sends or deletes one (mirrors the
+    /// `gmail_draft_list`/`gmail_draft_show` MCP tools for `list`/`show`;
+    /// `create`/`update` are CLI-only; #1920).
     Draft(draft::DraftCommand),
     /// Maintains a durable local archive of a mailbox (CLI-only; no MCP equivalent).
     Sync(sync::SyncCommand),

@@ -5,7 +5,7 @@ API through the `omni-dev gmail` command tree, with a matching `gmail_*` MCP
 tool for every read-only subcommand. Authentication and output formats are
 identical across both surfaces; the MCP tools simply return YAML matching the
 CLI's `-o yaml` output. For the MCP-tool reference (parameters only), see
-[docs/mcp.md](mcp.md#gmail-6-tools).
+[docs/mcp.md](mcp.md#gmail-8-tools).
 
 New to this integration? Follow the
 [Gmail Quickstart](gmail-quickstart.md) for a linear, zero-to-synced-archive
@@ -781,8 +781,24 @@ for a read-only account.
 
 ### MCP equivalent(s)
 
-None yet. `draft list`, `draft show`, `draft create` and `draft update` are
-CLI-only.
+- `gmail_draft_list` mirrors `draft list`. It takes the same `query` and
+  `limit` (default 50, `0` for every draft up to the 10,000 hard cap) and
+  returns the same rows as `-o yaml`, with `draft_id`, `message_id` and
+  `thread_id` named apart. Hydration concurrency is fixed at the CLI's
+  default of 4. Neither surface has a knob for it.
+- `gmail_draft_show` mirrors `draft show`. It takes a `draft_id` and the
+  same `format` values as `gmail_message_read` (`minimal` / `metadata` /
+  `full` / `raw`) and returns `drafts.get`'s `{id, message}` as YAML. A
+  message id fails with the same `No draft with id` hint. `output_file`
+  writes that YAML to disk and returns a short summary. Unlike
+  `--detail raw --out-file draft.eml`, it never decodes the message to an
+  `.eml`.
+
+Both need only `gmail.readonly`. `draft create` and `draft update` stay
+CLI-only: they would be the first Gmail MCP tools that need `gmail.modify`,
+and their file inputs (`--attach`, `--body-file`, `--raw`) would let an MCP
+client make the server read local files into the mailbox, so they get their
+own review. `send` and `delete` are not offered on either surface.
 
 ## Sync
 
@@ -1531,8 +1547,8 @@ still surfaces as an ordinary error and is retried on the next run. See
   the same named-account/OAuth2 storage pattern.
 - [User Guide](user-guide.md#gmail-integration) — short reference; primary
   content lives here.
-- [MCP Reference — Gmail](mcp.md#gmail-6-tools) — parameter-only listing of
-  all 6 `gmail_*` MCP tools.
+- [MCP Reference — Gmail](mcp.md#gmail-8-tools) — parameter-only listing of
+  all 8 `gmail_*` MCP tools.
 - [ADR-0063](adrs/adr-0063.md) — OAuth2 authorization-code + PKCE design,
   refresh-token-only persistence, and the bring-your-own Google Cloud
   project rationale.

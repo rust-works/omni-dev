@@ -317,7 +317,7 @@ refresh tokens that expire after 7 days — see
 `auth login` weekly.
 
 Every read-only Gmail subcommand except `sync` is also exposed as an MCP
-tool (`gmail_*`) — see [docs/mcp.md](docs/mcp.md#gmail-5-tools); `sync` is
+tool (`gmail_*`) — see [docs/mcp.md](docs/mcp.md#gmail-8-tools); `sync` is
 CLI-only (a long-running bulk filesystem operation, a poor fit for a
 synchronous MCP call). For the full guide, see
 [docs/gmail.md](docs/gmail.md).
@@ -689,7 +689,7 @@ Tools cover seven domains:
 | **Confluence** (13) | read/write/search/create/delete/download/children, comments, labels, user search |
 | **Atlassian shared** (2) | `atlassian_auth_status`, `atlassian_convert` (offline JFM ↔ ADF) |
 | **Datadog** (14) | metrics, monitors, dashboards, logs, events, SLOs, hosts, downtimes, metrics catalog |
-| **Gmail** (5) | `gmail_auth_status`, `gmail_search`, `gmail_message_read`, `gmail_thread_read`, `gmail_label_list` |
+| **Gmail** (8) | `gmail_auth_status`, `gmail_account_list`, `gmail_search`, `gmail_message_read`, `gmail_thread_read`, `gmail_label_list`, `gmail_draft_list`, `gmail_draft_show` |
 | **AI / Config** (5) | `ai_chat` (one-shot chat), `claude_skills_*` (sync / clean / status for `.claude/skills/` distribution), `config_models_show` |
 
 Resources exposed via URI templates:

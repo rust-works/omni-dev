@@ -391,6 +391,8 @@ mod tests {
             "gmail_thread_read",
             "gmail_label_list",
             "gmail_account_list",
+            "gmail_draft_list",
+            "gmail_draft_show",
         ] {
             assert!(server.tool_router.has_route(name), "missing route: {name}");
         }
