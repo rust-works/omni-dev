@@ -24,8 +24,12 @@
 //!   [`Composition::message_id_domain`] replaces that with the account's own
 //!   domain (#1953).
 //!
-//! Only `text/plain` bodies are built. `From` is never set: Gmail fills in the
-//! authenticated account's address.
+//! - **HTML bodies.** An HTML body always goes out as `multipart/alternative`
+//!   beside a plain-text part (#1955). [`plain_text_from_html`] derives that
+//!   part when the caller has none, and [`inline_image_warning`] flags HTML
+//!   that expects inline images nothing here attaches.
+//!
+//! `From` is never set: Gmail fills in the authenticated account's address.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -460,7 +464,8 @@ fn parse_address_header(name: &str, value: &str) -> (Vec<Mailbox>, Vec<String>) 
     (mailboxes, skipped)
 }
 
-/// A `text/plain` message to build.
+/// A message to build: `text/plain`, or `multipart/alternative` when it has
+/// an HTML body.
 #[derive(Debug, Clone, Default)]
 pub struct Composition {
     /// `To` recipients.
@@ -472,8 +477,11 @@ pub struct Composition {
     pub bcc: Vec<Mailbox>,
     /// The `Subject`. May be empty.
     pub subject: String,
-    /// The plain-text body.
+    /// The plain-text body, or with `html_body` its plain-text alternative.
     pub body: String,
+    /// The HTML body. Sent as `multipart/alternative` after `body`, so
+    /// clients that can render HTML show this one.
+    pub html_body: Option<String>,
     /// Files attached after the body. Any attachment makes the message
     /// `multipart/mixed`.
     pub attachments: Vec<Attachment>,
@@ -576,6 +584,9 @@ impl Composition {
             }
         }
         builder = builder.text_body(self.body.as_str());
+        if let Some(html) = &self.html_body {
+            builder = builder.html_body(html.as_str());
+        }
         for attachment in &self.attachments {
             builder = builder.attachment(
                 attachment.content_type.as_str(),
@@ -587,6 +598,35 @@ impl Composition {
             .write_to_vec()
             .map_err(|err| anyhow::anyhow!("Failed to build the message: {err}"))
     }
+}
+
+/// The plain-text alternative for an HTML body, as Markdown.
+///
+/// `htmd` converts it, the converter `gmail render` uses for an HTML-only
+/// message. Markdown keeps links as `[text](url)`, which stripping the tags
+/// would lose. A full HTML document's `<head>`, `<style>` and `<script>`
+/// are left out, so an email template's title and CSS don't open the plain
+/// text. A failed conversion is an error, never raw HTML in the plain part.
+pub fn plain_text_from_html(html: &str) -> Result<String> {
+    htmd::HtmlToMarkdown::builder()
+        .skip_tags(vec!["head", "title", "style", "script"])
+        .build()
+        .convert(html)
+        .map_err(|err| anyhow::anyhow!("could not derive a plain-text body from the HTML: {err}"))
+}
+
+/// A warning when `html` refers to an inline image (`cid:`), which no
+/// command here attaches, so the image would show as broken.
+///
+/// A plain case-insensitive search: it can fire on `cid:` in the text
+/// itself, which only costs a spurious warning.
+#[must_use]
+pub fn inline_image_warning(html: &str) -> Option<String> {
+    html.to_ascii_lowercase().contains("cid:").then(|| {
+        "the HTML refers to inline images (`cid:`), which aren't attached; they will show as \
+         broken images"
+            .to_string()
+    })
 }
 
 #[cfg(test)]
@@ -908,6 +948,133 @@ mod tests {
         assert_eq!(second.content_type().unwrap().ctype(), "application");
         assert_eq!(second.content_type().unwrap().subtype(), Some("pdf"));
         assert_eq!(second.contents(), b"%PDF-1.4");
+    }
+
+    fn with_html(html: &str) -> Composition {
+        Composition {
+            html_body: Some(html.to_string()),
+            ..plain("Styled")
+        }
+    }
+
+    /// Byte offset of the first `Content-Type: {mime_type}` line.
+    fn content_type_at(message: &str, mime_type: &str) -> usize {
+        message
+            .find(&format!("Content-Type: {mime_type}"))
+            .unwrap_or_else(|| panic!("no {mime_type} part in {message}"))
+    }
+
+    #[test]
+    fn build_with_html_is_multipart_alternative_plain_text_first() {
+        let message = built(&with_html("<p>Hello <b>Alice</b>.</p>"));
+        assert!(raw_header(&message, "Content-Type")
+            .unwrap()
+            .starts_with("multipart/alternative"));
+        // Clients show the last alternative they can render, so HTML goes last.
+        assert!(content_type_at(&message, "text/plain") < content_type_at(&message, "text/html"));
+        assert!(!message.contains("multipart/mixed"));
+
+        let parsed = MessageParser::default().parse(message.as_bytes()).unwrap();
+        assert_eq!(parsed.body_text(0).as_deref(), Some("Hello Alice.\r\n"));
+        assert_eq!(
+            parsed.body_html(0).as_deref(),
+            Some("<p>Hello <b>Alice</b>.</p>")
+        );
+    }
+
+    #[test]
+    fn build_with_html_and_an_attachment_nests_the_alternative_in_mixed() {
+        let composition = Composition {
+            attachments: vec![Attachment {
+                filename: "q3.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                data: b"%PDF-1.4".to_vec(),
+            }],
+            ..with_html("<p>Figures attached.</p>")
+        };
+        let message = built(&composition);
+        assert!(raw_header(&message, "Content-Type")
+            .unwrap()
+            .starts_with("multipart/mixed"));
+        let alternative = content_type_at(&message, "multipart/alternative");
+        assert!(alternative < content_type_at(&message, "text/plain"));
+        assert!(
+            content_type_at(&message, "text/html") < content_type_at(&message, "application/pdf")
+        );
+
+        let parsed = MessageParser::default().parse(message.as_bytes()).unwrap();
+        assert_eq!(parsed.body_text(0).as_deref(), Some("Hello Alice.\r\n"));
+        assert_eq!(
+            parsed.body_html(0).as_deref(),
+            Some("<p>Figures attached.</p>")
+        );
+        assert_eq!(parsed.attachment_count(), 1);
+        assert_eq!(parsed.attachment(0).unwrap().contents(), b"%PDF-1.4");
+    }
+
+    #[test]
+    fn build_encodes_a_non_ascii_html_body_losslessly() {
+        let message = built(&with_html("<p>Grüße, “Ünïcödé” — ✓</p>"));
+        assert!(message.is_ascii());
+        let parsed = MessageParser::default().parse(message.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.body_html(0).as_deref(),
+            Some("<p>Grüße, “Ünïcödé” — ✓</p>")
+        );
+    }
+
+    #[test]
+    fn build_reply_with_html_keeps_the_threading_headers() {
+        let composition = Composition {
+            reply: Some(ReplyContext {
+                thread_id: "t".to_string(),
+                message_id: Some("b@example.com".to_string()),
+                ..ReplyContext::default()
+            }),
+            ..with_html("<p>Thanks!</p>")
+        };
+        let message = built(&composition);
+        assert_eq!(
+            raw_header(&message, "In-Reply-To").as_deref(),
+            Some("<b@example.com>")
+        );
+        assert_eq!(
+            raw_header(&message, "References").as_deref(),
+            Some("<b@example.com>")
+        );
+    }
+
+    #[test]
+    fn plain_text_from_html_keeps_links_and_emphasis_as_markdown() {
+        let text = plain_text_from_html(
+            "<p>See <a href=\"https://example.com/q3\">the report</a>, <b>today</b>.</p>",
+        )
+        .unwrap();
+        assert_eq!(text, "See [the report](https://example.com/q3), **today**.");
+    }
+
+    #[test]
+    fn plain_text_from_html_leaves_out_a_documents_head_styles_and_scripts() {
+        let text = plain_text_from_html(
+            "<!DOCTYPE html><html><head><title>Q3 Note</title>\
+             <style>p { color: red }</style></head>\
+             <body><style>.x { y: z }</style><p>Hello <b>Alice</b>.</p>\
+             <script>alert(1)</script></body></html>",
+        )
+        .unwrap();
+        assert_eq!(text, "Hello **Alice**.");
+    }
+
+    #[test]
+    fn inline_image_warning_fires_on_cid_references_in_any_case() {
+        assert!(inline_image_warning("<img src=\"CID:logo@x\">")
+            .unwrap()
+            .contains("inline images"));
+        assert!(inline_image_warning("<div style=\"background: url(cid:bg)\">").is_some());
+        assert_eq!(
+            inline_image_warning("<img src=\"https://example.com/a.png\">"),
+            None
+        );
     }
 
     #[test]

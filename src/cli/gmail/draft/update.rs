@@ -7,7 +7,9 @@ use anyhow::{bail, Context, Result};
 use clap::{ArgGroup, Parser};
 use serde::Serialize;
 
-use crate::cli::gmail::draft::create::{load_attachments, read_limited};
+use crate::cli::gmail::draft::create::{
+    load_attachments, plain_alternative, read_limited, read_text_file, resolve_html_body,
+};
 use crate::cli::gmail::format::{
     output_as, sanitize_for_terminal, write_scalar_jsonl, JsonlSerialize, OutputFormat,
 };
@@ -23,13 +25,15 @@ use crate::gmail::raw_message::decode_raw_message;
 const UPDATE_ACTION: &str = "update a draft to";
 
 /// Every field-editing flag, which `--raw` conflicts with.
-const EDIT_ARGS: [&str; 8] = [
+const EDIT_ARGS: [&str; 10] = [
     "to",
     "cc",
     "bcc",
     "subject",
     "body",
     "body_file",
+    "html_body",
+    "html_body_file",
     "attach",
     "remove_attachment",
 ];
@@ -42,6 +46,9 @@ const EDIT_ARGS: [&str; 8] = [
 /// membership are kept exactly as they were. `--to`, `--cc` and `--bcc`
 /// replace that header's whole list. `--body` replaces the body with plain
 /// text; a draft written in Gmail loses its HTML version, with a warning.
+/// `--html-body` replaces the body with HTML plus a plain-text alternative,
+/// which is `--body` when given and otherwise derived from the HTML (never
+/// kept from the old body, so the two versions can't disagree).
 ///
 /// `--raw` replaces the whole message with a `.eml` file instead, such as
 /// one written by `draft show --detail raw --out-file`. The draft still
@@ -77,13 +84,23 @@ pub struct UpdateCommand {
     #[arg(long)]
     pub subject: Option<String>,
 
-    /// Replace the body with this plain text.
+    /// Replace the body with this plain text (with `--html-body`, its
+    /// plain-text version).
     #[arg(long, conflicts_with = "body_file")]
     pub body: Option<String>,
 
     /// Replace the body with the plain text in this UTF-8 file.
     #[arg(long, value_name = "PATH")]
     pub body_file: Option<PathBuf>,
+
+    /// Replace the body with this HTML and a plain-text version of it: the
+    /// `--body` text when given, else one derived from the HTML.
+    #[arg(long, value_name = "HTML", conflicts_with = "html_body_file")]
+    pub html_body: Option<String>,
+
+    /// Replace the body with the HTML in this UTF-8 file, as `--html-body`.
+    #[arg(long, value_name = "PATH")]
+    pub html_body_file: Option<PathBuf>,
 
     /// Attach a file after the existing attachments. Repeat the flag for more.
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
@@ -119,22 +136,29 @@ impl UpdateCommand {
         let change = if let Some(path) = &self.raw {
             Change::Raw(read_limited(path, UPDATE_ACTION)?)
         } else {
+            let html_body = resolve_html_body(
+                self.html_body,
+                self.html_body_file.as_deref(),
+                UPDATE_ACTION,
+            )?;
             let body = match (self.body, &self.body_file) {
                 (Some(body), _) => Some(body),
-                (None, Some(path)) => {
-                    let bytes = read_limited(path, UPDATE_ACTION)
-                        .with_context(|| format!("Failed to read body file {}", path.display()))?;
-                    Some(String::from_utf8(bytes).context("The body is not valid UTF-8")?)
-                }
+                (None, Some(path)) => Some(read_text_file(path, UPDATE_ACTION, "body")?),
                 (None, None) => None,
             };
-            let body_len = body.as_ref().map_or(0, String::len);
+            let body = match &html_body {
+                Some(html) => Some(plain_alternative(body, html)?),
+                None => body,
+            };
+            let body_len =
+                body.as_ref().map_or(0, String::len) + html_body.as_ref().map_or(0, String::len);
             Change::Edit(DraftEdit {
                 to: parse_mailboxes(&self.to)?,
                 cc: parse_mailboxes(&self.cc)?,
                 bcc: parse_mailboxes(&self.bcc)?,
                 subject: self.subject,
                 body,
+                html_body,
                 attach: load_attachments(&self.attach, body_len)?,
                 remove_attachments: self.remove_attachment,
             })
@@ -730,12 +754,94 @@ JVBERi0xLjQK\r\n\
             subject: None,
             body: None,
             body_file: None,
+            html_body: None,
+            html_body_file: None,
             attach: vec![],
             remove_attachment: vec![],
             raw: None,
             if_message_id: None,
             output,
         }
+    }
+
+    #[tokio::test]
+    async fn execute_replaces_the_body_with_html_and_a_derived_plain_part() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_get_raw(&server, "m-1", REPLY_DRAFT, 1).await;
+        mount_get_minimal(&server, "m-1", 1).await;
+        mount_update(&server, "t-1", 1).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let html = dir.path().join("note.html");
+        std::fs::write(&html, "<p>Revised <b>figures</b>.</p>").unwrap();
+
+        UpdateCommand {
+            html_body_file: Some(html),
+            ..update_command(OutputFormat::Table)
+        }
+        .execute(&client)
+        .await
+        .unwrap();
+
+        let (_, message) = uploaded(&server).await;
+        let parsed = MessageParser::default().parse(message.as_bytes()).unwrap();
+        assert_eq!(parsed.body_text(0).as_deref(), Some("Revised **figures**."));
+        assert_eq!(
+            parsed.body_html(0).as_deref(),
+            Some("<p>Revised <b>figures</b>.</p>")
+        );
+        // The draft's old HTML version is gone, and its attachment kept.
+        assert!(!message.contains("Figures attached."), "{message}");
+        let names: Vec<_> = parsed
+            .attachments()
+            .map(|a| a.attachment_name().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["q3.pdf"]);
+    }
+
+    #[tokio::test]
+    async fn execute_sends_an_explicit_body_beside_the_html() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_get_raw(&server, "m-1", REPLY_DRAFT, 1).await;
+        mount_get_minimal(&server, "m-1", 1).await;
+        mount_update(&server, "t-1", 1).await;
+
+        UpdateCommand {
+            body: Some("Plain words.".to_string()),
+            html_body: Some("<p>Rich words.</p>".to_string()),
+            ..update_command(OutputFormat::Table)
+        }
+        .execute(&client)
+        .await
+        .unwrap();
+
+        let (_, message) = uploaded(&server).await;
+        let parsed = MessageParser::default().parse(message.as_bytes()).unwrap();
+        assert_eq!(parsed.body_text(0).as_deref(), Some("Plain words."));
+        assert_eq!(parsed.body_html(0).as_deref(), Some("<p>Rich words.</p>"));
+    }
+
+    #[tokio::test]
+    async fn execute_reports_an_unreadable_html_body_file_before_any_request() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::path_regex("^/(gmail|upload)/"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = UpdateCommand {
+            html_body_file: Some(dir.path().join("missing.html")),
+            ..update_command(OutputFormat::Table)
+        }
+        .execute(&client)
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("HTML body file"), "{err}");
     }
 
     #[tokio::test]
@@ -930,6 +1036,8 @@ JVBERi0xLjQK\r\n\
             &["--subject", "s"],
             &["--body", "b"],
             &["--body-file", "b.txt"],
+            &["--html-body", "<p>b</p>"],
+            &["--html-body-file", "b.html"],
             &["--attach", "f"],
             &["--remove-attachment", "f"],
             &["--raw", "m.eml"],
@@ -947,6 +1055,8 @@ JVBERi0xLjQK\r\n\
             ["--to", "a@example.com"],
             ["--subject", "s"],
             ["--body", "b"],
+            ["--html-body", "<p>b</p>"],
+            ["--html-body-file", "b.html"],
             ["--attach", "f"],
             ["--remove-attachment", "f"],
         ] {
@@ -959,6 +1069,12 @@ JVBERi0xLjQK\r\n\
     #[test]
     fn clap_body_and_body_file_conflict() {
         assert!(parse(&["r-1", "--body", "b", "--body-file", "f"]).is_err());
+    }
+
+    #[test]
+    fn clap_html_body_and_html_body_file_conflict() {
+        assert!(parse(&["r-1", "--html-body", "<p>b</p>", "--html-body-file", "f"]).is_err());
+        assert!(parse(&["r-1", "--html-body", "<p>b</p>", "--body-file", "f"]).is_ok());
     }
 
     #[test]

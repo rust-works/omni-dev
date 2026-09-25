@@ -7195,6 +7195,8 @@ Options:
       --subject <SUBJECT>      The subject. Required unless `--reply-to` is given, which defaults it to `Re: <original subject>`
       --body <BODY>            The plain-text body
       --body-file <PATH>       Read the plain-text body from this UTF-8 file
+      --html-body <HTML>       An HTML body, sent alongside the plain-text one. Without `--body` or `--body-file`, the plain text is derived from the HTML
+      --html-body-file <PATH>  Read the HTML body from this UTF-8 file
       --attach <PATH>...       Attach a file. Repeat the flag (or list several after it) for more
       --reply-to <MESSAGE_ID>  Reply to this Gmail message id, filing the draft in its thread. Without `--to`, replies to the original's `Reply-To`, else its `From` (or, for a message you sent, its `To`)
       --reply-all              With `--reply-to`, also address the original's other `To` and `Cc` recipients, leaving out your own addresses. `--to`/`--cc` still replace the defaults for their header
@@ -7243,7 +7245,7 @@ omni-dev gmail draft update - Updates a draft in place, keeping its id and threa
 
 Updates a draft in place, keeping its id and thread (needs `gmail.modify`)
 
-Usage: update [OPTIONS] <--to <ADDR>|--cc <ADDR>|--bcc <ADDR>|--subject <SUBJECT>|--body <BODY>|--body-file <PATH>|--attach <PATH>|--remove-attachment <NAME>|--raw <FILE>> <DRAFT_ID>
+Usage: update [OPTIONS] <--to <ADDR>|--cc <ADDR>|--bcc <ADDR>|--subject <SUBJECT>|--body <BODY>|--body-file <PATH>|--html-body <HTML>|--html-body-file <PATH>|--attach <PATH>|--remove-attachment <NAME>|--raw <FILE>> <DRAFT_ID>
 
 Arguments:
   <DRAFT_ID>  Gmail draft id (the `DRAFT_ID` column of `gmail draft list`)
@@ -7253,8 +7255,10 @@ Options:
       --cc <ADDR>                 Replace the `Cc` recipients, in the same form as `--to`
       --bcc <ADDR>                Replace the `Bcc` recipients, in the same form as `--to`
       --subject <SUBJECT>         Replace the subject
-      --body <BODY>               Replace the body with this plain text
+      --body <BODY>               Replace the body with this plain text (with `--html-body`, its plain-text version)
       --body-file <PATH>          Replace the body with the plain text in this UTF-8 file
+      --html-body <HTML>          Replace the body with this HTML and a plain-text version of it: the `--body` text when given, else one derived from the HTML
+      --html-body-file <PATH>     Replace the body with the HTML in this UTF-8 file, as `--html-body`
       --attach <PATH>             Attach a file after the existing attachments. Repeat the flag for more
       --remove-attachment <NAME>  Remove the attachment `gmail draft show` lists under this name (or the one stored under it, when only one is). Repeat the flag for more
       --raw <FILE>                Replace the whole message with this RFC 5322 file (`.eml`), uploaded byte for byte

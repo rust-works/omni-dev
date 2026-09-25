@@ -13,8 +13,8 @@ use crate::cli::gmail::format::{
 use crate::cli::gmail::helpers::with_modify_scope_hint;
 use crate::gmail::client::GmailClient;
 use crate::gmail::compose::{
-    check_subject, message_id_domain, subject_matches_reply, Attachment, Composition, Mailbox,
-    ReplyContext, REPLY_HEADERS,
+    check_subject, inline_image_warning, message_id_domain, plain_text_from_html,
+    subject_matches_reply, Attachment, Composition, Mailbox, ReplyContext, REPLY_HEADERS,
 };
 use crate::gmail::drafts_api::DraftsApi;
 use crate::gmail::messages_api::{
@@ -27,13 +27,15 @@ use crate::gmail::send_as_api::SendAsApi;
 const CREATE_ACTION: &str = "create a draft of";
 
 /// Every composition flag, which `--raw` conflicts with.
-const COMPOSE_ARGS: [&str; 9] = [
+const COMPOSE_ARGS: [&str; 11] = [
     "to",
     "cc",
     "bcc",
     "subject",
     "body",
     "body_file",
+    "html_body",
+    "html_body_file",
     "attach",
     "reply_to",
     "reply_all",
@@ -41,10 +43,16 @@ const COMPOSE_ARGS: [&str; 9] = [
 
 /// Creates a Gmail draft for a person to review and send from Gmail.
 ///
-/// Builds a `text/plain` message from the flags, or with `--raw` uploads a
+/// Builds a plain-text message from the flags, or with `--raw` uploads a
 /// complete `.eml` file unchanged. `From` is left to Gmail, which fills in
 /// the account's own address. The body comes from `--body`, `--body-file`,
 /// or else standard input.
+///
+/// `--html-body` or `--html-body-file` adds an HTML version, sent as
+/// `multipart/alternative` with a plain-text part. That part is `--body`
+/// (or `--body-file`) when given, and otherwise the HTML converted to
+/// Markdown; standard input is then never read. Inline images (`cid:`) are
+/// not supported.
 ///
 /// `--reply-to` takes the Gmail message id of the message being answered
 /// (as `gmail search` and `gmail read` print it, not its `Message-ID`
@@ -87,6 +95,15 @@ pub struct CreateCommand {
     #[arg(long, value_name = "PATH")]
     pub body_file: Option<PathBuf>,
 
+    /// An HTML body, sent alongside the plain-text one. Without `--body` or
+    /// `--body-file`, the plain text is derived from the HTML.
+    #[arg(long, value_name = "HTML", conflicts_with = "html_body_file")]
+    pub html_body: Option<String>,
+
+    /// Read the HTML body from this UTF-8 file.
+    #[arg(long, value_name = "PATH")]
+    pub html_body_file: Option<PathBuf>,
+
     /// Attach a file. Repeat the flag (or list several after it) for more.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     pub attach: Vec<PathBuf>,
@@ -124,21 +141,29 @@ impl CreateCommand {
         let input = if let Some(path) = &self.raw {
             DraftInput::Raw(read_limited(path, CREATE_ACTION)?)
         } else {
+            let html_body = resolve_html_body(
+                self.html_body,
+                self.html_body_file.as_deref(),
+                CREATE_ACTION,
+            )?;
             let stdin = std::io::stdin();
             let stdin_is_terminal = stdin.is_terminal();
             let body = resolve_body(
                 self.body,
                 self.body_file.as_deref(),
+                html_body.as_deref(),
                 stdin.lock(),
                 stdin_is_terminal,
             )?;
-            let attachments = load_attachments(&self.attach, body.len())?;
+            let body_len = body.len() + html_body.as_ref().map_or(0, String::len);
+            let attachments = load_attachments(&self.attach, body_len)?;
             DraftInput::Compose(ComposeInput {
                 to: self.to,
                 cc: self.cc,
                 bcc: self.bcc,
                 subject: self.subject,
                 body,
+                html_body,
                 attachments,
                 reply_to: self.reply_to,
                 reply_all: self.reply_all,
@@ -169,6 +194,7 @@ struct ComposeInput {
     bcc: Vec<String>,
     subject: Option<String>,
     body: String,
+    html_body: Option<String>,
     attachments: Vec<Attachment>,
     reply_to: Option<String>,
     reply_all: bool,
@@ -254,6 +280,13 @@ async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDr
                 None => (recipients, Vec::new()),
             };
             notes.extend(fallback_warning.map(|warning| format!("warning: {warning}")));
+            notes.extend(
+                compose
+                    .html_body
+                    .as_deref()
+                    .and_then(inline_image_warning)
+                    .map(|warning| format!("warning: {warning}")),
+            );
             (
                 compose_message(compose, recipients, reply, domain)?,
                 thread_id,
@@ -490,6 +523,7 @@ fn compose_message(
         bcc: recipients.bcc,
         subject,
         body: input.body,
+        html_body: input.html_body,
         attachments: input.attachments,
         reply,
         message_id_domain,
@@ -497,37 +531,76 @@ fn compose_message(
     .build()
 }
 
-/// Picks the body from `--body`, then `--body-file`, then `stdin`.
+/// Picks the plain-text body from `--body`, then `--body-file`, then (with
+/// an HTML body) the HTML converted by [`plain_alternative`], then `stdin`.
 ///
-/// Refuses to read a terminal: with no body flag and no piped input, the
-/// command would otherwise sit waiting for typed input. Reads at most
-/// [`MAX_INSERT_BYTES`] from a file or stdin, refusing anything larger.
+/// Stdin is never read when there is an HTML body: a script passing only
+/// `--html-body-file` with an open stdin would otherwise hang, or send
+/// whatever arrived there as the plain-text part. Refuses to read a
+/// terminal: with no body flag and no piped input, the command would
+/// otherwise sit waiting for typed input. Reads at most [`MAX_INSERT_BYTES`]
+/// from a file or stdin, refusing anything larger.
 fn resolve_body(
     body: Option<String>,
     body_file: Option<&Path>,
+    html_body: Option<&str>,
     stdin: impl Read,
     stdin_is_terminal: bool,
 ) -> Result<String> {
     if let Some(body) = body {
         return Ok(body);
     }
-    let bytes = if let Some(path) = body_file {
-        read_limited(path, CREATE_ACTION)
-            .with_context(|| format!("Failed to read body file {}", path.display()))?
-    } else {
-        ensure!(
-            !stdin_is_terminal,
-            "no body given: pass --body TEXT or --body-file PATH, or pipe the body on stdin"
-        );
-        let mut bytes = Vec::new();
-        stdin
-            .take(MAX_INSERT_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .context("Failed to read the body from stdin")?;
-        ensure_within_message_limit(bytes.len(), CREATE_ACTION)?;
-        bytes
-    };
+    if let Some(path) = body_file {
+        return read_text_file(path, CREATE_ACTION, "body");
+    }
+    if let Some(html) = html_body {
+        return plain_alternative(None, html);
+    }
+    ensure!(
+        !stdin_is_terminal,
+        "no body given: pass --body TEXT, --body-file PATH or --html-body[-file], or pipe the \
+         body on stdin"
+    );
+    let mut bytes = Vec::new();
+    stdin
+        .take(MAX_INSERT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("Failed to read the body from stdin")?;
+    ensure_within_message_limit(bytes.len(), CREATE_ACTION)?;
     String::from_utf8(bytes).context("The body is not valid UTF-8")
+}
+
+/// The HTML body from `--html-body`, else `--html-body-file`; `None` when
+/// neither is given. `action` is as for [`read_limited`].
+pub(super) fn resolve_html_body(
+    html_body: Option<String>,
+    html_body_file: Option<&Path>,
+    action: &str,
+) -> Result<Option<String>> {
+    match (html_body, html_body_file) {
+        (Some(html), _) => Ok(Some(html)),
+        (None, Some(path)) => read_text_file(path, action, "HTML body").map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The plain-text part to send beside the HTML body `html`: `body` when the
+/// caller gave one (verbatim, with no check that the two agree), else
+/// derived from the HTML.
+pub(super) fn plain_alternative(body: Option<String>, html: &str) -> Result<String> {
+    match body {
+        Some(body) => Ok(body),
+        None => plain_text_from_html(html)
+            .context("pass the plain-text body with --body or --body-file as well"),
+    }
+}
+
+/// Reads a UTF-8 file with [`read_limited`]. `what` names its contents
+/// ("body", "HTML body") in errors.
+pub(super) fn read_text_file(path: &Path, action: &str, what: &str) -> Result<String> {
+    let bytes = read_limited(path, action)
+        .with_context(|| format!("Failed to read {what} file {}", path.display()))?;
+    String::from_utf8(bytes).with_context(|| format!("The {what} is not valid UTF-8"))
 }
 
 /// Reads each attachment, after checking that they fit in
@@ -920,12 +993,69 @@ mod tests {
                 Some("Hi.".to_string())
             },
             body_file: None,
+            html_body: None,
+            html_body_file: None,
             attach: vec![],
             reply_to: None,
             reply_all: false,
             raw,
             output,
         }
+    }
+
+    #[tokio::test]
+    async fn execute_counts_the_html_body_toward_the_attachment_limit() {
+        // No mocks: the refusal must come before any request.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, b"abc").unwrap();
+
+        let html = "x".repeat(usize::try_from(MAX_INSERT_BYTES).unwrap() - 8);
+        // The HTML and the attachment fit on their own; the plain-text part
+        // derived from the HTML must be counted too.
+        let err = CreateCommand {
+            html_body: Some(html),
+            attach: vec![path],
+            body: None,
+            ..create_command(None, OutputFormat::Table)
+        }
+        .execute(&client)
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("refusing to attach"), "{err}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_create_uploads_a_multipart_alternative_draft() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "me@example.org").await;
+        mount_create(&server, "t-new").await;
+
+        let input = ComposeInput {
+            html_body: Some("<p>Hi <b>there</b>.</p>".to_string()),
+            ..compose("alice@example.com", Some("Styled"))
+        };
+        run_create(&client, DraftInput::Compose(input))
+            .await
+            .unwrap();
+
+        let body = create_request_body(&server).await;
+        let message = body
+            .split_once("Content-Type: message/rfc822\r\n\r\n")
+            .unwrap_or_else(|| panic!("no message part in {body}"))
+            .1;
+        let parsed = mail_parser::MessageParser::default()
+            .parse(message.as_bytes())
+            .unwrap();
+        assert_eq!(parsed.body_text(0).as_deref(), Some("Hi."));
+        assert_eq!(
+            parsed.body_html(0).as_deref(),
+            Some("<p>Hi <b>there</b>.</p>")
+        );
     }
 
     #[tokio::test]
@@ -1632,7 +1762,8 @@ mod tests {
 
     #[test]
     fn resolve_body_prefers_the_flag() {
-        let body = resolve_body(Some("flag".to_string()), None, &b"stdin"[..], false).unwrap();
+        let body =
+            resolve_body(Some("flag".to_string()), None, None, &b"stdin"[..], false).unwrap();
         assert_eq!(body, "flag");
     }
 
@@ -1641,20 +1772,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("body.txt");
         std::fs::write(&path, "from file\n").unwrap();
-        let body = resolve_body(None, Some(&path), &b"stdin"[..], false).unwrap();
+        let body = resolve_body(None, Some(&path), None, &b"stdin"[..], false).unwrap();
         assert_eq!(body, "from file\n");
     }
 
     #[test]
     fn resolve_body_reports_a_missing_file() {
-        let err =
-            resolve_body(None, Some(Path::new("/nonexistent/b.txt")), &b""[..], false).unwrap_err();
+        let err = resolve_body(
+            None,
+            Some(Path::new("/nonexistent/b.txt")),
+            None,
+            &b""[..],
+            false,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("body file"), "{err}");
     }
 
     #[test]
     fn resolve_body_falls_back_to_piped_stdin() {
-        let body = resolve_body(None, None, &b"piped"[..], false).unwrap();
+        let body = resolve_body(None, None, None, &b"piped"[..], false).unwrap();
         assert_eq!(body, "piped");
     }
 
@@ -1662,14 +1799,16 @@ mod tests {
     fn resolve_body_refuses_oversize_stdin_after_a_bounded_read() {
         let limit = usize::try_from(MAX_INSERT_BYTES).unwrap();
         let big = std::io::repeat(b'a').take(MAX_INSERT_BYTES + 10);
-        let err = resolve_body(None, None, big, false).unwrap_err();
+        let err = resolve_body(None, None, None, big, false).unwrap_err();
         assert!(
             err.to_string().contains("refusing to create a draft of"),
             "{err}"
         );
         let at_limit = std::io::repeat(b'a').take(MAX_INSERT_BYTES);
         assert_eq!(
-            resolve_body(None, None, at_limit, false).unwrap().len(),
+            resolve_body(None, None, None, at_limit, false)
+                .unwrap()
+                .len(),
             limit
         );
     }
@@ -1682,7 +1821,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_INSERT_BYTES + 1)
             .unwrap();
-        let err = resolve_body(None, Some(&path), &b""[..], false).unwrap_err();
+        let err = resolve_body(None, Some(&path), None, &b""[..], false).unwrap_err();
         assert!(
             format!("{err:#}").contains("refusing to create a draft of"),
             "{err:#}"
@@ -1691,13 +1830,88 @@ mod tests {
 
     #[test]
     fn resolve_body_rejects_non_utf8() {
-        let err = resolve_body(None, None, &[0xffu8, 0xfe][..], false).unwrap_err();
+        let err = resolve_body(None, None, None, &[0xffu8, 0xfe][..], false).unwrap_err();
         assert!(err.to_string().contains("UTF-8"), "{err}");
+    }
+
+    /// A stdin that fails the test if anything reads it.
+    struct UnreadableStdin;
+
+    impl Read for UnreadableStdin {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            panic!("stdin was read")
+        }
+    }
+
+    #[test]
+    fn resolve_body_derives_the_plain_text_from_html_without_reading_stdin() {
+        let html = "<p>See <a href=\"https://example.com\">this</a>.</p>";
+        // A terminal, too: with an HTML body there is nothing to wait for.
+        let body = resolve_body(None, None, Some(html), UnreadableStdin, true).unwrap();
+        assert_eq!(body, "See [this](https://example.com).");
+    }
+
+    #[test]
+    fn resolve_body_keeps_an_explicit_body_beside_html() {
+        let body = resolve_body(
+            Some("Plain.".to_string()),
+            None,
+            Some("<p>Rich.</p>"),
+            UnreadableStdin,
+            false,
+        )
+        .unwrap();
+        assert_eq!(body, "Plain.");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.txt");
+        std::fs::write(&path, "From a file.").unwrap();
+        let body = resolve_body(
+            None,
+            Some(&path),
+            Some("<p>Rich.</p>"),
+            UnreadableStdin,
+            false,
+        )
+        .unwrap();
+        assert_eq!(body, "From a file.");
+    }
+
+    #[test]
+    fn resolve_html_body_prefers_the_flag_then_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.html");
+        std::fs::write(&path, "<p>From file</p>").unwrap();
+        assert_eq!(
+            resolve_html_body(Some("<p>Flag</p>".to_string()), None, CREATE_ACTION).unwrap(),
+            Some("<p>Flag</p>".to_string())
+        );
+        assert_eq!(
+            resolve_html_body(None, Some(&path), CREATE_ACTION).unwrap(),
+            Some("<p>From file</p>".to_string())
+        );
+        assert_eq!(resolve_html_body(None, None, CREATE_ACTION).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_html_body_rejects_a_missing_or_non_utf8_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_html_body(None, Some(&dir.path().join("missing.html")), CREATE_ACTION)
+            .unwrap_err();
+        assert!(err.to_string().contains("HTML body file"), "{err}");
+
+        let path = dir.path().join("bad.html");
+        std::fs::write(&path, [0xffu8, 0xfe]).unwrap();
+        let err = resolve_html_body(None, Some(&path), CREATE_ACTION).unwrap_err();
+        assert!(
+            err.to_string().contains("HTML body is not valid UTF-8"),
+            "{err}"
+        );
     }
 
     #[test]
     fn resolve_body_refuses_to_wait_on_a_terminal() {
-        let err = resolve_body(None, None, &b""[..], true).unwrap_err();
+        let err = resolve_body(None, None, None, &b""[..], true).unwrap_err();
         assert!(err.to_string().contains("no body given"), "{err}");
     }
 
@@ -1896,6 +2110,26 @@ mod tests {
                 "Doe, Jane <j@example.com>"
             ]
         );
+    }
+
+    #[test]
+    fn clap_html_body_and_html_body_file_conflict() {
+        let base = ["--to", "a@example.com", "--subject", "s"];
+        let with = |extra: &[&'static str]| {
+            let mut args = base.to_vec();
+            args.extend(extra);
+            parse(&args)
+        };
+        let cmd = with(&["--html-body", "<p>x</p>"]).unwrap();
+        assert_eq!(cmd.html_body.as_deref(), Some("<p>x</p>"));
+        assert!(with(&["--html-body-file", "x.html", "--body", "b"]).is_ok());
+        assert!(with(&["--html-body", "<p>x</p>", "--html-body-file", "x.html"]).is_err());
+        for flag in ["--html-body", "--html-body-file"] {
+            assert!(
+                parse(&["--raw", "m.eml", flag, "x"]).is_err(),
+                "--raw accepted {flag}"
+            );
+        }
     }
 
     #[test]
