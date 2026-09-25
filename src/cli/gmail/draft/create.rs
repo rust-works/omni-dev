@@ -20,6 +20,9 @@ use crate::gmail::messages_api::{
     ensure_within_message_limit, MessageFormat, MessagesApi, MAX_INSERT_BYTES,
 };
 
+/// What `draft create` does with a message, for size-limit refusals.
+const CREATE_ACTION: &str = "create a draft of";
+
 /// Every composition flag, which `--raw` conflicts with.
 const COMPOSE_ARGS: [&str; 8] = [
     "to",
@@ -102,7 +105,7 @@ impl CreateCommand {
     /// Gmail.
     pub async fn execute(self, client: &GmailClient) -> Result<()> {
         let input = if let Some(path) = &self.raw {
-            DraftInput::Raw(read_limited(path)?)
+            DraftInput::Raw(read_limited(path, CREATE_ACTION)?)
         } else {
             let stdin = std::io::stdin();
             let stdin_is_terminal = stdin.is_terminal();
@@ -282,7 +285,7 @@ fn resolve_body(
         return Ok(body);
     }
     let bytes = if let Some(path) = body_file {
-        read_limited(path)
+        read_limited(path, CREATE_ACTION)
             .with_context(|| format!("Failed to read body file {}", path.display()))?
     } else {
         ensure!(
@@ -294,7 +297,7 @@ fn resolve_body(
             .take(MAX_INSERT_BYTES + 1)
             .read_to_end(&mut bytes)
             .context("Failed to read the body from stdin")?;
-        ensure_within_message_limit(bytes.len(), "create a draft of")?;
+        ensure_within_message_limit(bytes.len(), CREATE_ACTION)?;
         bytes
     };
     String::from_utf8(bytes).context("The body is not valid UTF-8")
@@ -307,7 +310,7 @@ fn resolve_body(
 /// Headers and MIME boundaries aren't counted, so a message right at the
 /// limit can still pass this and be refused by `DraftsApi::create`'s exact
 /// check, which also runs before any request.
-fn load_attachments(paths: &[PathBuf], body_len: usize) -> Result<Vec<Attachment>> {
+pub(super) fn load_attachments(paths: &[PathBuf], body_len: usize) -> Result<Vec<Attachment>> {
     let mut total = body_len as u64;
     for path in paths {
         let metadata = std::fs::metadata(path)
@@ -354,14 +357,13 @@ fn base64_len(len: u64) -> u64 {
 }
 
 /// Reads a file, refusing one over [`MAX_INSERT_BYTES`] before reading it.
-fn read_limited(path: &Path) -> Result<Vec<u8>> {
+/// `action` names what the file is for in that refusal ("create a draft
+/// of").
+pub(super) fn read_limited(path: &Path, action: &str) -> Result<Vec<u8>> {
     let len = std::fs::metadata(path)
         .with_context(|| format!("Failed to read {}", path.display()))?
         .len();
-    ensure_within_message_limit(
-        usize::try_from(len).unwrap_or(usize::MAX),
-        "create a draft of",
-    )?;
+    ensure_within_message_limit(usize::try_from(len).unwrap_or(usize::MAX), action)?;
     std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))
 }
 
@@ -886,7 +888,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_INSERT_BYTES + 1)
             .unwrap();
-        let err = read_limited(&path).unwrap_err();
+        let err = read_limited(&path, CREATE_ACTION).unwrap_err();
         assert!(
             err.to_string().contains("refusing to create a draft"),
             "{err}"
@@ -898,7 +900,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("m.eml");
         std::fs::write(&path, b"Subject: x\n\nbody").unwrap();
-        assert_eq!(read_limited(&path).unwrap(), b"Subject: x\n\nbody");
+        assert_eq!(
+            read_limited(&path, CREATE_ACTION).unwrap(),
+            b"Subject: x\n\nbody"
+        );
     }
 
     // ── render_created ───────────────────────────────────────────────

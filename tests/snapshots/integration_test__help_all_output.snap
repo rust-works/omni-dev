@@ -7173,6 +7173,7 @@ Commands:
   list    Lists drafts with their draft ids (`gmail.readonly` is enough)
   show    Shows one draft by its draft id (`gmail.readonly` is enough)
   create  Creates a draft to review and send from Gmail (needs `gmail.modify`)
+  update  Updates a draft in place, keeping its id and thread (needs `gmail.modify`)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -7233,6 +7234,32 @@ Options:
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl, markdown]
       --fold-quotes      Collapses `>`-quoted reply history nested more than one level deep into a one-line `*(N quoted lines omitted)*` marker (#1514). Only affects `-o markdown`, mirroring `--detail`'s reverse asymmetry (it is silently ignored elsewhere). Off by default: verbatim rendering is fully information-preserving, and the full text is one re-render away without this flag
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev gmail draft update - Updates a draft in place, keeping its id and thread (needs `gmail.modify`)
+
+Updates a draft in place, keeping its id and thread (needs `gmail.modify`)
+
+Usage: update [OPTIONS] <--to <ADDR>...|--cc <ADDR>...|--bcc <ADDR>...|--subject <SUBJECT>|--body <BODY>|--body-file <PATH>|--attach <PATH>...|--remove-attachment <NAME>...|--raw <FILE>> <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>  Gmail draft id (the `DRAFT_ID` column of `gmail draft list`)
+
+Options:
+      --to <ADDR>...                 Replace the `To` recipients: `addr@example.com` or `"Name <addr@example.com>"`. Repeat the flag (or list several after it) for more recipients
+      --cc <ADDR>...                 Replace the `Cc` recipients, in the same form as `--to`
+      --bcc <ADDR>...                Replace the `Bcc` recipients, in the same form as `--to`
+      --subject <SUBJECT>            Replace the subject
+      --body <BODY>                  Replace the body with this plain text
+      --body-file <PATH>             Replace the body with the plain text in this UTF-8 file
+      --attach <PATH>...             Attach a file after the existing attachments. Repeat the flag (or list several after it) for more
+      --remove-attachment <NAME>...  Remove the attachment with this filename. Repeat the flag (or list several after it) for more
+      --raw <FILE>                   Replace the whole message with this RFC 5322 file (`.eml`), uploaded byte for byte
+      --if-message-id <ID>           Refuse the update unless the draft's current message id is this one, e.g. the `MESSAGE_ID` from when you last read the draft
+  -o, --output <OUTPUT>              Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                         Print help (see more with '--help')
 
 
 ================================================================================

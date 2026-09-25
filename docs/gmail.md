@@ -532,8 +532,8 @@ render a message the same way:
   emit Gmail's `drafts.get` response, `{id, message}`, so machine output
   carries the draft id beside the message.
 - `--detail raw --out-file PATH` writes the draft's exact stored RFC 2822
-  bytes: an `.eml` file you can edit and hand back to a later `draft update
-  --raw` (#1924).
+  bytes: an `.eml` file you can edit and hand back to
+  [`draft update --raw`](#updating-drafts).
 
 A draft id that doesn't exist fails with `No draft with id "…"`. The usual
 cause is passing a message id from `gmail search` or `gmail read`, which no
@@ -609,9 +609,71 @@ Gmail's `drafts.send` delivers mail that can't be recalled, and
 or discard drafts in Gmail itself. A unit test fails the build if either
 endpoint is ever added to the drafts client (#1920).
 
+### Updating drafts
+
+```bash
+$ omni-dev gmail draft update r-1234567890 --subject 'Quarterly report (final)'
+$ omni-dev gmail draft update r-1234567890 --cc bob@example.com carol@example.com
+$ omni-dev gmail draft update r-1234567890 --body-file revised.txt --remove-attachment q3-draft.pdf \
+    --attach q3.pdf
+$ omni-dev gmail draft update r-1234567890 --raw draft.eml --if-message-id 18c2f0a1b2c3d4e5
+```
+
+`draft update` revises a staged draft and prints its `DRAFT_ID` (unchanged),
+its new `MESSAGE_ID`, the `PREVIOUS_MESSAGE_ID` it replaced, and its
+`THREAD_ID`. `-o yaml`/`json` give the same ids in snake case. At least one
+edit is required. Nothing is sent.
+
+Gmail's `drafts.update` has no partial form: every update replaces the whole
+message. So `draft update` reads the stored message
+(`drafts.get?format=raw`), changes only what the flags name, and uploads the result.
+**Everything else is kept byte for byte**: `From`, `Date`, `Message-ID`,
+`In-Reply-To`/`References`, any other header, the body, and every attachment
+you didn't name.
+
+- **Recipients and subject.** `--to`, `--cc`, `--bcc` and `--subject`
+  replace just that header, encoded the way `draft create` encodes it. Each
+  recipient flag replaces that header's **whole** list, so pass every
+  recipient you want to keep. There is no way to clear a header yet.
+- **Body.** `--body TEXT` or `--body-file PATH` replaces the body with plain
+  text. There's no standard-input fallback, unlike `draft create`, because
+  the body is optional here. A draft written in the Gmail UI also has an
+  HTML version (and possibly inline images). That version is **dropped**,
+  with a warning, rather than left contradicting the new text, since Gmail
+  shows the HTML version when there is one.
+- **Attachments.** `--attach PATH` adds files after the existing
+  attachments, with the same on-disk size check as `draft create`.
+  `--remove-attachment NAME` removes the attachment with that filename, as
+  `draft show` prints it. A name the draft doesn't have is an error that
+  lists the names it does have.
+- **`--raw FILE`** replaces the whole message with an `.eml` file, uploaded
+  byte for byte. `draft show --detail raw --out-file` writes such a file.
+  Use this for anything the flags can't express, such as an HTML body. It
+  can't be combined with the editing flags.
+- **Threads.** The draft's `threadId` is copied from the stored draft into
+  every update, `--raw` included. Without it, a reply draft silently falls
+  out of its thread. Gmail also threads by subject, so changing a reply
+  draft's subject prints a warning. If Gmail files the result in a different
+  thread anyway, a second warning names both thread ids.
+
+**Concurrent edits.** Drafts have no ETag or precondition, so an update
+always overwrites whatever is stored, including an edit made in the Gmail UI
+after omni-dev read the draft. The draft's message id changes on every save,
+which gives a cheap check. `draft update` reads the draft again
+(`format=minimal`) just before the upload and refuses with `draft changed since it
+was read` if the message id moved. `--if-message-id ID` extends the check
+back to an earlier read: pass the `MESSAGE_ID` that `draft show` or `draft
+list` printed, and the update is refused unless the draft still holds that
+message. The window is **smaller, not closed**: a save that lands between
+the final read and the upload is still overwritten.
+
+**Needs `gmail.modify`**, like `draft create`, with the same actionable error
+for a read-only account.
+
 ### MCP equivalent(s)
 
-None yet. `draft list`, `draft show` and `draft create` are CLI-only.
+None yet. `draft list`, `draft show`, `draft create` and `draft update` are
+CLI-only.
 
 ## Sync
 
@@ -1162,7 +1224,8 @@ Gmail enforces a **per-user quota of 250 units/second**; `messages.get` and
 for up to 1000 ids. Gmail doesn't document a separate cost for
 `drafts.create`, so assume the `messages.insert` cost (25 units) until it's
 verified. `draft create` makes one such call, plus one `messages.get` with
-`--reply-to`. `gmail search`'s ids-only default costs a flat 5 units
+`--reply-to`. `draft update` makes one `drafts.update` (assume the same 25
+units) plus two `drafts.get` calls, or one with `--raw`. `gmail search`'s ids-only default costs a flat 5 units
 regardless of `--limit` (auto-pagination is still one `messages.list` call
 per page). `--enrich` adds one `messages.get` (5 units) **per hit**, so
 `--enrich --limit 50` can cost up to 255 units — nearly the entire
@@ -1274,11 +1337,11 @@ was.
 Error: Gmail API request failed: HTTP 403: Insufficient Permission (reason: insufficientPermissions)
 ```
 
-`gmail.readonly` was granted, but `label add`/`remove`, `insert` or
-`draft create` fails — read commands (`search`, `read`, `thread`,
+`gmail.readonly` was granted, but `label add`/`remove`, `insert`,
+`draft create` or `draft update` fails — read commands (`search`, `read`, `thread`,
 `draft list`, `auth status`) all work fine; only mailbox writes 403. Fix is
 `omni-dev gmail auth login --modify` (re-consent with the write scope), not
-a retry. `draft create` and `label add`/`remove` say so themselves (`insert`
+a retry. `draft create`, `draft update` and `label add`/`remove` say so themselves (`insert`
 still shows the bare 403):
 
 ```

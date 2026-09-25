@@ -454,6 +454,7 @@ impl<'a> MessagesApi<'a> {
         let metadata = serde_json::json!({ "labelIds": label_ids });
         upload_rfc822(
             self.client,
+            UploadMethod::Post,
             &url,
             &metadata,
             raw_eml,
@@ -475,14 +476,25 @@ pub(crate) fn ensure_within_message_limit(len: usize, action: &str) -> Result<()
     Ok(())
 }
 
-/// Posts a raw RFC 5322 message to one of Gmail's `/upload/` endpoints as
+/// The HTTP method of an [`upload_rfc822`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadMethod {
+    /// Creates a resource: `messages.insert`, `drafts.create`.
+    Post,
+    /// Replaces a resource: `drafts.update`.
+    Put,
+}
+
+/// Uploads a raw RFC 5322 message to one of Gmail's `/upload/` endpoints as
 /// `multipart/related`: `metadata` as the JSON part, then `raw` spliced in
 /// **verbatim** as `message/rfc822`, under a boundary checked not to occur
 /// in `raw` ([`multipart::generate_boundary_absent_from`]). Shared by
-/// `messages.insert` and `drafts.create`, which differ only in URL and
-/// metadata. Goes through the client's retry and token-refresh handling.
+/// `messages.insert`, `drafts.create` and `drafts.update`, which differ only
+/// in method, URL and metadata. Goes through the client's retry and
+/// token-refresh handling.
 pub(crate) async fn upload_rfc822<T: serde::de::DeserializeOwned>(
     client: &GmailClient,
+    method: UploadMethod,
     url: &Url,
     metadata: &serde_json::Value,
     raw: &[u8],
@@ -490,13 +502,15 @@ pub(crate) async fn upload_rfc822<T: serde::de::DeserializeOwned>(
 ) -> Result<T> {
     let boundary = multipart::generate_boundary_absent_from(raw);
     let body = multipart::build_related_body(metadata, raw, "message/rfc822", &boundary);
-    let response = client
-        .post_bytes(
-            url.as_str(),
-            &body,
-            &format!("multipart/related; boundary={boundary}"),
-        )
-        .await?;
+    let content_type = format!("multipart/related; boundary={boundary}");
+    let response = match method {
+        UploadMethod::Post => {
+            client
+                .post_bytes(url.as_str(), &body, &content_type)
+                .await?
+        }
+        UploadMethod::Put => client.put_bytes(url.as_str(), &body, &content_type).await?,
+    };
     client.parse_response(response, parse_context).await
 }
 

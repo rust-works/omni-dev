@@ -211,6 +211,27 @@ impl GmailClient {
         .await
     }
 
+    /// [`Self::post_bytes`] with `PUT`: `drafts.update`'s
+    /// `uploadType=multipart` media endpoint
+    /// (`crate::gmail::drafts_api::DraftsApi::update`), which replaces the
+    /// whole draft. The body is re-materialised per attempt for the same
+    /// reason.
+    pub(crate) async fn put_bytes(
+        &self,
+        url: &str,
+        body: &[u8],
+        content_type: &str,
+    ) -> Result<Response> {
+        self.send_authorized(url, "PUT", |client, token| {
+            client
+                .put(url)
+                .bearer_auth(token)
+                .header("Content-Type", content_type)
+                .body(body.to_vec())
+        })
+        .await
+    }
+
     /// Sends a request built by `build`, retrying exactly once on HTTP 401.
     ///
     /// [`GmailSession::access_token`] already refreshes proactively when the

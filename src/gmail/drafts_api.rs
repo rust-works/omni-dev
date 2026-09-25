@@ -4,8 +4,8 @@
 //! deliberately the same caps: [`MAX_PAGE_LIMIT`], [`HARD_CAP`] and
 //! [`DEFAULT_SEARCH_LIMIT`] are imported from there rather than redeclared, so
 //! `gmail draft list` and `gmail search` can't drift apart (#1921).
-//! [`DraftsApi::create`] (#1923) likewise reuses `messages.insert`'s upload
-//! transport and size limit.
+//! [`DraftsApi::create`] (#1923) and [`DraftsApi::update`] (#1924) likewise
+//! reuse `messages.insert`'s upload transport and size limit.
 //!
 //! **`drafts.send` and `drafts.delete` are deliberately absent** (#1920):
 //! `send` delivers mail that can't be recalled, and `delete` skips Trash, so
@@ -24,7 +24,7 @@ use crate::gmail::client::GmailClient;
 use crate::gmail::error::GmailError;
 use crate::gmail::messages_api::{
     effective_cap, ensure_within_message_limit, header_value, hydrate_in_order, upload_rfc822,
-    MessageFormat, MessagesApi, MAX_PAGE_LIMIT,
+    MessageFormat, MessagesApi, UploadMethod, MAX_PAGE_LIMIT,
 };
 use crate::gmail::types::{Draft, DraftDetail, DraftListResponse, Message};
 
@@ -257,6 +257,7 @@ impl<'a> DraftsApi<'a> {
         };
         upload_rfc822(
             self.client,
+            UploadMethod::Post,
             &url,
             &metadata,
             raw,
@@ -264,6 +265,59 @@ impl<'a> DraftsApi<'a> {
         )
         .await
     }
+
+    /// Replaces a draft's message with `raw`
+    /// (`PUT drafts/{id}?uploadType=multipart`).
+    ///
+    /// Gmail has no partial form: the whole message is replaced, and the
+    /// draft keeps its id but gets a new message id. Same `/upload/`
+    /// transport and [`MAX_INSERT_BYTES`] pre-check as [`Self::create`].
+    ///
+    /// [`MAX_INSERT_BYTES`]: crate::gmail::messages_api::MAX_INSERT_BYTES
+    ///
+    /// **`thread_id` must be re-sent to keep a reply draft in its thread.**
+    /// An update that omits it silently moves the draft out of the thread,
+    /// so callers pass the `threadId` of the draft they fetched. Drafts have
+    /// no ETag or precondition, so this always overwrites whatever is
+    /// stored; callers that care check the message id first.
+    ///
+    /// Requires `gmail.modify` (or `gmail.compose`).
+    pub async fn update(
+        &self,
+        draft_id: &str,
+        raw: &[u8],
+        thread_id: Option<&str>,
+    ) -> Result<Draft> {
+        ensure_within_message_limit(raw.len(), "update a draft to")?;
+        let url = build_draft_update_url(self.client.base_url(), draft_id)?;
+        let metadata = match thread_id {
+            Some(thread_id) => {
+                serde_json::json!({ "id": draft_id, "message": { "threadId": thread_id } })
+            }
+            None => serde_json::json!({ "id": draft_id }),
+        };
+        upload_rfc822(
+            self.client,
+            UploadMethod::Put,
+            &url,
+            &metadata,
+            raw,
+            "Failed to parse drafts.update response",
+        )
+        .await
+    }
+}
+
+/// `drafts.update` URL, on Gmail's `/upload/` path prefix. The id is pushed
+/// as a path segment, so it is percent-encoded rather than able to change
+/// the path or query.
+fn build_draft_update_url(base_url: &str, draft_id: &str) -> Result<Url> {
+    let mut url = GmailClient::api_url(base_url, "/upload/gmail/v1/users/me/drafts")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("Gmail base URL cannot have path segments"))?
+        .push(draft_id);
+    url.query_pairs_mut().append_pair("uploadType", "multipart");
+    Ok(url)
 }
 
 /// `drafts.create` URL, on Gmail's `/upload/` path prefix.
@@ -1002,6 +1056,131 @@ mod tests {
 
         let err = DraftsApi::new(&client)
             .create(b"Subject: x\r\n\r\nbody", None)
+            .await
+            .unwrap_err();
+        let gmail = err.downcast_ref::<GmailError>().unwrap();
+        assert_eq!(gmail.reason(), Some("insufficientPermissions"));
+    }
+
+    // ── update ───────────────────────────────────────────────────────
+
+    #[test]
+    fn build_draft_update_url_targets_the_upload_path_and_encodes_the_id() {
+        let url = build_draft_update_url("https://gmail.googleapis.com", "r-1").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts/r-1?uploadType=multipart"
+        );
+        let url = build_draft_update_url("https://gmail.googleapis.com", "a/b?c").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts/a%2Fb%3Fc?uploadType=multipart"
+        );
+        assert!(build_draft_update_url("not a url", "r-1").is_err());
+    }
+
+    async fn mount_update(server: &wiremock::MockServer, status: u16, body: serde_json::Value) {
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(format!("{CREATE_PATH}/r-1")))
+            .and(wiremock::matchers::query_param("uploadType", "multipart"))
+            .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(body))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn update_request_body(server: &wiremock::MockServer) -> Vec<u8> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method.as_str() == "PUT")
+            .unwrap()
+            .body
+    }
+
+    #[tokio::test]
+    async fn update_puts_the_message_verbatim_with_the_draft_id_and_thread_id() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_update(
+            &server,
+            200,
+            serde_json::json!({"id": "r-1", "message": {"id": "m-2", "threadId": "t-9"}}),
+        )
+        .await;
+        let raw = b"To: a@example.com\nSubject: Re: x \n\nbody\r\n\x00\xff";
+
+        let draft = DraftsApi::new(&client)
+            .update("r-1", raw, Some("t-9"))
+            .await
+            .unwrap();
+        assert_eq!(draft.id, "r-1");
+        assert_eq!(draft.message.id, "m-2");
+        assert_eq!(draft.message.thread_id, "t-9");
+
+        let body = update_request_body(&server).await;
+        assert!(body.windows(raw.len()).any(|w| w == raw.as_slice()));
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("Content-Type: message/rfc822"), "{text}");
+        assert!(
+            text.contains(r#"{"id":"r-1","message":{"threadId":"t-9"}}"#),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_without_a_thread_id_sends_only_the_draft_id() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_update(
+            &server,
+            200,
+            serde_json::json!({"id": "r-1", "message": {"id": "m-2", "threadId": "t-2"}}),
+        )
+        .await;
+
+        DraftsApi::new(&client)
+            .update("r-1", b"Subject: x\r\n\r\nbody", None)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&update_request_body(&server).await).into_owned();
+        assert!(text.contains(r#"{"id":"r-1"}"#), "{text}");
+        assert!(!text.contains("threadId"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn update_refuses_oversized_content_with_no_network_call() {
+        let oversized = vec![b'a'; (MAX_INSERT_BYTES + 1) as usize];
+        let err = DraftsApi::new(&dead_client())
+            .update("r-1", &oversized, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to update a draft to"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_surfaces_insufficient_scope_403_with_reason() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_update(
+            &server,
+            403,
+            serde_json::json!({
+                "error": {
+                    "message": "Request had insufficient authentication scopes.",
+                    "errors": [{"reason": "insufficientPermissions"}],
+                }
+            }),
+        )
+        .await;
+
+        let err = DraftsApi::new(&client)
+            .update("r-1", b"Subject: x\r\n\r\nbody", None)
             .await
             .unwrap_err();
         let gmail = err.downcast_ref::<GmailError>().unwrap();
