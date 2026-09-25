@@ -236,6 +236,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_show_jsonl_path_returns_ok() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_draft(&server, "full", serde_json::json!({"id": "m1"})).await;
+
+        run_show(
+            &client,
+            "r1",
+            ReadDetail::Full,
+            None,
+            &ReadOutputFormat::Jsonl,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn run_show_renders_a_table_to_stdout() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
