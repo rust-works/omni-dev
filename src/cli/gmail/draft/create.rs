@@ -1029,6 +1029,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_reports_an_unreadable_html_body_file_before_any_request() {
+        // No mocks: the refusal must come before any request.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = CreateCommand {
+            html_body_file: Some(dir.path().join("missing.html")),
+            ..create_command(None, OutputFormat::Table)
+        }
+        .execute(&client)
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("HTML body file"), "{err}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn run_create_uploads_a_multipart_alternative_draft() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
@@ -1838,9 +1856,11 @@ mod tests {
     struct UnreadableStdin;
 
     impl Read for UnreadableStdin {
+        // omni-dev: coverage ignore reason="never called: every test using UnreadableStdin gives an HTML body, so resolve_body returns before reading stdin; the panic exists to fail loudly if that ever changes"
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
             panic!("stdin was read")
         }
+        // omni-dev: coverage end
     }
 
     #[test]
