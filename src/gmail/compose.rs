@@ -13,6 +13,11 @@
 //!   when three things agree: the draft's `threadId`, its `In-Reply-To` /
 //!   `References` headers, and its `Subject`. [`ReplyContext`] derives the
 //!   last two from the original message's headers.
+//! - **Reply recipients.** [`ReplyContext::default_recipients`] works out who
+//!   a reply goes to when the caller names nobody, as a mail client's Reply
+//!   and Reply All do (#1954). The original's address headers are decoded
+//!   with `mail-parser`, and every address is re-validated by
+//!   [`Mailbox::from_parts`] before it can reach a header.
 //!
 //! - **The `Message-ID`.** `mail-builder` always writes one, and with its
 //!   `gethostname` feature off its host part is `localhost`. A
@@ -22,18 +27,33 @@
 //! Only `text/plain` bodies are built. `From` is never set: Gmail fills in the
 //! authenticated account's address.
 
+use std::fmt;
+
 use anyhow::{bail, ensure, Result};
 use mail_builder::headers::address::Address;
 use mail_builder::headers::message_id::MessageId;
 use mail_builder::mime::make_boundary;
 use mail_builder::MessageBuilder;
+use mail_parser::MessageParser;
 
 use crate::gmail::messages_api::header_value;
 use crate::gmail::types::Message;
 
 /// The headers [`ReplyContext::from_message`] reads, for the caller's
 /// `messages.get(format=metadata)` request.
-pub const REPLY_HEADERS: [&str; 4] = ["Subject", "Message-ID", "References", "In-Reply-To"];
+pub const REPLY_HEADERS: [&str; 8] = [
+    "Subject",
+    "Message-ID",
+    "References",
+    "In-Reply-To",
+    "From",
+    "Reply-To",
+    "To",
+    "Cc",
+];
+
+/// Gmail's label on every message the account sent.
+const SENT_LABEL: &str = "SENT";
 
 /// One recipient: an address with an optional display name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,8 +95,43 @@ impl Mailbox {
         })
     }
 
+    /// Builds a mailbox from an already-split name and address, such as one
+    /// decoded from another message's header.
+    ///
+    /// Applies the same checks as [`Mailbox::parse`]. The name is checked
+    /// *after* decoding, since an RFC 2047 encoded word can carry a CR, LF
+    /// or ESC that the raw header never showed. An empty name is `None`.
+    pub fn from_parts(name: Option<&str>, email: &str) -> Result<Self> {
+        let name = name.map(str::trim).filter(|name| !name.is_empty());
+        ensure!(
+            !email
+                .chars()
+                .chain(name.unwrap_or_default().chars())
+                .any(char::is_control),
+            "invalid address {email:?}: control characters (such as a line break) are not allowed"
+        );
+        let email = email.trim();
+        validate_email(email)
+            .map_err(|reason| anyhow::anyhow!("invalid address {email:?}: {reason}"))?;
+        Ok(Self {
+            name: name.map(str::to_string),
+            email: email.to_string(),
+        })
+    }
+
     fn to_address(&self) -> Address<'_> {
         Address::new_address(self.name.as_deref(), self.email.as_str())
+    }
+}
+
+impl fmt::Display for Mailbox {
+    /// `Name <addr>`, or the bare address. For messages to a person, not
+    /// for a header: the name is not quoted or encoded.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "{name} <{}>", self.email),
+            None => f.write_str(&self.email),
+        }
     }
 }
 
@@ -144,6 +199,20 @@ pub struct ReplyContext {
     pub in_reply_to: Vec<String>,
     /// The original's `Subject`, or empty.
     pub subject: String,
+    /// The original's `From`.
+    pub from: Vec<Mailbox>,
+    /// The original's `Reply-To`.
+    pub reply_to: Vec<Mailbox>,
+    /// The original's `To`.
+    pub to: Vec<Mailbox>,
+    /// The original's `Cc`.
+    pub cc: Vec<Mailbox>,
+    /// Whether the account sent the original (Gmail's `SENT` label, which
+    /// also covers send-as aliases).
+    pub sent_by_me: bool,
+    /// Addresses in the original's address headers that could not be used,
+    /// as `Header: address`, for the caller to warn about.
+    pub skipped: Vec<String>,
 }
 
 impl ReplyContext {
@@ -158,13 +227,80 @@ impl ReplyContext {
         };
         let payload = message.payload.as_ref();
         let ids = |name| parse_msg_ids(&header_value(payload, name).unwrap_or_default());
+        let mut skipped = Vec::new();
+        let mut addresses = |name| {
+            let (mailboxes, bad) =
+                parse_address_header(name, &header_value(payload, name).unwrap_or_default());
+            skipped.extend(bad.into_iter().map(|bad| format!("{name}: {bad}")));
+            mailboxes
+        };
         Ok(Self {
             thread_id,
             message_id: ids("Message-ID").into_iter().next(),
             references: ids("References"),
             in_reply_to: ids("In-Reply-To"),
             subject: header_value(payload, "Subject").unwrap_or_default(),
+            from: addresses("From"),
+            reply_to: addresses("Reply-To"),
+            to: addresses("To"),
+            cc: addresses("Cc"),
+            sent_by_me: message.label_ids.iter().any(|label| label == SENT_LABEL),
+            skipped,
         })
+    }
+
+    /// The reply's `To` and `Cc` when the caller names nobody (#1954).
+    ///
+    /// A plain reply goes to the original's `Reply-To`, else its `From`; a
+    /// reply to a message the account sent goes to that message's `To`
+    /// instead, as in Gmail's UI. `reply_all` adds the original's `To` to the
+    /// reply's `To` and its `Cc` to the reply's `Cc`, keeping each recipient
+    /// in the header they were in. The addresses in `exclude` (the account's
+    /// own, and any the caller has already placed) are left out, as are
+    /// repeats, both compared case-insensitively and keeping the first
+    /// occurrence (`To` before `Cc`).
+    ///
+    /// Either list can come back empty, `To` included: deciding what that
+    /// means is the caller's job.
+    #[must_use]
+    pub fn default_recipients(
+        &self,
+        reply_all: bool,
+        exclude: &[String],
+    ) -> (Vec<Mailbox>, Vec<Mailbox>) {
+        let primary = if self.sent_by_me {
+            &self.to
+        } else if self.reply_to.is_empty() {
+            &self.from
+        } else {
+            &self.reply_to
+        };
+        let mut to_candidates: Vec<&Mailbox> = primary.iter().collect();
+        let mut cc_candidates: Vec<&Mailbox> = Vec::new();
+        if reply_all {
+            if !self.sent_by_me {
+                to_candidates.extend(&self.to);
+            }
+            cc_candidates.extend(&self.cc);
+        }
+        let mut seen: Vec<String> = exclude.iter().map(|email| email.to_lowercase()).collect();
+        let mut keep_new = |candidates: Vec<&Mailbox>| -> Vec<Mailbox> {
+            candidates
+                .into_iter()
+                .filter(|mailbox| {
+                    let email = mailbox.email.to_lowercase();
+                    let new = !seen.contains(&email);
+                    if new {
+                        seen.push(email);
+                    }
+                    new
+                })
+                .cloned()
+                .collect()
+        };
+        let to = keep_new(to_candidates);
+        let cc = keep_new(cc_candidates);
+        (to, cc)
     }
 
     /// The reply's `References`: the original's `References` (or, lacking
@@ -250,6 +386,48 @@ fn parse_msg_ids(value: &str) -> Vec<String> {
         ids.extend(value.split_whitespace().map(str::to_string));
     }
     ids
+}
+
+/// Decodes the address header `name` (one of `From`, `Reply-To`, `To` or
+/// `Cc`) with `mail-parser`, which handles RFC 2047 encoded words, quoted
+/// names, comments and groups (`Team: a@x, b@y;`, whose members are
+/// flattened into the list).
+///
+/// Returns the usable mailboxes, then the addresses [`Mailbox::from_parts`]
+/// refused (as the address, or the name when there is none), for the caller
+/// to warn about. An empty group such as `undisclosed-recipients:;` yields
+/// neither.
+fn parse_address_header(name: &str, value: &str) -> (Vec<Mailbox>, Vec<String>) {
+    // Unfold, and make sure the value can't end the synthetic header early.
+    let value: String = value
+        .chars()
+        .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
+        .collect();
+    let raw = format!("{name}: {value}\r\n\r\n");
+    let Some(parsed) = MessageParser::default().parse_headers(raw.as_bytes()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let address = match name {
+        "From" => parsed.from(),
+        "Reply-To" => parsed.reply_to(),
+        "To" => parsed.to(),
+        "Cc" => parsed.cc(),
+        _ => None,
+    };
+    let mut mailboxes = Vec::new();
+    let mut skipped = Vec::new();
+    for addr in address.into_iter().flat_map(mail_parser::Address::iter) {
+        match Mailbox::from_parts(addr.name(), addr.address().unwrap_or_default()) {
+            Ok(mailbox) => mailboxes.push(mailbox),
+            Err(_) => skipped.push(
+                addr.address()
+                    .or(addr.name())
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+        }
+    }
+    (mailboxes, skipped)
 }
 
 /// A `text/plain` message to build.
@@ -734,8 +912,226 @@ mod tests {
                 references: vec!["a@example.com".to_string(), "b@example.com".to_string()],
                 in_reply_to: vec!["b@example.com".to_string()],
                 subject: "Quarterly report".to_string(),
+                ..ReplyContext::default()
             }
         );
+    }
+
+    // ── Mailbox::from_parts ──────────────────────────────────────────
+
+    #[test]
+    fn from_parts_trims_and_drops_an_empty_name() {
+        assert_eq!(
+            Mailbox::from_parts(Some("  "), " bob@example.com ").unwrap(),
+            Mailbox {
+                name: None,
+                email: "bob@example.com".to_string()
+            }
+        );
+        assert_eq!(
+            Mailbox::from_parts(Some(" Bob "), "bob@example.com")
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Bob")
+        );
+    }
+
+    #[test]
+    fn from_parts_rejects_control_characters_and_bad_addresses() {
+        for (name, email) in [
+            (Some("Eve\r\nBcc: x@example.com"), "eve@example.com"),
+            (Some("Eve\u{1b}[31m"), "eve@example.com"),
+            (None, "eve@example.com\n"),
+            (None, ""),
+            (None, "no-at-sign"),
+        ] {
+            assert!(
+                Mailbox::from_parts(name, email).is_err(),
+                "{name:?} {email:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_displays_name_and_address() {
+        assert_eq!(mailbox("Alice <a@x.org>").to_string(), "Alice <a@x.org>");
+        assert_eq!(mailbox("a@x.org").to_string(), "a@x.org");
+    }
+
+    // ── Reply recipients ─────────────────────────────────────────────
+
+    fn emails(mailboxes: &[Mailbox]) -> Vec<&str> {
+        mailboxes.iter().map(|m| m.email.as_str()).collect()
+    }
+
+    fn recipients_of(headers: &[(&str, &str)]) -> ReplyContext {
+        ReplyContext::from_message(&original(headers)).unwrap()
+    }
+
+    #[test]
+    fn reply_context_reads_the_address_headers_and_sent_label() {
+        let mut message = original(&[
+            ("From", "Alice <alice@example.com>"),
+            ("Reply-To", "list@example.com"),
+            ("To", "me@example.org, Bob <bob@example.com>"),
+            ("Cc", "carol@example.com"),
+        ]);
+        message.label_ids = vec!["INBOX".to_string(), "SENT".to_string()];
+        let reply = ReplyContext::from_message(&message).unwrap();
+        assert_eq!(reply.from, [mailbox("Alice <alice@example.com>")]);
+        assert_eq!(emails(&reply.reply_to), ["list@example.com"]);
+        assert_eq!(emails(&reply.to), ["me@example.org", "bob@example.com"]);
+        assert_eq!(emails(&reply.cc), ["carol@example.com"]);
+        assert!(reply.sent_by_me);
+        assert!(reply.skipped.is_empty());
+        assert!(!recipients_of(&[]).sent_by_me);
+    }
+
+    #[test]
+    fn reply_context_decodes_encoded_words_and_quoted_names() {
+        let reply = recipients_of(&[
+            (
+                "From",
+                "=?UTF-8?Q?Zo=C3=AB_=C3=85ngstr=C3=B6m?= <zoe@example.com>",
+            ),
+            (
+                "To",
+                r#""Doe, Jane" <jane@example.com>, bob@example.com (Bob)"#,
+            ),
+        ]);
+        assert_eq!(reply.from[0].name.as_deref(), Some("Zoë Ångström"));
+        assert_eq!(reply.from[0].email, "zoe@example.com");
+        assert_eq!(reply.to[0].name.as_deref(), Some("Doe, Jane"));
+        assert_eq!(emails(&reply.to), ["jane@example.com", "bob@example.com"]);
+    }
+
+    #[test]
+    fn reply_context_flattens_groups_and_unfolds() {
+        let reply = recipients_of(&[
+            (
+                "To",
+                "Team: a@example.com,\r\n b@example.com;, c@example.com",
+            ),
+            ("Cc", "undisclosed-recipients:;"),
+        ]);
+        assert_eq!(
+            emails(&reply.to),
+            ["a@example.com", "b@example.com", "c@example.com"]
+        );
+        assert!(reply.cc.is_empty());
+        assert!(reply.skipped.is_empty(), "{:?}", reply.skipped);
+    }
+
+    #[test]
+    fn reply_context_skips_an_encoded_line_break_in_a_name() {
+        // `=0D=0A` decodes to CR LF: kept, it would inject a header.
+        let reply = recipients_of(&[(
+            "Cc",
+            "=?UTF-8?Q?Eve=0D=0ABcc:_x@example.com?= <eve@example.com>, ok@example.com",
+        )]);
+        assert_eq!(emails(&reply.cc), ["ok@example.com"]);
+        assert_eq!(reply.skipped, ["Cc: eve@example.com"]);
+    }
+
+    #[test]
+    fn reply_context_keeps_a_raw_line_break_inside_its_header() {
+        // However `mail-parser` reads the garbage, it stays a `From` value:
+        // it can't start a `Cc` of its own.
+        let reply = recipients_of(&[("From", "a@example.com\r\nCc: eve@example.com")]);
+        assert!(reply.cc.is_empty());
+        assert!(reply.from.len() <= 1, "{:?}", reply.from);
+    }
+
+    fn context(from: &[&str], reply_to: &[&str], to: &[&str], cc: &[&str]) -> ReplyContext {
+        let list = |values: &[&str]| values.iter().map(|v| mailbox(v)).collect();
+        ReplyContext {
+            from: list(from),
+            reply_to: list(reply_to),
+            to: list(to),
+            cc: list(cc),
+            ..ReplyContext::default()
+        }
+    }
+
+    #[test]
+    fn default_recipients_prefers_reply_to_over_from() {
+        let reply = context(&["a@x.org"], &["list@x.org", "b@x.org"], &["me@x.org"], &[]);
+        let (to, cc) = reply.default_recipients(false, &[]);
+        assert_eq!(emails(&to), ["list@x.org", "b@x.org"]);
+        assert!(cc.is_empty());
+    }
+
+    #[test]
+    fn default_recipients_falls_back_to_from() {
+        let reply = context(&["Alice <a@x.org>"], &[], &["me@x.org"], &["c@x.org"]);
+        let (to, cc) = reply.default_recipients(false, &[]);
+        assert_eq!(to, [mailbox("Alice <a@x.org>")]);
+        assert!(cc.is_empty());
+    }
+
+    #[test]
+    fn default_recipients_of_a_sent_message_go_to_its_to() {
+        let reply = ReplyContext {
+            sent_by_me: true,
+            ..context(&["me@x.org"], &[], &["b@x.org", "c@x.org"], &["d@x.org"])
+        };
+        let (to, cc) = reply.default_recipients(false, &[]);
+        assert_eq!(emails(&to), ["b@x.org", "c@x.org"]);
+        assert!(cc.is_empty());
+        let (to, cc) = reply.default_recipients(true, &["me@x.org".to_string()]);
+        assert_eq!(emails(&to), ["b@x.org", "c@x.org"]);
+        assert_eq!(emails(&cc), ["d@x.org"]);
+    }
+
+    #[test]
+    fn default_recipients_reply_all_keeps_each_recipient_in_its_header() {
+        let reply = context(&["a@x.org"], &[], &["me@x.org", "b@x.org"], &["c@x.org"]);
+        let (to, cc) = reply.default_recipients(true, &["me@x.org".to_string()]);
+        assert_eq!(emails(&to), ["a@x.org", "b@x.org"]);
+        assert_eq!(emails(&cc), ["c@x.org"]);
+    }
+
+    #[test]
+    fn default_recipients_excludes_addresses_case_insensitively() {
+        let reply = context(
+            &["a@x.org"],
+            &[],
+            &["Me@X.org", "b@x.org"],
+            &["ALIAS@y.org", "c@x.org"],
+        );
+        let own = ["me@x.org".to_string(), "alias@Y.org".to_string()];
+        let (to, cc) = reply.default_recipients(true, &own);
+        assert_eq!(emails(&to), ["a@x.org", "b@x.org"]);
+        assert_eq!(emails(&cc), ["c@x.org"]);
+    }
+
+    #[test]
+    fn default_recipients_dedupes_across_to_and_cc() {
+        let reply = context(
+            &["a@x.org"],
+            &[],
+            &["A@x.org", "b@x.org", "b@x.org"],
+            &["B@X.ORG", "c@x.org", "a@x.org"],
+        );
+        let (to, cc) = reply.default_recipients(true, &[]);
+        assert_eq!(emails(&to), ["a@x.org", "b@x.org"]);
+        assert_eq!(emails(&cc), ["c@x.org"]);
+    }
+
+    #[test]
+    fn default_recipients_can_be_empty() {
+        let (to, cc) = ReplyContext::default().default_recipients(true, &[]);
+        assert!(to.is_empty() && cc.is_empty());
+        // Replying to your own message sent only to yourself.
+        let reply = ReplyContext {
+            sent_by_me: true,
+            ..context(&["me@x.org"], &[], &["me@x.org"], &[])
+        };
+        assert!(reply
+            .default_recipients(true, &["me@x.org".to_string()])
+            .0
+            .is_empty());
     }
 
     #[test]
@@ -850,6 +1246,7 @@ mod tests {
                 references: vec!["a@example.com".to_string()],
                 in_reply_to: Vec::new(),
                 subject: "Report".to_string(),
+                ..ReplyContext::default()
             }),
             ..plain("Re: Report")
         };
