@@ -127,7 +127,7 @@ impl Action {
 /// updated in place). `probe` is injected so tests can script pid states
 /// without touching real processes. Pure apart from `confirmed`.
 ///
-/// One [`probe`] call per **distinct** pid among `candidates`: several
+/// One `probe` call per **distinct** pid among `candidates`: several
 /// `session_id`s sharing a pid (a resumed process, several Codex threads under
 /// one app-server) are checked once, not once each.
 fn plan(
