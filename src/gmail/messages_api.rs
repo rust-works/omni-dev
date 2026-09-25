@@ -449,28 +449,55 @@ impl<'a> MessagesApi<'a> {
     /// performed, matching [`Self::batch_modify`]'s posture: a
     /// `gmail.readonly`-only token simply gets a 403 back from Google.
     pub async fn insert(&self, raw_eml: &[u8], label_ids: &[&str]) -> Result<Message> {
-        anyhow::ensure!(
-            raw_eml.len() as u64 <= MAX_INSERT_BYTES,
-            "refusing to insert {} bytes (limit: {MAX_INSERT_BYTES} bytes); this exceeds \
-             Gmail's documented per-message size limit",
-            raw_eml.len()
-        );
-        let boundary = multipart::generate_boundary_absent_from(raw_eml);
-        let metadata = serde_json::json!({ "labelIds": label_ids });
-        let body = multipart::build_related_body(&metadata, raw_eml, "message/rfc822", &boundary);
+        ensure_within_message_limit(raw_eml.len(), "insert")?;
         let url = build_message_insert_url(self.client.base_url())?;
-        let response = self
-            .client
-            .post_bytes(
-                url.as_str(),
-                &body,
-                &format!("multipart/related; boundary={boundary}"),
-            )
-            .await?;
-        self.client
-            .parse_response(response, "Failed to parse messages.insert response")
-            .await
+        let metadata = serde_json::json!({ "labelIds": label_ids });
+        upload_rfc822(
+            self.client,
+            &url,
+            &metadata,
+            raw_eml,
+            "Failed to parse messages.insert response",
+        )
+        .await
     }
+}
+
+/// Refuses content over [`MAX_INSERT_BYTES`], naming `action` ("insert",
+/// "create a draft of") in the error. Callers check this before building
+/// any request body.
+pub(crate) fn ensure_within_message_limit(len: usize, action: &str) -> Result<()> {
+    anyhow::ensure!(
+        len as u64 <= MAX_INSERT_BYTES,
+        "refusing to {action} {len} bytes (limit: {MAX_INSERT_BYTES} bytes); this exceeds \
+         Gmail's documented per-message size limit"
+    );
+    Ok(())
+}
+
+/// Posts a raw RFC 5322 message to one of Gmail's `/upload/` endpoints as
+/// `multipart/related`: `metadata` as the JSON part, then `raw` spliced in
+/// **verbatim** as `message/rfc822`, under a boundary checked not to occur
+/// in `raw` ([`multipart::generate_boundary_absent_from`]). Shared by
+/// `messages.insert` and `drafts.create`, which differ only in URL and
+/// metadata. Goes through the client's retry and token-refresh handling.
+pub(crate) async fn upload_rfc822<T: serde::de::DeserializeOwned>(
+    client: &GmailClient,
+    url: &Url,
+    metadata: &serde_json::Value,
+    raw: &[u8],
+    parse_context: &'static str,
+) -> Result<T> {
+    let boundary = multipart::generate_boundary_absent_from(raw);
+    let body = multipart::build_related_body(metadata, raw, "message/rfc822", &boundary);
+    let response = client
+        .post_bytes(
+            url.as_str(),
+            &body,
+            &format!("multipart/related; boundary={boundary}"),
+        )
+        .await?;
+    client.parse_response(response, parse_context).await
 }
 
 fn build_messages_list_url(

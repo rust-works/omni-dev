@@ -543,6 +543,65 @@ drafts endpoint accepts.
 `messages.get` all accept `gmail.readonly`, so `draft list` and `draft show`
 work for an account authorised without `--modify`.
 
+### Creating drafts
+
+```bash
+$ omni-dev gmail draft create --to alice@example.com --subject 'Quarterly report' \
+    --body 'Figures attached.' --attach q3.pdf
+$ omni-dev gmail draft create --to 'Zoë Ångström <zoe@example.com>' --cc bob@example.com \
+    --subject 'Grüße' --body-file note.txt
+$ git log -1 --format=%B | omni-dev gmail draft create --to team@example.com --subject 'Release notes'
+$ omni-dev gmail draft create --to alice@example.com --reply-to 18c2f0a1b2c3d4e5 --body 'Thanks!'
+$ omni-dev gmail draft create --raw message.eml
+```
+
+`draft create` stages a new draft and prints its `DRAFT_ID`, `MESSAGE_ID`
+and `THREAD_ID` (`-o yaml`/`json` give `draft_id`/`message_id`/`thread_id`).
+Nothing is sent. The draft waits in Gmail's Drafts folder for a person to
+review and send.
+
+- **Recipients.** `--to` is required. `--cc` and `--bcc` are optional. Each
+  value is one mailbox, either `addr@example.com` or `Name <addr@example.com>`.
+  Repeat the flag, or list several values after it, for more recipients.
+  Values are never split on commas, so `"Doe, Jane" <jane@example.com>`
+  works. Non-ASCII names and subjects are sent as RFC 2047 encoded words.
+  A line break in any header value is rejected.
+- **Body.** The body is plain text only, taken from `--body TEXT`,
+  `--body-file PATH` or, failing both, standard input. When standard input
+  is a terminal, the command errors instead of waiting for typed input. A
+  script that runs it with an open but silent stdin must pass `--body` or
+  `--body-file`, or redirect `</dev/null` for an empty body. The body must be
+  UTF-8. HTML bodies are not supported yet.
+- **Attachments.** Each `--attach PATH` becomes a base64 part of a
+  `multipart/mixed` message. Its type is guessed from the file extension,
+  defaulting to `application/octet-stream`.
+- **From.** Not set. Gmail fills in the account's own address. Sending
+  from a send-as alias isn't supported yet.
+- **Replies.** `--reply-to` takes the **Gmail message id** of the message
+  being answered, as `gmail search`/`read` print it, not its `Message-ID`
+  header. Gmail only files a reply into the original's thread when the
+  draft's `threadId`, its `In-Reply-To`/`References` headers and its
+  subject all line up. `draft create` fetches the original's headers (one
+  `messages.get`) and sets all three. The subject defaults to
+  `Re: <original subject>`, without doubling an existing `Re:`. An explicit
+  `--subject` is compared with the original's once leading `Re:` prefixes
+  are removed from both. If they differ, a warning is printed, because
+  Gmail may start a new thread for it.
+- **`--raw FILE`** uploads a complete RFC 5322 message byte for byte, with
+  no parsing or line-ending changes. It can't be combined with any of the
+  composing flags.
+- **Size.** Messages over Gmail's 35 MB per-message limit are refused
+  before any request is sent. This is the same limit as [Insert](#insert).
+  Attachments are checked on disk before they're read, with base64's growth
+  of about a third counted along with the body. The built message is
+  checked again, exactly, before the upload.
+  The upload uses the same `/upload/` multipart transport as `gmail insert`.
+
+**Needs `gmail.modify`.** `drafts.create` isn't allowed with
+`gmail.readonly`. A read-only account gets an error telling it to re-run
+`omni-dev gmail auth login --modify` (see
+[`insufficientPermissions`](#insufficientpermissions)).
+
 **Drafts are never sent or deleted.** omni-dev can only stage a draft for a
 person to review. It deliberately has no `draft send` and no `draft delete`:
 Gmail's `drafts.send` delivers mail that can't be recalled, and
@@ -552,7 +611,7 @@ endpoint is ever added to the drafts client (#1920).
 
 ### MCP equivalent(s)
 
-None yet. `draft list` and `draft show` are CLI-only.
+None yet. `draft list`, `draft show` and `draft create` are CLI-only.
 
 ## Sync
 
@@ -1100,7 +1159,10 @@ as poor a fit here as it is for `sync`/`extract-attachments`.
 
 Gmail enforces a **per-user quota of 250 units/second**; `messages.get` and
 `messages.list` each cost 5 units, `messages.batchModify` costs 50 units
-for up to 1000 ids. `gmail search`'s ids-only default costs a flat 5 units
+for up to 1000 ids. Gmail doesn't document a separate cost for
+`drafts.create`, so assume the `messages.insert` cost (25 units) until it's
+verified. `draft create` makes one such call, plus one `messages.get` with
+`--reply-to`. `gmail search`'s ids-only default costs a flat 5 units
 regardless of `--limit` (auto-pagination is still one `messages.list` call
 per page). `--enrich` adds one `messages.get` (5 units) **per hit**, so
 `--enrich --limit 50` can cost up to 255 units — nearly the entire
@@ -1212,10 +1274,17 @@ was.
 Error: Gmail API request failed: HTTP 403: Insufficient Permission (reason: insufficientPermissions)
 ```
 
-`gmail.readonly` was granted, but `label add`/`remove` fails — read
-commands (`search`, `read`, `thread`, `auth status`) all work fine; only
-label mutation 403s. Fix is `omni-dev gmail auth login --modify`
-(re-consent with the write scope), not a retry.
+`gmail.readonly` was granted, but `label add`/`remove`, `insert` or
+`draft create` fails — read commands (`search`, `read`, `thread`,
+`draft list`, `auth status`) all work fine; only mailbox writes 403. Fix is
+`omni-dev gmail auth login --modify` (re-consent with the write scope), not
+a retry. `draft create` and `label add`/`remove` say so themselves (`insert`
+still shows the bare 403):
+
+```
+Error: This Gmail account is authorised read-only, and this command needs the `gmail.modify` scope. Re-run `omni-dev gmail auth login --modify` (adding `--account NAME` for a named account) to grant it.
+  Caused by: Gmail API request failed: HTTP 403: …
+```
 
 ### MCP server cannot see credentials
 

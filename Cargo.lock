@@ -2511,6 +2511,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-builder"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccbc27cb02a58a311a404769a22f5abf63fe3173b290d80be7c534f9c7023151"
+
+[[package]]
 name = "mail-parser"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3027,6 +3033,7 @@ dependencies = [
  "http",
  "indicatif",
  "insta",
+ "mail-builder",
  "mail-parser",
  "mime_guess",
  "nix 0.31.3",

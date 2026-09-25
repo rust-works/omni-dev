@@ -3,6 +3,7 @@
 //! `draft` only ever *stages* mail: there is deliberately no `send` or
 //! `delete` leaf (see [`crate::gmail::drafts_api`]).
 
+pub(crate) mod create;
 pub(crate) mod list;
 pub(crate) mod show;
 
@@ -26,6 +27,8 @@ pub enum DraftSubcommands {
     List(list::ListCommand),
     /// Shows one draft by its draft id (`gmail.readonly` is enough).
     Show(show::ShowCommand),
+    /// Creates a draft to review and send from Gmail (needs `gmail.modify`).
+    Create(create::CreateCommand),
 }
 
 impl DraftCommand {
@@ -34,6 +37,7 @@ impl DraftCommand {
         match self.command {
             DraftSubcommands::List(cmd) => cmd.execute(client).await,
             DraftSubcommands::Show(cmd) => cmd.execute(client).await,
+            DraftSubcommands::Create(cmd) => cmd.execute(client).await,
         }
     }
 }

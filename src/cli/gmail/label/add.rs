@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+use crate::cli::gmail::helpers::with_modify_scope_hint;
 use crate::gmail::client::GmailClient;
 use crate::gmail::messages_api::MessagesApi;
 
@@ -39,7 +40,8 @@ async fn run_add(client: &GmailClient, message_ids: &[String], label: &str) -> R
     let ids: Vec<&str> = message_ids.iter().map(String::as_str).collect();
     MessagesApi::new(client)
         .batch_modify(&ids, &[label], &[])
-        .await?;
+        .await
+        .map_err(with_modify_scope_hint)?;
     println!("Added label '{label}' to {} message(s).", ids.len());
     Ok(())
 }
@@ -121,6 +123,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn run_add_explains_a_read_only_account() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/gmail/v1/users/me/messages/batchModify",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "message": "Insufficient Permission",
+                        "errors": [{"reason": "insufficientPermissions"}],
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = run_add(&client, &["m1".to_string()], "IMPORTANT")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("gmail auth login --modify"),
+            "{err}"
+        );
     }
 
     // ── AddCommand::execute glue ──────────────────────────────────

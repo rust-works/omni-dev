@@ -6,6 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::cli::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
+use crate::cli::gmail::helpers::with_modify_scope_hint;
 use crate::gmail::client::GmailClient;
 use crate::gmail::messages_api::MessagesApi;
 
@@ -88,7 +89,8 @@ async fn run_remove(
             let ids: Vec<&str> = message_ids.iter().map(String::as_str).collect();
             MessagesApi::new(client)
                 .batch_modify(&ids, &[], &[label])
-                .await?;
+                .await
+                .map_err(with_modify_scope_hint)?;
             writeln!(
                 writer,
                 "Removed label '{label}' from {} message(s).",
