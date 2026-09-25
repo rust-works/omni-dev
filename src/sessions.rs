@@ -88,6 +88,11 @@ const DEFAULT_WINDOW_TTL: Duration = Duration::from_secs(30);
 /// stays infallible.
 const MAX_SESSIONS: usize = 512;
 
+/// How many replaced agent processes a session remembers (#1948). Enough for a
+/// burst of window reloads, each of which replaces the previous process before
+/// its `SessionEnd` has necessarily arrived; the oldest is forgotten first.
+const MAX_REPLACED_PIDS: usize = 8;
+
 /// Ceiling on live window-embedding reports, mirroring the worktrees registry cap.
 const MAX_WINDOWS: usize = 256;
 
@@ -358,6 +363,11 @@ pub struct ObserveRequest {
     /// Which agent the session belongs to; omitted for Claude Code.
     #[serde(default, skip_serializing_if = "Agent::is_claude")]
     pub agent: Agent,
+    /// The pid of the agent process that fired the hook (the hook sink's parent),
+    /// when known. Tells a resumed session's new process from the old one it
+    /// replaced, which share a `session_id` (#1948). Only the hook sink sends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// A companion report of one VS Code window's embedded Claude sessions.
@@ -425,6 +435,15 @@ pub struct SessionEntry {
     pub started_at: DateTime<Utc>,
     /// When the registry last heard from this session (RFC 3339).
     pub last_seen: DateTime<Utc>,
+    /// The agent process that owns the session: the pid of its latest
+    /// pid-bearing sighting that did not come from a replaced process.
+    #[serde(skip)]
+    pub(crate) pid: Option<u32>,
+    /// The processes the session was taken over from, oldest first and capped
+    /// at [`MAX_REPLACED_PIDS`] — the old processes of in-place resumes. An
+    /// `end` from one of them is ignored (#1948).
+    #[serde(skip)]
+    pub(crate) replaced_pids: Vec<u32>,
 }
 
 /// One companion window-embedding report, with its liveness stamp.
@@ -555,6 +574,7 @@ impl SessionsRegistry {
                     false
                 }
                 Some(entry) => {
+                    track_pid(entry, req.pid);
                     let next = SessionState::for_event(&req.event, Some(entry.state));
                     let state_changed = next != entry.state;
                     entry.state = next;
@@ -587,6 +607,8 @@ impl SessionsRegistry {
                             last_event: req.event,
                             started_at: now,
                             last_seen: now,
+                            pid: req.pid,
+                            replaced_pids: Vec::new(),
                         },
                     );
                     true
@@ -603,7 +625,16 @@ impl SessionsRegistry {
     /// short window ([`ENDED_SESSION_TTL`]) before it is reaped. Returns whether
     /// the session was known. A no-op for an already-unknown session (a
     /// duplicate/late `SessionEnd`).
-    pub fn end(&self, session_id: &str, _reason: Option<&str>) -> bool {
+    ///
+    /// Also a no-op when `pid` is a process the session was taken over from:
+    /// an in-place resume (a VS Code window reload) starts a new process on the
+    /// same `session_id` without waiting for the old one to exit, so the old
+    /// process's `SessionEnd` can arrive after the new one's `SessionStart`
+    /// (#1948). Any other `end` — no pid, the owning pid, or a pid never seen
+    /// (a wrapped hook command whose parent is a per-hook shell) — ends the
+    /// session, so the rule can only ever keep a session the old process no
+    /// longer owns.
+    pub fn end(&self, session_id: &str, _reason: Option<&str>, pid: Option<u32>) -> bool {
         let now = Utc::now();
         let (known, reaped) = {
             let mut sessions = self.lock_sessions();
@@ -612,6 +643,11 @@ impl SessionsRegistry {
                 // Already ended (a hook and a watcher can both end it): leave the
                 // linger window alone rather than restart it.
                 Some(entry) if entry.state == SessionState::Ended => (true, false),
+                // The replaced process's late `SessionEnd`: the resumed session
+                // lives on under its new process.
+                Some(entry) if pid.is_some_and(|pid| entry.replaced_pids.contains(&pid)) => {
+                    (true, false)
+                }
                 Some(entry) => {
                     entry.state = SessionState::Ended;
                     entry.last_event = SessionEvent::Stop;
@@ -750,6 +786,29 @@ impl Default for SessionsRegistry {
     }
 }
 
+/// Records which agent process owns `entry` from a sighting's `pid` (#1948).
+///
+/// A sighting from a pid other than the owner is a new process resuming the
+/// session in place (every hook and the `claude-wrap` stream report the agent's
+/// pid), so it takes ownership and the old owner joins `replaced_pids`, whose
+/// late `end` is ignored. A replaced pid never becomes the owner again, so a
+/// straggling hook from the old process cannot take the session back. Not a
+/// rendered field, so it never decides a [`bump`](SessionsRegistry::bump).
+fn track_pid(entry: &mut SessionEntry, pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return;
+    };
+    if entry.pid == Some(pid) || entry.replaced_pids.contains(&pid) {
+        return;
+    }
+    if let Some(owner) = entry.pid.replace(pid) {
+        if entry.replaced_pids.len() >= MAX_REPLACED_PIDS {
+            entry.replaced_pids.remove(0);
+        }
+        entry.replaced_pids.push(owner);
+    }
+}
+
 /// Fills `slot` from `incoming` only when `incoming` carries a value, so a
 /// best-effort field never overwrites known data with `None` on a re-`observe`.
 /// Returns whether the stored value actually changed, which is what decides
@@ -859,6 +918,7 @@ mod tests {
 
     fn observe_request(session_id: &str, event: SessionEvent, cwd: Option<&str>) -> ObserveRequest {
         ObserveRequest {
+            pid: None,
             agent: Agent::Claude,
             session_id: session_id.to_string(),
             cwd: cwd.map(PathBuf::from),
@@ -995,9 +1055,9 @@ mod tests {
             SessionEvent::PreToolUse,
             Some("/tmp/a"),
         ));
-        assert!(reg.end("s1", Some("clear")));
+        assert!(reg.end("s1", Some("clear"), None));
         // Ending an unknown session is a no-op.
-        assert!(!reg.end("ghost", None));
+        assert!(!reg.end("ghost", None, None));
         let sessions = reg.list();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].state, SessionState::Ended);
@@ -1162,6 +1222,8 @@ mod tests {
             sessions.insert(
                 id.to_string(),
                 SessionEntry {
+                    pid: None,
+                    replaced_pids: Vec::new(),
                     agent: Agent::Claude,
                     session_id: id.to_string(),
                     cwd: None,
@@ -1187,6 +1249,7 @@ mod tests {
         let reg = SessionsRegistry::new();
         for (id, repo) in [("z", "repo-a"), ("a", "repo-b"), ("m", "repo-a")] {
             reg.observe(ObserveRequest {
+                pid: None,
                 agent: Agent::Claude,
                 session_id: id.to_string(),
                 cwd: None,
@@ -1217,6 +1280,7 @@ mod tests {
         // tagged source, and omitted `None` fields.
         let reg = SessionsRegistry::new();
         reg.observe(ObserveRequest {
+            pid: None,
             agent: Agent::Claude,
             session_id: "s1".to_string(),
             cwd: Some(PathBuf::from("/p")),
@@ -1306,7 +1370,7 @@ mod tests {
     fn an_ended_session_is_not_refreshed_by_a_passive_sighting_or_a_second_end() {
         let reg = SessionsRegistry::new();
         reg.observe(observe_request("s", SessionEvent::Stop, None));
-        assert!(reg.end("s", None));
+        assert!(reg.end("s", None, None));
         let ended_at = reg.list()[0].last_seen;
         let mut changes = reg.subscribe_changes();
         changes.mark_unchanged();
@@ -1316,7 +1380,7 @@ mod tests {
             SessionEvent::TranscriptDiscovered,
             None,
         ));
-        assert!(reg.end("s", None), "still a known session");
+        assert!(reg.end("s", None, None), "still a known session");
         let listed = reg.list();
         assert_eq!(listed[0].state, SessionState::Ended);
         assert_eq!(
@@ -1398,6 +1462,8 @@ mod tests {
                 sessions.insert(
                     id.clone(),
                     SessionEntry {
+                        pid: None,
+                        replaced_pids: Vec::new(),
                         agent: Agent::Claude,
                         session_id: id.clone(),
                         cwd: None,
@@ -1592,7 +1658,7 @@ mod tests {
             SessionEvent::PreToolUse,
             Some("/tmp/a"),
         ));
-        assert!(reg.end("s1", Some("clear")));
+        assert!(reg.end("s1", Some("clear"), None));
         // Subscribed after the end so its bump is already seen (see above).
         let rx = reg.subscribe_changes();
 
@@ -1652,15 +1718,130 @@ mod tests {
         reg.observe(observe_request("s1", SessionEvent::PreToolUse, None));
         let mut rx = reg.subscribe_changes();
 
-        assert!(!reg.end("ghost", None), "an unknown session is a no-op");
+        assert!(
+            !reg.end("ghost", None, None),
+            "an unknown session is a no-op"
+        );
         assert!(
             !rx.has_changed().unwrap(),
             "ending an unknown session must not bump"
         );
 
-        assert!(reg.end("s1", None));
+        assert!(reg.end("s1", None, None));
         assert!(rx.has_changed().unwrap(), "a real end should bump");
         rx.borrow_and_update();
+    }
+
+    /// A hook sighting from agent process `pid`.
+    fn observe_from(session_id: &str, event: SessionEvent, pid: u32) -> ObserveRequest {
+        ObserveRequest {
+            pid: Some(pid),
+            ..observe_request(session_id, event, None)
+        }
+    }
+
+    #[test]
+    fn a_late_end_from_the_replaced_process_keeps_a_resumed_session_live() {
+        let reg = SessionsRegistry::new();
+        // The old process (pid 100) runs the session; a window reload starts
+        // the new one (pid 200) on the same session_id before 100 has exited.
+        reg.observe(observe_from("s1", SessionEvent::SessionStart, 100));
+        reg.observe(observe_from("s1", SessionEvent::Stop, 100));
+        reg.observe(observe_from("s1", SessionEvent::SessionStart, 200));
+        let rx = reg.subscribe_changes();
+
+        // The old process's `SessionEnd` lands last (#1948).
+        assert!(reg.end("s1", Some("other"), Some(100)));
+        assert!(!rx.has_changed().unwrap(), "an ignored end must not bump");
+        let sessions = reg.list();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].state, SessionState::Starting);
+
+        // The new process's own `SessionEnd` still ends it.
+        assert!(reg.end("s1", Some("exit"), Some(200)));
+        assert_eq!(reg.list()[0].state, SessionState::Ended);
+    }
+
+    #[test]
+    fn a_straggling_hook_from_the_replaced_process_does_not_take_the_session_back() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_from("s1", SessionEvent::SessionStart, 100));
+        reg.observe(observe_from("s1", SessionEvent::SessionStart, 200));
+        // A replaced pid never becomes the owner again, so 200 still owns it.
+        reg.observe(observe_from("s1", SessionEvent::PostToolUse, 100));
+        reg.end("s1", None, Some(100));
+        assert_ne!(reg.list()[0].state, SessionState::Ended);
+    }
+
+    #[test]
+    fn an_end_not_from_the_replaced_process_still_ends_the_session() {
+        // No pid (an older sink, or a feed that sends none), the owning pid, and
+        // a never-seen pid (a wrapped hook command whose parent is a per-hook
+        // shell) all end the session: only a replaced pid is ignored.
+        for end_pid in [None, Some(200), Some(999)] {
+            let reg = SessionsRegistry::new();
+            reg.observe(observe_from("s1", SessionEvent::SessionStart, 100));
+            reg.observe(observe_from("s1", SessionEvent::SessionStart, 200));
+            assert!(reg.end("s1", None, end_pid));
+            assert_eq!(
+                reg.list()[0].state,
+                SessionState::Ended,
+                "end with pid {end_pid:?}"
+            );
+        }
+        // A session that was never resumed ends on its own process's end.
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_from("s1", SessionEvent::SessionStart, 100));
+        assert!(reg.end("s1", None, Some(100)));
+        assert_eq!(reg.list()[0].state, SessionState::Ended);
+    }
+
+    #[test]
+    fn every_process_of_a_reload_burst_is_remembered_as_replaced() {
+        let reg = SessionsRegistry::new();
+        for pid in [100, 200, 300] {
+            reg.observe(observe_from("s1", SessionEvent::SessionStart, pid));
+        }
+        // Both earlier processes' ends land after the third process started.
+        assert!(reg.end("s1", None, Some(100)));
+        assert!(reg.end("s1", None, Some(200)));
+        assert_eq!(reg.list()[0].state, SessionState::Starting);
+    }
+
+    #[test]
+    fn a_stream_report_from_a_new_process_takes_the_session_over() {
+        // A wrapper-only install: `claude-wrap` reports `StreamState` with the
+        // child's pid, and no hook ever sends a `SessionStart`.
+        let idle = || SessionEvent::StreamState(SessionState::Idle);
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_from("s1", idle(), 100));
+        reg.observe(observe_from("s1", idle(), 200));
+        reg.end("s1", None, Some(100));
+        assert_eq!(reg.list()[0].state, SessionState::Idle);
+    }
+
+    #[test]
+    fn replaced_pids_are_capped_oldest_first() {
+        let reg = SessionsRegistry::new();
+        let last = u32::try_from(MAX_REPLACED_PIDS).unwrap() + 1;
+        for pid in 0..=last {
+            reg.observe(observe_from("s1", SessionEvent::PostToolUse, pid));
+        }
+        let guard = reg.lock_sessions();
+        let replaced = &guard["s1"].replaced_pids;
+        assert_eq!(replaced.len(), MAX_REPLACED_PIDS);
+        assert_eq!(replaced.first(), Some(&1), "pid 0 was forgotten first");
+        assert_eq!(replaced.last(), Some(&(last - 1)));
+    }
+
+    #[test]
+    fn end_then_start_resume_ordering_is_unchanged() {
+        // #1946's ordering: the old process ends first, then the new one starts.
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_from("s1", SessionEvent::SessionStart, 100));
+        assert!(reg.end("s1", None, Some(100)));
+        reg.observe(observe_from("s1", SessionEvent::SessionStart, 200));
+        assert_eq!(reg.list()[0].state, SessionState::Starting);
     }
 
     #[test]

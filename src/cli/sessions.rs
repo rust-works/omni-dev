@@ -237,21 +237,24 @@ impl HookCommand {
     /// never block or fail a Claude turn, so every error — no daemon, bad JSON,
     /// an unknown event — is swallowed after a best-effort report.
     pub async fn execute(self) -> Result<()> {
+        // Read before stdin, while the agent that spawned this hook is surely
+        // still alive to be our parent.
+        let pid = agent_pid(std::os::unix::process::parent_id());
         let mut input = String::new();
         if std::io::stdin().read_to_string(&mut input).is_err() {
             return Ok(());
         }
-        self.report(&input).await;
+        self.report(&input, pid).await;
         Ok(())
     }
 
     /// Parses the hook JSON, maps it to an op, and best-effort sends it. Split
     /// out so tests can exercise the send path against a fake socket.
-    async fn report(&self, input: &str) {
+    async fn report(&self, input: &str, pid: Option<u32>) {
         let Ok(hook) = serde_json::from_str::<HookPayload>(input) else {
             return;
         };
-        let Some((op, payload)) = hook.to_op(self.agent) else {
+        let Some((op, payload)) = hook.to_op(self.agent, pid) else {
             return;
         };
         let Ok(socket) = server::resolve_socket(self.socket.clone()) else {
@@ -262,6 +265,17 @@ impl HookCommand {
         let env = DaemonEnvelope::service(SERVICE, op, payload);
         let _ = tokio::time::timeout(HOOK_TIMEOUT, DaemonClient::new(&socket).request(env)).await;
     }
+}
+
+/// The pid of the agent process that ran this hook, from the sink's parent pid.
+///
+/// The agent runs the installed hook command directly (a simple command, so no
+/// per-hook shell sits in between), making the parent the `claude` / `codex`
+/// process itself. The pid tells a resumed session's new process from the old
+/// one it replaced (#1948). Pid 1 means the hook was orphaned — its agent already
+/// exited and init/launchd adopted it — so it identifies nothing.
+fn agent_pid(parent: u32) -> Option<u32> {
+    (parent > 1).then_some(parent)
 }
 
 /// The subset of a Claude Code hook payload the sink reads. Every field is
@@ -303,14 +317,18 @@ struct HookPayload {
 
 impl HookPayload {
     /// Maps this hook payload to a `(op, payload)` for the daemon, or `None` when
-    /// it carries no `session_id` or names an event the tracker ignores.
-    fn to_op(&self, agent: HookAgent) -> Option<(&'static str, Value)> {
+    /// it carries no `session_id` or names an event the tracker ignores. `pid`
+    /// (the [`agent_pid`]) rides along on both ops when known.
+    fn to_op(&self, agent: HookAgent, pid: Option<u32>) -> Option<(&'static str, Value)> {
         let session_id = self.session_id.clone().filter(|s| !s.trim().is_empty())?;
         let event_name = self.hook_event_name.as_deref()?;
         if event_name == "SessionEnd" {
             let mut payload = json!({ "session_id": session_id });
             if let Some(reason) = self.reason.as_ref().or(self.message.as_ref()) {
                 payload["reason"] = Value::String(reason.clone());
+            }
+            if let Some(pid) = pid {
+                payload["pid"] = Value::from(pid);
             }
             return Some(("end", payload));
         }
@@ -335,6 +353,7 @@ impl HookPayload {
             event,
             repo: None,
             model: self.model.clone(),
+            pid,
         };
         Some(("observe", serde_json::to_value(request).ok()?))
     }
@@ -1557,7 +1576,7 @@ mod tests {
     fn hook_op(json_str: &str) -> Option<(&'static str, Value)> {
         serde_json::from_str::<HookPayload>(json_str)
             .unwrap()
-            .to_op(HookAgent::Claude)
+            .to_op(HookAgent::Claude, None)
     }
 
     #[test]
@@ -1599,6 +1618,30 @@ mod tests {
     }
 
     #[test]
+    fn hook_sends_the_agent_pid_on_both_ops_when_known() {
+        let hook = |json_str: &str, pid| {
+            serde_json::from_str::<HookPayload>(json_str)
+                .unwrap()
+                .to_op(HookAgent::Claude, pid)
+                .unwrap()
+        };
+        let start = r#"{"session_id":"s1","hook_event_name":"SessionStart"}"#;
+        let end = r#"{"session_id":"s1","hook_event_name":"SessionEnd"}"#;
+        assert_eq!(hook(start, Some(42)).1["pid"], 42);
+        assert_eq!(hook(end, Some(42)).1["pid"], 42);
+        // Unknown: omitted from the wire, exactly as before #1948.
+        assert!(hook(start, None).1.get("pid").is_none());
+        assert!(hook(end, None).1.get("pid").is_none());
+    }
+
+    #[test]
+    fn agent_pid_treats_an_orphaned_hook_as_unknown() {
+        assert_eq!(agent_pid(4242), Some(4242));
+        assert_eq!(agent_pid(1), None);
+        assert_eq!(agent_pid(0), None);
+    }
+
+    #[test]
     fn hook_classifies_notifications() {
         let permission = hook_op(
             r#"{"session_id":"s1","hook_event_name":"Notification","message":"Claude needs your permission to use Bash"}"#,
@@ -1634,7 +1677,7 @@ mod tests {
     fn codex_op(json_str: &str) -> Option<(&'static str, Value)> {
         serde_json::from_str::<HookPayload>(json_str)
             .unwrap()
-            .to_op(HookAgent::Codex)
+            .to_op(HookAgent::Codex, None)
     }
 
     fn codex_event(event: &str, tool: Option<&str>) -> Value {
@@ -2892,11 +2935,11 @@ mod tests {
             socket: Some(sock),
             agent: HookAgent::Claude,
         };
-        cmd.report(r#"{"session_id":"s1","hook_event_name":"Stop"}"#)
+        cmd.report(r#"{"session_id":"s1","hook_event_name":"Stop"}"#, None)
             .await;
         // Unmappable input returns before any socket work.
-        cmd.report("not json").await;
-        cmd.report(r#"{"hook_event_name":"Stop"}"#).await; // no session_id → no op
+        cmd.report("not json", None).await;
+        cmd.report(r#"{"hook_event_name":"Stop"}"#, None).await; // no session_id → no op
     }
 
     /// Spawns a minimal fake daemon on a short-path Unix socket that answers one

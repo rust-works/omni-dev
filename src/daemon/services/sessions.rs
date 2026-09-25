@@ -144,7 +144,13 @@ impl DaemonService for SessionsService {
             "end" => {
                 let session_id = require_str(&payload, "session_id", "end")?;
                 let reason = payload.get("reason").and_then(Value::as_str);
-                Ok(json!({ "ended": self.registry.end(session_id, reason) }))
+                // The hook sink's parent pid, when sent: lets the registry ignore
+                // the late `SessionEnd` of a process a resume replaced (#1948).
+                let pid = payload
+                    .get("pid")
+                    .and_then(Value::as_u64)
+                    .and_then(|pid| u32::try_from(pid).ok());
+                Ok(json!({ "ended": self.registry.end(session_id, reason, pid) }))
             }
             "window" => {
                 let req: WindowReport =
@@ -505,6 +511,7 @@ mod tests {
     async fn status_summarizes_states() {
         let svc = service();
         svc.registry().observe(ObserveRequest {
+            pid: None,
             agent: crate::sessions::Agent::Claude,
             session_id: "w".to_string(),
             cwd: None,
@@ -514,6 +521,7 @@ mod tests {
             model: None,
         });
         svc.registry().observe(ObserveRequest {
+            pid: None,
             agent: crate::sessions::Agent::Claude,
             session_id: "p".to_string(),
             cwd: None,
@@ -544,6 +552,8 @@ mod tests {
     fn menu_item_is_clickable_only_for_vscode_sessions() {
         let now = chrono::Utc::now();
         let base = |source: Source| SessionEntry {
+            pid: None,
+            replaced_pids: Vec::new(),
             agent: crate::sessions::Agent::Claude,
             session_id: "sid-12345678".to_string(),
             cwd: Some(PathBuf::from("/p")),
@@ -593,6 +603,8 @@ mod tests {
     fn entry(id: &str, state: SessionState, repo: Option<&str>, cwd: Option<&str>) -> SessionEntry {
         let now = chrono::Utc::now();
         SessionEntry {
+            pid: None,
+            replaced_pids: Vec::new(),
             agent: crate::sessions::Agent::Claude,
             session_id: id.to_string(),
             cwd: cwd.map(PathBuf::from),
@@ -713,6 +725,7 @@ mod tests {
     /// A small `observe` builder for the adapter tests.
     fn observe_req(id: &str, event: SessionEvent, cwd: Option<&str>) -> ObserveRequest {
         ObserveRequest {
+            pid: None,
             agent: crate::sessions::Agent::Claude,
             session_id: id.to_string(),
             cwd: cwd.map(PathBuf::from),
@@ -741,6 +754,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn end_op_ignores_the_replaced_process_by_pid() {
+        let svc = SessionsService::new();
+        for pid in [100, 200] {
+            svc.handle(
+                "observe",
+                json!({ "session_id": "s1", "event": "session_start", "pid": pid }),
+            )
+            .await
+            .unwrap();
+        }
+        svc.handle("end", json!({ "session_id": "s1", "pid": 100 }))
+            .await
+            .unwrap();
+        assert_eq!(svc.registry().list()[0].state, SessionState::Starting);
+        svc.handle("end", json!({ "session_id": "s1", "pid": 200 }))
+            .await
+            .unwrap();
+        assert_eq!(svc.registry().list()[0].state, SessionState::Ended);
+    }
+
     #[test]
     fn repo_name_for_resolves_a_real_repo() {
         let tmp = tempfile::tempdir().unwrap();
@@ -756,10 +790,10 @@ mod tests {
         let svc = SessionsService::new();
         svc.registry()
             .observe(observe_req("i", SessionEvent::Stop, None)); // idle
-        svc.registry().end("i2", None); // unknown → no-op
+        svc.registry().end("i2", None, None); // unknown → no-op
         svc.registry()
             .observe(observe_req("i2", SessionEvent::PreToolUse, None));
-        svc.registry().end("i2", Some("done")); // ended
+        svc.registry().end("i2", Some("done"), None); // ended
         svc.registry()
             .observe(observe_req("s", SessionEvent::SessionStart, None)); // starting
         let status = svc.status().await;

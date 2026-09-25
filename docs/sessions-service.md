@@ -140,7 +140,7 @@ best-effort:
 | `PermissionRequest` / `Notification` — permission prompt | `waiting_for_permission` |
 | `Elicitation` / `Notification` — idle, input, or elicitation prompt | `waiting_for_input` |
 | `Notification` — unclassified / `SubagentStop` / `PreCompact` / `PostCompact` / `SessionStart` with `source: "compact"` / transcript discovered | *unchanged* |
-| `SessionEnd` | `ended` (reaped shortly after) |
+| `SessionEnd` | `ended` (reaped shortly after); ignored from a process a resume replaced — see [Liveness](#liveness) |
 | **stream state** (Feed 4) | **exactly what was reported** |
 
 `waiting_for_*` are **reliable**: a dedicated hook fires them directly.
@@ -216,6 +216,23 @@ prompt, so its only liveness signal is activity. The session TTL is therefore
 generous (5 min). **A session left idle longer than that ages out and re-appears
 the moment it next does anything** — the accepted limitation of a hook-based
 tracker, since no liveness event exists. A clean `SessionEnd` removes it promptly.
+
+A resumed session is the exception to "`SessionEnd` removes it". Resuming in
+place, as a VS Code window reload does, starts a new `claude` process on the same
+`session_id` without waiting for the old one to exit. Each hook is its own
+process, so nothing orders the old process's `SessionEnd` against the new one's
+`SessionStart`, and it can arrive last (#1948). So every `observe` and `end` from
+the hook sink carries its parent pid, which is the agent process, and so does
+every report from [the stream wrapper](#the-stream-wrapper-feed-4), which sends
+its child's pid. A sighting from a pid other than the session's current one takes
+the session over and records the old pid as *replaced* (up to eight, oldest
+forgotten first). An `end` from a replaced pid is ignored, so the resumed row
+stays live. Any other `end` ends the session: one with no pid (an older sink, or
+a feed that sends none), the owning pid, or a pid never seen. The last case
+covers a hook command wrapped in a shell, where each hook's parent is a fresh
+shell. That keeps the rule fail-open: it can only keep a session that has since
+been taken over. A replaced pid never becomes the owner again, so a straggling
+hook from the old process cannot take the session back.
 
 ## CLI
 
