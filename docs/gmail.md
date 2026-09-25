@@ -551,6 +551,8 @@ $ omni-dev gmail draft create --to alice@example.com --subject 'Quarterly report
 $ omni-dev gmail draft create --to 'Zoë Ångström <zoe@example.com>' --cc bob@example.com \
     --subject 'Grüße' --body-file note.txt
 $ git log -1 --format=%B | omni-dev gmail draft create --to team@example.com --subject 'Release notes'
+$ omni-dev gmail draft create --to alice@example.com --subject 'Quarterly report' \
+    --html-body-file note.html --attach q3.pdf
 $ omni-dev gmail draft create --to alice@example.com --reply-to 18c2f0a1b2c3d4e5 --body 'Thanks!'
 $ omni-dev gmail draft create --reply-to 18c2f0a1b2c3d4e5 --reply-all --body 'Thanks, all!'
 $ omni-dev gmail draft create --raw message.eml
@@ -569,12 +571,25 @@ review and send.
   Values are never split on commas, so `"Doe, Jane" <jane@example.com>`
   works. Non-ASCII names and subjects are sent as RFC 2047 encoded words.
   A line break in any header value is rejected.
-- **Body.** The body is plain text only, taken from `--body TEXT`,
+- **Body.** The plain-text body is taken from `--body TEXT`,
   `--body-file PATH` or, failing both, standard input. When standard input
   is a terminal, the command errors instead of waiting for typed input. A
   script that runs it with an open but silent stdin must pass `--body` or
   `--body-file`, or redirect `</dev/null` for an empty body. The body must be
-  UTF-8. HTML bodies are not supported yet.
+  UTF-8.
+- **HTML body.** `--html-body HTML` or `--html-body-file PATH` adds an HTML
+  version. The message is then `multipart/alternative`, with the plain-text
+  part first and the HTML part second (nested inside `multipart/mixed` when
+  there are attachments), so Gmail and other HTML-capable clients show the
+  HTML. With `--body` or `--body-file` as well, that text is the plain-text
+  part, used as given. Without either, the plain-text part is the HTML
+  converted to Markdown with the converter `gmail render` uses, so links
+  survive as `[text](url)`, leaving out a full document's `<head>`,
+  `<style>` and `<script>` content; standard input is never read in that
+  case. The
+  HTML must be UTF-8 and is sent as given, not sanitised. Inline images
+  aren't supported: HTML that refers to one with `cid:` gets a warning,
+  because nothing attaches the image and it would show as broken.
 - **Attachments.** Each `--attach PATH` becomes a base64 part of a
   `multipart/mixed` message. Its type is guessed from the file extension,
   defaulting to `application/octet-stream`.
@@ -670,6 +685,7 @@ $ omni-dev gmail draft update r-1234567890 --subject 'Quarterly report (final)'
 $ omni-dev gmail draft update r-1234567890 --cc bob@example.com --cc carol@example.com
 $ omni-dev gmail draft update r-1234567890 --body-file revised.txt --remove-attachment q3-draft.pdf \
     --attach q3.pdf
+$ omni-dev gmail draft update r-1234567890 --html-body-file revised.html
 $ omni-dev gmail draft update r-1234567890 --raw draft.eml --if-message-id 18c2f0a1b2c3d4e5
 ```
 
@@ -698,6 +714,13 @@ you didn't name.
   HTML version (and possibly inline images). That version is **dropped**,
   with a warning, rather than left contradicting the new text, since Gmail
   shows the HTML version when there is one.
+- **HTML body.** `--html-body HTML` or `--html-body-file PATH` replaces the
+  body with a `multipart/alternative` of plain text and that HTML, as in
+  `draft create`. The plain-text part is `--body`/`--body-file` when given,
+  and otherwise derived from the new HTML. It is never kept from the old
+  body, where it could say something different. Replacing a body that had
+  inline images drops them, with a warning. New HTML that refers to a
+  `cid:` image gets the same warning as in `draft create`.
 - **Attachments.** `--attach PATH` adds files after the existing
   attachments, with the same on-disk size check as `draft create`.
   `--remove-attachment NAME` removes one attachment: the one
@@ -708,7 +731,7 @@ you didn't name.
   doesn't have is an error that lists the names it does have.
 - **`--raw FILE`** replaces the whole message with an `.eml` file, uploaded
   byte for byte. `draft show --detail raw --out-file` writes such a file.
-  Use this for anything the flags can't express, such as an HTML body. It
+  Use this for anything the flags can't express, such as inline images. It
   can't be combined with the editing flags.
 - **Threads.** The draft's `threadId` is copied from the stored draft into
   every update, `--raw` included. Without it, a reply draft silently falls
