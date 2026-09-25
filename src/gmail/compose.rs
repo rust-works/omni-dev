@@ -705,6 +705,10 @@ mod tests {
         assert_eq!(parse_msg_ids("a@x b@x"), ["a@x", "b@x"]);
         assert!(parse_msg_ids("").is_empty());
         assert!(parse_msg_ids("<>").is_empty());
+        // An unclosed `<` stops the scan without panicking or looping;
+        // ids found before it are kept.
+        assert!(parse_msg_ids("<unclosed").is_empty());
+        assert_eq!(parse_msg_ids("<a@x> <unclosed"), ["a@x"]);
     }
 
     #[test]

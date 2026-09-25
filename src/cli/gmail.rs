@@ -463,6 +463,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_draft_create() {
+        let cmd = GmailSubcommands::Draft(draft::DraftCommand {
+            command: draft::DraftSubcommands::Create(draft::create::CreateCommand {
+                to: vec!["alice@example.com".to_string()],
+                cc: vec![],
+                bcc: vec![],
+                subject: Some("Report".to_string()),
+                body: Some("Hi.".to_string()),
+                body_file: None,
+                attach: vec![],
+                reply_to: None,
+                raw: None,
+                output: OutputFormat::Table,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_label_add() {
         let cmd = GmailSubcommands::Label(label::LabelCommand {
             command: label::LabelSubcommands::Add(label::add::AddCommand {

@@ -580,6 +580,67 @@ mod tests {
         assert!(body.contains(raw), "{body}");
     }
 
+    // ── CreateCommand::execute ──────────────────────────────────────
+    //
+    // These exercise `execute` itself (not just `run_create`), so a
+    // `--body`/`--raw` flag is always given: reading real stdin would make
+    // the test process- and environment-dependent.
+
+    fn create_command(raw: Option<PathBuf>, output: OutputFormat) -> CreateCommand {
+        CreateCommand {
+            to: if raw.is_some() {
+                vec![]
+            } else {
+                vec!["alice@example.com".to_string()]
+            },
+            cc: vec![],
+            bcc: vec![],
+            subject: if raw.is_some() {
+                None
+            } else {
+                Some("Report".to_string())
+            },
+            body: if raw.is_some() {
+                None
+            } else {
+                Some("Hi.".to_string())
+            },
+            body_file: None,
+            attach: vec![],
+            reply_to: None,
+            raw,
+            output,
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_raw_path_uploads_the_file_and_renders_a_table() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_create(&server, "t-raw").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.eml");
+        std::fs::write(&path, b"To: a@example.com\r\nSubject: Raw\r\n\r\nBody.\r\n").unwrap();
+
+        create_command(Some(path), OutputFormat::Table)
+            .execute(&client)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_composes_from_flags_and_renders_jsonl() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_create(&server, "t-flags").await;
+
+        create_command(None, OutputFormat::Jsonl)
+            .execute(&client)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn run_create_rejects_a_bad_recipient_before_any_request() {
         let server = wiremock::MockServer::start().await;
