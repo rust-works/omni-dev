@@ -316,6 +316,7 @@ impl StatusTracker {
 fn observe(id: &str, known: &Known) -> ObserveRequest {
     ObserveRequest {
         pid: None,
+        pid_start: None,
         agent: Agent::Codex,
         session_id: id.to_string(),
         cwd: known.cwd.clone(),

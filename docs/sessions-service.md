@@ -212,10 +212,11 @@ task. The maps are capped (512 sessions, 256 window reports); at the cap a new
 entry evicts the longest-silent one, so ingest never fails.
 
 Sessions differ from windows in one way: a session emits nothing while idle at the
-prompt, so its only liveness signal is activity. The session TTL is therefore
-generous (5 min). **A session left idle longer than that ages out and re-appears
-the moment it next does anything** — the accepted limitation of a hook-based
-tracker, since no liveness event exists. A clean `SessionEnd` removes it promptly.
+prompt, so its only liveness signal used to be activity. The session TTL is
+therefore generous (5 min), and **a session left idle longer than that ages out
+and re-appears the moment it next does anything** — this remains the behavior for
+a session with no confirmed-alive pid (see below). A clean `SessionEnd` removes a
+session promptly regardless.
 
 A resumed session is the exception to "`SessionEnd` removes it". Resuming in
 place, as a VS Code window reload does, starts a new `claude` process on the same
@@ -233,6 +234,51 @@ covers a hook command wrapped in a shell, where each hook's parent is a fresh
 shell. That keeps the rule fail-open: it can only keep a session that has since
 been taken over. A replaced pid never becomes the owner again, so a straggling
 hook from the old process cannot take the session back.
+
+#### Pid-based liveness (#1916)
+
+The 5-minute TTL exists only because a hook-fed session has no other liveness
+signal — but the pid it already reports (above) *is* one. Every `observe` that
+carries a `pid` also carries `pid_start`: an opaque, platform-specific identity
+token for that pid's start time (`/proc/<pid>/stat`'s `starttime` field on Linux;
+`ps -o lstart=` on macOS — never a parseable timestamp, only ever compared for
+equality), read at the same time as the pid itself by the hook sink and
+`claude-wrap`. Together they let the registry tell a still-running process from
+the OS having since recycled the same pid number onto something unrelated.
+
+Two checks run ahead of the ordinary TTL, from every read (`observe`/`end`/`list`
+all reap inline), for any entry that carries a `pid_start`:
+
+- **Always:** a bare `kill(pid, 0)` existence check (no subprocess). A gone
+  process ends its session immediately, through the same short ended-linger
+  window a clean `SessionEnd` uses, rather than lingering for up to 5 minutes.
+  This runs regardless of the session's age, so a crash is caught within seconds
+  even for a session that was active moments ago.
+- **Only once a session is already past the ordinary TTL,** right before it
+  would otherwise be evicted: it is exempted — kept alive indefinitely — when
+  all of the following hold, each one closing a way a live pid could still be
+  the *wrong* reason to keep the row:
+  - it has had at least one `UserPromptSubmit` (`prompted`). Otherwise a spare
+    process VS Code keeps alive that is never prompted would pin a `starting`
+    row forever just because its pid lives — the #1454-style pinning bug this
+    feature must not reintroduce;
+  - its pid is the most-recently-started session among every live entry sharing
+    that pid. `/clear` (and possibly `/resume`) can start a new `session_id` in
+    the *same* process without necessarily firing `SessionEnd` for the old one,
+    so an older `session_id` under a pid a newer one has since taken over falls
+    back to ageing out normally, even though the process itself lives on;
+  - the pid's *current* start-time token still matches the one recorded for it
+    — the recycled-pid guard `pid_start` exists for.
+
+  This is the only check that can shell out (`ps` on macOS), which is why it is
+  gated behind "already past the TTL": a session refreshed by its own hooks
+  never reaches it.
+
+A session with no `pid_start` at all — an older sink, the transcript watcher, pi,
+or an unsupported platform — gets none of this: pure pre-#1916 TTL aging, same as
+before. If either guard above ever proves insufficient in practice, the safe
+fallback is to keep only the "process gone ends promptly" half and drop the TTL
+exemption — it is strictly an improvement and cannot pin anything.
 
 ## CLI
 
