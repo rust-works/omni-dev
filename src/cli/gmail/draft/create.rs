@@ -1552,6 +1552,10 @@ mod tests {
                 ("From", "bad-from@example.com".to_string()),
                 ("To", "bad-to@example.com".to_string()),
                 ("Cc", "bad-cc@example.com".to_string()),
+                // `ReplyContext::from_message` never records a header
+                // outside From/Reply-To/To/Cc, but `consulted`'s catch-all
+                // must still never warn about one.
+                ("Bcc", "bad-bcc@example.com".to_string()),
             ],
             ..ReplyContext::default()
         };
