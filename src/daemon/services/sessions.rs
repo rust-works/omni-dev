@@ -513,6 +513,7 @@ mod tests {
         let svc = service();
         svc.registry().observe(ObserveRequest {
             pid: None,
+            pid_start: None,
             agent: crate::sessions::Agent::Claude,
             session_id: "w".to_string(),
             cwd: None,
@@ -523,6 +524,7 @@ mod tests {
         });
         svc.registry().observe(ObserveRequest {
             pid: None,
+            pid_start: None,
             agent: crate::sessions::Agent::Claude,
             session_id: "p".to_string(),
             cwd: None,
@@ -554,6 +556,8 @@ mod tests {
         let now = chrono::Utc::now();
         let base = |source: Source| SessionEntry {
             pid: None,
+            pid_start: None,
+            prompted: false,
             replaced_pids: VecDeque::new(),
             agent: crate::sessions::Agent::Claude,
             session_id: "sid-12345678".to_string(),
@@ -605,6 +609,8 @@ mod tests {
         let now = chrono::Utc::now();
         SessionEntry {
             pid: None,
+            pid_start: None,
+            prompted: false,
             replaced_pids: VecDeque::new(),
             agent: crate::sessions::Agent::Claude,
             session_id: id.to_string(),
@@ -727,6 +733,7 @@ mod tests {
     fn observe_req(id: &str, event: SessionEvent, cwd: Option<&str>) -> ObserveRequest {
         ObserveRequest {
             pid: None,
+            pid_start: None,
             agent: crate::sessions::Agent::Claude,
             session_id: id.to_string(),
             cwd: cwd.map(PathBuf::from),

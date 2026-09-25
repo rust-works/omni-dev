@@ -259,6 +259,7 @@ impl Action {
                 transcript_path,
             } => registry.observe(ObserveRequest {
                 pid: None,
+                pid_start: None,
                 agent: Agent::Codex,
                 session_id: id,
                 cwd,
