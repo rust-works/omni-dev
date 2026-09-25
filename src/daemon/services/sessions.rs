@@ -96,6 +96,7 @@ impl SessionsService {
         let handles = vec![
             crate::sessions::watcher::spawn(self.registry.clone(), token.clone()),
             crate::sessions::codex_watcher::spawn(self.registry.clone(), token.clone()),
+            crate::sessions::pid_watcher::spawn(self.registry.clone(), token.clone()),
         ];
         *guard = Some(WatcherTask { token, handles });
     }
@@ -513,7 +514,6 @@ mod tests {
         let svc = service();
         svc.registry().observe(ObserveRequest {
             pid: None,
-            pid_start: None,
             agent: crate::sessions::Agent::Claude,
             session_id: "w".to_string(),
             cwd: None,
@@ -524,7 +524,6 @@ mod tests {
         });
         svc.registry().observe(ObserveRequest {
             pid: None,
-            pid_start: None,
             agent: crate::sessions::Agent::Claude,
             session_id: "p".to_string(),
             cwd: None,
@@ -733,7 +732,6 @@ mod tests {
     fn observe_req(id: &str, event: SessionEvent, cwd: Option<&str>) -> ObserveRequest {
         ObserveRequest {
             pid: None,
-            pid_start: None,
             agent: crate::sessions::Agent::Claude,
             session_id: id.to_string(),
             cwd: cwd.map(PathBuf::from),

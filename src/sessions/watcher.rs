@@ -70,7 +70,6 @@ impl Sighting {
     fn into_observe(self) -> ObserveRequest {
         ObserveRequest {
             pid: None,
-            pid_start: None,
             agent: crate::sessions::Agent::Claude,
             session_id: self.session_id,
             cwd: None,

@@ -196,10 +196,6 @@ where
         .take()
         .ok_or_else(|| anyhow!("failed to capture the wrapped process's stdout"))?;
     let child_pid = child.id();
-    // Read once: the child's start-time identity token (#1916) never changes
-    // for the life of this process, so there is no need to re-read it on every
-    // report the way the pid itself is threaded through unchanged already.
-    let child_pid_start = child_pid.and_then(crate::sessions::pid_liveness::process_start_token);
 
     let (tee, lines) = mpsc::channel::<(Direction, String)>(TEE_CAPACITY);
     let (title_tx, title_rx) = watch::channel::<Option<String>>(None);
@@ -209,7 +205,6 @@ where
         KEEPALIVE_INTERVAL,
         title_tx,
         child_pid,
-        child_pid_start,
     ));
     let signals = tokio::spawn(forward_signals(child_pid));
 
@@ -601,16 +596,15 @@ fn tee_chunk(
 /// waiting out the real [`KEEPALIVE_INTERVAL`]. `child_pid` is the wrapped
 /// `claude`, sent on every report — the same pid its hooks send — so the `end`
 /// this wrapper sends when an in-place resume has already replaced its child
-/// cannot end the resumed session (#1948). `child_pid_start` is that pid's
-/// start-time identity token, read once up front and sent on every `observe`
-/// report alongside it (#1916); never on `end`, which has no use for it.
+/// cannot end the resumed session (#1948). It is also the seed for pid-based
+/// liveness (#1916), whose identity-token reading is entirely the daemon's own
+/// [`pid_watcher`](crate::sessions::pid_watcher) work, never this wrapper's.
 async fn observe(
     mut lines: mpsc::Receiver<(Direction, String)>,
     socket: Option<PathBuf>,
     every: Duration,
     title_tx: watch::Sender<Option<String>>,
     child_pid: Option<u32>,
-    child_pid_start: Option<String>,
 ) {
     let Ok(socket) = server::resolve_socket(socket) else {
         return;
@@ -641,7 +635,6 @@ async fn observe(
         }
         if let Some(mut request) = observed {
             request.pid = child_pid;
-            request.pid_start = child_pid_start.clone();
             if let Ok(payload) = serde_json::to_value(request) {
                 report(&socket, "observe", payload).await;
             }
@@ -953,7 +946,6 @@ mod tests {
             Duration::from_millis(20),
             title_tx,
             Some(4242),
-            Some("token-4242".to_string()),
         ));
         tee.send((
             Direction::FromClaude,
@@ -974,14 +966,10 @@ mod tests {
             assert_eq!(envelope["payload"]["event"]["stream_state"], "idle");
             // The wrapped child's pid, so a resume can tell it apart (#1948).
             assert_eq!(envelope["payload"]["pid"], 4242);
-            // Its start-time identity token, read once up front (#1916).
-            assert_eq!(envelope["payload"]["pid_start"], "token-4242");
         }
         let end = envelopes.last().unwrap();
         assert_eq!(end["op"], "end");
         assert_eq!(end["payload"]["pid"], 4242);
-        // `end` never carries `pid_start` — the registry's `end` has no use for it.
-        assert!(end["payload"].get("pid_start").is_none());
     }
 
     #[tokio::test]

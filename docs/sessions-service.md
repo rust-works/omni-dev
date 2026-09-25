@@ -215,8 +215,8 @@ Sessions differ from windows in one way: a session emits nothing while idle at t
 prompt, so its only liveness signal used to be activity. The session TTL is
 therefore generous (5 min), and **a session left idle longer than that ages out
 and re-appears the moment it next does anything** — this remains the behavior for
-a session with no confirmed-alive pid (see below). A clean `SessionEnd` removes a
-session promptly regardless.
+a session the [pid liveness watcher](#pid-based-liveness-1916) below cannot vouch
+for. A clean `SessionEnd` removes a session promptly regardless.
 
 A resumed session is the exception to "`SessionEnd` removes it". Resuming in
 place, as a VS Code window reload does, starts a new `claude` process on the same
@@ -238,47 +238,73 @@ hook from the old process cannot take the session back.
 #### Pid-based liveness (#1916)
 
 The 5-minute TTL exists only because a hook-fed session has no other liveness
-signal — but the pid it already reports (above) *is* one. Every `observe` that
-carries a `pid` also carries `pid_start`: an opaque, platform-specific identity
-token for that pid's start time (`/proc/<pid>/stat`'s `starttime` field on Linux;
-`ps -o lstart=` on macOS — never a parseable timestamp, only ever compared for
-equality), read at the same time as the pid itself by the hook sink and
-`claude-wrap`. Together they let the registry tell a still-running process from
-the OS having since recycled the same pid number onto something unrelated.
+signal — but the pid it already reports (above) *is* one. A dedicated
+**pid liveness watcher**, an engine-owned background task alongside the
+transcript and Codex rollout watchers, polls every pid-bearing session every
+10 seconds and applies two decisions through the registry's ordinary `end` and
+a new `confirm_pid_liveness`:
 
-Two checks run ahead of the ordinary TTL, from every read (`observe`/`end`/`list`
-all reap inline), for any entry that carries a `pid_start`:
+- **A pid this watcher once confirmed alive is now gone:** end the session
+  immediately, through the same short ended-linger window a clean `SessionEnd`
+  uses, instead of lingering for up to 5 minutes.
+- **A pid is alive, its identity is confirmed, the session has had at least one
+  `UserPromptSubmit`, and it is the most recently started `session_id` among
+  every candidate sharing that pid:** refresh `last_seen`, which is all it
+  takes to keep the ordinary TTL reap from ever seeing the entry go stale.
 
-- **Always:** a bare `kill(pid, 0)` existence check (no subprocess). A gone
-  process ends its session immediately, through the same short ended-linger
-  window a clean `SessionEnd` uses, rather than lingering for up to 5 minutes.
-  This runs regardless of the session's age, so a crash is caught within seconds
-  even for a session that was active moments ago.
-- **Only once a session is already past the ordinary TTL,** right before it
-  would otherwise be evicted: it is exempted — kept alive indefinitely — when
-  all of the following hold, each one closing a way a live pid could still be
-  the *wrong* reason to keep the row:
-  - it has had at least one `UserPromptSubmit` (`prompted`). Otherwise a spare
-    process VS Code keeps alive that is never prompted would pin a `starting`
-    row forever just because its pid lives — the #1454-style pinning bug this
-    feature must not reintroduce;
-  - its pid is the most-recently-started session among every live entry sharing
-    that pid. `/clear` (and possibly `/resume`) can start a new `session_id` in
-    the *same* process without necessarily firing `SessionEnd` for the old one,
-    so an older `session_id` under a pid a newer one has since taken over falls
-    back to ageing out normally, even though the process itself lives on;
-  - the pid's *current* start-time token still matches the one recorded for it
-    — the recycled-pid guard `pid_start` exists for.
+The two extra conditions on the second bullet close two ways a live pid could
+still be the *wrong* reason to keep a row:
 
-  This is the only check that can shell out (`ps` on macOS), which is why it is
-  gated behind "already past the TTL": a session refreshed by its own hooks
-  never reaches it.
+- **Prompted.** Otherwise a spare process VS Code keeps alive that is never
+  prompted would pin a `starting` row forever just because its pid lives — the
+  #1454-style pinning bug this feature must not reintroduce.
+- **Most recently started under the pid.** `/clear` (and possibly `/resume`)
+  can start a new `session_id` in the *same* process without necessarily
+  firing `SessionEnd` for the old one, so an older `session_id` a newer one has
+  since taken over falls back to ageing out normally, even though the process
+  itself lives on.
 
-A session with no `pid_start` at all — an older sink, the transcript watcher, pi,
-or an unsupported platform — gets none of this: pure pre-#1916 TTL aging, same as
-before. If either guard above ever proves insufficient in practice, the safe
-fallback is to keep only the "process gone ends promptly" half and drop the TTL
-exemption — it is strictly an improvement and cannot pin anything.
+**Why a watcher, not an inline check.** An earlier version of this feature
+checked pid liveness inline, in the same `reap_sessions` every `observe`/
+`end`/`list` calls under the registry's lock. Review caught two problems with
+that: the check can shell out (`ps` on macOS) and once a session is exempted it
+never goes stale, so it would run *forever*, on every read, while holding the
+lock — on a tokio worker thread and on the tray's macOS main thread. Polling
+independently, off that lock, on its own schedule, fixes both: `reap_sessions`
+stays pure TTL-only CPU work, and the daemon's other request handling is never
+blocked by a pid check.
+
+**Why the pid must be independently confirmed alive before its death is ever
+trusted.** #1948 allows for a hook command wrapped in a shell, whose parent —
+the pid a hook reports — is a fresh shell that exits within milliseconds of
+the hook finishing. Trusting a bare "is `pid` gone right now" reading would end
+such a session after every hook. Instead the watcher remembers, across polls,
+which pids it has *itself* seen alive; a pid it never catches alive (near
+guaranteed for a shell living only milliseconds, against a 10-second poll)
+never triggers an end — it simply never enters pid-based liveness at all, and
+the session ages out on the ordinary TTL exactly as before this feature
+existed. A real `claude`/`codex` process, alive for the session's whole
+lifetime, is caught alive on the watcher's very first poll.
+
+**Why the identity token is never sent by the hook sink or `claude-wrap`.** The
+token is an opaque, platform-specific string for a pid's start time
+(`/proc/<pid>/stat`'s `starttime` field on Linux; `ps -o lstart=` on macOS —
+never a parseable timestamp, only ever compared for equality), which
+distinguishes a still-running process from the OS having recycled the same pid
+number onto something unrelated. An earlier version had the hook sink and
+`claude-wrap` read and send it. Review found two problems: reading it costs a
+`ps` fork on macOS, adding latency to every hook against the sink's "never
+blocks a turn" contract, and `ps -o lstart=` is locale/timezone dependent, so a
+token read in the client's environment would almost never equal one read later
+in the daemon's minimal service-manager environment — silently defeating the
+whole feature. The watcher reads a pid's token itself instead, always in the
+daemon's own environment, both when it first captures one and every time it
+later compares one — so a client sends nothing but the bare `pid` it already
+sent for #1948, and every comparison is apples to apples.
+
+A session with no pid at all — an older sink, the transcript watcher, pi, or an
+unsupported platform — gets none of this: pure pre-#1916 TTL aging, same as
+before.
 
 ## CLI
 

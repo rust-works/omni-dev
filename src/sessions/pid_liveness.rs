@@ -1,16 +1,23 @@
 //! Cross-platform process-identity checks backing the pid-based liveness
-//! exemption (#1916): whether a pid is still running, and an opaque per-process
+//! watcher (#1916): whether a pid is still running, and an opaque per-process
 //! identity token used to tell the original process from an unrelated one the
 //! OS has since recycled the same pid number onto.
+//!
+//! Both are called **only** from [`super::pid_watcher`], never from the hook
+//! sink or `claude-wrap`: those clients send nothing but a bare `pid` (#1948),
+//! and the daemon — the one process that will ever need to compare a token
+//! against a later reading — is also the only one that ever reads one. That
+//! keeps every reading in one environment (the daemon's own, under whatever
+//! service manager started it), so nothing about the *caller's* locale, `TZ`,
+//! or shell ever enters into it.
 //!
 //! Two independent axes of platform support, each with a safe, inert fallback:
 //! [`process_exists`] needs only `kill(pid, 0)`, available on any unix (`nix`'s
 //! `signal` feature); [`process_start_token`] has no portable equivalent, so it
-//! is implemented per `target_os` and returns `None` elsewhere. A `None`/`false`
-//! result never triggers the "definitely gone" path in [`super::reap_sessions`]
-//! — it only ever fails closed on the *exemption* half, falling back to the
-//! ordinary TTL, so an unsupported platform behaves exactly as it did before
-//! this module existed.
+//! is implemented per `target_os` and returns `None` elsewhere. A pid the
+//! watcher can only confirm as "cannot tell" (rather than "definitely gone" or
+//! "definitely still this process") never causes an end or an exemption — see
+//! [`super::pid_watcher`]'s `plan` for how each is used.
 
 /// Whether a process with this pid currently exists.
 ///
@@ -37,23 +44,12 @@ pub(crate) fn process_exists(_pid: u32) -> bool {
     true
 }
 
-/// Whether `pid` is confirmed to be the same process `expected_start` was
-/// captured from — the guard against a recycled pid being mistaken for the
-/// session that used to own it. `false` whenever either side is unknown: this
-/// only ever *grants* a TTL exemption, so "cannot confirm" must fail closed.
-pub(crate) fn confirm_alive(pid: Option<u32>, expected_start: Option<&str>) -> bool {
-    let (Some(pid), Some(expected)) = (pid, expected_start) else {
-        return false;
-    };
-    process_start_token(pid).as_deref() == Some(expected)
-}
-
 /// Reads an opaque identity token for `pid`'s start time, or `None` when it
 /// cannot be determined (no such pid, a read error, or an unsupported
 /// platform). This is **never** a parseable timestamp — only ever compared for
-/// equality against a token captured earlier for the same pid — so the two
-/// platform implementations are free to use whatever native representation is
-/// cheapest.
+/// equality against a token read earlier for the same pid, always by this same
+/// process — so the two platform implementations are free to use whatever
+/// native representation is cheapest.
 #[cfg(target_os = "linux")]
 pub(crate) fn process_start_token(pid: u32) -> Option<String> {
     // `/proc/<pid>/stat` field 22 (`starttime`, in clock ticks since boot) is a
@@ -75,11 +71,17 @@ pub(crate) fn process_start_token(pid: u32) -> Option<String> {
 /// reasoning applies here too: a subprocess needs no ADR, new `unsafe`, or new
 /// dependency). `lstart` is the full start timestamp string; kept as an opaque
 /// string rather than parsed, since only equality against a later reading
-/// matters. Tolerant of a dead pid producing a diagnostic line instead of data
-/// (checked by emptiness, not exit status, matching `app_pids_via_ps`).
+/// matters. `LC_ALL=C`/`TZ=UTC` pin the format regardless of the *daemon's*
+/// ambient locale/timezone — moot for two readings from the same environment,
+/// but a cheap, deterministic belt-and-suspenders since a service manager's
+/// environment can change across a restart. Tolerant of a dead pid producing a
+/// diagnostic line instead of data (checked by emptiness, not exit status,
+/// matching `app_pids_via_ps`).
 #[cfg(target_os = "macos")]
 pub(crate) fn process_start_token(pid: u32) -> Option<String> {
     let output = std::process::Command::new("/bin/ps")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .output()
         .ok()?;
@@ -133,21 +135,5 @@ mod tests {
         let pid = child.id();
         child.wait().expect("wait for `true`");
         assert_eq!(process_start_token(pid), None);
-    }
-
-    #[test]
-    fn confirm_alive_requires_both_sides_known() {
-        let pid = std::process::id();
-        assert!(!confirm_alive(None, Some("whatever")));
-        assert!(!confirm_alive(Some(pid), None));
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn confirm_alive_matches_this_process_and_rejects_a_forged_token() {
-        let pid = std::process::id();
-        let token = process_start_token(pid).expect("a token for this running process");
-        assert!(confirm_alive(Some(pid), Some(&token)));
-        assert!(!confirm_alive(Some(pid), Some("not-the-real-token")));
     }
 }

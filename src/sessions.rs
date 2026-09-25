@@ -54,6 +54,7 @@ use tokio::sync::watch;
 pub mod codex_app_server;
 pub mod codex_watcher;
 pub(crate) mod pid_liveness;
+pub(crate) mod pid_watcher;
 pub mod relocate;
 pub mod stream;
 pub mod watcher;
@@ -68,12 +69,14 @@ pub mod watcher;
 /// long is assumed gone (a `claude` that exited without firing `SessionEnd`)
 /// and reaped on the next read.
 ///
-/// Since #1916, a session whose hook reported the owning process's pid is no
-/// longer bound by this TTL while that pid is confirmed alive (see
-/// [`reap_sessions`]) — this is now a fallback for sessions with no pid
-/// (older hooks, the transcript watcher, pi.dev) or whose pid can't be
-/// confirmed (an unprompted spare process, or one an in-place `/clear`/resume
-/// has since superseded). A still-alive idle session bound by this TTL
+/// Since #1916, a session whose pid the [`pid_watcher`] has
+/// independently confirmed alive is kept out of this TTL's reach entirely: the
+/// watcher refreshes `last_seen` itself on a schedule of its own, off this
+/// lock, so `reap_sessions` never needs to know about pids at all. This TTL is
+/// now the fallback for a session with no pid (older hooks, the transcript
+/// watcher, pi.dev), one the watcher has not yet confirmed, or whose pid it
+/// can't confirm (an unprompted spare process, or one another `session_id`
+/// has since taken over). A still-alive idle session bound by this TTL
 /// re-appears the moment it next does anything. See ADR-0052.
 const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(300);
 
@@ -376,16 +379,13 @@ pub struct ObserveRequest {
     /// `claude-wrap`'s wrapped child. Tells a resumed session's new process
     /// from the old one it replaced, which share a `session_id` (#1948). Every
     /// other feed (the watchers, the Codex app-server, pi.dev) sends `None`.
+    ///
+    /// This is also the seed for pid-based liveness (#1916): the
+    /// [`pid_watcher`] independently probes every pid it sees here, off this
+    /// wire and off the registry lock, rather than trusting a client-supplied
+    /// process identity — see [`SessionEntry::pid_start`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
-    /// An opaque identity token for `pid`'s start time, when known (from the
-    /// same sighting's [`pid_liveness::process_start_token`]) — never a
-    /// parseable timestamp, only ever compared for equality. Lets the registry
-    /// tell `pid` genuinely still being this session's process from the OS
-    /// having since recycled the same pid number onto something else (#1916).
-    /// Sent alongside `pid` by the hook sink and `claude-wrap` only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pid_start: Option<String>,
 }
 
 /// A companion report of one VS Code window's embedded Claude sessions.
@@ -457,9 +457,13 @@ pub struct SessionEntry {
     /// pid-bearing sighting that did not come from a replaced process.
     #[serde(skip)]
     pub(crate) pid: Option<u32>,
-    /// `pid`'s start-time identity token, moved in lockstep with `pid` (#1916).
-    /// `None` when `pid` is `None`, or when the sighting that set `pid` could
-    /// not determine one.
+    /// `pid`'s start-time identity token (#1916), **set only by the
+    /// [`pid_watcher`]**, never from a client-supplied value: it is captured
+    /// the first time the watcher independently confirms `pid` alive, and
+    /// reset to `None` whenever `pid` changes owner (a new pid's identity is
+    /// unconfirmed until the watcher next probes it). `None` until then, so a
+    /// pid the watcher has not yet gotten to on its own schedule simply has no
+    /// opinion on liveness rather than a stale or spoofable one.
     #[serde(skip)]
     pub(crate) pid_start: Option<String>,
     /// Whether this session has had at least one `UserPromptSubmit`. Gates the
@@ -473,6 +477,21 @@ pub struct SessionEntry {
     /// `end` from one of them is ignored (#1948).
     #[serde(skip)]
     pub(crate) replaced_pids: VecDeque<u32>,
+}
+
+/// One pid-bearing session, as [`SessionsRegistry::pid_liveness_candidates`]
+/// hands it to the [`pid_watcher`](pid_watcher) — a plain data snapshot with no
+/// lock and no process handle attached, so the watcher can probe it entirely
+/// off the registry lock.
+#[derive(Debug, Clone)]
+pub(crate) struct PidCandidate {
+    pub(crate) session_id: String,
+    pub(crate) pid: u32,
+    /// The identity token last confirmed for `pid`, if any (see
+    /// [`SessionEntry::pid_start`]).
+    pub(crate) pid_start: Option<String>,
+    pub(crate) prompted: bool,
+    pub(crate) started_at: DateTime<Utc>,
 }
 
 /// One companion window-embedding report, with its liveness stamp.
@@ -615,7 +634,7 @@ impl SessionsRegistry {
                     false
                 }
                 Some(entry) => {
-                    track_pid(entry, req.pid, req.pid_start.clone());
+                    track_pid(entry, req.pid);
                     entry.prompted |= req.event == SessionEvent::UserPromptSubmit;
                     let next = SessionState::for_event(&req.event, Some(entry.state));
                     let state_changed = next != entry.state;
@@ -651,7 +670,7 @@ impl SessionsRegistry {
                             started_at: now,
                             last_seen: now,
                             pid: req.pid,
-                            pid_start: req.pid_start,
+                            pid_start: None,
                             prompted,
                             replaced_pids: VecDeque::new(),
                         },
@@ -710,6 +729,51 @@ impl SessionsRegistry {
             self.bump();
         }
         known
+    }
+
+    /// A cheap, lock-scoped snapshot for the [`pid_watcher`](pid_watcher): one
+    /// [`PidCandidate`] per live, non-`ended` session that carries a pid — the
+    /// watcher does every I/O-bearing liveness check off this lock, on its own
+    /// schedule, so this method itself touches no process and does no I/O.
+    pub(crate) fn pid_liveness_candidates(&self) -> Vec<PidCandidate> {
+        self.lock_sessions()
+            .values()
+            .filter(|e| e.state != SessionState::Ended)
+            .filter_map(|e| {
+                Some(PidCandidate {
+                    session_id: e.session_id.clone(),
+                    pid: e.pid?,
+                    pid_start: e.pid_start.clone(),
+                    prompted: e.prompted,
+                    started_at: e.started_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Records that the [`pid_watcher`](pid_watcher) has independently
+    /// confirmed `session_id`'s pid alive: refreshes `last_seen` so
+    /// [`reap_sessions`] never sees it go stale, and captures `pid_start` when
+    /// the entry does not already have one (the watcher's first confirmation of
+    /// a given owner pid). A no-op for an unknown or already-`ended` session —
+    /// the watcher's snapshot can be one tick stale by the time it applies a
+    /// decision. Never bumps: this only refreshes fields nothing renders,
+    /// exactly like a window's unchanged heartbeat refresh.
+    pub(crate) fn confirm_pid_liveness(
+        &self,
+        session_id: &str,
+        now: DateTime<Utc>,
+        pid_start: &str,
+    ) {
+        let mut sessions = self.lock_sessions();
+        if let Some(entry) = sessions.get_mut(session_id) {
+            if entry.state != SessionState::Ended {
+                entry.last_seen = now;
+                if entry.pid_start.is_none() {
+                    entry.pid_start = Some(pid_start.to_string());
+                }
+            }
+        }
     }
 
     /// Records (upserts) a companion window-embedding report and refreshes its
@@ -842,14 +906,20 @@ impl Default for SessionsRegistry {
 /// never becomes the owner again, so a straggling hook from the old process
 /// cannot take the session back. Not a rendered field, so it never decides a
 /// [`bump`](SessionsRegistry::bump).
-fn track_pid(entry: &mut SessionEntry, pid: Option<u32>, pid_start: Option<String>) {
+///
+/// `observe` already filters out a sighting whose pid is in `replaced_pids`
+/// before calling this, so the only two cases reaching here are the current
+/// owner (a no-op) and a genuinely new one.
+///
+/// A new owner's `pid_start` (#1916) resets to `None`: the previous owner's
+/// token describes a different process, and the [`pid_watcher`] captures the
+/// new owner's own token independently the next time it confirms this pid
+/// alive, rather than trusting anything client-supplied.
+fn track_pid(entry: &mut SessionEntry, pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
     };
-    if entry.pid == Some(pid) || entry.replaced_pids.contains(&pid) {
-        // Same owner: a later sighting may succeed at reading a start-time
-        // token where an earlier one for the same still-running pid failed.
-        fill(&mut entry.pid_start, pid_start);
+    if entry.pid == Some(pid) {
         return;
     }
     if let Some(owner) = entry.pid.replace(pid) {
@@ -858,7 +928,7 @@ fn track_pid(entry: &mut SessionEntry, pid: Option<u32>, pid_start: Option<Strin
         }
         entry.replaced_pids.push_back(owner);
     }
-    entry.pid_start = pid_start;
+    entry.pid_start = None;
 }
 
 /// Fills `slot` from `incoming` only when `incoming` carries a value, so a
@@ -900,36 +970,15 @@ fn resolve_source(cwd: Option<&Path>, windows: &[WindowReport]) -> Source {
 
 /// Removes sessions last seen longer than their TTL ago (a shorter
 /// [`ended_ttl`](SessionsRegistry::ended_ttl) for `ended` sessions), returning
-/// how many were dropped. Pure CPU except for the two pid checks below, which
-/// are `kill(pid, 0)` (no subprocess) and, rarely, a `ps` subprocess on macOS;
-/// the caller holds the sessions lock but never `.await`s under it, same as
-/// every other lock-scoped call here.
+/// how many were dropped. Pure CPU; the caller holds the sessions lock but never
+/// `.await`s under it.
 ///
-/// Two pid-liveness passes run first (#1916), ahead of the ordinary age check,
-/// so they apply uniformly from every call site (`observe`/`end`/`list`). Both
-/// require the entry to carry a `pid_start` token, not just a `pid`: every real
-/// sighting that reports a pid reads its start-time token in the same breath,
-/// so in practice this is the single opt-in signal for whether an entry
-/// participates in pid-based liveness at all, excluding only an unsupported
-/// platform or a feed that never populates it — which then gets exactly the
-/// pre-#1916 TTL-only behavior.
-///
-/// 1. **Always**, for every non-`ended` such entry: a bare
-///    [`pid_liveness::process_exists`] check. A gone process ends its session
-///    immediately, riding the same short `ended_ttl` linger a clean
-///    `SessionEnd` uses, rather than waiting out the full `session_ttl`. This
-///    runs regardless of age so a crash is caught within the linger window
-///    even for a session that was active moments ago.
-/// 2. **Only** for a non-`ended` entry already past `session_ttl`, right
-///    before it would otherwise be evicted: it survives when it is `prompted`,
-///    its pid is the most-recently-started session among every live entry
-///    sharing that pid (so an old `session_id` a `/clear`-style in-place
-///    restart has superseded falls back to ageing out normally, even though
-///    the process itself is still running), and
-///    [`pid_liveness::confirm_alive`] confirms the process is still the one
-///    the stored `pid_start` token was captured from. Gating this — the one
-///    check that can shell out — behind "already past the TTL" keeps it rare:
-///    a session refreshed by its own hooks never reaches this branch.
+/// This TTL is the fallback for a session the [`pid_watcher`] cannot vouch for
+/// (no pid, an unconfirmed pid, or one that has never been prompted) — see
+/// [`DEFAULT_SESSION_TTL`]. A pid the watcher has confirmed alive keeps this
+/// function from ever seeing the entry go stale by refreshing `last_seen`
+/// itself, so no pid-specific logic belongs here: every liveness decision that
+/// needs to inspect a process happens off this lock, in the watcher.
 fn reap_sessions(
     sessions: &mut HashMap<String, SessionEntry>,
     session_ttl: Duration,
@@ -939,58 +988,15 @@ fn reap_sessions(
     let session_max = session_ttl.as_secs() as i64;
     let ended_max = ended_ttl.as_secs() as i64;
     let before = sessions.len();
-
-    // Counted separately from the removals below: this mutates an entry's
-    // `state` in place rather than removing it (it still lingers for
-    // `ended_ttl`), so it needs its own tally to reach the caller's bump
-    // decision, which otherwise only sees removals.
-    let mut newly_ended = 0usize;
-    for entry in sessions.values_mut() {
-        // Gated on `pid_start` being known, not just `pid`: this is the single
-        // opt-in signal for whether an entry participates in pid-based
-        // liveness at all (#1916). Every real sighting that sends a `pid` also
-        // sends `pid_start` from the same read, so in practice this only ever
-        // excludes an unsupported platform (no start-time reading) or a feed
-        // that never populates it — which then gets exactly the pre-#1916
-        // TTL-only behavior, never a liveness-based end.
-        if entry.state != SessionState::Ended && entry.pid_start.is_some() {
-            if let Some(pid) = entry.pid {
-                if !pid_liveness::process_exists(pid) {
-                    entry.state = SessionState::Ended;
-                    entry.last_event = SessionEvent::Stop;
-                    entry.last_seen = now;
-                    newly_ended += 1;
-                }
-            }
-        }
-    }
-
-    let mut newest_per_pid: HashMap<u32, DateTime<Utc>> = HashMap::new();
-    for entry in sessions.values() {
-        if let Some(pid) = entry.pid {
-            newest_per_pid
-                .entry(pid)
-                .and_modify(|started| *started = (*started).max(entry.started_at))
-                .or_insert(entry.started_at);
-        }
-    }
-
     sessions.retain(|_, e| {
         let max_age = if e.state == SessionState::Ended {
             ended_max
         } else {
             session_max
         };
-        if (now - e.last_seen).num_seconds() <= max_age {
-            return true;
-        }
-        e.state != SessionState::Ended
-            && e.prompted
-            && e.pid
-                .is_some_and(|pid| newest_per_pid.get(&pid) == Some(&e.started_at))
-            && pid_liveness::confirm_alive(e.pid, e.pid_start.as_deref())
+        (now - e.last_seen).num_seconds() <= max_age
     });
-    (before - sessions.len()) + newly_ended
+    before - sessions.len()
 }
 
 /// Removes window-embedding reports last refreshed longer than `ttl` ago.
@@ -1042,7 +1048,6 @@ mod tests {
     fn observe_request(session_id: &str, event: SessionEvent, cwd: Option<&str>) -> ObserveRequest {
         ObserveRequest {
             pid: None,
-            pid_start: None,
             agent: Agent::Claude,
             session_id: session_id.to_string(),
             cwd: cwd.map(PathBuf::from),
@@ -1191,6 +1196,76 @@ mod tests {
             guard.get_mut("s1").unwrap().last_seen = Utc::now() - chrono::Duration::seconds(30);
         }
         assert!(reg.list().is_empty(), "ended entry reaps after ended TTL");
+    }
+
+    // --- pid-based liveness (#1916): the registry side the pid_watcher drives ---
+
+    #[test]
+    fn pid_liveness_candidates_lists_only_non_ended_pid_bearing_sessions() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_from(
+            "with_pid",
+            SessionEvent::UserPromptSubmit,
+            100,
+        ));
+        reg.observe(observe_request(
+            "no_pid",
+            SessionEvent::UserPromptSubmit,
+            None,
+        ));
+        reg.observe(observe_from("ended", SessionEvent::UserPromptSubmit, 200));
+        reg.end("ended", None, Some(200));
+
+        let candidates = reg.pid_liveness_candidates();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, "with_pid");
+        assert_eq!(candidates[0].pid, 100);
+        assert!(candidates[0].prompted);
+        assert_eq!(candidates[0].pid_start, None);
+    }
+
+    #[test]
+    fn confirm_pid_liveness_refreshes_last_seen_and_captures_the_token_once() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_from("s1", SessionEvent::UserPromptSubmit, 100));
+        let old = Utc::now() - chrono::Duration::seconds(1000);
+        {
+            let mut guard = reg.lock_sessions();
+            guard.get_mut("s1").unwrap().last_seen = old;
+        }
+
+        reg.confirm_pid_liveness("s1", Utc::now(), "tok-1");
+        {
+            let guard = reg.lock_sessions();
+            let entry = &guard["s1"];
+            assert!(entry.last_seen > old, "last_seen should be refreshed");
+            assert_eq!(entry.pid_start.as_deref(), Some("tok-1"));
+        }
+
+        // A later confirmation does not overwrite an already-captured token —
+        // it is fixed at the pid's first independently-confirmed sighting.
+        reg.confirm_pid_liveness("s1", Utc::now(), "tok-2");
+        assert_eq!(
+            reg.lock_sessions()["s1"].pid_start.as_deref(),
+            Some("tok-1")
+        );
+    }
+
+    #[test]
+    fn confirm_pid_liveness_is_a_noop_for_an_unknown_or_ended_session() {
+        let reg = SessionsRegistry::new();
+        // Unknown session: no panic.
+        reg.confirm_pid_liveness("ghost", Utc::now(), "tok");
+
+        reg.observe(observe_from("s1", SessionEvent::UserPromptSubmit, 100));
+        reg.end("s1", None, Some(100));
+        let before = reg.lock_sessions()["s1"].last_seen;
+        reg.confirm_pid_liveness("s1", Utc::now(), "tok");
+        assert_eq!(
+            reg.lock_sessions()["s1"].last_seen,
+            before,
+            "an ended session must not be revived by a liveness confirmation"
+        );
     }
 
     #[test]
@@ -1376,7 +1451,6 @@ mod tests {
         for (id, repo) in [("z", "repo-a"), ("a", "repo-b"), ("m", "repo-a")] {
             reg.observe(ObserveRequest {
                 pid: None,
-                pid_start: None,
                 agent: Agent::Claude,
                 session_id: id.to_string(),
                 cwd: None,
@@ -1408,7 +1482,6 @@ mod tests {
         let reg = SessionsRegistry::new();
         reg.observe(ObserveRequest {
             pid: None,
-            pid_start: None,
             agent: Agent::Claude,
             session_id: "s1".to_string(),
             cwd: Some(PathBuf::from("/p")),
@@ -2012,160 +2085,6 @@ mod tests {
         assert!(reg.end("s1", None, Some(100)));
         reg.observe(observe_from("s1", SessionEvent::SessionStart, 200));
         assert_eq!(reg.list()[0].state, SessionState::Starting);
-    }
-
-    // --- pid-based liveness (#1916) -------------------------------------------
-
-    /// A hook-shaped sighting carrying both `pid` and its start-time token.
-    fn observe_with_pid_start(
-        session_id: &str,
-        event: SessionEvent,
-        pid: u32,
-        pid_start: Option<&str>,
-    ) -> ObserveRequest {
-        ObserveRequest {
-            pid: Some(pid),
-            pid_start: pid_start.map(str::to_string),
-            ..observe_request(session_id, event, None)
-        }
-    }
-
-    /// Backdates a session's `last_seen` (and optionally `started_at`) past
-    /// [`DEFAULT_SESSION_TTL`], directly in the registry's map — the same
-    /// technique [`stale_working_session_reaps_but_recent_survives`] uses.
-    fn backdate(reg: &SessionsRegistry, session_id: &str, seconds_ago: i64) {
-        let mut guard = reg.lock_sessions();
-        let entry = guard.get_mut(session_id).unwrap();
-        let then = Utc::now() - chrono::Duration::seconds(seconds_ago);
-        entry.last_seen = then;
-        entry.started_at = then;
-    }
-
-    #[test]
-    fn a_confirmed_alive_prompted_session_survives_past_the_ttl() {
-        let reg = SessionsRegistry::new();
-        let pid = std::process::id();
-        let token = pid_liveness::process_start_token(pid);
-        reg.observe(observe_with_pid_start(
-            "s1",
-            SessionEvent::UserPromptSubmit,
-            pid,
-            token.as_deref(),
-        ));
-        reg.observe(observe_from("s1", SessionEvent::Stop, pid));
-        backdate(&reg, "s1", 1000);
-        let ids: Vec<String> = reg.list().into_iter().map(|s| s.session_id).collect();
-        assert_eq!(
-            ids,
-            vec!["s1".to_string()],
-            "a live, confirmed, prompted session must not age out"
-        );
-    }
-
-    #[test]
-    fn an_unprompted_session_still_ages_out_even_with_a_live_confirmed_pid() {
-        // The #1454-style pinning guard: a spare process VS Code keeps alive
-        // that has never been prompted must not be pinned as `starting` forever
-        // just because its pid is alive.
-        let reg = SessionsRegistry::new();
-        let pid = std::process::id();
-        let token = pid_liveness::process_start_token(pid);
-        reg.observe(observe_with_pid_start(
-            "s1",
-            SessionEvent::SessionStart,
-            pid,
-            token.as_deref(),
-        ));
-        backdate(&reg, "s1", 1000);
-        assert!(
-            reg.list().is_empty(),
-            "an unprompted session must not be exempted from the TTL"
-        );
-    }
-
-    #[test]
-    fn an_older_session_id_under_a_still_running_pid_falls_back_to_the_ttl() {
-        // The `/clear`-style guard: only the most recently started session_id
-        // under a pid is exempt; an older one the same pid has since moved on
-        // from ages out normally, even though the process itself lives on.
-        let reg = SessionsRegistry::new();
-        let pid = std::process::id();
-        let token = pid_liveness::process_start_token(pid);
-        reg.observe(observe_with_pid_start(
-            "old",
-            SessionEvent::UserPromptSubmit,
-            pid,
-            token.as_deref(),
-        ));
-        reg.observe(observe_from("old", SessionEvent::Stop, pid));
-        backdate(&reg, "old", 1000);
-        // The same pid starts a new session_id (e.g. `/clear`), more recently.
-        reg.observe(observe_with_pid_start(
-            "new",
-            SessionEvent::UserPromptSubmit,
-            pid,
-            token.as_deref(),
-        ));
-        let ids: Vec<String> = reg.list().into_iter().map(|s| s.session_id).collect();
-        assert_eq!(
-            ids,
-            vec!["new".to_string()],
-            "only the newest session_id under the pid is exempted"
-        );
-    }
-
-    #[test]
-    fn a_mismatched_start_token_prevents_exemption() {
-        // A pid the OS has recycled onto an unrelated process still passes the
-        // bare existence check, so the recorded start-time token is the only
-        // thing distinguishing it from the original session's process.
-        let reg = SessionsRegistry::new();
-        let pid = std::process::id();
-        reg.observe(observe_with_pid_start(
-            "s1",
-            SessionEvent::UserPromptSubmit,
-            pid,
-            Some("not-the-real-token"),
-        ));
-        reg.observe(observe_from("s1", SessionEvent::Stop, pid));
-        backdate(&reg, "s1", 1000);
-        assert!(
-            reg.list().is_empty(),
-            "a start-token mismatch must not grant the TTL exemption"
-        );
-    }
-
-    #[test]
-    fn a_session_with_no_pid_start_falls_back_to_the_ordinary_ttl() {
-        // An older sink, or a platform `process_start_token` returns `None`
-        // for: no `pid_start` at all means no participation in pid-based
-        // liveness — pure pre-#1916 TTL aging, whether or not the pid (100,
-        // never a process on this machine) happens to exist.
-        let reg = SessionsRegistry::new();
-        reg.observe(observe_from("s1", SessionEvent::UserPromptSubmit, 100));
-        reg.observe(observe_from("s1", SessionEvent::Stop, 100));
-        backdate(&reg, "s1", 1000);
-        assert!(reg.list().is_empty());
-    }
-
-    #[test]
-    fn a_dead_process_ends_its_session_promptly_even_when_recently_active() {
-        // The other half of #1916: a crash is caught within the short
-        // `ended_ttl` linger, not the full 5-minute `session_ttl` — even for a
-        // session whose `last_seen` is fresh, since the crash could have
-        // happened moments ago.
-        let reg = SessionsRegistry::new();
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        reg.observe(observe_with_pid_start(
-            "s1",
-            SessionEvent::UserPromptSubmit,
-            pid,
-            Some("whatever-token"),
-        ));
-        // last_seen is fresh (just observed above) — nowhere near session_ttl.
-        assert_eq!(reg.list()[0].state, SessionState::Ended);
     }
 
     #[test]

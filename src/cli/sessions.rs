@@ -240,25 +240,21 @@ impl HookCommand {
         // Read before stdin, while the agent that spawned this hook is surely
         // still alive to be our parent.
         let pid = agent_pid(std::os::unix::process::parent_id());
-        // The pid's start-time identity token (#1916), so the registry can
-        // later tell this process from an unrelated one the OS has since
-        // recycled the same pid onto.
-        let pid_start = pid.and_then(crate::sessions::pid_liveness::process_start_token);
         let mut input = String::new();
         if std::io::stdin().read_to_string(&mut input).is_err() {
             return Ok(());
         }
-        self.report(&input, pid, pid_start).await;
+        self.report(&input, pid).await;
         Ok(())
     }
 
     /// Parses the hook JSON, maps it to an op, and best-effort sends it. Split
     /// out so tests can exercise the send path against a fake socket.
-    async fn report(&self, input: &str, pid: Option<u32>, pid_start: Option<String>) {
+    async fn report(&self, input: &str, pid: Option<u32>) {
         let Ok(hook) = serde_json::from_str::<HookPayload>(input) else {
             return;
         };
-        let Some((op, payload)) = hook.to_op(self.agent, pid, pid_start) else {
+        let Some((op, payload)) = hook.to_op(self.agent, pid) else {
             return;
         };
         let Ok(socket) = server::resolve_socket(self.socket.clone()) else {
@@ -322,15 +318,11 @@ struct HookPayload {
 impl HookPayload {
     /// Maps this hook payload to a `(op, payload)` for the daemon, or `None` when
     /// it carries no `session_id` or names an event the tracker ignores. `pid`
-    /// (the [`agent_pid`]) rides along on both ops when known; `pid_start` (its
-    /// start-time identity token, #1916) only on `observe` — `end` never needed
-    /// start-time, only `pid` and the registry's `replaced_pids`.
-    fn to_op(
-        &self,
-        agent: HookAgent,
-        pid: Option<u32>,
-        pid_start: Option<String>,
-    ) -> Option<(&'static str, Value)> {
+    /// (the [`agent_pid`]) rides along on both ops when known — it is also the
+    /// seed for pid-based liveness (#1916), whose identity-token reading is
+    /// entirely the daemon's own [`pid_watcher`](crate::sessions::pid_watcher)
+    /// work, never this sink's.
+    fn to_op(&self, agent: HookAgent, pid: Option<u32>) -> Option<(&'static str, Value)> {
         let session_id = self.session_id.clone().filter(|s| !s.trim().is_empty())?;
         let event_name = self.hook_event_name.as_deref()?;
         if event_name == "SessionEnd" {
@@ -365,7 +357,6 @@ impl HookPayload {
             repo: None,
             model: self.model.clone(),
             pid,
-            pid_start,
         };
         Some(("observe", serde_json::to_value(request).ok()?))
     }
@@ -1588,7 +1579,7 @@ mod tests {
     fn hook_op(json_str: &str) -> Option<(&'static str, Value)> {
         serde_json::from_str::<HookPayload>(json_str)
             .unwrap()
-            .to_op(HookAgent::Claude, None, None)
+            .to_op(HookAgent::Claude, None)
     }
 
     #[test]
@@ -1634,7 +1625,7 @@ mod tests {
         let hook = |json_str: &str, pid| {
             serde_json::from_str::<HookPayload>(json_str)
                 .unwrap()
-                .to_op(HookAgent::Claude, pid, None)
+                .to_op(HookAgent::Claude, pid)
                 .unwrap()
         };
         let start = r#"{"session_id":"s1","hook_event_name":"SessionStart"}"#;
@@ -1644,34 +1635,6 @@ mod tests {
         // Unknown: omitted from the wire, exactly as before #1948.
         assert!(hook(start, None).1.get("pid").is_none());
         assert!(hook(end, None).1.get("pid").is_none());
-    }
-
-    #[test]
-    fn hook_sends_pid_start_on_observe_only_and_omits_it_when_unknown() {
-        let start = r#"{"session_id":"s1","hook_event_name":"SessionStart"}"#;
-        let end = r#"{"session_id":"s1","hook_event_name":"SessionEnd"}"#;
-
-        let (op, payload) = serde_json::from_str::<HookPayload>(start)
-            .unwrap()
-            .to_op(HookAgent::Claude, Some(42), Some("token-1".to_string()))
-            .unwrap();
-        assert_eq!(op, "observe");
-        assert_eq!(payload["pid_start"], "token-1");
-
-        // `end` never carries `pid_start` — it only reads `pid`.
-        let (op, payload) = serde_json::from_str::<HookPayload>(end)
-            .unwrap()
-            .to_op(HookAgent::Claude, Some(42), Some("token-1".to_string()))
-            .unwrap();
-        assert_eq!(op, "end");
-        assert!(payload.get("pid_start").is_none());
-
-        // Unknown: omitted from the wire, like `pid`.
-        let (_, payload) = serde_json::from_str::<HookPayload>(start)
-            .unwrap()
-            .to_op(HookAgent::Claude, Some(42), None)
-            .unwrap();
-        assert!(payload.get("pid_start").is_none());
     }
 
     #[test]
@@ -1717,7 +1680,7 @@ mod tests {
     fn codex_op(json_str: &str) -> Option<(&'static str, Value)> {
         serde_json::from_str::<HookPayload>(json_str)
             .unwrap()
-            .to_op(HookAgent::Codex, None, None)
+            .to_op(HookAgent::Codex, None)
     }
 
     fn codex_event(event: &str, tool: Option<&str>) -> Value {
@@ -2975,16 +2938,11 @@ mod tests {
             socket: Some(sock),
             agent: HookAgent::Claude,
         };
-        cmd.report(
-            r#"{"session_id":"s1","hook_event_name":"Stop"}"#,
-            None,
-            None,
-        )
-        .await;
+        cmd.report(r#"{"session_id":"s1","hook_event_name":"Stop"}"#, None)
+            .await;
         // Unmappable input returns before any socket work.
-        cmd.report("not json", None, None).await;
-        cmd.report(r#"{"hook_event_name":"Stop"}"#, None, None)
-            .await; // no session_id → no op
+        cmd.report("not json", None).await;
+        cmd.report(r#"{"hook_event_name":"Stop"}"#, None).await; // no session_id → no op
     }
 
     /// Spawns a minimal fake daemon on a short-path Unix socket that answers one
