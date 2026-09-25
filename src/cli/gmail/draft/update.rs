@@ -258,7 +258,7 @@ async fn run_update(
     if let Some(slot) = from {
         if let Some(requested) = slot.take() {
             *slot = resolve_from(&fetch_send_as(client).await?, &requested)?;
-        }
+        } // omni-dev: coverage ignore-line reason="this closing brace reports 0 hits under llvm-cov regardless of test count — verified locally: run_update_sets_a_checked_from_and_keeps_everything_else and run_update_to_the_nameless_primary_leaves_from_to_gmail both complete the block above successfully (proven by the outer if-let's own closing brace and the following let drafts = ... line both measuring as hit), yet this specific inner brace, immediately after a statement with two chained ? operators, never registers a hit; an llvm-cov region-attribution artifact, not an untested path"
     }
     let drafts = DraftsApi::new(client);
     let format = match change {
