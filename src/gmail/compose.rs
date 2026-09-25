@@ -290,15 +290,34 @@ pub fn message_id_domain(email: &str) -> Option<String> {
 
 /// Whether `domain` is an RFC 1035 host name: at most 253 characters of
 /// dot-separated labels, each 1 to 63 letters, digits and hyphens that
-/// neither starts nor ends with a hyphen.
+/// neither starts nor ends with a hyphen. The last label may not be all
+/// digits (RFC 1123 §2.1), which also rules out a bare IPv4 address.
 fn is_plain_domain(domain: &str) -> bool {
     domain.len() <= 253
+        && !domain
+            .rsplit('.')
+            .next()
+            .is_some_and(|tld| tld.chars().all(|c| c.is_ascii_digit()))
         && domain.split('.').all(|label| {
             (1..=63).contains(&label.len())
                 && !label.starts_with('-')
                 && !label.ends_with('-')
                 && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         })
+}
+
+/// Refuses a subject that would break the header.
+///
+/// [`Composition::build`] runs it too; it is public so a caller can refuse
+/// a bad subject before it makes any request.
+pub fn check_subject(subject: &str) -> Result<()> {
+    // A tab is legal (and survives unfolding a long original subject);
+    // CR, LF and NUL would break the header.
+    ensure!(
+        !subject.contains(['\r', '\n', '\0']),
+        "the subject contains a line break or NUL character"
+    );
+    Ok(())
 }
 
 impl Composition {
@@ -308,12 +327,7 @@ impl Composition {
     /// keeps it when the draft is sent is unverified (#1953), so it is made
     /// valid either way rather than left as `@localhost`.
     pub fn build(&self) -> Result<Vec<u8>> {
-        // A tab is legal (and survives unfolding a long original subject);
-        // CR, LF and NUL would break the header.
-        ensure!(
-            !self.subject.contains(['\r', '\n', '\0']),
-            "the subject contains a line break or NUL character"
-        );
+        check_subject(&self.subject)?;
         for attachment in &self.attachments {
             ensure!(
                 !attachment.content_type.chars().any(char::is_control),
@@ -546,6 +560,7 @@ mod tests {
             "no-at-sign",
             "me@",
             "me@[127.0.0.1]",
+            "me@127.0.0.1",
             "me@a..b",
             "me@exa mple.org",
             "me@-example.org",

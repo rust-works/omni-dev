@@ -13,8 +13,8 @@ use crate::cli::gmail::format::{
 use crate::cli::gmail::helpers::with_modify_scope_hint;
 use crate::gmail::client::GmailClient;
 use crate::gmail::compose::{
-    message_id_domain, subject_matches_reply, Attachment, Composition, Mailbox, ReplyContext,
-    REPLY_HEADERS,
+    check_subject, message_id_domain, subject_matches_reply, Attachment, Composition, Mailbox,
+    ReplyContext, REPLY_HEADERS,
 };
 use crate::gmail::drafts_api::DraftsApi;
 use crate::gmail::messages_api::{
@@ -185,6 +185,13 @@ async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDr
         DraftInput::Compose(compose) => {
             // Bad input fails here, before the lookups cost a request.
             let recipients = Recipients::parse(&compose)?;
+            match &compose.subject {
+                Some(subject) => check_subject(subject)?,
+                None => ensure!(
+                    compose.reply_to.is_some(),
+                    "--subject is required unless --reply-to is given"
+                ),
+            }
             // The two lookups are independent, so they share a round trip.
             let (reply, domain) = tokio::join!(
                 async {
@@ -684,6 +691,7 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
             .mount(&server)
             .await;
+        mount_profile(&server, "me@example.org").await;
         wiremock::Mock::given(wiremock::matchers::path(CREATE_PATH))
             .respond_with(wiremock::ResponseTemplate::new(200))
             .expect(0)
@@ -797,6 +805,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_create_rejects_a_bad_subject_before_any_request() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::path_regex("^/(gmail|upload)/"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        for (subject, expected) in [
+            (None, "--subject is required"),
+            (Some("Hi\r\nBcc: eve@example.com"), "line break"),
+        ] {
+            let err = run_create(
+                &client,
+                DraftInput::Compose(compose("alice@example.com", subject)),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    #[tokio::test]
     async fn run_create_rejects_a_bad_recipient_before_the_reply_lookup() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
@@ -821,6 +853,7 @@ mod tests {
     async fn run_create_turns_a_read_only_403_into_an_actionable_error() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "me@example.org").await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(CREATE_PATH))
             .respond_with(
