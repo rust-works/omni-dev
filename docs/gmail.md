@@ -343,7 +343,7 @@ failure. See [ADR-0067](adrs/adr-0067.md) for the full design rationale.
 ## Output formats
 
 Every subcommand that renders a list or record (`search`, `read`, `thread`,
-`label list`, `draft list`, `sync`, `sync-all`, `extract-attachments`, `render`, `account
+`label list`, `draft list`, `draft show`, `sync`, `sync-all`, `extract-attachments`, `render`, `account
 list`) accepts `-o <format>` (`table` / `json` / `yaml` / `yamls` / `jsonl`,
 default `table`) — the same convention as every other `omni-dev` domain
 (see [ADR-0046](adrs/adr-0046.md)). `auth login`/`auth logout`/`auth
@@ -507,9 +507,39 @@ message. If a draft is saved while `draft list` runs, the old message it
 was about to fetch is gone. That row still appears, with its ids but blank
 headers, and running the command again shows it in full.
 
-**Read-only scope is enough.** `drafts.list` and `messages.get` both
-accept `gmail.readonly`, so `draft list` works for an account authorised
-without `--modify`.
+### Showing a draft
+
+```bash
+$ omni-dev gmail draft show r-1234567890
+$ omni-dev gmail draft show r-1234567890 -o markdown
+$ omni-dev gmail draft show r-1234567890 --detail raw --out-file draft.eml
+```
+
+`draft show` fetches one draft by its **draft id** (the `DRAFT_ID` column of
+`draft list`). `gmail read <message-id>` can read a draft's message too, but
+that id goes stale the next time the draft is saved. The draft id does not.
+
+It takes `gmail read`'s flags and shares its output code, so the two
+render a message the same way:
+
+- `--detail minimal|metadata|full|raw` (default `full`) picks how much of
+  the message Gmail returns.
+- The default table view prints `Draft-Id`, `Message-Id`, `Thread-Id`,
+  labels and the snippet. `-o markdown` renders the headers (including
+  `Bcc`, which a draft keeps) and the body. `-o json`/`yaml`/`yamls`/`jsonl`
+  emit Gmail's `drafts.get` response, `{id, message}`, so machine output
+  carries the draft id beside the message.
+- `--detail raw --out-file PATH` writes the draft's exact stored RFC 2822
+  bytes: an `.eml` file you can edit and hand back to a later `draft update
+  --raw` (#1924).
+
+A draft id that doesn't exist fails with `No draft with id "…"`. The usual
+cause is passing a message id from `gmail search` or `gmail read`, which no
+drafts endpoint accepts.
+
+**Read-only scope is enough.** `drafts.list`, `drafts.get` and
+`messages.get` all accept `gmail.readonly`, so `draft list` and `draft show`
+work for an account authorised without `--modify`.
 
 **Drafts are never sent or deleted.** omni-dev can only stage a draft for a
 person to review. It deliberately has no `draft send` and no `draft delete`:
@@ -520,7 +550,7 @@ endpoint is ever added to the drafts client (#1920).
 
 ### MCP equivalent(s)
 
-None yet. `draft list` is CLI-only.
+None yet. `draft list` and `draft show` are CLI-only.
 
 ## Sync
 

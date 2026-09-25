@@ -17,7 +17,7 @@ use mail_parser::{ContentType, Encoding, Header, HeaderName, MessagePart, PartTy
 
 use crate::gmail::attachments::extract_attachments;
 
-/// Renders `raw` as Markdown: a header block (Subject/From/To/Cc/Date/
+/// Renders `raw` as Markdown: a header block (Subject/From/To/Cc/Bcc/Date/
 /// Message-Id/In-Reply-To/References, RFC 2047-decoded courtesy of
 /// `mail-parser`), the message body (preferring `text/plain`, falling back
 /// to `text/html` converted via `htmd`), and a bullet list of attachment
@@ -43,6 +43,9 @@ pub(crate) fn render_markdown(raw: &[u8], fold_quotes: bool) -> String {
     write_header(&mut out, "From", format_address(message.from()));
     write_header(&mut out, "To", format_address(message.to()));
     write_header(&mut out, "Cc", format_address(message.cc()));
+    // Received mail rarely carries `Bcc`, but a draft's stored message
+    // does (`gmail draft show -o markdown`), and there it matters.
+    write_header(&mut out, "Bcc", format_address(message.bcc()));
     write_header(
         &mut out,
         "Date",

@@ -23,7 +23,7 @@ use crate::gmail::error::GmailError;
 use crate::gmail::messages_api::{
     effective_cap, header_value, hydrate_in_order, MessageFormat, MessagesApi, MAX_PAGE_LIMIT,
 };
-use crate::gmail::types::{Draft, DraftListResponse, Message};
+use crate::gmail::types::{Draft, DraftDetail, DraftListResponse, Message};
 
 /// The headers [`DraftsApi::list_summaries`] asks `messages.get` for.
 const SUMMARY_HEADERS: [&str; 5] = ["To", "Cc", "Bcc", "Subject", "Date"];
@@ -198,6 +198,31 @@ impl<'a> DraftsApi<'a> {
         })
         .await
     }
+
+    /// Fetches one draft by its draft id, with its message at `format`.
+    ///
+    /// A 404 becomes a "no draft with id" error that points at `gmail
+    /// draft list`, since the likely cause is passing a message id, which
+    /// `gmail search` and `gmail read` show but no drafts endpoint accepts.
+    /// The HTTP error stays in the chain. Needs only the `gmail.readonly`
+    /// scope.
+    pub async fn get(&self, draft_id: &str, format: MessageFormat) -> Result<DraftDetail> {
+        let url = build_draft_get_url(self.client.base_url(), draft_id, format)?;
+        self.client
+            .get_parsed(url.as_str(), "Failed to parse drafts.get response")
+            .await
+            .map_err(|err| {
+                if is_not_found(&err) {
+                    err.context(format!(
+                        "No draft with id {draft_id:?}. Run `omni-dev gmail draft list` to see \
+                         draft ids; a message id from `gmail search` or `gmail read` is not a \
+                         draft id"
+                    ))
+                } else {
+                    err
+                }
+            })
+    }
 }
 
 /// Whether `err` is Gmail's HTTP 404.
@@ -206,6 +231,17 @@ fn is_not_found(err: &anyhow::Error) -> bool {
         err.downcast_ref::<GmailError>(),
         Some(GmailError::ApiRequestFailed { status: 404, .. })
     )
+}
+
+/// `drafts.get` URL. The id is pushed as a path segment, so it is
+/// percent-encoded rather than able to change the path or query.
+fn build_draft_get_url(base_url: &str, draft_id: &str, format: MessageFormat) -> Result<Url> {
+    let mut url = GmailClient::api_url(base_url, "/gmail/v1/users/me/drafts")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("Gmail base URL cannot have path segments"))?
+        .push(draft_id);
+    url.query_pairs_mut().append_pair("format", format.as_str());
+    Ok(url)
 }
 
 fn build_drafts_list_url(
@@ -677,6 +713,105 @@ mod tests {
         assert_eq!(summary.message_id, "m1");
         assert_eq!(summary.thread_id, "t1");
         assert!(summary.to.is_empty());
+    }
+
+    // ── get ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_draft_get_url_sends_the_format_and_encodes_the_id() {
+        let url =
+            build_draft_get_url("https://gmail.googleapis.com", "r1", MessageFormat::Raw).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://gmail.googleapis.com/gmail/v1/users/me/drafts/r1?format=raw"
+        );
+        let url = build_draft_get_url("https://gmail.googleapis.com", "a/b?c", MessageFormat::Full)
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://gmail.googleapis.com/gmail/v1/users/me/drafts/a%2Fb%3Fc?format=full"
+        );
+    }
+
+    #[test]
+    fn build_draft_get_url_rejects_invalid_base_url() {
+        assert!(build_draft_get_url("not a url", "r1", MessageFormat::Full).is_err());
+    }
+
+    #[tokio::test]
+    async fn get_parses_the_draft_and_its_full_message() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/drafts/r1"))
+            .and(wiremock::matchers::query_param("format", "metadata"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "r1",
+                    "message": {
+                        "id": "m1",
+                        "threadId": "t1",
+                        "labelIds": ["DRAFT"],
+                        "snippet": "Hi there",
+                    },
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let draft = DraftsApi::new(&client)
+            .get("r1", MessageFormat::Metadata)
+            .await
+            .unwrap();
+        assert_eq!(draft.id, "r1");
+        assert_eq!(draft.message.id, "m1");
+        assert_eq!(draft.message.thread_id.as_deref(), Some("t1"));
+        assert_eq!(draft.message.label_ids, ["DRAFT"]);
+        assert_eq!(draft.message.snippet.as_deref(), Some("Hi there"));
+    }
+
+    #[tokio::test]
+    async fn get_turns_a_404_into_a_no_such_draft_error() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/drafts/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404)
+                    .set_body_string("Requested entity was not found."),
+            )
+            .mount(&server)
+            .await;
+
+        let err = DraftsApi::new(&client)
+            .get("m1", MessageFormat::Full)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.starts_with("No draft with id \"m1\""), "{message}");
+        assert!(message.contains("is not a draft id"), "{message}");
+        // The HTTP error is kept as the cause.
+        assert!(format!("{err:#}").contains("404"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn get_propagates_other_api_errors_unchanged() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/drafts/r1"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("nope"))
+            .mount(&server)
+            .await;
+
+        let err = DraftsApi::new(&client)
+            .get("r1", MessageFormat::Full)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("403"), "{message}");
+        assert!(!message.contains("No draft"), "{message}");
     }
 
     // ── read-only surface ────────────────────────────────────────────

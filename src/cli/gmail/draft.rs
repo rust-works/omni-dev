@@ -4,6 +4,7 @@
 //! `delete` leaf (see [`crate::gmail::drafts_api`]).
 
 pub(crate) mod list;
+pub(crate) mod show;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -23,6 +24,8 @@ pub struct DraftCommand {
 pub enum DraftSubcommands {
     /// Lists drafts with their draft ids (`gmail.readonly` is enough).
     List(list::ListCommand),
+    /// Shows one draft by its draft id (`gmail.readonly` is enough).
+    Show(show::ShowCommand),
 }
 
 impl DraftCommand {
@@ -30,6 +33,7 @@ impl DraftCommand {
     pub async fn execute(self, client: &GmailClient) -> Result<()> {
         match self.command {
             DraftSubcommands::List(cmd) => cmd.execute(client).await,
+            DraftSubcommands::Show(cmd) => cmd.execute(client).await,
         }
     }
 }

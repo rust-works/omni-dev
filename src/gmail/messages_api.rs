@@ -92,7 +92,7 @@ pub enum MessageFormat {
 }
 
 impl MessageFormat {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Minimal => "minimal",
             Self::Full => "full",

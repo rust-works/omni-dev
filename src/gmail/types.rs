@@ -120,6 +120,21 @@ pub struct Draft {
     pub message: MessageRef,
 }
 
+/// A Gmail draft with its full message, as returned by `drafts.get`.
+///
+/// Unlike [`Draft`], whose message is only `{id, threadId}`, this carries
+/// the whole [`Message`] at whichever `format` was requested. `id` is the
+/// draft id, which stays the same across saves; `message.id` changes on
+/// every save.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DraftDetail {
+    /// Gmail draft id.
+    pub id: String,
+    /// The draft's current message.
+    #[serde(default)]
+    pub message: Message,
+}
+
 /// Response envelope for `GET /gmail/v1/users/{userId}/drafts`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DraftListResponse {
@@ -381,6 +396,12 @@ impl JsonlSerialize for HistoryListResponse {
 }
 
 impl JsonlSerialize for Message {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_scalar_jsonl(self, out)
+    }
+}
+
+impl JsonlSerialize for DraftDetail {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
         write_scalar_jsonl(self, out)
     }

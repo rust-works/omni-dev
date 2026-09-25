@@ -7171,6 +7171,7 @@ Usage: draft <COMMAND>
 
 Commands:
   list  Lists drafts with their draft ids (`gmail.readonly` is enough)
+  show  Shows one draft by its draft id (`gmail.readonly` is enough)
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -7189,6 +7190,25 @@ Options:
       --query <QUERY>    Only list drafts matching this Gmail search query (same syntax as the Gmail search box, e.g. `to:alice subject:report`)
       --limit <LIMIT>    Maximum drafts to return. `0` means "every draft" (capped at the same hard ceiling as `gmail search`) [default: 50]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev gmail draft show - Shows one draft by its draft id (`gmail.readonly` is enough)
+
+Shows one draft by its draft id (`gmail.readonly` is enough)
+
+Usage: show [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>  Gmail draft id (the `DRAFT_ID` column of `gmail draft list`)
+
+Options:
+      --out-file <PATH>  Output file (writes to stdout if omitted). With `--detail raw`, this is the draft's exact RFC 2822 bytes, i.e. an `.eml` file
+      --detail <DETAIL>  How much of the draft's message to fetch [default: full] [possible values: minimal, metadata, full, raw]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl, markdown]
+      --fold-quotes      Collapses `>`-quoted reply history nested more than one level deep into a one-line `*(N quoted lines omitted)*` marker. Only affects `-o markdown`, as with `gmail read`
   -h, --help             Print help (see more with '--help')
 
 
