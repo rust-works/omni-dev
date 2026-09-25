@@ -21,12 +21,13 @@ use crate::gmail::messages_api::{
     ensure_within_message_limit, MessageFormat, MessagesApi, MAX_INSERT_BYTES,
 };
 use crate::gmail::profile_api::ProfileApi;
+use crate::gmail::send_as_api::SendAsApi;
 
 /// What `draft create` does with a message, for size-limit refusals.
 const CREATE_ACTION: &str = "create a draft of";
 
 /// Every composition flag, which `--raw` conflicts with.
-const COMPOSE_ARGS: [&str; 8] = [
+const COMPOSE_ARGS: [&str; 9] = [
     "to",
     "cc",
     "bcc",
@@ -35,6 +36,7 @@ const COMPOSE_ARGS: [&str; 8] = [
     "body_file",
     "attach",
     "reply_to",
+    "reply_all",
 ];
 
 /// Creates a Gmail draft for a person to review and send from Gmail.
@@ -48,7 +50,10 @@ const COMPOSE_ARGS: [&str; 8] = [
 /// (as `gmail search` and `gmail read` print it, not its `Message-ID`
 /// header). The draft is filed into that message's thread, with
 /// `In-Reply-To`/`References` set and the subject defaulting to
-/// `Re: <original subject>`.
+/// `Re: <original subject>`. Without `--to`, the draft goes to the
+/// original's `Reply-To` (else its `From`, or its `To` when you sent it), and
+/// `--reply-all` adds its other recipients, as a mail client's Reply and
+/// Reply All do. An explicit `--to` or `--cc` replaces that header's default.
 ///
 /// Needs the `gmail.modify` scope (`gmail auth login --modify`). Nothing is
 /// ever sent: the draft waits in Gmail's Drafts folder.
@@ -56,7 +61,9 @@ const COMPOSE_ARGS: [&str; 8] = [
 pub struct CreateCommand {
     /// A `To` recipient: `addr@example.com` or `"Name <addr@example.com>"`.
     /// Repeat the flag (or list several after it) for more recipients.
-    #[arg(long, value_name = "ADDR", num_args = 1.., required_unless_present = "raw")]
+    /// Required unless `--reply-to` is given, which defaults it from the
+    /// original.
+    #[arg(long, value_name = "ADDR", num_args = 1.., required_unless_present_any = ["raw", "reply_to"])]
     pub to: Vec<String>,
 
     /// A `Cc` recipient, in the same form as `--to`.
@@ -85,8 +92,16 @@ pub struct CreateCommand {
     pub attach: Vec<PathBuf>,
 
     /// Reply to this Gmail message id, filing the draft in its thread.
+    /// Without `--to`, replies to the original's `Reply-To`, else its `From`
+    /// (or, for a message you sent, its `To`).
     #[arg(long, value_name = "MESSAGE_ID")]
     pub reply_to: Option<String>,
+
+    /// With `--reply-to`, also address the original's other `To` and `Cc`
+    /// recipients, leaving out your own addresses. `--to`/`--cc` still
+    /// replace the defaults for their header.
+    #[arg(long, requires = "reply_to")]
+    pub reply_all: bool,
 
     /// Upload this complete RFC 5322 message (`.eml`) byte for byte instead
     /// of composing one.
@@ -126,6 +141,7 @@ impl CreateCommand {
                 body,
                 attachments,
                 reply_to: self.reply_to,
+                reply_all: self.reply_all,
             })
         };
         let created = run_create(client, input).await?;
@@ -155,6 +171,7 @@ struct ComposeInput {
     body: String,
     attachments: Vec<Attachment>,
     reply_to: Option<String>,
+    reply_all: bool,
 }
 
 /// The ids of a newly created draft.
@@ -180,8 +197,8 @@ impl JsonlSerialize for CreatedDraft {
 /// Split from [`CreateCommand::execute`] so tests can inject a wiremock
 /// client and in-memory inputs.
 async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDraft> {
-    let (raw, thread_id, fallback_warning) = match input {
-        DraftInput::Raw(raw) => (raw, None, None),
+    let (raw, thread_id, notes) = match input {
+        DraftInput::Raw(raw) => (raw, None, Vec::new()),
         DraftInput::Compose(compose) => {
             // Bad input fails here, before the lookups cost a request.
             let recipients = Recipients::parse(&compose)?;
@@ -192,8 +209,20 @@ async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDr
                     "--subject is required unless --reply-to is given"
                 ),
             }
-            // The two lookups are independent, so they share a round trip.
-            let (reply, domain) = tokio::join!(
+            ensure!(
+                !recipients.to.is_empty() || compose.reply_to.is_some(),
+                "--to is required unless --reply-to is given"
+            );
+            ensure!(
+                !compose.reply_all || compose.reply_to.is_some(),
+                "--reply-all needs --reply-to"
+            );
+            // Only a reply-all that still has a header to fill needs to know
+            // which addresses are the account's own.
+            let wants_own =
+                compose.reply_all && (recipients.to.is_empty() || recipients.cc.is_empty());
+            // The lookups are independent, so they share a round trip.
+            let (reply, domain, own) = tokio::join!(
                 async {
                     match &compose.reply_to {
                         Some(id) => fetch_reply_context(client, id).await.map(Some),
@@ -201,17 +230,34 @@ async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDr
                     }
                 },
                 fetch_message_id_domain(client),
+                async {
+                    if wants_own {
+                        fetch_own_addresses(client).await
+                    } else {
+                        Ok(Vec::new())
+                    }
+                },
             );
             let reply = reply?;
+            let own = own?;
             let thread_id = reply.as_ref().map(|reply| reply.thread_id.clone());
+            let (recipients, defaulted) = match &reply {
+                Some(reply) => recipients.fill_from_reply(reply, compose.reply_all, &own)?,
+                None => (recipients, None),
+            };
             let (domain, fallback_warning) = match domain {
                 Ok(domain) => (Some(domain), None),
                 Err(warning) => (None, Some(warning)),
             };
+            let notes = defaulted
+                .map(|note| format!("note: {note}"))
+                .into_iter()
+                .chain(fallback_warning.map(|warning| format!("warning: {warning}")))
+                .collect();
             (
                 compose_message(compose, recipients, reply, domain)?,
                 thread_id,
-                fallback_warning,
+                notes,
             )
         }
     };
@@ -220,9 +266,10 @@ async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDr
         .await
         .map_err(with_modify_scope_hint)?;
     // Only once the draft exists: a lookup that failed for the same reason
-    // as the create would otherwise warn about a draft that never was.
-    if let Some(warning) = fallback_warning {
-        eprintln!("warning: {warning}");
+    // as the create would otherwise warn about a draft that never was, and
+    // a note would name recipients of a draft that never was.
+    for note in notes {
+        eprintln!("{}", sanitize_for_terminal(&note));
     }
     Ok(CreatedDraft {
         draft_id: draft.id,
@@ -267,6 +314,22 @@ async fn fetch_message_id_domain(client: &GmailClient) -> std::result::Result<St
     })
 }
 
+/// The account's primary address and send-as aliases, for `--reply-all` to
+/// leave out (#1954).
+///
+/// Unlike [`fetch_message_id_domain`], a failure fails the command: carrying
+/// on would quietly put the account in its own reply.
+async fn fetch_own_addresses(client: &GmailClient) -> Result<Vec<String>> {
+    let send_as = SendAsApi::new(client)
+        .list()
+        .await
+        .context("Failed to list the account's send-as addresses for --reply-all")?;
+    Ok(send_as
+        .into_iter()
+        .map(|alias| alias.send_as_email)
+        .collect())
+}
+
 /// The parsed `--to`/`--cc`/`--bcc` values.
 #[derive(Debug)]
 struct Recipients {
@@ -285,6 +348,66 @@ impl Recipients {
             cc: parse_all(&input.cc)?,
             bcc: parse_all(&input.bcc)?,
         })
+    }
+
+    /// Fills an empty `To` (and, with `reply_all`, an empty `Cc`) from the
+    /// message being replied to (see [`ReplyContext::default_recipients`]).
+    ///
+    /// A defaulted header leaves out `own` and every address already given
+    /// explicitly, so nobody is named twice. Returns the recipients and, when
+    /// anything was defaulted, a line saying who, for the caller to show.
+    /// Fails when `To` would be left empty.
+    fn fill_from_reply(
+        mut self,
+        reply: &ReplyContext,
+        reply_all: bool,
+        own: &[String],
+    ) -> Result<(Self, Option<String>)> {
+        let default_to = self.to.is_empty();
+        let default_cc = reply_all && self.cc.is_empty();
+        if !default_to && !default_cc {
+            return Ok((self, None));
+        }
+        for skipped in &reply.skipped {
+            eprintln!(
+                "warning: skipping an unusable address in the original's {}",
+                sanitize_for_terminal(skipped)
+            );
+        }
+        let exclude: Vec<String> = own
+            .iter()
+            .cloned()
+            .chain(
+                self.to
+                    .iter()
+                    .chain(&self.cc)
+                    .chain(&self.bcc)
+                    .map(|mailbox| mailbox.email.clone()),
+            )
+            .collect();
+        let (to, cc) = reply.default_recipients(reply_all, &exclude);
+        let list = |mailboxes: &[Mailbox]| {
+            mailboxes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut note = Vec::new();
+        if default_to {
+            ensure!(
+                !to.is_empty(),
+                "found nobody to reply to: the original has no usable From/Reply-To (or To, \
+                 for a message you sent) that isn't you or already named; pass --to"
+            );
+            note.push(format!("replying to {}", list(&to)));
+            self.to = to;
+        }
+        if default_cc && !cc.is_empty() {
+            note.push(format!("cc {}", list(&cc)));
+            self.cc = cc;
+        }
+        Ok((self, Some(note.join("; ")).filter(|note| !note.is_empty())))
     }
 }
 
@@ -751,6 +874,7 @@ mod tests {
             body_file: None,
             attach: vec![],
             reply_to: None,
+            reply_all: false,
             raw,
             output,
         }
@@ -877,6 +1001,410 @@ mod tests {
             err.to_string().contains("gmail auth login --modify"),
             "{err}"
         );
+    }
+
+    // ── Reply recipients (#1954) ─────────────────────────────────────
+
+    const SEND_AS_PATH: &str = "/gmail/v1/users/me/settings/sendAs";
+
+    /// Mounts `m-orig` with the given address headers and labels.
+    async fn mount_original(
+        server: &wiremock::MockServer,
+        headers: &[(&str, &str)],
+        labels: &[&str],
+    ) {
+        let mut all = vec![
+            serde_json::json!({"name": "Subject", "value": "Plans"}),
+            serde_json::json!({"name": "Message-ID", "value": "<o@example.com>"}),
+        ];
+        all.extend(
+            headers
+                .iter()
+                .map(|(name, value)| serde_json::json!({"name": name, "value": value})),
+        );
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/gmail/v1/users/me/messages/m-orig",
+            ))
+            .and(wiremock::matchers::query_param(
+                "metadataHeaders",
+                "Reply-To",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "m-orig",
+                    "threadId": "t-orig",
+                    "labelIds": labels,
+                    "payload": {"headers": all},
+                })),
+            )
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_send_as(server: &wiremock::MockServer, expected: u64) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(SEND_AS_PATH))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "sendAs": [
+                        {"sendAsEmail": "me@example.org", "isPrimary": true},
+                        {"sendAsEmail": "alias@example.net"},
+                    ],
+                })),
+            )
+            .expect(expected)
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_no_create(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::path(CREATE_PATH))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(server)
+            .await;
+    }
+
+    fn reply_input(reply_all: bool) -> ComposeInput {
+        ComposeInput {
+            body: "Hi.".to_string(),
+            reply_to: Some("m-orig".to_string()),
+            reply_all,
+            ..ComposeInput::default()
+        }
+    }
+
+    /// The addresses in the upload's `name` header, in order.
+    async fn uploaded(server: &wiremock::MockServer, name: &str) -> Vec<String> {
+        let body = create_request_body(server).await;
+        // The message is the upload's `message/rfc822` part.
+        let marker = "Content-Type: message/rfc822\r\n\r\n";
+        let message = &body[body.find(marker).unwrap() + marker.len()..];
+        let parsed = mail_parser::MessageParser::default()
+            .parse(message.as_bytes())
+            .unwrap();
+        let address = match name {
+            "To" => parsed.to(),
+            "Cc" => parsed.cc(),
+            _ => parsed.bcc(),
+        };
+        address
+            .map(|list| {
+                list.iter()
+                    .filter_map(|addr| addr.address().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn run_create_reply_without_to_replies_to_the_sender() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_original(
+            &server,
+            &[
+                ("From", "Alice <alice@example.com>"),
+                ("To", "me@example.org, bob@example.com"),
+                ("Cc", "carol@example.com"),
+            ],
+            &["INBOX"],
+        )
+        .await;
+        mount_profile(&server, "me@example.org").await;
+        mount_send_as(&server, 0).await;
+        mount_create(&server, "t-orig").await;
+
+        run_create(&client, DraftInput::Compose(reply_input(false)))
+            .await
+            .unwrap();
+        assert_eq!(uploaded(&server, "To").await, ["alice@example.com"]);
+        assert!(uploaded(&server, "Cc").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_create_reply_prefers_reply_to() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_original(
+            &server,
+            &[
+                ("From", "alice@example.com"),
+                ("Reply-To", "=?UTF-8?Q?Zo=C3=AB?= <list@example.com>"),
+            ],
+            &["INBOX"],
+        )
+        .await;
+        mount_profile(&server, "me@example.org").await;
+        mount_create(&server, "t-orig").await;
+
+        run_create(&client, DraftInput::Compose(reply_input(false)))
+            .await
+            .unwrap();
+        assert_eq!(uploaded(&server, "To").await, ["list@example.com"]);
+    }
+
+    #[tokio::test]
+    async fn run_create_reply_all_addresses_everyone_but_me() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_original(
+            &server,
+            &[
+                ("From", "alice@example.com"),
+                ("To", "Me <ME@example.org>, bob@example.com"),
+                (
+                    "Cc",
+                    "alias@example.net, carol@example.com, Bob <bob@example.com>",
+                ),
+            ],
+            &["INBOX"],
+        )
+        .await;
+        mount_profile(&server, "me@example.org").await;
+        mount_send_as(&server, 1).await;
+        mount_create(&server, "t-orig").await;
+
+        run_create(&client, DraftInput::Compose(reply_input(true)))
+            .await
+            .unwrap();
+        assert_eq!(
+            uploaded(&server, "To").await,
+            ["alice@example.com", "bob@example.com"]
+        );
+        assert_eq!(uploaded(&server, "Cc").await, ["carol@example.com"]);
+    }
+
+    #[tokio::test]
+    async fn run_create_reply_all_to_my_own_message_keeps_its_to() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_original(
+            &server,
+            &[
+                ("From", "alias@example.net"),
+                ("To", "bob@example.com"),
+                ("Cc", "carol@example.com"),
+            ],
+            &["SENT"],
+        )
+        .await;
+        mount_profile(&server, "me@example.org").await;
+        mount_send_as(&server, 1).await;
+        mount_create(&server, "t-orig").await;
+
+        run_create(&client, DraftInput::Compose(reply_input(true)))
+            .await
+            .unwrap();
+        assert_eq!(uploaded(&server, "To").await, ["bob@example.com"]);
+        assert_eq!(uploaded(&server, "Cc").await, ["carol@example.com"]);
+    }
+
+    #[tokio::test]
+    async fn run_create_explicit_to_and_cc_skip_the_send_as_lookup() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_original(
+            &server,
+            &[("From", "alice@example.com"), ("Cc", "carol@example.com")],
+            &["INBOX"],
+        )
+        .await;
+        mount_profile(&server, "me@example.org").await;
+        mount_send_as(&server, 0).await;
+        mount_create(&server, "t-orig").await;
+
+        let input = ComposeInput {
+            to: vec!["dan@example.com".to_string()],
+            cc: vec!["erin@example.com".to_string()],
+            ..reply_input(true)
+        };
+        run_create(&client, DraftInput::Compose(input))
+            .await
+            .unwrap();
+        assert_eq!(uploaded(&server, "To").await, ["dan@example.com"]);
+        assert_eq!(uploaded(&server, "Cc").await, ["erin@example.com"]);
+    }
+
+    #[tokio::test]
+    async fn run_create_explicit_recipients_are_not_defaulted_again() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_original(
+            &server,
+            &[
+                ("From", "alice@example.com"),
+                ("To", "bob@example.com"),
+                ("Cc", "carol@example.com"),
+            ],
+            &["INBOX"],
+        )
+        .await;
+        mount_profile(&server, "me@example.org").await;
+        mount_send_as(&server, 1).await;
+        mount_create(&server, "t-orig").await;
+
+        // Bob moved to Cc, Carol to Bcc: each appears only where named.
+        let input = ComposeInput {
+            cc: vec!["bob@example.com".to_string()],
+            bcc: vec!["carol@example.com".to_string()],
+            ..reply_input(true)
+        };
+        run_create(&client, DraftInput::Compose(input))
+            .await
+            .unwrap();
+        assert_eq!(uploaded(&server, "To").await, ["alice@example.com"]);
+        assert_eq!(uploaded(&server, "Cc").await, ["bob@example.com"]);
+        assert_eq!(uploaded(&server, "Bcc").await, ["carol@example.com"]);
+    }
+
+    #[tokio::test]
+    async fn run_create_reply_all_fails_when_send_as_fails() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_original(&server, &[("From", "alice@example.com")], &["INBOX"]).await;
+        mount_profile(&server, "me@example.org").await;
+        wiremock::Mock::given(wiremock::matchers::path(SEND_AS_PATH))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        mount_no_create(&server).await;
+
+        let err = run_create(&client, DraftInput::Compose(reply_input(true)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("send-as addresses"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_create_reply_with_nobody_to_reply_to_fails_before_creating() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_original(
+            &server,
+            &[
+                ("From", "me@example.org"),
+                ("To", "undisclosed-recipients:;"),
+            ],
+            &["SENT"],
+        )
+        .await;
+        mount_profile(&server, "me@example.org").await;
+        mount_no_create(&server).await;
+
+        let err = run_create(&client, DraftInput::Compose(reply_input(false)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("pass --to"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_create_rejects_missing_to_or_reply_to_before_any_request() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::path_regex("^/(gmail|upload)/"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        for (input, expected) in [
+            (
+                ComposeInput {
+                    to: Vec::new(),
+                    ..compose("unused@example.com", Some("Hi"))
+                },
+                "--to is required",
+            ),
+            (
+                ComposeInput {
+                    reply_all: true,
+                    ..compose("alice@example.com", Some("Hi"))
+                },
+                "--reply-all needs --reply-to",
+            ),
+        ] {
+            let err = run_create(&client, DraftInput::Compose(input))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    fn parsed(values: &[&str]) -> Vec<Mailbox> {
+        values.iter().map(|v| Mailbox::parse(v).unwrap()).collect()
+    }
+
+    fn recipients(to: &[&str], cc: &[&str]) -> Recipients {
+        Recipients {
+            to: parsed(to),
+            cc: parsed(cc),
+            bcc: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fill_from_reply_describes_what_it_defaulted() {
+        let reply = ReplyContext {
+            from: parsed(&["Alice <alice@example.com>"]),
+            cc: parsed(&["bob@example.com"]),
+            ..ReplyContext::default()
+        };
+        let (_, note) = recipients(&[], &[])
+            .fill_from_reply(&reply, true, &[])
+            .unwrap();
+        assert_eq!(
+            note.as_deref(),
+            Some("replying to Alice <alice@example.com>; cc bob@example.com")
+        );
+        let (_, note) = recipients(&[], &[])
+            .fill_from_reply(&reply, false, &[])
+            .unwrap();
+        assert_eq!(
+            note.as_deref(),
+            Some("replying to Alice <alice@example.com>")
+        );
+    }
+
+    #[test]
+    fn fill_from_reply_leaves_explicit_headers_alone() {
+        let reply = ReplyContext {
+            from: parsed(&["alice@example.com"]),
+            cc: parsed(&["bob@example.com"]),
+            ..ReplyContext::default()
+        };
+        let (filled, note) = recipients(&["dan@example.com"], &[])
+            .fill_from_reply(&reply, false, &[])
+            .unwrap();
+        assert_eq!(filled.to, parsed(&["dan@example.com"]));
+        assert!(filled.cc.is_empty());
+        assert_eq!(note, None);
+        // Reply-all with an explicit To still defaults Cc.
+        let (filled, note) = recipients(&["dan@example.com"], &[])
+            .fill_from_reply(&reply, true, &[])
+            .unwrap();
+        assert_eq!(filled.to, parsed(&["dan@example.com"]));
+        assert_eq!(filled.cc, parsed(&["bob@example.com"]));
+        assert_eq!(note.as_deref(), Some("cc bob@example.com"));
+        // With nothing to add, there is nothing to say.
+        let (_, note) = recipients(&["dan@example.com"], &[])
+            .fill_from_reply(&ReplyContext::default(), true, &[])
+            .unwrap();
+        assert_eq!(note, None);
+    }
+
+    #[test]
+    fn fill_from_reply_refuses_an_empty_to() {
+        let reply = ReplyContext {
+            from: parsed(&["me@example.org"]),
+            ..ReplyContext::default()
+        };
+        let err = recipients(&[], &[])
+            .fill_from_reply(&reply, true, &["ME@example.org".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("pass --to"), "{err}");
     }
 
     // ── compose_message ──────────────────────────────────────────────
@@ -1119,14 +1647,32 @@ mod tests {
     }
 
     #[test]
+    fn clap_reply_to_makes_to_optional() {
+        let cmd = parse(&["--reply-to", "m1"]).unwrap();
+        assert!(cmd.to.is_empty() && !cmd.reply_all);
+        assert!(
+            parse(&["--reply-to", "m1", "--reply-all"])
+                .unwrap()
+                .reply_all
+        );
+        assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn clap_reply_all_requires_reply_to() {
+        assert!(parse(&["--to", "a@example.com", "--subject", "s", "--reply-all"]).is_err());
+    }
+
+    #[test]
     fn clap_raw_stands_alone() {
         assert!(parse(&["--raw", "m.eml"]).is_ok());
         for flag in [
-            ["--to", "a@example.com"],
-            ["--subject", "s"],
-            ["--body", "b"],
-            ["--attach", "f"],
-            ["--reply-to", "m1"],
+            &["--to", "a@example.com"][..],
+            &["--subject", "s"],
+            &["--body", "b"],
+            &["--attach", "f"],
+            &["--reply-to", "m1"],
+            &["--reply-all"],
         ] {
             let mut args = vec!["--raw", "m.eml"];
             args.extend(flag);

@@ -474,6 +474,7 @@ mod tests {
                 body_file: None,
                 attach: vec![],
                 reply_to: None,
+                reply_all: false,
                 raw: None,
                 output: OutputFormat::Table,
             }),

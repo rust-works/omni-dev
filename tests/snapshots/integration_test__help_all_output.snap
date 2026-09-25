@@ -7189,14 +7189,15 @@ Creates a draft to review and send from Gmail (needs `gmail.modify`)
 Usage: create [OPTIONS]
 
 Options:
-      --to <ADDR>...           A `To` recipient: `addr@example.com` or `"Name <addr@example.com>"`. Repeat the flag (or list several after it) for more recipients
+      --to <ADDR>...           A `To` recipient: `addr@example.com` or `"Name <addr@example.com>"`. Repeat the flag (or list several after it) for more recipients. Required unless `--reply-to` is given, which defaults it from the original
       --cc <ADDR>...           A `Cc` recipient, in the same form as `--to`
       --bcc <ADDR>...          A `Bcc` recipient, in the same form as `--to`
       --subject <SUBJECT>      The subject. Required unless `--reply-to` is given, which defaults it to `Re: <original subject>`
       --body <BODY>            The plain-text body
       --body-file <PATH>       Read the plain-text body from this UTF-8 file
       --attach <PATH>...       Attach a file. Repeat the flag (or list several after it) for more
-      --reply-to <MESSAGE_ID>  Reply to this Gmail message id, filing the draft in its thread
+      --reply-to <MESSAGE_ID>  Reply to this Gmail message id, filing the draft in its thread. Without `--to`, replies to the original's `Reply-To`, else its `From` (or, for a message you sent, its `To`)
+      --reply-all              With `--reply-to`, also address the original's other `To` and `Cc` recipients, leaving out your own addresses. `--to`/`--cc` still replace the defaults for their header
       --raw <FILE>             Upload this complete RFC 5322 message (`.eml`) byte for byte instead of composing one
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')

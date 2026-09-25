@@ -552,6 +552,7 @@ $ omni-dev gmail draft create --to 'Zoë Ångström <zoe@example.com>' --cc bob@
     --subject 'Grüße' --body-file note.txt
 $ git log -1 --format=%B | omni-dev gmail draft create --to team@example.com --subject 'Release notes'
 $ omni-dev gmail draft create --to alice@example.com --reply-to 18c2f0a1b2c3d4e5 --body 'Thanks!'
+$ omni-dev gmail draft create --reply-to 18c2f0a1b2c3d4e5 --reply-all --body 'Thanks, all!'
 $ omni-dev gmail draft create --raw message.eml
 ```
 
@@ -560,7 +561,8 @@ and `THREAD_ID` (`-o yaml`/`json` give `draft_id`/`message_id`/`thread_id`).
 Nothing is sent. The draft waits in Gmail's Drafts folder for a person to
 review and send.
 
-- **Recipients.** `--to` is required. `--cc` and `--bcc` are optional. Each
+- **Recipients.** `--to` is required unless `--reply-to` is given, which
+  defaults it (see *Reply recipients* below). `--cc` and `--bcc` are optional. Each
   value is one mailbox, either `addr@example.com` or `Name <addr@example.com>`.
   Repeat the flag, or list several values after it, for more recipients.
   Values are never split on commas, so `"Doe, Jane" <jane@example.com>`
@@ -594,6 +596,39 @@ review and send.
   `--subject` is compared with the original's once leading `Re:` prefixes
   are removed from both. If they differ, a warning is printed, because
   Gmail may start a new thread for it.
+- **Reply recipients.** With `--reply-to` and no `--to`, the draft is
+  addressed the way a mail client's Reply addresses it. The same
+  `messages.get` also reads the original's `From`, `Reply-To`, `To` and
+  `Cc`, so this costs no extra request.
+
+  | Original message                      | Draft `To`                  |
+  |---------------------------------------|-----------------------------|
+  | From someone else, has `Reply-To`     | the `Reply-To` mailbox(es)  |
+  | From someone else, no `Reply-To`      | `From`                      |
+  | Sent by you (Gmail's `SENT` label)    | the original's `To`         |
+
+  `--reply-all` (only with `--reply-to`) also adds the original's `To` to the
+  draft's `To` and its `Cc` to the draft's `Cc`, keeping each recipient in
+  the header they were in, as Gmail's web UI does. Your own addresses are
+  left out, found with one `users.settings.sendAs.list` call, which lists
+  the primary address and every send-as alias. If that call fails, the
+  command fails rather than risk putting you in your own reply. `Bcc` is
+  never carried over.
+
+  An explicit `--to` or `--cc` **replaces** that header's default rather than
+  adding to it, so you can drop someone. A defaulted header also leaves out
+  anyone you already named in `--to`, `--cc` or `--bcc`, and repeats, both
+  compared case-insensitively. When a recipient was defaulted, a
+  `note: replying to …; cc …` line is printed on stderr once the draft
+  exists. Standard output and `-o` output are unchanged. If nobody is left to
+  address, the command fails before creating anything and asks for `--to`.
+
+  Addresses are decoded from the original's headers (RFC 2047 names,
+  groups, quoted names). One that can't be used, such as a name that decodes
+  to a line break, is skipped with a warning. Your addresses are matched as
+  whole addresses, so Gmail's dot and `+tag` variants of an `@gmail.com`
+  address (`j.doe+x@gmail.com` for `jdoe@gmail.com`) are **not** recognised
+  as yours. `Mail-Followup-To`/`Mail-Reply-To` are ignored.
 - **`--raw FILE`** uploads a complete RFC 5322 message byte for byte, with
   no parsing or line-ending changes. It can't be combined with any of the
   composing flags.
@@ -1236,8 +1271,9 @@ Gmail enforces a **per-user quota of 250 units/second**; `messages.get` and
 `messages.list` each cost 5 units, `messages.batchModify` costs 50 units
 for up to 1000 ids. Gmail doesn't document a separate cost for
 `drafts.create`, so assume the `messages.insert` cost (25 units) until it's
-verified. `draft create` makes one such call, plus one `messages.get` with
-`--reply-to`. `draft update` makes one `drafts.update` (assume the same 25
+verified. `draft create` makes one such call and one `users.getProfile`
+(1 unit), plus one `messages.get` with `--reply-to` and one
+`users.settings.sendAs.list` (1 unit) with `--reply-all`. `draft update` makes one `drafts.update` (assume the same 25
 units) plus two `drafts.get` calls, or one with `--raw`. `gmail search`'s ids-only default costs a flat 5 units
 regardless of `--limit` (auto-pagination is still one `messages.list` call
 per page). `--enrich` adds one `messages.get` (5 units) **per hit**, so
