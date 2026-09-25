@@ -363,9 +363,10 @@ pub struct ObserveRequest {
     /// Which agent the session belongs to; omitted for Claude Code.
     #[serde(default, skip_serializing_if = "Agent::is_claude")]
     pub agent: Agent,
-    /// The pid of the agent process that fired the hook (the hook sink's parent),
-    /// when known. Tells a resumed session's new process from the old one it
-    /// replaced, which share a `session_id` (#1948). Only the hook sink sends it.
+    /// The agent process's pid, when known: the hook sink's parent, or
+    /// `claude-wrap`'s wrapped child. Tells a resumed session's new process
+    /// from the old one it replaced, which share a `session_id` (#1948). Every
+    /// other feed (the watchers, the Codex app-server, pi.dev) sends `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
 }
@@ -570,6 +571,18 @@ impl SessionsRegistry {
                 Some(entry)
                     if entry.state == SessionState::Ended
                         && req.event == SessionEvent::TranscriptDiscovered =>
+                {
+                    false
+                }
+                // A straggling sighting from a process this session's resume
+                // already replaced: ignore it entirely, so a delayed hook from
+                // the old process (anything short of its `SessionEnd`, handled
+                // separately by `end`) cannot move the resumed session's state
+                // out from under the new process that owns it (#1948).
+                Some(entry)
+                    if req
+                        .pid
+                        .is_some_and(|pid| entry.replaced_pids.contains(&pid)) =>
                 {
                     false
                 }
@@ -1688,7 +1701,7 @@ mod tests {
         ));
         // A VS Code window reload: the old process fires `SessionEnd`, and the
         // new one resumes the same session id and fires `SessionStart`.
-        assert!(reg.end("s1", Some("other")));
+        assert!(reg.end("s1", Some("other"), None));
         reg.observe(observe_request(
             "s1",
             SessionEvent::SessionStart,
@@ -1767,10 +1780,34 @@ mod tests {
         let reg = SessionsRegistry::new();
         reg.observe(observe_from("s1", SessionEvent::SessionStart, 100));
         reg.observe(observe_from("s1", SessionEvent::SessionStart, 200));
-        // A replaced pid never becomes the owner again, so 200 still owns it.
+        // A replaced pid never becomes the owner again, so 200 still owns it —
+        // and the straggling `PostToolUse` must not move the state either
+        // (`observe`, not only `end`, ignores a replaced pid's sighting).
         reg.observe(observe_from("s1", SessionEvent::PostToolUse, 100));
+        assert_eq!(reg.list()[0].state, SessionState::Starting);
         reg.end("s1", None, Some(100));
         assert_ne!(reg.list()[0].state, SessionState::Ended);
+    }
+
+    #[test]
+    fn a_straggling_non_end_hook_from_the_replaced_process_does_not_change_state() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_from("s1", SessionEvent::UserPromptSubmit, 100));
+        assert_eq!(reg.list()[0].state, SessionState::Working);
+        // The resume: a new process takes over ownership.
+        reg.observe(observe_from("s1", SessionEvent::SessionStart, 200));
+        assert_eq!(reg.list()[0].state, SessionState::Starting);
+        let rx = reg.subscribe_changes();
+
+        // The old process's last, delayed `Stop` arrives after the resume.
+        // Left unguarded, `for_event(Stop, Starting)` would move this back to
+        // `idle`, corrupting the resumed session's freshly-`starting` state.
+        reg.observe(observe_from("s1", SessionEvent::Stop, 100));
+        assert_eq!(reg.list()[0].state, SessionState::Starting);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "an ignored sighting must not bump"
+        );
     }
 
     #[test]
