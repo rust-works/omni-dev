@@ -320,9 +320,10 @@ fn status_summary(sessions: &[SessionEntry]) -> String {
     let mut idle = 0;
     for s in sessions {
         match s.state {
-            SessionState::Working | SessionState::Starting => working += 1,
+            SessionState::Working => working += 1,
             SessionState::WaitingForInput | SessionState::WaitingForPermission => waiting += 1,
-            SessionState::Idle | SessionState::Ended => idle += 1,
+            // A session that has not been prompted yet is not busy (#1946).
+            SessionState::Starting | SessionState::Idle | SessionState::Ended => idle += 1,
         }
     }
     format!(
@@ -759,9 +760,13 @@ mod tests {
         svc.registry()
             .observe(observe_req("i2", SessionEvent::PreToolUse, None));
         svc.registry().end("i2", Some("done")); // ended
+        svc.registry()
+            .observe(observe_req("s", SessionEvent::SessionStart, None)); // starting
         let status = svc.status().await;
-        // Idle + ended both count toward the "idle" tally.
-        assert!(status.summary.contains("2 idle"), "{}", status.summary);
+        // Idle, ended and an unprompted `starting` session all count toward the
+        // "idle" tally (#1946).
+        assert!(status.summary.contains("3 idle"), "{}", status.summary);
+        assert!(status.summary.contains("0 working"), "{}", status.summary);
     }
 
     // --- Push subscription (#1414) -----------------------------------------

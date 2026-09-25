@@ -211,8 +211,9 @@ fn session_glyph(wt: &WorktreeRow, glyphs: GlyphMode) -> &'static str {
             SessionState::WaitingForInput | SessionState::WaitingForPermission => {
                 Glyph::SessionWaiting
             }
-            SessionState::Starting | SessionState::Working => Glyph::SessionWorking,
-            SessionState::Idle => Glyph::SessionIdle,
+            SessionState::Working => Glyph::SessionWorking,
+            // A session that has not been prompted yet is not busy (#1946).
+            SessionState::Starting | SessionState::Idle => Glyph::SessionIdle,
             SessionState::Ended => continue,
         };
         // Waiting outranks working outranks idle.
@@ -633,6 +634,9 @@ mod tests {
         wt.sessions = vec![session(SessionState::Idle), session(SessionState::Working)];
         assert_eq!(session_glyph(&wt, GlyphMode::Unicode), "\u{25cf}");
         wt.sessions = vec![session(SessionState::Idle)];
+        assert_eq!(session_glyph(&wt, GlyphMode::Unicode), "\u{00b7}");
+        // An unprompted session is not busy (#1946).
+        wt.sessions = vec![session(SessionState::Starting)];
         assert_eq!(session_glyph(&wt, GlyphMode::Unicode), "\u{00b7}");
         // An ended session is not a cue at all.
         wt.sessions = vec![session(SessionState::Ended)];
