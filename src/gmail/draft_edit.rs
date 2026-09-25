@@ -1225,8 +1225,9 @@ Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r
     #[test]
     fn edits_keep_the_drafts_message_id_exactly() {
         // `draft update` never writes a Message-ID of its own, so a draft
-        // keeps whichever id `draft create` or Gmail gave it (#1953).
-        let original = Composition {
+        // keeps whichever id `draft create` or Gmail gave it, byte for byte
+        // (#1953).
+        let composed = Composition {
             to: vec![mailbox("a@example.com")],
             subject: "Hi".to_string(),
             body: "Hello.\n".to_string(),
@@ -1235,34 +1236,33 @@ Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r
         }
         .build()
         .unwrap();
-        let message_id = |raw: &[u8]| parse(raw).message_id().map(str::to_string);
-        for edit in [
-            DraftEdit {
-                subject: Some("New".to_string()),
-                ..DraftEdit::default()
-            },
-            DraftEdit {
-                body: Some("New.".to_string()),
-                attach: vec![attachment("n.txt", "text/plain", b"note")],
-                ..DraftEdit::default()
-            },
-        ] {
-            let edited = edit.apply(&original).unwrap();
-            assert_eq!(message_id(&edited.raw), message_id(&original));
-        }
-        assert_eq!(
-            parse(GMAIL_UI_DRAFT.as_bytes()).message_id(),
-            parse(
-                &DraftEdit {
-                    body: Some("New.".to_string()),
+        let message_id_field = |raw: &[u8]| {
+            let split = split_message(raw);
+            parse_fields(split.headers, split.eol)
+                .into_iter()
+                .find(|f| f.is_named("Message-ID"))
+                .map(|f| f.bytes)
+        };
+        let edits = || {
+            [
+                DraftEdit {
+                    subject: Some("New".to_string()),
                     ..DraftEdit::default()
-                }
-                .apply(GMAIL_UI_DRAFT.as_bytes())
-                .unwrap()
-                .raw
-            )
-            .message_id()
-        );
+                },
+                DraftEdit {
+                    body: Some("New.".to_string()),
+                    attach: vec![attachment("n.txt", "text/plain", b"note")],
+                    ..DraftEdit::default()
+                },
+            ]
+        };
+        for original in [composed.as_slice(), GMAIL_UI_DRAFT.as_bytes()] {
+            let id = message_id_field(original).expect("the draft has a Message-ID");
+            for edit in edits() {
+                let edited = edit.apply(original).unwrap();
+                assert_eq!(message_id_field(&edited.raw).as_ref(), Some(&id));
+            }
+        }
     }
 
     #[test]

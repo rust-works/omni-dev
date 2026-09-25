@@ -180,20 +180,31 @@ impl JsonlSerialize for CreatedDraft {
 /// Split from [`CreateCommand::execute`] so tests can inject a wiremock
 /// client and in-memory inputs.
 async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDraft> {
-    let (raw, thread_id) = match input {
-        DraftInput::Raw(raw) => (raw, None),
+    let (raw, thread_id, fallback_warning) = match input {
+        DraftInput::Raw(raw) => (raw, None, None),
         DraftInput::Compose(compose) => {
-            // Bad input fails here, before the reply lookup costs a request.
+            // Bad input fails here, before the lookups cost a request.
             let recipients = Recipients::parse(&compose)?;
-            let reply = match &compose.reply_to {
-                Some(id) => Some(fetch_reply_context(client, id).await?),
-                None => None,
-            };
+            // The two lookups are independent, so they share a round trip.
+            let (reply, domain) = tokio::join!(
+                async {
+                    match &compose.reply_to {
+                        Some(id) => fetch_reply_context(client, id).await.map(Some),
+                        None => Ok(None),
+                    }
+                },
+                fetch_message_id_domain(client),
+            );
+            let reply = reply?;
             let thread_id = reply.as_ref().map(|reply| reply.thread_id.clone());
-            let domain = fetch_message_id_domain(client).await;
+            let (domain, fallback_warning) = match domain {
+                Ok(domain) => (Some(domain), None),
+                Err(warning) => (None, Some(warning)),
+            };
             (
                 compose_message(compose, recipients, reply, domain)?,
                 thread_id,
+                fallback_warning,
             )
         }
     };
@@ -201,6 +212,11 @@ async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDr
         .create(&raw, thread_id.as_deref())
         .await
         .map_err(with_modify_scope_hint)?;
+    // Only once the draft exists: a lookup that failed for the same reason
+    // as the create would otherwise warn about a draft that never was.
+    if let Some(warning) = fallback_warning {
+        eprintln!("warning: {warning}");
+    }
     Ok(CreatedDraft {
         draft_id: draft.id,
         message_id: draft.message.id,
@@ -222,28 +238,26 @@ async fn fetch_reply_context(client: &GmailClient, message_id: &str) -> Result<R
 ///
 /// Asks `users.getProfile` (which `gmail.readonly` allows) rather than the
 /// cached `email_address` in settings, which is display-only and missing
-/// for accounts set up before it existed. Never fails the command: on any
-/// error it warns and returns `None`, leaving `mail-builder`'s
-/// `@localhost` id in place.
-async fn fetch_message_id_domain(client: &GmailClient) -> Option<String> {
-    let email = match ProfileApi::new(client).get().await {
-        Ok(profile) => profile.email_address,
-        Err(err) => {
-            eprintln!(
-                "warning: could not look up the account's address ({err:#}); the draft's \
-                 Message-ID will end in @localhost."
-            );
-            return None;
-        }
-    };
-    let domain = message_id_domain(&email);
-    if domain.is_none() {
-        eprintln!(
-            "warning: the account's address {email:?} has no usable domain; the draft's \
-             Message-ID will end in @localhost."
-        );
-    }
-    domain
+/// for accounts set up before it existed. Never fails the command: the
+/// `Err` is a warning for the caller to print, and the draft keeps
+/// `mail-builder`'s `@localhost` id.
+async fn fetch_message_id_domain(client: &GmailClient) -> std::result::Result<String, String> {
+    let email = ProfileApi::new(client)
+        .get()
+        .await
+        .map_err(|err| {
+            format!(
+                "could not look up the account's address ({err:#}); the draft's Message-ID \
+                 ends in @localhost."
+            )
+        })?
+        .email_address;
+    message_id_domain(&email).ok_or_else(|| {
+        format!(
+            "the account's address {email:?} has no usable domain; the draft's Message-ID \
+             ends in @localhost."
+        )
+    })
 }
 
 /// The parsed `--to`/`--cc`/`--bcc` values.
@@ -589,18 +603,14 @@ mod tests {
         let client = client_with_bootstrapped_token(&server).await;
         mount_profile(&server, "me@[127.0.0.1]").await;
 
-        assert_eq!(fetch_message_id_domain(&client).await, None);
+        let warning = fetch_message_id_domain(&client).await.unwrap_err();
+        assert!(warning.contains("no usable domain"), "{warning}");
     }
 
     #[tokio::test]
     async fn run_create_raw_never_asks_for_the_profile() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
-        wiremock::Mock::given(wiremock::matchers::path(PROFILE_PATH))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&server)
-            .await;
         mount_create(&server, "t-new").await;
 
         run_create(
@@ -609,6 +619,8 @@ mod tests {
         )
         .await
         .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|r| r.url.path() != PROFILE_PATH));
     }
 
     #[tokio::test]
