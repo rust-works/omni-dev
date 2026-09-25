@@ -390,7 +390,10 @@ impl Recipients {
         let exclude: Vec<String> = own.iter().cloned().chain(named.iter().cloned()).collect();
         let (mut to, mut cc) = reply.default_recipients(reply_all, &exclude);
         if default_to && to.is_empty() && cc.is_empty() && named.is_empty() {
-            (to, cc) = reply.default_recipients(reply_all, &[]);
+            // A note to self goes back to its primary target only: reply-all's
+            // extras are all the account's own addresses here, and must stay
+            // filtered.
+            (to, cc) = reply.default_recipients(false, &[]);
         }
         if default_to && to.is_empty() && default_cc {
             to = std::mem::take(&mut cc);
@@ -1512,6 +1515,26 @@ mod tests {
                 .unwrap();
             assert_eq!(filled.to, parsed(&["me@example.org"]));
         }
+    }
+
+    #[test]
+    fn fill_from_reply_keeps_aliases_out_of_a_note_to_self() {
+        let reply = ReplyContext {
+            sent_by_me: true,
+            from: parsed(&["me@example.org"]),
+            to: parsed(&["me@example.org", "alias@example.net"]),
+            cc: parsed(&["alias@example.net"]),
+            ..ReplyContext::default()
+        };
+        let own = [
+            "me@example.org".to_string(),
+            "alias@example.net".to_string(),
+        ];
+        let (filled, _) = recipients(&[], &[])
+            .fill_from_reply(&reply, true, &own)
+            .unwrap();
+        assert_eq!(filled.to, parsed(&["me@example.org", "alias@example.net"]));
+        assert!(filled.cc.is_empty(), "{:?}", filled.cc);
     }
 
     #[test]
