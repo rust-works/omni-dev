@@ -1872,6 +1872,22 @@ mod tests {
     }
 
     #[test]
+    fn a_sessions_first_pid_sighting_is_not_a_replacement() {
+        let reg = SessionsRegistry::new();
+        // Some feeds (e.g. the transcript watcher) can create an entry with no
+        // pid at all; its first sighting of one has no prior owner to replace.
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::TranscriptDiscovered,
+            None,
+        ));
+        reg.observe(observe_from("s1", SessionEvent::PostToolUse, 100));
+        let guard = reg.lock_sessions();
+        assert_eq!(guard["s1"].pid, Some(100));
+        assert!(guard["s1"].replaced_pids.is_empty());
+    }
+
+    #[test]
     fn end_then_start_resume_ordering_is_unchanged() {
         // #1946's ordering: the old process ends first, then the new one starts.
         let reg = SessionsRegistry::new();
