@@ -3,7 +3,9 @@
 use anyhow::Result;
 use clap::Parser;
 
-use crate::cli::gmail::read::{emit_message, fetch_format, ReadDetail, ReadOutputFormat};
+use crate::cli::gmail::read::{
+    emit_message, fetch_format, MessageOutputArgs, ReadDetail, ReadOutputFormat, Shown,
+};
 use crate::gmail::client::GmailClient;
 use crate::gmail::drafts_api::DraftsApi;
 
@@ -18,37 +20,23 @@ pub struct ShowCommand {
     /// Gmail draft id (the `DRAFT_ID` column of `gmail draft list`).
     pub draft_id: String,
 
-    /// Output file (writes to stdout if omitted). With `--detail raw`, this
-    /// is the draft's exact RFC 2822 bytes, i.e. an `.eml` file.
-    #[arg(long = "out-file", value_name = "PATH")]
-    pub out_file: Option<String>,
-
-    /// How much of the draft's message to fetch.
-    #[arg(long, value_enum, default_value_t = ReadDetail::Full)]
-    pub detail: ReadDetail,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = ReadOutputFormat::Table)]
-    pub output: ReadOutputFormat,
-
-    /// Collapses `>`-quoted reply history nested more than one level deep
-    /// into a one-line `*(N quoted lines omitted)*` marker. Only affects
-    /// `-o markdown`, as with `gmail read`.
-    #[arg(long)]
-    pub fold_quotes: bool,
+    /// Output flags shared with `gmail read`.
+    #[command(flatten)]
+    pub args: MessageOutputArgs,
 }
 
 impl ShowCommand {
     /// Runs the command against the shared client resolved by the parent
     /// `GmailCommand::execute`.
     pub async fn execute(self, client: &GmailClient) -> Result<()> {
+        let args = self.args;
         run_show(
             client,
             &self.draft_id,
-            self.detail,
-            self.out_file.as_deref(),
-            &self.output,
-            self.fold_quotes,
+            args.detail,
+            args.out_file.as_deref(),
+            &args.output,
+            args.fold_quotes,
         )
         .await
     }
@@ -69,15 +57,7 @@ async fn run_show(
     let draft = DraftsApi::new(client)
         .get(draft_id, fetch_format(detail, output))
         .await?;
-    emit_message(
-        &draft,
-        &draft.message,
-        Some(&draft.id),
-        detail,
-        out_file,
-        output,
-        fold_quotes,
-    )
+    emit_message(Shown::Draft(&draft), detail, out_file, output, fold_quotes)
 }
 
 #[cfg(test)]
@@ -212,7 +192,10 @@ mod tests {
         .unwrap();
 
         let markdown = std::fs::read_to_string(&path).unwrap();
-        assert!(markdown.contains("# Draft"), "{markdown}");
+        assert!(
+            markdown.starts_with("# Draft\n\n- **Draft-Id:** r1\n"),
+            "{markdown}"
+        );
         assert!(
             markdown.contains("- **Bcc:** hidden@example.com"),
             "{markdown}"

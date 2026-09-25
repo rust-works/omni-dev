@@ -7205,10 +7205,10 @@ Arguments:
   <DRAFT_ID>  Gmail draft id (the `DRAFT_ID` column of `gmail draft list`)
 
 Options:
-      --out-file <PATH>  Output file (writes to stdout if omitted). With `--detail raw`, this is the draft's exact RFC 2822 bytes, i.e. an `.eml` file
-      --detail <DETAIL>  How much of the draft's message to fetch [default: full] [possible values: minimal, metadata, full, raw]
+      --out-file <PATH>  Output file (writes to stdout if omitted). With `--detail raw`, the message's exact RFC 2822 bytes, i.e. an `.eml` file
+      --detail <DETAIL>  How much of the message to fetch [default: full] [possible values: minimal, metadata, full, raw]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl, markdown]
-      --fold-quotes      Collapses `>`-quoted reply history nested more than one level deep into a one-line `*(N quoted lines omitted)*` marker. Only affects `-o markdown`, as with `gmail read`
+      --fold-quotes      Collapses `>`-quoted reply history nested more than one level deep into a one-line `*(N quoted lines omitted)*` marker (#1514). Only affects `-o markdown`, mirroring `--detail`'s reverse asymmetry (it is silently ignored elsewhere). Off by default: verbatim rendering is fully information-preserving, and the full text is one re-render away without this flag
   -h, --help             Print help (see more with '--help')
 
 
@@ -7332,7 +7332,7 @@ Arguments:
   <MESSAGE_ID>  Gmail message id
 
 Options:
-      --out-file <PATH>  Output file (writes to stdout if omitted)
+      --out-file <PATH>  Output file (writes to stdout if omitted). With `--detail raw`, the message's exact RFC 2822 bytes, i.e. an `.eml` file
       --detail <DETAIL>  How much of the message to fetch [default: full] [possible values: minimal, metadata, full, raw]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl, markdown]
       --fold-quotes      Collapses `>`-quoted reply history nested more than one level deep into a one-line `*(N quoted lines omitted)*` marker (#1514). Only affects `-o markdown`, mirroring `--detail`'s reverse asymmetry (it is silently ignored elsewhere). Off by default: verbatim rendering is fully information-preserving, and the full text is one re-render away without this flag

@@ -405,10 +405,12 @@ mod tests {
     async fn dispatch_routes_read() {
         let cmd = GmailSubcommands::Read(read::ReadCommand {
             message_id: "msg1".to_string(),
-            out_file: None,
-            detail: read::ReadDetail::Full,
-            output: read::ReadOutputFormat::Table,
-            fold_quotes: false,
+            args: read::MessageOutputArgs {
+                out_file: None,
+                detail: read::ReadDetail::Full,
+                output: read::ReadOutputFormat::Table,
+                fold_quotes: false,
+            },
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
@@ -449,10 +451,12 @@ mod tests {
         let cmd = GmailSubcommands::Draft(draft::DraftCommand {
             command: draft::DraftSubcommands::Show(draft::show::ShowCommand {
                 draft_id: "r1".to_string(),
-                out_file: None,
-                detail: read::ReadDetail::Full,
-                output: read::ReadOutputFormat::Table,
-                fold_quotes: false,
+                args: read::MessageOutputArgs {
+                    out_file: None,
+                    detail: read::ReadDetail::Full,
+                    output: read::ReadOutputFormat::Table,
+                    fold_quotes: false,
+                },
             }),
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
