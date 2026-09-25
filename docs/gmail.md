@@ -610,16 +610,22 @@ review and send.
   primary address's, as Gmail itself does for a nameless alias. When that
   leaves the primary address with no name at all, `From` is left out, so
   Gmail fills in the address and your account name rather than a bare
-  address. The `Message-ID` then ends in the `From` address's domain. No new
-  scope is needed: `gmail.modify` (and even `gmail.readonly`) allows the
-  call. `--from` doesn't change who a `--reply-to` draft is addressed to.
-- **Message-ID.** Ends in the `--from` address's domain, or else the
-  account's own domain (for example `<…@gmail.com>`), looked up with one
-  `users.getProfile` call, which `gmail.readonly` allows, alongside any
-  `--reply-to` lookup. If that call fails, the id ends in `@localhost`
-  instead and a warning is printed once the draft has been created. `--raw`
-  messages keep whatever `Message-ID` they carry, and so does every
-  [`draft update`](#updating-drafts).
+  address. The uploaded `Message-ID` then ends in the `From` address's
+  domain. No new scope is needed: `gmail.modify` (and even
+  `gmail.readonly`) allows the call. `--from` doesn't change who a
+  `--reply-to` draft is addressed to.
+- **Message-ID.** The uploaded id ends in the `--from` address's domain,
+  or else the account's own domain (for example `<…@gmail.com>`), looked
+  up with one `users.getProfile` call, which `gmail.readonly` allows,
+  alongside any `--reply-to` lookup. If that call fails, the id ends in
+  `@localhost` instead and a warning is printed once the draft has been
+  created. **Gmail doesn't keep it:** every save, by `draft create` or
+  [`draft update`](#updating-drafts), `--raw` included, gives the stored
+  draft a `Message-ID` of Gmail's own (`<…@mail.gmail.com>`) and a new
+  `Date`, so `draft show` returns those rather than the uploaded values.
+  What id the message carries once it is sent from the Gmail UI is
+  unverified ([#1953](https://github.com/rust-works/omni-dev/issues/1953)),
+  which is why the uploaded one is still made valid.
 - **Replies.** `--reply-to` takes the **Gmail message id** of the message
   being answered, as `gmail search`/`read` print it, not its `Message-ID`
   header. Gmail only files a reply into the original's thread when the
@@ -675,9 +681,9 @@ review and send.
   address (`j.doe+x@gmail.com` for `jdoe@gmail.com`) are **not** recognised
   as yours. `Mail-Followup-To`/`Mail-Reply-To` are ignored.
 - **`--raw FILE`** uploads a complete RFC 5322 message byte for byte, with
-  no parsing or line-ending changes. It can't be combined with any of the
-  composing flags, `--from` included: the file's own `From` is uploaded
-  unchecked.
+  no parsing or line-ending changes (Gmail still replaces its `Message-ID`
+  and `Date` on save). It can't be combined with any of the composing
+  flags, `--from` included: the file's own `From` is uploaded unchecked.
 - **Size.** Messages over Gmail's 35 MB per-message limit are refused
   before any request is sent. This is the same limit as [Insert](#insert).
   Attachments are checked on disk before they're read, with base64's growth
@@ -717,9 +723,12 @@ edit is required. Nothing is sent.
 Gmail's `drafts.update` has no partial form: every update replaces the whole
 message. So `draft update` reads the stored message
 (`drafts.get?format=raw`), changes only what the flags name, and uploads the result.
-**Everything else is kept byte for byte**: `From` (unless `--from` is
-given), `Date`, `Message-ID`, `In-Reply-To`/`References`, any other header,
-the body, and every attachment you didn't name.
+**Everything else is uploaded byte for byte**: `From` (unless `--from` is
+given), `In-Reply-To`/`References`, any other header, the body, and every
+attachment you didn't name. The upload also carries the stored `Date` and
+`Message-ID` unchanged, but Gmail replaces both on every save, as it does
+for `draft create`, so after an update `draft show` returns a new
+`<…@mail.gmail.com>` `Message-ID` and the time of the update as `Date`.
 
 - **Recipients and subject.** `--to`, `--cc`, `--bcc` and `--subject`
   replace just that header, encoded the way `draft create` encodes it. Each
@@ -756,7 +765,8 @@ the body, and every attachment you didn't name.
   `image.png` are removed as `image.png` and `image-1.png`. A name the draft
   doesn't have is an error that lists the names it does have.
 - **`--raw FILE`** replaces the whole message with an `.eml` file, uploaded
-  byte for byte. `draft show --detail raw --out-file` writes such a file.
+  byte for byte (Gmail then replaces its `Message-ID` and `Date`, as on
+  every save). `draft show --detail raw --out-file` writes such a file.
   Use this for anything the flags can't express, such as inline images. It
   can't be combined with the editing flags.
 - **Threads.** The draft's `threadId` is copied from the stored draft into

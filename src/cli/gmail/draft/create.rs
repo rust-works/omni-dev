@@ -360,13 +360,13 @@ async fn fetch_reply_context(client: &GmailClient, message_id: &str) -> Result<R
     ReplyContext::from_message(&original)
 }
 
-/// The account's primary address: the source of the draft's `Message-ID`
+/// The account's primary address: the source of the uploaded `Message-ID`
 /// domain (#1953), and an address a reply leaves out (#1954).
 ///
 /// Asks `users.getProfile` (which `gmail.readonly` allows) rather than the
 /// cached `email_address` in settings, which is display-only and missing
 /// for accounts set up before it existed. Never fails the command: the
-/// `Err` is a warning for the caller to print, and the draft keeps
+/// `Err` is a warning for the caller to print, and the upload carries
 /// `mail-builder`'s `@localhost` id.
 async fn fetch_account_address(client: &GmailClient) -> std::result::Result<String, String> {
     ProfileApi::new(client)
@@ -375,7 +375,7 @@ async fn fetch_account_address(client: &GmailClient) -> std::result::Result<Stri
         .map(|profile| profile.email_address)
         .map_err(|err| {
             format!(
-                "could not look up the account's address ({err:#}); the draft's Message-ID \
+                "could not look up the account's address ({err:#}); the uploaded Message-ID \
                  ends in @localhost."
             )
         })
@@ -386,7 +386,7 @@ async fn fetch_account_address(client: &GmailClient) -> std::result::Result<Stri
 fn message_id_domain_for(email: &str) -> std::result::Result<String, String> {
     message_id_domain(email).ok_or_else(|| {
         format!(
-            "the account's address {email:?} has no usable domain; the draft's Message-ID \
+            "the account's address {email:?} has no usable domain; the uploaded Message-ID \
              ends in @localhost."
         )
     })

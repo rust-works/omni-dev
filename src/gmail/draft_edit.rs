@@ -23,7 +23,9 @@
 //!
 //! Every other top-level header that isn't a `Content-*` header (`From`
 //! unless it is edited, `Date`, `Message-ID`, `In-Reply-To`, `References`,
-//! …) is always kept.
+//! …) is always kept in the upload. Gmail then replaces the stored draft's
+//! `Message-ID` and `Date` on every save (#1966), so those two survive only
+//! as far as the request.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -1522,9 +1524,9 @@ Content-Type: text/html\r\n\r\n<p>x</p>\r\n--r--\r\n"
 
     #[test]
     fn edits_keep_the_drafts_message_id_exactly() {
-        // `draft update` never writes a Message-ID of its own, so a draft
-        // keeps whichever id `draft create` or Gmail gave it, byte for byte
-        // (#1953).
+        // `draft update` never writes a Message-ID of its own: the upload
+        // carries the stored draft's id byte for byte (#1953). Gmail then
+        // assigns a new one on save (#1966), which no test here can see.
         let composed = Composition {
             to: vec![mailbox("a@example.com")],
             subject: "Hi".to_string(),

@@ -22,7 +22,8 @@
 //! - **The `Message-ID`.** `mail-builder` always writes one, and with its
 //!   `gethostname` feature off its host part is `localhost`. A
 //!   [`Composition::message_id_domain`] replaces that with the account's own
-//!   domain (#1953).
+//!   domain (#1953). This is the uploaded id only: Gmail gives the stored
+//!   draft an id of its own on every save (#1966).
 //!
 //! - **HTML bodies.** An HTML body always goes out as `multipart/alternative`
 //!   beside a plain-text part (#1955). [`plain_text_from_html`] derives that
@@ -546,9 +547,10 @@ pub fn check_subject(subject: &str) -> Result<()> {
 impl Composition {
     /// Serialises the message to RFC 5322 bytes with CRLF line endings.
     ///
-    /// The `Message-ID` is `<{random}@{message_id_domain}>`. Whether Gmail
-    /// keeps it when the draft is sent is unverified (#1953), so it is made
-    /// valid either way rather than left as `@localhost`.
+    /// The `Message-ID` is `<{random}@{message_id_domain}>`. Gmail replaces
+    /// it on the stored draft (#1966), but whether the id is also replaced
+    /// when the draft is sent is unverified (#1953), so it is made valid
+    /// either way rather than left as `@localhost`.
     pub fn build(&self) -> Result<Vec<u8>> {
         check_subject(&self.subject)?;
         for attachment in &self.attachments {
