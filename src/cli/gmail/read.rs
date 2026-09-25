@@ -5,14 +5,13 @@ use std::io::Write;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use serde::Serialize;
 
-use crate::cli::gmail::format::{output_as, sanitize_for_terminal, JsonlSerialize, OutputFormat};
+use crate::cli::gmail::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::gmail::client::GmailClient;
 use crate::gmail::messages_api::{MessageFormat, MessagesApi};
 use crate::gmail::raw_message::decode_raw_message;
-use crate::gmail::render::render_markdown;
-use crate::gmail::types::Message;
+use crate::gmail::render::{render_draft_markdown, render_markdown};
+use crate::gmail::types::{DraftDetail, Message};
 
 /// How much of the message to fetch.
 ///
@@ -78,8 +77,8 @@ pub enum ReadOutputFormat {
 
 impl ReadOutputFormat {
     /// Converts to the shared [`OutputFormat`] for the non-`Markdown`
-    /// variants. Never called for `Markdown`, which `run_read` handles
-    /// before this conversion is needed.
+    /// variants. Never called for `Markdown`, which [`emit_message`]
+    /// handles before this conversion is needed.
     fn as_shared(&self) -> OutputFormat {
         match self {
             Self::Table => OutputFormat::Table,
@@ -87,20 +86,17 @@ impl ReadOutputFormat {
             Self::Yaml => OutputFormat::Yaml,
             Self::Yamls => OutputFormat::Yamls,
             Self::Jsonl => OutputFormat::Jsonl,
-            Self::Markdown => unreachable!("Markdown is handled before this point in run_read"),
+            Self::Markdown => unreachable!("Markdown is handled before this point in emit_message"),
         }
     }
 }
 
-/// Reads a single Gmail message.
-///
-/// (mirrors the `gmail_message_read` MCP tool)
-#[derive(Parser)]
-pub struct ReadCommand {
-    /// Gmail message id.
-    pub message_id: String,
-
-    /// Output file (writes to stdout if omitted).
+/// The output flags `gmail read` and `gmail draft show` share, flattened
+/// into both so their flags can't drift apart any more than their output.
+#[derive(clap::Args)]
+pub struct MessageOutputArgs {
+    /// Output file (writes to stdout if omitted). With `--detail raw`, the
+    /// message's exact RFC 2822 bytes, i.e. an `.eml` file.
     #[arg(long = "out-file", value_name = "PATH")]
     pub out_file: Option<String>,
 
@@ -122,17 +118,31 @@ pub struct ReadCommand {
     pub fold_quotes: bool,
 }
 
+/// Reads a single Gmail message.
+///
+/// (mirrors the `gmail_message_read` MCP tool)
+#[derive(Parser)]
+pub struct ReadCommand {
+    /// Gmail message id.
+    pub message_id: String,
+
+    /// Output flags shared with `gmail draft show`.
+    #[command(flatten)]
+    pub args: MessageOutputArgs,
+}
+
 impl ReadCommand {
     /// Runs the command against the shared client resolved by the parent
     /// `GmailCommand::execute`.
     pub async fn execute(self, client: &GmailClient) -> Result<()> {
+        let args = self.args;
         run_read(
             client,
             &self.message_id,
-            self.detail,
-            self.out_file.as_deref(),
-            &self.output,
-            self.fold_quotes,
+            args.detail,
+            args.out_file.as_deref(),
+            &args.output,
+            args.fold_quotes,
         )
         .await
     }
@@ -154,9 +164,7 @@ async fn run_read(
         .get(message_id, fetch_format(detail, output), &[])
         .await?;
     emit_message(
-        &message,
-        &message,
-        None,
+        Shown::Message(&message),
         detail,
         out_file,
         output,
@@ -176,26 +184,67 @@ pub(crate) fn fetch_format(detail: ReadDetail, output: &ReadOutputFormat) -> Mes
     }
 }
 
-/// Emits a fetched message in the requested format.
+/// What [`emit_message`] shows: a message from `gmail read`, or a draft
+/// from `gmail draft show`.
+///
+/// One value rather than a separate record, message and draft id, so a
+/// caller can't pair a draft's JSON with some other message's table.
+#[derive(Clone, Copy)]
+pub(crate) enum Shown<'a> {
+    /// A message, as `messages.get` returned it.
+    Message(&'a Message),
+    /// A draft and its message, as `drafts.get` returned it.
+    Draft(&'a DraftDetail),
+}
+
+impl<'a> Shown<'a> {
+    fn message(self) -> &'a Message {
+        match self {
+            Self::Message(message) => message,
+            Self::Draft(draft) => &draft.message,
+        }
+    }
+
+    fn draft_id(self) -> Option<&'a str> {
+        match self {
+            Self::Message(_) => None,
+            Self::Draft(draft) => Some(&draft.id),
+        }
+    }
+
+    /// Writes the machine formats: the message itself for `read`, and the
+    /// draft's whole `{id, message}` for `draft show`.
+    fn output_as(self, format: &OutputFormat) -> Result<bool> {
+        match self {
+            Self::Message(message) => output_as(message, format),
+            Self::Draft(draft) => output_as(draft, format),
+        }
+    }
+}
+
+/// Emits a fetched message or draft in the requested format.
 ///
 /// This is the whole output path of `gmail read`, shared with `gmail draft
-/// show` so the two can't render a message differently. `record` is what
-/// the machine formats (json/yaml/yamls/jsonl) serialize: `read` passes the
-/// message itself, `draft show` its `{id, message}` draft. `draft_id`, when
-/// given, is shown beside the message id in the human views. `message` must
-/// have been fetched at the format [`fetch_format`] returns for them.
-pub(crate) fn emit_message<T: Serialize + JsonlSerialize>(
-    record: &T,
-    message: &Message,
-    draft_id: Option<&str>,
+/// show` so the two can't render a message differently. A draft adds its
+/// draft id to every view: the machine formats serialize the whole draft,
+/// and the table, plain-text and Markdown views show a `Draft-Id` line.
+/// The message must have been fetched at the format [`fetch_format`]
+/// returns for `detail` and `output`.
+pub(crate) fn emit_message(
+    shown: Shown<'_>,
     detail: ReadDetail,
     out_file: Option<&str>,
     output: &ReadOutputFormat,
     fold_quotes: bool,
 ) -> Result<()> {
+    let message = shown.message();
+    let draft_id = shown.draft_id();
     if matches!(output, ReadOutputFormat::Markdown) {
         let bytes = decode_raw_message(message)?;
-        let markdown = render_markdown(&bytes, fold_quotes);
+        let markdown = match draft_id {
+            Some(draft_id) => render_draft_markdown(&bytes, fold_quotes, draft_id),
+            None => render_markdown(&bytes, fold_quotes),
+        };
 
         if let Some(path) = out_file {
             fs::write(path, &markdown).with_context(|| format!("Failed to write to {path}"))?;
@@ -218,7 +267,7 @@ pub(crate) fn emit_message<T: Serialize + JsonlSerialize>(
         return Ok(());
     }
 
-    if output_as(record, &output.as_shared())? {
+    if shown.output_as(&output.as_shared())? {
         return Ok(());
     }
     let stdout = std::io::stdout();
@@ -384,6 +433,19 @@ mod tests {
         assert!(text.contains("Thread-Id: t1"));
         assert!(text.contains("Labels: INBOX, UNREAD"));
         assert!(text.contains("Snippet: Hi there"));
+    }
+
+    #[test]
+    fn render_read_table_labels_both_ids_for_a_draft() {
+        let message = Message {
+            id: "m1".to_string(),
+            thread_id: Some("t1".to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        render_read_table(&message, Some("r\x1b1"), &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text, "Draft-Id: r1\nMessage-Id: m1\nThread-Id: t1\n");
     }
 
     #[test]
@@ -858,10 +920,12 @@ mod tests {
 
         let cmd = ReadCommand {
             message_id: "m42".to_string(),
-            out_file: None,
-            detail: ReadDetail::Full,
-            output: ReadOutputFormat::Json,
-            fold_quotes: false,
+            args: MessageOutputArgs {
+                out_file: None,
+                detail: ReadDetail::Full,
+                output: ReadOutputFormat::Json,
+                fold_quotes: false,
+            },
         };
         cmd.execute(&client).await.unwrap();
     }

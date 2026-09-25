@@ -17,7 +17,7 @@ use mail_parser::{ContentType, Encoding, Header, HeaderName, MessagePart, PartTy
 
 use crate::gmail::attachments::extract_attachments;
 
-/// Renders `raw` as Markdown: a header block (Subject/From/To/Cc/Bcc/Date/
+/// Renders `raw` as Markdown: a header block (Subject/From/To/Cc/Date/
 /// Message-Id/In-Reply-To/References, RFC 2047-decoded courtesy of
 /// `mail-parser`), the message body (preferring `text/plain`, falling back
 /// to `text/html` converted via `htmd`), and a bullet list of attachment
@@ -33,6 +33,24 @@ use crate::gmail::attachments::extract_attachments;
 /// [`extract_attachments`] takes so a batch caller like `gmail render`
 /// never has one bad file abort the whole run.
 pub(crate) fn render_markdown(raw: &[u8], fold_quotes: bool) -> String {
+    render(raw, fold_quotes, None)
+}
+
+/// Renders a draft's `raw` message as [`render_markdown`] does, with two
+/// additions: a leading `Draft-Id` bullet, the id that stays the same across
+/// saves, and the `Bcc` header.
+///
+/// `Bcc` is draft-only on purpose. A draft's stored message keeps it and
+/// its author needs to see it, but Gmail keeps `Bcc` on Sent mail too, and
+/// `gmail read`/`gmail render` output is the kind of thing people paste
+/// elsewhere, where blind-copied recipients must stay hidden.
+pub(crate) fn render_draft_markdown(raw: &[u8], fold_quotes: bool, draft_id: &str) -> String {
+    render(raw, fold_quotes, Some(draft_id))
+}
+
+/// The body of [`render_markdown`] and [`render_draft_markdown`]; a
+/// `draft_id` switches on the draft-only header bullets.
+fn render(raw: &[u8], fold_quotes: bool, draft_id: Option<&str>) -> String {
     let Some(message) = MessageParser::default().parse(raw) else {
         return "*(unable to parse this message)*\n".to_string();
     };
@@ -40,12 +58,15 @@ pub(crate) fn render_markdown(raw: &[u8], fold_quotes: bool) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# {}\n", message.subject().unwrap_or("(no subject)"));
 
+    if let Some(draft_id) = draft_id {
+        write_header(&mut out, "Draft-Id", Some(draft_id.to_string()));
+    }
     write_header(&mut out, "From", format_address(message.from()));
     write_header(&mut out, "To", format_address(message.to()));
     write_header(&mut out, "Cc", format_address(message.cc()));
-    // Received mail rarely carries `Bcc`, but a draft's stored message
-    // does (`gmail draft show -o markdown`), and there it matters.
-    write_header(&mut out, "Bcc", format_address(message.bcc()));
+    if draft_id.is_some() {
+        write_header(&mut out, "Bcc", format_address(message.bcc()));
+    }
     write_header(
         &mut out,
         "Date",
@@ -257,6 +278,29 @@ mod tests {
         assert!(markdown.contains("- **From:** Alice <a@example.com>"));
         assert!(markdown.contains("- **To:** b@example.com"));
         assert!(markdown.contains("Hi there."));
+    }
+
+    #[test]
+    fn render_markdown_never_shows_bcc() {
+        let raw = b"Subject: Sent\r\nTo: b@example.com\r\nBcc: hidden@example.com\r\n\r\nHi.";
+        let markdown = render_markdown(raw, false);
+        assert!(!markdown.contains("hidden@example.com"), "{markdown}");
+        assert!(!markdown.contains("Draft-Id"), "{markdown}");
+    }
+
+    #[test]
+    fn render_draft_markdown_leads_with_the_draft_id_and_shows_bcc() {
+        let raw = b"Subject: Draft\r\nTo: b@example.com\r\nBcc: hidden@example.com\r\n\r\nHi.";
+        let markdown = render_draft_markdown(raw, false, "r1");
+        assert!(
+            markdown.starts_with("# Draft\n\n- **Draft-Id:** r1\n"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("- **Bcc:** hidden@example.com"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("Hi."), "{markdown}");
     }
 
     #[test]

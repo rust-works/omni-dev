@@ -525,8 +525,10 @@ render a message the same way:
 - `--detail minimal|metadata|full|raw` (default `full`) picks how much of
   the message Gmail returns.
 - The default table view prints `Draft-Id`, `Message-Id`, `Thread-Id`,
-  labels and the snippet. `-o markdown` renders the headers (including
-  `Bcc`, which a draft keeps) and the body. `-o json`/`yaml`/`yamls`/`jsonl`
+  labels and the snippet. `-o markdown` renders a `Draft-Id` line, the
+  headers and the body. Unlike `gmail read`, it includes `Bcc`, which a
+  draft keeps. `read` and `render` leave `Bcc` out because Gmail keeps it
+  on Sent mail too, and hiding those recipients is the point of `Bcc`. `-o json`/`yaml`/`yamls`/`jsonl`
   emit Gmail's `drafts.get` response, `{id, message}`, so machine output
   carries the draft id beside the message.
 - `--detail raw --out-file PATH` writes the draft's exact stored RFC 2822
