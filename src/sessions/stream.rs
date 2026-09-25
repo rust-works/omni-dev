@@ -154,8 +154,9 @@ impl StreamTracker {
             model: None,
             // A `claude` that has started but has not been prompted is sitting at
             // the prompt: idle, not "starting". `Starting` stays the hook feed's
-            // (very brief) `SessionStart` state, so both feeds agree that a tab
-            // the user opened and has not typed into is not doing work.
+            // `SessionStart` state, which lasts until the first prompt and which
+            // every consumer counts as idle (#1946), so both feeds agree that a
+            // tab the user opened and has not typed into is not doing work.
             base: SessionState::Idle,
             pending: HashSet::new(),
             reported: None,
