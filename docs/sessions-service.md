@@ -248,9 +248,10 @@ a new `confirm_pid_liveness`:
   immediately, through the same short ended-linger window a clean `SessionEnd`
   uses, instead of lingering for up to 5 minutes.
 - **A pid is alive, its identity is confirmed, the session has had at least one
-  `UserPromptSubmit`, and it is the most recently started `session_id` among
-  every candidate sharing that pid:** refresh `last_seen`, which is all it
-  takes to keep the ordinary TTL reap from ever seeing the entry go stale.
+  `UserPromptSubmit`, and it is the most recently *active* `session_id` (by
+  `last_seen`) among every candidate sharing that pid:** refresh `last_seen`,
+  which is all it takes to keep the ordinary TTL reap from ever seeing the
+  entry go stale.
 
 The two extra conditions on the second bullet close two ways a live pid could
 still be the *wrong* reason to keep a row:
@@ -258,11 +259,15 @@ still be the *wrong* reason to keep a row:
 - **Prompted.** Otherwise a spare process VS Code keeps alive that is never
   prompted would pin a `starting` row forever just because its pid lives — the
   #1454-style pinning bug this feature must not reintroduce.
-- **Most recently started under the pid.** `/clear` (and possibly `/resume`)
-  can start a new `session_id` in the *same* process without necessarily
-  firing `SessionEnd` for the old one, so an older `session_id` a newer one has
-  since taken over falls back to ageing out normally, even though the process
-  itself lives on.
+- **Most recently active under the pid, by `last_seen` rather than creation
+  order.** `/clear` (and possibly `/resume`) can start a new `session_id` in
+  the *same* process without necessarily firing `SessionEnd` for the old one,
+  so an abandoned `session_id` a newer one has since taken over falls back to
+  ageing out normally, even though the process itself lives on. Keying this on
+  `last_seen` rather than when each `session_id` was first created also means
+  a later `/resume` of the older one correctly reclaims the exemption, since
+  activity — not creation order — is what should decide which `session_id`
+  under a pid is the one currently in use.
 
 **Why a watcher, not an inline check.** An earlier version of this feature
 checked pid liveness inline, in the same `reap_sessions` every `observe`/
@@ -306,7 +311,16 @@ A session with no pid at all — an older sink, the transcript watcher, pi, or a
 unsupported platform — gets none of this: pure pre-#1916 TTL aging, same as
 before.
 
-## CLI
+**Known limitation: a Linux subreaper can misattribute a pid.** `agent_pid`
+(#1948) trusts the hook's parent pid outright, treating only pid 1 as an
+orphan. Under a child subreaper (`systemd --user` is one) a `claude` that
+dies mid-hook reparents the hook to the subreaper's own long-lived pid, not to
+1, so the sink would report *that* pid instead. Since a subreaper is always
+alive, the watcher would confirm it immediately and, if the session happens to
+already be `prompted`, exempt it from the TTL indefinitely — the #1454-style
+pinning this feature is otherwise built to avoid. This requires the exact
+double fault of a subreaper *and* a crash mid-hook, and is not otherwise
+mitigated today.
 
 ```bash
 # The live set of running sessions, as a table.

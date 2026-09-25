@@ -491,7 +491,12 @@ pub(crate) struct PidCandidate {
     /// [`SessionEntry::pid_start`]).
     pub(crate) pid_start: Option<String>,
     pub(crate) prompted: bool,
-    pub(crate) started_at: DateTime<Utc>,
+    /// When this session was last seen, used to pick the *currently active*
+    /// session_id among several sharing a pid — not `started_at`, which would
+    /// wrongly keep favouring a `/clear`-abandoned session forever over one a
+    /// later `/resume` reactivated, since creation order never changes but
+    /// `last_seen` moves with whichever session_id is actually receiving hooks.
+    pub(crate) last_seen: DateTime<Utc>,
 }
 
 /// One companion window-embedding report, with its liveness stamp.
@@ -745,7 +750,7 @@ impl SessionsRegistry {
                     pid: e.pid?,
                     pid_start: e.pid_start.clone(),
                     prompted: e.prompted,
-                    started_at: e.started_at,
+                    last_seen: e.last_seen,
                 })
             })
             .collect()
