@@ -466,6 +466,7 @@ mod tests {
     async fn dispatch_routes_draft_create() {
         let cmd = GmailSubcommands::Draft(draft::DraftCommand {
             command: draft::DraftSubcommands::Create(draft::create::CreateCommand {
+                from: None,
                 to: vec!["alice@example.com".to_string()],
                 cc: vec![],
                 bcc: vec![],
@@ -489,6 +490,7 @@ mod tests {
         let cmd = GmailSubcommands::Draft(draft::DraftCommand {
             command: draft::DraftSubcommands::Update(draft::update::UpdateCommand {
                 draft_id: "r1".to_string(),
+                from: None,
                 to: vec![],
                 cc: vec![],
                 bcc: vec![],

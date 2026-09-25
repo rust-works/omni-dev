@@ -21,13 +21,14 @@ use crate::gmail::messages_api::{
     ensure_within_message_limit, MessageFormat, MessagesApi, MAX_INSERT_BYTES,
 };
 use crate::gmail::profile_api::ProfileApi;
-use crate::gmail::send_as_api::SendAsApi;
+use crate::gmail::send_as_api::{resolve_from, SendAs, SendAsApi};
 
 /// What `draft create` does with a message, for size-limit refusals.
 const CREATE_ACTION: &str = "create a draft of";
 
 /// Every composition flag, which `--raw` conflicts with.
-const COMPOSE_ARGS: [&str; 11] = [
+const COMPOSE_ARGS: [&str; 12] = [
+    "from",
     "to",
     "cc",
     "bcc",
@@ -44,9 +45,14 @@ const COMPOSE_ARGS: [&str; 11] = [
 /// Creates a Gmail draft for a person to review and send from Gmail.
 ///
 /// Builds a plain-text message from the flags, or with `--raw` uploads a
-/// complete `.eml` file unchanged. `From` is left to Gmail, which fills in
-/// the account's own address. The body comes from `--body`, `--body-file`,
-/// or else standard input.
+/// complete `.eml` file unchanged. The body comes from `--body`,
+/// `--body-file`, or else standard input.
+///
+/// `From` is left to Gmail, which fills in the account's own address,
+/// unless `--from` names one of the account's send-as addresses. That is
+/// checked first (`users.settings.sendAs.list`): an unknown address, or an
+/// alias still awaiting verification, is refused before anything is
+/// created, and the error lists the addresses the account can use.
 ///
 /// `--html-body` or `--html-body-file` adds an HTML version, sent as
 /// `multipart/alternative` with a plain-text part. That part is `--body`
@@ -67,6 +73,13 @@ const COMPOSE_ARGS: [&str; 11] = [
 /// ever sent: the draft waits in Gmail's Drafts folder.
 #[derive(Parser)]
 pub struct CreateCommand {
+    /// Send as this address: one of the account's verified send-as aliases,
+    /// or its primary address, as `addr@example.com` or
+    /// `"Name <addr@example.com>"`. Without a name, Gmail's name for the
+    /// address is used.
+    #[arg(long, value_name = "ADDR")]
+    pub from: Option<String>,
+
     /// A `To` recipient: `addr@example.com` or `"Name <addr@example.com>"`.
     /// Repeat the flag (or list several after it) for more recipients.
     /// Required unless `--reply-to` is given, which defaults it from the
@@ -158,6 +171,7 @@ impl CreateCommand {
             let body_len = body.len() + html_body.as_ref().map_or(0, String::len);
             let attachments = load_attachments(&self.attach, body_len)?;
             DraftInput::Compose(ComposeInput {
+                from: self.from,
                 to: self.to,
                 cc: self.cc,
                 bcc: self.bcc,
@@ -189,6 +203,7 @@ enum DraftInput {
 /// The unparsed composition flags plus the resolved body and attachments.
 #[derive(Debug, Default)]
 struct ComposeInput {
+    from: Option<String>,
     to: Vec<String>,
     cc: Vec<String>,
     bcc: Vec<String>,
@@ -243,10 +258,13 @@ async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDr
                 !compose.reply_all || compose.reply_to.is_some(),
                 "--reply-all needs --reply-to"
             );
-            // The profile gives the primary address; only a reply-all that
-            // still has a header to fill also needs the send-as aliases.
-            let wants_aliases =
+            // The profile gives the primary address. The send-as aliases are
+            // needed to check `--from`, and by a reply-all that still has a
+            // header to fill. Only the latter leaves them out of the reply,
+            // so `--from` never changes who a reply goes to.
+            let reply_skips_aliases =
                 compose.reply_all && (recipients.to.is_empty() || recipients.cc.is_empty());
+            let wants_aliases = recipients.from.is_some() || reply_skips_aliases;
             // The lookups are independent, so they share a round trip.
             let (reply, account, aliases) = tokio::join!(
                 async {
@@ -258,22 +276,43 @@ async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDr
                 fetch_account_address(client),
                 async {
                     if wants_aliases {
-                        fetch_send_as_addresses(client).await
+                        fetch_send_as(client).await
                     } else {
                         Ok(Vec::new())
                     }
                 },
             );
-            let reply = reply?;
+            // A refused `--from` is reported ahead of a failed reply lookup.
             let aliases = aliases?;
+            let recipients = Recipients {
+                from: recipients
+                    .from
+                    .map(|from| resolve_from(&aliases, &from))
+                    .transpose()?
+                    .flatten(),
+                ..recipients
+            };
+            let reply = reply?;
             let thread_id = reply.as_ref().map(|reply| reply.thread_id.clone());
-            let (domain, fallback_warning) = match account
-                .clone()
-                .and_then(|email| message_id_domain_for(&email))
-            {
+            // The `Message-ID` ends in the sending address's domain.
+            let from_domain = recipients
+                .from
+                .as_ref()
+                .and_then(|from| message_id_domain(&from.email));
+            let domain = match from_domain {
+                Some(domain) => Ok(domain),
+                None => account
+                    .clone()
+                    .and_then(|email| message_id_domain_for(&email)),
+            };
+            let (domain, fallback_warning) = match domain {
                 Ok(domain) => (Some(domain), None),
                 Err(warning) => (None, Some(warning)),
             };
+            let aliases = aliases
+                .into_iter()
+                .filter(|_| reply_skips_aliases)
+                .map(|alias| alias.send_as_email);
             let own: Vec<String> = account.into_iter().chain(aliases).collect();
             let (recipients, mut notes) = match &reply {
                 Some(reply) => recipients.fill_from_reply(reply, compose.reply_all, &own)?,
@@ -353,25 +392,23 @@ fn message_id_domain_for(email: &str) -> std::result::Result<String, String> {
     })
 }
 
-/// The account's send-as addresses (the primary one and every alias), for
-/// `--reply-all` to leave out (#1954).
+/// The account's send-as addresses (the primary one and every alias), to
+/// check `--from` against (#1956) and for a reply to leave out (#1954).
 ///
 /// Unlike [`fetch_account_address`], a failure fails the command: carrying
-/// on would quietly put an alias in its own reply.
-async fn fetch_send_as_addresses(client: &GmailClient) -> Result<Vec<String>> {
-    let send_as = SendAsApi::new(client)
+/// on would write an unchecked `From`, or quietly put an alias in its own
+/// reply.
+pub(super) async fn fetch_send_as(client: &GmailClient) -> Result<Vec<SendAs>> {
+    SendAsApi::new(client)
         .list()
         .await
-        .context("Failed to list the account's send-as addresses for --reply-all")?;
-    Ok(send_as
-        .into_iter()
-        .map(|alias| alias.send_as_email)
-        .collect())
+        .context("Failed to list the account's send-as addresses")
 }
 
-/// The parsed `--to`/`--cc`/`--bcc` values.
+/// The parsed `--from`/`--to`/`--cc`/`--bcc` values.
 #[derive(Debug)]
 struct Recipients {
+    from: Option<Mailbox>,
     to: Vec<Mailbox>,
     cc: Vec<Mailbox>,
     bcc: Vec<Mailbox>,
@@ -383,6 +420,7 @@ impl Recipients {
             values.iter().map(|value| Mailbox::parse(value)).collect()
         };
         Ok(Self {
+            from: input.from.as_deref().map(Mailbox::parse).transpose()?,
             to: parse_all(&input.to)?,
             cc: parse_all(&input.cc)?,
             bcc: parse_all(&input.bcc)?,
@@ -518,6 +556,7 @@ fn compose_message(
         (None, None) => bail!("--subject is required unless --reply-to is given"),
     };
     Composition {
+        from: recipients.from,
         to: recipients.to,
         cc: recipients.cc,
         bcc: recipients.bcc,
@@ -975,6 +1014,7 @@ mod tests {
 
     fn create_command(raw: Option<PathBuf>, output: OutputFormat) -> CreateCommand {
         CreateCommand {
+            from: None,
             to: if raw.is_some() {
                 vec![]
             } else {
@@ -1246,7 +1286,12 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "sendAs": [
                         {"sendAsEmail": "me@example.org", "isPrimary": true},
-                        {"sendAsEmail": "alias@example.net"},
+                        {
+                            "sendAsEmail": "alias@example.net",
+                            "displayName": "Alias Desk",
+                            "verificationStatus": "accepted",
+                        },
+                        {"sendAsEmail": "new@example.net", "verificationStatus": "pending"},
                     ],
                 })),
             )
@@ -1282,6 +1327,7 @@ mod tests {
             .parse(message.as_bytes())
             .unwrap();
         let address = match name {
+            "From" => parsed.from(),
             "To" => parsed.to(),
             "Cc" => parsed.cc(),
             _ => parsed.bcc(),
@@ -1552,12 +1598,195 @@ mod tests {
         }
     }
 
+    // ── --from (#1956) ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_create_writes_a_checked_from_with_the_aliases_display_name() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "me@example.org").await;
+        mount_send_as(&server, 1).await;
+        mount_create(&server, "t-new").await;
+
+        let input = ComposeInput {
+            from: Some("ALIAS@example.net".to_string()),
+            ..compose("alice@example.com", Some("Hi"))
+        };
+        run_create(&client, DraftInput::Compose(input))
+            .await
+            .unwrap();
+        assert_eq!(uploaded(&server, "From").await, ["alias@example.net"]);
+        assert!(uploaded_message_id(&server).await.ends_with("@example.net"));
+        let body = create_request_body(&server).await;
+        assert!(
+            body.contains("From: \"Alias Desk\" <alias@example.net>\r\n"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_create_refuses_an_unknown_or_unverified_from_before_creating() {
+        for (from, expected) in [
+            (
+                "stranger@example.com",
+                "not one of this account's send-as addresses",
+            ),
+            ("new@example.net", "awaiting verification"),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            let client = client_with_bootstrapped_token(&server).await;
+            mount_send_as(&server, 1).await;
+            mount_no_create(&server).await;
+
+            let input = ComposeInput {
+                from: Some(from.to_string()),
+                ..compose("alice@example.com", Some("Hi"))
+            };
+            let err = run_create(&client, DraftInput::Compose(input))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_create_rejects_a_malformed_from_before_any_request() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_send_as(&server, 0).await;
+        mount_no_create(&server).await;
+
+        let input = ComposeInput {
+            from: Some("me@example.org\r\nBcc: eve@example.com".to_string()),
+            ..compose("alice@example.com", Some("Hi"))
+        };
+        let err = run_create(&client, DraftInput::Compose(input))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid address"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_create_from_with_reply_all_lists_the_aliases_once() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_original(
+            &server,
+            &[("From", "alice@example.com"), ("Cc", "alias@example.net")],
+            &["INBOX"],
+        )
+        .await;
+        mount_profile(&server, "me@example.org").await;
+        mount_send_as(&server, 1).await;
+        mount_create(&server, "t-orig").await;
+
+        let input = ComposeInput {
+            from: Some("alias@example.net".to_string()),
+            ..reply_input(true)
+        };
+        run_create(&client, DraftInput::Compose(input))
+            .await
+            .unwrap();
+        assert_eq!(uploaded(&server, "From").await, ["alias@example.net"]);
+        assert_eq!(uploaded(&server, "To").await, ["alice@example.com"]);
+        assert!(uploaded(&server, "Cc").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_create_from_does_not_change_who_a_plain_reply_goes_to() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_original(
+            &server,
+            &[
+                ("From", "alias@example.net"),
+                ("To", "alias@example.net, bob@example.com"),
+            ],
+            &["SENT"],
+        )
+        .await;
+        mount_profile(&server, "me@example.org").await;
+        mount_send_as(&server, 1).await;
+        mount_create(&server, "t-orig").await;
+
+        let input = ComposeInput {
+            from: Some("alias@example.net".to_string()),
+            ..reply_input(false)
+        };
+        run_create(&client, DraftInput::Compose(input))
+            .await
+            .unwrap();
+        // As without `--from`: a plain reply only knows the primary address.
+        assert_eq!(
+            uploaded(&server, "To").await,
+            ["alias@example.net", "bob@example.com"]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_create_from_needs_no_profile_for_the_message_id() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(PROFILE_PATH))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        mount_send_as(&server, 1).await;
+        mount_create(&server, "t-new").await;
+
+        let input = ComposeInput {
+            from: Some("alias@example.net".to_string()),
+            ..compose("alice@example.com", Some("Hi"))
+        };
+        run_create(&client, DraftInput::Compose(input))
+            .await
+            .unwrap();
+        assert!(uploaded_message_id(&server).await.ends_with("@example.net"));
+    }
+
+    #[tokio::test]
+    async fn run_create_from_the_nameless_primary_leaves_from_to_gmail() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "me@example.org").await;
+        mount_send_as(&server, 1).await;
+        mount_create(&server, "t-new").await;
+
+        let input = ComposeInput {
+            from: Some("me@example.org".to_string()),
+            ..compose("alice@example.com", Some("Hi"))
+        };
+        run_create(&client, DraftInput::Compose(input))
+            .await
+            .unwrap();
+        assert!(uploaded(&server, "From").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_create_reports_a_refused_from_before_a_failed_reply_lookup() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_send_as(&server, 1).await;
+        mount_no_create(&server).await;
+
+        let input = ComposeInput {
+            from: Some("stranger@example.com".to_string()),
+            ..reply_input(false)
+        };
+        let err = run_create(&client, DraftInput::Compose(input))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("send-as addresses"), "{err}");
+    }
+
     fn parsed(values: &[&str]) -> Vec<Mailbox> {
         values.iter().map(|v| Mailbox::parse(v).unwrap()).collect()
     }
 
     fn recipients(to: &[&str], cc: &[&str]) -> Recipients {
         Recipients {
+            from: None,
             to: parsed(to),
             cc: parsed(cc),
             bcc: Vec::new(),
@@ -2103,6 +2332,7 @@ mod tests {
             &["--attach", "f"],
             &["--reply-to", "m1"],
             &["--reply-all"],
+            &["--from", "a@example.com"],
         ] {
             let mut args = vec!["--raw", "m.eml"];
             args.extend(flag);
