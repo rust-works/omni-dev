@@ -27,6 +27,7 @@
 //! Only `text/plain` bodies are built. `From` is never set: Gmail fills in the
 //! authenticated account's address.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use anyhow::{bail, ensure, Result};
@@ -87,12 +88,8 @@ impl Mailbox {
             }
             _ => (None, trimmed),
         };
-        validate_email(email)
-            .map_err(|reason| anyhow::anyhow!("invalid address {input:?}: {reason}"))?;
-        Ok(Self {
-            name,
-            email: email.to_string(),
-        })
+        Self::checked(name, email)
+            .map_err(|reason| anyhow::anyhow!("invalid address {input:?}: {reason}"))
     }
 
     /// Builds a mailbox from an already-split name and address, such as one
@@ -102,19 +99,30 @@ impl Mailbox {
     /// *after* decoding, since an RFC 2047 encoded word can carry a CR, LF
     /// or ESC that the raw header never showed. An empty name is `None`.
     pub fn from_parts(name: Option<&str>, email: &str) -> Result<Self> {
-        let name = name.map(str::trim).filter(|name| !name.is_empty());
-        ensure!(
-            !email
-                .chars()
-                .chain(name.unwrap_or_default().chars())
-                .any(char::is_control),
-            "invalid address {email:?}: control characters (such as a line break) are not allowed"
-        );
-        let email = email.trim();
-        validate_email(email)
-            .map_err(|reason| anyhow::anyhow!("invalid address {email:?}: {reason}"))?;
+        // Trim spaces only, so a stray CR/LF at either end is still seen
+        // (and refused) by `checked` rather than quietly trimmed away.
+        let name = name
+            .map(|name| name.trim_matches(' '))
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        Self::checked(name, email.trim_matches(' '))
+            .map_err(|reason| anyhow::anyhow!("invalid address {email:?}: {reason}"))
+    }
+
+    /// The checks [`Mailbox::parse`] and [`Mailbox::from_parts`] share: no
+    /// control character in the name or address (CR/LF would inject a
+    /// header), then [`validate_email`].
+    fn checked(name: Option<String>, email: &str) -> std::result::Result<Self, &'static str> {
+        if email
+            .chars()
+            .chain(name.iter().flat_map(|name| name.chars()))
+            .any(char::is_control)
+        {
+            return Err("control characters (such as a line break) are not allowed");
+        }
+        validate_email(email)?;
         Ok(Self {
-            name: name.map(str::to_string),
+            name,
             email: email.to_string(),
         })
     }
@@ -211,8 +219,8 @@ pub struct ReplyContext {
     /// also covers send-as aliases).
     pub sent_by_me: bool,
     /// Addresses in the original's address headers that could not be used,
-    /// as `Header: address`, for the caller to warn about.
-    pub skipped: Vec<String>,
+    /// as `(header, address)`, for the caller to warn about.
+    pub skipped: Vec<(&'static str, String)>,
 }
 
 impl ReplyContext {
@@ -228,10 +236,9 @@ impl ReplyContext {
         let payload = message.payload.as_ref();
         let ids = |name| parse_msg_ids(&header_value(payload, name).unwrap_or_default());
         let mut skipped = Vec::new();
-        let mut addresses = |name| {
-            let (mailboxes, bad) =
-                parse_address_header(name, &header_value(payload, name).unwrap_or_default());
-            skipped.extend(bad.into_iter().map(|bad| format!("{name}: {bad}")));
+        let mut addresses = |name: &'static str| {
+            let (mailboxes, bad) = parse_address_header(name, &all_header_values(payload, name));
+            skipped.extend(bad.into_iter().map(|bad| (name, bad)));
             mailboxes
         };
         Ok(Self {
@@ -283,18 +290,11 @@ impl ReplyContext {
             }
             cc_candidates.extend(&self.cc);
         }
-        let mut seen: Vec<String> = exclude.iter().map(|email| email.to_lowercase()).collect();
+        let mut seen: HashSet<String> = exclude.iter().map(|email| email.to_lowercase()).collect();
         let mut keep_new = |candidates: Vec<&Mailbox>| -> Vec<Mailbox> {
             candidates
                 .into_iter()
-                .filter(|mailbox| {
-                    let email = mailbox.email.to_lowercase();
-                    let new = !seen.contains(&email);
-                    if new {
-                        seen.push(email);
-                    }
-                    new
-                })
+                .filter(|mailbox| seen.insert(mailbox.email.to_lowercase()))
                 .cloned()
                 .collect()
         };
@@ -388,6 +388,26 @@ fn parse_msg_ids(value: &str) -> Vec<String> {
     ids
 }
 
+/// Every value of the header `name`, joined with `, `. A long recipient
+/// list is sometimes split over several `To`/`Cc` headers, and
+/// [`header_value`] returns only the first.
+fn all_header_values(payload: Option<&serde_json::Value>, name: &str) -> String {
+    payload
+        .and_then(|payload| payload.get("headers"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|header| {
+            header
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+        .filter_map(|header| header.get("value").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Decodes the address header `name` (one of `From`, `Reply-To`, `To` or
 /// `Cc`) with `mail-parser`, which handles RFC 2047 encoded words, quoted
 /// names, comments and groups (`Team: a@x, b@y;`, whose members are
@@ -398,10 +418,20 @@ fn parse_msg_ids(value: &str) -> Vec<String> {
 /// to warn about. An empty group such as `undisclosed-recipients:;` yields
 /// neither.
 fn parse_address_header(name: &str, value: &str) -> (Vec<Mailbox>, Vec<String>) {
-    // Unfold, and make sure the value can't end the synthetic header early.
+    // Unfold as RFC 5322 does (drop the CRLF, keep the whitespace after it),
+    // then turn any stray CR, LF or tab into a space: a folded quoted name
+    // would otherwise keep the fold's tab (a control character), and a lone
+    // line break must not end the synthetic header early.
     let value: String = value
+        .replace("\r\n", "")
         .chars()
-        .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
+        .map(|c| {
+            if matches!(c, '\r' | '\n' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let raw = format!("{name}: {value}\r\n\r\n");
     let Some(parsed) = MessageParser::default().parse_headers(raw.as_bytes()) else {
@@ -1031,7 +1061,27 @@ mod tests {
             "=?UTF-8?Q?Eve=0D=0ABcc:_x@example.com?= <eve@example.com>, ok@example.com",
         )]);
         assert_eq!(emails(&reply.cc), ["ok@example.com"]);
-        assert_eq!(reply.skipped, ["Cc: eve@example.com"]);
+        assert_eq!(reply.skipped, [("Cc", "eve@example.com".to_string())]);
+    }
+
+    #[test]
+    fn reply_context_reads_every_repeated_address_header() {
+        let reply = recipients_of(&[
+            ("Cc", "a@example.com"),
+            ("To", "t@example.com"),
+            ("cc", "b@example.com, c@example.com"),
+        ]);
+        assert_eq!(
+            emails(&reply.cc),
+            ["a@example.com", "b@example.com", "c@example.com"]
+        );
+    }
+
+    #[test]
+    fn reply_context_unfolds_a_tab_in_a_quoted_name() {
+        let reply = recipients_of(&[("To", "\"Doe,\r\n\tJane\" <jane@example.com>")]);
+        assert_eq!(reply.to.len(), 1, "{:?}", reply.skipped);
+        assert_eq!(reply.to[0].name.as_deref(), Some("Doe, Jane"));
     }
 
     #[test]
