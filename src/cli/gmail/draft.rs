@@ -6,6 +6,7 @@
 pub(crate) mod create;
 pub(crate) mod list;
 pub(crate) mod show;
+pub(crate) mod update;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -29,6 +30,9 @@ pub enum DraftSubcommands {
     Show(show::ShowCommand),
     /// Creates a draft to review and send from Gmail (needs `gmail.modify`).
     Create(create::CreateCommand),
+    /// Updates a draft in place, keeping its id and thread (needs
+    /// `gmail.modify`).
+    Update(update::UpdateCommand),
 }
 
 impl DraftCommand {
@@ -38,6 +42,7 @@ impl DraftCommand {
             DraftSubcommands::List(cmd) => cmd.execute(client).await,
             DraftSubcommands::Show(cmd) => cmd.execute(client).await,
             DraftSubcommands::Create(cmd) => cmd.execute(client).await,
+            DraftSubcommands::Update(cmd) => cmd.execute(client).await,
         }
     }
 }
