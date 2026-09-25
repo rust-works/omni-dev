@@ -415,6 +415,7 @@ fn state_label(state: SessionState) -> &'static str {
 mod tests {
     use super::*;
     use crate::sessions::{NotificationKind, SessionEvent, Source};
+    use std::collections::VecDeque;
     use std::path::PathBuf;
 
     fn service() -> SessionsService {
@@ -553,7 +554,7 @@ mod tests {
         let now = chrono::Utc::now();
         let base = |source: Source| SessionEntry {
             pid: None,
-            replaced_pids: Vec::new(),
+            replaced_pids: VecDeque::new(),
             agent: crate::sessions::Agent::Claude,
             session_id: "sid-12345678".to_string(),
             cwd: Some(PathBuf::from("/p")),
@@ -604,7 +605,7 @@ mod tests {
         let now = chrono::Utc::now();
         SessionEntry {
             pid: None,
-            replaced_pids: Vec::new(),
+            replaced_pids: VecDeque::new(),
             agent: crate::sessions::Agent::Claude,
             session_id: id.to_string(),
             cwd: cwd.map(PathBuf::from),

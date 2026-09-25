@@ -41,7 +41,7 @@
 //! [`codex_watcher`] supplements it from Codex's rollout files and thread locks:
 //! discovery, archive and killed-process ends, and idle liveness (#1909).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -444,7 +444,7 @@ pub struct SessionEntry {
     /// at [`MAX_REPLACED_PIDS`] — the old processes of in-place resumes. An
     /// `end` from one of them is ignored (#1948).
     #[serde(skip)]
-    pub(crate) replaced_pids: Vec<u32>,
+    pub(crate) replaced_pids: VecDeque<u32>,
 }
 
 /// One companion window-embedding report, with its liveness stamp.
@@ -621,7 +621,7 @@ impl SessionsRegistry {
                             started_at: now,
                             last_seen: now,
                             pid: req.pid,
-                            replaced_pids: Vec::new(),
+                            replaced_pids: VecDeque::new(),
                         },
                     );
                     true
@@ -816,9 +816,9 @@ fn track_pid(entry: &mut SessionEntry, pid: Option<u32>) {
     }
     if let Some(owner) = entry.pid.replace(pid) {
         if entry.replaced_pids.len() >= MAX_REPLACED_PIDS {
-            entry.replaced_pids.remove(0);
+            entry.replaced_pids.pop_front();
         }
-        entry.replaced_pids.push(owner);
+        entry.replaced_pids.push_back(owner);
     }
 }
 
@@ -1236,7 +1236,7 @@ mod tests {
                 id.to_string(),
                 SessionEntry {
                     pid: None,
-                    replaced_pids: Vec::new(),
+                    replaced_pids: VecDeque::new(),
                     agent: Agent::Claude,
                     session_id: id.to_string(),
                     cwd: None,
@@ -1476,7 +1476,7 @@ mod tests {
                     id.clone(),
                     SessionEntry {
                         pid: None,
-                        replaced_pids: Vec::new(),
+                        replaced_pids: VecDeque::new(),
                         agent: Agent::Claude,
                         session_id: id.clone(),
                         cwd: None,
@@ -1867,8 +1867,8 @@ mod tests {
         let guard = reg.lock_sessions();
         let replaced = &guard["s1"].replaced_pids;
         assert_eq!(replaced.len(), MAX_REPLACED_PIDS);
-        assert_eq!(replaced.first(), Some(&1), "pid 0 was forgotten first");
-        assert_eq!(replaced.last(), Some(&(last - 1)));
+        assert_eq!(replaced.front(), Some(&1), "pid 0 was forgotten first");
+        assert_eq!(replaced.back(), Some(&(last - 1)));
     }
 
     #[test]
