@@ -562,8 +562,9 @@ Nothing is sent. The draft waits in Gmail's Drafts folder for a person to
 review and send.
 
 - **Recipients.** `--to` is required unless `--reply-to` is given, which
-  defaults it (see *Reply recipients* below). `--cc` and `--bcc` are optional. Each
-  value is one mailbox, either `addr@example.com` or `Name <addr@example.com>`.
+  defaults it (see *Reply recipients* below). `--cc` and `--bcc` are
+  optional. Each value is one mailbox, either `addr@example.com` or
+  `Name <addr@example.com>`.
   Repeat the flag, or list several values after it, for more recipients.
   Values are never split on commas, so `"Doe, Jane" <jane@example.com>`
   works. Non-ASCII names and subjects are sent as RFC 2047 encoded words.
@@ -609,23 +610,31 @@ review and send.
 
   `--reply-all` (only with `--reply-to`) also adds the original's `To` to the
   draft's `To` and its `Cc` to the draft's `Cc`, keeping each recipient in
-  the header they were in, as Gmail's web UI does. Your own addresses are
-  left out, found with one `users.settings.sendAs.list` call, which lists
-  the primary address and every send-as alias. If that call fails, the
-  command fails rather than risk putting you in your own reply. `Bcc` is
-  never carried over.
+  the header they were in, as Gmail's web UI does. `Bcc` is never carried
+  over.
+
+  Your own address is left out of every defaulted header. The primary
+  address comes from the `users.getProfile` call `draft create` already
+  makes. `--reply-all` also leaves out your send-as aliases, found with one
+  `users.settings.sendAs.list` call. If that call fails, the command fails
+  rather than risk putting an alias in its own reply. A plain reply doesn't
+  make that call, so it only recognises the primary address.
 
   An explicit `--to` or `--cc` **replaces** that header's default rather than
   adding to it, so you can drop someone. A defaulted header also leaves out
   anyone you already named in `--to`, `--cc` or `--bcc`, and repeats, both
-  compared case-insensitively. When a recipient was defaulted, a
-  `note: replying to …; cc …` line is printed on stderr once the draft
-  exists. Standard output and `-o` output are unchanged. If nobody is left to
-  address, the command fails before creating anything and asks for `--to`.
+  compared case-insensitively. If leaving yourself out empties `To`, a
+  defaulted `Cc` moves up into `To`, as mail clients do: replying to a
+  message you sent yourself, copying others, goes to them. A reply to a note
+  to self goes back to you, as in Gmail. The command fails before creating
+  anything, asking for `--to`, only when the draft would have no recipient
+  at all. Once the draft exists, a `note: replying to …; cc …` line on stderr
+  says who was defaulted. Standard output and `-o` output are unchanged.
 
   Addresses are decoded from the original's headers (RFC 2047 names,
-  groups, quoted names). One that can't be used, such as a name that decodes
-  to a line break, is skipped with a warning. Your addresses are matched as
+  groups, quoted names, headers repeated or folded). One that can't be used,
+  such as a name that decodes to a line break, is skipped, with a warning
+  when it was in a header the reply drew on. Your addresses are matched as
   whole addresses, so Gmail's dot and `+tag` variants of an `@gmail.com`
   address (`j.doe+x@gmail.com` for `jdoe@gmail.com`) are **not** recognised
   as yours. `Mail-Followup-To`/`Mail-Reply-To` are ignored.

@@ -217,43 +217,43 @@ async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDr
                 !compose.reply_all || compose.reply_to.is_some(),
                 "--reply-all needs --reply-to"
             );
-            // Only a reply-all that still has a header to fill needs to know
-            // which addresses are the account's own.
-            let wants_own =
+            // The profile gives the primary address; only a reply-all that
+            // still has a header to fill also needs the send-as aliases.
+            let wants_aliases =
                 compose.reply_all && (recipients.to.is_empty() || recipients.cc.is_empty());
             // The lookups are independent, so they share a round trip.
-            let (reply, domain, own) = tokio::join!(
+            let (reply, account, aliases) = tokio::join!(
                 async {
                     match &compose.reply_to {
                         Some(id) => fetch_reply_context(client, id).await.map(Some),
                         None => Ok(None),
                     }
                 },
-                fetch_message_id_domain(client),
+                fetch_account_address(client),
                 async {
-                    if wants_own {
-                        fetch_own_addresses(client).await
+                    if wants_aliases {
+                        fetch_send_as_addresses(client).await
                     } else {
                         Ok(Vec::new())
                     }
                 },
             );
             let reply = reply?;
-            let own = own?;
+            let aliases = aliases?;
             let thread_id = reply.as_ref().map(|reply| reply.thread_id.clone());
-            let (recipients, defaulted) = match &reply {
-                Some(reply) => recipients.fill_from_reply(reply, compose.reply_all, &own)?,
-                None => (recipients, None),
-            };
-            let (domain, fallback_warning) = match domain {
+            let (domain, fallback_warning) = match account
+                .clone()
+                .and_then(|email| message_id_domain_for(&email))
+            {
                 Ok(domain) => (Some(domain), None),
                 Err(warning) => (None, Some(warning)),
             };
-            let notes = defaulted
-                .map(|note| format!("note: {note}"))
-                .into_iter()
-                .chain(fallback_warning.map(|warning| format!("warning: {warning}")))
-                .collect();
+            let own: Vec<String> = account.into_iter().chain(aliases).collect();
+            let (recipients, mut notes) = match &reply {
+                Some(reply) => recipients.fill_from_reply(reply, compose.reply_all, &own)?,
+                None => (recipients, Vec::new()),
+            };
+            notes.extend(fallback_warning.map(|warning| format!("warning: {warning}")));
             (
                 compose_message(compose, recipients, reply, domain)?,
                 thread_id,
@@ -267,7 +267,7 @@ async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDr
         .map_err(with_modify_scope_hint)?;
     // Only once the draft exists: a lookup that failed for the same reason
     // as the create would otherwise warn about a draft that never was, and
-    // a note would name recipients of a draft that never was.
+    // a note would describe the recipients of a draft that never was.
     for note in notes {
         eprintln!("{}", sanitize_for_terminal(&note));
     }
@@ -288,25 +288,31 @@ async fn fetch_reply_context(client: &GmailClient, message_id: &str) -> Result<R
     ReplyContext::from_message(&original)
 }
 
-/// The account's domain, for the draft's `Message-ID` (#1953).
+/// The account's primary address: the source of the draft's `Message-ID`
+/// domain (#1953), and an address a reply leaves out (#1954).
 ///
 /// Asks `users.getProfile` (which `gmail.readonly` allows) rather than the
 /// cached `email_address` in settings, which is display-only and missing
 /// for accounts set up before it existed. Never fails the command: the
 /// `Err` is a warning for the caller to print, and the draft keeps
 /// `mail-builder`'s `@localhost` id.
-async fn fetch_message_id_domain(client: &GmailClient) -> std::result::Result<String, String> {
-    let email = ProfileApi::new(client)
+async fn fetch_account_address(client: &GmailClient) -> std::result::Result<String, String> {
+    ProfileApi::new(client)
         .get()
         .await
+        .map(|profile| profile.email_address)
         .map_err(|err| {
             format!(
                 "could not look up the account's address ({err:#}); the draft's Message-ID \
                  ends in @localhost."
             )
-        })?
-        .email_address;
-    message_id_domain(&email).ok_or_else(|| {
+        })
+}
+
+/// The `Message-ID` domain for the account address `email`, or the warning
+/// to print when it has none.
+fn message_id_domain_for(email: &str) -> std::result::Result<String, String> {
+    message_id_domain(email).ok_or_else(|| {
         format!(
             "the account's address {email:?} has no usable domain; the draft's Message-ID \
              ends in @localhost."
@@ -314,12 +320,12 @@ async fn fetch_message_id_domain(client: &GmailClient) -> std::result::Result<St
     })
 }
 
-/// The account's primary address and send-as aliases, for `--reply-all` to
-/// leave out (#1954).
+/// The account's send-as addresses (the primary one and every alias), for
+/// `--reply-all` to leave out (#1954).
 ///
-/// Unlike [`fetch_message_id_domain`], a failure fails the command: carrying
-/// on would quietly put the account in its own reply.
-async fn fetch_own_addresses(client: &GmailClient) -> Result<Vec<String>> {
+/// Unlike [`fetch_account_address`], a failure fails the command: carrying
+/// on would quietly put an alias in its own reply.
+async fn fetch_send_as_addresses(client: &GmailClient) -> Result<Vec<String>> {
     let send_as = SendAsApi::new(client)
         .list()
         .await
@@ -354,38 +360,72 @@ impl Recipients {
     /// message being replied to (see [`ReplyContext::default_recipients`]).
     ///
     /// A defaulted header leaves out `own` and every address already given
-    /// explicitly, so nobody is named twice. Returns the recipients and, when
-    /// anything was defaulted, a line saying who, for the caller to show.
-    /// Fails when `To` would be left empty.
+    /// explicitly, so nobody is named twice. When that leaves `To` empty, a
+    /// defaulted `Cc` moves up into it, as mail clients do. When the draft
+    /// would have no recipient at all, the reply goes back to the account
+    /// itself (a note to self, as in Gmail), and failing that the command
+    /// errors.
+    ///
+    /// Returns the recipients and the `warning:`/`note:` lines for the
+    /// caller to show once the draft exists: unusable addresses in the
+    /// headers that were consulted, and who was defaulted.
     fn fill_from_reply(
         mut self,
         reply: &ReplyContext,
         reply_all: bool,
         own: &[String],
-    ) -> Result<(Self, Option<String>)> {
+    ) -> Result<(Self, Vec<String>)> {
         let default_to = self.to.is_empty();
         let default_cc = reply_all && self.cc.is_empty();
         if !default_to && !default_cc {
-            return Ok((self, None));
+            return Ok((self, Vec::new()));
         }
-        for skipped in &reply.skipped {
-            eprintln!(
-                "warning: skipping an unusable address in the original's {}",
-                sanitize_for_terminal(skipped)
-            );
-        }
-        let exclude: Vec<String> = own
+        let named: Vec<String> = self
+            .to
             .iter()
-            .cloned()
-            .chain(
-                self.to
-                    .iter()
-                    .chain(&self.cc)
-                    .chain(&self.bcc)
-                    .map(|mailbox| mailbox.email.clone()),
-            )
+            .chain(&self.cc)
+            .chain(&self.bcc)
+            .map(|mailbox| mailbox.email.clone())
             .collect();
-        let (to, cc) = reply.default_recipients(reply_all, &exclude);
+        let exclude: Vec<String> = own.iter().cloned().chain(named.iter().cloned()).collect();
+        let (mut to, mut cc) = reply.default_recipients(reply_all, &exclude);
+        if default_to && to.is_empty() && cc.is_empty() && named.is_empty() {
+            (to, cc) = reply.default_recipients(reply_all, &[]);
+        }
+        if default_to && to.is_empty() && default_cc {
+            to = std::mem::take(&mut cc);
+        }
+
+        let consulted = |header: &str| match header {
+            "From" | "Reply-To" => default_to && !reply.sent_by_me,
+            "To" => default_to && (reply.sent_by_me || reply_all),
+            "Cc" => default_cc,
+            _ => false,
+        };
+        let skipped: Vec<&str> = reply
+            .skipped
+            .iter()
+            .filter(|(header, _)| consulted(header))
+            .map(|(_, address)| address.as_str())
+            .collect();
+        ensure!(
+            !(default_to
+                && to.is_empty()
+                && self.cc.is_empty()
+                && cc.is_empty()
+                && self.bcc.is_empty()),
+            "found nobody to reply to: the original has no usable From/Reply-To (or To, for a \
+             message you sent) that isn't already named{}; pass --to",
+            if skipped.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (skipped unusable {})",
+                    sanitize_for_terminal(&skipped.join(", "))
+                )
+            }
+        );
+
         let list = |mailboxes: &[Mailbox]| {
             mailboxes
                 .iter()
@@ -393,13 +433,14 @@ impl Recipients {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let mut lines: Vec<String> = skipped
+            .iter()
+            .map(|address| {
+                format!("warning: skipped an unusable address in the original: {address}")
+            })
+            .collect();
         let mut note = Vec::new();
-        if default_to {
-            ensure!(
-                !to.is_empty(),
-                "found nobody to reply to: the original has no usable From/Reply-To (or To, \
-                 for a message you sent) that isn't you or already named; pass --to"
-            );
+        if default_to && !to.is_empty() {
             note.push(format!("replying to {}", list(&to)));
             self.to = to;
         }
@@ -407,7 +448,10 @@ impl Recipients {
             note.push(format!("cc {}", list(&cc)));
             self.cc = cc;
         }
-        Ok((self, Some(note.join("; ")).filter(|note| !note.is_empty())))
+        if !note.is_empty() {
+            lines.push(format!("note: {}", note.join("; ")));
+        }
+        Ok((self, lines))
     }
 }
 
@@ -728,12 +772,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_message_id_domain_rejects_an_address_without_a_usable_domain() {
+    async fn message_id_domain_for_rejects_an_address_without_a_usable_domain() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
         mount_profile(&server, "me@[127.0.0.1]").await;
 
-        let warning = fetch_message_id_domain(&client).await.unwrap_err();
+        let email = fetch_account_address(&client).await.unwrap();
+        let warning = message_id_domain_for(&email).unwrap_err();
         assert!(warning.contains("no usable domain"), "{warning}");
     }
 
@@ -1203,6 +1248,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_create_plain_reply_leaves_out_the_profile_address() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_original(
+            &server,
+            &[
+                ("From", "me@example.org"),
+                ("To", "Me@Example.org, bob@example.com"),
+            ],
+            &["SENT"],
+        )
+        .await;
+        mount_profile(&server, "me@example.org").await;
+        mount_send_as(&server, 0).await;
+        mount_create(&server, "t-orig").await;
+
+        run_create(&client, DraftInput::Compose(reply_input(false)))
+            .await
+            .unwrap();
+        assert_eq!(uploaded(&server, "To").await, ["bob@example.com"]);
+    }
+
+    #[tokio::test]
     async fn run_create_explicit_to_and_cc_skip_the_send_as_lookup() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
@@ -1345,6 +1413,10 @@ mod tests {
         }
     }
 
+    fn me() -> Vec<String> {
+        vec!["ME@example.org".to_string()]
+    }
+
     #[test]
     fn fill_from_reply_describes_what_it_defaulted() {
         let reply = ReplyContext {
@@ -1352,20 +1424,17 @@ mod tests {
             cc: parsed(&["bob@example.com"]),
             ..ReplyContext::default()
         };
-        let (_, note) = recipients(&[], &[])
+        let (_, lines) = recipients(&[], &[])
             .fill_from_reply(&reply, true, &[])
             .unwrap();
         assert_eq!(
-            note.as_deref(),
-            Some("replying to Alice <alice@example.com>; cc bob@example.com")
+            lines,
+            ["note: replying to Alice <alice@example.com>; cc bob@example.com"]
         );
-        let (_, note) = recipients(&[], &[])
+        let (_, lines) = recipients(&[], &[])
             .fill_from_reply(&reply, false, &[])
             .unwrap();
-        assert_eq!(
-            note.as_deref(),
-            Some("replying to Alice <alice@example.com>")
-        );
+        assert_eq!(lines, ["note: replying to Alice <alice@example.com>"]);
     }
 
     #[test]
@@ -1375,36 +1444,136 @@ mod tests {
             cc: parsed(&["bob@example.com"]),
             ..ReplyContext::default()
         };
-        let (filled, note) = recipients(&["dan@example.com"], &[])
+        let (filled, lines) = recipients(&["dan@example.com"], &[])
             .fill_from_reply(&reply, false, &[])
             .unwrap();
         assert_eq!(filled.to, parsed(&["dan@example.com"]));
         assert!(filled.cc.is_empty());
-        assert_eq!(note, None);
+        assert!(lines.is_empty());
         // Reply-all with an explicit To still defaults Cc.
-        let (filled, note) = recipients(&["dan@example.com"], &[])
+        let (filled, lines) = recipients(&["dan@example.com"], &[])
             .fill_from_reply(&reply, true, &[])
             .unwrap();
         assert_eq!(filled.to, parsed(&["dan@example.com"]));
         assert_eq!(filled.cc, parsed(&["bob@example.com"]));
-        assert_eq!(note.as_deref(), Some("cc bob@example.com"));
+        assert_eq!(lines, ["note: cc bob@example.com"]);
         // With nothing to add, there is nothing to say.
-        let (_, note) = recipients(&["dan@example.com"], &[])
+        let (_, lines) = recipients(&["dan@example.com"], &[])
             .fill_from_reply(&ReplyContext::default(), true, &[])
             .unwrap();
-        assert_eq!(note, None);
+        assert!(lines.is_empty());
     }
 
     #[test]
-    fn fill_from_reply_refuses_an_empty_to() {
+    fn fill_from_reply_leaves_me_out_of_a_plain_reply() {
         let reply = ReplyContext {
+            sent_by_me: true,
             from: parsed(&["me@example.org"]),
+            to: parsed(&["me@example.org", "bob@example.com"]),
+            ..ReplyContext::default()
+        };
+        let (filled, _) = recipients(&[], &[])
+            .fill_from_reply(&reply, false, &me())
+            .unwrap();
+        assert_eq!(filled.to, parsed(&["bob@example.com"]));
+    }
+
+    #[test]
+    fn fill_from_reply_moves_cc_up_when_to_is_left_empty() {
+        // I sent it to myself, copying Bob and Carol.
+        let reply = ReplyContext {
+            sent_by_me: true,
+            to: parsed(&["me@example.org"]),
+            cc: parsed(&["bob@example.com", "carol@example.com"]),
+            ..ReplyContext::default()
+        };
+        let (filled, lines) = recipients(&[], &[])
+            .fill_from_reply(&reply, true, &me())
+            .unwrap();
+        assert_eq!(filled.to, parsed(&["bob@example.com", "carol@example.com"]));
+        assert!(filled.cc.is_empty());
+        assert_eq!(
+            lines,
+            ["note: replying to bob@example.com, carol@example.com"]
+        );
+    }
+
+    #[test]
+    fn fill_from_reply_answers_a_note_to_self_to_myself() {
+        let reply = ReplyContext {
+            sent_by_me: true,
+            from: parsed(&["me@example.org"]),
+            to: parsed(&["me@example.org"]),
+            ..ReplyContext::default()
+        };
+        for reply_all in [false, true] {
+            let (filled, _) = recipients(&[], &[])
+                .fill_from_reply(&reply, reply_all, &me())
+                .unwrap();
+            assert_eq!(filled.to, parsed(&["me@example.org"]));
+        }
+    }
+
+    #[test]
+    fn fill_from_reply_allows_a_draft_with_only_an_explicit_cc() {
+        // `--cc alice` to Alice's message: she is already named, so `To`
+        // stays empty, but the draft still has a recipient.
+        let reply = ReplyContext {
+            from: parsed(&["alice@example.com"]),
+            ..ReplyContext::default()
+        };
+        let (filled, lines) = recipients(&[], &["alice@example.com"])
+            .fill_from_reply(&reply, false, &[])
+            .unwrap();
+        assert!(filled.to.is_empty());
+        assert_eq!(filled.cc, parsed(&["alice@example.com"]));
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn fill_from_reply_refuses_a_draft_with_no_recipient() {
+        let reply = ReplyContext {
+            skipped: vec![("From", "eve@example.com".to_string())],
             ..ReplyContext::default()
         };
         let err = recipients(&[], &[])
-            .fill_from_reply(&reply, true, &["ME@example.org".to_string()])
-            .unwrap_err();
-        assert!(err.to_string().contains("pass --to"), "{err}");
+            .fill_from_reply(&reply, true, &me())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pass --to"), "{err}");
+        assert!(err.contains("skipped unusable eve@example.com"), "{err}");
+    }
+
+    #[test]
+    fn fill_from_reply_warns_only_about_headers_it_used() {
+        let reply = ReplyContext {
+            from: parsed(&["alice@example.com"]),
+            skipped: vec![
+                ("From", "bad-from@example.com".to_string()),
+                ("To", "bad-to@example.com".to_string()),
+                ("Cc", "bad-cc@example.com".to_string()),
+            ],
+            ..ReplyContext::default()
+        };
+        let warnings = |recipients: Recipients, reply_all| -> Vec<String> {
+            recipients
+                .fill_from_reply(&reply, reply_all, &[])
+                .unwrap()
+                .1
+                .into_iter()
+                .filter(|line| line.starts_with("warning:"))
+                .collect()
+        };
+        assert_eq!(
+            warnings(recipients(&[], &[]), false),
+            ["warning: skipped an unusable address in the original: bad-from@example.com"]
+        );
+        assert_eq!(warnings(recipients(&[], &[]), true).len(), 3);
+        // Only Cc is defaulted here.
+        assert_eq!(
+            warnings(recipients(&["dan@example.com"], &[]), true),
+            ["warning: skipped an unusable address in the original: bad-cc@example.com"]
+        );
     }
 
     // ── compose_message ──────────────────────────────────────────────

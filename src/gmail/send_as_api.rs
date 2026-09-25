@@ -17,9 +17,6 @@ pub struct SendAs {
     /// The address that appears in `From`.
     #[serde(rename = "sendAsEmail")]
     pub send_as_email: String,
-    /// Whether this is the account's primary address.
-    #[serde(rename = "isPrimary", default)]
-    pub is_primary: bool,
 }
 
 /// The `users.settings.sendAs.list` response body.
@@ -128,11 +125,9 @@ mod tests {
             [
                 SendAs {
                     send_as_email: "me@example.com".to_string(),
-                    is_primary: true,
                 },
                 SendAs {
                     send_as_email: "alias@example.org".to_string(),
-                    is_primary: false,
                 },
             ]
         );
