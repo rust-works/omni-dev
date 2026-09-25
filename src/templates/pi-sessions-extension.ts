@@ -149,9 +149,8 @@ export default function (pi: Any): void {
     // The session announced itself but has not been prompted yet — pi's chat
     // input is already live at this point, so this reads as idle rather than
     // busy (mirrors the stream wrapper's `init` handling for Claude, ADR-0057;
-    // reporting `starting` here left every session showing as busy from launch
-    // until the first prompt completed, since `starting` buckets as working
-    // everywhere it is rendered).
+    // `starting` means "launched, chat surface not up yet", and reporting it
+    // here once left every session showing as busy until the first prompt).
     report("idle", true);
     stopKeepalive();
     keepalive = setInterval(() => report(state, true), KEEPALIVE_MS);

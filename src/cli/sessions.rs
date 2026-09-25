@@ -321,7 +321,11 @@ impl HookPayload {
                 self.notification_type.as_deref(),
                 self.message.as_deref(),
             )?,
-            HookAgent::Codex => codex_session_event_for(event_name, self.tool_name.as_deref())?,
+            HookAgent::Codex => codex_session_event_for(
+                event_name,
+                self.source.as_deref(),
+                self.tool_name.as_deref(),
+            )?,
         };
         let request = ObserveRequest {
             agent: agent.agent(),
@@ -410,11 +414,19 @@ fn session_event_for(
 /// - `Interrupt` (Esc / Ctrl-C mid-turn, or a declined approval in the TUI) ends
 ///   the turn without a `Stop`, so it is one;
 /// - the compaction and subagent events carry the parent session's id and mean
-///   only that the session is busy — a working-state heartbeat.
+///   only that the session is busy — a working-state heartbeat;
+/// - a `SessionStart` with `source: "compact"` is not a new session, so, as for
+///   Claude, it preserves the state rather than resetting it to `starting`
+///   (#1946).
 ///
 /// `SessionEnd` is handled by the caller, as for Claude.
-fn codex_session_event_for(event_name: &str, tool_name: Option<&str>) -> Option<SessionEvent> {
+fn codex_session_event_for(
+    event_name: &str,
+    source: Option<&str>,
+    tool_name: Option<&str>,
+) -> Option<SessionEvent> {
     Some(match event_name {
+        "SessionStart" if source == Some("compact") => SessionEvent::TranscriptDiscovered,
         "SessionStart" => SessionEvent::SessionStart,
         "UserPromptSubmit" => SessionEvent::UserPromptSubmit,
         "PreToolUse" if tool_name == Some("request_user_input") => {
@@ -1654,6 +1666,13 @@ mod tests {
         assert_eq!(codex_event("PreToolUse", Some("Bash")), "pre_tool_use");
         assert_eq!(codex_event("PostToolUse", Some("Bash")), "post_tool_use");
         assert_eq!(codex_event("Stop", None), "stop");
+        let compact =
+            json!({ "session_id": "c1", "hook_event_name": "SessionStart", "source": "compact" });
+        assert_eq!(
+            codex_op(&compact.to_string()).unwrap().1["event"],
+            "transcript_discovered",
+            "a compaction start is not a new session (#1946)"
+        );
         assert_eq!(
             codex_event("PermissionRequest", Some("Bash"))["notification"],
             "permission_prompt"
@@ -2400,9 +2419,9 @@ mod tests {
         // pi has no permission prompt, so the template must never claim one.
         assert!(!PI_EXTENSION_TEMPLATE.contains("waiting_for_permission"));
         // pi's chat input is already live at `session_start`, so the template
-        // must report `idle` there, never the hook-only `starting` state (it
-        // buckets as working everywhere it renders, which left every pi
-        // session showing as busy from launch until the first prompt finished).
+        // must report `idle` there, never the hook-only `starting` state, which
+        // means "launched, chat surface not up yet" (reporting it once left every
+        // pi session showing as busy from launch until the first prompt, #1905).
         assert!(!PI_EXTENSION_TEMPLATE.contains("\"starting\""));
         assert_eq!(
             PI_EXTENSION_TEMPLATE.matches(PI_SOCKET_PLACEHOLDER).count(),
