@@ -623,13 +623,16 @@ review and send.
   An explicit `--to` or `--cc` **replaces** that header's default rather than
   adding to it, so you can drop someone. A defaulted header also leaves out
   anyone you already named in `--to`, `--cc` or `--bcc`, and repeats, both
-  compared case-insensitively. If leaving yourself out empties `To`, a
-  defaulted `Cc` moves up into `To`, as mail clients do: replying to a
-  message you sent yourself, copying others, goes to them. A reply to a note
-  to self goes back to you, as in Gmail. The command fails before creating
-  anything, asking for `--to`, only when the draft would have no recipient
-  at all. Once the draft exists, a `note: replying to …; cc …` line on stderr
-  says who was defaulted. Standard output and `-o` output are unchanged.
+  compared case-insensitively. So naming the original's sender in `--cc` or
+  `--bcc` keeps them out of the defaulted `To`, and the draft can end up with
+  no `To` at all; pass `--to` as well to keep them there. If leaving yourself
+  out empties `To`, a defaulted `Cc` moves up into `To`, as mail clients do:
+  replying to a message you sent yourself, copying others, goes to them. A
+  reply to a note to self goes back to you, as in Gmail, without
+  `--reply-all`'s extras. The command fails before creating anything, asking
+  for `--to`, only when the draft would have no recipient at all. Once the
+  draft exists, a `note: replying to …; cc …` line on stderr says who was
+  defaulted. Standard output and `-o` output are unchanged.
 
   Addresses are decoded from the original's headers (RFC 2047 names,
   groups, quoted names, headers repeated or folded). One that can't be used,
@@ -1282,9 +1285,10 @@ for up to 1000 ids. Gmail doesn't document a separate cost for
 `drafts.create`, so assume the `messages.insert` cost (25 units) until it's
 verified. `draft create` makes one such call and one `users.getProfile`
 (1 unit), plus one `messages.get` with `--reply-to` and one
-`users.settings.sendAs.list` (1 unit) with `--reply-all`. `draft update` makes one `drafts.update` (assume the same 25
-units) plus two `drafts.get` calls, or one with `--raw`. `gmail search`'s ids-only default costs a flat 5 units
-regardless of `--limit` (auto-pagination is still one `messages.list` call
+`users.settings.sendAs.list` (1 unit) with `--reply-all`. `draft update`
+makes one `drafts.update` (assume the same 25 units) plus two `drafts.get`
+calls, or one with `--raw`. `gmail search`'s ids-only default costs a flat
+5 units regardless of `--limit` (auto-pagination is still one `messages.list` call
 per page). `--enrich` adds one `messages.get` (5 units) **per hit**, so
 `--enrich --limit 50` can cost up to 255 units — nearly the entire
 per-second budget in one command — and `--limit 0 --enrich` against a large
