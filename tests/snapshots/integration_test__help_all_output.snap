@@ -7170,12 +7170,35 @@ Manages Gmail drafts; never sends or deletes one (CLI-only; no MCP equivalent ye
 Usage: draft <COMMAND>
 
 Commands:
-  list  Lists drafts with their draft ids (`gmail.readonly` is enough)
-  show  Shows one draft by its draft id (`gmail.readonly` is enough)
-  help  Print this message or the help of the given subcommand(s)
+  list    Lists drafts with their draft ids (`gmail.readonly` is enough)
+  show    Shows one draft by its draft id (`gmail.readonly` is enough)
+  create  Creates a draft to review and send from Gmail (needs `gmail.modify`)
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev gmail draft create - Creates a draft to review and send from Gmail (needs `gmail.modify`)
+
+Creates a draft to review and send from Gmail (needs `gmail.modify`)
+
+Usage: create [OPTIONS]
+
+Options:
+      --to <ADDR>...           A `To` recipient: `addr@example.com` or `"Name <addr@example.com>"`. Repeat the flag (or list several after it) for more recipients
+      --cc <ADDR>...           A `Cc` recipient, in the same form as `--to`
+      --bcc <ADDR>...          A `Bcc` recipient, in the same form as `--to`
+      --subject <SUBJECT>      The subject. Required unless `--reply-to` is given, which defaults it to `Re: <original subject>`
+      --body <BODY>            The plain-text body
+      --body-file <PATH>       Read the plain-text body from this UTF-8 file
+      --attach <PATH>...       Attach a file. Repeat the flag (or list several after it) for more
+      --reply-to <MESSAGE_ID>  Reply to this Gmail message id, filing the draft in its thread
+      --raw <FILE>             Upload this complete RFC 5322 message (`.eml`) byte for byte instead of composing one
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                   Print help (see more with '--help')
 
 
 ================================================================================

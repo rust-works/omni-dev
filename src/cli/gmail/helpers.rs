@@ -4,6 +4,7 @@ use anyhow::Result;
 
 use crate::gmail::auth;
 use crate::gmail::client::GmailClient;
+use crate::gmail::error::GmailError;
 
 /// Creates an authenticated Gmail API client from environment/settings-resolved credentials.
 pub fn create_client() -> Result<GmailClient> {
@@ -42,6 +43,29 @@ pub fn print_shadowing_notice() {
          `gmail auth logout` to remove the old credentials once every mailbox you use is \
          migrated."
     );
+}
+
+/// Explains Gmail's scope 403 for a command that writes to the mailbox.
+///
+/// A `gmail.readonly` account gets `HTTP 403` with reason
+/// `insufficientPermissions` from every write endpoint, which says nothing
+/// about the fix. This wraps that one error in context naming it: re-consent
+/// with `gmail auth login --modify`. The original error stays in the chain.
+/// Any other error is returned unchanged.
+pub(crate) fn with_modify_scope_hint(err: anyhow::Error) -> anyhow::Error {
+    let insufficient_scope = err.downcast_ref::<GmailError>().is_some_and(|gmail| {
+        matches!(gmail, GmailError::ApiRequestFailed { status: 403, .. })
+            && gmail.reason() == Some("insufficientPermissions")
+    });
+    if insufficient_scope {
+        err.context(
+            "This Gmail account is authorised read-only, and this command needs the \
+             `gmail.modify` scope. Re-run `omni-dev gmail auth login --modify` (adding \
+             `--account NAME` for a named account) to grant it.",
+        )
+    } else {
+        err
+    }
 }
 
 /// Whether `label_ids` contains any of `targets` — a plain membership
@@ -131,6 +155,42 @@ mod tests {
 
         let client = create_client_for(Some("work")).unwrap();
         assert_eq!(client.base_url(), "https://gmail.googleapis.com");
+    }
+
+    fn api_error(status: u16, reason: Option<&str>) -> anyhow::Error {
+        GmailError::ApiRequestFailed {
+            status,
+            body: "Insufficient Permission".to_string(),
+            reason: reason.map(str::to_string),
+        }
+        .into()
+    }
+
+    #[test]
+    fn with_modify_scope_hint_explains_an_insufficient_scope_403() {
+        let err = with_modify_scope_hint(api_error(403, Some("insufficientPermissions")));
+        assert!(
+            err.to_string().contains("gmail auth login --modify"),
+            "{err}"
+        );
+        // The original error is kept as the cause.
+        let cause = err.source().unwrap().to_string();
+        assert!(cause.contains("HTTP 403"), "{cause}");
+    }
+
+    #[test]
+    fn with_modify_scope_hint_leaves_other_errors_alone() {
+        for err in [
+            api_error(403, Some("rateLimitExceeded")),
+            api_error(403, None),
+            api_error(400, Some("insufficientPermissions")),
+            anyhow::anyhow!("network down"),
+        ] {
+            let before = err.to_string();
+            let after = with_modify_scope_hint(err);
+            assert_eq!(after.to_string(), before);
+            assert!(after.source().is_none());
+        }
     }
 
     #[test]

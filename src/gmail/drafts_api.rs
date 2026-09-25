@@ -4,6 +4,8 @@
 //! deliberately the same caps: [`MAX_PAGE_LIMIT`], [`HARD_CAP`] and
 //! [`DEFAULT_SEARCH_LIMIT`] are imported from there rather than redeclared, so
 //! `gmail draft list` and `gmail search` can't drift apart (#1921).
+//! [`DraftsApi::create`] (#1923) likewise reuses `messages.insert`'s upload
+//! transport and size limit.
 //!
 //! **`drafts.send` and `drafts.delete` are deliberately absent** (#1920):
 //! `send` delivers mail that can't be recalled, and `delete` skips Trash, so
@@ -21,7 +23,8 @@ use url::Url;
 use crate::gmail::client::GmailClient;
 use crate::gmail::error::GmailError;
 use crate::gmail::messages_api::{
-    effective_cap, header_value, hydrate_in_order, MessageFormat, MessagesApi, MAX_PAGE_LIMIT,
+    effective_cap, ensure_within_message_limit, header_value, hydrate_in_order, upload_rfc822,
+    MessageFormat, MessagesApi, MAX_PAGE_LIMIT,
 };
 use crate::gmail::types::{Draft, DraftDetail, DraftListResponse, Message};
 
@@ -223,6 +226,51 @@ impl<'a> DraftsApi<'a> {
                 }
             })
     }
+
+    /// Creates a draft from a complete RFC 5322 message
+    /// (`drafts.create?uploadType=multipart`).
+    ///
+    /// Uses [`MessagesApi::insert`]'s `/upload/` multipart transport
+    /// ([`upload_rfc822`]), so large attachments work: the draft resource as
+    /// the JSON part, then `raw` **verbatim** as `message/rfc822`. Content
+    /// over [`MAX_INSERT_BYTES`] is refused before the request body is even
+    /// built.
+    ///
+    /// [`MAX_INSERT_BYTES`]: crate::gmail::messages_api::MAX_INSERT_BYTES
+    ///
+    /// `thread_id` files the draft into an existing thread. Gmail only
+    /// honours it when the message's `In-Reply-To`/`References` and
+    /// `Subject` also match that thread (see [`crate::gmail::compose`]).
+    ///
+    /// Requires `gmail.modify` (or `gmail.compose`); a `gmail.readonly`
+    /// token gets a 403 back from Google. Gmail doesn't document this call's
+    /// quota cost separately; assume the insert cost
+    /// ([`MESSAGES_INSERT_COST_UNITS`]) until someone verifies it.
+    ///
+    /// [`MESSAGES_INSERT_COST_UNITS`]: crate::gmail::messages_api::MESSAGES_INSERT_COST_UNITS
+    pub async fn create(&self, raw: &[u8], thread_id: Option<&str>) -> Result<Draft> {
+        ensure_within_message_limit(raw.len(), "create a draft of")?;
+        let url = build_draft_create_url(self.client.base_url())?;
+        let metadata = match thread_id {
+            Some(thread_id) => serde_json::json!({ "message": { "threadId": thread_id } }),
+            None => serde_json::json!({}),
+        };
+        upload_rfc822(
+            self.client,
+            &url,
+            &metadata,
+            raw,
+            "Failed to parse drafts.create response",
+        )
+        .await
+    }
+}
+
+/// `drafts.create` URL, on Gmail's `/upload/` path prefix.
+fn build_draft_create_url(base_url: &str) -> Result<Url> {
+    let mut url = GmailClient::api_url(base_url, "/upload/gmail/v1/users/me/drafts")?;
+    url.query_pairs_mut().append_pair("uploadType", "multipart");
+    Ok(url)
 }
 
 /// Whether `err` is Gmail's HTTP 404.
@@ -275,10 +323,12 @@ fn build_drafts_list_url(
 mod tests {
     use super::*;
     use crate::gmail::auth::{GmailCredentials, GmailScope};
+    use crate::gmail::messages_api::MAX_INSERT_BYTES;
     use crate::utils::secret::Secret;
 
     /// Read-only credentials throughout: both endpoints `draft list` calls
-    /// accept `gmail.readonly`, and nothing client-side gates on scope.
+    /// accept `gmail.readonly`, and nothing client-side gates on scope, so
+    /// `create` is sent regardless and a read-only account gets Gmail's 403.
     fn test_credentials() -> GmailCredentials {
         GmailCredentials {
             client_id: "client-1".to_string(),
@@ -814,7 +864,151 @@ mod tests {
         assert!(!message.contains("No draft"), "{message}");
     }
 
-    // ── read-only surface ────────────────────────────────────────────
+    // ── create ───────────────────────────────────────────────────────
+
+    const CREATE_PATH: &str = "/upload/gmail/v1/users/me/drafts";
+
+    fn dead_client() -> GmailClient {
+        // Routes the session's token endpoint to the same dead address, so
+        // any request at all fails rather than reaching Google.
+        let mut client = GmailClient::new("http://127.0.0.1:1", &test_credentials()).unwrap();
+        crate::gmail::client::test_support::replace_session(
+            &mut client,
+            &test_credentials(),
+            "http://127.0.0.1:1",
+        );
+        client
+    }
+
+    async fn mount_create(server: &wiremock::MockServer, status: u16, body: serde_json::Value) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(CREATE_PATH))
+            .and(wiremock::matchers::query_param("uploadType", "multipart"))
+            .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(body))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn create_request_body(server: &wiremock::MockServer) -> Vec<u8> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.url.path() == CREATE_PATH)
+            .unwrap()
+            .body
+    }
+
+    #[test]
+    fn build_draft_create_url_targets_the_upload_path() {
+        let url = build_draft_create_url("https://gmail.googleapis.com").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=multipart"
+        );
+        assert!(build_draft_create_url("not a url").is_err());
+    }
+
+    #[tokio::test]
+    async fn create_uploads_the_message_byte_identical_and_parses_the_draft() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_create(
+            &server,
+            200,
+            serde_json::json!({
+                "id": "r-1",
+                "message": {"id": "m-1", "threadId": "t-1", "labelIds": ["DRAFT"]},
+            }),
+        )
+        .await;
+        // Bare LFs and a trailing space: nothing may be normalised.
+        let raw = b"To: a@example.com\nSubject: Hi \n\nbody\r\n\x00\xff";
+
+        let draft = DraftsApi::new(&client).create(raw, None).await.unwrap();
+        assert_eq!(draft.id, "r-1");
+        assert_eq!(draft.message.id, "m-1");
+        assert_eq!(draft.message.thread_id, "t-1");
+
+        let body = create_request_body(&server).await;
+        assert!(body.windows(raw.len()).any(|w| w == raw.as_slice()));
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("Content-Type: message/rfc822"));
+        assert!(text.contains("Content-Type: application/json; charset=UTF-8\r\n\r\n{}\r\n"));
+        assert!(!text.contains("threadId"));
+    }
+
+    #[tokio::test]
+    async fn create_puts_the_thread_id_on_the_draft_message() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_create(
+            &server,
+            200,
+            serde_json::json!({"id": "r-1", "message": {"id": "m-1", "threadId": "t-9"}}),
+        )
+        .await;
+
+        DraftsApi::new(&client)
+            .create(b"Subject: Re: x\r\n\r\nbody", Some("t-9"))
+            .await
+            .unwrap();
+
+        let text = String::from_utf8_lossy(&create_request_body(&server).await).into_owned();
+        assert!(text.contains(r#"{"message":{"threadId":"t-9"}}"#), "{text}");
+    }
+
+    #[tokio::test]
+    async fn create_refuses_oversized_content_with_no_network_call() {
+        let oversized = vec![b'a'; (MAX_INSERT_BYTES + 1) as usize];
+        let err = DraftsApi::new(&dead_client())
+            .create(&oversized, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to create a draft"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ensure_within_message_limit_accepts_exactly_the_limit() {
+        let limit = MAX_INSERT_BYTES as usize;
+        assert!(ensure_within_message_limit(limit, "create a draft of").is_ok());
+        let err = ensure_within_message_limit(limit + 1, "create a draft of").unwrap_err();
+        assert!(
+            err.to_string().starts_with("refusing to create a draft of"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_surfaces_insufficient_scope_403_with_reason() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_create(
+            &server,
+            403,
+            serde_json::json!({
+                "error": {
+                    "message": "Request had insufficient authentication scopes.",
+                    "errors": [{"reason": "insufficientPermissions"}],
+                }
+            }),
+        )
+        .await;
+
+        let err = DraftsApi::new(&client)
+            .create(b"Subject: x\r\n\r\nbody", None)
+            .await
+            .unwrap_err();
+        let gmail = err.downcast_ref::<GmailError>().unwrap();
+        assert_eq!(gmail.reason(), Some("insufficientPermissions"));
+    }
+
+    // ── no send or delete ────────────────────────────────────────────
 
     /// #1920 excludes `drafts.send` (irrecoverable delivery) and
     /// `drafts.delete` (skips Trash) on purpose. This fails the build if

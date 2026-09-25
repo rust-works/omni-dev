@@ -13,6 +13,7 @@ pub mod attachments;
 pub mod auth;
 mod chrome_profile;
 pub mod client;
+pub mod compose;
 pub mod drafts_api;
 pub mod error;
 pub mod history_api;
