@@ -5,8 +5,9 @@ use std::io::Write;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use serde::Serialize;
 
-use crate::cli::gmail::format::{output_as, sanitize_for_terminal, OutputFormat};
+use crate::cli::gmail::format::{output_as, sanitize_for_terminal, JsonlSerialize, OutputFormat};
 use crate::gmail::client::GmailClient;
 use crate::gmail::messages_api::{MessageFormat, MessagesApi};
 use crate::gmail::raw_message::decode_raw_message;
@@ -149,14 +150,51 @@ async fn run_read(
     output: &ReadOutputFormat,
     fold_quotes: bool,
 ) -> Result<()> {
+    let message = MessagesApi::new(client)
+        .get(message_id, fetch_format(detail, output), &[])
+        .await?;
+    emit_message(
+        &message,
+        &message,
+        None,
+        detail,
+        out_file,
+        output,
+        fold_quotes,
+    )
+}
+
+/// The `format` to fetch a message at for `detail` and `output`.
+///
+/// `-o markdown` needs the full raw MIME message whatever `--detail` says,
+/// so it always fetches `raw`. Shared with `gmail draft show`.
+pub(crate) fn fetch_format(detail: ReadDetail, output: &ReadOutputFormat) -> MessageFormat {
     if matches!(output, ReadOutputFormat::Markdown) {
-        // Rendering needs the full raw MIME message regardless of
-        // `--detail`, so this fetches with `format=raw` directly rather
-        // than honouring `detail.as_message_format()`.
-        let message = MessagesApi::new(client)
-            .get(message_id, MessageFormat::Raw, &[])
-            .await?;
-        let bytes = decode_raw_message(&message)?;
+        MessageFormat::Raw
+    } else {
+        detail.as_message_format()
+    }
+}
+
+/// Emits a fetched message in the requested format.
+///
+/// This is the whole output path of `gmail read`, shared with `gmail draft
+/// show` so the two can't render a message differently. `record` is what
+/// the machine formats (json/yaml/yamls/jsonl) serialize: `read` passes the
+/// message itself, `draft show` its `{id, message}` draft. `draft_id`, when
+/// given, is shown beside the message id in the human views. `message` must
+/// have been fetched at the format [`fetch_format`] returns for them.
+pub(crate) fn emit_message<T: Serialize + JsonlSerialize>(
+    record: &T,
+    message: &Message,
+    draft_id: Option<&str>,
+    detail: ReadDetail,
+    out_file: Option<&str>,
+    output: &ReadOutputFormat,
+    fold_quotes: bool,
+) -> Result<()> {
+    if matches!(output, ReadOutputFormat::Markdown) {
+        let bytes = decode_raw_message(message)?;
         let markdown = render_markdown(&bytes, fold_quotes);
 
         if let Some(path) = out_file {
@@ -168,38 +206,41 @@ async fn run_read(
         return Ok(());
     }
 
-    let message = MessagesApi::new(client)
-        .get(message_id, detail.as_message_format(), &[])
-        .await?;
-
     if let Some(path) = out_file {
         if matches!(detail, ReadDetail::Raw) {
-            let bytes = decode_raw_message(&message)?;
+            let bytes = decode_raw_message(message)?;
             fs::write(path, &bytes).with_context(|| format!("Failed to write to {path}"))?;
         } else {
-            let rendered = render_plain_text(&message);
+            let rendered = render_plain_text(message, draft_id);
             fs::write(path, &rendered).with_context(|| format!("Failed to write to {path}"))?;
         }
         println!("Saved to: {path}");
         return Ok(());
     }
 
-    if output_as(&message, &output.as_shared())? {
+    if output_as(record, &output.as_shared())? {
         return Ok(());
     }
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    render_read_table(&message, &mut handle)
+    render_read_table(message, draft_id, &mut handle)
 }
 
 /// Renders a message as a flat `key: value` header block followed by its
 /// snippet — an `.eml`-ish preview for `--out-file` on non-`raw` details,
 /// not a markdown dialect. `--detail raw` never reaches this: it writes the
 /// decoded bytes from [`decode_raw_message`] instead, since Gmail's `raw`
-/// field only comes back populated for that format.
-fn render_plain_text(message: &Message) -> String {
+/// field only comes back populated for that format. With a `draft_id`, the
+/// id lines are labelled `Draft-Id`/`Message-Id` as in [`render_read_table`].
+fn render_plain_text(message: &Message, draft_id: Option<&str>) -> String {
     let mut lines = Vec::new();
-    lines.push(format!("Id: {}", message.id));
+    match draft_id {
+        Some(draft_id) => {
+            lines.push(format!("Draft-Id: {draft_id}"));
+            lines.push(format!("Message-Id: {}", message.id));
+        }
+        None => lines.push(format!("Id: {}", message.id)),
+    }
     if let Some(thread_id) = &message.thread_id {
         lines.push(format!("Thread-Id: {thread_id}"));
     }
@@ -216,9 +257,21 @@ fn render_plain_text(message: &Message) -> String {
 /// Renders a single message as a bespoke header block — a "table" in the
 /// sense of "one command, one rendering," not a literal grid, matching the
 /// Datadog `monitor get` precedent for single-record views.
-fn render_read_table(message: &Message, out: &mut dyn Write) -> Result<()> {
-    writeln!(out, "Id: {}", sanitize_for_terminal(&message.id))
-        .context("Failed to write read row")?;
+///
+/// With a `draft_id` (from `gmail draft show`), the id line becomes two,
+/// `Draft-Id` and `Message-Id`, so the ids can't be confused: every drafts
+/// endpoint takes the draft id, and the message id changes on every save.
+fn render_read_table(message: &Message, draft_id: Option<&str>, out: &mut dyn Write) -> Result<()> {
+    match draft_id {
+        Some(draft_id) => {
+            writeln!(out, "Draft-Id: {}", sanitize_for_terminal(draft_id))
+                .context("Failed to write read row")?;
+            writeln!(out, "Message-Id: {}", sanitize_for_terminal(&message.id))
+                .context("Failed to write read row")?;
+        }
+        None => writeln!(out, "Id: {}", sanitize_for_terminal(&message.id))
+            .context("Failed to write read row")?,
+    }
     if let Some(thread_id) = &message.thread_id {
         writeln!(out, "Thread-Id: {}", sanitize_for_terminal(thread_id))
             .context("Failed to write read row")?;
@@ -306,7 +359,7 @@ mod tests {
             snippet: Some("Hi there".to_string()),
             ..Default::default()
         };
-        let text = render_plain_text(&message);
+        let text = render_plain_text(&message, None);
         assert!(text.contains("Id: m1"));
         assert!(text.contains("Thread-Id: t1"));
         assert!(text.contains("Labels: INBOX, UNREAD"));
@@ -325,7 +378,7 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        render_read_table(&message, &mut buf).unwrap();
+        render_read_table(&message, None, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("Id: m1"));
         assert!(text.contains("Thread-Id: t1"));
@@ -340,7 +393,7 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        render_read_table(&message, &mut buf).unwrap();
+        render_read_table(&message, None, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert_eq!(text, "Id: m1\n");
     }
@@ -355,7 +408,7 @@ mod tests {
             ..Default::default()
         };
         let mut buf = Vec::new();
-        render_read_table(&message, &mut buf).unwrap();
+        render_read_table(&message, None, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(
             !text.contains(|c: char| c.is_control() && c != '\n'),

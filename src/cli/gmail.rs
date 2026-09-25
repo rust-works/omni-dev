@@ -445,6 +445,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_routes_draft_show() {
+        let cmd = GmailSubcommands::Draft(draft::DraftCommand {
+            command: draft::DraftSubcommands::Show(draft::show::ShowCommand {
+                draft_id: "r1".to_string(),
+                out_file: None,
+                detail: read::ReadDetail::Full,
+                output: read::ReadOutputFormat::Table,
+                fold_quotes: false,
+            }),
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
     async fn dispatch_routes_label_add() {
         let cmd = GmailSubcommands::Label(label::LabelCommand {
             command: label::LabelSubcommands::Add(label::add::AddCommand {
