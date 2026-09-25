@@ -17,6 +17,9 @@
 //!   first non-attachment part is "the body" and every other part is kept
 //!   as it is; any other message is itself "the body". New parts are written
 //!   by `mail-builder` and the parts are re-joined under a fresh boundary.
+//!   A body edit replaces "the body" whole: with plain text alone, or with a
+//!   `multipart/alternative` of plain text and HTML (#1955). Neither half of
+//!   an existing alternative is ever kept, so the two can't drift apart.
 //!
 //! Every top-level header that isn't a `Content-*` header (`From`, `Date`,
 //! `Message-ID`, `In-Reply-To`, `References`, …) is always kept.
@@ -32,7 +35,9 @@ use mail_builder::mime::{BodyPart, MimePart};
 use mail_parser::{MessageParser, MimeHeaders};
 
 use crate::gmail::attachments::dedupe_filename;
-use crate::gmail::compose::{subject_matches_reply, Attachment, Mailbox, ReplyContext};
+use crate::gmail::compose::{
+    inline_image_warning, subject_matches_reply, Attachment, Mailbox, ReplyContext,
+};
 use crate::utils::multipart::generate_boundary_absent_from;
 use crate::utils::path::attachment_filename;
 
@@ -48,8 +53,13 @@ pub struct DraftEdit {
     pub bcc: Option<Vec<Mailbox>>,
     /// Replaces the `Subject`. An empty subject removes the header.
     pub subject: Option<String>,
-    /// Replaces the body with this plain text.
+    /// Replaces the body with this plain text, or with `html_body` its
+    /// plain-text alternative.
     pub body: Option<String>,
+    /// With `body`, replaces the body with a `multipart/alternative` of
+    /// `body` and this HTML. Deriving `body` from the HTML is the caller's
+    /// job; an HTML body without `body` is refused.
+    pub html_body: Option<String>,
     /// Files to attach after the existing attachments.
     pub attach: Vec<Attachment>,
     /// Existing attachments to remove, one per name. A name matches the
@@ -72,11 +82,18 @@ impl DraftEdit {
     /// Whether the edit changes the MIME structure (the body or the
     /// attachments) rather than only header fields.
     fn is_structural(&self) -> bool {
-        self.body.is_some() || !self.attach.is_empty() || !self.remove_attachments.is_empty()
+        self.body.is_some()
+            || self.html_body.is_some()
+            || !self.attach.is_empty()
+            || !self.remove_attachments.is_empty()
     }
 
     /// Applies the edit to `original`, a complete RFC 5322 message.
     pub fn apply(&self, original: &[u8]) -> Result<EditedMessage> {
+        ensure!(
+            self.html_body.is_none() || self.body.is_some(),
+            "an HTML body needs a plain-text alternative"
+        );
         if let Some(subject) = &self.subject {
             // Same rule as `Composition::build`: a tab is legal, but CR, LF
             // and NUL would break (or inject) a header.
@@ -155,20 +172,33 @@ impl DraftEdit {
 
         let body = match (&self.body, body) {
             (Some(text), old) => {
-                if let Some(old) = old {
-                    let info = part_info(&old);
-                    if info.is_rich_body() {
-                        warnings.push(format!(
-                            "the draft's {} body is replaced by plain text: its HTML version \
-                             (and any inline images) is dropped",
-                            info.mime_type
-                        ));
+                let text_part = MimePart::new("text/plain", BodyPart::Text(text.as_str().into()));
+                let new_body = match &self.html_body {
+                    None => {
+                        let info = old.as_deref().map(part_info);
+                        if let Some(info) = info.filter(PartInfo::is_rich_body) {
+                            warnings.push(format!(
+                                "the draft's {} body is replaced by plain text: its HTML \
+                                 version (and any inline images) is dropped",
+                                info.mime_type
+                            ));
+                        }
+                        text_part
                     }
-                }
-                Some(Cow::Owned(write_part(
-                    MimePart::new("text/plain", BodyPart::Text(text.as_str().into())),
-                    eol,
-                )))
+                    Some(html) => {
+                        if old.as_deref().is_some_and(has_inline_images) {
+                            warnings.push(
+                                "the draft's inline images are dropped along with its old body"
+                                    .to_string(),
+                            );
+                        }
+                        warnings.extend(inline_image_warning(html));
+                        let html_part =
+                            MimePart::new("text/html", BodyPart::Text(html.as_str().into()));
+                        MimePart::new("multipart/alternative", vec![text_part, html_part])
+                    }
+                };
+                Some(Cow::Owned(write_part(new_body, eol)))
             }
             (None, old) => old,
         };
@@ -649,6 +679,22 @@ fn part_info(part: &[u8]) -> PartInfo {
         is_attachment,
         name,
     }
+}
+
+/// Whether a body part holds inline images: a `multipart/related` part, or
+/// any part with a `Content-ID` for the HTML to refer to by `cid:`.
+fn has_inline_images(part: &[u8]) -> bool {
+    MessageParser::default().parse(part).is_some_and(|message| {
+        message.parts.iter().any(|part| {
+            part.content_id().is_some()
+                || part.content_type().is_some_and(|ct| {
+                    ct.ctype().eq_ignore_ascii_case("multipart")
+                        && ct
+                            .subtype()
+                            .is_some_and(|subtype| subtype.eq_ignore_ascii_case("related"))
+                })
+        })
+    })
 }
 
 /// Serialises a `mail-builder` part, converting its CRLFs to `eol`.
@@ -1172,6 +1218,179 @@ Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r
             other_fields(&edited.raw, &["Content-Type", "Content-Transfer-Encoding"]),
             other_fields(&original, &["Content-Type", "Content-Transfer-Encoding"])
         );
+    }
+
+    fn html_edit(text: &str, html: &str) -> DraftEdit {
+        DraftEdit {
+            body: Some(text.to_string()),
+            html_body: Some(html.to_string()),
+            ..DraftEdit::default()
+        }
+    }
+
+    #[test]
+    fn an_html_edit_on_a_plain_draft_makes_it_multipart_alternative() {
+        let original = Composition {
+            to: vec![mailbox("a@example.com")],
+            subject: "Hi".to_string(),
+            body: "Old.\n".to_string(),
+            ..Composition::default()
+        }
+        .build()
+        .unwrap();
+        let edited = html_edit("New.", "<p>New.</p>").apply(&original).unwrap();
+
+        assert!(edited.warnings.is_empty(), "{:?}", edited.warnings);
+        let raw = String::from_utf8(edited.raw.clone()).unwrap();
+        let top = split_message(&edited.raw).headers;
+        assert!(
+            contains(top, "Content-Type: multipart/alternative"),
+            "{raw}"
+        );
+        assert!(raw.find("text/plain").unwrap() < raw.find("text/html").unwrap());
+        let parsed = parse(&edited.raw);
+        assert_eq!(parsed.body_text(0).as_deref(), Some("New."));
+        assert_eq!(parsed.body_html(0).as_deref(), Some("<p>New.</p>"));
+        assert_eq!(
+            other_fields(&edited.raw, &["Content-Type", "Content-Transfer-Encoding"]),
+            other_fields(&original, &["Content-Type", "Content-Transfer-Encoding"])
+        );
+    }
+
+    #[test]
+    fn an_html_edit_replaces_a_gmail_alternative_and_keeps_the_attachments() {
+        let original = GMAIL_UI_DRAFT.as_bytes();
+        let edited = html_edit("Revised.", "<p>Revised <b>figures</b>.</p>")
+            .apply(original)
+            .unwrap();
+
+        assert!(edited.warnings.is_empty(), "{:?}", edited.warnings);
+        assert!(!contains(&edited.raw, ALT_PART));
+        assert!(!contains(&edited.raw, "Figures attached."));
+        assert!(contains(&edited.raw, PDF_PART));
+        assert!(contains(
+            &edited.raw,
+            "Content-Disposition: attachment; filename*=UTF-8''Jahresabschlu%C3%9F.txt\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8="
+        ));
+        let parsed = parse(&edited.raw);
+        assert_eq!(parsed.body_text(0).as_deref(), Some("Revised."));
+        assert_eq!(
+            parsed.body_html(0).as_deref(),
+            Some("<p>Revised <b>figures</b>.</p>")
+        );
+        assert_eq!(parsed.attachment_count(), 2);
+        assert_eq!(
+            other_fields(&edited.raw, &["Content-Type"]),
+            other_fields(original, &["Content-Type"])
+        );
+    }
+
+    /// A Gmail-style body with an inline image: `multipart/related` around
+    /// the alternative and a `Content-ID` part.
+    const INLINE_IMAGE_DRAFT: &str = "MIME-Version: 1.0\r\n\
+Subject: Logo\r\n\
+Content-Type: multipart/related; boundary=\"rel\"\r\n\
+\r\n\
+--rel\r\n\
+Content-Type: multipart/alternative; boundary=\"alt\"\r\n\
+\r\n\
+--alt\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+[image: logo]\r\n\
+--alt\r\n\
+Content-Type: text/html\r\n\
+\r\n\
+<img src=\"cid:logo@x\">\r\n\
+--alt--\r\n\
+--rel\r\n\
+Content-Type: image/png; name=\"logo.png\"\r\n\
+Content-ID: <logo@x>\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+iVBORw0KGgo=\r\n\
+--rel--\r\n";
+
+    #[test]
+    fn an_html_edit_warns_when_it_drops_inline_images() {
+        let edited = html_edit("New.", "<p>New.</p>")
+            .apply(INLINE_IMAGE_DRAFT.as_bytes())
+            .unwrap();
+        assert_eq!(edited.warnings.len(), 1, "{:?}", edited.warnings);
+        assert!(
+            edited.warnings[0].contains("inline images are dropped"),
+            "{:?}",
+            edited.warnings
+        );
+        assert!(!contains(&edited.raw, "iVBORw0KGgo="));
+    }
+
+    #[test]
+    fn an_html_edit_warns_about_cid_references_in_the_new_html() {
+        let edited = html_edit("New.", "<img src=\"cid:logo@x\">")
+            .apply(b"Subject: x\r\n\r\nOld.\r\n")
+            .unwrap();
+        assert_eq!(edited.warnings.len(), 1, "{:?}", edited.warnings);
+        assert!(
+            edited.warnings[0].contains("`cid:`"),
+            "{:?}",
+            edited.warnings
+        );
+    }
+
+    #[test]
+    fn has_inline_images_looks_for_related_parts_and_content_ids() {
+        assert!(has_inline_images(INLINE_IMAGE_DRAFT.as_bytes()));
+        assert!(!has_inline_images(ALT_PART.as_bytes()));
+        assert!(has_inline_images(
+            b"Content-Type: multipart/related; boundary=\"r\"\r\n\r\n--r\r\n\
+Content-Type: text/html\r\n\r\n<p>x</p>\r\n--r--\r\n"
+        ));
+    }
+
+    #[test]
+    fn an_html_edit_needs_a_plain_text_body() {
+        let err = DraftEdit {
+            html_body: Some("<p>x</p>".to_string()),
+            ..DraftEdit::default()
+        }
+        .apply(b"Subject: x\r\n\r\nOld.\r\n")
+        .unwrap_err();
+        assert!(err.to_string().contains("plain-text alternative"), "{err}");
+    }
+
+    #[test]
+    fn an_html_edit_on_an_lf_message_writes_lf_parts() {
+        let original = b"Subject: x\nContent-Type: text/plain\n\nbody\n";
+        let edited = html_edit("New.\n", "<p>New.</p>\n")
+            .apply(original)
+            .unwrap();
+        assert!(!edited.raw.contains(&b'\r'));
+        let parsed = parse(&edited.raw);
+        assert_eq!(parsed.body_text(0).as_deref(), Some("New.\n"));
+        assert_eq!(parsed.body_html(0).as_deref(), Some("<p>New.</p>\n"));
+    }
+
+    #[test]
+    fn an_html_edit_combines_with_attachment_and_subject_edits() {
+        let edited = DraftEdit {
+            subject: Some("Re: Quarterly report (v2)".to_string()),
+            attach: vec![attachment("notes.txt", "text/plain", b"notes")],
+            remove_attachments: vec!["q3.pdf".to_string()],
+            ..html_edit("Revised.", "<p>Revised.</p>")
+        }
+        .apply(GMAIL_UI_DRAFT.as_bytes())
+        .unwrap();
+
+        let parsed = parse(&edited.raw);
+        assert_eq!(parsed.subject(), Some("Re: Quarterly report (v2)"));
+        assert_eq!(parsed.body_html(0).as_deref(), Some("<p>Revised.</p>"));
+        let names: Vec<_> = parsed
+            .attachments()
+            .map(|a| a.attachment_name().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["Jahresabschluß.txt", "notes.txt"]);
     }
 
     #[test]
