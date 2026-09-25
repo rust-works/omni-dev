@@ -245,13 +245,14 @@ async fn run_update(
         .await
         .map_err(with_modify_scope_hint)?;
     let new_thread_id = updated.message.thread_id;
-    if let Some(thread_id) = &thread_id {
-        if !new_thread_id.is_empty() && &new_thread_id != thread_id {
-            warnings.push(format!(
-                "Gmail moved the draft from thread {thread_id} to thread {new_thread_id}; its \
-                 subject or reply headers may no longer match the thread's"
-            ));
-        }
+    let moved_thread = thread_id
+        .as_deref()
+        .filter(|id| !new_thread_id.is_empty() && *id != new_thread_id.as_str());
+    if let Some(thread_id) = moved_thread {
+        warnings.push(format!(
+            "Gmail moved the draft from thread {thread_id} to thread {new_thread_id}; its \
+             subject or reply headers may no longer match the thread's"
+        ));
     }
     for warning in &warnings {
         writeln!(warn, "warning: {warning}").context("Failed to write a warning")?;
@@ -794,6 +795,27 @@ JVBERi0xLjQK\r\n\
             parsed.to().unwrap().first().unwrap().address(),
             Some("bob@example.com")
         );
+    }
+
+    #[tokio::test]
+    async fn execute_edits_the_body_from_an_inline_flag() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_get_raw(&server, "m-1", REPLY_DRAFT, 1).await;
+        mount_get_minimal(&server, "m-1", 1).await;
+        mount_update(&server, "t-1", 1).await;
+
+        UpdateCommand {
+            body: Some("Inline body.".to_string()),
+            ..update_command(OutputFormat::Table)
+        }
+        .execute(&client)
+        .await
+        .unwrap();
+
+        let (_, message) = uploaded(&server).await;
+        let parsed = MessageParser::default().parse(message.as_bytes()).unwrap();
+        assert_eq!(parsed.body_text(0).as_deref(), Some("Inline body."));
     }
 
     #[tokio::test]
