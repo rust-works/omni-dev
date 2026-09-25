@@ -359,7 +359,6 @@ impl StreamTracker {
     fn request(&self, state: SessionState) -> Option<ObserveRequest> {
         Some(ObserveRequest {
             pid: None,
-            pid_start: None,
             agent: crate::sessions::Agent::Claude,
             session_id: self.session_id.clone()?,
             cwd: self.cwd.clone(),
