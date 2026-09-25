@@ -595,6 +595,28 @@ mod tests {
     use super::*;
     use mail_parser::{MessageParser, MimeHeaders};
 
+    #[test]
+    fn parse_address_header_handles_an_unparsable_header() {
+        // An empty header name leaves mail-parser unable to find any header
+        // at all, taking the `parse_headers` None branch that a real call
+        // site (always a fixed, non-empty header name) never hits.
+        assert_eq!(
+            parse_address_header("", "alice@example.com"),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn parse_address_header_ignores_an_unrecognized_header_name() {
+        // `parse_address_header`'s only call site always passes one of
+        // From/Reply-To/To/Cc; a header name outside that set falls through
+        // the match's catch-all arm.
+        assert_eq!(
+            parse_address_header("X-Custom", "alice@example.com"),
+            (Vec::new(), Vec::new())
+        );
+    }
+
     fn mailbox(input: &str) -> Mailbox {
         Mailbox::parse(input).unwrap()
     }
