@@ -46,7 +46,14 @@ test("tallyByWorktree buckets each state onto its worktree", () => {
     ],
     PATHS,
   );
-  assert.deepEqual(tallies["/w/repo"], { working: 2, waiting: 2, idle: 1, agents: ["claude"] });
+  assert.deepEqual(tallies["/w/repo"], { working: 1, waiting: 2, idle: 2, agents: ["claude"] });
+});
+
+test("tallyByWorktree counts an unprompted (starting) session as idle", () => {
+  // A session resumed by a window reload sits at `starting` until its first
+  // prompt; it is not busy (#1946).
+  const tallies = tallyByWorktree([session("/w/repo", "starting")], PATHS);
+  assert.deepEqual(tallies["/w/repo"], { working: 0, waiting: 0, idle: 1, agents: ["claude"] });
 });
 
 test("tallyByWorktree drops sessions it cannot or should not attribute", () => {

@@ -126,11 +126,12 @@ impl SessionState {
     /// - `UserPromptSubmit` / `PreToolUse` / `PostToolUse` →
     ///   [`Working`](Self::Working)
     /// - `TranscriptGrew` → [`Working`](Self::Working), **except** while
+    ///   [`Starting`](Self::Starting) /
     ///   [`WaitingForInput`](Self::WaitingForInput) /
     ///   [`WaitingForPermission`](Self::WaitingForPermission) /
     ///   [`Ended`](Self::Ended), which it leaves **unchanged** — growth is
     ///   expected in those states without the session doing anything, so it is
-    ///   not evidence the turn resumed (#1418)
+    ///   not evidence a turn is running (#1418, #1946)
     /// - `Stop` → [`Idle`](Self::Idle)
     /// - `Notification(PermissionPrompt)` →
     ///   [`WaitingForPermission`](Self::WaitingForPermission)
@@ -161,15 +162,27 @@ impl SessionState {
             //   go quiet exactly when it should be shouting (#1418);
             // - `ended` — a session's last lines land around `SessionEnd`, so a
             //   scan inside the ended-linger window would revive the entry and
-            //   hold a phantom `working` row for the whole session TTL.
+            //   hold a phantom `working` row for the whole session TTL;
+            // - `starting` — a resumed session (a VS Code window reload,
+            //   `claude --resume`) keeps its id, and the *old* process appends a
+            //   `cost-state` line to the shared transcript as it exits. The 5s
+            //   scan usually sees that write after the new `SessionStart`, and
+            //   no hook fires while an unprompted session sits idle, so reading
+            //   it as `working` would pin the row busy until the next prompt
+            //   (#1946). Nothing is lost: a hook-fed session's first prompt
+            //   fires `UserPromptSubmit`, and a watcher-only session never
+            //   reaches `starting`, because `SessionStart` is a hook.
             //
             // That is ADR-0052's reliable-over-inferred ordering, and the rule
-            // `stream.rs`'s `state` already applies to a permission prompt. Both
-            // states are released by any later hook, which is inference-free.
+            // `stream.rs`'s `state` already applies to a permission prompt. Each
+            // is released by any later hook, which is inference-free.
             SessionEvent::TranscriptGrew => match current {
-                Some(held @ (Self::WaitingForInput | Self::WaitingForPermission | Self::Ended)) => {
-                    held
-                }
+                Some(
+                    held @ (Self::Starting
+                    | Self::WaitingForInput
+                    | Self::WaitingForPermission
+                    | Self::Ended),
+                ) => held,
                 _ => Self::Working,
             },
             SessionEvent::Stop => Self::Idle,
@@ -948,8 +961,11 @@ mod tests {
         // Growth is expected while a session waits on the user (the transcript
         // grows before the prompt is answered) and around `SessionEnd` (the
         // final lines land as it exits), so in neither case is it evidence the
-        // turn is running: the directly reported state stands (#1418).
+        // turn is running: the directly reported state stands (#1418). A
+        // resumed session's old process writes to the shared transcript as it
+        // exits, after the new one's `SessionStart` (#1946).
         for held in [
+            SessionState::Starting,
             SessionState::WaitingForInput,
             SessionState::WaitingForPermission,
             SessionState::Ended,
@@ -962,11 +978,7 @@ mod tests {
         }
         // From every other state growth still means working, as does growth on
         // a session whose state is not yet known (covered by the table above).
-        for other in [
-            SessionState::Working,
-            SessionState::Idle,
-            SessionState::Starting,
-        ] {
+        for other in [SessionState::Working, SessionState::Idle] {
             assert_eq!(
                 SessionState::for_event(&TranscriptGrew, Some(other)),
                 SessionState::Working,
@@ -1598,6 +1610,40 @@ mod tests {
             !rx.has_changed().unwrap(),
             "state did not change, so nothing a consumer renders did either (#1414)"
         );
+    }
+
+    #[test]
+    fn a_resumed_session_stays_starting_until_its_first_prompt() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::UserPromptSubmit,
+            Some("/tmp/a"),
+        ));
+        // A VS Code window reload: the old process fires `SessionEnd`, and the
+        // new one resumes the same session id and fires `SessionStart`.
+        assert!(reg.end("s1", Some("other")));
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::SessionStart,
+            Some("/tmp/a"),
+        ));
+        assert_eq!(reg.list()[0].state, SessionState::Starting);
+
+        // The watcher's next scan sees the `cost-state` line the old process
+        // appended as it exited. It is not the resumed session doing work, and
+        // no hook fires while it sits unprompted, so it must not read as
+        // `working` (#1946).
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::TranscriptGrew,
+            Some("/tmp/a"),
+        ));
+        assert_eq!(reg.list()[0].state, SessionState::Starting);
+
+        // The first prompt still moves it to `working`.
+        reg.observe(observe_request("s1", SessionEvent::UserPromptSubmit, None));
+        assert_eq!(reg.list()[0].state, SessionState::Working);
     }
 
     #[test]

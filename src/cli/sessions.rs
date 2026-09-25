@@ -288,6 +288,10 @@ struct HookPayload {
     /// Present on `SessionEnd` — why the session ended.
     #[serde(default)]
     reason: Option<String>,
+    /// Present on `SessionStart` — why it fired (`startup`, `resume`, `clear`,
+    /// `compact`). A `compact` start is not a new session.
+    #[serde(default)]
+    source: Option<String>,
     /// Present on tool events. Codex's clarifying-question UI is the
     /// `request_user_input` tool, so its `PreToolUse` is a wait for input.
     #[serde(default)]
@@ -313,6 +317,7 @@ impl HookPayload {
         let event = match agent {
             HookAgent::Claude => session_event_for(
                 event_name,
+                self.source.as_deref(),
                 self.notification_type.as_deref(),
                 self.message.as_deref(),
             )?,
@@ -354,7 +359,13 @@ impl HookPayload {
 ///   a manual `/compact` — and nothing after them would release a `working`, so
 ///   they are the state-preserving
 ///   [`TranscriptDiscovered`](SessionEvent::TranscriptDiscovered) sighting,
-///   which refreshes liveness alone.
+///   which refreshes liveness alone;
+/// - `SessionStart` with `source: "compact"` follows a compaction, which can run
+///   mid-turn, and is not a new session. Since growth no longer moves a
+///   `starting` session (#1946), mapping it to `SessionStart` would hold a
+///   working session at `starting` until its next tool hook, so it is the same
+///   state-preserving sighting. Every other source (`startup`, `resume`,
+///   `clear`) is a real start.
 ///
 /// `PostToolBatch` is deliberately not installed: every tool in a batch has
 /// already reported its own `PostToolUse` / `PostToolUseFailure`, so it would be
@@ -364,10 +375,12 @@ impl HookPayload {
 /// wait is released by whatever hook comes next.
 fn session_event_for(
     event_name: &str,
+    source: Option<&str>,
     notification_type: Option<&str>,
     message: Option<&str>,
 ) -> Option<SessionEvent> {
     Some(match event_name {
+        "SessionStart" if source == Some("compact") => SessionEvent::TranscriptDiscovered,
         "SessionStart" => SessionEvent::SessionStart,
         "UserPromptSubmit" => SessionEvent::UserPromptSubmit,
         "PreToolUse" => SessionEvent::PreToolUse,
@@ -1745,6 +1758,28 @@ mod tests {
                 SessionState::WaitingForPermission,
                 "{preserving}"
             );
+        }
+    }
+
+    #[test]
+    fn a_compaction_session_start_preserves_state() {
+        let event_for = |source: Option<&str>| {
+            let mut hook = json!({ "session_id": "s1", "hook_event_name": "SessionStart" });
+            if let Some(source) = source {
+                hook["source"] = json!(source);
+            }
+            let (_, payload) = hook_op(&hook.to_string()).unwrap();
+            serde_json::from_value::<SessionEvent>(payload["event"].clone()).unwrap()
+        };
+        // Claude fires it after a compaction, possibly mid-turn: a working
+        // session must stay working, an idle one idle (#1946).
+        let compact = event_for(Some("compact"));
+        assert_eq!(compact, SessionEvent::TranscriptDiscovered);
+        for current in [SessionState::Working, SessionState::Idle] {
+            assert_eq!(SessionState::for_event(&compact, Some(current)), current);
+        }
+        for start in [Some("startup"), Some("resume"), Some("clear"), None] {
+            assert_eq!(event_for(start), SessionEvent::SessionStart, "{start:?}");
         }
     }
 

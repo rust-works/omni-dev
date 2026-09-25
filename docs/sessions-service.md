@@ -135,11 +135,11 @@ best-effort:
 | `SessionStart` | `starting` |
 | `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / transcript grew | `working` |
 | `PostToolUseFailure` / `PermissionDenied` / `ElicitationResult` / `SubagentStart` | `working` |
-| transcript grew — while already `waiting_for_*` or `ended` | *unchanged* |
+| transcript grew — while already `starting`, `waiting_for_*` or `ended` | *unchanged* |
 | `Stop` / `StopFailure` | `idle` |
 | `PermissionRequest` / `Notification` — permission prompt | `waiting_for_permission` |
 | `Elicitation` / `Notification` — idle, input, or elicitation prompt | `waiting_for_input` |
-| `Notification` — unclassified / `SubagentStop` / `PreCompact` / `PostCompact` / transcript discovered | *unchanged* |
+| `Notification` — unclassified / `SubagentStop` / `PreCompact` / `PostCompact` / `SessionStart` with `source: "compact"` / transcript discovered | *unchanged* |
 | `SessionEnd` | `ended` (reaped shortly after) |
 | **stream state** (Feed 4) | **exactly what was reported** |
 
@@ -155,7 +155,9 @@ Without it the row stayed `working` until the TTL expired.
 the state. Each can fire while the session is idle: a background subagent can
 finish after the turn's `Stop`, and a manual `/compact` can run from idle. No
 event afterwards would release a `working`, so treating them as `working` would
-leave an idle row showing `working`. `PostToolBatch` is not installed. Every tool
+leave an idle row showing `working`. A `SessionStart` with `source: "compact"` follows a compaction, which can run
+mid-turn. It isn't a new session, so it doesn't reset the state to `starting`.
+`PostToolBatch` is not installed. Every tool
 in a batch has already sent its own `PostToolUse` or `PostToolUseFailure`, so it
 would only add a process spawn per batch.
 `working` vs `idle` is best-effort, with the transcript-growth backstop covering
@@ -170,6 +172,17 @@ so in both cases growth is evidence the file grew, not that a turn is running.
 Reading it as `working` would turn a waiting row green for the whole wait — exactly
 when it should be shouting — and revive an exited session as a phantom `working` row
 for the rest of the session TTL.
+
+`starting` is held for the same reason (#1946). A resumed session (a VS Code
+window reload, `claude --resume`) keeps its session id, and the *old* process
+appends a `cost-state` line to the shared transcript as it exits. The watcher
+scans every 5s, so it usually sees that write after the new process's
+`SessionStart`. No hook fires while an unprompted session sits idle, so reading
+the write as `working` would keep the row busy until the next prompt. The first
+prompt fires `UserPromptSubmit`, which releases the hold. A watcher-only session
+never reaches `starting`, because `SessionStart` is a hook. Every consumer (the
+tray summary, `worktrees ui`, the VS Code tree) counts `starting` as idle, because
+a session that hasn't been prompted isn't busy.
 
 Neither state can strand, but the release has latency worth knowing: it is the
 **next hook**, and no hook fires at the moment you answer a permission prompt (the
@@ -398,8 +411,8 @@ before its chat surface exists yet". pi's extension only loads once pi's UI is
 already interactive, so by the time `session_start` fires there is nothing left
 to distinguish from `idle`; reporting `starting` there previously left every
 pi session showing as busy from launch until the first prompt finished, since
-`starting` buckets as working everywhere it renders (the tray, `sessions list`,
-and the VS Code tree).
+`starting` then bucketed as working everywhere it rendered (the tray, `sessions
+list`, and the VS Code tree). Since #1946 it buckets as idle.
 
 The extension talks to the socket directly from pi's own Node process. It does not
 spawn a sink per event, because `tool_execution_start` fires on every tool call.

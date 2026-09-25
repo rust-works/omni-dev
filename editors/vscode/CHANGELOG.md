@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **pi.dev tabs show just the session name** ([#1899](https://github.com/rust-works/omni-dev/issues/1899)): after `/name Blah`, a pi.dev tab now reads `Blah` instead of pi's own `pi - Blah - <directory>`. pi always adds the working directory's name to its title, and in a worktree that looks like a branch name and widens the tab. **Launch pi.dev** now starts pi with a small pi extension bundled with this extension (`pi -e …/dist/pi-title.mjs`), which retitles the terminal whenever pi does: at startup, after `/name`, and on switching sessions. Until a session is named, the tab keeps its `pi.dev`, `pi.dev 2`, … title.
   - The new `omniDevWorktrees.piTabTitle` setting chooses between `name` (the default) and `native`, which runs plain `pi` and keeps pi's own title. It applies to newly launched terminals. Claude Code tabs are unaffected.
 
+### Fixed
+- **A resumed Claude Code session no longer shows as busy until its first prompt** ([#1946](https://github.com/rust-works/omni-dev/issues/1946)): a worktree row now counts a `starting` session (one that has launched or resumed but hasn't been prompted, as after a window reload) as idle rather than working. The matching daemon fix, which stops the old process's exit write from moving the resumed session to `working`, ships in the omni-dev crate. Both are needed for the row to read idle.
+
 ## [0.9.0] - 2026-08-21
 
 ### Added

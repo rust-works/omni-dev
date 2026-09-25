@@ -121,15 +121,18 @@ function addAgent(tally: SessionTally, agent: Agent): void {
  * `ended` is dropped rather than bucketed: the daemon keeps an ended session
  * visible for ~10s so `sessions list` can show it, which is useful in a table
  * and misleading as a row badge.
+ *
+ * `starting` is idle: a session that has not been prompted yet, such as one
+ * resumed by a window reload, is not busy (#1946).
  */
 function bucketFor(state: SessionState): Bucket | undefined {
   switch (state) {
-    case "starting":
     case "working":
       return "working";
     case "waiting_for_input":
     case "waiting_for_permission":
       return "waiting";
+    case "starting":
     case "idle":
       return "idle";
     case "ended":

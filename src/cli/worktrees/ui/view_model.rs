@@ -251,8 +251,9 @@ pub fn badge_severity(
     for state in session_states {
         severity = severity.max(match state {
             SessionState::WaitingForInput | SessionState::WaitingForPermission => Severity::Yellow,
-            SessionState::Working | SessionState::Starting => Severity::Green,
-            SessionState::Idle | SessionState::Ended => Severity::Muted,
+            SessionState::Working => Severity::Green,
+            // A session that has not been prompted yet is not busy (#1946).
+            SessionState::Starting | SessionState::Idle | SessionState::Ended => Severity::Muted,
         });
     }
     severity
@@ -646,6 +647,11 @@ mod tests {
             Severity::Green
         );
         assert_eq!(badge_severity(None, [SessionState::Idle]), Severity::Muted);
+        // An unprompted session is not busy (#1946).
+        assert_eq!(
+            badge_severity(None, [SessionState::Starting]),
+            Severity::Muted
+        );
         assert_eq!(badge_severity(None, []), Severity::Muted);
     }
 
