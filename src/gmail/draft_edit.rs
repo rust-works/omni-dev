@@ -455,10 +455,8 @@ fn parse_fields(headers: &[u8], eol: &[u8]) -> Vec<Field> {
             }
         }
     }
-    if let Some(last) = fields.last_mut() {
-        if !last.bytes.ends_with(b"\n") {
-            last.bytes.extend_from_slice(eol);
-        }
+    if let Some(last) = fields.last_mut().filter(|f| !f.bytes.ends_with(b"\n")) {
+        last.bytes.extend_from_slice(eol);
     }
     fields
 }
@@ -531,12 +529,10 @@ fn top_level_parts<'a>(
     let mut parts = parts.into_iter().map(Cow::Borrowed);
     let mut body = None;
     let mut others = Vec::new();
-    if let Some(first) = parts.next() {
-        if part_info(&first).is_attachment {
-            others.push(first);
-        } else {
-            body = Some(first);
-        }
+    match parts.next() {
+        Some(first) if part_info(&first).is_attachment => others.push(first),
+        Some(first) => body = Some(first),
+        None => {}
     }
     others.extend(parts);
     Ok(TopLevel {
@@ -585,7 +581,7 @@ fn split_multipart<'a>(body: &'a [u8], boundary: &str) -> Option<Multipart<'a>> 
                 } else if body[..pos].ends_with(b"\n") {
                     pos - 1
                 } else {
-                    pos
+                    pos // omni-dev: coverage ignore-line reason="unreachable: a delimiter line's start is always the position right after some previous line's '\n' (either the outer while loop's line_end, or 0 for the very first line), so it always ends with '\n'; this arm exists solely for exhaustiveness over the byte-slice check"
                 };
                 parts.push(&body[part_start..end.max(part_start)]);
             }
@@ -1254,6 +1250,25 @@ Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r
         .apply(original)
         .unwrap_err();
         assert!(err.to_string().contains("--raw"), "{err}");
+    }
+
+    #[test]
+    fn an_attachment_added_to_an_empty_mixed_draft_becomes_the_whole_entity() {
+        // The open and close delimiter coincide: no parts, no body, no
+        // attachments to carry over.
+        let original = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b--\r\n";
+        let edited = DraftEdit {
+            attach: vec![attachment("a.pdf", "application/pdf", b"%PDF")],
+            ..DraftEdit::default()
+        }
+        .apply(original)
+        .unwrap();
+        assert!(!contains(&edited.raw, "multipart"));
+        let parsed = parse(&edited.raw);
+        assert_eq!(
+            parsed.attachment(0).unwrap().attachment_name(),
+            Some("a.pdf")
+        );
     }
 
     #[test]
