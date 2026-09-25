@@ -22,6 +22,7 @@
 //! `Message-ID`, `In-Reply-To`, `References`, …) is always kept.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use anyhow::{bail, ensure, Result};
 use mail_builder::headers::address::Address;
@@ -30,8 +31,10 @@ use mail_builder::headers::Header;
 use mail_builder::mime::{BodyPart, MimePart};
 use mail_parser::{MessageParser, MimeHeaders};
 
+use crate::gmail::attachments::dedupe_filename;
 use crate::gmail::compose::{subject_matches_reply, Attachment, Mailbox, ReplyContext};
 use crate::utils::multipart::generate_boundary_absent_from;
+use crate::utils::path::attachment_filename;
 
 /// The changes to make to a draft's message. A `None` or empty field leaves
 /// that part of the message exactly as it is.
@@ -49,7 +52,10 @@ pub struct DraftEdit {
     pub body: Option<String>,
     /// Files to attach after the existing attachments.
     pub attach: Vec<Attachment>,
-    /// Filenames of existing attachments to remove.
+    /// Existing attachments to remove, one per name. A name matches the
+    /// name `gmail draft show` lists (sanitised, with `-N` added to repeats
+    /// and `attachment-N` for an unnamed part), or failing that the stored
+    /// filename when exactly one attachment has it.
     pub remove_attachments: Vec<String>,
 }
 
@@ -143,14 +149,9 @@ impl DraftEdit {
             preamble,
             body,
             others,
+            epilogue,
         } = top_level_parts(original, split, &content_fields)?;
-        let mut others: Vec<(Cow<'_, [u8]>, Option<String>)> = others
-            .into_iter()
-            .map(|part| {
-                let name = part_info(&part).name;
-                (part, name)
-            })
-            .collect();
+        let mut others = name_parts(others);
 
         let body = match (&self.body, body) {
             (Some(text), old) => {
@@ -173,25 +174,12 @@ impl DraftEdit {
         };
 
         for name in &self.remove_attachments {
-            let before = others.len();
-            others.retain(|(_, part_name)| part_name.as_deref() != Some(name.as_str()));
-            if others.len() == before {
-                let names: Vec<String> = others
-                    .iter()
-                    .filter_map(|(_, name)| name.as_ref().map(|n| format!("{n:?}")))
-                    .collect();
-                if names.is_empty() {
-                    bail!("the draft has no attachment named {name:?}: it has no attachments");
-                }
-                bail!(
-                    "the draft has no attachment named {name:?}; its attachments are: {}",
-                    names.join(", ")
-                );
-            }
+            let index = find_attachment(&others, name)?;
+            others.remove(index);
         }
 
         let mut parts: Vec<Cow<'_, [u8]>> = body.into_iter().collect();
-        parts.extend(others.into_iter().map(|(part, _)| part));
+        parts.extend(others.into_iter().map(|part| part.bytes));
         for attachment in &self.attach {
             let part = MimePart::new(
                 attachment.content_type.as_str(),
@@ -238,7 +226,74 @@ impl DraftEdit {
         }
         raw.extend_from_slice(format!("--{boundary}--").as_bytes());
         raw.extend_from_slice(eol);
+        raw.extend_from_slice(epilogue);
         Ok(raw)
+    }
+}
+
+/// A top-level part other than the body, with the names it can be removed
+/// by.
+struct ExistingPart<'a> {
+    bytes: Cow<'a, [u8]>,
+    /// The decoded stored filename, if any.
+    stored_name: Option<String>,
+    /// The name `gmail draft show` lists it under: sanitised, unique within
+    /// the message, `attachment-N` when unnamed.
+    shown_name: String,
+}
+
+/// Names each part the way `gmail draft show` (via
+/// [`crate::gmail::attachments::extract_attachments`]) lists it.
+fn name_parts(parts: Vec<Cow<'_, [u8]>>) -> Vec<ExistingPart<'_>> {
+    let mut seen = HashSet::new();
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            let stored_name = part_info(&bytes).name;
+            let shown_name = dedupe_filename(
+                &mut seen,
+                attachment_filename(stored_name.as_deref().unwrap_or(""), &index.to_string()),
+            );
+            ExistingPart {
+                bytes,
+                stored_name,
+                shown_name,
+            }
+        })
+        .collect()
+}
+
+/// The index of the one part `name` removes: the part `draft show` lists
+/// under `name`, else the only part stored under that filename.
+fn find_attachment(parts: &[ExistingPart<'_>], name: &str) -> Result<usize> {
+    if let Some(index) = parts.iter().position(|part| part.shown_name == name) {
+        return Ok(index);
+    }
+    let stored: Vec<usize> = (0..parts.len())
+        .filter(|&i| parts[i].stored_name.as_deref() == Some(name))
+        .collect();
+    let quoted = |indexes: &mut dyn Iterator<Item = usize>| -> String {
+        indexes
+            .map(|i| format!("{:?}", parts[i].shown_name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match stored.as_slice() {
+        [index] => Ok(*index),
+        [] if parts.is_empty() => {
+            bail!("the draft has no attachment named {name:?}: it has no attachments")
+        }
+        [] => bail!(
+            "the draft has no attachment named {name:?}; its attachments are: {}",
+            quoted(&mut (0..parts.len()))
+        ),
+        _ => bail!(
+            "{} attachments are named {name:?}; remove them by the names `gmail draft show` \
+             lists instead: {}",
+            stored.len(),
+            quoted(&mut stored.iter().copied())
+        ),
     }
 }
 
@@ -274,16 +329,9 @@ fn encode_field(name: &str, value: &impl Header, eol: &[u8]) -> Field {
     let mut bytes = format!("{name}: ").into_bytes();
     value.write_header(&mut bytes, name.len() + 2);
     // The encoder ends the field (and any fold) with CRLF.
-    let bytes = if eol == b"\n" {
-        String::from_utf8_lossy(&bytes)
-            .replace("\r\n", "\n")
-            .into_bytes()
-    } else {
-        bytes
-    };
     Field {
         name: name.to_string(),
-        bytes,
+        bytes: with_eol(bytes, eol),
     }
 }
 
@@ -424,6 +472,9 @@ struct TopLevel<'a> {
     body: Option<Cow<'a, [u8]>>,
     /// Every other part, byte for byte.
     others: Vec<Cow<'a, [u8]>>,
+    /// Anything after a `multipart/mixed` message's close delimiter line,
+    /// kept as it was.
+    epilogue: &'a [u8],
 }
 
 fn top_level_parts<'a>(
@@ -451,14 +502,27 @@ fn top_level_parts<'a>(
             .collect();
         entity.extend_from_slice(split.eol);
         entity.extend_from_slice(split.body);
+        let entity = Cow::Owned(entity);
+        // A draft that is nothing but an attachment has no body.
+        let (body, others) = if part_info(&entity).is_attachment {
+            (None, vec![entity])
+        } else {
+            (Some(entity), Vec::new())
+        };
         return Ok(TopLevel {
             preamble: b"",
-            body: Some(Cow::Owned(entity)),
-            others: Vec::new(),
+            body,
+            others,
+            epilogue: b"",
         });
     };
 
-    let Some((preamble, parts)) = split_multipart(split.body, &boundary) else {
+    let Some(Multipart {
+        preamble,
+        parts,
+        epilogue,
+    }) = split_multipart(split.body, &boundary)
+    else {
         bail!(
             "the draft is multipart/mixed but its boundary {boundary:?} never occurs in it, so \
              its parts can't be edited; use `--raw` instead"
@@ -479,15 +543,26 @@ fn top_level_parts<'a>(
         preamble,
         body,
         others,
+        epilogue,
     })
 }
 
+/// A multipart body split on its delimiter lines.
+#[derive(Debug, PartialEq, Eq)]
+struct Multipart<'a> {
+    /// Everything before the first delimiter line.
+    preamble: &'a [u8],
+    /// Each part, without the line ending that precedes the next delimiter.
+    parts: Vec<&'a [u8]>,
+    /// Everything after the close delimiter line.
+    epilogue: &'a [u8],
+}
+
 /// Splits a multipart body on `--boundary` delimiter lines (RFC 2046
-/// §5.1.1), returning the preamble and each part. A part excludes the line
-/// ending before the next delimiter, which belongs to the delimiter. A
-/// missing close delimiter is tolerated: the last part runs to the end.
-/// `None` when the boundary never occurs.
-fn split_multipart<'a>(body: &'a [u8], boundary: &str) -> Option<(&'a [u8], Vec<&'a [u8]>)> {
+/// §5.1.1). A part excludes the line ending before the next delimiter, which
+/// belongs to the delimiter. A missing close delimiter is tolerated: the
+/// last part runs to the end. `None` when the boundary never occurs.
+fn split_multipart<'a>(body: &'a [u8], boundary: &str) -> Option<Multipart<'a>> {
     let delimiter = format!("--{boundary}");
     let delimiter = delimiter.as_bytes();
     let mut preamble = None;
@@ -515,7 +590,11 @@ fn split_multipart<'a>(body: &'a [u8], boundary: &str) -> Option<(&'a [u8], Vec<
                 parts.push(&body[part_start..end.max(part_start)]);
             }
             if is_close {
-                return Some((preamble.unwrap_or_default(), parts));
+                return Some(Multipart {
+                    preamble: preamble.unwrap_or_default(),
+                    parts,
+                    epilogue: &body[line_end..],
+                });
             }
             part_start = line_end;
         }
@@ -525,7 +604,11 @@ fn split_multipart<'a>(body: &'a [u8], boundary: &str) -> Option<(&'a [u8], Vec<
     if part_start < body.len() {
         parts.push(&body[part_start..]);
     }
-    Some((preamble, parts))
+    Some(Multipart {
+        preamble,
+        parts,
+        epilogue: b"",
+    })
 }
 
 /// What [`top_level_parts`] and the attachment edits need to know about a
@@ -533,8 +616,8 @@ fn split_multipart<'a>(body: &'a [u8], boundary: &str) -> Option<(&'a [u8], Vec<
 struct PartInfo {
     /// `type/subtype`, lower-cased; `text/plain` when unstated.
     mime_type: String,
-    /// `Content-Disposition: attachment`, or a part that is neither text
-    /// nor multipart.
+    /// `Content-Disposition: attachment`, a filename, or a part that is
+    /// neither text nor multipart.
     is_attachment: bool,
     /// The decoded filename (RFC 2231 / RFC 2047), if any.
     name: Option<String>,
@@ -559,14 +642,16 @@ fn part_info(part: &[u8]) -> PartInfo {
         .as_ref()
         .and_then(|message| message.content_disposition())
         .is_some_and(|disposition| disposition.ctype().eq_ignore_ascii_case("attachment"));
-    let is_attachment = disposition_attachment || !matches!(ctype.as_str(), "text" | "multipart");
+    let name = parsed
+        .as_ref()
+        .and_then(|message| message.attachment_name())
+        .map(str::to_string);
+    let is_attachment =
+        disposition_attachment || name.is_some() || !matches!(ctype.as_str(), "text" | "multipart");
     PartInfo {
         mime_type: format!("{ctype}/{subtype}"),
         is_attachment,
-        name: parsed
-            .as_ref()
-            .and_then(|message| message.attachment_name())
-            .map(str::to_string),
+        name,
     }
 }
 
@@ -574,6 +659,11 @@ fn part_info(part: &[u8]) -> PartInfo {
 fn write_part(part: MimePart<'_>, eol: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::new();
     part.write_part(&mut bytes);
+    with_eol(bytes, eol)
+}
+
+/// `mail-builder` output (CRLF line endings) converted to `eol`'s style.
+fn with_eol(bytes: Vec<u8>, eol: &[u8]) -> Vec<u8> {
     if eol == b"\n" {
         let mut lf = Vec::with_capacity(bytes.len());
         let mut iter = bytes.iter().peekable();
@@ -1229,27 +1319,185 @@ Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r
         assert_eq!(after.message_id(), before.message_id());
     }
 
+    // ── attachment naming (review fixes) ─────────────────────────────
+
+    /// A `multipart/mixed` message of `parts`, each already a complete part.
+    fn mixed(parts: &[&str], epilogue: &str) -> Vec<u8> {
+        let mut raw = String::from(
+            "Subject: x\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n",
+        );
+        for part in parts {
+            raw.push_str("--b\r\n");
+            raw.push_str(part);
+            raw.push_str("\r\n");
+        }
+        raw.push_str("--b--\r\n");
+        raw.push_str(epilogue);
+        raw.into_bytes()
+    }
+
+    const TEXT_BODY: &str = "Content-Type: text/plain\r\n\r\nHello.";
+
+    fn named(name: &str, data: &str) -> String {
+        format!(
+            "Content-Type: application/octet-stream\r\nContent-Disposition: attachment; \
+             filename=\"{name}\"\r\n\r\n{data}"
+        )
+    }
+
+    fn remove(raw: &[u8], name: &str) -> Result<EditedMessage> {
+        DraftEdit {
+            remove_attachments: vec![name.to_string()],
+            ..DraftEdit::default()
+        }
+        .apply(raw)
+    }
+
+    #[test]
+    fn duplicate_names_are_removed_one_at_a_time_by_their_shown_names() {
+        let raw = mixed(
+            &[
+                TEXT_BODY,
+                &named("image.png", "first"),
+                &named("image.png", "second"),
+            ],
+            "",
+        );
+        // `draft show` lists these as image.png and image-1.png.
+        let edited = remove(&raw, "image-1.png").unwrap();
+        assert!(contains(&edited.raw, "first"));
+        assert!(!contains(&edited.raw, "second"));
+        let edited = remove(&raw, "image.png").unwrap();
+        assert!(!contains(&edited.raw, "first"));
+        assert!(contains(&edited.raw, "second"));
+    }
+
+    #[test]
+    fn a_stored_name_works_only_when_it_is_unambiguous() {
+        let raw = mixed(&[TEXT_BODY, &named("a/b.pdf", "only")], "");
+        // Shown as `b.pdf`; the stored `a/b.pdf` names just one part.
+        assert!(!contains(&remove(&raw, "b.pdf").unwrap().raw, "only"));
+        assert!(!contains(&remove(&raw, "a/b.pdf").unwrap().raw, "only"));
+
+        let raw = mixed(
+            &[
+                TEXT_BODY,
+                &named("x/r.pdf", "one"),
+                &named("y/r.pdf", "two"),
+            ],
+            "",
+        );
+        // Only one part is stored as y/r.pdf (shown as r-1.pdf).
+        let edited = remove(&raw, "y/r.pdf").unwrap();
+        assert!(contains(&edited.raw, "one"));
+        assert!(!contains(&edited.raw, "two"));
+        let err = remove(&raw, "zzz").unwrap_err().to_string();
+        assert!(err.contains("\"r.pdf\", \"r-1.pdf\""), "{err}");
+    }
+
+    #[test]
+    fn two_parts_with_the_same_stored_name_need_their_shown_names() {
+        let a = "Content-Type: application/pdf; name=\"r.pdf\"\r\n\r\none";
+        let b = "Content-Type: application/pdf; name=\"x/r.pdf\"\r\n\r\ntwo";
+        // Both show as r.pdf / r-1.pdf, and "x/r.pdf" matches only b.
+        let raw = mixed(&[TEXT_BODY, a, b, &named("x/r.pdf", "three")], "");
+        let err = remove(&raw, "x/r.pdf").unwrap_err().to_string();
+        assert!(
+            err.starts_with("2 attachments are named \"x/r.pdf\""),
+            "{err}"
+        );
+        assert!(err.contains("\"r-1.pdf\", \"r-2.pdf\""), "{err}");
+    }
+
+    #[test]
+    fn an_unnamed_attachment_is_removed_by_its_placeholder_name() {
+        let unnamed = "Content-Type: application/pdf\r\n\r\n%PDF";
+        let raw = mixed(&[TEXT_BODY, unnamed], "");
+        let edited = remove(&raw, "attachment-0").unwrap();
+        assert!(!contains(&edited.raw, "%PDF"));
+    }
+
+    #[test]
+    fn a_named_text_part_first_is_an_attachment_not_the_body() {
+        let notes = "Content-Type: text/plain; name=\"notes.txt\"\r\n\r\nmy notes";
+        let raw = mixed(&[notes], "");
+        let edited = DraftEdit {
+            body: Some("Cover note.".to_string()),
+            ..DraftEdit::default()
+        }
+        .apply(&raw)
+        .unwrap();
+        assert!(contains(&edited.raw, "my notes"));
+        let parsed = parse(&edited.raw);
+        assert_eq!(parsed.body_text(0).as_deref(), Some("Cover note."));
+        assert!(!contains(
+            &remove(&raw, "notes.txt").unwrap().raw,
+            "my notes"
+        ));
+    }
+
+    #[test]
+    fn a_draft_that_is_only_an_attachment_keeps_it_when_a_body_is_added() {
+        let raw = b"Subject: x\r\nContent-Type: application/pdf\r\n\
+Content-Disposition: attachment; filename=a.pdf\r\n\r\n%PDF";
+        let edited = DraftEdit {
+            body: Some("Cover note.".to_string()),
+            ..DraftEdit::default()
+        }
+        .apply(raw)
+        .unwrap();
+        assert!(edited.warnings.is_empty(), "{:?}", edited.warnings);
+        let parsed = parse(&edited.raw);
+        assert_eq!(parsed.body_text(0).as_deref(), Some("Cover note."));
+        assert_eq!(
+            parsed.attachment(0).unwrap().attachment_name(),
+            Some("a.pdf")
+        );
+        assert!(!contains(&remove(raw, "a.pdf").unwrap().raw, "%PDF"));
+    }
+
+    #[test]
+    fn the_epilogue_survives_a_structural_edit() {
+        let raw = mixed(&[TEXT_BODY, &named("a.pdf", "x")], "trailer text\r\n");
+        let edited = remove(&raw, "a.pdf").unwrap();
+        // Unwrapped to a single part: there is no multipart left to carry it.
+        assert!(!contains(&edited.raw, "multipart"));
+        let edited = DraftEdit {
+            attach: vec![attachment("b.pdf", "application/pdf", b"%PDF")],
+            ..DraftEdit::default()
+        }
+        .apply(&raw)
+        .unwrap();
+        assert!(edited.raw.ends_with(b"--\r\ntrailer text\r\n"));
+    }
+
     // ── split_multipart ──────────────────────────────────────────────
 
     #[test]
     fn split_multipart_keeps_the_preamble_and_excludes_delimiter_line_endings() {
         let body = b"preamble\r\n--b\r\nA\r\n--b  \r\n\r\nB\r\n--b--\r\nepilogue";
-        let (preamble, parts) = split_multipart(body, "b").unwrap();
-        assert_eq!(preamble, b"preamble\r\n");
-        assert_eq!(parts, [&b"A"[..], &b"\r\nB"[..]]);
+        assert_eq!(
+            split_multipart(body, "b").unwrap(),
+            Multipart {
+                preamble: b"preamble\r\n",
+                parts: vec![&b"A"[..], &b"\r\nB"[..]],
+                epilogue: b"epilogue",
+            }
+        );
     }
 
     #[test]
     fn split_multipart_ignores_lines_that_only_start_with_the_delimiter() {
         let body = b"--b\r\n--bx is not a delimiter\r\n--b--";
-        let (_, parts) = split_multipart(body, "b").unwrap();
+        let parts = split_multipart(body, "b").unwrap().parts;
         assert_eq!(parts, [&b"--bx is not a delimiter"[..]]);
     }
 
     #[test]
     fn split_multipart_tolerates_a_missing_close_delimiter() {
-        let (_, parts) = split_multipart(b"--b\nA\n--b\nB\n", "b").unwrap();
-        assert_eq!(parts, [&b"A"[..], &b"B\n"[..]]);
+        let split = split_multipart(b"--b\nA\n--b\nB\n", "b").unwrap();
+        assert_eq!(split.parts, [&b"A"[..], &b"B\n"[..]]);
+        assert!(split.epilogue.is_empty());
         assert!(split_multipart(b"no delimiter", "b").is_none());
     }
 }

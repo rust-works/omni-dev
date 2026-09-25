@@ -61,17 +61,16 @@ pub struct UpdateCommand {
     pub draft_id: String,
 
     /// Replace the `To` recipients: `addr@example.com` or
-    /// `"Name <addr@example.com>"`. Repeat the flag (or list several after
-    /// it) for more recipients.
-    #[arg(long, value_name = "ADDR", num_args = 1..)]
+    /// `"Name <addr@example.com>"`. Repeat the flag for more recipients.
+    #[arg(long, value_name = "ADDR", action = clap::ArgAction::Append)]
     pub to: Vec<String>,
 
     /// Replace the `Cc` recipients, in the same form as `--to`.
-    #[arg(long, value_name = "ADDR", num_args = 1..)]
+    #[arg(long, value_name = "ADDR", action = clap::ArgAction::Append)]
     pub cc: Vec<String>,
 
     /// Replace the `Bcc` recipients, in the same form as `--to`.
-    #[arg(long, value_name = "ADDR", num_args = 1..)]
+    #[arg(long, value_name = "ADDR", action = clap::ArgAction::Append)]
     pub bcc: Vec<String>,
 
     /// Replace the subject.
@@ -86,14 +85,13 @@ pub struct UpdateCommand {
     #[arg(long, value_name = "PATH")]
     pub body_file: Option<PathBuf>,
 
-    /// Attach a file after the existing attachments. Repeat the flag (or
-    /// list several after it) for more.
-    #[arg(long, value_name = "PATH", num_args = 1..)]
+    /// Attach a file after the existing attachments. Repeat the flag for more.
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
     pub attach: Vec<PathBuf>,
 
-    /// Remove the attachment with this filename. Repeat the flag (or list
-    /// several after it) for more.
-    #[arg(long, value_name = "NAME", num_args = 1..)]
+    /// Remove the attachment `gmail draft show` lists under this name (or
+    /// the one stored under it, when only one is). Repeat the flag for more.
+    #[arg(long, value_name = "NAME", action = clap::ArgAction::Append)]
     pub remove_attachment: Vec<String>,
 
     /// Replace the whole message with this RFC 5322 file (`.eml`), uploaded
@@ -225,15 +223,15 @@ async fn run_update(
         .clone()
         .filter(|id| !id.is_empty());
 
+    // Held back until the upload succeeds: a refused update changed nothing.
+    let mut warnings = Vec::new();
     let raw = match change {
         // For `--raw` the read above is already the last one before the upload.
         Change::Raw(raw) => raw,
         Change::Edit(edit) => {
             let original = decode_raw_message(&current.message)?;
             let edited = edit.apply(&original)?;
-            for warning in &edited.warnings {
-                writeln!(warn, "warning: {warning}").context("Failed to write a warning")?;
-            }
+            warnings = edited.warnings;
             // Building the message took a moment; re-read just before the
             // upload to narrow the window for an unseen save.
             let latest = drafts.get(draft_id, MessageFormat::Minimal).await?;
@@ -246,22 +244,28 @@ async fn run_update(
         .update(draft_id, &raw, thread_id.as_deref())
         .await
         .map_err(with_modify_scope_hint)?;
+    let new_thread_id = updated.message.thread_id;
     if let Some(thread_id) = &thread_id {
-        if &updated.message.thread_id != thread_id {
-            writeln!(
-                warn,
-                "warning: Gmail moved the draft from thread {thread_id} to thread {}; its subject \
-                 or reply headers may no longer match the thread's",
-                updated.message.thread_id
-            )
-            .context("Failed to write a warning")?;
+        if !new_thread_id.is_empty() && &new_thread_id != thread_id {
+            warnings.push(format!(
+                "Gmail moved the draft from thread {thread_id} to thread {new_thread_id}; its \
+                 subject or reply headers may no longer match the thread's"
+            ));
         }
+    }
+    for warning in &warnings {
+        writeln!(warn, "warning: {warning}").context("Failed to write a warning")?;
     }
     Ok(UpdatedDraft {
         draft_id: updated.id,
         message_id: updated.message.id,
         previous_message_id: read_id,
-        thread_id: updated.message.thread_id,
+        // An answer without a thread id means the draft wasn't moved.
+        thread_id: if new_thread_id.is_empty() {
+            thread_id.unwrap_or_default()
+        } else {
+            new_thread_id
+        },
     })
 }
 
@@ -499,15 +503,13 @@ JVBERi0xLjQK\r\n\
         mount_get_minimal(&server, "m-9", 1).await;
         mount_update(&server, "t-1", 0).await;
 
-        let err = run_update(
-            &client,
-            "r-1",
-            subject_edit("Re: Report"),
-            None,
-            &mut Vec::new(),
-        )
-        .await
-        .unwrap_err();
+        // The edit would warn about the thread, but nothing is updated, so
+        // nothing is warned about.
+        let mut warn = Vec::new();
+        let err = run_update(&client, "r-1", subject_edit("Elsewhere"), None, &mut warn)
+            .await
+            .unwrap_err();
+        assert!(warn.is_empty(), "{}", String::from_utf8_lossy(&warn));
         let message = err.to_string();
         assert!(
             message.contains("draft changed since it was read"),
@@ -625,6 +627,27 @@ JVBERi0xLjQK\r\n\
         assert!(warn.contains("HTML version"), "{warn}");
         assert!(warn.contains("out of its thread"), "{warn}");
         assert!(warn.contains("from thread t-1 to thread t-new"), "{warn}");
+    }
+
+    #[tokio::test]
+    async fn run_update_keeps_the_read_thread_id_when_the_answer_has_none() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_get_minimal(&server, "m-1", 1).await;
+        mount_update(&server, "", 1).await;
+
+        let mut warn = Vec::new();
+        let updated = run_update(
+            &client,
+            "r-1",
+            Change::Raw(b"Subject: x\r\n\r\nbody".to_vec()),
+            None,
+            &mut warn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.thread_id, "t-1");
+        assert!(warn.is_empty(), "{}", String::from_utf8_lossy(&warn));
     }
 
     #[tokio::test]
@@ -917,11 +940,12 @@ JVBERi0xLjQK\r\n\
     }
 
     #[test]
-    fn clap_collects_multi_value_flags() {
+    fn clap_collects_repeated_flags() {
         let cmd = parse(&[
             "r-1",
             "--remove-attachment",
             "a.pdf",
+            "--remove-attachment",
             "b.pdf",
             "--to",
             "Doe, Jane <j@example.com>",
@@ -929,5 +953,16 @@ JVBERi0xLjQK\r\n\
         .unwrap();
         assert_eq!(cmd.remove_attachment, ["a.pdf", "b.pdf"]);
         assert_eq!(cmd.to, ["Doe, Jane <j@example.com>"]);
+    }
+
+    #[test]
+    fn clap_takes_the_draft_id_after_a_recipient_or_attachment_flag() {
+        for flag in ["--to", "--cc", "--bcc", "--remove-attachment"] {
+            let cmd = parse(&[flag, "a@example.com", "r-1"]).unwrap();
+            assert_eq!(cmd.draft_id, "r-1", "{flag}");
+        }
+        let cmd = parse(&["--attach", "f.pdf", "r-1"]).unwrap();
+        assert_eq!(cmd.draft_id, "r-1");
+        assert_eq!(cmd.attach, [PathBuf::from("f.pdf")]);
     }
 }
