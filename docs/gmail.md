@@ -577,6 +577,12 @@ review and send.
   defaulting to `application/octet-stream`.
 - **From.** Not set. Gmail fills in the account's own address. Sending
   from a send-as alias isn't supported yet.
+- **Message-ID.** Ends in the account's own domain (for example
+  `<…@gmail.com>`), looked up with one `users.getProfile` call, which
+  `gmail.readonly` allows. If that call fails, a warning is printed and the
+  id ends in `@localhost` instead; the draft is still created. `--raw`
+  messages keep whatever `Message-ID` they carry, and so does every
+  [`draft update`](#updating-drafts).
 - **Replies.** `--reply-to` takes the **Gmail message id** of the message
   being answered, as `gmail search`/`read` print it, not its `Message-ID`
   header. Gmail only files a reply into the original's thread when the

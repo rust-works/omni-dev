@@ -13,12 +13,14 @@ use crate::cli::gmail::format::{
 use crate::cli::gmail::helpers::with_modify_scope_hint;
 use crate::gmail::client::GmailClient;
 use crate::gmail::compose::{
-    subject_matches_reply, Attachment, Composition, Mailbox, ReplyContext, REPLY_HEADERS,
+    message_id_domain, subject_matches_reply, Attachment, Composition, Mailbox, ReplyContext,
+    REPLY_HEADERS,
 };
 use crate::gmail::drafts_api::DraftsApi;
 use crate::gmail::messages_api::{
     ensure_within_message_limit, MessageFormat, MessagesApi, MAX_INSERT_BYTES,
 };
+use crate::gmail::profile_api::ProfileApi;
 
 /// What `draft create` does with a message, for size-limit refusals.
 const CREATE_ACTION: &str = "create a draft of";
@@ -188,7 +190,11 @@ async fn run_create(client: &GmailClient, input: DraftInput) -> Result<CreatedDr
                 None => None,
             };
             let thread_id = reply.as_ref().map(|reply| reply.thread_id.clone());
-            (compose_message(compose, recipients, reply)?, thread_id)
+            let domain = fetch_message_id_domain(client).await;
+            (
+                compose_message(compose, recipients, reply, domain)?,
+                thread_id,
+            )
         }
     };
     let draft = DraftsApi::new(client)
@@ -210,6 +216,34 @@ async fn fetch_reply_context(client: &GmailClient, message_id: &str) -> Result<R
         .await
         .with_context(|| format!("Failed to fetch message {message_id} to reply to"))?;
     ReplyContext::from_message(&original)
+}
+
+/// The account's domain, for the draft's `Message-ID` (#1953).
+///
+/// Asks `users.getProfile` (which `gmail.readonly` allows) rather than the
+/// cached `email_address` in settings, which is display-only and missing
+/// for accounts set up before it existed. Never fails the command: on any
+/// error it warns and returns `None`, leaving `mail-builder`'s
+/// `@localhost` id in place.
+async fn fetch_message_id_domain(client: &GmailClient) -> Option<String> {
+    let email = match ProfileApi::new(client).get().await {
+        Ok(profile) => profile.email_address,
+        Err(err) => {
+            eprintln!(
+                "warning: could not look up the account's address ({err:#}); the draft's \
+                 Message-ID will end in @localhost."
+            );
+            return None;
+        }
+    };
+    let domain = message_id_domain(&email);
+    if domain.is_none() {
+        eprintln!(
+            "warning: the account's address {email:?} has no usable domain; the draft's \
+             Message-ID will end in @localhost."
+        );
+    }
+    domain
 }
 
 /// The parsed `--to`/`--cc`/`--bcc` values.
@@ -242,6 +276,7 @@ fn compose_message(
     input: ComposeInput,
     recipients: Recipients,
     reply: Option<ReplyContext>,
+    message_id_domain: Option<String>,
 ) -> Result<Vec<u8>> {
     let subject = match (input.subject, &reply) {
         (Some(subject), Some(reply)) => {
@@ -266,6 +301,7 @@ fn compose_message(
         body: input.body,
         attachments: input.attachments,
         reply,
+        message_id_domain,
     }
     .build()
 }
@@ -433,6 +469,36 @@ mod tests {
             .await;
     }
 
+    const PROFILE_PATH: &str = "/gmail/v1/users/me/profile";
+
+    async fn mount_profile(server: &wiremock::MockServer, email: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(PROFILE_PATH))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "emailAddress": email,
+                    "messagesTotal": 1,
+                    "threadsTotal": 1,
+                    "historyId": "1",
+                })),
+            )
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    /// The upload's decoded `Message-ID` value, without angle brackets.
+    async fn uploaded_message_id(server: &wiremock::MockServer) -> String {
+        let body = create_request_body(server).await;
+        let line = body
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("Message-ID: "))
+            .unwrap_or_else(|| panic!("no Message-ID in {body}"));
+        line.trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_string()
+    }
+
     async fn create_request_body(server: &wiremock::MockServer) -> String {
         let request = server
             .received_requests()
@@ -459,6 +525,7 @@ mod tests {
     async fn run_create_builds_and_uploads_a_plain_draft() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "me@example.org").await;
         mount_create(&server, "t-new").await;
 
         let input = ComposeInput {
@@ -489,6 +556,59 @@ mod tests {
         assert!(body.contains("Bcc: <dave@example.com>\r\n"), "{body}");
         assert!(!body.contains("threadId"));
         assert!(!body.contains("In-Reply-To"));
+        assert!(!body.contains("@localhost"), "{body}");
+        assert!(
+            uploaded_message_id(&server).await.ends_with("@example.org"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_create_falls_back_to_the_builders_id_when_the_profile_fails() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(PROFILE_PATH))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        mount_create(&server, "t-new").await;
+
+        run_create(
+            &client,
+            DraftInput::Compose(compose("alice@example.com", Some("Hi"))),
+        )
+        .await
+        .unwrap();
+        assert!(uploaded_message_id(&server).await.ends_with("@localhost"));
+    }
+
+    #[tokio::test]
+    async fn fetch_message_id_domain_rejects_an_address_without_a_usable_domain() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "me@[127.0.0.1]").await;
+
+        assert_eq!(fetch_message_id_domain(&client).await, None);
+    }
+
+    #[tokio::test]
+    async fn run_create_raw_never_asks_for_the_profile() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::path(PROFILE_PATH))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        mount_create(&server, "t-new").await;
+
+        run_create(
+            &client,
+            DraftInput::Raw(b"Subject: x\r\n\r\nx\r\n".to_vec()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -518,6 +638,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        mount_profile(&server, "me@example.org").await;
         mount_create(&server, "t-orig").await;
 
         let input = ComposeInput {
@@ -635,6 +756,7 @@ mod tests {
     async fn execute_composes_from_flags_and_renders_jsonl() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "me@example.org").await;
         mount_create(&server, "t-flags").await;
 
         create_command(None, OutputFormat::Jsonl)
@@ -723,7 +845,7 @@ mod tests {
         };
         let input = compose("a@example.com", Some("Different"));
         let recipients = Recipients::parse(&input).unwrap();
-        let message = compose_message(input, recipients, Some(reply)).unwrap();
+        let message = compose_message(input, recipients, Some(reply), None).unwrap();
         assert!(String::from_utf8(message)
             .unwrap()
             .contains("Subject: Different\r\n"));
@@ -733,7 +855,7 @@ mod tests {
     fn compose_message_requires_a_subject_without_a_reply() {
         let input = compose("a@example.com", None);
         let recipients = Recipients::parse(&input).unwrap();
-        let err = compose_message(input, recipients, None).unwrap_err();
+        let err = compose_message(input, recipients, None, None).unwrap_err();
         assert!(err.to_string().contains("--subject"), "{err}");
     }
 

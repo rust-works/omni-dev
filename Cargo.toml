@@ -111,7 +111,9 @@ mail-parser = "0.11"
 # RFC 5322 message builder (same author as mail-parser), used only by
 # src/gmail/compose.rs to back `gmail draft create` (#1923): RFC 2047 encoded
 # words, RFC 2231 filenames, multipart/mixed and base64 parts. The default
-# `gethostname` feature only picks the Message-ID's host part, so it's off.
+# `gethostname` feature only picks the Message-ID's host part, so it's off:
+# it would write the machine's hostname into every draft. compose.rs sets the
+# account's own domain instead (#1953).
 mail-builder = { version = "1.0.0", default-features = false }
 # Live stderr progress bars for `gmail sync`'s full-mailbox pass
 # (`src/cli/gmail/sync/progress.rs`, #1502) — the only consumer; no-ops
