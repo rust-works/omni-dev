@@ -315,6 +315,7 @@ impl StatusTracker {
 /// The authoritative `observe` for a known thread.
 fn observe(id: &str, known: &Known) -> ObserveRequest {
     ObserveRequest {
+        pid: None,
         agent: Agent::Codex,
         session_id: id.to_string(),
         cwd: known.cwd.clone(),

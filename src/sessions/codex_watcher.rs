@@ -258,6 +258,7 @@ impl Action {
                 cwd,
                 transcript_path,
             } => registry.observe(ObserveRequest {
+                pid: None,
                 agent: Agent::Codex,
                 session_id: id,
                 cwd,
@@ -269,7 +270,7 @@ impl Action {
                 model: None,
             }),
             Self::End { id } => {
-                registry.end(&id, Some("codex rollout watcher"));
+                registry.end(&id, Some("codex rollout watcher"), None);
             }
         }
     }

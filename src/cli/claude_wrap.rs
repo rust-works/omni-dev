@@ -199,7 +199,13 @@ where
 
     let (tee, lines) = mpsc::channel::<(Direction, String)>(TEE_CAPACITY);
     let (title_tx, title_rx) = watch::channel::<Option<String>>(None);
-    let observer = tokio::spawn(observe(lines, socket, KEEPALIVE_INTERVAL, title_tx));
+    let observer = tokio::spawn(observe(
+        lines,
+        socket,
+        KEEPALIVE_INTERVAL,
+        title_tx,
+        child_pid,
+    ));
     let signals = tokio::spawn(forward_signals(child_pid));
 
     // The title rewrite only ever applies to the FromClaude direction — it
@@ -587,12 +593,16 @@ fn tee_chunk(
 /// the daemon — plus a keep-alive while nothing changes, and an `end` once the
 /// stream is over.
 /// `every` is the keep-alive cadence, injected so tests can drive it without
-/// waiting out the real [`KEEPALIVE_INTERVAL`].
+/// waiting out the real [`KEEPALIVE_INTERVAL`]. `child_pid` is the wrapped
+/// `claude`, sent on every report — the same pid its hooks send — so the `end`
+/// this wrapper sends when an in-place resume has already replaced its child
+/// cannot end the resumed session (#1948).
 async fn observe(
     mut lines: mpsc::Receiver<(Direction, String)>,
     socket: Option<PathBuf>,
     every: Duration,
     title_tx: watch::Sender<Option<String>>,
+    child_pid: Option<u32>,
 ) {
     let Ok(socket) = server::resolve_socket(socket) else {
         return;
@@ -621,7 +631,8 @@ async fn observe(
             let prefix = last_model.as_deref().map(title_prefix_for_model);
             let _ = title_tx.send(prefix);
         }
-        if let Some(request) = observed {
+        if let Some(mut request) = observed {
+            request.pid = child_pid;
             if let Ok(payload) = serde_json::to_value(request) {
                 report(&socket, "observe", payload).await;
             }
@@ -629,7 +640,11 @@ async fn observe(
     }
 
     if let Some(session_id) = tracker.session_id() {
-        report(&socket, "end", json!({ "session_id": session_id })).await;
+        let mut payload = json!({ "session_id": session_id });
+        if let Some(pid) = child_pid {
+            payload["pid"] = Value::from(pid);
+        }
+        report(&socket, "end", payload).await;
     }
 }
 
@@ -928,6 +943,7 @@ mod tests {
             Some(socket),
             Duration::from_millis(20),
             title_tx,
+            Some(4242),
         ));
         tee.send((
             Direction::FromClaude,
@@ -946,8 +962,12 @@ mod tests {
         for envelope in &observes {
             assert_eq!(envelope["payload"]["session_id"], "ka-1");
             assert_eq!(envelope["payload"]["event"]["stream_state"], "idle");
+            // The wrapped child's pid, so a resume can tell it apart (#1948).
+            assert_eq!(envelope["payload"]["pid"], 4242);
         }
-        assert_eq!(envelopes.last().unwrap()["op"], "end");
+        let end = envelopes.last().unwrap();
+        assert_eq!(end["op"], "end");
+        assert_eq!(end["payload"]["pid"], 4242);
     }
 
     #[tokio::test]
