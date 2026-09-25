@@ -14,12 +14,18 @@
 //!   `References` headers, and its `Subject`. [`ReplyContext`] derives the
 //!   last two from the original message's headers.
 //!
+//! - **The `Message-ID`.** `mail-builder` always writes one, and with its
+//!   `gethostname` feature off its host part is `localhost`. A
+//!   [`Composition::message_id_domain`] replaces that with the account's own
+//!   domain (#1953).
+//!
 //! Only `text/plain` bodies are built. `From` is never set: Gmail fills in the
 //! authenticated account's address.
 
 use anyhow::{bail, ensure, Result};
 use mail_builder::headers::address::Address;
 use mail_builder::headers::message_id::MessageId;
+use mail_builder::mime::make_boundary;
 use mail_builder::MessageBuilder;
 
 use crate::gmail::messages_api::header_value;
@@ -265,10 +271,37 @@ pub struct Composition {
     pub attachments: Vec<Attachment>,
     /// When replying: the source of `In-Reply-To` and `References`.
     pub reply: Option<ReplyContext>,
+    /// The domain for the generated `Message-ID`, normally the account
+    /// address's (see [`message_id_domain`]). `None` leaves the id to
+    /// `mail-builder`, which ends it in `@localhost`.
+    pub message_id_domain: Option<String>,
+}
+
+/// The domain part of `email`, when it can serve as a `Message-ID`'s right
+/// half: a dot-separated run of letters, digits and hyphens.
+///
+/// Anything else (no `@`, an address literal, a stray character) is `None`,
+/// so a malformed address can never inject into the header.
+#[must_use]
+pub fn message_id_domain(email: &str) -> Option<String> {
+    let (_, domain) = email.rsplit_once('@')?;
+    is_plain_domain(domain).then(|| domain.to_ascii_lowercase())
+}
+
+/// Whether `domain` is non-empty dot-separated labels of letters, digits
+/// and hyphens.
+fn is_plain_domain(domain: &str) -> bool {
+    domain.split('.').all(|label| {
+        !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
 }
 
 impl Composition {
     /// Serialises the message to RFC 5322 bytes with CRLF line endings.
+    ///
+    /// The `Message-ID` is `<{random}@{message_id_domain}>`. Whether Gmail
+    /// keeps it when the draft is sent is unverified (#1953), so it is made
+    /// valid either way rather than left as `@localhost`.
     pub fn build(&self) -> Result<Vec<u8>> {
         // A tab is legal (and survives unfolding a long original subject);
         // CR, LF and NUL would break the header.
@@ -285,6 +318,13 @@ impl Composition {
         }
 
         let mut builder = MessageBuilder::new();
+        if let Some(domain) = &self.message_id_domain {
+            ensure!(
+                is_plain_domain(domain),
+                "invalid Message-ID domain {domain:?}"
+            );
+            builder = builder.message_id(format!("{}@{domain}", make_boundary(".")));
+        }
         for (header, mailboxes) in [("To", &self.to), ("Cc", &self.cc), ("Bcc", &self.bcc)] {
             if mailboxes.is_empty() {
                 continue;
@@ -432,6 +472,10 @@ mod tests {
         assert!(raw_header(&message, "From").is_none());
         assert!(raw_header(&message, "Date").is_some());
         assert!(raw_header(&message, "MIME-Version").is_some());
+        // With no domain, the id is the builder's own placeholder (#1953).
+        assert!(raw_header(&message, "Message-ID")
+            .unwrap()
+            .ends_with("@localhost>"));
         assert!(raw_header(&message, "Content-Type")
             .unwrap()
             .starts_with("text/plain"));
@@ -440,6 +484,64 @@ mod tests {
         let parsed = MessageParser::default().parse(message.as_bytes()).unwrap();
         // A 7-bit body goes out with RFC 5322's CRLF line endings.
         assert_eq!(parsed.body_text(0).as_deref(), Some("Hello Alice.\r\n"));
+    }
+
+    fn with_domain(domain: &str) -> Composition {
+        Composition {
+            message_id_domain: Some(domain.to_string()),
+            ..plain("Hello")
+        }
+    }
+
+    #[test]
+    fn build_writes_a_message_id_in_the_given_domain() {
+        let message = built(&with_domain("example.org"));
+        assert_eq!(message.matches("Message-ID:").count(), 1, "{message}");
+        let parsed = MessageParser::default().parse(message.as_bytes()).unwrap();
+        let id = parsed.message_id().unwrap();
+        let (left, right) = id.split_once('@').unwrap();
+        assert_eq!(right, "example.org");
+        // RFC 5322 `id-left` is a `dot-atom-text`.
+        assert!(!left.is_empty() && !left.starts_with('.') && !left.ends_with('.'));
+        assert!(left.chars().all(|c| c.is_ascii_alphanumeric() || c == '.'));
+    }
+
+    #[test]
+    fn build_writes_a_fresh_message_id_each_time() {
+        let composition = with_domain("example.org");
+        assert_ne!(
+            raw_header(&built(&composition), "Message-ID"),
+            raw_header(&built(&composition), "Message-ID")
+        );
+    }
+
+    #[test]
+    fn build_rejects_a_message_id_domain_that_could_inject() {
+        for domain in ["", "example.org>\r\nBcc: eve@example.com", "a..b", "a b"] {
+            let err = with_domain(domain).build().unwrap_err().to_string();
+            assert!(err.contains("invalid Message-ID domain"), "{err}");
+        }
+    }
+
+    #[test]
+    fn message_id_domain_takes_the_part_after_the_last_at() {
+        assert_eq!(
+            message_id_domain("Me@Example.ORG").as_deref(),
+            Some("example.org")
+        );
+        assert_eq!(
+            message_id_domain("\"a@b\"@mail.example.com").as_deref(),
+            Some("mail.example.com")
+        );
+        for email in [
+            "no-at-sign",
+            "me@",
+            "me@[127.0.0.1]",
+            "me@a..b",
+            "me@exa mple.org",
+        ] {
+            assert_eq!(message_id_domain(email), None, "{email}");
+        }
     }
 
     #[test]

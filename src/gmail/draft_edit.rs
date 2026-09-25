@@ -1223,6 +1223,49 @@ Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r
     }
 
     #[test]
+    fn edits_keep_the_drafts_message_id_exactly() {
+        // `draft update` never writes a Message-ID of its own, so a draft
+        // keeps whichever id `draft create` or Gmail gave it (#1953).
+        let original = Composition {
+            to: vec![mailbox("a@example.com")],
+            subject: "Hi".to_string(),
+            body: "Hello.\n".to_string(),
+            message_id_domain: Some("example.org".to_string()),
+            ..Composition::default()
+        }
+        .build()
+        .unwrap();
+        let message_id = |raw: &[u8]| parse(raw).message_id().map(str::to_string);
+        for edit in [
+            DraftEdit {
+                subject: Some("New".to_string()),
+                ..DraftEdit::default()
+            },
+            DraftEdit {
+                body: Some("New.".to_string()),
+                attach: vec![attachment("n.txt", "text/plain", b"note")],
+                ..DraftEdit::default()
+            },
+        ] {
+            let edited = edit.apply(&original).unwrap();
+            assert_eq!(message_id(&edited.raw), message_id(&original));
+        }
+        assert_eq!(
+            parse(GMAIL_UI_DRAFT.as_bytes()).message_id(),
+            parse(
+                &DraftEdit {
+                    body: Some("New.".to_string()),
+                    ..DraftEdit::default()
+                }
+                .apply(GMAIL_UI_DRAFT.as_bytes())
+                .unwrap()
+                .raw
+            )
+            .message_id()
+        );
+    }
+
+    #[test]
     fn a_missing_mime_version_is_added_on_a_structural_edit() {
         let edited = DraftEdit {
             attach: vec![attachment("a.pdf", "application/pdf", b"%PDF")],
