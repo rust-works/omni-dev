@@ -1163,7 +1163,7 @@ mod tests {
                 assert!(detail.contains("--start 2"), "{detail}");
                 assert!(detail.contains("--end 7"), "{detail}");
             }
-            other => panic!("expected RefusedInvalidLocation, got {other:?}"),
+            other => panic!("expected RefusedInvalidLocation, got {other:?}"), // omni-dev: coverage ignore-line reason="guards this test's assumption; the multi-row span above always fails resolve_location with RefusedInvalidLocation"
         }
     }
 
@@ -2375,7 +2375,7 @@ mod tests {
             DeveloperMetadataResult::RefusedInvalidLocation { detail } => {
                 assert!(detail.contains("--start must be at least 1"), "{detail}");
             }
-            other => panic!("expected RefusedInvalidLocation, got {other:?}"),
+            other => panic!("expected RefusedInvalidLocation, got {other:?}"), // omni-dev: coverage ignore-line reason="guards this test's assumption; a start of 0 above always fails resolve_location with RefusedInvalidLocation"
         }
     }
 
