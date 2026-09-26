@@ -41,10 +41,11 @@ question map) has nothing in common with a chat completion.
 11. [verify-decision](#verify-decision)
 12. [Ordering caveats](#ordering-caveats)
 13. [Best practices](#best-practices)
-14. [Retries and timeouts](#retries-and-timeouts)
-15. [Request log](#request-log)
-16. [Troubleshooting](#troubleshooting)
-17. [See also](#see-also)
+14. [GitHub fetch cache](#github-fetch-cache)
+15. [Retries and timeouts](#retries-and-timeouts)
+16. [Request log](#request-log)
+17. [Troubleshooting](#troubleshooting)
+18. [See also](#see-also)
 
 ## Prerequisites
 
@@ -1406,6 +1407,40 @@ examples from your own data whose answers you already know. Then check that
 high-confidence answers really are right more often. Pin the model with
 `--jev-model` while you do (see [Choosing a model](#choosing-a-model)), so a
 `jev-latest` release cannot move the numbers underneath your thresholds.
+
+## GitHub fetch cache
+
+`route` and `verify-decision` read issues and pull requests from GitHub through
+`gh api graphql`. Both are usually re-run against the same issue while you tune
+flags or prompts, so each item they fetch is cached on disk and reused for a
+few minutes instead of being queried again ([#1858](https://github.com/rust-works/omni-dev/issues/1858)).
+
+- **What is cached:** each fetched issue or pull request, as one JSON file at
+  `<cache dir>/omni-dev/github-issues/<owner>/<repo>/<number>.json`. The cache
+  dir is `~/Library/Caches` on macOS and `$XDG_CACHE_HOME` (or `~/.cache`) on
+  Linux. `route` and `verify-decision` share entries, so a cited issue
+  that `route` fetched is reused by `verify-decision`, and the other way round.
+- **What is not cached:** a citation that could not be found, so fixing a typo
+  or giving `gh` access takes effect on the next run. The current repository
+  (`gh repo view`) and `route --all-open`'s list of open issues aren't cached
+  either. The issues `--all-open` goes on to fetch are cached.
+- **How long:** `OMNI_DEV_GITHUB_CACHE_TTL_SECS`, 300 seconds by default. It can
+  also be set in the `settings.json` `env` map. `0` turns the cache off: nothing
+  is read or written. A value that isn't a whole number of seconds is warned
+  about and ignored.
+- **Bypassing it:** `--refresh` re-fetches everything for that run and caches
+  the fresh copies. Use it after posting a comment you want `verify-decision`
+  to see at once.
+- **Knowing when it was used:** when a run reuses anything, it says so on
+  stderr, and stdout is unchanged:
+  `note: reused 2 cached GitHub items, up to 3m old; pass --refresh to re-fetch`.
+
+The cache is best-effort. An unreadable, corrupt or expired entry is fetched
+again, and a failed write is ignored, so at worst a run behaves as if there
+were no cache. Entries hold issue text, including text from private
+repositories. They are written readable by you alone (`0600` files in `0700`
+directories) and are never deleted automatically; remove the directory to
+clear them.
 
 ## Retries and timeouts
 

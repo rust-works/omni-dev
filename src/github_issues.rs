@@ -22,6 +22,10 @@ use tracing::warn;
 
 use crate::provider::{Comment, GitProvider, IssueDoc, ItemKind, ItemRef, ItemState};
 
+mod cache;
+
+pub use cache::{IssueCache, DEFAULT_TTL as DEFAULT_CACHE_TTL, GITHUB_CACHE_TTL_ENV};
+
 /// Most issues resolved by one `gh api graphql` call. Each issue carries up
 /// to [`MAX_COMMENTS`] comment bodies, so an unbounded `--all-open` query on a
 /// large backlog would hit GraphQL's node and response-size limits.
@@ -698,6 +702,75 @@ pub fn fetch_items(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<IssueDoc>>
         .collect()
 }
 
+/// [`fetch_issues`] through `cache`: serves fresh cached issues from disk,
+/// fetches only the rest, and caches what it fetched (#1858).
+///
+/// A cached pull request is not served, so asking for one as an issue still
+/// reaches GitHub and fails as it would uncached. **Blocking.**
+pub fn fetch_issues_cached(
+    bin: &Path,
+    cache: &IssueCache,
+    refs: &[ItemRef],
+) -> Result<Vec<IssueDoc>> {
+    let mut found: Vec<Option<IssueDoc>> = refs
+        .iter()
+        .map(|item_ref| cache.lookup(item_ref, |doc| doc.kind == ItemKind::Issue))
+        .collect();
+    let misses = missing_refs(refs, &found);
+    if !misses.is_empty() {
+        let mut fetched = fetch_issues(bin, &misses)?.into_iter();
+        for slot in found.iter_mut().filter(|slot| slot.is_none()) {
+            let doc = fetched
+                .next()
+                .context("fetch_issues returned fewer issues than asked for (bug)")?;
+            cache.store(&doc);
+            *slot = Some(doc);
+        }
+    }
+    refs.iter()
+        .zip(found)
+        .map(|(item_ref, doc)| {
+            doc.ok_or_else(|| anyhow!("issue {item_ref} missing after the fetch (bug)"))
+        })
+        .collect()
+}
+
+/// [`fetch_items`] through `cache`, like [`fetch_issues_cached`]. A
+/// not-found item is not cached, so it is re-queried next time. **Blocking.**
+pub fn fetch_items_cached(
+    bin: &Path,
+    cache: &IssueCache,
+    refs: &[ItemRef],
+) -> Result<Vec<Option<IssueDoc>>> {
+    let mut found: Vec<Option<Option<IssueDoc>>> = refs
+        .iter()
+        .map(|item_ref| cache.lookup(item_ref, |_| true).map(Some))
+        .collect();
+    let misses = missing_refs(refs, &found);
+    if !misses.is_empty() {
+        let mut fetched = fetch_items(bin, &misses)?.into_iter();
+        for slot in found.iter_mut().filter(|slot| slot.is_none()) {
+            let doc = fetched
+                .next()
+                .context("fetch_items returned fewer items than asked for (bug)")?;
+            if let Some(doc) = &doc {
+                cache.store(doc);
+            }
+            *slot = Some(doc);
+        }
+    }
+    Ok(found.into_iter().map(Option::flatten).collect())
+}
+
+/// The refs whose `found` slot is still empty, in order.
+fn missing_refs<T>(refs: &[ItemRef], found: &[Option<T>]) -> Vec<ItemRef> {
+    refs.iter()
+        .zip(found)
+        .filter(|(_, slot)| slot.is_none())
+        .map(|(item_ref, _)| item_ref.clone())
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1361,5 +1434,157 @@ mod tests {
         let docs = retry_on_etxtbsy(|| fetch_items(&bin, &[item_ref("rust-works/omni-dev", 1614)]))
             .unwrap();
         assert!(docs[0].is_none());
+    }
+
+    // ── fetch_*_cached (fake-gh shim + on-disk cache) ─────────────────
+
+    /// A fake `gh` that appends a line to `<dir>/calls` per invocation, so a
+    /// test can assert how many times the network was reached.
+    fn counting_gh(dir: &Path, stdout: &str, code: i32) -> (PathBuf, MutexGuard<'static, ()>) {
+        let guard = shim_lock();
+        let path = dir.join("fake-gh");
+        let calls = dir.join("calls");
+        write_exec_script(
+            &path,
+            &format!(
+                "#!/bin/sh\necho call >> '{}'\ncat <<'JSON'\n{stdout}\nJSON\nexit {code}\n",
+                calls.display()
+            ),
+        );
+        (path, guard)
+    }
+
+    fn gh_calls(dir: &Path) -> usize {
+        std::fs::read_to_string(dir.join("calls")).map_or(0, |s| s.lines().count())
+    }
+
+    fn one_issue_reply(title: &str) -> String {
+        serde_json::json!({"data": {"r0": {"i0": {
+            "__typename": "Issue",
+            "title": title, "body": "b", "state": "OPEN", "url": "u",
+            "comments": {"totalCount": 0, "nodes": []},
+            "closedByPullRequestsReferences": {"nodes": []}
+        }}}})
+        .to_string()
+    }
+
+    #[test]
+    fn fetch_issues_cached_reuses_a_fresh_fetch_without_calling_gh() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        let (bin, _shim) = counting_gh(dir.path(), &one_issue_reply("first"), 0);
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+
+        let first = retry_on_etxtbsy(|| fetch_issues_cached(&bin, &cache, &refs)).unwrap();
+        assert_eq!(gh_calls(dir.path()), 1);
+        assert!(cache.reuse_note().is_none());
+
+        let second = retry_on_etxtbsy(|| fetch_issues_cached(&bin, &cache, &refs)).unwrap();
+        assert_eq!(
+            gh_calls(dir.path()),
+            1,
+            "the second fetch must be served from disk"
+        );
+        assert_eq!(first, second);
+        assert!(cache.reuse_note().is_some());
+    }
+
+    #[test]
+    fn fetch_issues_cached_fetches_only_misses_and_keeps_caller_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        {
+            let (bin, _shim) = counting_gh(dir.path(), &one_issue_reply("cached"), 0);
+            retry_on_etxtbsy(|| {
+                fetch_issues_cached(&bin, &cache, &[item_ref("rust-works/omni-dev", 1)])
+            })
+            .unwrap();
+        }
+        let (bin, _shim) = counting_gh(dir.path(), &one_issue_reply("fresh"), 0);
+        let refs = [
+            item_ref("rust-works/omni-dev", 2),
+            item_ref("rust-works/omni-dev", 1),
+        ];
+        let docs = retry_on_etxtbsy(|| fetch_issues_cached(&bin, &cache, &refs)).unwrap();
+        assert_eq!(gh_calls(dir.path()), 2);
+        assert_eq!((docs[0].number, docs[0].title.as_str()), (2, "fresh"));
+        assert_eq!((docs[1].number, docs[1].title.as_str()), (1, "cached"));
+    }
+
+    #[test]
+    fn refresh_bypasses_the_cache_for_fetch_issues_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = counting_gh(dir.path(), &one_issue_reply("t"), 0);
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        let normal = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        retry_on_etxtbsy(|| fetch_issues_cached(&bin, &normal, &refs)).unwrap();
+        let refresh = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, true);
+        retry_on_etxtbsy(|| fetch_issues_cached(&bin, &refresh, &refs)).unwrap();
+        assert_eq!(gh_calls(dir.path()), 2);
+    }
+
+    #[test]
+    fn fetch_items_cached_shares_entries_with_fetch_issues_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        let (bin, _shim) = counting_gh(dir.path(), &one_issue_reply("t"), 0);
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        let item = retry_on_etxtbsy(|| fetch_items_cached(&bin, &cache, &refs)).unwrap();
+        let issue = retry_on_etxtbsy(|| fetch_issues_cached(&bin, &cache, &refs)).unwrap();
+        assert_eq!(gh_calls(dir.path()), 1);
+        assert_eq!(item[0].as_ref(), Some(&issue[0]));
+    }
+
+    #[test]
+    fn a_cached_pull_request_is_not_served_as_an_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        let reply = serde_json::json!({"data": {"r0": {"i0": {
+            "__typename": "PullRequest",
+            "title": "a PR", "body": "b", "state": "MERGED", "url": "u"
+        }}}})
+        .to_string();
+        let (bin, _shim) = counting_gh(dir.path(), &reply, 0);
+        let refs = [item_ref("rust-works/omni-dev", 5)];
+        retry_on_etxtbsy(|| fetch_items_cached(&bin, &cache, &refs)).unwrap();
+        // Uncached, the issue query fails on a pull request (here, on its
+        // `MERGED` state); it must still reach `gh` and fail the same way.
+        assert!(retry_on_etxtbsy(|| fetch_issues_cached(&bin, &cache, &refs)).is_err());
+        assert_eq!(gh_calls(dir.path()), 2);
+    }
+
+    #[test]
+    fn fetch_items_cached_does_not_cache_a_not_found_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        let reply = serde_json::json!({
+            "data": {"r0": {"i0": null}},
+            "errors": [{"type": "NOT_FOUND", "path": ["r0", "i0"], "message": "nope"}]
+        })
+        .to_string();
+        let (bin, _shim) = counting_gh(dir.path(), &reply, 1);
+        let refs = [item_ref("rust-works/omni-dev", 9)];
+        for _ in 0..2 {
+            let docs = retry_on_etxtbsy(|| fetch_items_cached(&bin, &cache, &refs)).unwrap();
+            assert!(docs[0].is_none());
+        }
+        assert_eq!(gh_calls(dir.path()), 2);
+    }
+
+    #[test]
+    fn a_disabled_cache_always_calls_gh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = counting_gh(dir.path(), &one_issue_reply("t"), 0);
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        let cache = IssueCache::disabled();
+        retry_on_etxtbsy(|| fetch_issues_cached(&bin, &cache, &refs)).unwrap();
+        retry_on_etxtbsy(|| fetch_items_cached(&bin, &cache, &refs)).unwrap();
+        assert_eq!(gh_calls(dir.path()), 2);
     }
 }

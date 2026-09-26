@@ -359,6 +359,7 @@ Options:
       --max-input-chars <CHARS>        Longest issue text, in characters, sent to Jev; longer text is cut with a marker [default: 60000]
       --allow-closed                   Routes closed issues instead of refusing them
       --ignore-closed                  Skips closed issues instead of refusing them, listing them under `ignored_closed`
+      --refresh                        Re-fetches every issue from GitHub instead of reusing one fetched in the last few minutes (see OMNI_DEV_GITHUB_CACHE_TTL_SECS)
   -o, --output <OUTPUT>                Output format [default: json] [possible values: json, yaml, text]
       --jev-model <MODEL>              Overrides the configured Jev model for this call
   -C, --repo <PATH>                    Run as if omni-dev was started in `<PATH>` instead of the current working directory
@@ -407,6 +408,8 @@ Options:
           Threshold below which low statement coverage becomes a review reason [default: 0.5]
       --max-input-chars <CHARS>
           Longest source text, in characters, sent to Jev; longer text is cut with a marker [default: 60000]
+      --refresh
+          Re-fetches the issue and its cited sources from GitHub instead of reusing ones fetched in the last few minutes (see OMNI_DEV_GITHUB_CACHE_TTL_SECS)
   -o, --output <OUTPUT>
           Output format [default: json] [possible values: json, yaml]
       --jev-model <MODEL>

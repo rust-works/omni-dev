@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use crate::github_issues::IssueCache;
 use crate::jev::citations::Citation;
 use crate::jev::client::JevClient;
 use crate::jev::config::JevConfig;
@@ -58,6 +59,11 @@ pub struct VerifyDecisionCommand {
     #[arg(long, value_name = "CHARS", default_value_t = crate::jev::route::DEFAULT_MAX_INPUT_CHARS)]
     pub max_input_chars: usize,
 
+    /// Re-fetches the issue and its cited sources from GitHub instead of reusing ones fetched
+    /// in the last few minutes (see OMNI_DEV_GITHUB_CACHE_TTL_SECS).
+    #[arg(long)]
+    pub refresh: bool,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = JevFormat::Json)]
     pub(super) output: JevFormat,
@@ -99,10 +105,16 @@ impl VerifyDecisionCommand {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let issue_arg = self.issue;
 
-        let (issue, comment, citations, sources) =
-            tokio::task::spawn_blocking(move || fetch_input(&bin, &cwd, &issue_arg, &selector))
-                .await
-                .context("Issue fetch task panicked")??;
+        let cache = std::sync::Arc::new(IssueCache::from_env(self.refresh));
+        let fetch_cache = std::sync::Arc::clone(&cache);
+        let (issue, comment, citations, sources) = tokio::task::spawn_blocking(move || {
+            fetch_input(&bin, &fetch_cache, &cwd, &issue_arg, &selector)
+        })
+        .await
+        .context("Issue fetch task panicked")??;
+        if let Some(note) = cache.reuse_note() {
+            eprintln!("{note}");
+        }
 
         let opts = VerifyOptions {
             jev_model: jev_config.model,
@@ -121,6 +133,7 @@ impl VerifyDecisionCommand {
 /// **Blocking** — callers must be on a blocking thread.
 fn fetch_input(
     bin: &Path,
+    cache: &IssueCache,
     cwd: &Path,
     issue_arg: &str,
     selector: &CommentSelector,
@@ -136,7 +149,7 @@ fn fetch_input(
     };
     let judged = crate::github_issues::parse_issue_arg(issue_arg, default_project.as_deref())?;
     let default_project = default_project.unwrap_or_else(|| judged.project.clone());
-    fetch_verify_input(bin, &default_project, &judged, selector)
+    fetch_verify_input(bin, cache, &default_project, &judged, selector)
 }
 
 #[cfg(test)]
@@ -174,6 +187,8 @@ mod tests {
         assert!((cmd.reject_below - DEFAULT_REJECT_BELOW).abs() < f64::EPSILON);
         assert!((cmd.coverage_threshold - DEFAULT_COVERAGE).abs() < f64::EPSILON);
         assert_eq!(cmd.output, JevFormat::Json);
+        assert!(!cmd.refresh);
+        assert!(parse(&["#1779", "--refresh"]).unwrap().refresh);
     }
 
     #[test]
@@ -247,9 +262,16 @@ mod tests {
     fn fetch_input_resolves_the_issue_and_its_citation() {
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(dir.path());
-        let (issue, comment, citations, sources) =
-            retry_on_etxtbsy(|| fetch_input(&bin, dir.path(), "#1", &CommentSelector::Latest))
-                .unwrap();
+        let (issue, comment, citations, sources) = retry_on_etxtbsy(|| {
+            fetch_input(
+                &bin,
+                &IssueCache::disabled(),
+                dir.path(),
+                "#1",
+                &CommentSelector::Latest,
+            )
+        })
+        .unwrap();
         assert_eq!(issue.number, 1);
         assert_eq!(comment.body, "settled by #1614");
         assert_eq!(citations.len(), 1);
@@ -266,6 +288,7 @@ mod tests {
         let (issue, comment, citations, sources) = retry_on_etxtbsy(|| {
             fetch_input(
                 &bin,
+                &IssueCache::disabled(),
                 dir.path(),
                 "rust-works/omni-dev#1",
                 &CommentSelector::Latest,
