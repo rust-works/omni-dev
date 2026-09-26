@@ -120,6 +120,7 @@ allow:
   - "src/templates/**"
   - "src/build_info.rs"
   - "src/github_issues.rs"
+  - "src/github_issues/**"
   - "src/github_metrics.rs"
   - "src/github_rate_limit.rs"
   - "src/pr_status.rs"
