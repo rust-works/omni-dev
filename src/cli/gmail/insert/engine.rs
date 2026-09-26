@@ -95,16 +95,8 @@ pub(crate) async fn run_insert_with_progress(
 ) -> Result<InsertReport> {
     let mut report = InsertReport::default();
     let manifest = Manifest::load(&manifest_path(&opts.archive_dir))?;
-
-    // An explicitly-named id absent from the archive is an error, never a
-    // silent drop — the caller asked for a specific message by id.
-    for id in opts.selection.requested_ids() {
-        anyhow::ensure!(
-            manifest.get(id).is_some(),
-            "--id {id} was not found in the archive manifest at {}",
-            opts.archive_dir.display()
-        );
-    }
+    opts.selection
+        .ensure_requested_ids_selectable(&manifest, &opts.archive_dir)?;
 
     let mut planned: Vec<&ManifestRecord> = manifest
         .records_not_deleted()
@@ -1088,6 +1080,43 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("missing"));
+        assert!(err.to_string().contains("was not found"));
+    }
+
+    #[tokio::test]
+    async fn a_requested_id_that_is_soft_deleted_is_an_error_not_a_silent_empty_run() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_archived_message(
+            &archive_dir,
+            "m1",
+            Some("<m1@example.com>"),
+            &["INBOX"],
+            "From: a@example.com\r\n\r\nbody",
+        );
+        let mut manifest = Manifest::load(&manifest_path(&archive_dir)).unwrap();
+        manifest.mark_deleted("m1", Utc::now());
+        manifest.save(&manifest_path(&archive_dir)).unwrap();
+
+        let selection = Selection::from_args(&SelectionArgs {
+            ids: vec!["m1".to_string()],
+            ..SelectionArgs::default()
+        })
+        .unwrap();
+
+        let err = run_insert(
+            &client,
+            &InsertOptions {
+                selection,
+                ..base_opts(archive_dir)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("m1"));
         assert!(err.to_string().contains("was not found"));
     }
 
