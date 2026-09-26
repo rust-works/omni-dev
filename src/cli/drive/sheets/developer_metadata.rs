@@ -4,7 +4,9 @@
 //! `--sheet`/`--dimension`/`--start`/`--end` are shared, optional flags on
 //! all three commands, following the same combination `resolve_location`
 //! interprets: none given means spreadsheet-scoped, `--sheet` alone means
-//! sheet-scoped, all four together mean a row/column span. There is no
+//! sheet-scoped, all four together mean a single row or column — Sheets
+//! rejects a wider `DimensionRange` outright (issue #1933), so `--start`
+//! and `--end` must be equal. There is no
 //! `--visibility` flag anywhere — see [`crate::drive::sheets::types::DOCUMENT_VISIBILITY`]'s
 //! doc comment for why.
 
@@ -49,11 +51,12 @@ pub struct SetDeveloperMetadataCommand {
     #[arg(long, value_enum)]
     pub dimension: Option<DimensionArg>,
 
-    /// 1-based first row/column, inclusive.
+    /// 1-based row/column index. Must equal `--end` — Sheets rejects a
+    /// developer-metadata span of more than one row/column (issue #1933).
     #[arg(long, value_name = "N")]
     pub start: Option<i64>,
 
-    /// 1-based last row/column, inclusive.
+    /// 1-based row/column index. Must equal `--start` — see its doc comment.
     #[arg(long, value_name = "N")]
     pub end: Option<i64>,
 
@@ -113,11 +116,12 @@ pub struct DeleteDeveloperMetadataCommand {
     #[arg(long, value_enum)]
     pub dimension: Option<DimensionArg>,
 
-    /// 1-based first row/column, inclusive.
+    /// 1-based row/column index. Must equal `--end` — Sheets rejects a
+    /// developer-metadata span of more than one row/column (issue #1933).
     #[arg(long, value_name = "N")]
     pub start: Option<i64>,
 
-    /// 1-based last row/column, inclusive.
+    /// 1-based row/column index. Must equal `--start` — see its doc comment.
     #[arg(long, value_name = "N")]
     pub end: Option<i64>,
 
@@ -199,11 +203,12 @@ pub struct SearchDeveloperMetadataCommand {
     #[arg(long, value_enum)]
     pub dimension: Option<DimensionArg>,
 
-    /// 1-based first row/column, inclusive.
+    /// 1-based row/column index. Must equal `--end` — Sheets rejects a
+    /// developer-metadata span of more than one row/column (issue #1933).
     #[arg(long, value_name = "N")]
     pub start: Option<i64>,
 
-    /// 1-based last row/column, inclusive.
+    /// 1-based row/column index. Must equal `--start` — see its doc comment.
     #[arg(long, value_name = "N")]
     pub end: Option<i64>,
 

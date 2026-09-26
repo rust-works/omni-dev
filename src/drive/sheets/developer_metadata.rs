@@ -332,9 +332,12 @@ fn find_sheet_id(workbook: &Spreadsheet, title: &str) -> Result<i64, DeveloperMe
 /// the three location shapes Sheets models — inferred from which flags
 /// were given, never from a separate `--scope` flag: none given means
 /// spreadsheet-scoped, `--sheet` alone means sheet-scoped, and all four
-/// together mean dimension-scoped (applying the same 1-based-inclusive to
-/// 0-based-half-open conversion, and the same bounds check, as
-/// `format.rs::resolve_target` does for `update-dimension-properties`).
+/// together mean dimension-scoped, applying the same 1-based-inclusive to
+/// 0-based-half-open conversion as `format.rs::resolve_target` does for
+/// `update-dimension-properties`. The bounds check is stricter here,
+/// though: unlike a formatting range, a developer-metadata `DimensionRange`
+/// can only ever cover a **single** row or column — Sheets rejects a wider
+/// one outright (issue #1933) — so `--start` and `--end` must be equal.
 /// Any other combination — a partial one — is refused rather than silently
 /// falling back to a different scope than the caller likely intended.
 fn resolve_location(
@@ -352,11 +355,25 @@ fn resolve_location(
         }
         (Some(sheet), Some(dimension), Some(start), Some(end)) => {
             let sheet_id = find_sheet_id(workbook, sheet)?;
-            if start < 1 || end < start {
+            if start < 1 {
+                return Err(DeveloperMetadataResult::RefusedInvalidLocation {
+                    detail: format!("--start must be at least 1 (got --start {start})"),
+                });
+            }
+            // Issue #1933: Sheets rejects a developer-metadata DimensionRange
+            // spanning more than one row/column with a bare HTTP 400
+            // ("DimensionRange must represent a single row or column"), so
+            // --start and --end must name the same one. Checked here rather
+            // than left to the API so the failure is a clear local refusal,
+            // not an opaque round-trip.
+            if end != start {
                 return Err(DeveloperMetadataResult::RefusedInvalidLocation {
                     detail: format!(
-                        "--start must be at least 1 and --end must be >= --start (got \
-                         --start {start} --end {end})"
+                        "developer metadata can only be attached to a single row or \
+                         column — Sheets rejects a span of more than one. Pass the \
+                         same value for --start and --end (e.g. --start {start} --end \
+                         {start} selects that row/column alone); got --start {start} \
+                         --end {end}"
                     ),
                 });
             }
@@ -1084,7 +1101,7 @@ mod tests {
             Some("Q1"),
             Some(Dimension::Rows),
             Some(2),
-            Some(5),
+            Some(2),
         )
         .unwrap();
         assert_eq!(
@@ -1093,7 +1110,7 @@ mod tests {
                 sheet_id: 0,
                 dimension: Dimension::Rows,
                 start_index: 1,
-                end_index: 5,
+                end_index: 2,
             })
         );
     }
@@ -1113,6 +1130,52 @@ mod tests {
             result,
             DeveloperMetadataResult::RefusedInvalidLocation { .. }
         ));
+    }
+
+    #[test]
+    fn resolve_location_rejects_a_multi_row_span() {
+        // issue #1933's exact repro: Sheets rejects any DimensionRange
+        // spanning more than one row/column with an opaque HTTP 400. This
+        // must be caught locally with a clear message instead.
+        let workbook = test_workbook();
+        let result = resolve_location(
+            &workbook,
+            Some("Q1"),
+            Some(Dimension::Rows),
+            Some(2),
+            Some(7),
+        )
+        .unwrap_err();
+        match result {
+            DeveloperMetadataResult::RefusedInvalidLocation { detail } => {
+                assert!(detail.contains("single row or column"), "{detail}");
+                assert!(detail.contains("--start 2"), "{detail}");
+                assert!(detail.contains("--end 7"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidLocation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_location_accepts_a_single_column() {
+        let workbook = test_workbook();
+        let location = resolve_location(
+            &workbook,
+            Some("Q1"),
+            Some(Dimension::Columns),
+            Some(3),
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(
+            location,
+            DeveloperMetadataLocation::dimension(DimensionRange {
+                sheet_id: 0,
+                dimension: Dimension::Columns,
+                start_index: 2,
+                end_index: 3,
+            })
+        );
     }
 
     #[test]
@@ -2104,11 +2167,36 @@ mod tests {
             sheet: Some("Q1".to_string()),
             dimension: Some(Dimension::Rows),
             start: Some(2),
-            end: Some(5),
+            end: Some(2),
         };
         let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
         let text = describe(&outcome);
-        assert!(text.contains("row(s) 2-5 of sheet 'Q1'"), "{text}");
+        assert!(text.contains("row(s) 2-2 of sheet 'Q1'"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn set_at_a_multi_row_dimension_location_is_refused() {
+        // issue #1933: Sheets rejects a DimensionRange spanning more than
+        // one row/column, so this must be caught before the batchUpdate
+        // call, not just at the resolve_location unit-test level.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        let mut o = set_opts(true);
+        o.verb = DeveloperMetadataVerb::Set {
+            key: "source".to_string(),
+            value: "import".to_string(),
+            sheet: Some("Q1".to_string()),
+            dimension: Some(Dimension::Rows),
+            start: Some(2),
+            end: Some(7),
+        };
+        let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
+        match outcome.result {
+            DeveloperMetadataResult::RefusedInvalidLocation { detail } => {
+                assert!(detail.contains("single row or column"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidLocation, got {other:?}"),
+        }
     }
 
     #[tokio::test]
