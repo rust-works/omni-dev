@@ -171,8 +171,7 @@ pub(crate) fn reject_blank_date(date: &DateValue, flag: &str) -> Result<(), Stri
 }
 
 /// `--date-between` takes two absolute dates only (see its own doc comment):
-/// unlike the three single-value date flags it never accepts a relative
-/// keyword, so one must be rejected loudly here rather than silently
+/// it never accepts a relative keyword, so one must be rejected loudly here rather than silently
 /// reaching the API as a literal `userEnteredValue` string. Also mirrors
 /// [`reject_reversed_range`]'s ordering check for the numeric family, on a
 /// best-effort basis: a bound that doesn't parse as an ISO `YYYY-MM-DD` date
@@ -184,8 +183,7 @@ pub(crate) fn reject_invalid_date_between(start: &str, end: &str) -> Result<(), 
     reject_blank(end, "--date-between")?;
     if RelativeDate::parse(start).is_some() || RelativeDate::parse(end).is_some() {
         return Err(
-            "--date-between only accepts absolute dates, not a relative keyword like 'today' \
-             (use --date-after/--date-before/--date-on for those)"
+            "--date-between only accepts absolute dates, not a relative keyword like 'today'"
                 .to_string(),
         );
     }

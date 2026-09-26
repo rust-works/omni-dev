@@ -588,33 +588,27 @@ fn validate_condition(condition: &Condition) -> Result<(), String> {
         Condition::TextStartsWith(text) => reject_empty(text, "--text-starts-with"),
         Condition::TextEndsWith(text) => reject_empty(text, "--text-ends-with"),
         Condition::TextEq(text) => reject_empty(text, "--text-eq"),
-        Condition::DateAfter(date) => {
-            reject_blank_date(date, "--date-after")?;
-            reject_relative_date(date, "--date-after")
-        }
-        Condition::DateBefore(date) => {
-            reject_blank_date(date, "--date-before")?;
-            reject_relative_date(date, "--date-before")
-        }
-        Condition::DateOn(date) => {
-            reject_blank_date(date, "--date-on")?;
-            reject_relative_date(date, "--date-on")
-        }
+        Condition::DateAfter(date) => validate_single_date(date, "--date-after"),
+        Condition::DateBefore(date) => validate_single_date(date, "--date-before"),
+        Condition::DateOn(date) => validate_single_date(date, "--date-on"),
         Condition::DateBetween(start, end) => reject_invalid_date_between(start, end),
         Condition::Blank | Condition::NotBlank | Condition::Checkbox => Ok(()),
         Condition::CustomFormula(formula) => reject_blank(formula, "--custom-formula"),
     }
 }
 
-/// `set-data-validation`'s single-value date flags accept only an absolute
-/// date — Sheets rejects a relative keyword here with "relativeDate values
-/// are not supported in data validation" (issue #1934, live-verified).
+/// Validates one of `set-data-validation`'s single-value date flags
+/// (`--date-after`/`--date-before`/`--date-on`): rejects a blank date (the
+/// shared `reject_blank_date` check both this file and
+/// `conditional_format.rs` use identically), then rejects a relative
+/// keyword — Sheets accepts only an absolute date here, failing a relative
+/// one with "relativeDate values are not supported in data validation"
+/// (issue #1934, live-verified). That second check is deliberately local
+/// to this file rather than joining `date_value.rs`'s shared validators:
 /// `conditional_format.rs`'s identically-shaped `DateAfter`/`DateBefore`/
-/// `DateOn` genuinely does accept them, so this check is deliberately local
-/// to this file rather than joining `date_value.rs`'s shared validators
-/// (`reject_blank_date`, `reject_invalid_date_between`) that both callers
-/// use identically.
-fn reject_relative_date(date: &DateValue, flag: &str) -> Result<(), String> {
+/// `DateOn` genuinely does accept a relative keyword.
+fn validate_single_date(date: &DateValue, flag: &str) -> Result<(), String> {
+    reject_blank_date(date, flag)?;
     if matches!(date, DateValue::Relative(_)) {
         return Err(format!(
             "{flag} only accepts an absolute date, not a relative keyword like 'today' — \
@@ -1201,6 +1195,9 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.contains("absolute dates"), "{err}");
+        // Issue #1934: the single-value date flags refuse relative keywords
+        // here too, so the refusal must not redirect the user to them.
+        assert!(!err.contains("--date-after"), "{err}");
 
         let err = validate_condition(&Condition::DateBetween(
             "2024-01-01".to_string(),
