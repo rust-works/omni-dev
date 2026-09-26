@@ -17,8 +17,12 @@
 //! adds every remaining type addressable with a flat flag: `ONE_OF_RANGE`,
 //! the numeric comparators and `NUMBER_NOT_BETWEEN`, the `TEXT_*`
 //! contains/starts/ends/eq family, the `DATE_*` after/before/on/between
-//! family (with relative-date support for the three single-value forms),
-//! and `BLANK`/`NOT_BLANK`. Still excluded, a documented cut rather than a
+//! family, and `BLANK`/`NOT_BLANK`. **Absolute dates only** — unlike
+//! `conditional_format.rs`'s identically-shaped condition, Sheets rejects
+//! a relative keyword (`today`, `past-week`, ...) in data validation with
+//! a bare HTTP 400 ("relativeDate values are not supported"), so
+//! `validate_condition` refuses one locally instead (issue #1934).
+//! Still excluded, a documented cut rather than a
 //! silent gap: `TEXT_IS_EMAIL`, `TEXT_IS_URL`, `DATE_ON_OR_BEFORE`,
 //! `DATE_ON_OR_AFTER`, `DATE_NOT_BETWEEN`, `DATE_IS_VALID`, and every
 //! condition type meaningful only inside a conditional-format rule —
@@ -584,13 +588,41 @@ fn validate_condition(condition: &Condition) -> Result<(), String> {
         Condition::TextStartsWith(text) => reject_empty(text, "--text-starts-with"),
         Condition::TextEndsWith(text) => reject_empty(text, "--text-ends-with"),
         Condition::TextEq(text) => reject_empty(text, "--text-eq"),
-        Condition::DateAfter(date) => reject_blank_date(date, "--date-after"),
-        Condition::DateBefore(date) => reject_blank_date(date, "--date-before"),
-        Condition::DateOn(date) => reject_blank_date(date, "--date-on"),
+        Condition::DateAfter(date) => {
+            reject_blank_date(date, "--date-after")?;
+            reject_relative_date(date, "--date-after")
+        }
+        Condition::DateBefore(date) => {
+            reject_blank_date(date, "--date-before")?;
+            reject_relative_date(date, "--date-before")
+        }
+        Condition::DateOn(date) => {
+            reject_blank_date(date, "--date-on")?;
+            reject_relative_date(date, "--date-on")
+        }
         Condition::DateBetween(start, end) => reject_invalid_date_between(start, end),
         Condition::Blank | Condition::NotBlank | Condition::Checkbox => Ok(()),
         Condition::CustomFormula(formula) => reject_blank(formula, "--custom-formula"),
     }
+}
+
+/// `set-data-validation`'s single-value date flags accept only an absolute
+/// date — Sheets rejects a relative keyword here with "relativeDate values
+/// are not supported in data validation" (issue #1934, live-verified).
+/// `conditional_format.rs`'s identically-shaped `DateAfter`/`DateBefore`/
+/// `DateOn` genuinely does accept them, so this check is deliberately local
+/// to this file rather than joining `date_value.rs`'s shared validators
+/// (`reject_blank_date`, `reject_invalid_date_between`) that both callers
+/// use identically.
+fn reject_relative_date(date: &DateValue, flag: &str) -> Result<(), String> {
+    if matches!(date, DateValue::Relative(_)) {
+        return Err(format!(
+            "{flag} only accepts an absolute date, not a relative keyword like 'today' — \
+             Sheets rejects relative dates in data validation (they work only in \
+             add-conditional-format/update-conditional-format)"
+        ));
+    }
+    Ok(())
 }
 
 fn reject_empty_list(items: &[String], flag: &str) -> Result<(), String> {
@@ -878,15 +910,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn date_condition_builds_a_relative_value() {
-        let condition = Condition::DateAfter(DateValue::parse("today".to_string()));
-        let built = condition.into_boolean_condition();
-        assert_eq!(built.condition_type, "DATE_AFTER");
-        assert_eq!(built.values[0].user_entered_value, None);
-        assert_eq!(built.values[0].relative_date, Some("TODAY".to_string()));
-    }
-
     // `date_value_parse_is_case_and_separator_insensitive` and
     // `relative_date_all_covers_every_variant` moved to
     // `date_value.rs`'s own test module (issue #1793) — `RelativeDate`/
@@ -1119,8 +1142,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_condition_accepts_a_relative_date() {
-        validate_condition(&Condition::DateAfter(DateValue::parse("today".to_string()))).unwrap();
+    fn validate_condition_rejects_a_relative_date() {
+        // issue #1934's exact repro: Sheets rejects relativeDate values in
+        // data validation, unlike conditional formatting, which accepts
+        // them for the identically-shaped condition.
+        for (condition, flag) in [
+            (
+                Condition::DateAfter(DateValue::parse("today".to_string())),
+                "--date-after",
+            ),
+            (
+                Condition::DateBefore(DateValue::parse("past-week".to_string())),
+                "--date-before",
+            ),
+            (
+                Condition::DateOn(DateValue::parse("yesterday".to_string())),
+                "--date-on",
+            ),
+        ] {
+            let err = validate_condition(&condition).unwrap_err();
+            assert!(err.contains(flag), "{err}");
+            assert!(err.contains("relative"), "{err}");
+        }
+    }
+
+    #[test]
+    fn validate_condition_accepts_an_absolute_date() {
+        validate_condition(&Condition::DateAfter(DateValue::parse(
+            "2024-01-01".to_string(),
+        )))
+        .unwrap();
     }
 
     #[test]
@@ -1427,28 +1478,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_data_validation_sends_a_relative_date_condition_without_user_entered_value() {
+    async fn set_data_validation_refuses_a_relative_date_condition() {
+        // issue #1934's exact repro: `--date-after today` used to reach the
+        // API and fail with HTTP 400 ("relativeDate values are not
+        // supported in data validation"). It must now be refused locally,
+        // before the workbook is even fetched — no mocks besides the
+        // client are set up, so reaching the API would fail this test.
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
-        mount_file(
-            "sheet-1",
-            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
-            &["folder-1"],
-        )
-        .mount(&server)
-        .await;
-        mount_folder("folder-1").mount(&server).await;
-        mount_workbook().mount(&server).await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path(
-                "/v4/spreadsheets/sheet-1:batchUpdate",
-            ))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"replies": [{}]})),
-            )
-            .mount(&server)
-            .await;
         let rules = vec![allow_rule("folder-1")];
         let (lease_token, ledger_path) = leased_opts_for("sheet-1");
         let opts = ValidationOptions {
@@ -1465,18 +1502,13 @@ mod tests {
             ledger_path,
         };
         let outcome = validation(&drive, &sheets, &opts, &rules).await;
-        assert!(matches!(outcome.result, ValidationResult::Changed { .. }));
-
-        let requests = server.received_requests().await.unwrap();
-        let batch = requests
-            .iter()
-            .find(|r| r.url.path().ends_with(":batchUpdate"))
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
-        let rule = &body["requests"][0]["setDataValidation"]["rule"];
-        assert_eq!(rule["condition"]["type"], "DATE_AFTER");
-        assert_eq!(rule["condition"]["values"][0]["relativeDate"], "TODAY");
-        assert!(rule["condition"]["values"][0]["userEnteredValue"].is_null());
+        match outcome.result {
+            ValidationResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("--date-after"), "{detail}");
+                assert!(detail.contains("relative"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
     }
 
     #[tokio::test]

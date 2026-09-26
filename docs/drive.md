@@ -2616,7 +2616,7 @@ omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range F2:F100 \
   --custom-formula '=F2<=D2'
 
 # Tranche 2 (#1792): a dropdown sourced from a range, numeric comparators,
-# text conditions, date conditions (absolute or relative), and blank checks.
+# text conditions, date conditions (absolute dates only), and blank checks.
 omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range G2:G100 \
   --one-of-range 'Lists!A1:A10'
 omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range H2:H100 \
@@ -2624,7 +2624,7 @@ omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range H2:H100 \
 omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range I2:I100 \
   --text-contains '@example.com'
 omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range J2:J100 \
-  --date-after today
+  --date-after 2024-01-01
 omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range K2:K100 --not-blank
 
 # --show-warning allows an invalid entry through with a warning instead of
@@ -2639,13 +2639,14 @@ type addressable with a flat flag: `--one-of-range`; the numeric comparators
 `--number-eq`, `--number-not-eq`); the text conditions (`--text-contains`,
 `--text-not-contains`, `--text-starts-with`, `--text-ends-with`,
 `--text-eq`); the date conditions (`--date-after`, `--date-before`,
-`--date-on`, `--date-between` — the single-value forms also accept a
-relative keyword: `today`, `tomorrow`, `yesterday`, `past-week`,
-`past-month`, `past-year`); and `--blank`/`--not-blank`. Still not reachable,
-a documented cut rather than a silent gap: `TEXT_IS_EMAIL`, `TEXT_IS_URL`,
-`DATE_ON_OR_BEFORE`, `DATE_ON_OR_AFTER`, `DATE_NOT_BETWEEN`,
-`DATE_IS_VALID`, and every condition type meaningful only inside a
-conditional-format rule.
+`--date-on`, `--date-between` — absolute dates only; Sheets rejects a
+relative keyword like `today` in data validation with a bare HTTP 400,
+even though `add-conditional-format`/`update-conditional-format` accept
+one for the identically-shaped condition); and `--blank`/`--not-blank`.
+Still not reachable, a documented cut rather than a silent gap:
+`TEXT_IS_EMAIL`, `TEXT_IS_URL`, `DATE_ON_OR_BEFORE`, `DATE_ON_OR_AFTER`,
+`DATE_NOT_BETWEEN`, `DATE_IS_VALID`, and every condition type meaningful
+only inside a conditional-format rule.
 
 #### drive sheets set-developer-metadata / delete-developer-metadata / search-developer-metadata
 
