@@ -2949,8 +2949,9 @@ match more than one named range. `update-named-range` refuses a
 named range before that can happen; if a workbook already has two ranges
 sharing a name — from before this check existed, or from another client —
 `--name` matching more than one is refused as ambiguous rather than acting
-on whichever came first, naming both ids so `list-named-ranges` can
-disambiguate. `update-named-range` may rename only, re-point only, or
+on whichever came first, naming every matching id. Neither verb can target
+a range by id, so resolve it by renaming or deleting all but one in the
+Sheets UI (**Data › Named ranges**), then retry. `update-named-range` may rename only, re-point only, or
 both — passing neither `--new-name` nor a new range is refused as nothing
 to change.
 
