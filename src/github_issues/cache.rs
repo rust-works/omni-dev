@@ -13,18 +13,22 @@
 //! accepts issues filters on [`IssueDoc::kind`] at lookup.
 //!
 //! The cache is best-effort throughout: a missing, unreadable, corrupt,
-//! old-schema or expired entry is a miss, and a failed write is logged and
-//! ignored, so the worst case is exactly the uncached behaviour. Not-found
-//! results are never cached, so fixing a typo or granting `gh` access takes
-//! effect at once.
+//! old-schema or expired entry is a miss (and is deleted), and a failed write
+//! is logged and ignored, so the worst case is exactly the uncached
+//! behaviour. Not-found results are never cached, so fixing a typo or
+//! granting `gh` access takes effect at once. Entries hold issue text from
+//! possibly private repositories, so [`IssueCache::prune_expired`] sweeps
+//! expired ones each run rather than leaving them on disk indefinitely.
 //!
 //! A flat file rather than a daemon op was a deliberate choice: the usage
 //! pattern is *sequential* re-runs, which a shared file serves fully, while a
 //! daemon would add a wire op, a daemon-down fallback and version skew for
 //! the one extra it offers — deduplicating concurrent in-flight fetches.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -40,12 +44,15 @@ pub const GITHUB_CACHE_TTL_ENV: &str = "OMNI_DEV_GITHUB_CACHE_TTL_SECS";
 
 /// How long a fetched item is reused when [`GITHUB_CACHE_TTL_ENV`] is unset.
 ///
-/// Long enough to cover rapid re-runs, short enough that a newly posted
-/// decision comment is seen soon (and `--refresh` covers "I just commented").
+/// Long enough to cover rapid re-runs, short enough that a closed or
+/// newly-commented issue is seen soon (and `--refresh` covers "I just
+/// changed it").
 pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
 
-/// Bumped whenever the entry layout (or [`IssueDoc`]'s) changes
-/// incompatibly; an entry with any other value is a miss.
+/// Bumped whenever the entry layout (or [`IssueDoc`]'s) changes; an entry
+/// with any other value is a miss. A new `#[serde(default)]` field would
+/// otherwise deserialise from an old entry without error and be served
+/// empty, so `schema_tracks_the_issue_doc_shape` pins the field set.
 const SCHEMA: u32 = 1;
 
 /// The cache's directory under the user cache directory.
@@ -58,6 +65,15 @@ struct Entry {
     /// Unix seconds at which `doc` was fetched.
     fetched_at: u64,
     doc: IssueDoc,
+}
+
+/// An [`Entry`]'s header alone, for [`IssueCache::prune_expired`], which
+/// needs only the age and must not reject an entry just because a newer
+/// build's [`IssueDoc`] no longer parses it.
+#[derive(Deserialize)]
+struct EntryHeader {
+    schema: u32,
+    fetched_at: u64,
 }
 
 /// The GitHub fetch cache shared by `route` and `verify-decision`.
@@ -74,6 +90,10 @@ pub struct IssueCache {
     refresh: bool,
     hits: AtomicUsize,
     oldest_hit_secs: AtomicU64,
+    /// Items this run fetched and stored itself, so reading one back (say, a
+    /// judged issue that another judged issue cites) is not reported as a
+    /// reuse of an earlier run's data.
+    stored: Mutex<HashSet<(String, u64)>>,
 }
 
 impl IssueCache {
@@ -88,6 +108,7 @@ impl IssueCache {
             refresh,
             hits: AtomicUsize::new(0),
             oldest_hit_secs: AtomicU64::new(0),
+            stored: Mutex::new(HashSet::new()),
         }
     }
 
@@ -97,19 +118,9 @@ impl IssueCache {
         Self::new(PathBuf::new(), Duration::ZERO, false)
     }
 
-    /// The cache configured from the environment (with the `settings.json`
-    /// fallback), rooted under the user cache directory.
-    #[must_use]
-    pub fn from_env(refresh: bool) -> Self {
-        Self::from_env_with(
-            &crate::utils::settings::SettingsEnv::load(),
-            dirs::cache_dir(),
-            refresh,
-        )
-    }
-
-    /// [`from_env`](Self::from_env) over an injected [`EnvSource`] and base
-    /// cache directory. With no base directory the cache is disabled.
+    /// The cache configured from `env` (in production, the `SettingsEnv` the
+    /// command already loaded), rooted under `base` (`dirs::cache_dir()`).
+    /// With no base directory the cache is disabled.
     #[must_use]
     pub fn from_env_with(env: &impl EnvSource, base: Option<PathBuf>, refresh: bool) -> Self {
         let Some(base) = base else {
@@ -139,34 +150,75 @@ impl IssueCache {
                 return None;
             }
         };
-        // A corrupt or old-layout entry is rewritten by the fetch this miss
-        // triggers, so it heals itself; debug, not warn.
-        let entry: Entry = match serde_json::from_slice(&bytes) {
-            Ok(entry) => entry,
+        // A corrupt or old-layout entry is deleted, and the fetch this miss
+        // triggers rewrites it, so it heals itself; debug, not warn.
+        let entry = match serde_json::from_slice::<Entry>(&bytes) {
+            Ok(entry) if entry.schema == SCHEMA => entry,
+            Ok(_) => {
+                remove_entry(&path);
+                return None;
+            }
             Err(e) => {
                 debug!(
                     "Ignoring unreadable GitHub cache entry {}: {e}",
                     path.display()
                 );
+                remove_entry(&path);
                 return None;
             }
         };
-        if entry.schema != SCHEMA
-            || entry.doc.project != item_ref.project
+        let Some(age) = self.fresh_age(entry.fetched_at) else {
+            remove_entry(&path);
+            return None;
+        };
+        // A mismatched key or a rejected kind is a miss but still a valid
+        // entry (a cached pull request serves `fetch_items`), so it is kept.
+        if entry.doc.project != item_ref.project
             || entry.doc.number != item_ref.number
             || !accept(&entry.doc)
         {
             return None;
         }
-        // A `fetched_at` in the future means the clock went backwards; the
-        // entry's age is unknown, so it is not trusted.
-        let age = now_secs().checked_sub(entry.fetched_at)?;
-        if age >= self.ttl.as_secs() {
-            return None;
+        if !self.stored_this_run(&item_ref.project, item_ref.number) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.oldest_hit_secs.fetch_max(age, Ordering::Relaxed);
         }
-        self.hits.fetch_add(1, Ordering::Relaxed);
-        self.oldest_hit_secs.fetch_max(age, Ordering::Relaxed);
         Some(entry.doc)
+    }
+
+    /// Deletes every expired, old-schema or unreadable entry. Best-effort,
+    /// like everything else here; **blocking**, so run it on the same
+    /// blocking thread as the fetch.
+    pub fn prune_expired(&self) {
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        for path in entry_files(dir) {
+            let fresh = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<EntryHeader>(&bytes).ok())
+                .filter(|header| header.schema == SCHEMA)
+                .and_then(|header| self.fresh_age(header.fetched_at))
+                .is_some();
+            if !fresh {
+                remove_entry(&path);
+            }
+        }
+    }
+
+    /// The age of an entry fetched at `fetched_at`, or `None` once it has
+    /// expired. A `fetched_at` in the future means the clock went backwards;
+    /// the entry's age is unknown, so it is not trusted either.
+    fn fresh_age(&self, fetched_at: u64) -> Option<u64> {
+        now_secs()
+            .checked_sub(fetched_at)
+            .filter(|age| *age < self.ttl.as_secs())
+    }
+
+    fn stored_this_run(&self, project: &str, number: u64) -> bool {
+        self.stored
+            .lock()
+            .is_ok_and(|stored| stored.contains(&(project.to_string(), number)))
     }
 
     /// Writes `doc` to the cache. Best-effort: a failure is logged at debug
@@ -175,8 +227,13 @@ impl IssueCache {
         let Some(path) = self.entry_path(&doc.project, doc.number) else {
             return;
         };
-        if let Err(e) = write_entry(&path, doc) {
-            debug!("Failed to cache {}#{}: {e:#}", doc.project, doc.number);
+        match write_entry(&path, doc) {
+            Ok(()) => {
+                if let Ok(mut stored) = self.stored.lock() {
+                    stored.insert((doc.project.clone(), doc.number));
+                }
+            }
+            Err(e) => debug!("Failed to cache {}#{}: {e:#}", doc.project, doc.number),
         }
     }
 
@@ -241,8 +298,8 @@ fn is_safe_segment(segment: &str) -> bool {
 /// directory, then a rename, so a concurrent reader sees either the old entry
 /// or the new one, never a partial file.
 fn write_entry(path: &Path, doc: &IssueDoc) -> Result<()> {
+    crate::daemon::paths::ensure_parent_dir_0700(path)?;
     let dir = path.parent().context("cache entry path has no parent")?;
-    crate::daemon::paths::ensure_dir_0700(dir)?;
     let entry = Entry {
         schema: SCHEMA,
         fetched_at: now_secs(),
@@ -256,6 +313,40 @@ fn write_entry(path: &Path, doc: &IssueDoc) -> Result<()> {
     tmp.persist(path)
         .with_context(|| format!("Failed to replace {}", path.display()))?;
     Ok(())
+}
+
+/// Deletes one entry, best-effort: a failure only means the entry is tried
+/// again on the next read or prune.
+fn remove_entry(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            debug!(
+                "Failed to remove GitHub cache entry {}: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Every `<owner>/<repo>/<number>.json` file under `dir`. Temp files from an
+/// in-flight write (`.tmp*`, no `.json` extension) are skipped.
+fn entry_files(dir: &Path) -> Vec<PathBuf> {
+    let subdirs = |dir: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect()
+    };
+    subdirs(dir)
+        .iter()
+        .filter(|owner| owner.is_dir())
+        .flat_map(|owner| subdirs(owner))
+        .filter(|repo| repo.is_dir())
+        .flat_map(|repo| subdirs(&repo))
+        .filter(|file| file.extension().is_some_and(|ext| ext == "json"))
+        .collect()
 }
 
 fn now_secs() -> u64 {
@@ -321,9 +412,9 @@ mod tests {
     #[test]
     fn a_stored_doc_is_served_back_and_counted() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = cache(dir.path());
         let stored = doc("o/r", 7, ItemKind::Issue);
-        cache.store(&stored);
+        cache(dir.path()).store(&stored);
+        let cache = cache(dir.path());
         assert_eq!(cache.lookup(&item_ref("o/r", 7), |_| true), Some(stored));
         assert!(cache.lookup(&item_ref("o/r", 8), |_| true).is_none());
         let note = cache.reuse_note().unwrap();
@@ -341,12 +432,21 @@ mod tests {
     }
 
     #[test]
-    fn the_note_reports_the_count_and_oldest_age() {
+    fn an_item_stored_this_run_is_served_but_not_reported_as_reused() {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache(dir.path());
-        cache.store(&doc("o/r", 1, ItemKind::Issue));
-        cache.store(&doc("o/r", 2, ItemKind::Issue));
+        cache.store(&doc("o/r", 7, ItemKind::Issue));
+        assert!(cache.lookup(&item_ref("o/r", 7), |_| true).is_some());
+        assert!(cache.reuse_note().is_none());
+    }
+
+    #[test]
+    fn the_note_reports_the_count_and_oldest_age() {
+        let dir = tempfile::tempdir().unwrap();
+        cache(dir.path()).store(&doc("o/r", 1, ItemKind::Issue));
+        cache(dir.path()).store(&doc("o/r", 2, ItemKind::Issue));
         backdate(dir.path(), "o/r", 2, 150);
+        let cache = cache(dir.path());
         assert!(cache.lookup(&item_ref("o/r", 1), |_| true).is_some());
         assert!(cache.lookup(&item_ref("o/r", 2), |_| true).is_some());
         assert_eq!(
@@ -356,13 +456,79 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_entry_is_a_miss() {
+    fn an_expired_entry_is_a_miss_and_is_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache(dir.path());
         cache.store(&doc("o/r", 7, ItemKind::Issue));
         backdate(dir.path(), "o/r", 7, 300);
         assert!(cache.lookup(&item_ref("o/r", 7), |_| true).is_none());
         assert!(cache.reuse_note().is_none());
+        assert!(!cache.entry_path("o/r", 7).unwrap().exists());
+    }
+
+    #[test]
+    fn prune_removes_expired_old_and_corrupt_entries_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path());
+        for number in 1..=4 {
+            cache.store(&doc("o/r", number, ItemKind::Issue));
+        }
+        backdate(dir.path(), "o/r", 2, 3600);
+        let path = |n| cache.entry_path("o/r", n).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path(3)).unwrap()).unwrap();
+        value["schema"] = serde_json::json!(SCHEMA + 1);
+        std::fs::write(path(3), value.to_string()).unwrap();
+        std::fs::write(path(4), "{not json").unwrap();
+        let temp = dir.path().join("o/r/.tmpXYZ");
+        std::fs::write(&temp, "in flight").unwrap();
+
+        cache.prune_expired();
+        assert!(path(1).exists());
+        assert!(!path(2).exists());
+        assert!(!path(3).exists());
+        assert!(!path(4).exists());
+        assert!(temp.exists(), "an in-flight temp file is never pruned");
+    }
+
+    #[test]
+    fn prune_is_a_no_op_when_disabled_or_empty() {
+        IssueCache::disabled().prune_expired();
+        let dir = tempfile::tempdir().unwrap();
+        cache(&dir.path().join("missing")).prune_expired();
+    }
+
+    /// Adding, removing or renaming a field of [`IssueDoc`] or [`Comment`]
+    /// changes what a cached entry means, so it must bump [`SCHEMA`] — and
+    /// then update this list.
+    #[test]
+    fn schema_tracks_the_issue_doc_shape() {
+        let mut issue = doc("o/r", 7, ItemKind::Issue);
+        issue.comments.push(crate::provider::Comment {
+            author: "a".to_string(),
+            body: "b".to_string(),
+            id: Some(1),
+        });
+        let value = serde_json::to_value(&issue).unwrap();
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            (SCHEMA, keys(&value), keys(&value["comments"][0])),
+            (
+                1,
+                [
+                    "body", "closed_by", "comments", "kind", "number", "project", "provider",
+                    "state", "title", "url"
+                ]
+                .map(String::from)
+                .to_vec(),
+                ["author", "body", "id"].map(String::from).to_vec(),
+            ),
+            "IssueDoc's shape changed: bump SCHEMA in github_issues/cache.rs, then update this test"
+        );
     }
 
     #[test]

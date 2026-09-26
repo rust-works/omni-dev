@@ -735,6 +735,22 @@ pub fn fetch_issues_cached(
         .collect()
 }
 
+/// [`fetch_issues`], always from GitHub, writing the result through to `cache`.
+///
+/// For an issue whose freshness matters to this run but whose copy is still
+/// useful to a later cached read. **Blocking.**
+pub fn fetch_issues_refreshed(
+    bin: &Path,
+    cache: &IssueCache,
+    refs: &[ItemRef],
+) -> Result<Vec<IssueDoc>> {
+    let docs = fetch_issues(bin, refs)?;
+    for doc in &docs {
+        cache.store(doc);
+    }
+    Ok(docs)
+}
+
 /// [`fetch_items`] through `cache`, like [`fetch_issues_cached`]. A
 /// not-found item is not cached, so it is re-queried next time. **Blocking.**
 pub fn fetch_items_cached(
@@ -1480,14 +1496,16 @@ mod tests {
         assert_eq!(gh_calls(dir.path()), 1);
         assert!(cache.reuse_note().is_none());
 
-        let second = retry_on_etxtbsy(|| fetch_issues_cached(&bin, &cache, &refs)).unwrap();
+        // A later run: a new cache instance over the same directory.
+        let later = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        let second = retry_on_etxtbsy(|| fetch_issues_cached(&bin, &later, &refs)).unwrap();
         assert_eq!(
             gh_calls(dir.path()),
             1,
             "the second fetch must be served from disk"
         );
         assert_eq!(first, second);
-        assert!(cache.reuse_note().is_some());
+        assert!(later.reuse_note().is_some());
     }
 
     #[test]
@@ -1575,6 +1593,25 @@ mod tests {
             assert!(docs[0].is_none());
         }
         assert_eq!(gh_calls(dir.path()), 2);
+    }
+
+    #[test]
+    fn fetch_issues_refreshed_always_calls_gh_and_writes_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        let (bin, _shim) = counting_gh(dir.path(), &one_issue_reply("t"), 0);
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        retry_on_etxtbsy(|| fetch_issues_refreshed(&bin, &cache, &refs)).unwrap();
+        retry_on_etxtbsy(|| fetch_issues_refreshed(&bin, &cache, &refs)).unwrap();
+        assert_eq!(gh_calls(dir.path()), 2);
+        let later = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        retry_on_etxtbsy(|| fetch_issues_cached(&bin, &later, &refs)).unwrap();
+        assert_eq!(
+            gh_calls(dir.path()),
+            2,
+            "the refreshed copy is reused later"
+        );
     }
 
     #[test]

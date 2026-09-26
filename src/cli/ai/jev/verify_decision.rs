@@ -88,7 +88,8 @@ impl VerifyDecisionCommand {
     pub async fn execute(self) -> Result<()> {
         self.ai.apply();
 
-        let mut jev_config = JevConfig::from_env()?;
+        let env = crate::utils::settings::SettingsEnv::load();
+        let mut jev_config = JevConfig::from_env_with(&env)?;
         if let Some(model) = self.jev_model {
             jev_config.model = model;
         }
@@ -105,16 +106,23 @@ impl VerifyDecisionCommand {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let issue_arg = self.issue;
 
-        let cache = std::sync::Arc::new(IssueCache::from_env(self.refresh));
+        let cache = std::sync::Arc::new(IssueCache::from_env_with(
+            &env,
+            dirs::cache_dir(),
+            self.refresh,
+        ));
         let fetch_cache = std::sync::Arc::clone(&cache);
-        let (issue, comment, citations, sources) = tokio::task::spawn_blocking(move || {
+        let fetched = tokio::task::spawn_blocking(move || {
+            fetch_cache.prune_expired();
             fetch_input(&bin, &fetch_cache, &cwd, &issue_arg, &selector)
         })
         .await
-        .context("Issue fetch task panicked")??;
+        .context("Issue fetch task panicked")?;
+        // Before `?`, so a failure on cached input still names --refresh.
         if let Some(note) = cache.reuse_note() {
             eprintln!("{note}");
         }
+        let (issue, comment, citations, sources) = fetched?;
 
         let opts = VerifyOptions {
             jev_model: jev_config.model,

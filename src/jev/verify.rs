@@ -20,7 +20,7 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::claude::client::ClaudeClient;
-use crate::github_issues::{fetch_issues_cached, fetch_items_cached, IssueCache};
+use crate::github_issues::{fetch_issues_refreshed, fetch_items_cached, IssueCache};
 use crate::jev::citations::{find_citations, first_citation, Citation};
 use crate::jev::client::JevClient;
 use crate::jev::error::is_auth_failure;
@@ -341,7 +341,11 @@ pub fn fetch_verify_input(
     judged: &ItemRef,
     selector: &CommentSelector,
 ) -> Result<(IssueDoc, Comment, Vec<Citation>, Vec<Source>)> {
-    let issue = fetch_issues_cached(bin, cache, std::slice::from_ref(judged))?
+    // The judged issue is always fetched fresh: its comments are what gets
+    // selected, and a cached copy would silently miss a decision comment
+    // posted since, verifying an older one instead (or failing to find a
+    // `--comment` id). Only the cited sources are served from the cache.
+    let issue = fetch_issues_refreshed(bin, cache, std::slice::from_ref(judged))?
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("issue {judged} missing from the parsed gh reply (bug)"))?;
