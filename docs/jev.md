@@ -512,10 +512,13 @@ usage: {input_tokens: 1432, output_tokens: 61}
 separated, in request order, followed by a line reporting `model` and the
 summed `usage` — for reading, not scripting. Plain text with no markdown: a
 terminal doesn't render `**bold**`/`*italic*` markers, so they'd just be
-clutter. Each issue is a header line (`ref — title`) followed by one indented
-line per fact, rather than one run-on sentence — which keeps a
-multi-`--ladders` issue readable. Its wording is **not** a stable contract
-and may change without notice; scripts should keep using `json` or `yaml`.
+clutter. Each issue is a header line (`ref — title`, with a trailing
+` (closed)` when the routed issue itself is closed — relevant with
+`--allow-closed`) followed by one indented line per fact, rather than one
+run-on sentence — which keeps a multi-`--ladders` issue readable. Its wording
+is **not** a stable contract and may change without notice; scripts should
+keep using `json` or `yaml`, which carry the same information as an
+additive `state` field (`"open"`/`"closed"`).
 
 The class-summary examples below show the default text output. With
 `--effort-advice`, a per-model table follows each summary; see
