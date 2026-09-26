@@ -1092,11 +1092,11 @@ account's bars fighting another's over the same terminal, is what lets them
 all advance concurrently and stay legible. Independent of the bars, a
 one-line summary still prints per account as soon as that account finishes
 (not only once every account is done), e.g. `jky.greens: 42 fetched, 0
-errors`, followed by a trailing `combined: ...` total once every account has
-finished — that line prints through the bars (via `suspend`) rather than
-racing their redraw. An account's own bars are cleared as it finishes, just
-before its summary line prints, so what remains once the run ends is one
-summary line per account and the `combined:` total. `--quiet` suppresses both the live bars and the
+errors` — printed through the bars (via `suspend`) rather than racing their
+redraw, and only once that account's own bars have been cleared away. Once
+every account has finished, and so every bar is gone, a trailing
+`combined: ...` total follows: what remains on screen is one summary line
+per account plus that total. `--quiet` suppresses both the live bars and the
 per-account summary lines; the combined total and any per-message error
 lines always print regardless. `-o json`/`-o yaml`/`-o yamls`/`-o jsonl`
 instead emit one structured record per account (`account`, `actions`,
