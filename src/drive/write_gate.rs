@@ -384,7 +384,7 @@ impl DriveOperation {
     /// from today's behavior); every write defaults closed — the whole
     /// "disabled by default" requirement lives in this one match, not a
     /// separate on/off flag.
-    fn default_policy(self) -> Verdict {
+    pub(crate) fn default_policy(self) -> Verdict {
         match self {
             Self::Read => Verdict::Allow,
             Self::Create
@@ -423,6 +423,27 @@ impl DriveOperation {
             | Self::DocsWrite => true,
         }
     }
+
+    /// Every [`DriveOperation`] variant.
+    ///
+    /// Kept in sync by hand, like [`Display`](std::fmt::Display)'s `fmt`
+    /// impl and [`Self::default_policy`]'s match — this crate has no
+    /// `strum`-style derive to enumerate variants automatically. Used to
+    /// build `drive permissions show`'s empty-rules message
+    /// (issue #1919) from [`Self::default_policy`] itself, rather than a
+    /// separately maintained list of operation names that could name a
+    /// different set than what actually defaults to `Deny`.
+    pub(crate) const ALL: [Self; 9] = [
+        Self::Read,
+        Self::Create,
+        Self::Upload,
+        Self::Edit,
+        Self::SheetsWrite,
+        Self::SheetsStructure,
+        Self::SheetsDelete,
+        Self::SheetsProtection,
+        Self::DocsWrite,
+    ];
 }
 
 /// One configured permission rule, keyed on **either** a folder id or a
@@ -989,6 +1010,21 @@ mod tests {
 
     fn chain(ids: &[&str]) -> Vec<String> {
         ids.iter().copied().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn all_contains_every_variant_exactly_once() {
+        // `ALL` is hand-maintained (issue #1919), so pin its size and
+        // uniqueness against the same serde round-trip
+        // `display_matches_the_serde_kebab_case_wire_form` uses to keep
+        // `Display` honest, rather than a second hand-written literal
+        // that could drift with it.
+        let wire_forms: std::collections::HashSet<String> = DriveOperation::ALL
+            .iter()
+            .map(|op| serde_json::to_string(op).unwrap())
+            .collect();
+        assert_eq!(wire_forms.len(), DriveOperation::ALL.len());
+        assert_eq!(DriveOperation::ALL.len(), 9);
     }
 
     #[test]

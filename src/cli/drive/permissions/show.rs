@@ -7,7 +7,7 @@ use clap::Parser;
 
 use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::cli::drive::helpers::active_account_rules;
-use crate::drive::write_gate::FolderPermissionRule;
+use crate::drive::write_gate::{DriveOperation, FolderPermissionRule, Verdict};
 
 /// Prints the active account's configured write-permission rules.
 #[derive(Parser)]
@@ -64,9 +64,10 @@ fn render_rules_table(rules: &[FolderPermissionRule], out: &mut dyn Write) -> Re
         writeln!(
             out,
             "No write-permission rules configured for this account — every \
-             create/upload/edit/sheets-write/sheets-structure is refused everywhere. Add rules under \
+             {} is refused everywhere. Add rules under \
              drive.accounts.<name>.write_permissions.rules in \
-             ~/.omni-dev/settings.json, keyed on either a folder_id or a file_id."
+             ~/.omni-dev/settings.json, keyed on either a folder_id or a file_id.",
+            default_deny_operations_list()
         )
         .context("Failed to write empty-table message")?;
         return Ok(());
@@ -109,6 +110,20 @@ fn render_rules_table(rules: &[FolderPermissionRule], out: &mut dyn Write) -> Re
         .context("Failed to write rule row")?;
     }
     Ok(())
+}
+
+/// `"create/upload/edit/.../docs-write"` — every operation the gate
+/// refuses by default absent a configured rule, built from
+/// [`DriveOperation::ALL`]/[`DriveOperation::default_policy`] rather than
+/// a hardcoded string, so it cannot silently omit an operation the way
+/// the empty-rules message once did (issue #1919).
+fn default_deny_operations_list() -> String {
+    DriveOperation::ALL
+        .into_iter()
+        .filter(|op| op.default_policy() == Verdict::Deny)
+        .map(|op| op.to_string())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// `"folder"` or `"file"` — which id this rule keys on.
@@ -306,11 +321,49 @@ mod tests {
     }
 
     #[test]
-    fn the_empty_table_message_names_sheets_write_and_both_rule_keys() {
+    fn the_empty_table_message_names_every_gated_operation() {
+        // issue #1919: the message previously hardcoded a five-operation
+        // string that silently omitted sheets-delete, sheets-protection
+        // and docs-write despite all three being gated the same way.
         let mut buf = Vec::new();
         render_rules_table(&[], &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("sheets-write"), "{out}");
+        assert!(
+            !out.contains("read"),
+            "{out} should not name read, which is allowed by default"
+        );
+        for op in [
+            "create",
+            "upload",
+            "edit",
+            "sheets-write",
+            "sheets-structure",
+            "sheets-delete",
+            "sheets-protection",
+            "docs-write",
+        ] {
+            assert!(out.contains(op), "{out} should name {op}");
+        }
+    }
+
+    #[test]
+    fn default_deny_operations_list_matches_default_policy() {
+        let list = default_deny_operations_list();
+        for op in DriveOperation::ALL {
+            let named = list.contains(&op.to_string());
+            assert_eq!(
+                named,
+                op.default_policy() == Verdict::Deny,
+                "{op:?}: named={named}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_empty_table_message_names_both_rule_keys() {
+        let mut buf = Vec::new();
+        render_rules_table(&[], &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("folder_id"), "{out}");
         assert!(out.contains("file_id"), "{out}");
     }
