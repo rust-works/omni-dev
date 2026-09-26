@@ -5966,9 +5966,9 @@ Options:
       --text-starts-with <TEXT>         Restrict entries to text starting with this substring
       --text-ends-with <TEXT>           Restrict entries to text ending with this substring
       --text-eq <TEXT>                  Restrict entries to text equal to this
-      --date-after <DATE>               Restrict entries to a date after this one. Accepts an absolute date or a relative keyword (`today`, `tomorrow`, `yesterday`, `past-week`, `past-month`, `past-year`)
-      --date-before <DATE>              Restrict entries to a date before this one. Accepts an absolute date or a relative keyword (see `--date-after`)
-      --date-on <DATE>                  Restrict entries to a date equal to this one. Accepts an absolute date or a relative keyword (see `--date-after`)
+      --date-after <DATE>               Restrict entries to a date after this one. Absolute dates only — Sheets rejects a relative keyword like `today` in data validation (accepted in `add-conditional-format`/`update-conditional-format`, not here)
+      --date-before <DATE>              Restrict entries to a date before this one. Absolute dates only (see `--date-after`)
+      --date-on <DATE>                  Restrict entries to a date equal to this one. Absolute dates only (see `--date-after`)
       --date-between <START> <END>      Restrict entries to a date in this inclusive range (absolute dates only; relative keywords are not accepted here)
       --blank                           Restrict entries to an empty cell
       --not-blank                       Restrict entries to a non-empty cell

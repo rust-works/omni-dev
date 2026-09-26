@@ -22,9 +22,10 @@ use crate::drive::sheets::validation::{
 /// `--number-eq`, `--number-not-eq`); the text conditions
 /// (`--text-contains`, `--text-not-contains`, `--text-starts-with`,
 /// `--text-ends-with`, `--text-eq`); the date conditions (`--date-after`,
-/// `--date-before`, `--date-on`, `--date-between` — the single-value forms
-/// also accept a relative keyword: `today`, `tomorrow`, `yesterday`,
-/// `past-week`, `past-month`, `past-year`); `--blank`/`--not-blank`;
+/// `--date-before`, `--date-on`, `--date-between` — absolute dates only;
+/// Sheets rejects a relative keyword like `today` in data validation, even
+/// though `add-conditional-format`/`update-conditional-format` accept one
+/// for the identically-shaped condition); `--blank`/`--not-blank`;
 /// `--checkbox`; or `--custom-formula`.
 #[derive(Parser)]
 #[command(group(clap::ArgGroup::new("condition")
@@ -114,19 +115,20 @@ pub struct SetDataValidationCommand {
     #[arg(long, value_name = "TEXT")]
     pub text_eq: Option<String>,
 
-    /// Restrict entries to a date after this one. Accepts an absolute date
-    /// or a relative keyword (`today`, `tomorrow`, `yesterday`,
-    /// `past-week`, `past-month`, `past-year`).
+    /// Restrict entries to a date after this one. Absolute dates only —
+    /// Sheets rejects a relative keyword like `today` in data validation
+    /// (accepted in `add-conditional-format`/`update-conditional-format`,
+    /// not here).
     #[arg(long, value_name = "DATE")]
     pub date_after: Option<String>,
 
-    /// Restrict entries to a date before this one. Accepts an absolute
-    /// date or a relative keyword (see `--date-after`).
+    /// Restrict entries to a date before this one. Absolute dates only
+    /// (see `--date-after`).
     #[arg(long, value_name = "DATE")]
     pub date_before: Option<String>,
 
-    /// Restrict entries to a date equal to this one. Accepts an absolute
-    /// date or a relative keyword (see `--date-after`).
+    /// Restrict entries to a date equal to this one. Absolute dates only
+    /// (see `--date-after`).
     #[arg(long, value_name = "DATE")]
     pub date_on: Option<String>,
 
