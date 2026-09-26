@@ -120,12 +120,17 @@ impl SyncProgressBars {
     /// explicitly removed bar never becomes a zombie. The account's summary
     /// line, printed right after this returns, supersedes the fetch bar's
     /// final count.
-    pub(crate) async fn drain_and_remove(self, rx: mpsc::UnboundedReceiver<SyncProgressEvent>) {
-        self.apply_events(rx).await;
-        for bar in [&self.listing, &self.fetch] {
-            bar.finish_and_clear();
-            self.multi.remove(bar);
-        }
+    ///
+    /// The detach runs from a drop guard that owns the bars from the moment
+    /// this is called — not from the future's first poll — so it also
+    /// happens if the render task panics, or is cancelled before or during
+    /// the drain: the cases where a zombie would otherwise be left behind.
+    pub(crate) fn drain_and_remove(
+        self,
+        rx: mpsc::UnboundedReceiver<SyncProgressEvent>,
+    ) -> impl std::future::Future<Output = ()> {
+        let bars = DetachOnDrop(self);
+        async move { bars.0.apply_events(rx).await }
     }
 
     /// The event loop shared by [`SyncProgressBars::drain`] and
@@ -172,6 +177,19 @@ impl SyncProgressBars {
     }
 }
 
+/// [`SyncProgressBars::drain_and_remove`]'s drop guard: clears both bars and
+/// detaches them from their `MultiProgress`, on every exit path.
+struct DetachOnDrop(SyncProgressBars);
+
+impl Drop for DetachOnDrop {
+    fn drop(&mut self) {
+        for bar in [&self.0.listing, &self.0.fetch] {
+            bar.finish_and_clear();
+            self.0.multi.remove(bar);
+        }
+    }
+}
+
 /// `prefixed` selects a `{prefix}`-leading template for [`SyncProgressBars::
 /// new_in`]'s multi-account rows; [`SyncProgressBars::new`]'s single-account
 /// bars keep the plain template byte-identical to before #1504.
@@ -202,8 +220,6 @@ fn fetch_style(prefixed: bool) -> indicatif::ProgressStyle {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
 
     /// `ProgressBar` is a cheap `Clone` handle onto shared state (see
@@ -401,10 +417,11 @@ mod tests {
 
     #[tokio::test]
     async fn drain_and_remove_finishes_both_bars() {
-        let multi = indicatif::MultiProgress::new();
+        let multi = visible_multi_progress();
         let bars = SyncProgressBars::new_in(&multi, "acct");
         let listing = bars.listing.clone();
         let fetch = bars.fetch.clone();
+        assert!(!listing.is_hidden() && !fetch.is_hidden());
         let (tx, rx) = mpsc::unbounded_channel();
 
         tx.send(SyncProgressEvent::FetchQueued).unwrap();
@@ -415,141 +432,53 @@ mod tests {
 
         assert!(listing.is_finished());
         assert!(fetch.is_finished());
+        // `MultiProgress::remove` swaps in a hidden draw target — the
+        // detachment that keeps a dropped bar from becoming a zombie.
+        assert!(listing.is_hidden());
+        assert!(fetch.is_hidden());
         assert_eq!(fetch.position(), 1);
         assert_eq!(fetch.message(), "(1 errors)");
     }
 
-    /// Terminal width for [`FakeTerm`]. Every bar row is padded to it by
-    /// indicatif, so it only needs to fit the widest rendered bar.
-    const FAKE_TERM_WIDTH: usize = 100;
+    #[tokio::test]
+    async fn drain_and_remove_detaches_both_bars_when_cancelled_mid_drain() {
+        let multi = visible_multi_progress();
+        let bars = SyncProgressBars::new_in(&multi, "acct");
+        let listing = bars.listing.clone();
+        let fetch = bars.fetch.clone();
+        assert!(!listing.is_hidden() && !fetch.is_hidden());
+        let (tx, rx) = mpsc::unbounded_channel::<SyncProgressEvent>();
 
-    /// The cells [`FakeTerm`] has drawn, plus its cursor.
-    #[derive(Debug, Default)]
-    struct Screen {
-        rows: Vec<Vec<char>>,
-        row: usize,
-        col: usize,
+        // `tx` stays open, so the drain can only end by being aborted — and
+        // on this current-thread runtime the abort lands before the task is
+        // ever polled, the case a guard built inside an `async fn` body
+        // would miss.
+        let render_task = tokio::spawn(bars.drain_and_remove(rx));
+        render_task.abort();
+        assert!(render_task.await.unwrap_err().is_cancelled());
+
+        assert!(listing.is_hidden());
+        assert!(fetch.is_hidden());
+        drop(tx);
     }
 
-    impl Screen {
-        fn ensure_row(&mut self) {
-            while self.rows.len() <= self.row {
-                self.rows.push(Vec::new());
-            }
-        }
-
-        /// Writes one character the way a VT100-style terminal does,
-        /// including *deferred* auto-wrap: indicatif pads each bar row to
-        /// the full width and relies on the next character wrapping, rather
-        /// than writing a newline.
-        fn put(&mut self, c: char) {
-            match c {
-                '\n' => {
-                    self.row += 1;
-                    self.col = 0;
-                }
-                '\r' => self.col = 0,
-                c => {
-                    if self.col >= FAKE_TERM_WIDTH {
-                        self.row += 1;
-                        self.col = 0;
-                    }
-                    self.ensure_row();
-                    let row = &mut self.rows[self.row];
-                    if row.len() <= self.col {
-                        row.resize(self.col + 1, ' ');
-                    }
-                    row[self.col] = c;
-                    self.col += 1;
-                }
-            }
-            self.ensure_row();
-        }
+    /// A `MultiProgress` drawing to an in-memory terminal. Unlike
+    /// `MultiProgress::new()`, whose stderr target is hidden whenever the
+    /// test's stderr isn't a tty, its bars start out *not* hidden — so a
+    /// test can observe `MultiProgress::remove` hiding them.
+    fn visible_multi_progress() -> indicatif::MultiProgress {
+        indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::term_like(
+            Box::new(indicatif::InMemoryTerm::new(10, 100)),
+        ))
     }
 
-    /// An in-memory `indicatif::TermLike` screen emulator, so a test can see
-    /// exactly which lines survive a sequence of `MultiProgress` redraws.
-    /// Cloning shares the screen, which is how a test "prints to stdout" onto
-    /// the same terminal the bars draw on.
-    #[derive(Debug, Clone, Default)]
-    struct FakeTerm(Arc<Mutex<Screen>>);
-
-    impl FakeTerm {
-        fn print_line(&self, line: &str) {
-            indicatif::TermLike::write_line(self, line).unwrap();
-        }
-
-        /// The visible non-blank lines, top to bottom.
-        fn lines(&self) -> Vec<String> {
-            let screen = self.0.lock().unwrap();
-            screen
-                .rows
-                .iter()
-                .map(|row| row.iter().collect::<String>().trim_end().to_string())
-                .filter(|row| !row.is_empty())
-                .collect()
-        }
-    }
-
-    impl indicatif::TermLike for FakeTerm {
-        fn width(&self) -> u16 {
-            FAKE_TERM_WIDTH as u16
-        }
-
-        fn height(&self) -> u16 {
-            50
-        }
-
-        fn move_cursor_up(&self, n: usize) -> std::io::Result<()> {
-            let mut screen = self.0.lock().unwrap();
-            screen.row = screen.row.saturating_sub(n);
-            screen.col = screen.col.min(FAKE_TERM_WIDTH - 1);
-            Ok(())
-        }
-
-        fn move_cursor_down(&self, n: usize) -> std::io::Result<()> {
-            let mut screen = self.0.lock().unwrap();
-            screen.row += n;
-            screen.col = screen.col.min(FAKE_TERM_WIDTH - 1);
-            screen.ensure_row();
-            Ok(())
-        }
-
-        fn move_cursor_right(&self, n: usize) -> std::io::Result<()> {
-            let mut screen = self.0.lock().unwrap();
-            screen.col = (screen.col + n).min(FAKE_TERM_WIDTH - 1);
-            Ok(())
-        }
-
-        fn move_cursor_left(&self, n: usize) -> std::io::Result<()> {
-            let mut screen = self.0.lock().unwrap();
-            screen.col = screen.col.saturating_sub(n);
-            Ok(())
-        }
-
-        fn write_line(&self, s: &str) -> std::io::Result<()> {
-            self.write_str(s)?;
-            self.write_str("\n")
-        }
-
-        fn write_str(&self, s: &str) -> std::io::Result<()> {
-            let mut screen = self.0.lock().unwrap();
-            s.chars().for_each(|c| screen.put(c));
-            Ok(())
-        }
-
-        fn clear_line(&self) -> std::io::Result<()> {
-            let mut screen = self.0.lock().unwrap();
-            screen.ensure_row();
-            let row = screen.row;
-            screen.rows[row].clear();
-            screen.col = 0;
-            Ok(())
-        }
-
-        fn flush(&self) -> std::io::Result<()> {
-            Ok(())
-        }
+    /// The non-blank lines on `term`'s screen, top to bottom.
+    fn screen_lines(term: &indicatif::InMemoryTerm) -> Vec<String> {
+        term.contents()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     /// Replays one account's whole run (`fetched` successful fetches) and
@@ -575,7 +504,7 @@ mod tests {
         // that inflated count — reaching above the bars into the stdout
         // lines. A 1 Hz draw target makes nearly every non-forced draw a
         // throttled one.
-        let term = FakeTerm::default();
+        let term = indicatif::InMemoryTerm::new(50, 100);
         let multi = indicatif::MultiProgress::with_draw_target(
             indicatif::ProgressDrawTarget::term_like_with_hz(Box::new(term.clone()), 1),
         );
@@ -586,18 +515,18 @@ mod tests {
         c_fetch.inc_length(100);
 
         finish_account(b, 2).await;
-        multi.suspend(|| term.print_line("b: summary"));
+        multi.suspend(|| indicatif::TermLike::write_line(&term, "b: summary").unwrap());
         finish_account(a, 1).await;
         for _ in 0..50 {
             c_fetch.inc(1);
         }
-        multi.suspend(|| term.print_line("a: summary"));
+        multi.suspend(|| indicatif::TermLike::write_line(&term, "a: summary").unwrap());
         finish_account(c, 0).await;
-        multi.suspend(|| term.print_line("c: summary"));
-        term.print_line("combined");
+        multi.suspend(|| indicatif::TermLike::write_line(&term, "c: summary").unwrap());
+        indicatif::TermLike::write_line(&term, "combined").unwrap();
 
         assert_eq!(
-            term.lines(),
+            screen_lines(&term),
             ["b: summary", "a: summary", "c: summary", "combined"]
         );
     }

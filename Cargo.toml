@@ -194,6 +194,10 @@ rmcp = { version = "3.1", features = ["client", "server", "transport-io", "macro
 # by src/utils/rate_limit.rs's TokenBucket tests to drive its
 # tokio::time::Instant-based pacing deterministically instead of real sleeps.
 tokio = { version = "1.52", features = ["test-util"] }
+# `in_memory` (a vt100-backed `InMemoryTerm`) lets src/cli/gmail/sync/
+# progress.rs's tests see which lines survive a sequence of `MultiProgress`
+# redraws (#1652).
+indicatif = { version = "0.18", features = ["in_memory"] }
 
 [lib]
 name = "omni_dev"
