@@ -20,7 +20,7 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::claude::client::ClaudeClient;
-use crate::github_issues::{fetch_issues, fetch_items};
+use crate::github_issues::{fetch_issues_cached, fetch_items_cached, IssueCache};
 use crate::jev::citations::{find_citations, first_citation, Citation};
 use crate::jev::client::JevClient;
 use crate::jev::error::is_auth_failure;
@@ -336,11 +336,12 @@ pub fn group_sources(
 /// fetched). **Blocking** — callers must be on a blocking thread.
 pub fn fetch_verify_input(
     bin: &Path,
+    cache: &IssueCache,
     default_project: &str,
     judged: &ItemRef,
     selector: &CommentSelector,
 ) -> Result<(IssueDoc, Comment, Vec<Citation>, Vec<Source>)> {
-    let issue = fetch_issues(bin, std::slice::from_ref(judged))?
+    let issue = fetch_issues_cached(bin, cache, std::slice::from_ref(judged))?
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("issue {judged} missing from the parsed gh reply (bug)"))?;
@@ -357,7 +358,7 @@ pub fn fetch_verify_input(
         .filter(|r| seen.insert((r.project.clone(), r.number)))
         .collect();
     let mut fetched: BTreeMap<(String, u64), IssueDoc> = BTreeMap::new();
-    for (item_ref, doc) in refs.iter().zip(fetch_items(bin, &refs)?) {
+    for (item_ref, doc) in refs.iter().zip(fetch_items_cached(bin, cache, &refs)?) {
         if let Some(doc) = doc {
             fetched.insert((item_ref.project.clone(), item_ref.number), doc);
         }
@@ -373,7 +374,10 @@ pub fn fetch_verify_input(
         .cloned()
         .collect();
     if !pr_refs.is_empty() {
-        for (item_ref, doc) in pr_refs.iter().zip(fetch_items(bin, &pr_refs)?) {
+        for (item_ref, doc) in pr_refs
+            .iter()
+            .zip(fetch_items_cached(bin, cache, &pr_refs)?)
+        {
             if let Some(doc) = doc {
                 fetched.insert((item_ref.project.clone(), item_ref.number), doc);
             }
@@ -1515,6 +1519,7 @@ mod tests {
         let (issue, comment, citations, sources) = retry_on_etxtbsy(|| {
             fetch_verify_input(
                 &bin,
+                &IssueCache::disabled(),
                 "rust-works/omni-dev",
                 &judged(1),
                 &CommentSelector::Id(1),
@@ -1569,6 +1574,7 @@ mod tests {
         let (_issue, _comment, citations, sources) = retry_on_etxtbsy(|| {
             fetch_verify_input(
                 &bin,
+                &IssueCache::disabled(),
                 "rust-works/omni-dev",
                 &judged(1),
                 &CommentSelector::Latest,

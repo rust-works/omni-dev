@@ -8,8 +8,8 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use crate::github_issues::{
-    fetch_issues, fetch_items, list_open_issue_numbers, needs_default_project, parse_issue_arg,
-    resolve_current_project,
+    fetch_issues_cached, fetch_items_cached, list_open_issue_numbers, needs_default_project,
+    parse_issue_arg, resolve_current_project, IssueCache,
 };
 use crate::jev::citations::{find_citations, Citation};
 use crate::jev::client::JevClient;
@@ -129,6 +129,11 @@ pub struct RouteCommand {
     #[arg(long, conflicts_with = "allow_closed")]
     pub ignore_closed: bool,
 
+    /// Re-fetches every issue from GitHub instead of reusing one fetched in the last few
+    /// minutes (see OMNI_DEV_GITHUB_CACHE_TTL_SECS).
+    #[arg(long)]
+    pub refresh: bool,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = RouteFormat::Json)]
     pub(super) output: RouteFormat,
@@ -165,10 +170,13 @@ impl RouteCommand {
             self.max_input_chars,
             self.ignore_closed,
         );
+        let cache = std::sync::Arc::new(IssueCache::from_env(self.refresh));
+        let fetch_cache = std::sync::Arc::clone(&cache);
         let (docs, dependencies, reference_fetch_failures) =
             tokio::task::spawn_blocking(move || {
                 fetch_docs(
                     &bin,
+                    &fetch_cache,
                     &cwd,
                     &issues,
                     all_open,
@@ -178,6 +186,9 @@ impl RouteCommand {
             })
             .await
             .context("Issue fetch task panicked")??;
+        if let Some(note) = cache.reuse_note() {
+            eprintln!("{note}");
+        }
 
         let report = run_route_with_reference_fetch_failures(
             &client,
@@ -386,6 +397,7 @@ fn failure_summary(report: &RouteReport) -> Option<String> {
 /// **Blocking.**
 fn fetch_docs(
     bin: &Path,
+    cache: &IssueCache,
     cwd: &Path,
     issues: &[String],
     all_open: bool,
@@ -427,13 +439,13 @@ fn fetch_docs(
         .into_iter()
         .filter(|r| seen.insert((r.project.clone(), r.number)))
         .collect();
-    let docs = fetch_issues(bin, &refs)?;
+    let docs = fetch_issues_cached(bin, cache, &refs)?;
     let routable: Vec<&IssueDoc> = docs
         .iter()
         .filter(|d| !is_ignored_closed(d, ignore_closed))
         .collect();
     let (dependencies, reference_fetch_failures) =
-        find_open_dependencies(bin, &routable, max_input_chars)?;
+        find_open_dependencies(bin, cache, &routable, max_input_chars)?;
     Ok((docs, dependencies, reference_fetch_failures))
 }
 
@@ -443,6 +455,7 @@ fn fetch_docs(
 /// retained as a reference-fetch failure for output. **Blocking.**
 fn find_open_dependencies(
     bin: &Path,
+    cache: &IssueCache,
     docs: &[&IssueDoc],
     max_input_chars: usize,
 ) -> Result<(OpenDependencies, ReferenceFetchFailures)> {
@@ -471,7 +484,7 @@ fn find_open_dependencies(
     }
 
     let mut resolved: BTreeMap<(String, u64), Option<(ItemState, String)>> = BTreeMap::new();
-    for (item_ref, fetched) in refs.iter().zip(fetch_items(bin, &refs)?) {
+    for (item_ref, fetched) in refs.iter().zip(fetch_items_cached(bin, cache, &refs)?) {
         resolved.insert(
             (item_ref.project.clone(), item_ref.number),
             fetched.map(|doc| (doc.state, doc.url)),
@@ -546,10 +559,16 @@ mod tests {
         assert_eq!(cmd.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
         assert!(!cmd.allow_closed);
         assert!(!cmd.ignore_closed);
+        assert!(!cmd.refresh);
         assert!(!cmd.effort_advice);
         assert_eq!(cmd.output, RouteFormat::Json);
         assert_eq!(cmd.ladders, ["anthropic"]);
         assert!(cmd.ladder_definition.is_empty());
+    }
+
+    #[test]
+    fn route_parses_refresh() {
+        assert!(parse(&["#1", "--refresh"]).unwrap().refresh);
     }
 
     #[test]
@@ -1016,6 +1035,7 @@ mod tests {
         let (docs, deps, _failures) = retry_on_etxtbsy(|| {
             fetch_docs(
                 &bin,
+                &IssueCache::disabled(),
                 dir.path(),
                 &["rust-works/omni-dev#1".to_string()],
                 false,
@@ -1030,6 +1050,36 @@ mod tests {
     }
 
     #[test]
+    fn fetch_docs_reuses_a_cached_issue_on_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(dir.path());
+        let cache = IssueCache::new(
+            cache_dir.path().to_path_buf(),
+            crate::github_issues::DEFAULT_CACHE_TTL,
+            false,
+        );
+        let args = ["rust-works/omni-dev#1".to_string()];
+        for _ in 0..2 {
+            let (docs, _deps, _failures) = retry_on_etxtbsy(|| {
+                fetch_docs(
+                    &bin,
+                    &cache,
+                    dir.path(),
+                    &args,
+                    false,
+                    DEFAULT_MAX_INPUT_CHARS,
+                    false,
+                )
+            })
+            .unwrap();
+            assert_eq!(docs.len(), 1);
+        }
+        assert_eq!(calls(dir.path()), ["api"]);
+        assert!(cache.reuse_note().is_some());
+    }
+
+    #[test]
     fn fetch_docs_resolves_bare_numbers_and_dedupes() {
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(dir.path());
@@ -1037,6 +1087,7 @@ mod tests {
         let (docs, _deps, _failures) = retry_on_etxtbsy(|| {
             fetch_docs(
                 &bin,
+                &IssueCache::disabled(),
                 dir.path(),
                 &args,
                 false,
@@ -1055,7 +1106,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(dir.path());
         let (docs, _deps, _failures) = retry_on_etxtbsy(|| {
-            fetch_docs(&bin, dir.path(), &[], true, DEFAULT_MAX_INPUT_CHARS, false)
+            fetch_docs(
+                &bin,
+                &IssueCache::disabled(),
+                dir.path(),
+                &[],
+                true,
+                DEFAULT_MAX_INPUT_CHARS,
+                false,
+            )
         })
         .unwrap();
         let numbers: Vec<u64> = docs.iter().map(|d| d.number).collect();
@@ -1067,6 +1126,7 @@ mod tests {
     fn fetch_docs_explains_a_failed_repo_lookup() {
         let err = fetch_docs(
             Path::new("/no/such/gh/xyzzy"),
+            &IssueCache::disabled(),
             Path::new("."),
             &["#1".to_string()],
             false,
@@ -1156,6 +1216,7 @@ mod tests {
         let (docs, deps, _failures) = retry_on_etxtbsy(|| {
             fetch_docs(
                 &bin,
+                &IssueCache::disabled(),
                 dir.path(),
                 &["#1".to_string()],
                 false,
@@ -1182,6 +1243,7 @@ mod tests {
         let (_docs, deps, _failures) = retry_on_etxtbsy(|| {
             fetch_docs(
                 &bin,
+                &IssueCache::disabled(),
                 dir.path(),
                 &["#1".to_string()],
                 false,
@@ -1204,6 +1266,7 @@ mod tests {
             retry_on_etxtbsy(|| {
                 fetch_docs(
                     &bin,
+                    &IssueCache::disabled(),
                     dir.path(),
                     &["rust-works/omni-dev#1".to_string()],
                     false,
@@ -1230,6 +1293,7 @@ mod tests {
         let (docs, dependencies, failures) = retry_on_etxtbsy(|| {
             fetch_docs(
                 &bin,
+                &IssueCache::disabled(),
                 dir.path(),
                 &["#1".to_string()],
                 false,
@@ -1281,6 +1345,7 @@ mod tests {
         let (docs, dependencies, failures) = retry_on_etxtbsy(|| {
             fetch_docs(
                 &bin,
+                &IssueCache::disabled(),
                 dir.path(),
                 &["#1".to_string()],
                 false,
