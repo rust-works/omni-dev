@@ -46,9 +46,10 @@ pub(crate) enum SyncProgressEvent {
 pub(crate) struct SyncProgressBars {
     listing: indicatif::ProgressBar,
     fetch: indicatif::ProgressBar,
-    // Keeps both bars registered/coordinated for the run's lifetime; never
-    // read again after construction, but must outlive both bars.
-    _multi: indicatif::MultiProgress,
+    // Keeps both bars registered/coordinated for the run's lifetime (it must
+    // outlive both bars), and is what [`SyncProgressBars::drain_and_remove`]
+    // detaches them from.
+    multi: indicatif::MultiProgress,
 }
 
 impl SyncProgressBars {
@@ -89,14 +90,48 @@ impl SyncProgressBars {
         Self {
             listing,
             fetch,
-            _multi: multi,
+            multi,
         }
     }
 
     /// Drains `rx` until the sender side is dropped (the sync run finished
     /// or failed), updating both bars as events arrive, then clears the
     /// listing spinner and finishes the fetch bar in place.
-    pub(crate) async fn drain(self, mut rx: mpsc::UnboundedReceiver<SyncProgressEvent>) {
+    pub(crate) async fn drain(self, rx: mpsc::UnboundedReceiver<SyncProgressEvent>) {
+        self.apply_events(rx).await;
+        // Safety net if the channel closed before a `ListingDone` was sent
+        // (e.g. an error aborted the run mid-listing) — both calls are
+        // idempotent, so this is a no-op when `ListingDone` already fired.
+        self.listing.finish_and_clear();
+        self.fetch.finish();
+    }
+
+    /// [`SyncProgressBars::drain`]'s `gmail sync-all` counterpart (#1652):
+    /// once `rx` closes, clears *both* bars and detaches them from the
+    /// shared `MultiProgress`, instead of leaving the fetch bar finished in
+    /// place.
+    ///
+    /// A bar that is dropped while still registered becomes an indicatif
+    /// "zombie", whose on-screen lines the next `suspend` wipes. indicatif
+    /// 0.18 counts a head-of-list zombie's lines once per *rate-limited*
+    /// draw, not once, so while other accounts' bars keep ticking the count
+    /// grows past the lines the bars occupy — and the next `suspend` then
+    /// erases stdout lines above them: an earlier account's summary. An
+    /// explicitly removed bar never becomes a zombie. The account's summary
+    /// line, printed right after this returns, supersedes the fetch bar's
+    /// final count.
+    pub(crate) async fn drain_and_remove(self, rx: mpsc::UnboundedReceiver<SyncProgressEvent>) {
+        self.apply_events(rx).await;
+        for bar in [&self.listing, &self.fetch] {
+            bar.finish_and_clear();
+            self.multi.remove(bar);
+        }
+    }
+
+    /// The event loop shared by [`SyncProgressBars::drain`] and
+    /// [`SyncProgressBars::drain_and_remove`]: updates both bars until the
+    /// sender side of `rx` is dropped.
+    async fn apply_events(&self, mut rx: mpsc::UnboundedReceiver<SyncProgressEvent>) {
         let mut errors = 0usize;
         while let Some(event) = rx.recv().await {
             match event {
@@ -134,11 +169,6 @@ impl SyncProgressBars {
                 }
             }
         }
-        // Safety net if the channel closed before a `ListingDone` was sent
-        // (e.g. an error aborted the run mid-listing) — both calls are
-        // idempotent, so this is a no-op when `ListingDone` already fired.
-        self.listing.finish_and_clear();
-        self.fetch.finish();
     }
 }
 
@@ -172,6 +202,8 @@ fn fetch_style(prefixed: bool) -> indicatif::ProgressStyle {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     /// `ProgressBar` is a cheap `Clone` handle onto shared state (see
@@ -363,5 +395,210 @@ mod tests {
         assert_eq!(fetch_b.position(), 2);
         assert_eq!(fetch_b.length(), Some(2));
         assert_eq!(fetch_b.message(), "(1 errors)");
+    }
+
+    // ── drain_and_remove (#1652) ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn drain_and_remove_finishes_both_bars() {
+        let multi = indicatif::MultiProgress::new();
+        let bars = SyncProgressBars::new_in(&multi, "acct");
+        let listing = bars.listing.clone();
+        let fetch = bars.fetch.clone();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        tx.send(SyncProgressEvent::FetchQueued).unwrap();
+        tx.send(SyncProgressEvent::FetchCompleted { failed: true })
+            .unwrap();
+        drop(tx);
+        bars.drain_and_remove(rx).await;
+
+        assert!(listing.is_finished());
+        assert!(fetch.is_finished());
+        assert_eq!(fetch.position(), 1);
+        assert_eq!(fetch.message(), "(1 errors)");
+    }
+
+    /// Terminal width for [`FakeTerm`]. Every bar row is padded to it by
+    /// indicatif, so it only needs to fit the widest rendered bar.
+    const FAKE_TERM_WIDTH: usize = 100;
+
+    /// The cells [`FakeTerm`] has drawn, plus its cursor.
+    #[derive(Debug, Default)]
+    struct Screen {
+        rows: Vec<Vec<char>>,
+        row: usize,
+        col: usize,
+    }
+
+    impl Screen {
+        fn ensure_row(&mut self) {
+            while self.rows.len() <= self.row {
+                self.rows.push(Vec::new());
+            }
+        }
+
+        /// Writes one character the way a VT100-style terminal does,
+        /// including *deferred* auto-wrap: indicatif pads each bar row to
+        /// the full width and relies on the next character wrapping, rather
+        /// than writing a newline.
+        fn put(&mut self, c: char) {
+            match c {
+                '\n' => {
+                    self.row += 1;
+                    self.col = 0;
+                }
+                '\r' => self.col = 0,
+                c => {
+                    if self.col >= FAKE_TERM_WIDTH {
+                        self.row += 1;
+                        self.col = 0;
+                    }
+                    self.ensure_row();
+                    let row = &mut self.rows[self.row];
+                    if row.len() <= self.col {
+                        row.resize(self.col + 1, ' ');
+                    }
+                    row[self.col] = c;
+                    self.col += 1;
+                }
+            }
+            self.ensure_row();
+        }
+    }
+
+    /// An in-memory `indicatif::TermLike` screen emulator, so a test can see
+    /// exactly which lines survive a sequence of `MultiProgress` redraws.
+    /// Cloning shares the screen, which is how a test "prints to stdout" onto
+    /// the same terminal the bars draw on.
+    #[derive(Debug, Clone, Default)]
+    struct FakeTerm(Arc<Mutex<Screen>>);
+
+    impl FakeTerm {
+        fn print_line(&self, line: &str) {
+            indicatif::TermLike::write_line(self, line).unwrap();
+        }
+
+        /// The visible non-blank lines, top to bottom.
+        fn lines(&self) -> Vec<String> {
+            let screen = self.0.lock().unwrap();
+            screen
+                .rows
+                .iter()
+                .map(|row| row.iter().collect::<String>().trim_end().to_string())
+                .filter(|row| !row.is_empty())
+                .collect()
+        }
+    }
+
+    impl indicatif::TermLike for FakeTerm {
+        fn width(&self) -> u16 {
+            FAKE_TERM_WIDTH as u16
+        }
+
+        fn height(&self) -> u16 {
+            50
+        }
+
+        fn move_cursor_up(&self, n: usize) -> std::io::Result<()> {
+            let mut screen = self.0.lock().unwrap();
+            screen.row = screen.row.saturating_sub(n);
+            screen.col = screen.col.min(FAKE_TERM_WIDTH - 1);
+            Ok(())
+        }
+
+        fn move_cursor_down(&self, n: usize) -> std::io::Result<()> {
+            let mut screen = self.0.lock().unwrap();
+            screen.row += n;
+            screen.col = screen.col.min(FAKE_TERM_WIDTH - 1);
+            screen.ensure_row();
+            Ok(())
+        }
+
+        fn move_cursor_right(&self, n: usize) -> std::io::Result<()> {
+            let mut screen = self.0.lock().unwrap();
+            screen.col = (screen.col + n).min(FAKE_TERM_WIDTH - 1);
+            Ok(())
+        }
+
+        fn move_cursor_left(&self, n: usize) -> std::io::Result<()> {
+            let mut screen = self.0.lock().unwrap();
+            screen.col = screen.col.saturating_sub(n);
+            Ok(())
+        }
+
+        fn write_line(&self, s: &str) -> std::io::Result<()> {
+            self.write_str(s)?;
+            self.write_str("\n")
+        }
+
+        fn write_str(&self, s: &str) -> std::io::Result<()> {
+            let mut screen = self.0.lock().unwrap();
+            s.chars().for_each(|c| screen.put(c));
+            Ok(())
+        }
+
+        fn clear_line(&self) -> std::io::Result<()> {
+            let mut screen = self.0.lock().unwrap();
+            screen.ensure_row();
+            let row = screen.row;
+            screen.rows[row].clear();
+            screen.col = 0;
+            Ok(())
+        }
+
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Replays one account's whole run (`fetched` successful fetches) and
+    /// closes its channel, the way `run_one_account` returning does.
+    async fn finish_account(bars: SyncProgressBars, fetched: usize) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(SyncProgressEvent::ListingDone).unwrap();
+        for _ in 0..fetched {
+            tx.send(SyncProgressEvent::FetchQueued).unwrap();
+            tx.send(SyncProgressEvent::FetchCompleted { failed: false })
+                .unwrap();
+        }
+        drop(tx);
+        bars.drain_and_remove(rx).await;
+    }
+
+    #[tokio::test]
+    async fn drain_and_remove_keeps_every_summary_line_while_other_bars_draw() {
+        // The #1652 sequence. With `drain` (finished bars dropped while still
+        // registered) this erases `b: summary` and `b`'s bar: `b`'s zombie
+        // reaches the head of the list when `a` finishes, `c`'s throttled
+        // `inc` draws each re-count its lines, and the next `suspend` clears
+        // that inflated count — reaching above the bars into the stdout
+        // lines. A 1 Hz draw target makes nearly every non-forced draw a
+        // throttled one.
+        let term = FakeTerm::default();
+        let multi = indicatif::MultiProgress::with_draw_target(
+            indicatif::ProgressDrawTarget::term_like_with_hz(Box::new(term.clone()), 1),
+        );
+        let a = SyncProgressBars::new_in(&multi, "a");
+        let b = SyncProgressBars::new_in(&multi, "b");
+        let c = SyncProgressBars::new_in(&multi, "c");
+        let c_fetch = c.fetch.clone();
+        c_fetch.inc_length(100);
+
+        finish_account(b, 2).await;
+        multi.suspend(|| term.print_line("b: summary"));
+        finish_account(a, 1).await;
+        for _ in 0..50 {
+            c_fetch.inc(1);
+        }
+        multi.suspend(|| term.print_line("a: summary"));
+        finish_account(c, 0).await;
+        multi.suspend(|| term.print_line("c: summary"));
+        term.print_line("combined");
+
+        assert_eq!(
+            term.lines(),
+            ["b: summary", "a: summary", "c: summary", "combined"]
+        );
     }
 }
