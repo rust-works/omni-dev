@@ -19,6 +19,13 @@ use crate::cli::gmail::format::{write_scalar_jsonl, JsonlSerialize};
 pub(crate) struct InsertReport {
     pub(crate) actions: Vec<InsertAction>,
     pub(crate) errors: Vec<InsertError>,
+    /// Why the run stopped before trying every message, if it did: Gmail's
+    /// scope 403, already carrying the `gmail auth login --modify` hint
+    /// (#1951). Kept on the report rather than returned as the run's error
+    /// so the CLI still renders everything else the run did before failing
+    /// with it. Not serialised: it is the command's error, not report data.
+    #[serde(skip)]
+    pub(crate) stop_error: Option<anyhow::Error>,
 }
 
 impl JsonlSerialize for InsertReport {
@@ -130,6 +137,7 @@ mod tests {
                 id: "m4".to_string(),
                 reason: "boom".to_string(),
             }],
+            stop_error: None,
         };
 
         assert_eq!(
@@ -155,6 +163,7 @@ mod tests {
                 message: "note".to_string(),
             }],
             errors: vec![],
+            stop_error: None,
         };
         let mut buf = Vec::new();
         report.write_jsonl(&mut buf).unwrap();

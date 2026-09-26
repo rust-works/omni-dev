@@ -1493,9 +1493,10 @@ Error: This Gmail account is authorised read-only, and this command needs the `g
 ```
 
 `insert` stops at the first such 403 instead of trying every message, since
-each one would fail the same way. It reports the error once, saying how many
-inserts Gmail refused and how many were never sent. Inserts already in flight
-when the 403 arrives still finish, so the ledger misses nothing.
+each one would fail the same way. It still prints the run's report (including
+any other per-message errors), then fails once with the error above, saying how
+many inserts Gmail refused and how many were never sent. Inserts already in
+flight when the 403 arrives still finish, so the ledger misses nothing.
 
 ### MCP server cannot see credentials
 

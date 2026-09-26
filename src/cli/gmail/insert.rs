@@ -128,7 +128,7 @@ async fn run_insert_command(
     output: &OutputFormat,
 ) -> Result<()> {
     let show_progress = should_show_progress(quiet, output, std::io::stderr().is_terminal());
-    let report = if show_progress {
+    let mut report = if show_progress {
         let (tx, rx) = mpsc::unbounded_channel();
         let bar = InsertProgressBar::new();
         let render_task = tokio::spawn(bar.drain(rx));
@@ -159,6 +159,11 @@ async fn run_insert_command(
         render_report_text(&report, &mut handle, !quiet && !show_progress)?;
     }
 
+    // A stopped run's own error outranks the per-message tally: it names
+    // the fix, and every message after it was never tried (#1951).
+    if let Some(err) = report.stop_error.take() {
+        return Err(err);
+    }
     if !report.errors.is_empty() {
         anyhow::bail!(
             "{} message(s) failed to insert; see errors above",
@@ -368,6 +373,7 @@ mod tests {
                 id: "m3".to_string(),
                 reason: "boom".to_string(),
             }],
+            stop_error: None,
         };
         let mut buf = Vec::new();
         render_report_text(&report, &mut buf, true).unwrap();
@@ -394,6 +400,7 @@ mod tests {
                 },
             ],
             errors: vec![],
+            stop_error: None,
         };
         let mut buf = Vec::new();
         render_report_text(&report, &mut buf, false).unwrap();
