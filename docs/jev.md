@@ -1420,17 +1420,24 @@ few minutes instead of being queried again ([#1858](https://github.com/rust-work
   dir is `~/Library/Caches` on macOS and `$XDG_CACHE_HOME` (or `~/.cache`) on
   Linux. `route` and `verify-decision` share entries, so a cited issue
   that `route` fetched is reused by `verify-decision`, and the other way round.
-- **What is not cached:** a citation that could not be found, so fixing a typo
-  or giving `gh` access takes effect on the next run. The current repository
-  (`gh repo view`) and `route --all-open`'s list of open issues aren't cached
-  either. The issues `--all-open` goes on to fetch are cached.
+- **What is always fetched fresh:**
+  - `verify-decision`'s own issue. Its comments are what gets checked, and a
+    cached copy would silently miss a decision comment posted since. The fresh
+    copy is still cached, for its cited sources and for `route`.
+  - A citation that could not be found, so fixing a typo or giving `gh` access
+    takes effect on the next run.
+  - The current repository (`gh repo view`) and `route --all-open`'s list of
+    open issues. The issues `--all-open` goes on to fetch are cached.
 - **How long:** `OMNI_DEV_GITHUB_CACHE_TTL_SECS`, 300 seconds by default. It can
   also be set in the `settings.json` `env` map. `0` turns the cache off: nothing
   is read or written. A value that isn't a whole number of seconds is warned
   about and ignored.
+- **What can be stale:** anything `route` reads, and `verify-decision`'s cited
+  sources, can be up to the TTL old. That includes whether a cited dependency
+  is still open and whether a routed issue is closed.
 - **Bypassing it:** `--refresh` re-fetches everything for that run and caches
-  the fresh copies. Use it after posting a comment you want `verify-decision`
-  to see at once.
+  the fresh copies. Use it after closing, reopening or commenting on an issue
+  you're about to route.
 - **Knowing when it was used:** when a run reuses anything, it says so on
   stderr, and stdout is unchanged:
   `note: reused 2 cached GitHub items, up to 3m old; pass --refresh to re-fetch`.
@@ -1439,8 +1446,8 @@ The cache is best-effort. An unreadable, corrupt or expired entry is fetched
 again, and a failed write is ignored, so at worst a run behaves as if there
 were no cache. Entries hold issue text, including text from private
 repositories. They are written readable by you alone (`0600` files in `0700`
-directories) and are never deleted automatically; remove the directory to
-clear them.
+directories), and each run deletes the expired ones. Setting the TTL to `0`
+stops the sweep too, so remove the directory to clear what is left.
 
 ## Retries and timeouts
 

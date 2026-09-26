@@ -150,7 +150,8 @@ pub struct RouteCommand {
 impl RouteCommand {
     /// Executes the route command.
     pub async fn execute(self) -> Result<()> {
-        let mut config = JevConfig::from_env()?;
+        let env = crate::utils::settings::SettingsEnv::load();
+        let mut config = JevConfig::from_env_with(&env)?;
         if let Some(model) = &self.jev_model {
             config.model = model.clone();
         }
@@ -170,25 +171,31 @@ impl RouteCommand {
             self.max_input_chars,
             self.ignore_closed,
         );
-        let cache = std::sync::Arc::new(IssueCache::from_env(self.refresh));
+        let cache = std::sync::Arc::new(IssueCache::from_env_with(
+            &env,
+            dirs::cache_dir(),
+            self.refresh,
+        ));
         let fetch_cache = std::sync::Arc::clone(&cache);
-        let (docs, dependencies, reference_fetch_failures) =
-            tokio::task::spawn_blocking(move || {
-                fetch_docs(
-                    &bin,
-                    &fetch_cache,
-                    &cwd,
-                    &issues,
-                    all_open,
-                    max_input_chars,
-                    ignore_closed,
-                )
-            })
-            .await
-            .context("Issue fetch task panicked")??;
+        let fetched = tokio::task::spawn_blocking(move || {
+            fetch_cache.prune_expired();
+            fetch_docs(
+                &bin,
+                &fetch_cache,
+                &cwd,
+                &issues,
+                all_open,
+                max_input_chars,
+                ignore_closed,
+            )
+        })
+        .await
+        .context("Issue fetch task panicked")?;
+        // Before `?`, so a failure on cached input still names --refresh.
         if let Some(note) = cache.reuse_note() {
             eprintln!("{note}");
         }
+        let (docs, dependencies, reference_fetch_failures) = fetched?;
 
         let report = run_route_with_reference_fetch_failures(
             &client,
@@ -1054,13 +1061,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(dir.path());
-        let cache = IssueCache::new(
-            cache_dir.path().to_path_buf(),
-            crate::github_issues::DEFAULT_CACHE_TTL,
-            false,
-        );
         let args = ["rust-works/omni-dev#1".to_string()];
+        let mut notes = Vec::new();
         for _ in 0..2 {
+            // Each run builds its own cache over the same directory.
+            let cache = IssueCache::new(
+                cache_dir.path().to_path_buf(),
+                crate::github_issues::DEFAULT_CACHE_TTL,
+                false,
+            );
             let (docs, _deps, _failures) = retry_on_etxtbsy(|| {
                 fetch_docs(
                     &bin,
@@ -1074,9 +1083,11 @@ mod tests {
             })
             .unwrap();
             assert_eq!(docs.len(), 1);
+            notes.push(cache.reuse_note());
         }
         assert_eq!(calls(dir.path()), ["api"]);
-        assert!(cache.reuse_note().is_some());
+        assert!(notes[0].is_none(), "a cold run reuses nothing");
+        assert!(notes[1].is_some());
     }
 
     #[test]
