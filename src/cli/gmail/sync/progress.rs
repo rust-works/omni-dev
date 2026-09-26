@@ -46,9 +46,10 @@ pub(crate) enum SyncProgressEvent {
 pub(crate) struct SyncProgressBars {
     listing: indicatif::ProgressBar,
     fetch: indicatif::ProgressBar,
-    // Keeps both bars registered/coordinated for the run's lifetime; never
-    // read again after construction, but must outlive both bars.
-    _multi: indicatif::MultiProgress,
+    // Keeps both bars registered/coordinated for the run's lifetime (it must
+    // outlive both bars), and is what [`SyncProgressBars::drain_and_remove`]
+    // detaches them from.
+    multi: indicatif::MultiProgress,
 }
 
 impl SyncProgressBars {
@@ -89,14 +90,53 @@ impl SyncProgressBars {
         Self {
             listing,
             fetch,
-            _multi: multi,
+            multi,
         }
     }
 
     /// Drains `rx` until the sender side is dropped (the sync run finished
     /// or failed), updating both bars as events arrive, then clears the
     /// listing spinner and finishes the fetch bar in place.
-    pub(crate) async fn drain(self, mut rx: mpsc::UnboundedReceiver<SyncProgressEvent>) {
+    pub(crate) async fn drain(self, rx: mpsc::UnboundedReceiver<SyncProgressEvent>) {
+        self.apply_events(rx).await;
+        // Safety net if the channel closed before a `ListingDone` was sent
+        // (e.g. an error aborted the run mid-listing) — both calls are
+        // idempotent, so this is a no-op when `ListingDone` already fired.
+        self.listing.finish_and_clear();
+        self.fetch.finish();
+    }
+
+    /// [`SyncProgressBars::drain`]'s `gmail sync-all` counterpart (#1652):
+    /// once `rx` closes, clears *both* bars and detaches them from the
+    /// shared `MultiProgress`, instead of leaving the fetch bar finished in
+    /// place.
+    ///
+    /// A bar that is dropped while still registered becomes an indicatif
+    /// "zombie", whose on-screen lines the next `suspend` wipes. indicatif
+    /// 0.18 counts a head-of-list zombie's lines once per *rate-limited*
+    /// draw, not once, so while other accounts' bars keep ticking the count
+    /// grows past the lines the bars occupy — and the next `suspend` then
+    /// erases stdout lines above them: an earlier account's summary. An
+    /// explicitly removed bar never becomes a zombie. The account's summary
+    /// line, printed right after this returns, supersedes the fetch bar's
+    /// final count.
+    ///
+    /// The detach runs from a drop guard that owns the bars from the moment
+    /// this is called — not from the future's first poll — so it also
+    /// happens if the render task panics, or is cancelled before or during
+    /// the drain: the cases where a zombie would otherwise be left behind.
+    pub(crate) fn drain_and_remove(
+        self,
+        rx: mpsc::UnboundedReceiver<SyncProgressEvent>,
+    ) -> impl std::future::Future<Output = ()> {
+        let bars = DetachOnDrop(self);
+        async move { bars.0.apply_events(rx).await }
+    }
+
+    /// The event loop shared by [`SyncProgressBars::drain`] and
+    /// [`SyncProgressBars::drain_and_remove`]: updates both bars until the
+    /// sender side of `rx` is dropped.
+    async fn apply_events(&self, mut rx: mpsc::UnboundedReceiver<SyncProgressEvent>) {
         let mut errors = 0usize;
         while let Some(event) = rx.recv().await {
             match event {
@@ -134,11 +174,19 @@ impl SyncProgressBars {
                 }
             }
         }
-        // Safety net if the channel closed before a `ListingDone` was sent
-        // (e.g. an error aborted the run mid-listing) — both calls are
-        // idempotent, so this is a no-op when `ListingDone` already fired.
-        self.listing.finish_and_clear();
-        self.fetch.finish();
+    }
+}
+
+/// [`SyncProgressBars::drain_and_remove`]'s drop guard: clears both bars and
+/// detaches them from their `MultiProgress`, on every exit path.
+struct DetachOnDrop(SyncProgressBars);
+
+impl Drop for DetachOnDrop {
+    fn drop(&mut self) {
+        for bar in [&self.0.listing, &self.0.fetch] {
+            bar.finish_and_clear();
+            self.0.multi.remove(bar);
+        }
     }
 }
 
@@ -363,5 +411,123 @@ mod tests {
         assert_eq!(fetch_b.position(), 2);
         assert_eq!(fetch_b.length(), Some(2));
         assert_eq!(fetch_b.message(), "(1 errors)");
+    }
+
+    // ── drain_and_remove (#1652) ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn drain_and_remove_finishes_both_bars() {
+        let multi = visible_multi_progress();
+        let bars = SyncProgressBars::new_in(&multi, "acct");
+        let listing = bars.listing.clone();
+        let fetch = bars.fetch.clone();
+        assert!(!listing.is_hidden() && !fetch.is_hidden());
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        tx.send(SyncProgressEvent::FetchQueued).unwrap();
+        tx.send(SyncProgressEvent::FetchCompleted { failed: true })
+            .unwrap();
+        drop(tx);
+        bars.drain_and_remove(rx).await;
+
+        assert!(listing.is_finished());
+        assert!(fetch.is_finished());
+        // `MultiProgress::remove` swaps in a hidden draw target — the
+        // detachment that keeps a dropped bar from becoming a zombie.
+        assert!(listing.is_hidden());
+        assert!(fetch.is_hidden());
+        assert_eq!(fetch.position(), 1);
+        assert_eq!(fetch.message(), "(1 errors)");
+    }
+
+    #[tokio::test]
+    async fn drain_and_remove_detaches_both_bars_when_cancelled_mid_drain() {
+        let multi = visible_multi_progress();
+        let bars = SyncProgressBars::new_in(&multi, "acct");
+        let listing = bars.listing.clone();
+        let fetch = bars.fetch.clone();
+        assert!(!listing.is_hidden() && !fetch.is_hidden());
+        let (tx, rx) = mpsc::unbounded_channel::<SyncProgressEvent>();
+
+        // `tx` stays open, so the drain can only end by being aborted — and
+        // on this current-thread runtime the abort lands before the task is
+        // ever polled, the case a guard built inside an `async fn` body
+        // would miss.
+        let render_task = tokio::spawn(bars.drain_and_remove(rx));
+        render_task.abort();
+        assert!(render_task.await.unwrap_err().is_cancelled());
+
+        assert!(listing.is_hidden());
+        assert!(fetch.is_hidden());
+        drop(tx);
+    }
+
+    /// A `MultiProgress` drawing to an in-memory terminal. Unlike
+    /// `MultiProgress::new()`, whose stderr target is hidden whenever the
+    /// test's stderr isn't a tty, its bars start out *not* hidden — so a
+    /// test can observe `MultiProgress::remove` hiding them.
+    fn visible_multi_progress() -> indicatif::MultiProgress {
+        indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::term_like(
+            Box::new(indicatif::InMemoryTerm::new(10, 100)),
+        ))
+    }
+
+    /// The non-blank lines on `term`'s screen, top to bottom.
+    fn screen_lines(term: &indicatif::InMemoryTerm) -> Vec<String> {
+        term.contents()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Replays one account's whole run (`fetched` successful fetches) and
+    /// closes its channel, the way `run_one_account` returning does.
+    async fn finish_account(bars: SyncProgressBars, fetched: usize) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(SyncProgressEvent::ListingDone).unwrap();
+        for _ in 0..fetched {
+            tx.send(SyncProgressEvent::FetchQueued).unwrap();
+            tx.send(SyncProgressEvent::FetchCompleted { failed: false })
+                .unwrap();
+        }
+        drop(tx);
+        bars.drain_and_remove(rx).await;
+    }
+
+    #[tokio::test]
+    async fn drain_and_remove_keeps_every_summary_line_while_other_bars_draw() {
+        // The #1652 sequence. With `drain` (finished bars dropped while still
+        // registered) this erases `b: summary` and `b`'s bar: `b`'s zombie
+        // reaches the head of the list when `a` finishes, `c`'s throttled
+        // `inc` draws each re-count its lines, and the next `suspend` clears
+        // that inflated count — reaching above the bars into the stdout
+        // lines. A 1 Hz draw target makes nearly every non-forced draw a
+        // throttled one.
+        let term = indicatif::InMemoryTerm::new(50, 100);
+        let multi = indicatif::MultiProgress::with_draw_target(
+            indicatif::ProgressDrawTarget::term_like_with_hz(Box::new(term.clone()), 1),
+        );
+        let a = SyncProgressBars::new_in(&multi, "a");
+        let b = SyncProgressBars::new_in(&multi, "b");
+        let c = SyncProgressBars::new_in(&multi, "c");
+        let c_fetch = c.fetch.clone();
+        c_fetch.inc_length(100);
+
+        finish_account(b, 2).await;
+        multi.suspend(|| indicatif::TermLike::write_line(&term, "b: summary").unwrap());
+        finish_account(a, 1).await;
+        for _ in 0..50 {
+            c_fetch.inc(1);
+        }
+        multi.suspend(|| indicatif::TermLike::write_line(&term, "a: summary").unwrap());
+        finish_account(c, 0).await;
+        multi.suspend(|| indicatif::TermLike::write_line(&term, "c: summary").unwrap());
+        indicatif::TermLike::write_line(&term, "combined").unwrap();
+
+        assert_eq!(
+            screen_lines(&term),
+            ["b: summary", "a: summary", "c: summary", "combined"]
+        );
     }
 }

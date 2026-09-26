@@ -261,7 +261,6 @@ async fn run_sync_all(
     // follow-up, #1504).
     let show_progress = should_show_progress(quiet, output, std::io::stderr().is_terminal());
     let multi = show_progress.then(indicatif::MultiProgress::new);
-    let mut render_tasks = Vec::new();
 
     let mut tasks = FuturesUnordered::new();
     for entry in &config.accounts {
@@ -281,12 +280,14 @@ async fn run_sync_all(
             extract_attachments: entry.extract_attachments.unwrap_or(false),
             shared_pool: Some(Arc::clone(&pool)),
         };
-        let progress_tx = multi.as_ref().map(|multi| {
-            let bars = SyncProgressBars::new_in(multi, &account);
-            let (tx, rx) = mpsc::unbounded_channel();
-            render_tasks.push(tokio::spawn(bars.drain(rx)));
-            tx
-        });
+        let (progress_tx, render_task) = multi
+            .as_ref()
+            .map(|multi| {
+                let bars = SyncProgressBars::new_in(multi, &account);
+                let (tx, rx) = mpsc::unbounded_channel();
+                (tx, tokio::spawn(bars.drain_and_remove(rx)))
+            })
+            .unzip();
         let spawn_account = account.clone();
         let spawn_client_for = Arc::clone(&client_for);
         let join = tokio::spawn(async move {
@@ -298,13 +299,24 @@ async fn run_sync_all(
             )
             .await
             // `progress_tx` drops here, closing its channel so the
-            // corresponding `bars.drain` render task above can exit.
+            // corresponding `bars.drain_and_remove` render task above can
+            // exit.
         });
         tasks.push(async move {
             let outcome = match join.await {
                 Ok(result) => result,
                 Err(join_err) => Err(anyhow::anyhow!("sync task panicked: {join_err}")),
             };
+            // Join point (#1652): the account's line is only printed once
+            // its own bars are cleared and detached, so its render task can
+            // never redraw the shared `MultiProgress` concurrently with that
+            // print. Best-effort — a panicking/cancelled render task only
+            // ever formats bars, so it mustn't fail an otherwise-successful
+            // sync. Awaiting it can't hang: `progress_tx` (and the retry
+            // notifier's clone of it) dropped when the sync task finished.
+            if let Some(render_task) = render_task {
+                let _ = render_task.await;
+            }
             (account, outcome)
         });
     }
@@ -317,19 +329,15 @@ async fn run_sync_all(
             // line doesn't land mid-redraw of the stderr bars below it —
             // `suspend` clears every registered bar first and redraws once
             // the closure returns, regardless of which stream it writes to.
+            // This account's own bars are already gone (see the join point
+            // above); once the loop ends every account's are, so the
+            // `combined:` line below needs no further coordination.
             match &multi {
                 Some(multi) => multi.suspend(|| print_account_line(&account, &outcome, quiet)),
                 None => print_account_line(&account, &outcome, quiet),
             }
         }
         outcomes.push((account, outcome));
-    }
-
-    // Best-effort: a panicking/cancelled render task shouldn't fail an
-    // otherwise-successful sync — it only ever formats bars. Awaited before
-    // the combined summary prints so every bar has finished/cleared first.
-    for render_task in render_tasks {
-        let _ = render_task.await;
     }
 
     let mut combined = SyncSummary::default();
