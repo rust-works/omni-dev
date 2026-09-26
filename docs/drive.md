@@ -2655,7 +2655,10 @@ channel other add-ons key their own state on. Also gated by
 `--sheet`/`--dimension`/`--start`/`--end` are optional on all three and
 compose into one of three locations: none of them means the whole
 spreadsheet, `--sheet` alone means the whole sheet, and all four together
-mean a row or column span.
+mean a single row or column. Sheets rejects a `DimensionRange` spanning
+more than one row/column with a bare HTTP 400 ("must represent a single
+row or column"), so `--start` and `--end` must name the same 1-based
+index — refused locally with a clear message if they don't (issue #1933).
 
 ```bash
 # Spreadsheet-scoped: no --sheet/--dimension/--start/--end at all.
@@ -2665,10 +2668,9 @@ omni-dev drive sheets set-developer-metadata <ID> --key owner --value team-a
 omni-dev drive sheets set-developer-metadata <ID> --key owner --value team-a \
   --sheet Q2
 
-# Row/column-scoped, 1-based and inclusive like every other --start/--end
-# pair in this crate.
+# Row/column-scoped: --start and --end name the same 1-based row or column.
 omni-dev drive sheets set-developer-metadata <ID> --key source --value import \
-  --sheet Q2 --dimension rows --start 2 --end 100
+  --sheet Q2 --dimension rows --start 2 --end 2
 
 # Re-running set-developer-metadata with an existing key and location
 # updates its value instead of creating a duplicate entry.

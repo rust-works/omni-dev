@@ -5124,8 +5124,8 @@ Options:
       --key <KEY>              The key to remove
       --sheet <NAME>           Title of the sheet, when the location is sheet- or dimension-scoped. Omit entirely, along with `--dimension`/`--start`/`--end`, for a spreadsheet-scoped entry
       --dimension <DIMENSION>  Rows or columns, when the location is a row/column span. Requires `--sheet`, `--start` and `--end` together [possible values: rows, columns]
-      --start <N>              1-based first row/column, inclusive
-      --end <N>                1-based last row/column, inclusive
+      --start <N>              1-based row/column index. Must equal `--end` — Sheets rejects a developer-metadata span of more than one row/column (issue #1933)
+      --end <N>                1-based row/column index. Must equal `--start` — see its doc comment
       --dry-run                Reports the gate verdict and every entry that would be removed, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
@@ -5909,8 +5909,8 @@ Options:
       --key <KEY>              Restrict to this key. Omit to match every key
       --sheet <NAME>           Title of the sheet, when restricting the search to a sheet or dimension span. Omit entirely, along with `--dimension`/`--start`/`--end`, to search the whole workbook
       --dimension <DIMENSION>  Rows or columns, when restricting the search to a row/column span [possible values: rows, columns]
-      --start <N>              1-based first row/column, inclusive
-      --end <N>                1-based last row/column, inclusive
+      --start <N>              1-based row/column index. Must equal `--end` — Sheets rejects a developer-metadata span of more than one row/column (issue #1933)
+      --end <N>                1-based row/column index. Must equal `--start` — see its doc comment
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
@@ -5998,8 +5998,8 @@ Options:
       --value <VALUE>          The value to write
       --sheet <NAME>           Title of the sheet, when the location is sheet- or dimension-scoped. Omit entirely, along with `--dimension`/`--start`/`--end`, for a spreadsheet-scoped entry
       --dimension <DIMENSION>  Rows or columns, when the location is a row/column span. Requires `--sheet`, `--start` and `--end` together [possible values: rows, columns]
-      --start <N>              1-based first row/column, inclusive
-      --end <N>                1-based last row/column, inclusive
+      --start <N>              1-based row/column index. Must equal `--end` — Sheets rejects a developer-metadata span of more than one row/column (issue #1933)
+      --end <N>                1-based row/column index. Must equal `--start` — see its doc comment
       --dry-run                Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>          The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
