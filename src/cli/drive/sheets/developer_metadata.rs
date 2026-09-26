@@ -46,17 +46,18 @@ pub struct SetDeveloperMetadataCommand {
     #[arg(long, value_name = "NAME")]
     pub sheet: Option<String>,
 
-    /// Rows or columns, when the location is a row/column span. Requires
+    /// Rows or columns, when the location is a single row or column. Requires
     /// `--sheet`, `--start` and `--end` together.
     #[arg(long, value_enum)]
     pub dimension: Option<DimensionArg>,
 
-    /// 1-based row/column index. Must equal `--end` — Sheets rejects a
-    /// developer-metadata span of more than one row/column (issue #1933).
+    /// 1-based row/column. Must equal `--end`: developer metadata attaches
+    /// to a single row or column only.
     #[arg(long, value_name = "N")]
     pub start: Option<i64>,
 
-    /// 1-based row/column index. Must equal `--start` — see its doc comment.
+    /// 1-based row/column. Must equal `--start`: developer metadata attaches
+    /// to a single row or column only.
     #[arg(long, value_name = "N")]
     pub end: Option<i64>,
 
@@ -111,17 +112,18 @@ pub struct DeleteDeveloperMetadataCommand {
     #[arg(long, value_name = "NAME")]
     pub sheet: Option<String>,
 
-    /// Rows or columns, when the location is a row/column span. Requires
+    /// Rows or columns, when the location is a single row or column. Requires
     /// `--sheet`, `--start` and `--end` together.
     #[arg(long, value_enum)]
     pub dimension: Option<DimensionArg>,
 
-    /// 1-based row/column index. Must equal `--end` — Sheets rejects a
-    /// developer-metadata span of more than one row/column (issue #1933).
+    /// 1-based row/column. Must equal `--end`: developer metadata attaches
+    /// to a single row or column only.
     #[arg(long, value_name = "N")]
     pub start: Option<i64>,
 
-    /// 1-based row/column index. Must equal `--start` — see its doc comment.
+    /// 1-based row/column. Must equal `--start`: developer metadata attaches
+    /// to a single row or column only.
     #[arg(long, value_name = "N")]
     pub end: Option<i64>,
 
@@ -194,21 +196,22 @@ pub struct SearchDeveloperMetadataCommand {
     pub key: Option<String>,
 
     /// Title of the sheet, when restricting the search to a sheet or
-    /// dimension span. Omit entirely, along with `--dimension`/`--start`/`--end`,
+    /// a single row/column. Omit entirely, along with `--dimension`/`--start`/`--end`,
     /// to search the whole workbook.
     #[arg(long, value_name = "NAME")]
     pub sheet: Option<String>,
 
-    /// Rows or columns, when restricting the search to a row/column span.
+    /// Rows or columns, when restricting the search to a single row or column.
     #[arg(long, value_enum)]
     pub dimension: Option<DimensionArg>,
 
-    /// 1-based row/column index. Must equal `--end` — Sheets rejects a
-    /// developer-metadata span of more than one row/column (issue #1933).
+    /// 1-based row/column. Must equal `--end`: developer metadata attaches
+    /// to a single row or column only.
     #[arg(long, value_name = "N")]
     pub start: Option<i64>,
 
-    /// 1-based row/column index. Must equal `--start` — see its doc comment.
+    /// 1-based row/column. Must equal `--start`: developer metadata attaches
+    /// to a single row or column only.
     #[arg(long, value_name = "N")]
     pub end: Option<i64>,
 

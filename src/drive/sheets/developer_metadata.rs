@@ -143,7 +143,7 @@ pub struct DeveloperMetadataEntry {
     /// The value stored under `key`.
     pub value: String,
     /// A human-readable rendering of where this entry is attached, e.g.
-    /// `"sheet 'Q1'"` or `"row(s) 2-5 of sheet 'Q1'"`.
+    /// `"sheet 'Q1'"` or `"row 2 of sheet 'Q1'"`.
     pub location: String,
 }
 
@@ -434,12 +434,23 @@ fn describe_location(workbook: &Spreadsheet, location: &DeveloperMetadataLocatio
         return format!("sheet {}", sheet_title_or_id(workbook, sheet_id));
     }
     if let Some(range) = &location.dimension_range {
+        let sheet = sheet_title_or_id(workbook, range.sheet_id);
+        // Sheets only ever accepts a single row/column here (issue #1933),
+        // so that is the shape every entry has; the span form is kept only
+        // as a fallback should the API ever hand back a wider range.
+        if range.end_index == range.start_index + 1 {
+            return format!(
+                "{} {} of sheet {sheet}",
+                range.dimension.noun(),
+                range.end_index
+            );
+        }
         return format!(
             "{}(s) {}-{} of sheet {}",
             range.dimension.noun(),
             range.start_index + 1,
             range.end_index,
-            sheet_title_or_id(workbook, range.sheet_id)
+            sheet
         );
     }
     "an unknown location".to_string()
@@ -2171,7 +2182,7 @@ mod tests {
         };
         let outcome = developer_metadata(&drive, &sheets, &o, &rules).await;
         let text = describe(&outcome);
-        assert!(text.contains("row(s) 2-2 of sheet 'Q1'"), "{text}");
+        assert!(text.contains("row 2 of sheet 'Q1'"), "{text}");
     }
 
     #[tokio::test]
@@ -2317,5 +2328,81 @@ mod tests {
             err.contains("--dimension/--start/--end need --sheet too"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn describe_location_renders_a_single_row_without_a_span() {
+        let workbook = test_workbook();
+        let location = DeveloperMetadataLocation::dimension(DimensionRange {
+            sheet_id: 0,
+            dimension: Dimension::Columns,
+            start_index: 2,
+            end_index: 3,
+        });
+        assert_eq!(
+            describe_location(&workbook, &location),
+            "column 3 of sheet 'Q1'"
+        );
+    }
+
+    #[test]
+    fn describe_location_falls_back_to_a_span_for_a_wider_range() {
+        let workbook = test_workbook();
+        let location = DeveloperMetadataLocation::dimension(DimensionRange {
+            sheet_id: 0,
+            dimension: Dimension::Rows,
+            start_index: 1,
+            end_index: 5,
+        });
+        assert_eq!(
+            describe_location(&workbook, &location),
+            "row(s) 2-5 of sheet 'Q1'"
+        );
+    }
+
+    #[test]
+    fn resolve_location_still_rejects_a_start_below_one() {
+        let workbook = test_workbook();
+        let result = resolve_location(
+            &workbook,
+            Some("Q1"),
+            Some(Dimension::Rows),
+            Some(0),
+            Some(0),
+        )
+        .unwrap_err();
+        match result {
+            DeveloperMetadataResult::RefusedInvalidLocation { detail } => {
+                assert!(detail.contains("--start must be at least 1"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidLocation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_rejects_a_multi_row_span_before_calling_the_api() {
+        // issue #1933: `search-developer-metadata --start 2 --end 7` hit the
+        // same HTTP 400; no mock is mounted, so any API call would fail the
+        // test with a different error.
+        let server = wiremock::MockServer::start().await;
+        let (_drive, sheets) = clients(&server).await;
+        let api = SheetsApi::new(&sheets);
+        let workbook = test_workbook();
+        let err = search(
+            &api,
+            "sheet-1",
+            &workbook,
+            None,
+            SearchLocationFilter {
+                sheet: Some("Q1"),
+                dimension: Some(Dimension::Rows),
+                start: Some(2),
+                end: Some(7),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("single row or column"), "{err}");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }
