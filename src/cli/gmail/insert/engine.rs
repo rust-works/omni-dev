@@ -286,9 +286,10 @@ enum InsertOutcome {
 /// #1951). The scope is fixed by the refresh token, so once one insert gets
 /// it every other insert would too. The first one stops any further insert
 /// from being sent; requests already in flight are drained rather than
-/// dropped, so anything that did land is still ledgered; and the run ends
-/// with that one error, carrying the `gmail auth login --modify` hint,
-/// instead of one bare 403 per message.
+/// dropped, so anything that did land is still ledgered; and that one
+/// error, carrying the `gmail auth login --modify` hint, goes on
+/// `report.stop_error` instead of one bare 403 per message in
+/// `report.errors`.
 #[allow(clippy::too_many_arguments)]
 async fn insert_all(
     client: &GmailClient,
@@ -428,13 +429,13 @@ async fn insert_all(
             let _ = tx.send(InsertProgressEvent::Completed { failed });
         }
     }
-    match scope_error {
-        Some(e) => Err(with_modify_scope_hint(e).context(format!(
+    report.stop_error = scope_error.map(|e| {
+        with_modify_scope_hint(e).context(format!(
             "stopped inserting: Gmail refused {refused} of {total} planned insert(s); \
              {not_attempted} were not attempted"
-        ))),
-        None => Ok(()),
-    }
+        ))
+    });
+    Ok(())
 }
 
 /// Probes the destination mailbox for a message already carrying `key` as
@@ -935,7 +936,7 @@ mod tests {
         let archive_dir = dir.path().join("archive");
         write_n_archived_messages(&archive_dir, 5);
 
-        let err = run_insert(
+        let report = run_insert(
             &client,
             &InsertOptions {
                 concurrency: 1,
@@ -943,10 +944,12 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
         assert_eq!(inserts.received_requests().await.len(), 1);
-        let chain = format!("{err:#}");
+        // The 403 is the run's one error, not a per-message one.
+        assert!(report.errors.is_empty());
+        let chain = format!("{:#}", report.stop_error.unwrap());
         assert!(
             chain.contains("refused 1 of 5 planned insert(s); 4 were not attempted"),
             "{chain}"
@@ -971,7 +974,7 @@ mod tests {
         let archive_dir = dir.path().join("archive");
         write_n_archived_messages(&archive_dir, 12);
 
-        let err = run_insert(
+        let report = run_insert(
             &client,
             &InsertOptions {
                 concurrency: 3,
@@ -979,11 +982,12 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
         let sent = inserts.received_requests().await.len();
         assert!((1..=3).contains(&sent), "sent {sent} inserts");
-        let chain = format!("{err:#}");
+        assert!(report.errors.is_empty());
+        let chain = format!("{:#}", report.stop_error.unwrap());
         assert!(
             chain.contains(&format!(
                 "refused {sent} of 12 planned insert(s); {} were not attempted",
@@ -992,6 +996,40 @@ mod tests {
             "{chain}"
         );
         assert_eq!(chain.matches("gmail auth login --modify").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_scope_stop_keeps_the_runs_other_per_message_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "dest@example.com").await;
+        let _inserts = mount_insert_status(&server, 403, "insufficientPermissions").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_n_archived_messages(&archive_dir, 3);
+        // m1 plans first (every fixture shares one date; ties keep id
+        // order), so its unreadable file fails before any insert is sent.
+        std::fs::remove_file(archive_dir.join("messages/m1.eml")).unwrap();
+
+        let report = run_insert(
+            &client,
+            &InsertOptions {
+                concurrency: 1,
+                ..base_opts(archive_dir)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].id, "m1");
+        assert!(report.errors[0].reason.contains("Failed to read"));
+        let chain = format!("{:#}", report.stop_error.unwrap());
+        assert!(
+            chain.contains("refused 1 of 3 planned insert(s); 1 were not attempted"),
+            "{chain}"
+        );
     }
 
     #[tokio::test]
