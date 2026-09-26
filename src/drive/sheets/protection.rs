@@ -441,14 +441,11 @@ async fn protection_inner(
         }
     };
 
-    let summary = describe_effect(&opts.verb);
-
-    if opts.dry_run {
-        return gated(ProtectionResult::WouldChange { summary });
-    }
-
-    // Only past the dry-run return does building the actual request (in
-    // particular `update-protection`'s editor-list merge) do any work.
+    // Building the actual request — in particular `update-protection`'s
+    // editor-list merge and the resulting warning-only-with-editors check
+    // that depends on it — happens here, before the dry-run return (issue
+    // #1939), so a preview reaches the exact verdict a real run would
+    // rather than silently approving a change the real run then refuses.
     let built = match &opts.verb {
         ProtectionVerb::ProtectRange {
             description,
@@ -510,6 +507,12 @@ async fn protection_inner(
         Ok(built) => built,
         Err(detail) => return gated(ProtectionResult::RefusedInvalidRange { detail }),
     };
+
+    let summary = describe_effect(&opts.verb);
+
+    if opts.dry_run {
+        return gated(ProtectionResult::WouldChange { summary });
+    }
 
     // The lease check (ADR-0080 §9) sits here: after the permission gate
     // and the `--dry-run` branch, before the mutating call — see
@@ -769,11 +772,23 @@ fn describe_effect(verb: &ProtectionVerb) -> String {
             format!("protect ({strictness}{editors})")
         }
         ProtectionVerb::UpdateProtection {
+            description,
+            warning_only,
             add_editors,
             remove_editors,
             ..
         } => {
+            // issue #1939: name every field actually changing, not just the
+            // editor deltas — a caller reading a dry-run preview has no
+            // other way to see that --description/--warning-only took
+            // effect.
             let mut parts = Vec::new();
+            if let Some(description) = description {
+                parts.push(format!("description: {description:?}"));
+            }
+            if let Some(warning_only) = warning_only {
+                parts.push(format!("warning-only: {warning_only}"));
+            }
             if !add_editors.is_empty() {
                 parts.push(format!("+{}", add_editors.join(",")));
             }
@@ -1591,6 +1606,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn describe_effect_update_protection_reports_description_and_warning_only() {
+        // issue #1939: the dry-run/real-run summary must name every field
+        // actually changing, not just editor deltas.
+        let description_only = ProtectionVerb::UpdateProtection {
+            sheet: None,
+            range: None,
+            whole_sheet: false,
+            description: Some("note".to_string()),
+            warning_only: None,
+            add_editors: Vec::new(),
+            remove_editors: Vec::new(),
+        };
+        assert_eq!(
+            describe_effect(&description_only),
+            "update protection (description: \"note\")"
+        );
+
+        let warning_only_change = ProtectionVerb::UpdateProtection {
+            sheet: None,
+            range: None,
+            whole_sheet: false,
+            description: None,
+            warning_only: Some(true),
+            add_editors: Vec::new(),
+            remove_editors: Vec::new(),
+        };
+        assert_eq!(
+            describe_effect(&warning_only_change),
+            "update protection (warning-only: true)"
+        );
+
+        let everything = ProtectionVerb::UpdateProtection {
+            sheet: None,
+            range: None,
+            whole_sheet: false,
+            description: Some("note".to_string()),
+            warning_only: Some(false),
+            add_editors: vec!["a@example.com".to_string()],
+            remove_editors: vec!["b@example.com".to_string()],
+        };
+        assert_eq!(
+            describe_effect(&everything),
+            "update protection (description: \"note\" warning-only: false \
+             +a@example.com -b@example.com)"
+        );
+    }
+
     fn outcome_with(
         verb: ProtectionVerb,
         file_name: Option<&str>,
@@ -2277,6 +2340,61 @@ mod tests {
                 remove_editors: Vec::new(),
             },
             dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            ProtectionResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("warning-only"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_protection_dry_run_refuses_the_same_warning_only_result_a_real_run_would() {
+        // issue #1939's exact repro: --dry-run returned WouldChange for a
+        // combination the real run refused, because the editor-list merge
+        // and its warning-only-with-editors check ran only after the
+        // dry-run return. No batchUpdate mock is mounted, so reaching the
+        // API would fail this test with a different error.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([{
+            "protectedRangeId": 30,
+            "range": {
+                "sheetId": 0,
+                "startRowIndex": 0,
+                "endRowIndex": 5,
+                "startColumnIndex": 0,
+                "endColumnIndex": 1,
+            },
+            "editors": {"users": ["a@example.com"]},
+        }]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::UpdateProtection {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: None,
+                warning_only: Some(true),
+                add_editors: Vec::new(),
+                remove_editors: Vec::new(),
+            },
+            dry_run: true,
             lease_token: None,
             ledger_path: std::path::PathBuf::new(),
         };
