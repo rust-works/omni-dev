@@ -14,12 +14,14 @@
 //! the report and only then decides the process exit code.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::stream::{self, StreamExt as _};
 use tokio::sync::mpsc;
 
+use crate::cli::gmail::helpers::{is_insufficient_scope, with_modify_scope_hint};
 use crate::cli::gmail::selection::Selection;
 use crate::cli::gmail::sync::engine::manifest_path;
 use crate::cli::gmail::sync::manifest::{Manifest, ManifestRecord};
@@ -270,12 +272,23 @@ enum InsertOutcome {
         inserted_thread_id: Option<String>,
     },
     FoundRemote,
+    /// Never sent: an earlier insert got Gmail's scope 403, so this one
+    /// would have too.
+    NotAttempted,
 }
 
 /// The bounded, throttled fan-out over `to_process`, and the single-threaded
 /// drain loop that owns `ledger`/`report` as results arrive. A per-message
 /// failure is pushed to `report.errors` and never aborts the batch —
 /// mirrors `sync::engine`'s fetch loop.
+///
+/// The one exception is Gmail's scope 403 (a `gmail.readonly` account,
+/// #1951). The scope is fixed by the refresh token, so once one insert gets
+/// it every other insert would too. The first one stops any further insert
+/// from being sent; requests already in flight are drained rather than
+/// dropped, so anything that did land is still ledgered; and the run ends
+/// with that one error, carrying the `gmail auth login --modify` hint,
+/// instead of one bare 403 per message.
 #[allow(clippy::too_many_arguments)]
 async fn insert_all(
     client: &GmailClient,
@@ -289,10 +302,16 @@ async fn insert_all(
     report: &mut InsertReport,
     progress: Option<&mpsc::UnboundedSender<InsertProgressEvent>>,
 ) -> Result<()> {
+    let total = to_process.len();
+    let scope_denied = AtomicBool::new(false);
+    let scope_denied = &scope_denied;
     let mut fetches = stream::iter(to_process)
         .map(|(id, relative_path, label_ids, key, rfc822_msgid)| {
             let archive_dir = archive_dir.to_path_buf();
             async move {
+                if scope_denied.load(Ordering::Relaxed) {
+                    return (id, key, label_ids, Ok(InsertOutcome::NotAttempted));
+                }
                 let eml_path = archive_dir.join(&relative_path);
                 let bytes = match std::fs::read(&eml_path) {
                     Ok(bytes) => bytes,
@@ -319,6 +338,11 @@ async fn insert_all(
                 }
 
                 limiter.acquire(MESSAGES_INSERT_COST_UNITS).await;
+                // Checked again after the wait: the 403 may have arrived
+                // while this insert was queued on the limiter.
+                if scope_denied.load(Ordering::Relaxed) {
+                    return (id, key, label_ids, Ok(InsertOutcome::NotAttempted));
+                }
                 let label_refs: Vec<&str> = label_ids.iter().map(String::as_str).collect();
                 let result = MessagesApi::new(client)
                     .insert(&bytes, &label_refs)
@@ -333,6 +357,9 @@ async fn insert_all(
         .buffer_unordered(concurrency);
 
     let mut since_checkpoint = 0usize;
+    let mut scope_error: Option<anyhow::Error> = None;
+    let mut refused = 0usize;
+    let mut not_attempted = 0usize;
     while let Some((id, key, label_ids, result)) = fetches.next().await {
         let mut failed = false;
         match result {
@@ -372,6 +399,18 @@ async fn insert_all(
                     reason: SkipReason::FoundRemote,
                 });
             }
+            Ok(InsertOutcome::NotAttempted) => {
+                failed = true;
+                not_attempted += 1;
+            }
+            Err(e) if is_insufficient_scope(&e) => {
+                failed = true;
+                scope_denied.store(true, Ordering::Relaxed);
+                refused += 1;
+                // Only the first is kept: an in-flight insert that gets the
+                // same 403 afterwards is counted, not reported again.
+                scope_error.get_or_insert(e);
+            }
             Err(e) => {
                 failed = true;
                 report.errors.push(InsertError {
@@ -389,7 +428,13 @@ async fn insert_all(
             let _ = tx.send(InsertProgressEvent::Completed { failed });
         }
     }
-    Ok(())
+    match scope_error {
+        Some(e) => Err(with_modify_scope_hint(e).context(format!(
+            "stopped inserting: Gmail refused {refused} of {total} planned insert(s); \
+             {not_attempted} were not attempted"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Probes the destination mailbox for a message already carrying `key` as
@@ -841,6 +886,141 @@ mod tests {
         let ledger = InsertLedger::load(&ledger_path(&archive_dir)).unwrap();
         assert!(ledger.contains("dest@example.com", "m2@example.com"));
         assert!(!ledger.contains("dest@example.com", "m1@example.com"));
+    }
+
+    // ── read-only account (#1951) ──────────────────────────────────────
+
+    fn write_n_archived_messages(archive_dir: &Path, n: usize) {
+        for i in 1..=n {
+            write_archived_message(
+                archive_dir,
+                &format!("m{i}"),
+                Some(&format!("<m{i}@example.com>")),
+                &["INBOX"],
+                &format!("From: a@example.com\r\nMessage-ID: <m{i}@example.com>\r\n\r\nbody{i}"),
+            );
+        }
+    }
+
+    async fn mount_insert_status(
+        server: &wiremock::MockServer,
+        status: u16,
+        reason: &str,
+    ) -> wiremock::MockGuard {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/upload/gmail/v1/users/me/messages",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(
+                serde_json::json!({
+                    "error": {
+                        "code": status,
+                        "message": "Insufficient Permission",
+                        "errors": [{"reason": reason}],
+                    }
+                }),
+            ))
+            .mount_as_scoped(server)
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_read_only_account_stops_at_the_first_scope_403() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "dest@example.com").await;
+        let inserts = mount_insert_status(&server, 403, "insufficientPermissions").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_n_archived_messages(&archive_dir, 5);
+
+        let err = run_insert(
+            &client,
+            &InsertOptions {
+                concurrency: 1,
+                ..base_opts(archive_dir.clone())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(inserts.received_requests().await.len(), 1);
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("refused 1 of 5 planned insert(s); 4 were not attempted"),
+            "{chain}"
+        );
+        assert!(chain.contains("gmail auth login --modify"), "{chain}");
+        assert!(chain.contains("HTTP 403"), "{chain}");
+        // The hint is given once, not per message.
+        assert_eq!(chain.matches("gmail auth login --modify").count(), 1);
+
+        let ledger = InsertLedger::load(&ledger_path(&archive_dir)).unwrap();
+        assert!(!ledger.contains("dest@example.com", "m1@example.com"));
+    }
+
+    #[tokio::test]
+    async fn a_scope_403_under_concurrency_sends_at_most_one_window_of_inserts() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "dest@example.com").await;
+        let inserts = mount_insert_status(&server, 403, "insufficientPermissions").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_n_archived_messages(&archive_dir, 12);
+
+        let err = run_insert(
+            &client,
+            &InsertOptions {
+                concurrency: 3,
+                ..base_opts(archive_dir)
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let sent = inserts.received_requests().await.len();
+        assert!((1..=3).contains(&sent), "sent {sent} inserts");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(&format!(
+                "refused {sent} of 12 planned insert(s); {} were not attempted",
+                12 - sent
+            )),
+            "{chain}"
+        );
+        assert_eq!(chain.matches("gmail auth login --modify").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_403_with_another_reason_still_runs_the_whole_batch() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_profile(&server, "dest@example.com").await;
+        let inserts = mount_insert_status(&server, 403, "domainPolicy").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_n_archived_messages(&archive_dir, 3);
+
+        let report = run_insert(
+            &client,
+            &InsertOptions {
+                concurrency: 1,
+                ..base_opts(archive_dir)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(inserts.received_requests().await.len(), 3);
+        assert_eq!(report.summary().errors, 3);
+        assert!(report
+            .errors
+            .iter()
+            .all(|e| !e.reason.contains("gmail auth login --modify")));
     }
 
     // ── requested-id validation ────────────────────────────────────────

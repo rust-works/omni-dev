@@ -53,11 +53,7 @@ pub fn print_shadowing_notice() {
 /// with `gmail auth login --modify`. The original error stays in the chain.
 /// Any other error is returned unchanged.
 pub(crate) fn with_modify_scope_hint(err: anyhow::Error) -> anyhow::Error {
-    let insufficient_scope = err.downcast_ref::<GmailError>().is_some_and(|gmail| {
-        matches!(gmail, GmailError::ApiRequestFailed { status: 403, .. })
-            && gmail.reason() == Some("insufficientPermissions")
-    });
-    if insufficient_scope {
+    if is_insufficient_scope(&err) {
         err.context(
             "This Gmail account is authorised read-only, and this command needs the \
              `gmail.modify` scope. Re-run `omni-dev gmail auth login --modify` (adding \
@@ -66,6 +62,16 @@ pub(crate) fn with_modify_scope_hint(err: anyhow::Error) -> anyhow::Error {
     } else {
         err
     }
+}
+
+/// Whether `err` is Gmail's scope 403: `HTTP 403` with reason
+/// `insufficientPermissions`, what a `gmail.readonly` account gets from
+/// every write endpoint. Looks through any `.context()` layers.
+pub(crate) fn is_insufficient_scope(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<GmailError>().is_some_and(|gmail| {
+        matches!(gmail, GmailError::ApiRequestFailed { status: 403, .. })
+            && gmail.reason() == Some("insufficientPermissions")
+    })
 }
 
 /// Whether `label_ids` contains any of `targets` — a plain membership
@@ -190,6 +196,26 @@ mod tests {
             let after = with_modify_scope_hint(err);
             assert_eq!(after.to_string(), before);
             assert!(after.source().is_none());
+        }
+    }
+
+    #[test]
+    fn is_insufficient_scope_matches_only_the_scope_403() {
+        assert!(is_insufficient_scope(&api_error(
+            403,
+            Some("insufficientPermissions")
+        )));
+        // Still recognised under added context.
+        assert!(is_insufficient_scope(
+            &api_error(403, Some("insufficientPermissions")).context("while inserting")
+        ));
+        for err in [
+            api_error(403, Some("rateLimitExceeded")),
+            api_error(403, None),
+            api_error(400, Some("insufficientPermissions")),
+            anyhow::anyhow!("network down"),
+        ] {
+            assert!(!is_insufficient_scope(&err), "{err}");
         }
     }
 
