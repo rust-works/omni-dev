@@ -1609,52 +1609,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_named_range_refuses_as_ambiguous_when_name_matches_two_ranges() {
-        let server = wiremock::MockServer::start().await;
-        let (drive, sheets) = clients(&server).await;
-        mount_file(
-            "sheet-1",
-            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
-            &["folder-1"],
-        )
-        .mount(&server)
-        .await;
-        mount_folder("folder-1").mount(&server).await;
-        mount_workbook(serde_json::json!([
-            {
-                "namedRangeId": "id-1",
-                "name": "AllS1",
-                "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 5,
-                          "startColumnIndex": 0, "endColumnIndex": 1},
+    async fn update_and_delete_named_range_refuse_as_ambiguous_when_name_matches_two_ranges() {
+        let verbs = [
+            NamedRangeVerb::UpdateNamedRange {
+                name: "AllS1".to_string(),
+                new_name: Some("Totals".to_string()),
+                sheet: None,
+                range: None,
+                whole_sheet: false,
             },
-            {
-                "namedRangeId": "id-2",
-                "name": "AllS1",
-                "range": {"sheetId": 0, "startRowIndex": 5, "endRowIndex": 10,
-                          "startColumnIndex": 0, "endColumnIndex": 1},
-            },
-        ]))
-        .mount(&server)
-        .await;
-        let rules = vec![allow_rule("folder-1")];
-        let opts = NamedRangeOptions {
-            spreadsheet_id: "sheet-1".to_string(),
-            verb: NamedRangeVerb::DeleteNamedRange {
+            NamedRangeVerb::DeleteNamedRange {
                 name: "AllS1".to_string(),
             },
-            dry_run: false,
-            lease_token: None,
-            ledger_path: std::path::PathBuf::new(),
-        };
-        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
-        assert!(
-            matches!(
-                outcome.result,
-                NamedRangeResult::RefusedAmbiguousName { .. }
-            ),
-            "{:?}",
-            outcome.result
-        );
+        ];
+        for verb in verbs {
+            let server = wiremock::MockServer::start().await;
+            let (drive, sheets) = clients(&server).await;
+            mount_file(
+                "sheet-1",
+                crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                &["folder-1"],
+            )
+            .mount(&server)
+            .await;
+            mount_folder("folder-1").mount(&server).await;
+            mount_workbook(serde_json::json!([
+                {
+                    "namedRangeId": "id-1",
+                    "name": "AllS1",
+                    "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 5,
+                              "startColumnIndex": 0, "endColumnIndex": 1},
+                },
+                {
+                    "namedRangeId": "id-2",
+                    "name": "AllS1",
+                    "range": {"sheetId": 0, "startRowIndex": 5, "endRowIndex": 10,
+                              "startColumnIndex": 0, "endColumnIndex": 1},
+                },
+            ]))
+            .mount(&server)
+            .await;
+            let rules = vec![allow_rule("folder-1")];
+            let opts = NamedRangeOptions {
+                spreadsheet_id: "sheet-1".to_string(),
+                verb,
+                dry_run: false,
+                lease_token: None,
+                ledger_path: std::path::PathBuf::new(),
+            };
+            // No batchUpdate mock is mounted, so reaching the API would
+            // surface as Failed rather than the refusal asserted here.
+            let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+            assert!(
+                matches!(
+                    outcome.result,
+                    NamedRangeResult::RefusedAmbiguousName { .. }
+                ),
+                "{:?}",
+                outcome.result
+            );
+        }
     }
 
     #[tokio::test]
