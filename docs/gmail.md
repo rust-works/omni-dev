@@ -1254,7 +1254,8 @@ Gmail's default) so the archived `Date:` header — not the moment of
 insertion — sets Gmail's sort order. **Needs `gmail.modify`**
 (`gmail auth login --modify`), the scope `label add`/`remove` and
 `draft create`/`update` already use; a `gmail.readonly`-only account gets a
-403 (see [`insufficientPermissions`](#insufficientpermissions)).
+403 at its first insert, and the run stops there with an error naming the
+fix (see [`insufficientPermissions`](#insufficientpermissions)).
 
 **Selection** — one of `--all`, `--since DATE`/`--until DATE`
 (`YYYY-MM-DD`, inclusive), `--id ID` (repeatable), `--ids-from FILE` (one id
@@ -1483,13 +1484,18 @@ Error: Gmail API request failed: HTTP 403: Insufficient Permission (reason: insu
 `draft create` or `draft update` fails — read commands (`search`, `read`, `thread`,
 `draft list`, `auth status`) all work fine; only mailbox writes 403. Fix is
 `omni-dev gmail auth login --modify` (re-consent with the write scope), not
-a retry. `draft create`, `draft update` and `label add`/`remove` say so themselves (`insert`
-still shows the bare 403):
+a retry. `draft create`, `draft update`, `label add`/`remove` and `insert` say so
+themselves:
 
 ```
 Error: This Gmail account is authorised read-only, and this command needs the `gmail.modify` scope. Re-run `omni-dev gmail auth login --modify` (adding `--account NAME` for a named account) to grant it.
   Caused by: Gmail API request failed: HTTP 403: …
 ```
+
+`insert` stops at the first such 403 instead of trying every message, since
+each one would fail the same way. It reports the error once, saying how many
+inserts Gmail refused and how many were never sent. Inserts already in flight
+when the 403 arrives still finish, so the ledger misses nothing.
 
 ### MCP server cannot see credentials
 

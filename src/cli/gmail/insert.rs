@@ -497,6 +497,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_insert_command_explains_a_read_only_account_once() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/profile"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "emailAddress": "dest@example.com", "messagesTotal": 0, "threadsTotal": 0, "historyId": "1"
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/upload/gmail/v1/users/me/messages",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "code": 403,
+                        "message": "Insufficient Permission",
+                        "errors": [{"reason": "insufficientPermissions"}],
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_archived_message(&archive_dir, "m1");
+
+        let selection = Selection::from_args(&SelectionArgs {
+            all: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let err = run_insert_command(
+            &client,
+            InsertOptions {
+                archive_dir,
+                selection,
+                limit: 0,
+                label: None,
+                drop_label_ids: Vec::new(),
+                concurrency: DEFAULT_INSERT_CONCURRENCY,
+                verify_remote: false,
+                dry_run: false,
+            },
+            true,
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap_err();
+        let chain = format!("{err:#}");
+        assert_eq!(
+            chain.matches("gmail auth login --modify").count(),
+            1,
+            "{chain}"
+        );
+        assert!(!chain.contains("failed to insert"), "{chain}");
+    }
+
+    #[tokio::test]
     async fn run_insert_command_writes_jsonl_report() {
         let server = wiremock::MockServer::start().await;
         let client = client_with_bootstrapped_token(&server).await;
