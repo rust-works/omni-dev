@@ -185,6 +185,18 @@ pub struct FileTargetDecision {
     /// the OR of each contributing parent's own requirement, computed
     /// before its `decided_by` is folded away — see
     /// [`resolve_decision_for_parents`].
+    ///
+    /// Meaningless on its own for an operation that can never take a
+    /// lease in the first place (`Read`/`Create`/`Upload` —
+    /// [`DriveOperation::ever_requires_lease`], issue #1917): this field
+    /// answers only "does a matching rule opt out", never "can this
+    /// operation be asked at all". Every current caller of
+    /// [`resolve_decision_for_file_target`] passes a lease-eligible `op`
+    /// hardcoded at the call site, so this hasn't mattered yet — but
+    /// `drive permissions check`, whose `op` is caller-supplied, applies
+    /// `ever_requires_lease` on top of this field rather than trusting
+    /// it alone. A future caller that also accepts an arbitrary `op`
+    /// must do the same.
     pub requires_lease: bool,
 }
 
