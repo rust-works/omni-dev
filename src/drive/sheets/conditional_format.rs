@@ -27,8 +27,8 @@
 //! rather than shared, since the two surfaces support an overlapping but
 //! different set of condition types: this one drops `ONE_OF_LIST`/
 //! `ONE_OF_RANGE`/`CHECKBOX` (dropdown-only, meaningless for a format
-//! trigger) and adds `CELL_EMPTY`/`CELL_NOT_EMPTY` (meaningful only as a
-//! format trigger). [`GradientRule`](crate::drive::sheets::types::GradientRule)'s
+//! trigger) and adds `BLANK`/`NOT_BLANK` (`--cell-empty`/`--cell-not-empty`,
+//! meaningful only as a format trigger). [`GradientRule`](crate::drive::sheets::types::GradientRule)'s
 //! two endpoints are always anchored `MIN`/`MAX`; Sheets also allows an
 //! endpoint anchored at an explicit `NUMBER`/`PERCENT`/`PERCENTILE` value,
 //! which this crate doesn't build — `docs/drive.md` names both gaps.
@@ -137,8 +137,8 @@ impl FormatCondition {
             Self::DateBefore(_) => "DATE_BEFORE",
             Self::DateOn(_) => "DATE_EQ",
             Self::DateBetween(..) => "DATE_BETWEEN",
-            Self::CellEmpty => "CELL_EMPTY",
-            Self::CellNotEmpty => "CELL_NOT_EMPTY",
+            Self::CellEmpty => "BLANK",
+            Self::CellNotEmpty => "NOT_BLANK",
             Self::CustomFormula(_) => "CUSTOM_FORMULA",
         }
     }
@@ -274,14 +274,19 @@ impl GradientSpec {
                         .map_err(|e| format!("--gradient-mid-color: {e}"))?,
                 },
                 point_type: mid.point_type.as_sheets_str().to_string(),
-                value: mid.value,
+                value: Some(mid.value),
             }),
             None => None,
         };
+        let endpoint = |rgb_color, point_type: &str| InterpolationPoint {
+            color_style: ColorStyle { rgb_color },
+            point_type: point_type.to_string(),
+            value: None,
+        };
         Ok(GradientRule {
-            min_color_style: ColorStyle { rgb_color: min },
+            minpoint: Some(endpoint(min, "MIN")),
             midpoint,
-            max_color_style: ColorStyle { rgb_color: max },
+            maxpoint: Some(endpoint(max, "MAX")),
         })
     }
 }
@@ -970,13 +975,26 @@ pub(crate) fn describe_existing_rule(rule: &ConditionalFormatRule) -> String {
         };
         format!("boolean rule ({cond} -> {effect})")
     } else if let Some(gradient_rule) = &rule.gradient_rule {
-        let mid = gradient_rule
-            .midpoint
-            .as_ref()
-            .map_or_else(String::new, |m| {
-                format!(", mid {} at {}", m.point_type.to_ascii_lowercase(), m.value)
+        // The midpoint always has an anchor worth naming; an endpoint only
+        // when it isn't this crate's own `MIN`/`MAX` (a Sheets UI rule can
+        // anchor it at a value).
+        let mut anchors = String::new();
+        for (name, point, builtin) in [
+            ("min", &gradient_rule.minpoint, Some("MIN")),
+            ("mid", &gradient_rule.midpoint, None),
+            ("max", &gradient_rule.maxpoint, Some("MAX")),
+        ] {
+            let Some(point) = point else { continue };
+            if builtin.is_some_and(|t| point.point_type == t && point.value.is_none()) {
+                continue;
+            }
+            let point_type = point.point_type.to_ascii_lowercase();
+            anchors.push_str(&match &point.value {
+                Some(value) => format!(", {name} {point_type} at {value}"),
+                None => format!(", {name} {point_type}"),
             });
-        format!("gradient rule (min/max colors{mid})")
+        }
+        format!("gradient rule (min/max colors{anchors})")
     } else {
         "rule (unrecognized type)".to_string()
     }
@@ -1162,11 +1180,93 @@ mod tests {
     #[test]
     fn cell_empty_and_cell_not_empty_have_no_values() {
         let built = FormatCondition::CellEmpty.into_boolean_condition();
-        assert_eq!(built.condition_type, "CELL_EMPTY");
+        assert_eq!(built.condition_type, "BLANK");
         assert!(built.values.is_empty());
         let built = FormatCondition::CellNotEmpty.into_boolean_condition();
-        assert_eq!(built.condition_type, "CELL_NOT_EMPTY");
+        assert_eq!(built.condition_type, "NOT_BLANK");
         assert!(built.values.is_empty());
+    }
+
+    /// Serialises `rule` as the `addConditionalFormatRule` request the
+    /// engine sends, so a test can pin the exact wire body.
+    fn add_request_json(rule: FormatRule) -> serde_json::Value {
+        let rule = rule
+            .into_conditional_format_rule(vec![GridRange::default()])
+            .unwrap();
+        serde_json::to_value(BatchUpdateRequestItem::AddConditionalFormatRule(
+            AddConditionalFormatRuleRequest { rule, index: 0 },
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn cell_empty_and_cell_not_empty_send_the_sheets_blank_condition_types() {
+        // Issue #1943: `CELL_EMPTY`/`CELL_NOT_EMPTY` aren't `ConditionType`
+        // values, and Sheets rejected them with a 400.
+        for (condition, expected) in [
+            (FormatCondition::CellEmpty, "BLANK"),
+            (FormatCondition::CellNotEmpty, "NOT_BLANK"),
+        ] {
+            let body = add_request_json(FormatRule::Boolean {
+                condition,
+                format: FormatEffect {
+                    background: Some("#CCCCCC".to_string()),
+                    ..FormatEffect::default()
+                },
+            });
+            assert_eq!(
+                body["addConditionalFormatRule"]["rule"]["booleanRule"]["condition"],
+                serde_json::json!({"type": expected}),
+            );
+        }
+    }
+
+    #[test]
+    fn a_two_point_gradient_serialises_as_min_and_max_interpolation_points() {
+        // Issue #1944: the body used to carry invented
+        // `minColorStyle`/`maxColorStyle` fields, which Sheets rejected.
+        let body = add_request_json(FormatRule::Gradient(GradientSpec {
+            min_color: "#FFFFFF".to_string(),
+            max_color: "#00FF00".to_string(),
+            mid: None,
+        }));
+        assert_eq!(
+            body["addConditionalFormatRule"]["rule"]["gradientRule"],
+            serde_json::json!({
+                "minpoint": {
+                    "colorStyle": {"rgbColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
+                    "type": "MIN",
+                },
+                "maxpoint": {
+                    "colorStyle": {"rgbColor": {"red": 0.0, "green": 1.0, "blue": 0.0}},
+                    "type": "MAX",
+                },
+            }),
+        );
+    }
+
+    #[test]
+    fn a_three_point_gradient_serialises_its_midpoint_with_a_value() {
+        let body = add_request_json(FormatRule::Gradient(GradientSpec {
+            min_color: "#FFFFFF".to_string(),
+            max_color: "#00FF00".to_string(),
+            mid: Some(GradientMidpoint {
+                color: "#FF0000".to_string(),
+                point_type: GradientPointType::Percent,
+                value: "50".to_string(),
+            }),
+        }));
+        let gradient = &body["addConditionalFormatRule"]["rule"]["gradientRule"];
+        assert_eq!(
+            gradient["midpoint"],
+            serde_json::json!({
+                "colorStyle": {"rgbColor": {"red": 1.0, "green": 0.0, "blue": 0.0}},
+                "type": "PERCENT",
+                "value": "50",
+            }),
+        );
+        assert_eq!(gradient["minpoint"]["type"], "MIN");
+        assert_eq!(gradient["maxpoint"]["type"], "MAX");
     }
 
     #[test]
@@ -1280,17 +1380,23 @@ mod tests {
             let built = spec.into_gradient_rule().unwrap();
             let midpoint = built.midpoint.expect("midpoint should be set");
             assert_eq!(midpoint.point_type, expected, "{expected}");
-            assert_eq!(midpoint.value, "50");
+            assert_eq!(midpoint.value.as_deref(), Some("50"));
             assert_eq!(
                 midpoint.color_style.rgb_color,
                 parse_hex_color("#FF00FF").unwrap()
             );
+            let min = built.minpoint.expect("minpoint should be set");
+            assert_eq!(min.point_type, "MIN");
+            assert_eq!(min.value, None);
             assert_eq!(
-                built.min_color_style.rgb_color,
+                min.color_style.rgb_color,
                 parse_hex_color("#FFFFFF").unwrap()
             );
+            let max = built.maxpoint.expect("maxpoint should be set");
+            assert_eq!(max.point_type, "MAX");
+            assert_eq!(max.value, None);
             assert_eq!(
-                built.max_color_style.rgb_color,
+                max.color_style.rgb_color,
                 parse_hex_color("#000000").unwrap()
             );
         }
@@ -1711,7 +1817,7 @@ mod tests {
             ranges: vec![GridRange::default()],
             boolean_rule: Some(BooleanRule {
                 condition: BooleanCondition {
-                    condition_type: "CELL_EMPTY".to_string(),
+                    condition_type: "BLANK".to_string(),
                     values: Vec::new(),
                 },
                 format: CellFormat {
@@ -1743,23 +1849,42 @@ mod tests {
             ranges: vec![GridRange::default()],
             boolean_rule: None,
             gradient_rule: Some(GradientRule {
-                min_color_style: ColorStyle {
-                    rgb_color: parse_hex_color("#FFFFFF").unwrap(),
-                },
-                midpoint: Some(InterpolationPoint {
-                    color_style: ColorStyle {
-                        rgb_color: parse_hex_color("#888888").unwrap(),
-                    },
-                    point_type: "PERCENT".to_string(),
-                    value: "50".to_string(),
-                }),
-                max_color_style: ColorStyle {
-                    rgb_color: parse_hex_color("#000000").unwrap(),
-                },
+                minpoint: Some(point("MIN", None)),
+                midpoint: Some(point("PERCENT", Some("50"))),
+                maxpoint: Some(point("MAX", None)),
             }),
         };
-        let described = describe_existing_rule(&rule);
-        assert!(described.contains("mid percent at 50"), "{described}");
+        assert_eq!(
+            describe_existing_rule(&rule),
+            "gradient rule (min/max colors, mid percent at 50)"
+        );
+    }
+
+    fn point(point_type: &str, value: Option<&str>) -> InterpolationPoint {
+        InterpolationPoint {
+            color_style: ColorStyle::default(),
+            point_type: point_type.to_string(),
+            value: value.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn describe_existing_rule_names_a_value_anchored_endpoint() {
+        // A Sheets UI rule can anchor an endpoint at a value, which this
+        // crate never builds; don't describe it as a plain min/max scale.
+        let rule = ConditionalFormatRule {
+            ranges: vec![GridRange::default()],
+            boolean_rule: None,
+            gradient_rule: Some(GradientRule {
+                minpoint: Some(point("NUMBER", Some("10"))),
+                midpoint: None,
+                maxpoint: Some(point("PERCENTILE", Some("90"))),
+            }),
+        };
+        assert_eq!(
+            describe_existing_rule(&rule),
+            "gradient rule (min/max colors, min number at 10, max percentile at 90)"
+        );
     }
 
     #[test]
@@ -2277,15 +2402,15 @@ mod tests {
                                 {
                                     "ranges": [{"sheetId": 0, "startRowIndex": 0, "endRowIndex": 1}],
                                     "booleanRule": {
-                                        "condition": {"type": "CELL_EMPTY", "values": []},
+                                        "condition": {"type": "BLANK", "values": []},
                                         "format": {"backgroundColorStyle": {"rgbColor": {"red": 1.0, "green": 0.0, "blue": 0.0}}},
                                     },
                                 },
                                 {
                                     "ranges": [{"sheetId": 0, "startRowIndex": 1, "endRowIndex": 2}],
                                     "gradientRule": {
-                                        "minColorStyle": {"rgbColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
-                                        "maxColorStyle": {"rgbColor": {"red": 0.0, "green": 1.0, "blue": 0.0}},
+                                        "minpoint": {"colorStyle": {"rgbColor": {"red": 1.0, "green": 1.0, "blue": 1.0}}, "type": "MIN"},
+                                        "maxpoint": {"colorStyle": {"rgbColor": {"red": 0.0, "green": 1.0, "blue": 0.0}}, "type": "MAX"},
                                     },
                                 },
                             ],
@@ -2592,7 +2717,7 @@ mod tests {
         match outcome.result {
             ConditionalFormatResult::WouldChange { summary } => {
                 assert!(
-                    summary.contains("currently: boolean rule (cell empty"),
+                    summary.contains("currently: boolean rule (blank"),
                     "{summary}"
                 );
                 assert!(summary.contains("number greater"), "{summary}");

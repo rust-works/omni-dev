@@ -2740,8 +2740,9 @@ Unlike `set-data-validation`, `--sheet` is required on `add`/`update` (a
 rule's ranges must all share one sheet). The condition set is curated the
 same way `set-data-validation`'s is, cut to a different boundary: dropdown
 types (`ONE_OF_LIST`/`ONE_OF_RANGE`/`CHECKBOX`) don't apply to a format
-trigger, so they're absent here; `--cell-empty`/`--cell-not-empty` are
-present instead, since they're meaningful only as a format trigger. Still
+trigger, so they're absent here; `--cell-empty`/`--cell-not-empty` (Sheets'
+`BLANK`/`NOT_BLANK`) are present instead, since they're meaningful only as
+a format trigger. Still
 not reachable, the same documented cut `set-data-validation` names:
 `TEXT_IS_EMAIL`, `TEXT_IS_URL`, `DATE_ON_OR_BEFORE`, `DATE_ON_OR_AFTER`,
 `DATE_NOT_BETWEEN`, `DATE_IS_VALID`. `GradientRule`'s two endpoints are

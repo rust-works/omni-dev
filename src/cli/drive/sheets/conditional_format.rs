@@ -934,15 +934,15 @@ mod tests {
                                 {
                                     "ranges": [{"sheetId": 0, "startRowIndex": 0, "endRowIndex": 1}],
                                     "booleanRule": {
-                                        "condition": {"type": "CELL_EMPTY", "values": []},
+                                        "condition": {"type": "BLANK", "values": []},
                                         "format": {"backgroundColorStyle": {"rgbColor": {"red": 1.0, "green": 0.0, "blue": 0.0}}},
                                     },
                                 },
                                 {
                                     "ranges": [{"sheetId": 0, "startRowIndex": 1, "endRowIndex": 2}],
                                     "gradientRule": {
-                                        "minColorStyle": {"rgbColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
-                                        "maxColorStyle": {"rgbColor": {"red": 0.0, "green": 1.0, "blue": 0.0}},
+                                        "minpoint": {"colorStyle": {"rgbColor": {"red": 1.0, "green": 1.0, "blue": 1.0}}, "type": "MIN"},
+                                        "maxpoint": {"colorStyle": {"rgbColor": {"red": 0.0, "green": 1.0, "blue": 0.0}}, "type": "MAX"},
                                     },
                                 },
                             ],
