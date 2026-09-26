@@ -197,6 +197,7 @@ impl GmailSubcommands {
 mod tests {
     use super::*;
     use crate::cli::gmail::format::OutputFormat;
+    use crate::cli::gmail::selection::SelectionArgs;
     use crate::gmail::auth::{GmailCredentials, GmailScope};
     use crate::gmail::client::GmailClient;
     use crate::utils::secret::Secret;
@@ -679,7 +680,7 @@ mod tests {
             command: GmailSubcommands::Render(render::RenderCommand {
                 paths: vec![path],
                 archive_dir: None,
-                all: false,
+                selection: SelectionArgs::default(),
                 out_dir: None,
                 output: OutputFormat::Table,
                 fold_quotes: false,
@@ -702,7 +703,10 @@ mod tests {
             command: GmailSubcommands::Render(render::RenderCommand {
                 paths: Vec::new(),
                 archive_dir: Some(archive_dir.path().to_path_buf()),
-                all: true,
+                selection: SelectionArgs {
+                    all: true,
+                    ..SelectionArgs::default()
+                },
                 out_dir: None,
                 output: OutputFormat::Table,
                 fold_quotes: false,
@@ -727,7 +731,7 @@ mod tests {
             command: GmailSubcommands::Render(render::RenderCommand {
                 paths: vec![path],
                 archive_dir: None,
-                all: false,
+                selection: SelectionArgs::default(),
                 out_dir: None,
                 output: OutputFormat::Table,
                 fold_quotes: false,

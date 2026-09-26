@@ -1172,6 +1172,7 @@ $ omni-dev gmail render message.eml --out-dir rendered/
 $ omni-dev gmail render *.eml -o json
 $ omni-dev gmail render message.eml --fold-quotes
 $ omni-dev gmail render --archive-dir archive/ --all --out-dir rendered/
+$ omni-dev gmail render --archive-dir archive/ --since 2026-01-01 --until 2026-01-31 --out-dir rendered/
 ```
 
 Renders one or more `.eml` files as human-readable Markdown: a header
@@ -1189,12 +1190,13 @@ piped a glob from a `gmail sync` archive
 anywhere. The same rendering function backs `gmail read -o markdown`; see
 [Messages](#messages).
 
-**`--archive-dir PATH --all`** is the alternative for rendering an entire
-synced archive: it reads `PATH`'s `manifest.jsonl` and renders every
-non-deleted message, in place of gathering paths yourself. `--all` is
-required alongside `--archive-dir` (rather than `--archive-dir` alone
-implying it), reserving room for a future non-`--all` selector; the two
-are mutually exclusive with positional `PATH` arguments. Paired with
+**`--archive-dir PATH`** is the alternative for rendering an entire (or
+selected part of a) synced archive: it reads `PATH`'s `manifest.jsonl` and
+renders every matching non-deleted message, in place of gathering paths
+yourself. It shares [`gmail insert`](#insert)'s **Selection** — one of
+`--all`, `--since DATE`/`--until DATE` (`YYYY-MM-DD`, inclusive), `--id ID`
+(repeatable), `--ids-from FILE`, or `--source-label LABEL_ID` — and is
+mutually exclusive with positional `PATH` arguments. Paired with
 `--out-dir`, a message whose `.md` file already exists there is silently
 skipped, mirroring [`extract-attachments`](#extract-attachments)'s own
 presence-on-disk idempotence for `attachments/` dirs — so re-running

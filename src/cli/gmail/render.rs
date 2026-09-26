@@ -6,12 +6,15 @@
 //! message id, so it works on any `.eml` file — piped a glob from a `gmail
 //! sync` archive (`messages/<y>/<m>/<d>/*.eml`) or any other source — with
 //! no dependency on this tool having synced the mailbox at all.
-//! `--archive-dir PATH --all` is the opt-in alternative for the common
-//! "render everything I've synced" case (#1515): it reads `manifest.jsonl`
-//! and resolves the same paths a caller's own glob would have, but skips
-//! soft-deleted messages and (with `--out-dir`) messages already rendered by
-//! a prior run, mirroring `gmail extract-attachments --archive-dir`'s
-//! presence-on-disk idempotence (#1510). The actual rendering lives in
+//! `--archive-dir PATH` is the opt-in alternative for the common "render
+//! everything I've synced" case (#1515): it reads `manifest.jsonl` and
+//! resolves the same paths a caller's own glob would have, filtered by the
+//! same [`crate::cli::gmail::selection::Selection`] `gmail insert` uses
+//! (`--all`/`--since`/`--until`/`--id`/`--ids-from`/`--source-label`, #1656)
+//! — skipping soft-deleted messages regardless — and (with `--out-dir`)
+//! messages already rendered by a prior run, mirroring `gmail
+//! extract-attachments --archive-dir`'s presence-on-disk idempotence
+//! (#1510). The actual rendering lives in
 //! [`crate::gmail::render::render_markdown`], shared with `gmail read -o
 //! markdown` (`src/cli/gmail/read.rs`) so "MIME bytes -> readable Markdown"
 //! logic is written once regardless of whether the bytes came from disk or a
@@ -26,6 +29,7 @@ use clap::{ArgGroup, Parser};
 use serde::Serialize;
 
 use crate::cli::gmail::format::{output_as, OutputFormat};
+use crate::cli::gmail::selection::{Selection, SelectionArgs};
 use crate::cli::gmail::sync::engine::manifest_path;
 use crate::cli::gmail::sync::manifest::Manifest;
 use crate::gmail::render::render_markdown;
@@ -44,23 +48,23 @@ pub struct RenderCommand {
     pub paths: Vec<PathBuf>,
 
     /// Archive directory previously populated by `gmail sync`/`sync-all`.
-    /// Renders every non-deleted message from its `manifest.jsonl`.
-    /// Mutually exclusive with positional `PATH` arguments; requires
-    /// `--all`.
-    #[arg(long, value_name = "PATH", group = "render_source", requires = "all")]
+    /// Renders every non-deleted message from its `manifest.jsonl` selected
+    /// by `--all`/`--since`/`--until`/`--id`/`--ids-from`/`--source-label`
+    /// (see `selection`). Mutually exclusive with positional `PATH`
+    /// arguments.
+    #[arg(long, value_name = "PATH", group = "render_source")]
     pub archive_dir: Option<PathBuf>,
 
-    /// Confirms whole-archive rendering with `--archive-dir`. Requires
-    /// `--archive-dir`. A separate flag (rather than `--archive-dir` alone
-    /// implying it) reserves room for a future non-`--all` selector, e.g.
-    /// by message id.
-    #[arg(long, requires = "archive_dir")]
-    pub all: bool,
+    /// Selects which archived messages `--archive-dir` renders. At least
+    /// one selector is required with `--archive-dir`; meaningless (and
+    /// rejected) without it.
+    #[command(flatten)]
+    pub selection: SelectionArgs,
 
     /// Writes one `.md` file per input (named after the input's stem) into
     /// this directory instead of printing Markdown to stdout. With
-    /// `--archive-dir --all`, also makes a message already rendered by a
-    /// prior run into this directory skipped on this run.
+    /// `--archive-dir`, also makes a message already rendered by a prior
+    /// run into this directory skipped on this run.
     #[arg(long = "out-dir", value_name = "DIR")]
     pub out_dir: Option<PathBuf>,
 
@@ -84,8 +88,15 @@ impl RenderCommand {
     /// Purely local and synchronous — no client, no `.await` anywhere in
     /// this command, mirroring `ExtractAttachmentsCommand::execute`.
     pub fn execute(self) -> Result<()> {
+        anyhow::ensure!(
+            self.archive_dir.is_some() || !self.selection.any_given(),
+            "--all/--since/--until/--id/--ids-from/--source-label require --archive-dir \
+             (bare file paths have no manifest to filter)"
+        );
         let paths = match &self.archive_dir {
-            Some(archive_dir) => resolve_archive_paths(archive_dir, self.out_dir.as_deref())?,
+            Some(archive_dir) => {
+                resolve_archive_paths(archive_dir, &self.selection, self.out_dir.as_deref())?
+            }
             None => self.paths,
         };
         run_render_command(
@@ -97,20 +108,31 @@ impl RenderCommand {
     }
 }
 
-/// Resolves every non-deleted manifest record under `archive_dir` to its
-/// archived `.eml` path, for `--archive-dir --all`. Skips a record whose
-/// rendered `.md` already exists under `out_dir` — the same
-/// presence-on-disk idempotence `gmail extract-attachments` relies on for
-/// `attachments/` dirs (#1510), silently, matching its "already extracted"
-/// skip — so a large archive can be re-rendered incrementally without
-/// redoing work. No skip is applied when `out_dir` is `None`: stdout has
-/// nothing durable to check a re-run against. Reuses [`md_filename`] so this
-/// skip check's notion of "already rendered" can never drift from where
-/// [`render_one`] actually writes the file.
-fn resolve_archive_paths(archive_dir: &Path, out_dir: Option<&Path>) -> Result<Vec<PathBuf>> {
+/// Resolves every manifest record under `archive_dir` matched by `selection`
+/// to its archived `.eml` path, for `--archive-dir`. An explicitly named id
+/// (`--id`/`--ids-from`) that isn't selectable (absent, or soft-deleted) is
+/// an error — see [`Selection::ensure_requested_ids_selectable`], shared
+/// with `gmail insert`'s own check. Skips a record whose rendered `.md` already
+/// exists under `out_dir` — the same presence-on-disk idempotence `gmail
+/// extract-attachments` relies on for `attachments/` dirs (#1510), silently,
+/// matching its "already extracted" skip — so a large archive can be
+/// re-rendered incrementally without redoing work. No skip is applied when
+/// `out_dir` is `None`: stdout has nothing durable to check a re-run
+/// against. Reuses [`md_filename`] so this skip check's notion of "already
+/// rendered" can never drift from where [`render_one`] actually writes the
+/// file.
+fn resolve_archive_paths(
+    archive_dir: &Path,
+    selection: &SelectionArgs,
+    out_dir: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
+    let selection = Selection::from_args(selection)?;
     let manifest = Manifest::load(&manifest_path(archive_dir))?;
+    selection.ensure_requested_ids_selectable(&manifest, archive_dir)?;
+
     Ok(manifest
         .records_not_deleted()
+        .filter(|record| selection.matches(record))
         .map(|record| archive_dir.join(&record.path))
         .filter(|eml_path| match out_dir {
             Some(dir) => !dir.join(md_filename(eml_path)).exists(),
@@ -531,13 +553,20 @@ mod tests {
         manifest.save(&manifest_file).unwrap();
     }
 
+    fn all_selection() -> SelectionArgs {
+        SelectionArgs {
+            all: true,
+            ..SelectionArgs::default()
+        }
+    }
+
     #[test]
     fn resolve_archive_paths_resolves_non_deleted_records() {
         let dir = tempfile::tempdir().unwrap();
         let archive_dir = dir.path().join("archive");
         write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, false);
 
-        let resolved = resolve_archive_paths(&archive_dir, None).unwrap();
+        let resolved = resolve_archive_paths(&archive_dir, &all_selection(), None).unwrap();
         assert_eq!(resolved, vec![archive_dir.join("messages/m1.eml")]);
     }
 
@@ -548,7 +577,7 @@ mod tests {
         write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, false);
         write_manifest_record(&archive_dir, "m2", "messages/m2.eml", PLAIN_MESSAGE, true);
 
-        let resolved = resolve_archive_paths(&archive_dir, None).unwrap();
+        let resolved = resolve_archive_paths(&archive_dir, &all_selection(), None).unwrap();
         assert_eq!(resolved, vec![archive_dir.join("messages/m1.eml")]);
     }
 
@@ -561,7 +590,8 @@ mod tests {
         fs::create_dir_all(&out_dir).unwrap();
         fs::write(out_dir.join("m1.md"), "already rendered").unwrap();
 
-        let resolved = resolve_archive_paths(&archive_dir, Some(&out_dir)).unwrap();
+        let resolved =
+            resolve_archive_paths(&archive_dir, &all_selection(), Some(&out_dir)).unwrap();
         assert!(resolved.is_empty());
     }
 
@@ -573,7 +603,7 @@ mod tests {
 
         // No out_dir given, so there is nothing durable to skip against,
         // even though a same-named file happens to exist elsewhere.
-        let resolved = resolve_archive_paths(&archive_dir, None).unwrap();
+        let resolved = resolve_archive_paths(&archive_dir, &all_selection(), None).unwrap();
         assert_eq!(resolved.len(), 1);
     }
 
@@ -582,8 +612,81 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive_dir = dir.path().join("does-not-exist");
 
-        let resolved = resolve_archive_paths(&archive_dir, None).unwrap();
+        let resolved = resolve_archive_paths(&archive_dir, &all_selection(), None).unwrap();
         assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn resolve_archive_paths_filters_by_source_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, false);
+        write_manifest_record(&archive_dir, "m2", "messages/m2.eml", PLAIN_MESSAGE, false);
+        let mut manifest = Manifest::load(&manifest_path(&archive_dir)).unwrap();
+        manifest.add_labels("m1", &["Label_1".to_string()]);
+        manifest.save(&manifest_path(&archive_dir)).unwrap();
+
+        let selection = SelectionArgs {
+            source_label: Some("Label_1".to_string()),
+            ..SelectionArgs::default()
+        };
+        let resolved = resolve_archive_paths(&archive_dir, &selection, None).unwrap();
+        assert_eq!(resolved, vec![archive_dir.join("messages/m1.eml")]);
+    }
+
+    #[test]
+    fn resolve_archive_paths_filters_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, false);
+        write_manifest_record(&archive_dir, "m2", "messages/m2.eml", PLAIN_MESSAGE, false);
+
+        let selection = SelectionArgs {
+            ids: vec!["m2".to_string()],
+            ..SelectionArgs::default()
+        };
+        let resolved = resolve_archive_paths(&archive_dir, &selection, None).unwrap();
+        assert_eq!(resolved, vec![archive_dir.join("messages/m2.eml")]);
+    }
+
+    #[test]
+    fn resolve_archive_paths_errors_on_an_unknown_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, false);
+
+        let selection = SelectionArgs {
+            ids: vec!["missing".to_string()],
+            ..SelectionArgs::default()
+        };
+        let err = resolve_archive_paths(&archive_dir, &selection, None).unwrap_err();
+        assert!(err.to_string().contains("--id missing was not found"));
+    }
+
+    #[test]
+    fn resolve_archive_paths_errors_on_a_soft_deleted_id_rather_than_rendering_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, true);
+
+        let selection = SelectionArgs {
+            ids: vec!["m1".to_string()],
+            ..SelectionArgs::default()
+        };
+        let err = resolve_archive_paths(&archive_dir, &selection, None).unwrap_err();
+        assert!(err.to_string().contains("--id m1 was not found"));
+    }
+
+    #[test]
+    fn resolve_archive_paths_without_a_selector_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, false);
+
+        let err = resolve_archive_paths(&archive_dir, &SelectionArgs::default(), None).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("at least one selector is required"));
     }
 
     #[test]
@@ -596,7 +699,7 @@ mod tests {
         let cmd = RenderCommand {
             paths: Vec::new(),
             archive_dir: Some(archive_dir.clone()),
-            all: true,
+            selection: all_selection(),
             out_dir: Some(out_dir.clone()),
             output: OutputFormat::Table,
             fold_quotes: false,
@@ -612,7 +715,7 @@ mod tests {
         let cmd = RenderCommand {
             paths: Vec::new(),
             archive_dir: Some(archive_dir),
-            all: true,
+            selection: all_selection(),
             out_dir: Some(out_dir),
             output: OutputFormat::Table,
             fold_quotes: false,
@@ -625,10 +728,53 @@ mod tests {
     }
 
     #[test]
-    fn archive_dir_without_all_fails_to_parse() {
-        assert!(
-            RenderCommand::try_parse_from(["render", "--archive-dir", "/tmp/archive"]).is_err()
-        );
+    fn execute_archive_dir_without_a_selector_fails_at_execute_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        write_manifest_record(&archive_dir, "m1", "messages/m1.eml", PLAIN_MESSAGE, false);
+
+        let cmd = RenderCommand::try_parse_from([
+            "render",
+            "--archive-dir",
+            archive_dir.to_str().unwrap(),
+        ])
+        .unwrap();
+        let err = cmd.execute().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("at least one selector is required"));
+    }
+
+    #[test]
+    fn execute_rejects_a_selector_flag_used_without_archive_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_eml(dir.path(), "m1.eml", PLAIN_MESSAGE);
+
+        let cmd = RenderCommand::try_parse_from([
+            "render",
+            path.to_str().unwrap(),
+            "--since",
+            "2026-01-01",
+        ])
+        .unwrap();
+        let err = cmd.execute().unwrap_err();
+        assert!(err.to_string().contains("require --archive-dir"));
+    }
+
+    #[test]
+    fn since_and_until_flags_still_parse_with_archive_dir() {
+        let cmd = RenderCommand::try_parse_from([
+            "render",
+            "--archive-dir",
+            "/tmp/archive",
+            "--since",
+            "2026-01-01",
+            "--until",
+            "2026-01-31",
+        ])
+        .unwrap();
+        assert_eq!(cmd.selection.since, Some("2026-01-01".to_string()));
+        assert_eq!(cmd.selection.until, Some("2026-01-31".to_string()));
     }
 
     #[test]
@@ -661,6 +807,6 @@ mod tests {
             vec![PathBuf::from("m1.eml"), PathBuf::from("m2.eml")]
         );
         assert!(cmd.archive_dir.is_none());
-        assert!(!cmd.all);
+        assert!(!cmd.selection.any_given());
     }
 }

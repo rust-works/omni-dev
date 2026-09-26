@@ -1,36 +1,35 @@
-//! Shared message selection over `manifest.jsonl` for `gmail insert`.
-//!
-//! `gmail render`'s only selector is `--archive-dir --all` (see
-//! [`crate::cli::gmail::render`]) — there is no date/query/id filtering
-//! anywhere else in `src/cli/gmail/**`, despite issue #1655 assuming `render`
-//! already had one to reuse. This is deliberately **not** Gmail's search
-//! query syntax: it filters records already captured locally in
-//! `manifest.jsonl`, with no server round-trip, so it only needs a handful
-//! of independent predicates rather than a query-language parser. Factored
-//! out as its own module (rather than inlined into `insert.rs`) so `render`
-//! can adopt it later — a follow-up, not part of this change.
+//! Shared message selection over `manifest.jsonl` for `gmail insert` and
+//! `gmail render --archive-dir` (see [`crate::cli::gmail::render`], #1656).
+//! This is deliberately **not** Gmail's search query syntax: it filters
+//! records already captured locally in `manifest.jsonl`, with no server
+//! round-trip, so it only needs a handful of independent predicates rather
+//! than a query-language parser. Factored out as its own module (rather
+//! than inlined into `insert.rs`) precisely so a second caller could adopt
+//! it without duplicating the flags or the validation.
 
 use std::collections::HashSet;
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use clap::Args;
 
-use crate::cli::gmail::sync::manifest::ManifestRecord;
+use crate::cli::gmail::sync::manifest::{Manifest, ManifestRecord};
 
-/// CLI flags selecting which archived messages `gmail insert` acts on.
+/// CLI flags selecting which archived messages `gmail insert` acts on, and
+/// (with `--archive-dir`) which ones `gmail render` renders.
 ///
-/// Flattened into [`crate::cli::gmail::insert::InsertCommand`] via
-/// `#[command(flatten)]`. At least one of `all`/`since`/`until`/`id`/
-/// `ids_from`/`source_label` is required — enforced in
-/// [`Selection::from_args`], not via a `clap::ArgGroup`, since `--id` is a
-/// repeatable `Vec` whose "was this flag given at all" state clap groups
-/// don't distinguish cleanly from "given with zero values". `--all` combined
-/// with any other selector is also rejected there: it means "everything",
-/// so pairing it with a narrowing filter is a contradiction worth failing
-/// loudly on rather than silently picking a interpretation.
+/// Flattened into [`crate::cli::gmail::insert::InsertCommand`] and
+/// [`crate::cli::gmail::render::RenderCommand`] via `#[command(flatten)]`.
+/// At least one of `all`/`since`/`until`/`id`/`ids_from`/`source_label` is
+/// required — enforced in [`Selection::from_args`], not via a
+/// `clap::ArgGroup`, since `--id` is a repeatable `Vec` whose "was this flag
+/// given at all" state clap groups don't distinguish cleanly from "given
+/// with zero values". `--all` combined with any other selector is also
+/// rejected there: it means "everything", so pairing it with a narrowing
+/// filter is a contradiction worth failing loudly on rather than silently
+/// picking a interpretation.
 #[derive(Args, Debug, Clone, Default)]
 pub struct SelectionArgs {
     /// Selects every non-deleted archived message.
@@ -62,6 +61,22 @@ pub struct SelectionArgs {
     /// `--label` tag `gmail insert` itself applies).
     #[arg(long, value_name = "LABEL_ID")]
     pub source_label: Option<String>,
+}
+
+impl SelectionArgs {
+    /// Whether any selector flag was actually given, as opposed to a bare
+    /// `SelectionArgs::default()`. `gmail render` uses this to reject
+    /// selector flags passed alongside its bare-file-paths mode (which has
+    /// no `Selection` involvement at all) rather than silently ignoring
+    /// them.
+    pub(crate) fn any_given(&self) -> bool {
+        self.all
+            || self.since.is_some()
+            || self.until.is_some()
+            || !self.ids.is_empty()
+            || self.ids_from.is_some()
+            || self.source_label.is_some()
+    }
 }
 
 /// A validated, ready-to-apply selection — every fallible part of
@@ -119,11 +134,28 @@ impl Selection {
         })
     }
 
-    /// The explicit ids this selection names (via `--id`/`--ids-from`), for
-    /// the engine to check against the manifest up front — an id absent
-    /// from the archive is an error, never a silent drop.
-    pub(crate) fn requested_ids(&self) -> &HashSet<String> {
-        &self.ids
+    /// Ensures every id named via `--id`/`--ids-from` is actually selectable
+    /// — present in `manifest` **and** not soft-deleted — since a
+    /// soft-deleted record is dropped by [`crate::cli::gmail::sync::manifest::Manifest::records_not_deleted`]
+    /// before [`Self::matches`] ever runs on it. An id the caller named
+    /// explicitly but that can never be selected is an error, never a
+    /// silent drop from the result set, which is why this is checked up
+    /// front rather than left to fall out of an empty result.
+    pub(crate) fn ensure_requested_ids_selectable(
+        &self,
+        manifest: &Manifest,
+        archive_dir: &Path,
+    ) -> Result<()> {
+        for id in &self.ids {
+            anyhow::ensure!(
+                manifest
+                    .get(id)
+                    .is_some_and(|record| record.deleted_at.is_none()),
+                "--id {id} was not found in the archive manifest at {}",
+                archive_dir.display()
+            );
+        }
+        Ok(())
     }
 
     /// Whether `record` is selected — a plain conjunction of independent
@@ -245,6 +277,32 @@ mod tests {
         }
     }
 
+    // ── any_given ───────────────────────────────────────────────────
+
+    #[test]
+    fn any_given_is_false_for_default() {
+        assert!(!SelectionArgs::default().any_given());
+    }
+
+    #[test]
+    fn any_given_is_true_when_a_selector_is_set() {
+        assert!(SelectionArgs {
+            all: true,
+            ..SelectionArgs::default()
+        }
+        .any_given());
+        assert!(SelectionArgs {
+            since: Some("2026-01-01".to_string()),
+            ..SelectionArgs::default()
+        }
+        .any_given());
+        assert!(SelectionArgs {
+            ids: vec!["m1".to_string()],
+            ..SelectionArgs::default()
+        }
+        .any_given());
+    }
+
     // ── from_args validation ────────────────────────────────────────
 
     #[test]
@@ -293,13 +351,58 @@ mod tests {
             ..SelectionArgs::default()
         };
         let selection = Selection::from_args(&args).unwrap();
-        let mut ids: Vec<&str> = selection
-            .requested_ids()
-            .iter()
-            .map(String::as_str)
-            .collect();
-        ids.sort_unstable();
-        assert_eq!(ids, ["m1", "m2", "m3"]);
+        assert!(selection.matches(&sample_record("m1")));
+        assert!(selection.matches(&sample_record("m2")));
+        assert!(selection.matches(&sample_record("m3")));
+        assert!(!selection.matches(&sample_record("m4")));
+    }
+
+    // ── ensure_requested_ids_selectable ───────────────────────────────
+
+    #[test]
+    fn ensure_requested_ids_selectable_accepts_a_present_non_deleted_id() {
+        let mut manifest = Manifest::default();
+        manifest.upsert(sample_record("m1"));
+        let selection = Selection::from_args(&SelectionArgs {
+            ids: vec!["m1".to_string()],
+            ..SelectionArgs::default()
+        })
+        .unwrap();
+        assert!(selection
+            .ensure_requested_ids_selectable(&manifest, Path::new("archive"))
+            .is_ok());
+    }
+
+    #[test]
+    fn ensure_requested_ids_selectable_rejects_an_id_absent_from_the_manifest() {
+        let manifest = Manifest::default();
+        let selection = Selection::from_args(&SelectionArgs {
+            ids: vec!["missing".to_string()],
+            ..SelectionArgs::default()
+        })
+        .unwrap();
+        let err = selection
+            .ensure_requested_ids_selectable(&manifest, Path::new("archive"))
+            .unwrap_err();
+        assert!(err.to_string().contains("--id missing was not found"));
+    }
+
+    #[test]
+    fn ensure_requested_ids_selectable_rejects_a_soft_deleted_id() {
+        let mut manifest = Manifest::default();
+        manifest.upsert(ManifestRecord {
+            deleted_at: Some(Utc::now()),
+            ..sample_record("m1")
+        });
+        let selection = Selection::from_args(&SelectionArgs {
+            ids: vec!["m1".to_string()],
+            ..SelectionArgs::default()
+        })
+        .unwrap();
+        let err = selection
+            .ensure_requested_ids_selectable(&manifest, Path::new("archive"))
+            .unwrap_err();
+        assert!(err.to_string().contains("--id m1 was not found"));
     }
 
     // ── matches (conjunction) ─────────────────────────────────────────
