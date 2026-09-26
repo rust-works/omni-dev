@@ -3,10 +3,11 @@
 use std::io::Write;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::cli::drive::helpers::active_account_rules;
+use crate::cli::drive::permissions::check::OperationArg;
 use crate::drive::write_gate::{DriveOperation, FolderPermissionRule, Verdict};
 
 /// Prints the active account's configured write-permission rules.
@@ -114,16 +115,29 @@ fn render_rules_table(rules: &[FolderPermissionRule], out: &mut dyn Write) -> Re
 
 /// `"create/upload/edit/.../docs-write"` — every operation the gate
 /// refuses by default absent a configured rule, built from
-/// [`DriveOperation::ALL`]/[`DriveOperation::default_policy`] rather than
+/// [`OperationArg::value_variants`] (`permissions check`'s own `--operation`
+/// value set) filtered by [`DriveOperation::default_policy`], rather than
 /// a hardcoded string, so it cannot silently omit an operation the way
-/// the empty-rules message once did (issue #1919).
+/// the empty-rules message once did (issue #1919). `value_variants` is
+/// clap's own `ValueEnum` derive output — a real enumeration of
+/// `OperationArg`'s variants, not a second hand-maintained list that could
+/// itself drift from `DriveOperation`'s.
+///
+/// Panics (via the `debug_assert!`) only if `default_policy` ever stopped
+/// denying anything by default — a real bug, not a reachable input, since
+/// `default_policy`'s own exhaustive match keeps every write closed.
 fn default_deny_operations_list() -> String {
-    DriveOperation::ALL
-        .into_iter()
+    let list = OperationArg::value_variants()
+        .iter()
+        .map(|&arg| DriveOperation::from(arg))
         .filter(|op| op.default_policy() == Verdict::Deny)
         .map(|op| op.to_string())
-        .collect::<Vec<_>>()
-        .join("/")
+        .collect::<Vec<_>>();
+    debug_assert!(
+        !list.is_empty(),
+        "at least one DriveOperation must default-deny, or this message's wording breaks"
+    );
+    list.join("/")
 }
 
 /// `"folder"` or `"file"` — which id this rule keys on.
@@ -328,8 +342,14 @@ mod tests {
         let mut buf = Vec::new();
         render_rules_table(&[], &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
+        let list = default_deny_operations_list();
         assert!(
-            !out.contains("read"),
+            out.contains(&list),
+            "{out} should embed the operations list {list} verbatim"
+        );
+        let named: std::collections::HashSet<&str> = list.split('/').collect();
+        assert!(
+            !named.contains("read"),
             "{out} should not name read, which is allowed by default"
         );
         for op in [
@@ -342,19 +362,20 @@ mod tests {
             "sheets-protection",
             "docs-write",
         ] {
-            assert!(out.contains(op), "{out} should name {op}");
+            assert!(named.contains(op), "{out} should name {op}");
         }
     }
 
     #[test]
     fn default_deny_operations_list_matches_default_policy() {
         let list = default_deny_operations_list();
-        for op in DriveOperation::ALL {
-            let named = list.contains(&op.to_string());
+        let named: std::collections::HashSet<&str> = list.split('/').collect();
+        for &arg in OperationArg::value_variants() {
+            let op = DriveOperation::from(arg);
             assert_eq!(
-                named,
+                named.contains(op.to_string().as_str()),
                 op.default_policy() == Verdict::Deny,
-                "{op:?}: named={named}"
+                "{op:?}: list={list}"
             );
         }
     }
