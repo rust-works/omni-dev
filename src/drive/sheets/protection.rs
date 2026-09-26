@@ -784,7 +784,7 @@ fn describe_effect(verb: &ProtectionVerb) -> String {
             // effect.
             let mut parts = Vec::new();
             if let Some(description) = description {
-                parts.push(format!("description: {description:?}"));
+                parts.push(format!("description: '{description}'"));
             }
             if let Some(warning_only) = warning_only {
                 parts.push(format!("warning-only: {warning_only}"));
@@ -1621,7 +1621,7 @@ mod tests {
         };
         assert_eq!(
             describe_effect(&description_only),
-            "update protection (description: \"note\")"
+            "update protection (description: 'note')"
         );
 
         let warning_only_change = ProtectionVerb::UpdateProtection {
@@ -1649,7 +1649,7 @@ mod tests {
         };
         assert_eq!(
             describe_effect(&everything),
-            "update protection (description: \"note\" warning-only: false \
+            "update protection (description: 'note' warning-only: false \
              +a@example.com -b@example.com)"
         );
     }
