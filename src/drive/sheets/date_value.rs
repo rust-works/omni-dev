@@ -171,13 +171,13 @@ pub(crate) fn reject_blank_date(date: &DateValue, flag: &str) -> Result<(), Stri
 }
 
 /// `--date-between` takes two absolute dates only (see its own doc comment):
-/// it never accepts a relative keyword, so one must be rejected loudly here rather than silently
-/// reaching the API as a literal `userEnteredValue` string. Also mirrors
-/// [`reject_reversed_range`]'s ordering check for the numeric family, on a
-/// best-effort basis: a bound that doesn't parse as an ISO `YYYY-MM-DD` date
-/// is trusted through untouched, the same trust-the-caller stance the rest
-/// of this file takes for formats Sheets itself will parse at evaluation
-/// time.
+/// it never accepts a relative keyword, so one must be rejected loudly here
+/// rather than silently reaching the API as a literal `userEnteredValue`
+/// string. Also mirrors [`reject_reversed_range`]'s ordering check for the
+/// numeric family, on a best-effort basis: a bound that doesn't parse as an
+/// ISO `YYYY-MM-DD` date is trusted through untouched, the same
+/// trust-the-caller stance the rest of this file takes for formats Sheets
+/// itself will parse at evaluation time.
 pub(crate) fn reject_invalid_date_between(start: &str, end: &str) -> Result<(), String> {
     reject_blank(start, "--date-between")?;
     reject_blank(end, "--date-between")?;
