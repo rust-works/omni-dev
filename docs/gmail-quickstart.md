@@ -72,8 +72,9 @@ Google actually granted (`openid`, `email`, `profile` — no Gmail access
 at all), and nothing is written to `settings.json`. Tick the box and
 re-run the command.
 
-Pass `--modify` instead if you also want to manage labels
-(`gmail label add`/`remove`) — not needed for sync:
+Pass `--modify` instead if you also want to change the mailbox —
+`gmail label add`/`remove`, `draft create`/`update` or `insert` — not
+needed for sync:
 
 ```bash
 omni-dev gmail auth login --modify
@@ -97,11 +98,11 @@ Granted scope: gmail.readonly
 **Treat this as a gate, not a formality.** It makes a live
 `users.getProfile` call, so it catches anything a successful `auth login`
 can't — a revoked grant, a stale refresh token, or (if you're planning to
-use `label add`/`remove`) a `gmail.readonly`-only scope that needs
-`auth login --modify` instead. If it errors, don't retry `sync` — fix
-what it reports first (see
+use a command that changes the mailbox) a `gmail.readonly`-only scope
+that needs `auth login --modify` instead. If it errors, don't retry
+`sync` — fix what it reports first (see
 [gmail.md#insufficientpermissions](gmail.md#insufficientpermissions) for
-the label-scope case).
+the write-scope case).
 
 If this succeeds, everything downstream will work — you're clear to sync.
 
@@ -170,7 +171,8 @@ are documented in [gmail.md#sync](gmail.md#sync).
 - `auth login` fails with "Google did not grant a Gmail scope" →
   [gmail.md#no-gmail-scope-was-granted](gmail.md#no-gmail-scope-was-granted)
   — you missed the tick-box in step 3.
-- `insufficientPermissions` only on `label add`/`remove` →
+- `insufficientPermissions` only on `label add`/`remove`,
+  `draft create`/`update` or `insert` →
   [gmail.md#insufficientpermissions](gmail.md#insufficientpermissions) —
   re-run `auth login --modify`.
 - `invalid_grant` →

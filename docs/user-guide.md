@@ -1696,7 +1696,8 @@ omni-dev gmail read <message-id>
 omni-dev gmail thread <thread-id>
 omni-dev gmail label list
 
-# Label mutation needs the gmail.modify scope (auth login --modify)
+# Label mutation needs the gmail.modify scope (auth login --modify), as do
+# draft create/update and insert
 omni-dev gmail label add <message-id> --label IMPORTANT
 omni-dev gmail label remove <message-id> --label UNREAD
 

@@ -7021,7 +7021,7 @@ Commands:
   sync-all             Maintains durable local archives for every account in `.omni-dev/gmail-sync.yaml`, concurrently (CLI-only; no MCP equivalent; ADR-0068)
   extract-attachments  Retroactively extracts attachments for already-archived messages, without re-fetching from Gmail (CLI-only; no MCP equivalent; purely local, no client/credentials needed; #1510)
   render               Renders one or more archived `.eml` files as human-readable Markdown (CLI-only; no MCP equivalent; purely local, no client/credentials needed; #1513)
-  insert               Restores archived `.eml` messages into a mailbox (CLI-only; no MCP equivalent; #1655)
+  insert               Restores archived `.eml` messages into a mailbox (needs `gmail.modify`; CLI-only; no MCP equivalent; #1655)
   help                 Print this message or the help of the given subcommand(s)
 
 Options:
@@ -7132,7 +7132,7 @@ Runs the Gmail OAuth2 login flow (opens a browser). Interactive-only — login h
 Usage: login [OPTIONS]
 
 Options:
-      --modify  Request the `gmail.modify` scope (needed for `label add`/`remove`) in addition to `gmail.readonly`. Without this flag, only read access is granted
+      --modify  Request the `gmail.modify` scope in addition to `gmail.readonly`. It is needed by every command that changes the mailbox: `label add`/`remove`, `draft create`/`update` and `insert`. Without this flag, only read access is granted
   -h, --help    Print help
 
 
@@ -7287,9 +7287,9 @@ Options:
 
 ================================================================================
 
-omni-dev gmail insert - Restores archived `.eml` messages into a mailbox (CLI-only; no MCP equivalent; #1655)
+omni-dev gmail insert - Restores archived `.eml` messages into a mailbox (needs `gmail.modify`; CLI-only; no MCP equivalent; #1655)
 
-Restores archived `.eml` messages into a mailbox (CLI-only; no MCP equivalent; #1655)
+Restores archived `.eml` messages into a mailbox (needs `gmail.modify`; CLI-only; no MCP equivalent; #1655)
 
 Usage: insert [OPTIONS] --archive-dir <PATH>
 

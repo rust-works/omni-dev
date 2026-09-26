@@ -22,7 +22,8 @@ use clap::{Parser, Subcommand};
 use crate::gmail::account::GMAIL_ACCOUNT_ENV;
 use crate::gmail::client::GmailClient;
 
-/// Gmail: read Gmail messages, threads, and labels (and, with `gmail.modify`, mutate labels).
+/// Gmail: read Gmail messages, threads, and labels (and, with `gmail.modify`,
+/// change labels, drafts and restored messages).
 #[derive(Parser)]
 pub struct GmailCommand {
     /// Selects a named Gmail account configured in
@@ -78,8 +79,8 @@ pub enum GmailSubcommands {
     /// (CLI-only; no MCP equivalent; purely local, no client/credentials
     /// needed; #1513).
     Render(render::RenderCommand),
-    /// Restores archived `.eml` messages into a mailbox (CLI-only; no MCP
-    /// equivalent; #1655).
+    /// Restores archived `.eml` messages into a mailbox (needs
+    /// `gmail.modify`; CLI-only; no MCP equivalent; #1655).
     Insert(insert::InsertCommand),
 }
 
