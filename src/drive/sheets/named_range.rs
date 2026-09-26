@@ -198,8 +198,8 @@ pub enum NamedRangeResult {
     RefusedAmbiguousName {
         /// The name that was searched for.
         name: String,
-        /// The matching ids, so the user can disambiguate via
-        /// `list-named-ranges`.
+        /// The matching ids, for cross-referencing with
+        /// `list-named-ranges` (neither verb can target a range by id).
         candidates: Vec<String>,
     },
     /// `update-named-range --new-name` matches another, different named
@@ -208,8 +208,9 @@ pub enum NamedRangeResult {
     RefusedDuplicateName {
         /// The requested new name.
         new_name: String,
-        /// The other named range's id, if known.
-        existing_id: Option<String>,
+        /// Every other named range's id that already has this name — more
+        /// than one if the workbook already had duplicates under it.
+        existing_ids: Vec<String>,
     },
     /// The folder write-permission gate refused it.
     Blocked {
@@ -699,21 +700,41 @@ fn find_existing_named_range<'a>(
 /// has that name, case-insensitively (issue #1932). The API accepts this
 /// silently, producing two named ranges with the same name, which breaks
 /// the case-insensitive-exact-match lookup every other verb in this module
-/// relies on.
+/// relies on. Lists every colliding id, not just the first, the same way
+/// [`find_existing_named_range`]'s `RefusedAmbiguousName` does — a workbook
+/// can already have more than one range sharing `new_name` from before
+/// this check existed, or from another client.
+///
+/// Best-effort, not airtight: like every other check in this module, this
+/// reads a workbook fetched once at the top of [`named_range_inner`] and is
+/// not re-verified immediately before the mutating `batchUpdate` call. A
+/// rule with `require_lease: false` (ADR-0080 §13) skips the lease's own
+/// re-fetch-and-compare-`version` step, so two concurrent renames — or one
+/// racing an edit from another client — can each pass this check against
+/// their own snapshot and still collide. This closes the common case (a
+/// single CLI invocation, which is what issue #1932 reported); closing the
+/// race too would need re-reading the workbook after the lease is held,
+/// which no verb in this module does today.
 fn check_new_name_available(
     workbook: &Spreadsheet,
     own_id: Option<&str>,
     new_name: &str,
 ) -> Result<(), NamedRangeResult> {
-    let collision = workbook.named_ranges.iter().find(|nr| {
-        nr.name.eq_ignore_ascii_case(new_name) && nr.named_range_id.as_deref() != own_id
-    });
-    match collision {
-        Some(nr) => Err(NamedRangeResult::RefusedDuplicateName {
+    let collisions: Vec<String> = workbook
+        .named_ranges
+        .iter()
+        .filter(|nr| {
+            nr.name.eq_ignore_ascii_case(new_name) && nr.named_range_id.as_deref() != own_id
+        })
+        .filter_map(|nr| nr.named_range_id.clone())
+        .collect();
+    if collisions.is_empty() {
+        Ok(())
+    } else {
+        Err(NamedRangeResult::RefusedDuplicateName {
             new_name: new_name.to_string(),
-            existing_id: nr.named_range_id.clone(),
-        }),
-        None => Ok(()),
+            existing_ids: collisions,
+        })
     }
 }
 
@@ -913,18 +934,21 @@ pub fn describe_lines(outcome: &NamedRangeOutcome) -> Vec<String> {
         )],
         NamedRangeResult::RefusedAmbiguousName { name, candidates } => vec![format!(
             "Refused: more than one named range in {book} is named '{name}' (ids: {}); \
-             this is ambiguous and nothing was changed",
+             this is ambiguous and nothing was changed. Rename or delete all but one \
+             in the Sheets UI (Data > Named ranges), then retry",
             candidates.join(", ")
         )],
         NamedRangeResult::RefusedDuplicateName {
             new_name,
-            existing_id,
+            existing_ids,
         } => {
-            let id = existing_id
-                .as_deref()
-                .map_or_else(String::new, |id| format!(" (id {id})"));
+            let ids = if existing_ids.is_empty() {
+                String::new()
+            } else {
+                format!(" (ids: {})", existing_ids.join(", "))
+            };
             vec![format!(
-                "Refused: {book} already has a named range called '{new_name}'{id}; \
+                "Refused: {book} already has a named range called '{new_name}'{ids}; \
                  rename would create a duplicate"
             )]
         }
@@ -1100,12 +1124,37 @@ mod tests {
         match err {
             NamedRangeResult::RefusedDuplicateName {
                 new_name,
-                existing_id,
+                existing_ids,
             } => {
                 assert_eq!(new_name, "allS1");
-                assert_eq!(existing_id.as_deref(), Some("id-2"));
+                assert_eq!(existing_ids, ["id-2"]);
             }
             other => panic!("expected RefusedDuplicateName, got {other:?}"), // omni-dev: coverage ignore-line reason="check_new_name_available always returns RefusedDuplicateName here; this test's new_name always collides with a different named range"
+        }
+    }
+
+    #[test]
+    fn check_new_name_available_lists_every_colliding_id_when_the_workbook_already_has_duplicates()
+    {
+        // issue #1932 review: a collision check that only reported the
+        // first match would give an incomplete picture of a workbook that
+        // already has duplicates from before this check existed.
+        let workbook = workbook_with(vec![
+            named("id-1", "Qty", grid(0)),
+            named("id-2", "AllS1", grid(1)),
+            named("id-3", "AllS1", grid(2)),
+        ]);
+        let err = check_new_name_available(&workbook, Some("id-1"), "AllS1").unwrap_err();
+        match err {
+            NamedRangeResult::RefusedDuplicateName {
+                new_name,
+                mut existing_ids,
+            } => {
+                assert_eq!(new_name, "AllS1");
+                existing_ids.sort();
+                assert_eq!(existing_ids, ["id-2", "id-3"]);
+            }
+            other => panic!("expected RefusedDuplicateName, got {other:?}"), // omni-dev: coverage ignore-line reason="check_new_name_available always returns RefusedDuplicateName here; this test's new_name always collides with two different named ranges"
         }
     }
 
@@ -1493,10 +1542,10 @@ mod tests {
         match outcome.result {
             NamedRangeResult::RefusedDuplicateName {
                 new_name,
-                existing_id,
+                existing_ids,
             } => {
                 assert_eq!(new_name, "AllS1");
-                assert_eq!(existing_id.as_deref(), Some("id-1"));
+                assert_eq!(existing_ids, ["id-1"]);
             }
             other => panic!("expected RefusedDuplicateName, got {other:?}"),
         }
@@ -1886,33 +1935,46 @@ mod tests {
         assert!(text.contains("id-1"), "{text}");
         assert!(text.contains("id-2"), "{text}");
         assert!(text.contains("ambiguous"), "{text}");
+        assert!(text.contains("Data > Named ranges"), "{text}");
     }
 
     #[test]
-    fn describe_lines_renders_duplicate_name_with_and_without_an_id() {
+    fn describe_lines_renders_duplicate_name_with_one_and_several_ids() {
         let with_id = outcome_with(
             update_verb(),
             Some("Budget"),
             NamedRangeResult::RefusedDuplicateName {
                 new_name: "AllS1".to_string(),
-                existing_id: Some("id-1".to_string()),
+                existing_ids: vec!["id-1".to_string()],
             },
         );
         let text = describe(&with_id);
         assert!(text.contains("AllS1"), "{text}");
         assert!(text.contains("id-1"), "{text}");
 
+        let with_several = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            NamedRangeResult::RefusedDuplicateName {
+                new_name: "AllS1".to_string(),
+                existing_ids: vec!["id-1".to_string(), "id-2".to_string()],
+            },
+        );
+        let text = describe(&with_several);
+        assert!(text.contains("id-1"), "{text}");
+        assert!(text.contains("id-2"), "{text}");
+
         let without_id = outcome_with(
             update_verb(),
             Some("Budget"),
             NamedRangeResult::RefusedDuplicateName {
                 new_name: "AllS1".to_string(),
-                existing_id: None,
+                existing_ids: Vec::new(),
             },
         );
         let text = describe(&without_id);
         assert!(text.contains("AllS1"), "{text}");
-        assert!(!text.contains("(id"), "{text}");
+        assert!(!text.contains("(ids"), "{text}");
     }
 
     #[test]
@@ -2737,7 +2799,7 @@ mod tests {
         assert_eq!(
             NamedRangeResult::RefusedDuplicateName {
                 new_name: String::new(),
-                existing_id: None,
+                existing_ids: Vec::new(),
             }
             .log_status(),
             "refused-duplicate-name"
