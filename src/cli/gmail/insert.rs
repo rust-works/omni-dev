@@ -29,10 +29,10 @@ use engine::{InsertOptions, DEFAULT_INSERT_CONCURRENCY};
 use progress::{InsertProgressBar, InsertProgressEvent};
 use report::{InsertAction, InsertError, InsertReport, InsertSummary, SkipReason};
 
-/// Restores archived `.eml` messages into a mailbox (CLI-only; no MCP
-/// equivalent — a bulk, mutating, potentially long-running operation is a
-/// poor fit for a synchronous MCP tool call, mirroring `sync`'s own
-/// no-MCP rationale).
+/// Restores archived `.eml` messages into a mailbox (needs `gmail.modify`,
+/// granted by `gmail auth login --modify`; CLI-only; no MCP equivalent — a
+/// bulk, mutating, potentially long-running operation is a poor fit for a
+/// synchronous MCP tool call, mirroring `sync`'s own no-MCP rationale).
 #[derive(Parser)]
 pub struct InsertCommand {
     /// Archive directory previously populated by `gmail sync`/`sync-all`.

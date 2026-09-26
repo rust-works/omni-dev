@@ -131,8 +131,10 @@ Run `omni-dev gmail auth status` to verify.
 This opens a browser to Google's consent screen via a loopback OAuth2
 authorization-code + PKCE flow (see [ADR-0063](adrs/adr-0063.md)); once you
 approve, the refresh token is written to `~/.omni-dev/settings.json`. Pass
-`--modify` to additionally request the `gmail.modify` scope, needed for
-`gmail label add`/`remove`:
+`--modify` to additionally request the `gmail.modify` scope, needed by
+every command that changes the mailbox — `gmail label add`/`remove`,
+[`draft create`](#creating-drafts)/[`update`](#updating-drafts) and
+[`insert`](#insert):
 
 ```bash
 $ omni-dev gmail auth login --modify
@@ -1249,8 +1251,10 @@ wrong for mail that may be years old (it can land in spam, or be caught by
 filters written long after the mail actually arrived). `insert` places the
 message exactly where instructed, with `internalDateSource=dateHeader` (not
 Gmail's default) so the archived `Date:` header — not the moment of
-insertion — sets Gmail's sort order. No additional OAuth scope is needed;
-`gmail.modify` already covers it.
+insertion — sets Gmail's sort order. **Needs `gmail.modify`**
+(`gmail auth login --modify`), the scope `label add`/`remove` and
+`draft create`/`update` already use; a `gmail.readonly`-only account gets a
+403 (see [`insufficientPermissions`](#insufficientpermissions)).
 
 **Selection** — one of `--all`, `--since DATE`/`--until DATE`
 (`YYYY-MM-DD`, inclusive), `--id ID` (repeatable), `--ids-from FILE` (one id

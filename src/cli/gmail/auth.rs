@@ -81,9 +81,10 @@ impl ImportCommand {
 /// Runs the Gmail OAuth2 login flow.
 #[derive(Parser)]
 pub struct LoginCommand {
-    /// Request the `gmail.modify` scope (needed for `label add`/`remove`) in
-    /// addition to `gmail.readonly`. Without this flag, only read access is
-    /// granted.
+    /// Request the `gmail.modify` scope in addition to `gmail.readonly`. It
+    /// is needed by every command that changes the mailbox:
+    /// `label add`/`remove`, `draft create`/`update` and `insert`. Without
+    /// this flag, only read access is granted.
     #[arg(long)]
     pub modify: bool,
 }
