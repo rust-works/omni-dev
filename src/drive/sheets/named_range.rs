@@ -30,10 +30,17 @@
 //! handle a CLI user would actually type (the id is discoverable only via
 //! `list-named-ranges`). Case-insensitive to match the formula scan's own
 //! case-insensitive resolution of a name reference (see
-//! [`scan_referencing_formulas`]); Sheets is assumed to enforce
-//! case-insensitive uniqueness on names the same way, so unlike
-//! `protection.rs`'s range-based lookup this is not expected to need an
-//! "ambiguous" branch — the first match wins.
+//! [`scan_referencing_formulas`]).
+//!
+//! Sheets enforces unique names on `addNamedRange` but **not** on
+//! `updateNamedRange` (issue #1932, live-verified): renaming a named range
+//! to another's name is not rejected server-side, so a workbook can end up
+//! with two ranges sharing a name despite `addNamedRange`'s own behavior
+//! suggesting otherwise. Like `protection.rs`'s range-based lookup, name
+//! resolution here does need an "ambiguous" branch after all —
+//! [`find_existing_named_range`] refuses rather than picks the first match
+//! when more than one range shares a name, and [`check_new_name_available`]
+//! refuses a rename that would create that state in the first place.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -184,6 +191,26 @@ pub enum NamedRangeResult {
         /// The name that was searched for.
         name: String,
     },
+    /// `update-named-range`/`delete-named-range`'s `--name` matched more
+    /// than one named range (issue #1932: `updateNamedRange` does not
+    /// enforce unique names the way `addNamedRange` does) — refused rather
+    /// than guessing which was meant.
+    RefusedAmbiguousName {
+        /// The name that was searched for.
+        name: String,
+        /// The matching ids, so the user can disambiguate via
+        /// `list-named-ranges`.
+        candidates: Vec<String>,
+    },
+    /// `update-named-range --new-name` matches another, different named
+    /// range (case-insensitively) — refused pre-emptively (issue #1932)
+    /// since the API allows it, producing two ranges with the same name.
+    RefusedDuplicateName {
+        /// The requested new name.
+        new_name: String,
+        /// The other named range's id, if known.
+        existing_id: Option<String>,
+    },
     /// The folder write-permission gate refused it.
     Blocked {
         /// The rule that decided the refusal, if any.
@@ -247,6 +274,8 @@ impl NamedRangeResult {
             Self::RefusedSheetNotFound { .. } => "refused-sheet-not-found",
             Self::RefusedInvalidRange { .. } => "refused-invalid-range",
             Self::RefusedNotFound { .. } => "refused-not-found",
+            Self::RefusedAmbiguousName { .. } => "refused-ambiguous-name",
+            Self::RefusedDuplicateName { .. } => "refused-duplicate-name",
             Self::Blocked { .. } => "blocked",
             Self::RefusedNoLease => LeaseGateRefusal::NoLease.log_status(),
             Self::RefusedLeaseExpired => LeaseGateRefusal::Expired.log_status(),
@@ -397,6 +426,21 @@ async fn named_range_inner(
             }
         }
     };
+
+    if let NamedRangeVerb::UpdateNamedRange {
+        new_name: Some(new_name),
+        ..
+    } = &opts.verb
+    {
+        let Some(existing) = existing else {
+            unreachable!("existing is resolved for UpdateNamedRange above") // omni-dev: coverage ignore-line reason="existing is always Some for UpdateNamedRange: find_existing_named_range above either returns it or refuses and returns early"
+        };
+        if let Err(result) =
+            check_new_name_available(&workbook, existing.named_range_id.as_deref(), new_name)
+        {
+            return gated(result);
+        }
+    }
 
     let new_grid = match &opts.verb {
         NamedRangeVerb::AddNamedRange {
@@ -608,9 +652,18 @@ fn find_sheet_id(workbook: &Spreadsheet, title: &str) -> Result<i64, NamedRangeR
 /// Finds the one existing named range with a case-insensitive exact `name`
 /// match — `update-named-range`/`delete-named-range`'s only stable handle,
 /// since a named range's server-assigned id is discoverable only via
-/// `list-named-ranges`. Sheets enforces unique names workbook-wide, so
-/// unlike `protection.rs::find_existing_protection` this never needs an
-/// "ambiguous" branch — only found or not found.
+/// `list-named-ranges`. Refuses rather than guesses on zero or multiple
+/// matches, like `protection.rs::find_existing_protection`.
+///
+/// Sheets enforces unique names on `addNamedRange` but not on
+/// `updateNamedRange` (issue #1932): renaming one named range to another's
+/// name is not rejected server-side, so two ranges can end up sharing a
+/// name despite the "unique workbook-wide" assumption `addNamedRange`'s own
+/// behavior suggests. `check_new_name_available` refuses the rename that
+/// would create this; this function's `many` branch is the other half —
+/// refusing to guess which of two already-duplicate ranges `--name` meant,
+/// for a workbook that reached that state before this crate could refuse
+/// the rename (or via another client entirely).
 ///
 /// Case-insensitive to match [`scan_referencing_formulas`]'s own
 /// case-insensitive resolution of a reference to this same name — a
@@ -621,13 +674,47 @@ fn find_existing_named_range<'a>(
     workbook: &'a Spreadsheet,
     name: &str,
 ) -> Result<&'a NamedRange, NamedRangeResult> {
-    workbook
+    let matches: Vec<&NamedRange> = workbook
         .named_ranges
         .iter()
-        .find(|nr| nr.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| NamedRangeResult::RefusedNotFound {
+        .filter(|nr| nr.name.eq_ignore_ascii_case(name))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [] => Err(NamedRangeResult::RefusedNotFound {
             name: name.to_string(),
-        })
+        }),
+        many => Err(NamedRangeResult::RefusedAmbiguousName {
+            name: name.to_string(),
+            candidates: many
+                .iter()
+                .filter_map(|nr| nr.named_range_id.clone())
+                .collect(),
+        }),
+    }
+}
+
+/// Refuses `update-named-range --new-name <new_name>` when another named
+/// range — not the one being renamed, identified by `own_id` — already
+/// has that name, case-insensitively (issue #1932). The API accepts this
+/// silently, producing two named ranges with the same name, which breaks
+/// the case-insensitive-exact-match lookup every other verb in this module
+/// relies on.
+fn check_new_name_available(
+    workbook: &Spreadsheet,
+    own_id: Option<&str>,
+    new_name: &str,
+) -> Result<(), NamedRangeResult> {
+    let collision = workbook.named_ranges.iter().find(|nr| {
+        nr.name.eq_ignore_ascii_case(new_name) && nr.named_range_id.as_deref() != own_id
+    });
+    match collision {
+        Some(nr) => Err(NamedRangeResult::RefusedDuplicateName {
+            new_name: new_name.to_string(),
+            existing_id: nr.named_range_id.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Builds the `updateNamedRange` request and its `fields` mask from what
@@ -824,6 +911,23 @@ pub fn describe_lines(outcome: &NamedRangeOutcome) -> Vec<String> {
             "Refused: {book} has no named range '{name}'; run \
              `drive sheets list-named-ranges` to see what exists"
         )],
+        NamedRangeResult::RefusedAmbiguousName { name, candidates } => vec![format!(
+            "Refused: more than one named range in {book} is named '{name}' (ids: {}); \
+             this is ambiguous and nothing was changed",
+            candidates.join(", ")
+        )],
+        NamedRangeResult::RefusedDuplicateName {
+            new_name,
+            existing_id,
+        } => {
+            let id = existing_id
+                .as_deref()
+                .map_or_else(String::new, |id| format!(" (id {id})"));
+            vec![format!(
+                "Refused: {book} already has a named range called '{new_name}'{id}; \
+                 rename would create a duplicate"
+            )]
+        }
         NamedRangeResult::Blocked { decided_by } => vec![match decided_by {
             Some(rule) => format!(
                 "Blocked: {} on {book} refused by rule on {} {}{}",
@@ -944,6 +1048,71 @@ mod tests {
         let workbook = workbook_with(vec![named("id-1", "Foo", grid(0))]);
         let found = find_existing_named_range(&workbook, "foo").unwrap();
         assert_eq!(found.named_range_id.as_deref(), Some("id-1"));
+    }
+
+    #[test]
+    fn find_existing_named_range_refuses_as_ambiguous_when_two_share_a_name() {
+        // issue #1932: updateNamedRange doesn't enforce unique names, so a
+        // workbook can reach this state despite addNamedRange refusing it.
+        let workbook = workbook_with(vec![
+            named("id-1", "AllS1", grid(0)),
+            named("id-2", "AllS1", grid(1)),
+        ]);
+        let err = find_existing_named_range(&workbook, "AllS1").unwrap_err();
+        match err {
+            NamedRangeResult::RefusedAmbiguousName {
+                name,
+                mut candidates,
+            } => {
+                assert_eq!(name, "AllS1");
+                candidates.sort();
+                assert_eq!(candidates, ["id-1", "id-2"]);
+            }
+            other => panic!("expected RefusedAmbiguousName, got {other:?}"), // omni-dev: coverage ignore-line reason="find_existing_named_range always returns RefusedAmbiguousName here; this test's mounted workbook always has two matching names"
+        }
+    }
+
+    #[test]
+    fn find_existing_named_range_refuses_as_ambiguous_case_insensitively() {
+        let workbook = workbook_with(vec![
+            named("id-1", "Units", grid(0)),
+            named("id-2", "units", grid(1)),
+        ]);
+        let err = find_existing_named_range(&workbook, "UNITS").unwrap_err();
+        assert!(matches!(err, NamedRangeResult::RefusedAmbiguousName { .. }));
+    }
+
+    #[test]
+    fn check_new_name_available_allows_renaming_to_its_own_current_name() {
+        let workbook = workbook_with(vec![named("id-1", "Foo", grid(0))]);
+        assert!(check_new_name_available(&workbook, Some("id-1"), "Foo").is_ok());
+        // Case changes to the same range are also fine — still "own".
+        assert!(check_new_name_available(&workbook, Some("id-1"), "foo").is_ok());
+    }
+
+    #[test]
+    fn check_new_name_available_refuses_a_case_insensitive_collision() {
+        let workbook = workbook_with(vec![
+            named("id-1", "Qty", grid(0)),
+            named("id-2", "AllS1", grid(1)),
+        ]);
+        let err = check_new_name_available(&workbook, Some("id-1"), "allS1").unwrap_err();
+        match err {
+            NamedRangeResult::RefusedDuplicateName {
+                new_name,
+                existing_id,
+            } => {
+                assert_eq!(new_name, "allS1");
+                assert_eq!(existing_id.as_deref(), Some("id-2"));
+            }
+            other => panic!("expected RefusedDuplicateName, got {other:?}"), // omni-dev: coverage ignore-line reason="check_new_name_available always returns RefusedDuplicateName here; this test's new_name always collides with a different named range"
+        }
+    }
+
+    #[test]
+    fn check_new_name_available_allows_a_genuinely_new_name() {
+        let workbook = workbook_with(vec![named("id-1", "Qty", grid(0))]);
+        assert!(check_new_name_available(&workbook, Some("id-1"), "Units").is_ok());
     }
 
     #[test]
@@ -1274,6 +1443,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_named_range_refuses_a_new_name_that_collides_with_another_range() {
+        // issue #1932's exact repro: `AllS1` and `Qty` both defined,
+        // `update-named-range --name qty --new-name AllS1` must be refused
+        // rather than producing two ranges named `AllS1`. No batchUpdate
+        // mock is registered — a call to it would fail the test.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {
+                "namedRangeId": "id-1",
+                "name": "AllS1",
+                "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 5,
+                          "startColumnIndex": 0, "endColumnIndex": 1},
+            },
+            {
+                "namedRangeId": "id-2",
+                "name": "Qty",
+                "range": {"sheetId": 0, "startRowIndex": 5, "endRowIndex": 10,
+                          "startColumnIndex": 0, "endColumnIndex": 1},
+            },
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: NamedRangeVerb::UpdateNamedRange {
+                name: "qty".to_string(),
+                new_name: Some("AllS1".to_string()),
+                sheet: None,
+                range: None,
+                whole_sheet: false,
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            NamedRangeResult::RefusedDuplicateName {
+                new_name,
+                existing_id,
+            } => {
+                assert_eq!(new_name, "AllS1");
+                assert_eq!(existing_id.as_deref(), Some("id-1"));
+            }
+            other => panic!("expected RefusedDuplicateName, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_named_range_allows_renaming_to_its_own_current_name() {
+        // A same-name "rename" (e.g. re-pointing the range while also
+        // passing --new-name equal to the current name) is not a
+        // collision with a *different* range.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([{
+            "namedRangeId": "id-1",
+            "name": "Foo",
+            "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 5,
+                      "startColumnIndex": 0, "endColumnIndex": 1},
+        }]))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: NamedRangeVerb::UpdateNamedRange {
+                name: "Foo".to_string(),
+                new_name: Some("foo".to_string()),
+                sheet: Some("Q2".to_string()),
+                range: None,
+                whole_sheet: true,
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, NamedRangeResult::Changed { .. }),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
+    async fn update_named_range_refuses_as_ambiguous_when_name_matches_two_ranges() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {
+                "namedRangeId": "id-1",
+                "name": "AllS1",
+                "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 5,
+                          "startColumnIndex": 0, "endColumnIndex": 1},
+            },
+            {
+                "namedRangeId": "id-2",
+                "name": "AllS1",
+                "range": {"sheetId": 0, "startRowIndex": 5, "endRowIndex": 10,
+                          "startColumnIndex": 0, "endColumnIndex": 1},
+            },
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: NamedRangeVerb::DeleteNamedRange {
+                name: "AllS1".to_string(),
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                NamedRangeResult::RefusedAmbiguousName { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+    }
+
+    #[tokio::test]
     async fn delete_named_range_dry_run_reports_referencing_formulas_without_a_decoy_match() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
@@ -1534,6 +1869,50 @@ mod tests {
             NamedRangeResult::RefusedNoVisibleParents,
         );
         assert!(describe(&out).contains("sheets-structure"));
+    }
+
+    #[test]
+    fn describe_lines_renders_ambiguous_name_with_candidates() {
+        let out = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            NamedRangeResult::RefusedAmbiguousName {
+                name: "AllS1".to_string(),
+                candidates: vec!["id-1".to_string(), "id-2".to_string()],
+            },
+        );
+        let text = describe(&out);
+        assert!(text.contains("AllS1"), "{text}");
+        assert!(text.contains("id-1"), "{text}");
+        assert!(text.contains("id-2"), "{text}");
+        assert!(text.contains("ambiguous"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_duplicate_name_with_and_without_an_id() {
+        let with_id = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            NamedRangeResult::RefusedDuplicateName {
+                new_name: "AllS1".to_string(),
+                existing_id: Some("id-1".to_string()),
+            },
+        );
+        let text = describe(&with_id);
+        assert!(text.contains("AllS1"), "{text}");
+        assert!(text.contains("id-1"), "{text}");
+
+        let without_id = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            NamedRangeResult::RefusedDuplicateName {
+                new_name: "AllS1".to_string(),
+                existing_id: None,
+            },
+        );
+        let text = describe(&without_id);
+        assert!(text.contains("AllS1"), "{text}");
+        assert!(!text.contains("(id"), "{text}");
     }
 
     #[test]
@@ -2346,6 +2725,22 @@ mod tests {
             }
             .log_status(),
             "refused-not-found"
+        );
+        assert_eq!(
+            NamedRangeResult::RefusedAmbiguousName {
+                name: String::new(),
+                candidates: Vec::new(),
+            }
+            .log_status(),
+            "refused-ambiguous-name"
+        );
+        assert_eq!(
+            NamedRangeResult::RefusedDuplicateName {
+                new_name: String::new(),
+                existing_id: None,
+            }
+            .log_status(),
+            "refused-duplicate-name"
         );
         assert_eq!(
             NamedRangeResult::Failed {
