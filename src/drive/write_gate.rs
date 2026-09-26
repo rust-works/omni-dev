@@ -397,6 +397,32 @@ impl DriveOperation {
             | Self::DocsWrite => Verdict::Deny,
         }
     }
+
+    /// Whether an `Allow` verdict for this operation is ever backed by a
+    /// Drive write lease requirement (issue #1917).
+    ///
+    /// `Read` never mutates anything, and `Create`/`Upload` write into a
+    /// **new** file — there is no existing content for a lease to protect,
+    /// and neither engine (`create.rs`, `upload.rs`) ever gates on
+    /// `require_lease`; the field appears on their `LeasedWrite` values
+    /// only in test fixtures. Every other operation replaces or otherwise
+    /// mutates a target's existing content and does gate on it via
+    /// [`decided_rule_requires_lease`]. This is consulted only by
+    /// `drive permissions check`'s diagnostic, to keep it from reporting a
+    /// lease requirement an operation could never actually be asked to
+    /// satisfy — it does not itself change what any engine enforces.
+    #[must_use]
+    pub const fn ever_requires_lease(self) -> bool {
+        match self {
+            Self::Read | Self::Create | Self::Upload => false,
+            Self::Edit
+            | Self::SheetsWrite
+            | Self::SheetsStructure
+            | Self::SheetsDelete
+            | Self::SheetsProtection
+            | Self::DocsWrite => true,
+        }
+    }
 }
 
 /// One configured permission rule, keyed on **either** a folder id or a
@@ -986,6 +1012,34 @@ mod tests {
                 "{op:?} should default-deny"
             );
             assert_eq!(decision.decided_by, None);
+        }
+    }
+
+    #[test]
+    fn ever_requires_lease_is_false_for_read_create_and_upload() {
+        for op in [
+            DriveOperation::Read,
+            DriveOperation::Create,
+            DriveOperation::Upload,
+        ] {
+            assert!(
+                !op.ever_requires_lease(),
+                "{op:?} should never take a lease"
+            );
+        }
+    }
+
+    #[test]
+    fn ever_requires_lease_is_true_for_every_content_mutating_operation() {
+        for op in [
+            DriveOperation::Edit,
+            DriveOperation::SheetsWrite,
+            DriveOperation::SheetsStructure,
+            DriveOperation::SheetsDelete,
+            DriveOperation::SheetsProtection,
+            DriveOperation::DocsWrite,
+        ] {
+            assert!(op.ever_requires_lease(), "{op:?} should be lease-eligible");
         }
     }
 

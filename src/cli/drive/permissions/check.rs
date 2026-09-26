@@ -119,7 +119,10 @@ pub struct CheckReport {
     /// Whether a write acting on this verdict would need a valid `--lease`
     /// token ([`write_gate::decided_rule_requires_lease`], ADR-0080 §1/§9).
     /// Only meaningful alongside `verdict: "allow"` — a denied write never
-    /// reaches the lease check either way.
+    /// reaches the lease check either way. Always `false` for `read`,
+    /// `create` and `upload` (issue #1917,
+    /// [`DriveOperation::ever_requires_lease`]) — none of the three ever
+    /// gates on a lease, whatever the resolved decision reports.
     pub requires_lease: bool,
 }
 
@@ -143,7 +146,9 @@ async fn run_check(
 ) -> Result<()> {
     let files_api = FilesApi::new(client);
     let evaluated = evaluate_target(&files_api, target_id, op, rules).await?;
-    let requires_lease = evaluated.requires_lease;
+    // `op` may never gate on a lease at all (issue #1917) — `read`,
+    // `create` and `upload` never do, whatever the resolved decision says.
+    let requires_lease = op.ever_requires_lease() && evaluated.requires_lease;
     let evaluated_via = evaluated_via(evaluated.source).to_string();
     let decision = evaluated.decision;
     let log_fields = write_gate::decided_by_log_fields(decision.decided_by.as_ref());
@@ -408,6 +413,55 @@ mod tests {
             .unwrap();
         assert_eq!(decision.decision.verdict, Verdict::Allow);
         assert!(!decision.requires_lease);
+    }
+
+    #[tokio::test]
+    async fn create_upload_and_read_never_report_requires_lease() {
+        // issue #1917: neither `create.rs` nor `upload.rs` ever gates on
+        // `require_lease`, and `read` never mutates anything at all, so
+        // `run_check`'s diagnostic must say `requires_lease: false`
+        // regardless of what the resolved decision's own (otherwise
+        // correct) `requires_lease` reports — even when an explicit
+        // matching rule leaves `require_lease` at its default `true`.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/folder-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "folder-1", "name": "folder-1", "mimeType": GOOGLE_FOLDER_MIME_TYPE,
+                })),
+            )
+            .mount(&server)
+            .await;
+        let files_api = FilesApi::new(&client);
+        let rules = [rule(
+            "folder-1",
+            false,
+            &[
+                DriveOperation::Create,
+                DriveOperation::Upload,
+                DriveOperation::Read,
+            ],
+        )];
+
+        for op in [
+            DriveOperation::Create,
+            DriveOperation::Upload,
+            DriveOperation::Read,
+        ] {
+            let evaluated = evaluate_target(&files_api, "folder-1", op, &rules)
+                .await
+                .unwrap();
+            assert_eq!(evaluated.decision.verdict, Verdict::Allow);
+            assert!(
+                evaluated.requires_lease,
+                "sanity: the raw decision should still say a lease is required for {op:?} \
+                 before `run_check`'s override is applied"
+            );
+            let requires_lease = op.ever_requires_lease() && evaluated.requires_lease;
+            assert!(!requires_lease, "{op:?} should never report requires_lease");
+        }
     }
 
     #[tokio::test]
