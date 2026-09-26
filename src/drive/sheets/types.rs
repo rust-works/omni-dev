@@ -1853,45 +1853,50 @@ pub struct BooleanRule {
     pub format: CellFormat,
 }
 
-/// `GradientRule` — a three-point color scale. `midpoint` absent means a
-/// plain two-color (min/max) scale.
+/// `GradientRule` — a color scale of two or three [`InterpolationPoint`]s.
+/// `midpoint` absent means a plain two-color scale.
 ///
 /// A documented cut (issue #1793), mirroring `validation.rs`'s "curate
-/// rather than chase every enum value" stance: the two endpoints are always
-/// anchored `MIN`/`MAX`. Sheets also allows an endpoint to be anchored at an
-/// explicit `NUMBER`/`PERCENT`/`PERCENTILE` value, which this crate doesn't
-/// build — `docs/drive.md` names this gap.
+/// rather than chase every enum value" stance: the endpoints this crate
+/// builds are always anchored `MIN`/`MAX`. Sheets also allows an endpoint to
+/// be anchored at an explicit `NUMBER`/`PERCENT`/`PERCENTILE` value, which
+/// this crate doesn't build — `docs/drive.md` names this gap — but reads
+/// back from a rule made in the Sheets UI.
+///
+/// Every point is optional, as in the API: this crate always sets
+/// `minpoint`/`maxpoint` when building a rule, and never sends back a rule
+/// it read, so the optionality only makes reads tolerant (issue #1944).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct GradientRule {
-    /// The color at the low end of the scale (anchored `MIN`).
-    #[serde(rename = "minColorStyle")]
-    pub min_color_style: ColorStyle,
-    /// The color at an optional midpoint.
+    /// The low end of the scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minpoint: Option<InterpolationPoint>,
+    /// An optional midpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub midpoint: Option<InterpolationPoint>,
-    /// The color at the high end of the scale (anchored `MAX`).
-    #[serde(rename = "maxColorStyle")]
-    pub max_color_style: ColorStyle,
+    /// The high end of the scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maxpoint: Option<InterpolationPoint>,
 }
 
-/// One color/anchor pair of a [`GradientRule`]'s midpoint —
-/// `InterpolationPoint`.
+/// One color/anchor pair of a [`GradientRule`] — `InterpolationPoint`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct InterpolationPoint {
-    /// The color at this point.
+    /// The color at this point. The API's deprecated plain `color` field,
+    /// which Sheets still echoes back alongside it, is ignored.
     #[serde(rename = "colorStyle")]
     pub color_style: ColorStyle,
-    /// One of Sheets' `NUMBER`/`PERCENT`/`PERCENTILE` (`MIN`/`MAX` are
-    /// reserved for [`GradientRule`]'s fixed endpoints and never appear
-    /// here). A plain string, the same tolerate-unmodelled stance as
+    /// One of Sheets' `MIN`/`MAX`/`NUMBER`/`PERCENT`/`PERCENTILE`. A plain
+    /// string, the same tolerate-unmodelled stance as
     /// [`BooleanCondition::condition_type`] — a rule read back with a type
     /// this crate doesn't build still round-trips.
     #[serde(rename = "type")]
     pub point_type: String,
     /// The threshold value, untouched — Sheets parses it at evaluation
     /// time, the same trust-the-caller stance the rest of this module
-    /// takes.
-    pub value: String,
+    /// takes. Absent for a `MIN`/`MAX` point, which has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 /// `AddConditionalFormatRuleRequest`.
@@ -4150,9 +4155,23 @@ mod tests {
                     },
                     {
                         "ranges": [{"sheetId": 0, "startRowIndex": 1, "endRowIndex": 2}],
+                        // The real read shape (issue #1944): each point an
+                        // `InterpolationPoint`, the deprecated `color` echoed
+                        // beside `colorStyle`, and no `value` on a `MIN`/`MAX`
+                        // point. A UI-made rule can anchor an endpoint at a
+                        // `NUMBER`, which this crate never builds.
                         "gradientRule": {
-                            "minColorStyle": {"rgbColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
-                            "maxColorStyle": {"rgbColor": {"red": 0.0, "green": 1.0, "blue": 0.0}},
+                            "minpoint": {
+                                "color": {"red": 1.0, "green": 1.0, "blue": 1.0},
+                                "colorStyle": {"rgbColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
+                                "type": "MIN",
+                            },
+                            "maxpoint": {
+                                "color": {"red": 0.0, "green": 1.0, "blue": 0.0},
+                                "colorStyle": {"rgbColor": {"red": 0.0, "green": 1.0, "blue": 0.0}},
+                                "type": "NUMBER",
+                                "value": "100",
+                            },
                         },
                     },
                 ],
@@ -4172,7 +4191,22 @@ mod tests {
         );
         assert!(rules[0].gradient_rule.is_none());
         assert!(rules[1].boolean_rule.is_none());
-        assert!(rules[1].gradient_rule.as_ref().unwrap().midpoint.is_none());
+        let gradient = rules[1].gradient_rule.as_ref().unwrap();
+        assert!(gradient.midpoint.is_none());
+        let min = gradient.minpoint.as_ref().unwrap();
+        assert_eq!(min.point_type, "MIN");
+        assert_eq!(min.value, None);
+        assert_eq!(
+            min.color_style.rgb_color,
+            Color {
+                red: 1.0,
+                green: 1.0,
+                blue: 1.0
+            }
+        );
+        let max = gradient.maxpoint.as_ref().unwrap();
+        assert_eq!(max.point_type, "NUMBER");
+        assert_eq!(max.value.as_deref(), Some("100"));
     }
 
     #[test]
