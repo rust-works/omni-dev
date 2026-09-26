@@ -436,6 +436,10 @@ pub struct IssueRoute {
     pub url: String,
     /// The issue title.
     pub title: String,
+    /// The issue's own open/closed state on GitHub — distinct from
+    /// `depends_on`'s `state`, which is always [`ItemState::Open`] and
+    /// describes a *citation*, not this issue.
+    pub state: ItemState,
     /// The routing, or why this issue could not be routed.
     #[serde(flatten)]
     pub outcome: RouteOutcome,
@@ -638,6 +642,7 @@ pub async fn run_route_with_reference_fetch_failures(
             item_ref,
             url: doc.url.clone(),
             title: doc.title.clone(),
+            state: doc.state,
             outcome,
             truncated,
         });
@@ -854,10 +859,11 @@ fn dependency_entries(
 ///
 /// Plain text, deliberately with no markdown: it's read directly in a
 /// terminal, which doesn't render `**bold**`/`*italic*` markers, so they'd
-/// just be clutter. Each issue is a header line (`ref — title`) followed by
-/// one indented line per fact — one per provider's routing, then `depends_on`
-/// — rather than one run-on sentence, which reads poorly once more than one
-/// provider is involved.
+/// just be clutter. Each issue is a header line (`ref — title`, with a
+/// trailing ` (closed)` when the issue itself is closed — relevant here since
+/// `--allow-closed` routes them) followed by one indented line per fact — one
+/// per provider's routing, then `depends_on` — rather than one run-on
+/// sentence, which reads poorly once more than one provider is involved.
 ///
 /// `max_input_chars` is threaded in explicitly rather than read off
 /// `RouteReport` (which doesn't carry it) so a truncated issue's block can
@@ -930,7 +936,12 @@ fn render_issue_block(
     } else {
         colorize(&item_ref, Complexity::Low, style)
     };
-    let mut lines = vec![format!("{item_ref} — {}", issue.title)];
+    let header = if issue.state == ItemState::Closed {
+        format!("{item_ref} — {} (closed)", issue.title)
+    } else {
+        format!("{item_ref} — {}", issue.title)
+    };
+    let mut lines = vec![header];
     match &issue.outcome {
         RouteOutcome::Routed {
             providers,
@@ -2338,6 +2349,7 @@ mod tests {
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
@@ -2374,6 +2386,7 @@ mod tests {
             item_ref: "o/r#1".to_string(),
             url: "u".to_string(),
             title: "t".to_string(),
+            state: ItemState::Open,
             outcome: RouteOutcome::Failed {
                 error: "HTTP 529".to_string(),
                 reference_fetch_failures: vec![],
@@ -2396,6 +2409,7 @@ mod tests {
                 item_ref: "rust-works/omni-dev#1641".to_string(),
                 url: "u".to_string(),
                 title: "Some issue title".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
@@ -2443,6 +2457,7 @@ mod tests {
                 item_ref: "rust-works/omni-dev#1845".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
@@ -2496,6 +2511,7 @@ mod tests {
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([
                         ("anthropic".to_string(), route("sonnet")),
@@ -2521,6 +2537,7 @@ mod tests {
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Failed {
                     error: "HTTP 529".to_string(),
                     reference_fetch_failures: vec![],
@@ -2534,6 +2551,27 @@ mod tests {
     }
 
     #[test]
+    fn render_route_text_marks_a_closed_issue_in_the_header() {
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                state: ItemState::Closed,
+                outcome: RouteOutcome::Failed {
+                    error: "HTTP 529".to_string(),
+                    reference_fetch_failures: vec![],
+                },
+                truncated: false,
+            }],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(text.starts_with("o/r#1 — t (closed)\n"), "{text}");
+    }
+
+    #[test]
     fn render_route_text_omits_the_depends_on_sentence_when_empty() {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
@@ -2541,6 +2579,7 @@ mod tests {
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
@@ -2572,6 +2611,7 @@ mod tests {
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
@@ -2604,6 +2644,7 @@ mod tests {
             item_ref: "o/r#1".to_string(),
             url: "u".to_string(),
             title: "t".to_string(),
+            state: ItemState::Open,
             outcome: RouteOutcome::Routed {
                 providers: BTreeMap::from([(
                     "anthropic".to_string(),
@@ -2640,6 +2681,7 @@ mod tests {
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
@@ -2672,6 +2714,7 @@ mod tests {
                 item_ref: "rust-works/omni-dev#1832".to_string(),
                 url: "u".to_string(),
                 title: "feat(drive): banded ranges for drive sheets (#1830)".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
@@ -2722,6 +2765,7 @@ mod tests {
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
@@ -2768,6 +2812,7 @@ mod tests {
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([
                         ("anthropic".to_string(), route("a,b")),
@@ -2812,6 +2857,7 @@ mod tests {
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([
                         ("anthropic".to_string(), multi_route),
@@ -2844,6 +2890,7 @@ mod tests {
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
@@ -2877,6 +2924,7 @@ mod tests {
             item_ref: item_ref.to_string(),
             url: "u".to_string(),
             title: "t".to_string(),
+            state: ItemState::Open,
             outcome: RouteOutcome::Failed {
                 error: "e".to_string(),
                 reference_fetch_failures: vec![],
@@ -3023,6 +3071,7 @@ mod tests {
             item_ref: "o/r#1".to_string(),
             url: "https://github.com/o/r/issues/1".to_string(),
             title: "t".to_string(),
+            state: ItemState::Open,
             outcome: RouteOutcome::Routed {
                 providers: BTreeMap::from([(
                     "anthropic".to_string(),
@@ -3046,6 +3095,7 @@ mod tests {
             item_ref: "o/r#2".to_string(),
             url: "https://github.com/o/r/issues/2".to_string(),
             title: "failed".to_string(),
+            state: ItemState::Open,
             outcome: RouteOutcome::Failed {
                 error: "HTTP 529".to_string(),
                 reference_fetch_failures: vec![],
@@ -3111,6 +3161,7 @@ mod tests {
                 item_ref: "o/r#1".to_string(),
                 url: "https://github.com/o/r/issues/1".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([(
                         "custom".to_string(),

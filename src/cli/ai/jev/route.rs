@@ -744,6 +744,7 @@ mod tests {
             item_ref: "o/r#1".to_string(),
             url: String::new(),
             title: String::new(),
+            state: ItemState::Open,
             outcome,
             truncated: false,
         };
@@ -801,6 +802,7 @@ mod tests {
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
+                state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
