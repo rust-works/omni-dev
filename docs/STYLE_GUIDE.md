@@ -43,7 +43,7 @@ A new convention needs to be added to this style guide.
 
 ### Guidance
 
-Assign the next sequential ID (currently next is `STYLE-0030`) and include:
+Assign the next sequential ID (currently next is `STYLE-0031`) and include:
 
 1. A **Tags** line immediately after the heading — a comma-separated list of category labels
    from the tag vocabulary below.
@@ -1570,3 +1570,48 @@ update where a parent link was meant — each costing a recovery round-trip or
 quietly corrupting data. #1049 fixed one tool (`jira_link_create`) to this bar;
 this checklist generalises it so the whole `src/mcp/` surface meets the same
 standard rather than drifting tool-by-tool.
+
+---
+
+## STYLE-0030: Secret environment variables go through the secret resolver
+
+**Tags:** `module-organization`, `api-design`, `testing`
+
+### Situation
+
+Reading a credential — an API key, token, client secret, private key — from the
+environment or from settings.json's `env` map, or adding a new one.
+
+### Guidance
+
+Register the variable in `SECRET_ENV_VARS`
+([`src/utils/secret_env.rs`](../src/utils/secret_env.rs)) and read it **only**
+through `secret_var` / `secret_var_any` (or `secret_var_is_set` for a
+presence-only status flag). Never pass it to `EnvSource::var`, `var_any`,
+`non_empty_var`, `Settings::get_env_var` or `std::env::var`.
+
+```rust
+// Good: accepts DATADOG_API_KEY or DATADOG_API_KEY_FILE, returns a Secret.
+let api_key = secret_var(env, DATADOG_API_KEY)?.ok_or(DatadogError::CredentialsNotFound)?;
+
+// Bad: no _FILE support, and a plain String.
+let api_key = env.var(DATADOG_API_KEY).ok_or(DatadogError::CredentialsNotFound)?;
+```
+
+The resolver gives every secret a `<NAME>_FILE` companion with one set of rules
+(absolute path, owner-only and owned by the current user, one trailing newline
+trimmed, both-set is an error per layer) — see
+[ADR-0089](adrs/adr-0089.md). Document `<NAME>_FILE` next to the variable in
+its operator guide. A secret-shaped name that genuinely must not accept `_FILE`
+goes in `EXEMPT_SECRET_ENV_VARS` with its reason. Test the call site's `_FILE`
+path with `MapEnv` and `test_support::env::secret_file` (STYLE-0028).
+
+### Motivation
+
+A secret in an environment variable leaks into `env` listings,
+`/proc/<pid>/environ`, shell history and child processes; `_FILE` is the
+Docker/Kubernetes way out. Implemented per call site it would drift into
+sixteen subtly different readers. The grep guards in `secret_env.rs` fail the
+build when a new secret-shaped literal is unregistered, when a registered one is
+read through a plain accessor, or when a `<NAME>_FILE` would collide with an
+existing variable.
