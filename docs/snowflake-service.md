@@ -283,11 +283,10 @@ session for each `(account, user)` is established.
 `SNOWFLAKE_TOKEN` and `SNOWFLAKE_PRIVATE_KEY` each also accept a `<NAME>_FILE`
 companion (`SNOWFLAKE_TOKEN_FILE`, `SNOWFLAKE_PRIVATE_KEY_FILE`) naming an
 absolute path to a file holding the secret — the Docker/Kubernetes secrets
-convention. The file must be a regular file owned by you with no group/other
-permission bits, and setting both `NAME` and `NAME_FILE` in the same place (both exported, or both in the same settings.json map) is an error.
+convention. The file must be a regular file that is either yours and owner-only (`chmod 600`), or owned by root and not writable by others (the shape Kubernetes and Docker secrets take), and setting both `NAME` and `NAME_FILE` in the same place (both exported, or both in the same settings.json map) is an error.
 See [ADR-0089](adrs/adr-0089.md). The legacy `SNOWFLAKE_PRIVATE_KEY_PATH`
 alias still outranks `SNOWFLAKE_PRIVATE_KEY_FILE` and now gets the same
-checks (absolute path, `0600`/`0400`, owned by you) — previously it accepted
+checks (absolute path; yours and owner-only, or root-owned and not writable by others) — previously it accepted
 a relative path or a looser file mode.
 
 ### External-browser SSO (default)

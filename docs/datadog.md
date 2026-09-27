@@ -61,8 +61,7 @@ for on-prem Datadog or when routing traffic through a corporate proxy.
 `DATADOG_API_KEY` and `DATADOG_APP_KEY` each also accept a `<NAME>_FILE`
 companion (`DATADOG_API_KEY_FILE`, `DATADOG_APP_KEY_FILE`) naming an absolute
 path to a file holding the key, instead of the value itself — the
-Docker/Kubernetes secrets convention. The file must be a regular file owned
-by you with no group/other permission bits, and setting both `NAME` and
+Docker/Kubernetes secrets convention. The file must be a regular file that is either yours and owner-only (`chmod 600`), or owned by root and not writable by others (the shape Kubernetes and Docker secrets take), and setting both `NAME` and
 `NAME_FILE` in the same place (both exported, or both in the same settings.json map) is an error. See [ADR-0089](adrs/adr-0089.md).
 
 ### Known sites
