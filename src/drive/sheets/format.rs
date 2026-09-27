@@ -1063,11 +1063,11 @@ fn describe_effect(verb: &FormatVerb, discarded_cells: &[String]) -> Result<Stri
                 // §4 / #1880. This preview substitutes for a confirmation
                 // flag and names exactly what would be lost; eliding it
                 // would silently weaken that guarantee, which is an ADR
-                // change, not a formatting one. The list only ever
-                // contains non-top-left, non-blank cells of a
-                // caller-chosen merge range, which in practice is small,
-                // and it is already one line rather than one line per
-                // entry (unlike `paste`'s pre-#1880 shape).
+                // change, not a formatting one. Nothing bounds the merge
+                // range's populated-cell count, so a large, densely
+                // populated range still produces a long line — accepted
+                // for now (see #1880's follow-up) rather than applying
+                // `render_locations`'s elision here.
                 Ok(format!(
                     "merge ({merge_type}), discarding {} cell(s): {}",
                     discarded_cells.len(),
