@@ -48,18 +48,29 @@
 //! `--paste-type format` reads no values at all, the same as
 //! `format-cells`' preview.
 //!
-//! **Grid-edge behaviour is undocumented and not verified here.** Whether
-//! the API errors or expands the grid when a destination runs past the
-//! sheet's current extent is left as an open item (ADR-0083 §5) — this
-//! module never prepends a structural request to grow the grid first (that
-//! would smuggle `SheetsStructure` into a `SheetsWrite`-gated batch), and a
-//! preview whose extent exceeds the sheet's known dimensions carries a
-//! fixed caveat naming the uncertainty rather than guessing which way the
-//! API will go. The *preview read* is a separate question from the written
-//! extent and is clipped to the sheet's current grid
-//! ([`grid_range::clamp_to_sheet`]): `values.get` refuses a range past the
-//! edge outright, so reading the unclipped extent would turn the very case
-//! the caveat exists to report into an opaque failure.
+//! **Grid-edge behaviour is verified live (#1937): the API grows the
+//! grid** when a written extent runs past the sheet's current
+//! `rowCount`/`columnCount`, for all three verbs — `copyPaste`/
+//! `pasteData` were measured first (1000x26 → 1001x27), and `cutPaste`
+//! confirmed identically (a 10-row sheet grew to 11 rows to fit a
+//! 3-row-tall block landing on rows 8-10). This module still never
+//! prepends a structural request to grow the grid first (that would
+//! smuggle `SheetsStructure` into a `SheetsWrite`-gated batch) — there is
+//! nothing to smuggle now that growth is the verified, API-driven outcome
+//! — and a preview whose extent exceeds the sheet's known dimensions
+//! carries a caveat naming that growth rather than an uncertainty. The
+//! *preview read* is a separate question from the written extent and is
+//! clipped to the sheet's current grid ([`grid_range::clamp_to_sheet`]):
+//! `values.get` refuses a range past the edge outright, so reading the
+//! unclipped extent would turn the very case the caveat exists to report
+//! into an opaque failure. (`cutPaste`'s destination *coordinate* is a
+//! separate matter from the block it anchors: measured live, the API
+//! refuses outright — a plain 400, surfaced here as an ordinary `Failed`,
+//! with no special-casing — when the coordinate itself lies past the last
+//! existing row/column; only a coordinate inside the grid whose block
+//! then spills past the edge triggers growth. This crate performs no
+//! extent check of its own on the destination coordinate, so that
+//! refusal is entirely the API's.)
 //!
 //! **Destination must be fully bounded** for every verb, the same
 //! restriction `merge-cells`/`insert-range` place on their own ranges: an
@@ -269,9 +280,9 @@ pub struct PasteChange {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleared: Option<Vec<String>>,
     /// Set when `written_extent` runs past the sheet's currently allocated
-    /// rows/columns — whether the API errors or silently expands the grid
-    /// in that case is undocumented and unverified (ADR-0083 §5); this
-    /// names the uncertainty rather than guessing.
+    /// rows/columns — verified live (#1937): the API grows the grid to
+    /// fit rather than erroring, for all three verbs. This names that
+    /// growth rather than an uncertainty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grid_edge_caveat: Option<String>,
 }
@@ -598,8 +609,8 @@ async fn paste_inner(
     };
 
     let grid_edge_caveat = sheet_exceeds_dimensions(&workbook, &extent).then(|| {
-        "written extent runs past the sheet's currently allocated rows/columns; whether the API \
-         errors or expands the grid here is undocumented and unverified"
+        "written extent runs past the sheet's currently allocated rows/columns; Sheets grows \
+         the sheet to fit (verified live, #1937)"
             .to_string()
     });
 
