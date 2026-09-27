@@ -674,9 +674,9 @@ fn parse_item_response(
 /// Fetches a set of references that may be issues or pull requests.
 ///
 /// Tolerates a per-reference "not found" (`None`) rather than failing the
-/// whole call, including a reference into a repository that doesn't exist
-/// or that gh can't see — used by `route` and `verify-decision` to resolve
-/// citations. Returns one entry per `refs`, in the same order.
+/// whole call, including a reference into a repository GitHub reports as
+/// `NOT_FOUND` — used by `route` and `verify-decision` to resolve citations.
+/// Any other error (e.g. an SSO-gated org's `FORBIDDEN`) still fails it. Returns one entry per `refs`, in the same order.
 /// **Blocking** — callers must be on a blocking thread.
 pub fn fetch_items(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<IssueDoc>>> {
     let mut by_key = HashMap::with_capacity(refs.len());
