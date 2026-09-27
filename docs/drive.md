@@ -3039,10 +3039,41 @@ stay on `sheets-structure` alone.
 API uses. `update-filter-view`'s `--sort-by`/`--hide-values` **merge** onto
 the view's existing sort order and criteria: a given column's entry is
 replaced (or appended, for a new sort column), but every other column's
-entry survives untouched. This matters because Sheets' own `fields` mask
-would otherwise replace `sortSpecs`/`criteria` wholesale — `--clear-sort`/
-`--clear-criteria` reset to empty first, if that whole-replacement behavior
-is actually what you want.
+entry survives untouched. So `--sort-by 1:asc` on a view sorted `[2 desc]`
+leaves it sorted `[2 desc, 1 asc]`.
+
+`--clear-sort` and `--clear-criteria` reset to empty first, so they **clear**
+on their own and **replace** when combined with `--sort-by`/`--hide-values`:
+`--clear-sort --sort-by 0:asc` on a view sorted `[2 desc, 3 desc]` leaves it
+sorted `[0 asc]` alone (issue #1931). How they get there follows from how
+Sheets' `updateFilterView` actually behaves, which live testing showed is a
+merge, never a replacement, whatever the `fields` mask says:
+
+- **Sort order:** the sort columns sent go first, followed by every
+  existing sort column not sent. An empty `sortSpecs` changes nothing, and
+  no request body removes a sort column, even with `fields: "*"`. So
+  `update-filter-view` always sends the full resulting order — which lands
+  exactly when it still names every column the view sorts by — and when
+  the change *drops* a sort column (only `--clear-sort` can), it instead
+  deletes the view and re-adds it **under the same id** with the full
+  resulting state, in one atomic `batchUpdate`. The view's
+  `--filter-view-id` does not change. `--dry-run` and the report say when
+  this re-creation happens. A view that reads back with no grid range
+  cannot be re-created that way, so the command refuses unless you pass
+  `--sheet`/`--range`.
+- **Criteria:** each column sent replaces that column's criteria, and a
+  column not sent is left alone; an empty `criteria` changes nothing. So
+  `--hide-values` sends only the columns it names, and `--clear-criteria`
+  sends `{}` for each column the view filters on, which stops it filtering
+  that column. Sheets keeps a reset column as an empty entry (`"1": {}`)
+  rather than removing it; `list-filter-views` leaves such columns out of
+  its text output.
+
+A re-created view keeps its title, range, sort order and criteria, including
+criteria this crate does not model (a `condition` set in the Sheets UI, for
+example), which are carried over verbatim. A sort by cell colour is not
+modelled: any update that sends the sort order (`--sort-by`, `--clear-sort`)
+turns it back into a plain sort by value.
 
 **Two things this issue does not cover.** `duplicateFilterView` has no CLI
 verb — the issue's own proposed scope omits it, though the API supports it.
