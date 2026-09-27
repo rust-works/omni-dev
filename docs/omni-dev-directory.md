@@ -307,6 +307,13 @@ Any other environment variable consulted via `Settings::get_env_var` can also
 be set under the same `env` map (including API keys for `CLAUDE_API_KEY`,
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.).
 
+Every secret variable listed above also accepts a `<NAME>_FILE` companion
+naming an absolute path to a file holding the secret, instead of the value
+itself — the Docker/Kubernetes secrets convention. See
+[ADR-0089](adrs/adr-0089.md) for the resolution rules. `auth login` writing a
+secret removes its `_FILE` companion from the same map, and `auth logout`
+removes both.
+
 ### `local/`
 
 `{dir}/local/` is a gitignored sub-directory that mirrors the layout of

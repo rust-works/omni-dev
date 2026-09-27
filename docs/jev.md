@@ -71,6 +71,14 @@ persist the key, add it to that map by hand.
 
 One of the two key variables is required. An empty value counts as unset.
 
+Both `TYPESAFE_API_KEY` and `OMNI_DEV_JEV_API_KEY` also accept a `<NAME>_FILE`
+companion (`TYPESAFE_API_KEY_FILE`, `OMNI_DEV_JEV_API_KEY_FILE`) naming an
+absolute path to a file holding the key instead of the value itself — the
+Docker/Kubernetes secrets convention. The file must be a regular file owned
+by you with no group/other permission bits, its contents are trimmed of one
+trailing newline, and setting both `NAME` and `NAME_FILE` in the same place (both exported, or both in the same settings.json map)
+is an error. See [ADR-0089](adrs/adr-0089.md).
+
 Each variable is looked up in the process environment first, then in the
 `settings.json` `env` map, so an exported shell or CI variable always wins:
 

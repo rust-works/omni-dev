@@ -633,6 +633,13 @@ export ATLASSIAN_API_TOKEN=your-token
 
 Environment variables take precedence over the settings file.
 
+`ATLASSIAN_API_TOKEN` also accepts an `ATLASSIAN_API_TOKEN_FILE` companion
+naming an absolute path to a file holding the token, instead of the value
+itself — the Docker/Kubernetes secrets convention. The file must be a
+regular file owned by you with no group/other permission bits, and setting
+both `ATLASSIAN_API_TOKEN` and `ATLASSIAN_API_TOKEN_FILE` in the same place
+(both exported, or both in the same settings.json map) is an error. See [ADR-0089](adrs/adr-0089.md).
+
 To keep multiple Atlassian tenants (e.g. `work` and `personal`) on one machine
 and pick one per command, store each tenant's variables in a named **profile**
 and select it with `--profile <name>` (or `OMNI_DEV_PROFILE`). See
