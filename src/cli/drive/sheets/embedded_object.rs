@@ -362,9 +362,10 @@ pub struct AddSlicerCommand {
     #[arg(long, value_name = "A1")]
     pub range: String,
 
-    /// The 0-based column within `--range` the filter criteria apply to —
-    /// not an A1 letter, the same indexing `--hide-values`/`--sort-by` use
-    /// on `set-basic-filter`.
+    /// The absolute 0-based sheet column the filter criteria apply to (`0`
+    /// = column A), not an A1 letter and not an offset within `--range` —
+    /// for `--range B2:F8`, column F is `5`. Must fall inside `--range`'s
+    /// columns; anything else is refused, `--dry-run` included.
     #[arg(long, value_name = "N")]
     pub column: i64,
 
@@ -460,7 +461,10 @@ pub struct UpdateSlicerCommand {
     #[arg(long, value_name = "A1")]
     pub range: Option<String>,
 
-    /// Replace the filtered column.
+    /// Replace the filtered column — an absolute 0-based sheet column (`0`
+    /// = column A), like `add-slicer --column`. Must fall inside the
+    /// slicer's range (the new `--range` when given, else its existing
+    /// one).
     #[arg(long, value_name = "N")]
     pub column: Option<i64>,
 

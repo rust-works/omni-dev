@@ -197,7 +197,9 @@ pub enum EmbeddedObjectVerb {
         sheet: Option<String>,
         /// The range the slicer filters.
         range: String,
-        /// The 0-based column within `range` the filter criteria apply to.
+        /// The absolute 0-based sheet column (`0` = column A) the filter
+        /// criteria apply to — not an offset within `range`. Must fall
+        /// inside `range`'s columns.
         column: i64,
         /// Values to hide in `column`.
         hide_values: Vec<String>,
@@ -227,7 +229,9 @@ pub enum EmbeddedObjectVerb {
         sheet: Option<String>,
         /// Replace the filtered range, when set.
         range: Option<String>,
-        /// Replace the filtered column, when set.
+        /// Replace the filtered column, when set — an absolute 0-based
+        /// sheet column (`0` = column A), which must fall inside the
+        /// slicer's (new or existing) range.
         column: Option<i64>,
         /// Replace the hidden-value criteria, when non-empty.
         hide_values: Vec<String>,
@@ -1806,6 +1810,53 @@ fn build_delete_chart(workbook: &Spreadsheet, chart_id: i64) -> Result<Plan, Emb
 
 // ── add-slicer / update-slicer / delete-slicer ──────────────────────────
 
+/// Refuses a slicer filter column that falls outside the slicer's data
+/// range (issue #1945).
+///
+/// `SlicerSpec.columnIndex` is an **absolute** sheet column index (`0` =
+/// column A), not an offset within the range — so for a range of
+/// `B2:F8` the valid columns are `1..=5` (B–F). The live API rejects
+/// anything else with a `400`; checking here means `--dry-run` catches it
+/// too. An open-ended edge of the range (e.g. a whole-row `2:5`) leaves
+/// that side unbounded.
+fn check_slicer_column_in_range(
+    column: i64,
+    range: &GridRange,
+) -> Result<(), EmbeddedObjectResult> {
+    let start = range.start_column_index.unwrap_or(0);
+    let end = range.end_column_index;
+    let inside = column >= start && end.is_none_or(|end| column < end);
+    if inside {
+        return Ok(());
+    }
+    let column_label = if column >= 0 {
+        format!(
+            "{column} (column {})",
+            grid_range::column_index_to_letters(column)
+        )
+    } else {
+        column.to_string()
+    };
+    let valid = match end {
+        Some(end) if end <= start => "none (the range spans no columns)".to_string(),
+        Some(end) => format!(
+            "{start}..={} ({}–{})",
+            end - 1,
+            grid_range::column_index_to_letters(start),
+            grid_range::column_index_to_letters(end - 1)
+        ),
+        None => format!(
+            "{start} or greater ({} onward)",
+            grid_range::column_index_to_letters(start)
+        ),
+    };
+    Err(invalid(format!(
+        "slicer column {column_label} is outside the slicer's range; valid columns are \
+         {valid} — the column is an absolute sheet column index (0 = A), not an offset \
+         within the range"
+    )))
+}
+
 fn build_add_slicer(
     workbook: &Spreadsheet,
     verb: &EmbeddedObjectVerb,
@@ -1828,6 +1879,7 @@ fn build_add_slicer(
     };
 
     let data_range = compose_and_resolve(workbook, sheet.as_deref(), range)?;
+    check_slicer_column_in_range(*column, &data_range)?;
     let (position, position_sheet_id) = overlay_position(
         workbook,
         sheet.as_deref(),
@@ -1923,6 +1975,24 @@ fn build_update_slicer(
         spec.column_index = Some(*column);
         fields.push("columnIndex");
         changed.push("column");
+    }
+    // Only a change to the range or the column can move one outside the
+    // other, so a title- or criteria-only update never re-litigates the
+    // slicer's existing state. Whichever half isn't being replaced comes
+    // from the slicer as it stands.
+    if range.is_some() || column.is_some() {
+        let existing = slicer.spec.as_ref();
+        let effective_range = spec
+            .data_range
+            .as_ref()
+            .or_else(|| existing.and_then(|s| s.data_range.as_ref()));
+        let effective_column = spec
+            .column_index
+            .or_else(|| existing.and_then(|s| s.column_index));
+        if let (Some(effective_range), Some(effective_column)) = (effective_range, effective_column)
+        {
+            check_slicer_column_in_range(effective_column, effective_range)?;
+        }
     }
     if let Some(title) = title {
         spec.title = Some(title.clone());
@@ -4123,6 +4193,220 @@ mod tests {
             matches!(outcome.result, EmbeddedObjectResult::WouldChange { .. }),
             "{:?}",
             outcome.result
+        );
+    }
+
+    /// Runs `verb` against a one-sheet (`Q1`) workbook carrying slicer 4
+    /// over `B2:F8` filtering absolute column 5 (F), with a `batchUpdate`
+    /// mock that echoes a new slicer id — so a refusal proves the check
+    /// ran before the call, not that the call failed. The real run carries
+    /// a valid lease so it reaches the plan builder (issue #1945).
+    async fn run_slicer_column_verb(
+        verb: EmbeddedObjectVerb,
+        dry_run: bool,
+    ) -> EmbeddedObjectResult {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {
+                "properties": {"sheetId": 0, "title": "Q1", "index": 0},
+                "slicers": [{
+                    "slicerId": 4,
+                    "spec": {
+                        "title": "Region",
+                        "columnIndex": 5,
+                        "dataRange": {
+                            "sheetId": 0,
+                            "startRowIndex": 1, "endRowIndex": 8,
+                            "startColumnIndex": 1, "endColumnIndex": 6,
+                        },
+                    },
+                    "position": {"overlayPosition": {"anchorCell": {"sheetId": 0, "rowIndex": 0, "columnIndex": 7}}},
+                }],
+            },
+        ]))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{"addSlicer": {"slicer": {"slicerId": 8}}}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = if dry_run {
+            (None, std::path::PathBuf::new())
+        } else {
+            leased_opts_for("sheet-1")
+        };
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run,
+            lease_token,
+            ledger_path,
+        };
+        embedded_object(&drive, &sheets, &opts, &rules).await.result
+    }
+
+    fn add_slicer_over(range: &str, column: i64) -> EmbeddedObjectVerb {
+        EmbeddedObjectVerb::AddSlicer {
+            sheet: Some("Q1".to_string()),
+            range: range.to_string(),
+            column,
+            hide_values: Vec::new(),
+            title: None,
+            apply_to_pivot_tables: None,
+            anchor: "H2".to_string(),
+            offset_x: None,
+            offset_y: None,
+            width: None,
+            height: None,
+        }
+    }
+
+    fn update_slicer_4(range: Option<&str>, column: Option<i64>) -> EmbeddedObjectVerb {
+        EmbeddedObjectVerb::UpdateSlicer {
+            slicer_id: 4,
+            sheet: Some("Q1".to_string()),
+            range: range.map(str::to_string),
+            column,
+            hide_values: Vec::new(),
+            clear_criteria: false,
+            title: None,
+            apply_to_pivot_tables: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn add_slicer_refuses_a_column_outside_the_range_under_both_dry_run_and_a_real_run() {
+        // Column 0 is absolute column A, left of B2:F8 — the live API 400s it.
+        for dry_run in [true, false] {
+            let result = run_slicer_column_verb(add_slicer_over("B2:F8", 0), dry_run).await;
+            assert_invalid(&result, "0 (column A) is outside the slicer's range");
+            assert_invalid(&result, "1..=5 (B–F)");
+        }
+    }
+
+    #[tokio::test]
+    async fn add_slicer_accepts_an_absolute_column_inside_a_range_not_starting_at_a() {
+        // Column 5 is absolute column F — inside B2:F8, though it would be
+        // out of bounds read as an offset within the range.
+        let preview = run_slicer_column_verb(add_slicer_over("B2:F8", 5), true).await;
+        assert!(
+            matches!(preview, EmbeddedObjectResult::WouldChange { .. }),
+            "{preview:?}"
+        );
+        let real = run_slicer_column_verb(add_slicer_over("B2:F8", 5), false).await;
+        assert!(
+            matches!(
+                real,
+                EmbeddedObjectResult::Changed {
+                    object_id: Some(8),
+                    ..
+                }
+            ),
+            "{real:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_slicer_refuses_a_column_outside_the_range_under_both_dry_run_and_a_real_run() {
+        let cases = [
+            // A new column outside the slicer's existing B2:F8 range.
+            (
+                update_slicer_4(None, Some(0)),
+                "0 (column A)",
+                "1..=5 (B–F)",
+            ),
+            // One column past the right edge (G).
+            (
+                update_slicer_4(None, Some(6)),
+                "6 (column G)",
+                "1..=5 (B–F)",
+            ),
+            // A new range the slicer's existing column 5 (F) falls outside.
+            (
+                update_slicer_4(Some("H1:J5"), None),
+                "5 (column F)",
+                "7..=9 (H–J)",
+            ),
+            // Both replaced, still mismatched.
+            (
+                update_slicer_4(Some("H1:J5"), Some(1)),
+                "1 (column B)",
+                "7..=9 (H–J)",
+            ),
+        ];
+        for (verb, column, valid) in cases {
+            for dry_run in [true, false] {
+                let result = run_slicer_column_verb(verb.clone(), dry_run).await;
+                assert_invalid(&result, column);
+                assert_invalid(&result, valid);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn update_slicer_accepts_an_absolute_column_inside_a_range_not_starting_at_a() {
+        for verb in [
+            update_slicer_4(None, Some(5)),
+            update_slicer_4(Some("C2:F8"), None),
+            update_slicer_4(Some("H1:J5"), Some(9)),
+        ] {
+            let result = run_slicer_column_verb(verb, true).await;
+            assert!(
+                matches!(result, EmbeddedObjectResult::WouldChange { .. }),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_slicer_column_in_range_leaves_an_open_ended_edge_unbounded() {
+        let whole_rows = GridRange {
+            sheet_id: 0,
+            start_row_index: Some(1),
+            end_row_index: Some(5),
+            start_column_index: None,
+            end_column_index: None,
+        };
+        assert!(check_slicer_column_in_range(0, &whole_rows).is_ok());
+        assert!(check_slicer_column_in_range(700, &whole_rows).is_ok());
+        let from_c = GridRange {
+            start_column_index: Some(2),
+            ..whole_rows
+        };
+        assert!(check_slicer_column_in_range(2, &from_c).is_ok());
+        assert_invalid(
+            &check_slicer_column_in_range(1, &from_c).unwrap_err(),
+            "valid columns are 2 or greater (C onward)",
+        );
+        assert_invalid(
+            &check_slicer_column_in_range(-1, &from_c).unwrap_err(),
+            "slicer column -1 is outside",
+        );
+        let empty = GridRange {
+            start_column_index: Some(2),
+            end_column_index: Some(2),
+            ..whole_rows
+        };
+        assert_invalid(
+            &check_slicer_column_in_range(2, &empty).unwrap_err(),
+            "the range spans no columns",
         );
     }
 

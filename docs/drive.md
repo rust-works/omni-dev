@@ -3019,9 +3019,10 @@ omni-dev drive sheets list-charts <ID>
 omni-dev drive sheets update-chart <ID> --chart-id 3 --title 'Revenue (final)'
 omni-dev drive sheets delete-chart <ID> --chart-id 3
 
-# A slicer, filtering column 1 (0-based) of the range.
-omni-dev drive sheets add-slicer <ID> --sheet Q1 --range A1:D100 \
-  --column 1 --hide-values Closed,Cancelled --title Status --anchor F2
+# A slicer over B1:E100, filtering on column D — absolute index 3
+# (0 = A), not an offset within the range.
+omni-dev drive sheets add-slicer <ID> --sheet Q1 --range B1:E100 \
+  --column 3 --hide-values Closed,Cancelled --title Status --anchor G2
 
 omni-dev drive sheets list-slicers <ID>
 omni-dev drive sheets update-slicer <ID> --slicer-id 4 --hide-values Closed
@@ -3040,10 +3041,17 @@ every field this crate doesn't model (styling, `hiddenDimensionStrategy`,
 …) exactly as read. `update-slicer` is the opposite case — `updateSlicerSpec`
 *does* take a field mask, so only the flags actually set are ever sent.
 
-**`--column` is a 0-based index, not an A1 letter** — the same indexing
-`set-basic-filter`'s `--hide-values`/`--sort-by` use. `FilterCriteria`
-support is `hiddenValues` only, the same cut `set-basic-filter`/
-`add-filter-view` make.
+**`--column` is an absolute 0-based sheet column index, not an A1 letter
+and not an offset within `--range`** — `0` is column A wherever the range
+starts, which is what Sheets' `SlicerSpec.columnIndex` actually means. For
+`--range B2:F8` the valid values are `1`-`5` (B-F): `--column 5` filters
+column F, and `--column 0` names column A, outside the range. The column
+must fall inside the range's columns — on `update-slicer`, inside the new
+`--range` when one is given, else the slicer's existing range, and an
+existing `--column` is re-checked against a new `--range` — and anything
+else is refused locally, under `--dry-run` too, rather than surfacing as a
+live `400`. `FilterCriteria` support is `hiddenValues` only, the same cut
+`set-basic-filter`/`add-filter-view` make.
 
 **`--pie-hole` is validated two ways**, on both `add-chart` and
 `update-chart`: the value must be `0.0`-`1.0` inclusive, and it is refused

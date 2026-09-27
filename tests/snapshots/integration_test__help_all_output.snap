@@ -4823,7 +4823,7 @@ Arguments:
 Options:
       --sheet <NAME>                  Sheet title, supplying the prefix for `--range`/`--anchor` when they don't carry their own
       --range <A1>                    The range the slicer filters
-      --column <N>                    The 0-based column within `--range` the filter criteria apply to — not an A1 letter, the same indexing `--hide-values`/`--sort-by` use on `set-basic-filter`
+      --column <N>                    The absolute 0-based sheet column the filter criteria apply to (`0` = column A), not an A1 letter and not an offset within `--range` — for `--range B2:F8`, column F is `5`. Must fall inside `--range`'s columns; anything else is refused, `--dry-run` included
       --hide-values <VALUES>          A value to hide in `--column`. Repeatable
       --title <TITLE>                 A human-readable name for the slicer
       --apply-to-pivot-tables <BOOL>  Whether this slicer also filters pivot tables built from `--range` [possible values: true, false]
@@ -6464,7 +6464,7 @@ Options:
       --slicer-id <ID>                Which slicer to change, discovered via `list-slicers`
       --sheet <NAME>                  Sheet title, supplying the prefix for `--range` when it doesn't carry its own
       --range <A1>                    Replace the filtered range
-      --column <N>                    Replace the filtered column
+      --column <N>                    Replace the filtered column — an absolute 0-based sheet column (`0` = column A), like `add-slicer --column`. Must fall inside the slicer's range (the new `--range` when given, else its existing one)
       --hide-values <VALUES>          Replace the hidden-value criteria. Repeatable
       --clear-criteria                Reset the filter criteria to empty
       --title <TITLE>                 Change the title
