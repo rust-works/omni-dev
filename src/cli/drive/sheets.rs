@@ -1362,9 +1362,11 @@ mod tests {
                 clear_tab_color: false,
                 right_to_left: None,
                 hide_gridlines: None,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: structure::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table,
+                },
             }),
             &client,
         )

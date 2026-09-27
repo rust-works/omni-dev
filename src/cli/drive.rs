@@ -670,9 +670,11 @@ mod tests {
                 index: None,
                 rows: None,
                 columns: None,
-                dry_run: false,
-                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                output: OutputFormat::Table,
+                write: sheets::structure::StructureWriteArgs {
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
             }),
         });
         // Reaches the engine, which never returns `Err` — every failure is a
@@ -692,9 +694,11 @@ mod tests {
                     spreadsheet_id: "sheet-1".to_string(),
                     sheet: "Q2".to_string(),
                     title: "Q3".to_string(),
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: sheets::structure::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -713,9 +717,11 @@ mod tests {
                 sheet: "Q2".to_string(),
                 at: 5,
                 count: 3,
-                dry_run: false,
-                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                output: OutputFormat::Table,
+                write: sheets::structure::StructureWriteArgs {
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
             }),
         });
         assert!(cmd.dispatch(&dead_client()).await.is_ok());
@@ -734,9 +740,11 @@ mod tests {
                     sheet: "Q2".to_string(),
                     at: 2,
                     count: 1,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: sheets::structure::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -756,9 +764,11 @@ mod tests {
                 at: 5,
                 count: 3,
                 before: 10,
-                dry_run: false,
-                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                output: OutputFormat::Table,
+                write: sheets::structure::StructureWriteArgs {
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
             }),
         });
         assert!(cmd.dispatch(&dead_client()).await.is_ok());
@@ -778,9 +788,11 @@ mod tests {
                     at: 5,
                     count: 3,
                     before: 10,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: sheets::structure::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -873,9 +885,11 @@ mod tests {
                 sheets::structure::DeleteSheetCommand {
                     spreadsheet_id: "sheet-1".to_string(),
                     sheet: "Q2".to_string(),
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: sheets::structure::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -896,9 +910,11 @@ mod tests {
                 sheet: "Q2".to_string(),
                 at: 5,
                 count: 3,
-                dry_run: false,
-                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                output: OutputFormat::Table,
+                write: sheets::structure::StructureWriteArgs {
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
             }),
         });
         assert!(cmd.dispatch(&dead_client()).await.is_ok());
@@ -917,9 +933,11 @@ mod tests {
                     sheet: "Q2".to_string(),
                     at: 2,
                     count: 1,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: sheets::structure::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -944,9 +962,11 @@ mod tests {
                         end_column: 3,
                         shift: sheets::structure::ShiftArg::Rows,
                     },
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: sheets::structure::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -965,9 +985,11 @@ mod tests {
                     sheet: "Q2".to_string(),
                     title: Some("Q2 copy".to_string()),
                     index: None,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: sheets::structure::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -985,9 +1007,11 @@ mod tests {
                     spreadsheet_id: "sheet-1".to_string(),
                     sheet: "Q2".to_string(),
                     index: 0,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: sheets::structure::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1003,9 +1027,11 @@ mod tests {
             command: sheets::SheetsSubcommands::HideSheet(sheets::structure::HideSheetCommand {
                 spreadsheet_id: "sheet-1".to_string(),
                 sheet: "Q2".to_string(),
-                dry_run: false,
-                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                output: OutputFormat::Table,
+                write: sheets::structure::StructureWriteArgs {
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
             }),
         });
         assert!(cmd.dispatch(&dead_client()).await.is_ok());
@@ -1020,9 +1046,11 @@ mod tests {
             command: sheets::SheetsSubcommands::ShowSheet(sheets::structure::ShowSheetCommand {
                 spreadsheet_id: "sheet-1".to_string(),
                 sheet: "Q2".to_string(),
-                dry_run: false,
-                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                output: OutputFormat::Table,
+                write: sheets::structure::StructureWriteArgs {
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
             }),
         });
         assert!(cmd.dispatch(&dead_client()).await.is_ok());
@@ -1044,9 +1072,11 @@ mod tests {
                     iterative_calculation: None,
                     iterative_calculation_max_iterations: None,
                     iterative_calculation_convergence_threshold: None,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: sheets::structure::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });

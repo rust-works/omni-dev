@@ -32,6 +32,29 @@ use crate::drive::sheets::structure::{
     describe_lines, structure, IterativeCalculationToggle, StructureOptions, StructureVerb,
 };
 
+/// The `--dry-run`/`--lease`/`-o` trio every structural verb accepts,
+/// repeated verbatim at the end of each command struct below. Flattened
+/// rather than left duplicated, and always as the struct's **last** field —
+/// clap flattens in declaration order, so this keeps every command's help
+/// text in the order it printed before. The fields ahead of it differ
+/// per-dimension in ways that are genuinely user-facing (`value_name`,
+/// doc wording), which is why those structs stay separate rather than
+/// merging into one `--dimension rows|columns` command.
+#[derive(Parser)]
+pub struct StructureWriteArgs {
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
 /// Adds a new sheet to a spreadsheet.
 #[derive(Parser)]
 pub struct AddSheetCommand {
@@ -54,17 +77,8 @@ pub struct AddSheetCommand {
     #[arg(long, value_name = "N")]
     pub columns: Option<i64>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Renames an existing sheet.
@@ -81,17 +95,8 @@ pub struct RenameSheetCommand {
     #[arg(long, value_name = "TITLE")]
     pub title: String,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Inserts empty rows, shifting existing rows down.
@@ -113,17 +118,8 @@ pub struct InsertRowsCommand {
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub count: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Inserts empty columns, shifting existing columns right.
@@ -144,17 +140,8 @@ pub struct InsertColumnsCommand {
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub count: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Moves a contiguous block of rows to a new position within a sheet,
@@ -185,17 +172,8 @@ pub struct MoveRowsCommand {
     #[arg(long, value_name = "ROW")]
     pub before: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Moves a contiguous block of columns to a new position within a sheet,
@@ -226,17 +204,8 @@ pub struct MoveColumnsCommand {
     #[arg(long, value_name = "COLUMN")]
     pub before: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Deletes an entire sheet from a spreadsheet.
@@ -258,17 +227,8 @@ pub struct DeleteSheetCommand {
     #[arg(long, value_name = "NAME")]
     pub sheet: String,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Deletes whole rows, shifting the remainder up to close the gap.
@@ -293,17 +253,8 @@ pub struct DeleteRowsCommand {
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub count: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Deletes whole columns, shifting the remainder left to close the gap.
@@ -327,17 +278,8 @@ pub struct DeleteColumnsCommand {
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub count: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Which way a range operation shifts cells, mirroring
@@ -410,17 +352,8 @@ pub struct InsertRangeCommand {
     #[command(flatten)]
     pub range: GridRangeArgs,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Deletes a rectangular cell range, shifting the remainder along one axis
@@ -442,17 +375,8 @@ pub struct DeleteRangeCommand {
     #[command(flatten)]
     pub range: GridRangeArgs,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Copies an existing sheet within the same workbook.
@@ -478,17 +402,8 @@ pub struct DuplicateSheetCommand {
     #[arg(long, value_name = "N")]
     pub index: Option<i64>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Moves an existing sheet to a new position among its siblings.
@@ -505,17 +420,8 @@ pub struct ReorderSheetCommand {
     #[arg(long, value_name = "N")]
     pub index: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Hides an existing sheet.
@@ -528,17 +434,8 @@ pub struct HideSheetCommand {
     #[arg(long, value_name = "NAME")]
     pub sheet: String,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Shows an existing hidden sheet.
@@ -551,17 +448,8 @@ pub struct ShowSheetCommand {
     #[arg(long, value_name = "NAME")]
     pub sheet: String,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Changes a sheet's view properties — frozen rows/columns, tab color,
@@ -605,17 +493,8 @@ pub struct UpdateSheetPropertiesCommand {
     #[arg(long, value_name = "BOOL")]
     pub hide_gridlines: Option<bool>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 /// Sheets' auto-recalculation intervals, from `--auto-recalc`.
@@ -711,185 +590,168 @@ pub struct UpdateWorkbookPropertiesCommand {
     #[arg(long, value_name = "THRESHOLD")]
     pub iterative_calculation_convergence_threshold: Option<f64>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: StructureWriteArgs,
 }
 
 impl AddSheetCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::AddSheet {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::AddSheet {
                 title: self.title,
                 index: self.index,
                 rows: self.rows,
                 columns: self.columns,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl RenameSheetCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::RenameSheet {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::RenameSheet {
                 sheet: self.sheet,
                 new_title: self.title,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl InsertRowsCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::InsertRows {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::InsertRows {
                 sheet: self.sheet,
                 at: self.at,
                 count: self.count,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl InsertColumnsCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::InsertColumns {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::InsertColumns {
                 sheet: self.sheet,
                 at: self.at,
                 count: self.count,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl MoveRowsCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::MoveRows {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::MoveRows {
                 sheet: self.sheet,
                 at: self.at,
                 count: self.count,
                 before: self.before,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl MoveColumnsCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::MoveColumns {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::MoveColumns {
                 sheet: self.sheet,
                 at: self.at,
                 count: self.count,
                 before: self.before,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl DeleteSheetCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::DeleteSheet { sheet: self.sheet },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::DeleteSheet { sheet: self.sheet },
+            self.write,
+        )
+        .await
     }
 }
 
 impl DeleteRowsCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::DeleteRows {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::DeleteRows {
                 sheet: self.sheet,
                 at: self.at,
                 count: self.count,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl DeleteColumnsCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::DeleteColumns {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::DeleteColumns {
                 sheet: self.sheet,
                 at: self.at,
                 count: self.count,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl InsertRangeCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::InsertRange {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::InsertRange {
                 sheet: self.sheet,
                 start_row: self.range.start_row,
                 end_row: self.range.end_row,
@@ -897,20 +759,19 @@ impl InsertRangeCommand {
                 end_column: self.range.end_column,
                 shift: self.range.shift.into(),
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl DeleteRangeCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::DeleteRange {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::DeleteRange {
                 sheet: self.sheet,
                 start_row: self.range.start_row,
                 end_row: self.range.end_row,
@@ -918,89 +779,84 @@ impl DeleteRangeCommand {
                 end_column: self.range.end_column,
                 shift: self.range.shift.into(),
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl DuplicateSheetCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::DuplicateSheet {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::DuplicateSheet {
                 sheet: self.sheet,
                 title: self.title,
                 index: self.index,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl ReorderSheetCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::ReorderSheet {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::ReorderSheet {
                 sheet: self.sheet,
                 index: self.index,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl HideSheetCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::SetSheetVisibility {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::SetSheetVisibility {
                 sheet: self.sheet,
                 hidden: true,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl ShowSheetCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::SetSheetVisibility {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::SetSheetVisibility {
                 sheet: self.sheet,
                 hidden: false,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl UpdateSheetPropertiesCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::UpdateSheetProperties {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::UpdateSheetProperties {
                 sheet: self.sheet,
                 freeze_rows: self.freeze_rows,
                 freeze_columns: self.freeze_columns,
@@ -1009,20 +865,19 @@ impl UpdateSheetPropertiesCommand {
                 right_to_left: self.right_to_left,
                 hide_gridlines: self.hide_gridlines,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
 }
 
 impl UpdateWorkbookPropertiesCommand {
     /// Runs the command against the shared Drive client.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
-        let opts = StructureOptions {
-            spreadsheet_id: self.spreadsheet_id,
-            verb: StructureVerb::UpdateWorkbookProperties {
+        run_verb(
+            client,
+            self.spreadsheet_id,
+            StructureVerb::UpdateWorkbookProperties {
                 locale: self.locale,
                 time_zone: self.time_zone,
                 auto_recalc: self.auto_recalc.map(Into::into),
@@ -1031,12 +886,29 @@ impl UpdateWorkbookPropertiesCommand {
                 iterative_calculation_convergence_threshold: self
                     .iterative_calculation_convergence_threshold,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
-        };
-        run_structure(client, &opts, &self.output).await
+            self.write,
+        )
+        .await
     }
+}
+
+/// Builds `StructureOptions` from a resolved verb and the shared write
+/// trio, then runs it. Every `execute()` above becomes a single expression
+/// constructing its verb and delegating here.
+async fn run_verb(
+    client: &DriveClient,
+    spreadsheet_id: String,
+    verb: StructureVerb,
+    write: StructureWriteArgs,
+) -> Result<()> {
+    let opts = StructureOptions {
+        spreadsheet_id,
+        verb,
+        dry_run: write.dry_run,
+        lease_token: write.lease.lease,
+        ledger_path: helpers::resolve_ledger_path(write.dry_run)?,
+    };
+    run_structure(client, &opts, &write.output).await
 }
 
 /// Shared tail for every structural verb: derive the Sheets client, load the
