@@ -272,13 +272,23 @@ servers, or containers with no display.
 | `SNOWFLAKE_AUTHENTICATOR` | Method | Credential var(s) |
 |---|---|---|
 | `externalbrowser` (default) | External-browser SSO | — |
-| `programmatic_access_token` (alias `pat`) | Programmatic access token | `SNOWFLAKE_TOKEN` |
-| `snowflake_jwt` (aliases `keypair`, `key_pair`, `jwt`) | Key-pair RS256 JWT | `SNOWFLAKE_PRIVATE_KEY_PATH` or `SNOWFLAKE_PRIVATE_KEY` |
+| `programmatic_access_token` (alias `pat`) | Programmatic access token | `SNOWFLAKE_TOKEN` (or `SNOWFLAKE_TOKEN_FILE`) |
+| `snowflake_jwt` (aliases `keypair`, `key_pair`, `jwt`) | Key-pair RS256 JWT | `SNOWFLAKE_PRIVATE_KEY_PATH`, `SNOWFLAKE_PRIVATE_KEY`, or `SNOWFLAKE_PRIVATE_KEY_FILE` |
 
 An unknown selector — or a non-interactive method missing its credential — fails
 fast at daemon startup with an actionable error. All three reuse the same session
 pool, token renewal, and keep-alive heartbeat; they differ only in how the first
 session for each `(account, user)` is established.
+
+`SNOWFLAKE_TOKEN` and `SNOWFLAKE_PRIVATE_KEY` each also accept a `<NAME>_FILE`
+companion (`SNOWFLAKE_TOKEN_FILE`, `SNOWFLAKE_PRIVATE_KEY_FILE`) naming an
+absolute path to a file holding the secret — the Docker/Kubernetes secrets
+convention. The file must be a regular file owned by you with no group/other
+permission bits, and setting both `NAME` and `NAME_FILE` in the same place (both exported, or both in the same settings.json map) is an error.
+See [ADR-0089](adrs/adr-0089.md). The legacy `SNOWFLAKE_PRIVATE_KEY_PATH`
+alias still outranks `SNOWFLAKE_PRIVATE_KEY_FILE` and now gets the same
+checks (absolute path, `0600`/`0400`, owned by you) — previously it accepted
+a relative path or a looser file mode.
 
 ### External-browser SSO (default)
 
@@ -319,11 +329,13 @@ the non-interactive methods below open no browser and ignore it.
 
 ### Programmatic access token (PAT)
 
-Set `SNOWFLAKE_AUTHENTICATOR=programmatic_access_token` and `SNOWFLAKE_TOKEN` to a
-PAT minted in Snowsight (or via SQL). The token is presented in place of a
-password — no browser, no callback. **Prerequisite:** Snowflake requires the user
-to be covered by a **network policy** to use a PAT; without one the login is
-rejected. Mint and scope the token per Snowflake's
+Set `SNOWFLAKE_AUTHENTICATOR=programmatic_access_token` and `SNOWFLAKE_TOKEN` (or
+`SNOWFLAKE_TOKEN_FILE`, an absolute path to a file holding it — see
+[ADR-0089](adrs/adr-0089.md)) to a PAT minted in Snowsight (or via SQL). The
+token is presented in place of a password — no browser, no callback.
+**Prerequisite:** Snowflake requires the user to be covered by a **network
+policy** to use a PAT; without one the login is rejected. Mint and scope
+the token per Snowflake's
 [programmatic access tokens](https://docs.snowflake.com/en/user-guide/programmatic-access-tokens)
 guide.
 
@@ -331,7 +343,9 @@ guide.
 
 Set `SNOWFLAKE_AUTHENTICATOR=snowflake_jwt` and point `SNOWFLAKE_PRIVATE_KEY_PATH`
 at an **unencrypted PKCS#8** PEM private key (`-----BEGIN PRIVATE KEY-----`), or
-put the PEM inline in `SNOWFLAKE_PRIVATE_KEY`. The client signs a short-lived
+put the PEM inline in `SNOWFLAKE_PRIVATE_KEY` (or point `SNOWFLAKE_PRIVATE_KEY_FILE`
+at it instead — see [ADR-0089](adrs/adr-0089.md); `SNOWFLAKE_PRIVATE_KEY_PATH`
+wins if both are set). The client signs a short-lived
 RS256 JWT locally each time it authenticates — no browser, no callback, and no
 secret leaves the machine except the signed assertion. **Prerequisite:** register
 the matching public key on the user once:

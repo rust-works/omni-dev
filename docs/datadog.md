@@ -43,12 +43,12 @@ Credentials are read from environment variables first, falling back to
 
 ### Environment variables
 
-| Variable           | Purpose                                                                                       | Default          |
-|--------------------|-----------------------------------------------------------------------------------------------|------------------|
-| `DATADOG_API_KEY`  | Organisation API key (required).                                                              | _none_           |
-| `DATADOG_APP_KEY`  | Application key tied to a user account (required).                                            | _none_           |
-| `DATADOG_SITE`     | Datadog region identifier (e.g. `datadoghq.eu`).                                              | `datadoghq.com`  |
-| `DATADOG_API_URL`  | Explicit API base URL; overrides `DATADOG_SITE` entirely. Use for on-prem, proxies, or tests. | _unset_          |
+| Variable          | Purpose                                                                                                     | Default         |
+|-------------------|-------------------------------------------------------------------------------------------------------------|-----------------|
+| `DATADOG_API_KEY` | Organisation API key (required). Also accepts a `DATADOG_API_KEY_FILE` companion (below).                   | _none_          |
+| `DATADOG_APP_KEY` | Application key tied to a user account (required). Also accepts a `DATADOG_APP_KEY_FILE` companion (below). | _none_          |
+| `DATADOG_SITE`    | Datadog region identifier (e.g. `datadoghq.eu`).                                                            | `datadoghq.com` |
+| `DATADOG_API_URL` | Explicit API base URL; overrides `DATADOG_SITE` entirely. Use for on-prem, proxies, or tests.               | _unset_         |
 
 Environment variables take precedence over the settings file. Setting
 `DATADOG_API_URL` to `https://datadog.internal.example.com` bypasses the
@@ -57,6 +57,13 @@ for on-prem Datadog or when routing traffic through a corporate proxy.
 
 `DATADOG_SITE` is normalised: `https://api.us3.datadoghq.com/` collapses to
 `us3.datadoghq.com`, so pasting a Datadog UI URL also works.
+
+`DATADOG_API_KEY` and `DATADOG_APP_KEY` each also accept a `<NAME>_FILE`
+companion (`DATADOG_API_KEY_FILE`, `DATADOG_APP_KEY_FILE`) naming an absolute
+path to a file holding the key, instead of the value itself — the
+Docker/Kubernetes secrets convention. The file must be a regular file owned
+by you with no group/other permission bits, and setting both `NAME` and
+`NAME_FILE` in the same place (both exported, or both in the same settings.json map) is an error. See [ADR-0089](adrs/adr-0089.md).
 
 ### Known sites
 

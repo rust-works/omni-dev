@@ -115,6 +115,13 @@ export ANTHROPIC_AUTH_TOKEN="sk-ant-..."
 
 Get a key from [console.anthropic.com](https://console.anthropic.com/).
 
+Each of these also accepts a `<NAME>_FILE` companion (`CLAUDE_API_KEY_FILE`,
+`ANTHROPIC_API_KEY_FILE`, `ANTHROPIC_AUTH_TOKEN_FILE`) naming an absolute path
+to a file holding the secret, instead of the value itself — the
+Docker/Kubernetes secrets convention. The file must be a regular file owned
+by you with no group/other permission bits; setting both `NAME` and
+`NAME_FILE` in the same place (both exported, or both in the same settings.json map) is an error. See [ADR-0089](adrs/adr-0089.md).
+
 **Model.** Resolved from the precedence chain above. The registry default is
 `claude-sonnet-4-6`. Override per-invocation with `--model`:
 
@@ -195,6 +202,11 @@ export OPENAI_API_KEY="sk-..."
 # or
 export OPENAI_AUTH_TOKEN="sk-..."
 ```
+
+Both also accept a `<NAME>_FILE` companion (`OPENAI_API_KEY_FILE`,
+`OPENAI_AUTH_TOKEN_FILE`) naming an absolute path to a file holding the secret
+— see [ADR-0089](adrs/adr-0089.md) and the note under [Claude
+API](#claude-api-default).
 
 **Model.** Registry default is `gpt-5-mini`. Override with `OPENAI_MODEL` or
 `--model`:
@@ -301,6 +313,10 @@ export CLAUDE_CODE_USE_BEDROCK=true
 export ANTHROPIC_AUTH_TOKEN="..."           # bearer token for the Bedrock endpoint
 export ANTHROPIC_BEDROCK_BASE_URL="https://bedrock-runtime.<region>.amazonaws.com"
 ```
+
+`ANTHROPIC_AUTH_TOKEN` also accepts an `ANTHROPIC_AUTH_TOKEN_FILE` companion
+naming an absolute path to a file holding the token — see the note under
+[Claude API](#claude-api-default) and [ADR-0089](adrs/adr-0089.md).
 
 **Model.** Resolved through the standard chain (registry default
 `claude-sonnet-4-6`). Bedrock identifiers are URL-encoded automatically when
@@ -519,6 +535,16 @@ legitimately needs a credential, e.g.
 both escape hatches are enabled, MCP servers spawned by the nested session
 also see the scrubbed environment; servers that rely on inherited env
 credentials need the same exemption.
+
+The scrub also catches `<NAME>_FILE` companions of secret names (see
+[ADR-0089](adrs/adr-0089.md)) — including `ANTHROPIC_API_KEY_FILE` and
+`ANTHROPIC_AUTH_TOKEN_FILE`, even though the base `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN` names are kept, since a `_FILE` variable exposes a
+path the nested session's tools could read directly. As with the base names,
+listing one in `OMNI_DEV_CLAUDE_CLI_KEEP_ENV` exempts it. Note that the nested `claude` never reads the `_FILE` convention itself, so
+a key supplied only as `ANTHROPIC_API_KEY_FILE` does not authenticate the
+`claude-cli` backend; `claude` uses its own login or a plain
+`ANTHROPIC_API_KEY`.
 
 A `WARN` log is emitted on every invocation while this is active. Grep for
 it with `RUST_LOG=omni_dev=warn`:

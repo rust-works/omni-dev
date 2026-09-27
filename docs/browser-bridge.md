@@ -343,6 +343,10 @@ bridge runs.
 - Generated at startup and printed to stdout with the snippet. It is **never**
   accepted as a CLI argument (argv is world-readable via `ps`/`/proc`). It may
   optionally come from `OMNI_BRIDGE_TOKEN` or a `0600` `--token-file`.
+  `OMNI_BRIDGE_TOKEN` also accepts an `OMNI_BRIDGE_TOKEN_FILE` companion
+  naming an absolute path to a file holding the token (the Docker/Kubernetes
+  secrets convention) — an environment-variable alternative to the separate
+  `--token-file` flag; see [ADR-0089](adrs/adr-0089.md).
 - Control plane: every request must carry `Authorization: Bearer <token>`.
 - WebSocket plane: the browser presents the token via the WS subprotocol; the
   upgrade is rejected without it. An unauthenticated peer can never connect or

@@ -83,7 +83,7 @@ don't trigger it.
 |-------------------------|-----------------------------------------------------------------|---------|
 | `GMAIL_CLIENT_ID`       | OAuth2 client id from your own Google Cloud project (required). | _none_  |
 | `GMAIL_CLIENT_SECRET`   | OAuth2 client secret for the same client (required).            | _none_  |
-| `GMAIL_REFRESH_TOKEN`   | Written by `gmail auth login`; not meant to be hand-set.        | _none_  |
+| `GMAIL_REFRESH_TOKEN`   | Written by `gmail auth login`; not meant to be hand-set. Also accepts a `GMAIL_REFRESH_TOKEN_FILE` companion (below). | _none_  |
 | `GMAIL_SCOPE`           | Written by `gmail auth login`; records the granted scope (`gmail.readonly` or `gmail.modify`) so `auth status` can report it without a network call. | _none_ |
 | `GMAIL_API_URL`         | Explicit API base URL; overrides the real `gmail.googleapis.com` host entirely. Use for a proxy or a forced egress gateway. | _unset_ |
 
@@ -95,6 +95,16 @@ secret never transits a shell, an env var, or an agent's context — see
 in `~/.omni-dev/settings.json`'s `env` map); or leave them unset and
 `gmail auth login` prompts for them interactively — the client id echoes
 normally, the secret does not.
+
+`GMAIL_REFRESH_TOKEN` also accepts a `GMAIL_REFRESH_TOKEN_FILE` companion
+naming an absolute path to a file holding the token, instead of the value
+itself — the Docker/Kubernetes secrets convention described in
+[ADR-0089](adrs/adr-0089.md). `GMAIL_CLIENT_SECRET` is deliberately **not**
+part of this convention: `GMAIL_CLIENT_SECRET_FILE` already means something
+else (above) — the path to a Google `client_secret.json` for `gmail auth
+import` — and an installed-app OAuth client secret isn't confidential per
+Google in the first place, so `gmail auth import` already covers the
+file-based case.
 
 ### Interactive setup
 

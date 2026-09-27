@@ -122,8 +122,8 @@ omni-dev doesn't impose either shape.
 | Variable              | Purpose                                                                                                                                                                                                                                               | Default |
 |-----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
 | `DRIVE_CLIENT_ID`     | OAuth2 client id from your own Google Cloud project (required).                                                                                                                                                                                       | _none_  |
-| `DRIVE_CLIENT_SECRET` | OAuth2 client secret for the same client (required).                                                                                                                                                                                                  | _none_  |
-| `DRIVE_REFRESH_TOKEN` | Written by `drive auth login`; not meant to be hand-set.                                                                                                                                                                                              | _none_  |
+| `DRIVE_CLIENT_SECRET` | OAuth2 client secret for the same client (required). Also accepts a `DRIVE_CLIENT_SECRET_FILE` companion (below).                                                                                                                                     | _none_  |
+| `DRIVE_REFRESH_TOKEN` | Written by `drive auth login`; not meant to be hand-set. Also accepts a `DRIVE_REFRESH_TOKEN_FILE` companion (below).                                                                                                                                 | _none_  |
 | `DRIVE_SCOPE`         | Written by `drive auth login`; records the granted scope(s) — any combination of `drive.readonly`, `drive.metadata` (`--write`), `drive.file` (`--write-file`), and `drive` (`--write-full`) — so `auth status` can report it without a network call. | _none_  |
 | `DRIVE_API_URL`       | Explicit API base URL; overrides the real `www.googleapis.com` host entirely. Use for a proxy or a forced egress gateway.                                                                                                                             | _unset_ |
 
@@ -133,6 +133,15 @@ Unlike Gmail, there is **no `drive auth import`** — no
 by hand (in your shell profile, or in `~/.omni-dev/settings.json`'s `env`
 map), or leave them unset and `drive auth login` prompts for them
 interactively — the client id echoes normally, the secret does not.
+
+`DRIVE_CLIENT_SECRET` and `DRIVE_REFRESH_TOKEN` also accept `_FILE`
+companions (`DRIVE_CLIENT_SECRET_FILE`, `DRIVE_REFRESH_TOKEN_FILE`) naming
+an absolute path to a file holding the secret, instead of the value itself —
+the Docker/Kubernetes secrets convention. The file must be a regular file
+owned by you with no group/other permission bits, and setting both `NAME`
+and `NAME_FILE` in the same place (both exported, or both in the same settings.json map) is an error. See [ADR-0089](adrs/adr-0089.md).
+Unlike Gmail, there is no other meaning for `DRIVE_CLIENT_SECRET_FILE` to
+collide with.
 
 ### Interactive setup
 
