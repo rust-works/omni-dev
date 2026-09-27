@@ -1057,11 +1057,17 @@ const ACCOUNT_SECRET_FIELDS: &[&str] = &["client_secret", "refresh_token"];
 /// `<section>.accounts.<account>`.
 ///
 /// A secret field ([`ACCOUNT_SECRET_FIELDS`]) whose entry already names a
-/// `<field>_file` is written into that file through
-/// [`secret_env::write_secret_file`] instead, and the plain field is removed,
-/// so the secret never lands in settings.json and the entry can't hold both
-/// (#2008). Every such file is written before settings.json, so a failed
-/// secret write leaves settings.json untouched.
+/// `<field>_file` is written into that file instead, and the plain field is
+/// removed, so the secret never lands in settings.json and the entry can't
+/// hold both (#2008). Every file is checked
+/// ([`secret_env::plan_secret_file_write`]) before any is written, and all
+/// are written before settings.json, so a refused or failed secret write
+/// leaves settings.json untouched.
+///
+/// A `client_secret_file` that holds another value is not replaced when the
+/// incoming `client_id` differs from the entry's: that file is most likely
+/// shared with accounts of the other OAuth client, and replacing it would
+/// break them.
 fn upsert_account(
     path: &Path,
     section: &str,
@@ -1071,19 +1077,57 @@ fn upsert_account(
     let mut settings_value = read_or_default_settings(path)?;
 
     let entry = ensure_object_at(&mut settings_value, &[section, "accounts", account])?;
+    let stored_client_id = entry
+        .get("client_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut secret_writes = Vec::new();
     for (key, value) in vars {
         if let Some(file) = account_secret_file(entry, key, value) {
-            let file_key = format!("{key}_file");
-            let label = format!("{section}.accounts.{account}.{file_key}");
+            let label = format!("{section}.accounts.{account}.{key}_file");
             let secret = crate::utils::secret::Secret::new(value.as_str().unwrap_or_default());
-            secret_env::write_secret_file(&label, Path::new(&file), &secret)?;
+            if let Some(write) =
+                secret_env::plan_secret_file_write(&label, Path::new(&file), &secret)?
+            {
+                if *key == "client_secret" && write.replaces_existing() {
+                    refuse_client_change(&label, stored_client_id.as_deref(), vars)?;
+                }
+                secret_writes.push((write, secret));
+            }
             entry.remove(*key);
         } else {
             entry.insert((*key).to_string(), value.clone());
         }
     }
 
+    for (write, secret) in secret_writes {
+        write.write(&secret)?;
+    }
     write_settings(path, &settings_value)
+}
+
+/// Refuses to replace the `client_secret_file` named by `label` when `vars`
+/// carries a `client_id` other than the entry's `stored` one — see
+/// [`upsert_account`].
+fn refuse_client_change(
+    label: &str,
+    stored: Option<&str>,
+    vars: &[(&str, serde_json::Value)],
+) -> Result<()> {
+    let incoming = vars
+        .iter()
+        .find(|(key, _)| *key == "client_id")
+        .and_then(|(_, value)| value.as_str());
+    if let (Some(stored), Some(incoming)) = (stored, incoming) {
+        if stored != incoming {
+            anyhow::bail!(
+                "{label} holds the secret of OAuth client {stored}, not {incoming}; refusing to \
+                 replace it, since other accounts may share it. Point {label} at a file of its \
+                 own, or remove it to store the secret in settings.json"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Resolves the secret field `<section>.accounts.<account>.<field>` from its
@@ -2588,6 +2632,121 @@ mod tests {
         );
         assert!(!err.to_string().contains("new-token"), "{err}");
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// Writes `contents` owner-only to `name` under `dir`.
+    fn owner_only(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
+        let file = dir.join(name);
+        fs::write(&file, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        file
+    }
+
+    #[test]
+    fn upsert_account_checks_every_secret_file_before_writing_any() {
+        let (tmp, path) = temp_settings_path();
+        let secret_file = owner_only(tmp.path(), "client-secret", "old-secret\n");
+        let token_file = tmp.path().join("missing-dir").join("refresh-token");
+        settings_with_secret_files(&path, Some(&secret_file), &token_file);
+
+        Settings::upsert_drive_account(
+            &path,
+            "work",
+            &[
+                ("client_secret", serde_json::json!("new-secret")),
+                ("refresh_token", serde_json::json!("new-token")),
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(fs::read_to_string(&secret_file).unwrap(), "old-secret\n");
+    }
+
+    #[test]
+    fn upsert_account_refuses_to_replace_a_client_secret_file_of_another_client() {
+        let (tmp, path) = temp_settings_path();
+        let secret_file = owner_only(tmp.path(), "client-secret", "old-secret\n");
+        let token_file = tmp.path().join("refresh-token");
+        settings_with_secret_files(&path, Some(&secret_file), &token_file);
+        let before = fs::read_to_string(&path).unwrap();
+
+        let err = Settings::upsert_drive_account(
+            &path,
+            "work",
+            &[
+                ("client_id", serde_json::json!("other-id")),
+                ("client_secret", serde_json::json!("other-secret")),
+                ("refresh_token", serde_json::json!("new-token")),
+            ],
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("drive.accounts.work.client_secret_file"),
+            "{message}"
+        );
+        assert!(message.contains("other-id"), "{message}");
+        assert!(!message.contains("other-secret"), "{message}");
+        assert_eq!(fs::read_to_string(&secret_file).unwrap(), "old-secret\n");
+        assert!(!token_file.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn upsert_account_replaces_a_client_secret_file_for_the_same_client() {
+        let (tmp, path) = temp_settings_path();
+        let secret_file = owner_only(tmp.path(), "client-secret", "old-secret\n");
+        let token_file = tmp.path().join("refresh-token");
+        settings_with_secret_files(&path, Some(&secret_file), &token_file);
+
+        Settings::upsert_drive_account(
+            &path,
+            "work",
+            &[
+                ("client_id", serde_json::json!("id")),
+                ("client_secret", serde_json::json!("rotated-secret")),
+                ("refresh_token", serde_json::json!("new-token")),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&secret_file).unwrap(),
+            "rotated-secret\n"
+        );
+        assert_eq!(fs::read_to_string(&token_file).unwrap(), "new-token\n");
+    }
+
+    #[test]
+    fn upsert_gmail_account_writes_a_refresh_token_into_its_file() {
+        let (tmp, path) = temp_settings_path();
+        let token_file = tmp.path().join("gmail-refresh-token");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::json!({ "gmail": { "accounts": { "work": {
+                "refresh_token_file": token_file.to_str().unwrap(),
+            }}}})
+            .to_string(),
+        )
+        .unwrap();
+
+        Settings::upsert_gmail_account(
+            &path,
+            "work",
+            &[("refresh_token", serde_json::json!("gmail-token"))],
+        )
+        .unwrap();
+
+        assert!(!fs::read_to_string(&path).unwrap().contains("gmail-token"));
+        assert_eq!(fs::read_to_string(&token_file).unwrap(), "gmail-token\n");
+        let settings = Settings::load_from_path(&path).unwrap();
+        assert!(settings.gmail.accounts["work"].refresh_token.is_none());
     }
 
     /// Drive's twin of
