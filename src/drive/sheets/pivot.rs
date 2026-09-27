@@ -195,15 +195,29 @@ impl ValueLayout {
 struct PivotGroupSpec {
     /// 0-based, relative to the source range's first column.
     column: i64,
+    /// The order the caller gave, or `None` for a bare `COLUMN`. Kept
+    /// distinct from [`Self::effective_sort_order`] so the preview can say
+    /// the order was defaulted rather than chosen.
     sort_order: Option<SortOrder>,
 }
 
 impl PivotGroupSpec {
+    /// The order actually sent: the caller's, else [`SortOrder::Ascending`].
+    ///
+    /// The Sheets API rejects a `PivotGroup` with no `sortOrder`
+    /// (`HTTP 400 ... No sort order specified.`, #1930), so a bare
+    /// `COLUMN` cannot be passed through as "absent" — it defaults here,
+    /// the one place both the wire request and the dry-run preview read
+    /// from.
+    fn effective_sort_order(&self) -> SortOrder {
+        self.sort_order.unwrap_or(SortOrder::Ascending)
+    }
+
     fn to_wire(&self, show_totals: bool) -> PivotGroup {
         PivotGroup {
             source_column_offset: self.column,
             show_totals,
-            sort_order: self.sort_order.map(|o| o.as_sheets_str().to_string()),
+            sort_order: Some(self.effective_sort_order().as_sheets_str().to_string()),
         }
     }
 }
@@ -963,10 +977,12 @@ fn describe_pivot_config(
     show_totals: bool,
 ) -> String {
     let describe_group = |g: &PivotGroupSpec| {
-        g.sort_order.map_or_else(
-            || format!("col {}", g.column),
-            |order| format!("col {} ({})", g.column, order.describe()),
-        )
+        let order = g.effective_sort_order().describe();
+        if g.sort_order.is_some() {
+            format!("col {} ({order})", g.column)
+        } else {
+            format!("col {} ({order}, default)", g.column)
+        }
     };
     let rows_desc = if rows.is_empty() {
         "none".to_string()
@@ -1367,12 +1383,16 @@ mod tests {
         assert_eq!(desc.sort_order.as_deref(), Some("DESCENDING"));
         assert!(!desc.show_totals);
 
+        // A bare `COLUMN` defaults to ascending rather than omitting
+        // `sortOrder`, which the live API rejects (#1930).
         let none = PivotGroupSpec {
             column: 2,
             sort_order: None,
         }
         .to_wire(true);
-        assert_eq!(none.sort_order, None);
+        assert_eq!(none.sort_order.as_deref(), Some("ASCENDING"));
+        let json = serde_json::to_value(&none).unwrap();
+        assert_eq!(json["sortOrder"], "ASCENDING", "{json}");
     }
 
     #[test]
@@ -1482,12 +1502,17 @@ mod tests {
             Some(ValueLayout::Horizontal),
             true,
         );
-        assert!(desc.contains("rows: col 0, col 1 (desc)"), "{desc}");
-        assert!(desc.contains("columns: col 2"), "{desc}");
+        // A bare column previews the ascending order it will be sent with
+        // (#1930), marked as defaulted.
+        assert!(
+            desc.contains("rows: col 0 (asc, default), col 1 (desc)"),
+            "{desc}"
+        );
+        assert!(desc.contains("columns: col 2 (asc, default)"), "{desc}");
         // Explicit `Horizontal`, distinct from the `None` default's
         // "HORIZONTAL (default)" wording.
         assert!(desc.contains("layout: HORIZONTAL"), "{desc}");
-        assert!(!desc.contains("(default)"), "{desc}");
+        assert!(!desc.contains("HORIZONTAL (default)"), "{desc}");
     }
 
     #[test]

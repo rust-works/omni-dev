@@ -2594,8 +2594,11 @@ pub struct PivotGroup {
     /// would otherwise silently differ from a caller's expectation.
     #[serde(rename = "showTotals")]
     pub show_totals: bool,
-    /// `"ASCENDING"` or `"DESCENDING"`. Absent means the API default
-    /// (source order).
+    /// `"ASCENDING"` or `"DESCENDING"`. Optional only so a read-back of
+    /// an existing pivot table tolerates its absence: the API rejects a
+    /// write without it (`No sort order specified.`, #1930), so
+    /// `add-pivot-table` always sends one, defaulting a bare `COLUMN` to
+    /// `"ASCENDING"`.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "sortOrder")]
     pub sort_order: Option<String>,
 }
