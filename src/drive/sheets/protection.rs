@@ -446,6 +446,11 @@ async fn protection_inner(
     // that depends on it — happens here, before the dry-run return (issue
     // #1939), so a preview reaches the exact verdict a real run would
     // rather than silently approving a change the real run then refuses.
+    // This one `match`, and `describe_effect` below, are the single call
+    // site for all three verbs, so the same guarantee — and the same
+    // `summary` fed into both `WouldChange` and `Changed` — holds for
+    // `protect-range` and `unprotect-range` too, even though today only
+    // `update-protection`'s arm can fail here (issue #1978).
     let built = match &opts.verb {
         ProtectionVerb::ProtectRange {
             description,
@@ -2405,6 +2410,159 @@ mod tests {
             }
             other => panic!("expected RefusedInvalidRange, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn protect_range_dry_run_summary_matches_the_real_run_summary() {
+        // Companion to the #1939 regression test above, for issue #1978:
+        // `protect-range`'s `built` arm is a trivial always-`Ok`
+        // construction, so it can never itself fail and there is no
+        // refusal to reproduce here. What's tested instead is structural —
+        // `describe_effect` and the `built` match sit before the dry-run
+        // return and run unconditionally for both a preview and a real
+        // attempt, so the two cannot report different summaries for the
+        // same options.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let verb = ProtectionVerb::ProtectRange {
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:A5".to_string()),
+            whole_sheet: false,
+            description: Some("locked".to_string()),
+            warning_only: false,
+            editors: Vec::new(),
+        };
+
+        let dry_run_opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: verb.clone(),
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let dry_run_outcome = protection(&drive, &sheets, &dry_run_opts, &rules).await;
+        let dry_run_summary = match dry_run_outcome.result {
+            ProtectionResult::WouldChange { summary } => summary,
+            other => panic!("expected WouldChange, got {other:?}"),
+        };
+
+        // Only mounted now: proves the summary above was produced without
+        // ever reaching the API.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{"addProtectedRange": {"protectedRange": {"protectedRangeId": 7}}}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let real_run_opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let real_run_outcome = protection(&drive, &sheets, &real_run_opts, &rules).await;
+        let real_run_summary = match real_run_outcome.result {
+            ProtectionResult::Changed { summary, .. } => summary,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+
+        assert_eq!(dry_run_summary, real_run_summary);
+    }
+
+    #[tokio::test]
+    async fn unprotect_range_dry_run_summary_matches_the_real_run_summary() {
+        // Same parity check as `protect_range_dry_run_summary_matches_the_
+        // real_run_summary` above, for `unprotect-range`'s `built` arm —
+        // also a trivial always-`Ok` construction, so again there is no
+        // refusal to reproduce, only the shared-code structural guarantee
+        // that a preview and a real attempt report the same summary.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([{
+            "protectedRangeId": 30,
+            "range": {
+                "sheetId": 0,
+                "startRowIndex": 0,
+                "endRowIndex": 5,
+                "startColumnIndex": 0,
+                "endColumnIndex": 1,
+            },
+        }]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let verb = ProtectionVerb::UnprotectRange {
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:A5".to_string()),
+            whole_sheet: false,
+        };
+
+        let dry_run_opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: verb.clone(),
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let dry_run_outcome = protection(&drive, &sheets, &dry_run_opts, &rules).await;
+        let dry_run_summary = match dry_run_outcome.result {
+            ProtectionResult::WouldChange { summary } => summary,
+            other => panic!("expected WouldChange, got {other:?}"),
+        };
+
+        // Only mounted now: proves the summary above was produced without
+        // ever reaching the API.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let real_run_opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let real_run_outcome = protection(&drive, &sheets, &real_run_opts, &rules).await;
+        let real_run_summary = match real_run_outcome.result {
+            ProtectionResult::Changed { summary, .. } => summary,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+
+        assert_eq!(dry_run_summary, real_run_summary);
     }
 
     #[tokio::test]
