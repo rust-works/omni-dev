@@ -157,7 +157,7 @@ pub enum DriveOperation {
     /// `sheets write` of the same range could already replace outright.
     /// Unlike the reorder verbs above, it stays on this operation alone:
     /// issue #1877's live check found a trim moves no formatting, and even
-    /// rebases rich-text runs to keep them on their characters.
+    /// rebases rich-text runs to keep them on the characters that remain.
     /// Its sibling verb in that issue, `delete-duplicates`, takes
     /// [`Self::SheetsDelete`] instead — two verbs shipped together under
     /// two different operations, which is the per-verb mapping working as

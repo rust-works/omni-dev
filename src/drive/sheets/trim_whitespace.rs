@@ -10,8 +10,10 @@
 //! formatting check and nothing moved. Backgrounds, text and number
 //! formats, borders, notes and validation rules all survive a trim, and
 //! cells the trim skips are left untouched. Rich-text runs are rebased by
-//! the API so every character keeps its formatting — gentler than a plain
-//! `sheets write`, which drops those runs outright.
+//! the API so every character that remains keeps its own formatting;
+//! formatting on removed whitespace goes with it. That is gentler than a
+//! plain `sheets write`, which drops those runs outright (§5's #1877
+//! addendum).
 //!
 //! The trim rule, measured live against the API (issue #1844): leading
 //! and trailing whitespace is stripped **and each internal run collapses
