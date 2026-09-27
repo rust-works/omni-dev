@@ -165,6 +165,19 @@ mod tests {
     }
 
     #[test]
+    fn reference_forwards_var_pair_to_inner_source() {
+        let env = MapEnv::new().with("K", "v").with("K_FILE", "f");
+        fn read_pair(src: &impl EnvSource) -> (Option<String>, Option<String>) {
+            src.var_pair("K", "K_FILE")
+        }
+        // &MapEnv's var_pair must also forward, not just var.
+        assert_eq!(
+            read_pair(&&env),
+            (Some("v".to_string()), Some("f".to_string()))
+        );
+    }
+
+    #[test]
     fn truthy_var_parses_truthy_and_falsy_values_case_insensitively() {
         for v in ["1", "true", "TRUE", "yes", "YES"] {
             assert!(truthy_var(&MapEnv::new().with("FLAG", v), "FLAG"), "{v:?}");

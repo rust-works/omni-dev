@@ -1500,6 +1500,27 @@ mod tests {
             secret_var(&env, "DATADOG_API_KEY").unwrap_err(),
             SecretEnvError::Conflict { .. }
         ));
+        // secret_var only ever reads var_pair; var itself must still resolve
+        // through the same settings/profile chain for other EnvSource callers.
+        assert_eq!(env.var("DATADOG_API_KEY"), Some("v".to_string()));
+    }
+
+    #[test]
+    fn settings_env_ref_var_falls_back_to_the_settings_layer() {
+        // SettingsEnvRef::var is EnvSource's required method; secret_var and
+        // secret_var_is_set (its only production callers) read var_pair alone,
+        // so this exercises it directly against the same fallback chain
+        // SettingsEnv::var uses.
+        let settings = settings_with_env(
+            &[("OMNI_DEV_TEST_SETTINGS_ENV_REF_K", "from-settings")],
+            &[],
+        );
+        let env_ref = settings.env_source();
+        assert_eq!(
+            env_ref.var("OMNI_DEV_TEST_SETTINGS_ENV_REF_K"),
+            Some("from-settings".to_string())
+        );
+        assert_eq!(env_ref.var("OMNI_DEV_TEST_SETTINGS_ENV_REF_MISSING"), None);
     }
 
     // ── sourced resolution (issue #1143: provenance for warnings) ──

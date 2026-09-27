@@ -588,6 +588,7 @@ mod tests {
     fn any_group_or_other_bit_is_rejected() {
         for mode in [0o640, 0o604, 0o610, 0o601] {
             let (_dir, path) = secret_file(b"x", mode);
+            // omni-dev: coverage ignore reason="the loop above runs this 4 times and every mode fails the same way; verified locally that llvm-cov still reports 0 hits on the matches!( line — a region-attribution artifact on the nested assert!/matches! macro call, not an untested path"
             assert!(
                 matches!(
                     resolve(&env_with_file(&path)).unwrap_err(),
@@ -595,6 +596,7 @@ mod tests {
                 ),
                 "{mode:o}"
             );
+            // omni-dev: coverage end
         }
     }
 
@@ -865,7 +867,7 @@ mod tests {
                         if text[i + 1 + c.len_utf8()..].starts_with('\'') {
                             i += 1 + c.len_utf8();
                         }
-                    }
+                    } // omni-dev: coverage ignore-line reason="exercised by strip_test_modules_ignores_braces_in_literals_and_comments's '{' char literal; verified locally that llvm-cov still reports 0 hits — a region-attribution artifact on this closing brace, not an untested path"
                 }
                 b'{' => depth += 1,
                 b'}' => {
@@ -920,7 +922,7 @@ mod tests {
         for source in production_sources() {
             for name in env_like_literals(&source.code) {
                 if is_secret_shaped(&name) && !is_known(&name) {
-                    unknown.push(format!("{}: {name}", source.rel));
+                    unknown.push(format!("{}: {name}", source.rel)); // omni-dev: coverage ignore-line reason="only runs if an unregistered secret-shaped literal exists; the assert below that unknown is empty is this test's whole point, so a passing run never takes this branch"
                 }
             }
         }
@@ -978,7 +980,9 @@ mod tests {
                 let args = balanced_args(&source.code[m.end()..]);
                 for (re, name) in &spelling_res {
                     if re.is_match(args) {
+                        // omni-dev: coverage ignore reason="only runs if a registered secret is read through a plain accessor outside this module; offenders.is_empty() below is this test's whole point"
                         offenders.push(format!("{}: `{}…` reads {name}", source.rel, m.as_str()));
+                        // omni-dev: coverage end
                     }
                 }
             }
@@ -1019,7 +1023,7 @@ mod tests {
         for source in production_sources() {
             for name in env_like_literals(&source.code) {
                 if companions.contains(&name) {
-                    collisions.push(format!("{}: {name}", source.rel));
+                    collisions.push(format!("{}: {name}", source.rel)); // omni-dev: coverage ignore-line reason="only runs if a _FILE companion collides with an existing variable; collisions.is_empty() below is this test's whole point"
                 }
             }
         }
@@ -1054,6 +1058,24 @@ mod tests {
         let stripped = strip_test_modules("t.rs", text);
         assert!(stripped.contains("fn after()"), "{stripped}");
         assert!(!stripped.contains("fn f<"), "{stripped}");
+    }
+
+    /// Self-check: an unclosed `{` (a malformed test module) has no matching
+    /// brace, rather than looping forever or panicking itself — the panic on
+    /// `None` belongs to `strip_test_modules`'s caller, not this scanner.
+    #[test]
+    fn matching_brace_returns_none_when_unclosed() {
+        assert_eq!(matching_brace("{ fn f() { }"), None);
+    }
+
+    /// Self-check: nested parens are depth-counted rather than stopping at
+    /// the first `)`, and text with no closing paren at all is returned
+    /// unchanged (the caller's regex match is always balanced Rust source in
+    /// practice, but the helper must still degrade rather than panic).
+    #[test]
+    fn balanced_args_counts_nested_parens_and_degrades_when_unclosed() {
+        assert_eq!(balanced_args("f(x), y) rest"), "f(x), y");
+        assert_eq!(balanced_args("no closing paren"), "no closing paren");
     }
 
     /// Self-check: the guards see the real read sites (so an empty scan
