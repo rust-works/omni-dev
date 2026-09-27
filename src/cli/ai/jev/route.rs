@@ -15,7 +15,7 @@ use crate::jev::citations::{find_citations, Citation};
 use crate::jev::client::JevClient;
 use crate::jev::config::JevConfig;
 use crate::jev::route::{
-    build_route_state, render_route_text, render_route_text_styled,
+    build_route_state, is_ignored_closed, render_route_text, render_route_text_styled,
     run_route_with_reference_fetch_failures, Ladder, OpenDependencies, Provider,
     ReferenceFetchFailure, ReferenceFetchFailures, RouteOptions, RouteReport, TerminalStyle, Tiers,
     DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
@@ -73,7 +73,10 @@ is that resolving that dependency would leave less design work remaining than th
 implies. One extra Jev question is asked per open citation; a closed citation is settled and \
 is not reported. A cited issue or pull request that cannot be fetched is listed under \
 reference_fetch_failures instead.\n\nClosed issues are refused unless --allow-closed is given: their comments \
-often describe how the work was done, which leaks the answer.\n\nAn issue whose Jev call \
+often describe how the work was done, which leaks the answer. --ignore-closed instead drops \
+closed issues from the batch without routing them, so one closed issue in a long list does \
+not abort the run; the skipped issues are listed under ignored_closed, and a batch with no \
+open issue left is still an error.\n\nAn issue whose Jev call \
 fails is reported with an `error` field instead of providers, and the rest are still routed; \
 the command then exits non-zero. An authentication failure stops the run at once."
 )]
@@ -122,6 +125,10 @@ pub struct RouteCommand {
     #[arg(long)]
     pub allow_closed: bool,
 
+    /// Skips closed issues instead of refusing them, listing them under `ignored_closed`.
+    #[arg(long, conflicts_with = "allow_closed")]
+    pub ignore_closed: bool,
+
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = RouteFormat::Json)]
     pub(super) output: RouteFormat,
@@ -151,11 +158,22 @@ impl RouteCommand {
             .repo
             .path()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        let (issues, all_open, max_input_chars) =
-            (self.issues, self.all_open, self.max_input_chars);
+        let (issues, all_open, max_input_chars, ignore_closed) = (
+            self.issues,
+            self.all_open,
+            self.max_input_chars,
+            self.ignore_closed,
+        );
         let (docs, dependencies, reference_fetch_failures) =
             tokio::task::spawn_blocking(move || {
-                fetch_docs(&bin, &cwd, &issues, all_open, max_input_chars)
+                fetch_docs(
+                    &bin,
+                    &cwd,
+                    &issues,
+                    all_open,
+                    max_input_chars,
+                    ignore_closed,
+                )
             })
             .await
             .context("Issue fetch task panicked")??;
@@ -191,6 +209,7 @@ impl RouteCommand {
             effort_advice: self.effort_advice,
             max_input_chars: self.max_input_chars,
             allow_closed: self.allow_closed,
+            ignore_closed: self.ignore_closed,
         }
     }
 }
@@ -362,13 +381,16 @@ fn failure_summary(report: &RouteReport) -> Option<String> {
 /// Resolves the `<ISSUE>` arguments (or `--all-open`) to issue references,
 /// fetches them, in order, without duplicates, and resolves each one's open
 /// citations (#1812). The current repository is looked up through `gh` only
-/// when an argument needs it. **Blocking.**
+/// when an argument needs it. With `ignore_closed`, a closed issue's
+/// citations are not resolved, since the engine will skip it (#2000).
+/// **Blocking.**
 fn fetch_docs(
     bin: &Path,
     cwd: &Path,
     issues: &[String],
     all_open: bool,
     max_input_chars: usize,
+    ignore_closed: bool,
 ) -> Result<(Vec<IssueDoc>, OpenDependencies, ReferenceFetchFailures)> {
     let default_project = if all_open || issues.iter().any(|a| needs_default_project(a)) {
         Some(resolve_current_project(bin, cwd).context(
@@ -406,8 +428,12 @@ fn fetch_docs(
         .filter(|r| seen.insert((r.project.clone(), r.number)))
         .collect();
     let docs = fetch_issues(bin, &refs)?;
+    let routable: Vec<&IssueDoc> = docs
+        .iter()
+        .filter(|d| !is_ignored_closed(d, ignore_closed))
+        .collect();
     let (dependencies, reference_fetch_failures) =
-        find_open_dependencies(bin, &docs, max_input_chars)?;
+        find_open_dependencies(bin, &routable, max_input_chars)?;
     Ok((docs, dependencies, reference_fetch_failures))
 }
 
@@ -417,7 +443,7 @@ fn fetch_docs(
 /// retained as a reference-fetch failure for output. **Blocking.**
 fn find_open_dependencies(
     bin: &Path,
-    docs: &[IssueDoc],
+    docs: &[&IssueDoc],
     max_input_chars: usize,
 ) -> Result<(OpenDependencies, ReferenceFetchFailures)> {
     let mut per_issue: Vec<((String, u64), Vec<Citation>)> = Vec::new();
@@ -519,6 +545,7 @@ mod tests {
         assert!((cmd.close_call - DEFAULT_CLOSE_CALL).abs() < f64::EPSILON);
         assert_eq!(cmd.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
         assert!(!cmd.allow_closed);
+        assert!(!cmd.ignore_closed);
         assert!(!cmd.effort_advice);
         assert_eq!(cmd.output, RouteFormat::Json);
         assert_eq!(cmd.ladders, ["anthropic"]);
@@ -549,6 +576,7 @@ mod tests {
         assert_eq!(default.model, "configured-model");
         assert!(!default.effort_advice);
         assert!(!default.allow_closed);
+        assert!(!default.ignore_closed);
         assert_eq!(default.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
         assert!((default.close_call - DEFAULT_CLOSE_CALL).abs() < f64::EPSILON);
 
@@ -568,6 +596,23 @@ mod tests {
         assert!(enabled.allow_closed);
         assert_eq!(enabled.max_input_chars, 1234);
         assert!((enabled.close_call - 0.42).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn route_forwards_ignore_closed() {
+        let opts = parse(&["#1", "#2", "--ignore-closed"])
+            .unwrap()
+            .route_options("m".into());
+        assert!(opts.ignore_closed);
+        assert!(!opts.allow_closed);
+    }
+
+    #[test]
+    fn route_rejects_ignore_closed_with_allow_closed() {
+        let Err(err) = parse(&["#1", "--ignore-closed", "--allow-closed"]) else {
+            panic!("expected a conflict");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
@@ -775,6 +820,7 @@ mod tests {
         let report = |issues| RouteReport {
             model: String::new(),
             issues,
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
 
@@ -824,6 +870,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
 
@@ -973,6 +1020,7 @@ mod tests {
                 &["rust-works/omni-dev#1".to_string()],
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
+                false,
             )
         })
         .unwrap();
@@ -987,7 +1035,14 @@ mod tests {
         let (bin, _shim) = fake_gh(dir.path());
         let args = ["#1", "1", "rust-works/omni-dev#2"].map(str::to_string);
         let (docs, _deps, _failures) = retry_on_etxtbsy(|| {
-            fetch_docs(&bin, dir.path(), &args, false, DEFAULT_MAX_INPUT_CHARS)
+            fetch_docs(
+                &bin,
+                dir.path(),
+                &args,
+                false,
+                DEFAULT_MAX_INPUT_CHARS,
+                false,
+            )
         })
         .unwrap();
         let numbers: Vec<u64> = docs.iter().map(|d| d.number).collect();
@@ -999,9 +1054,10 @@ mod tests {
     fn fetch_docs_all_open_lists_the_current_repository() {
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(dir.path());
-        let (docs, _deps, _failures) =
-            retry_on_etxtbsy(|| fetch_docs(&bin, dir.path(), &[], true, DEFAULT_MAX_INPUT_CHARS))
-                .unwrap();
+        let (docs, _deps, _failures) = retry_on_etxtbsy(|| {
+            fetch_docs(&bin, dir.path(), &[], true, DEFAULT_MAX_INPUT_CHARS, false)
+        })
+        .unwrap();
         let numbers: Vec<u64> = docs.iter().map(|d| d.number).collect();
         assert_eq!(numbers, [5, 6]);
         assert_eq!(calls(dir.path()), ["repo", "issue", "api"]);
@@ -1015,6 +1071,7 @@ mod tests {
             &["#1".to_string()],
             false,
             DEFAULT_MAX_INPUT_CHARS,
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("-C/--repo"), "{err}");
@@ -1028,10 +1085,19 @@ mod tests {
         dir: &Path,
         cited_state: &str,
     ) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
+        fake_gh_with_states(dir, "OPEN", cited_state)
+    }
+
+    /// [`fake_gh_with_citation`] with the citing issue's own state chosen too.
+    fn fake_gh_with_states(
+        dir: &Path,
+        citing_state: &str,
+        cited_state: &str,
+    ) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
         let guard = shim_lock();
         let citing = serde_json::json!({
             "__typename": "Issue",
-            "title": "t", "body": "see #2", "state": "OPEN", "url": "u",
+            "title": "t", "body": "see #2", "state": citing_state, "url": "u",
             "comments": {"totalCount": 0, "nodes": []},
             "closedByPullRequestsReferences": {"nodes": []}
         });
@@ -1094,6 +1160,7 @@ mod tests {
                 &["#1".to_string()],
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
+                false,
             )
         })
         .unwrap();
@@ -1119,10 +1186,41 @@ mod tests {
                 &["#1".to_string()],
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
+                false,
             )
         })
         .unwrap();
         assert!(deps.is_empty(), "{deps:?}");
+    }
+
+    /// A closed issue `--ignore-closed` will skip keeps its place in the
+    /// fetched docs (the engine lists it under `ignored_closed`), but its
+    /// citations are not resolved (#2000).
+    #[test]
+    fn fetch_docs_skips_citations_of_a_closed_issue_when_ignoring_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh_with_states(dir.path(), "CLOSED", "OPEN");
+        let fetch = |ignore_closed| {
+            retry_on_etxtbsy(|| {
+                fetch_docs(
+                    &bin,
+                    dir.path(),
+                    &["rust-works/omni-dev#1".to_string()],
+                    false,
+                    DEFAULT_MAX_INPUT_CHARS,
+                    ignore_closed,
+                )
+            })
+            .unwrap()
+        };
+        let (docs, deps, failures) = fetch(true);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].state, ItemState::Closed);
+        assert!(deps.is_empty(), "{deps:?}");
+        assert!(failures.is_empty(), "{failures:?}");
+
+        let (_docs, deps, _failures) = fetch(false);
+        assert_eq!(deps.len(), 1, "{deps:?}");
     }
 
     #[test]
@@ -1136,6 +1234,7 @@ mod tests {
                 &["#1".to_string()],
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
+                false,
             )
         })
         .unwrap();

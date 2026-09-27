@@ -358,6 +358,7 @@ Options:
       --close-call <CONFIDENCE>        Confidence below which a model-class or effort answer is reported as a close call [default: 0.3]
       --max-input-chars <CHARS>        Longest issue text, in characters, sent to Jev; longer text is cut with a marker [default: 60000]
       --allow-closed                   Routes closed issues instead of refusing them
+      --ignore-closed                  Skips closed issues instead of refusing them, listing them under `ignored_closed`
   -o, --output <OUTPUT>                Output format [default: json] [possible values: json, yaml, text]
       --jev-model <MODEL>              Overrides the configured Jev model for this call
   -C, --repo <PATH>                    Run as if omni-dev was started in `<PATH>` instead of the current working directory

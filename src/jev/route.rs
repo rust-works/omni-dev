@@ -504,10 +504,28 @@ pub struct RouteReport {
     /// The Jev model that answered (comma-separated in the unlikely case the
     /// alias moved mid-run).
     pub model: String,
-    /// One entry per issue, in the order requested.
+    /// One entry per routed issue, in the order requested.
     pub issues: Vec<IssueRoute>,
+    /// Closed issues dropped from the batch by
+    /// [`RouteOptions::ignore_closed`], in the order requested (#2000).
+    /// Omitted when empty, so a run that skipped nothing serialises as before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignored_closed: Vec<IgnoredIssue>,
     /// Token usage summed over every Jev call.
     pub usage: Usage,
+}
+
+/// A closed issue [`RouteOptions::ignore_closed`] dropped from the batch
+/// without routing it (#2000).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IgnoredIssue {
+    /// The issue, as `owner/repo#N`.
+    #[serde(rename = "ref")]
+    pub item_ref: String,
+    /// The issue's web URL.
+    pub url: String,
+    /// The issue title.
+    pub title: String,
 }
 
 /// Knobs for [`run_route`].
@@ -523,6 +541,10 @@ pub struct RouteOptions {
     pub max_input_chars: usize,
     /// Route closed issues instead of refusing them.
     pub allow_closed: bool,
+    /// Drop closed issues from the batch instead of refusing them, listing
+    /// them under [`RouteReport::ignored_closed`] (#2000). Mutually
+    /// exclusive with [`RouteOptions::allow_closed`].
+    pub ignore_closed: bool,
 }
 
 /// Routes every issue in `docs`, one Jev call each, in order.
@@ -533,6 +555,9 @@ pub struct RouteOptions {
 ///
 /// Refuses closed issues unless [`RouteOptions::allow_closed`]: their comments
 /// often describe how the work was actually done, which leaks the answer.
+/// With [`RouteOptions::ignore_closed`] they are instead dropped before any
+/// request is sent and listed under [`RouteReport::ignored_closed`]; a batch
+/// with no open issue left is still an error.
 ///
 /// `dependencies` is each issue's open citations (#1812), keyed by `(project,
 /// number)` — pre-resolved by the caller's `gh` fetch, since this function
@@ -572,14 +597,15 @@ pub async fn run_route_with_reference_fetch_failures(
     dependencies: &OpenDependencies,
     reference_fetch_failures: &ReferenceFetchFailures,
 ) -> Result<RouteReport> {
-    validate_options(docs, ladders, opts)?;
+    let (docs, ignored_closed) = drop_closed(docs, opts)?;
+    validate_options(&docs, ladders, opts)?;
     let questions = build_route_questions_for_mode(ladders, opts.effort_advice)?;
 
     let mut models = BTreeSet::new();
     let mut usage = Usage::default();
     let mut issues = Vec::with_capacity(docs.len());
     for doc in docs {
-        let item_ref = format!("{}#{}", doc.project, doc.number);
+        let item_ref = item_ref(doc);
         let (state, truncated) = build_route_state(doc, opts.max_input_chars);
         if truncated {
             warn!(
@@ -651,8 +677,59 @@ pub async fn run_route_with_reference_fetch_failures(
     Ok(RouteReport {
         model: models.into_iter().collect::<Vec<_>>().join(", "),
         issues,
+        ignored_closed,
         usage,
     })
+}
+
+/// Whether `--ignore-closed` drops `doc` from the batch. Shared with the
+/// CLI, which skips resolving the citations of exactly these issues.
+#[must_use]
+pub fn is_ignored_closed(doc: &IssueDoc, ignore_closed: bool) -> bool {
+    ignore_closed && doc.state == ItemState::Closed
+}
+
+/// `doc`'s `owner/repo#N` reference.
+fn item_ref(doc: &IssueDoc) -> String {
+    format!("{}#{}", doc.project, doc.number)
+}
+
+/// Splits off the closed issues [`RouteOptions::ignore_closed`] skips,
+/// returning the issues still to route. Without the flag every issue is kept,
+/// so [`validate_options`] can refuse the closed ones. Refuses the flag
+/// alongside [`RouteOptions::allow_closed`] first, so that conflict is
+/// reported whatever the batch holds, then a batch the flag would leave empty, naming what it skipped, rather than letting it
+/// surface as the less helpful "no issues to route".
+fn drop_closed<'a>(
+    docs: &'a [IssueDoc],
+    opts: &RouteOptions,
+) -> Result<(Vec<&'a IssueDoc>, Vec<IgnoredIssue>)> {
+    if opts.allow_closed && opts.ignore_closed {
+        bail!("--allow-closed and --ignore-closed cannot be used together");
+    }
+    let (open, closed): (Vec<&IssueDoc>, Vec<&IssueDoc>) = docs
+        .iter()
+        .partition(|d| !is_ignored_closed(d, opts.ignore_closed));
+    if open.is_empty() && !closed.is_empty() {
+        bail!(
+            "every requested issue is closed ({}) and --ignore-closed skipped them; nothing to \
+             route",
+            closed
+                .iter()
+                .map(|d| item_ref(d))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let ignored = closed
+        .into_iter()
+        .map(|d| IgnoredIssue {
+            item_ref: item_ref(d),
+            url: d.url.clone(),
+            title: d.title.clone(),
+        })
+        .collect();
+    Ok((open, ignored))
 }
 
 /// Records `err` as `item_ref`'s outcome, warning so a long run shows it as
@@ -672,7 +749,7 @@ fn failed(
 
 /// Rejects an empty run, an empty or repeated ladder list, out-of-range
 /// knobs, and (by default) closed issues, before any paid request is sent.
-fn validate_options(docs: &[IssueDoc], ladders: &[Ladder], opts: &RouteOptions) -> Result<()> {
+fn validate_options(docs: &[&IssueDoc], ladders: &[Ladder], opts: &RouteOptions) -> Result<()> {
     if docs.is_empty() {
         bail!("no issues to route");
     }
@@ -698,12 +775,13 @@ fn validate_options(docs: &[IssueDoc], ladders: &[Ladder], opts: &RouteOptions) 
         let closed: Vec<String> = docs
             .iter()
             .filter(|d| d.state == ItemState::Closed)
-            .map(|d| format!("{}#{}", d.project, d.number))
+            .map(|d| item_ref(d))
             .collect();
         if !closed.is_empty() {
             bail!(
                 "refusing to route closed issues ({}): their comments often describe how the \
-                 work was done, which leaks the answer. Pass --allow-closed to route them anyway",
+                 work was done, which leaks the answer. Pass --ignore-closed to skip them, or \
+                 --allow-closed to route them anyway",
                 closed.join(", ")
             );
         }
@@ -864,6 +942,8 @@ fn dependency_entries(
 /// `--allow-closed` routes them) followed by one indented line per fact — one
 /// per provider's routing, then `depends_on` — rather than one run-on
 /// sentence, which reads poorly once more than one provider is involved.
+/// Closed issues `--ignore-closed` skipped get one `ignored closed:` line
+/// before the `model`/`usage` footer.
 ///
 /// `max_input_chars` is threaded in explicitly rather than read off
 /// `RouteReport` (which doesn't carry it) so a truncated issue's block can
@@ -912,6 +992,14 @@ pub fn render_route_text_styled(
         .iter()
         .map(|issue| render_issue_block(issue, max_input_chars, ladders, style))
         .collect();
+    if !report.ignored_closed.is_empty() {
+        let refs: Vec<String> = report
+            .ignored_closed
+            .iter()
+            .map(|issue| hyperlink(&issue.item_ref, Some(&issue.url), style))
+            .collect();
+        blocks.push(format!("ignored closed: {}", refs.join(", ")));
+    }
     blocks.push(format!(
         "model: {}, usage: {} input tokens, {} output tokens",
         report.model, report.usage.input_tokens, report.usage.output_tokens
@@ -1304,6 +1392,7 @@ mod tests {
             effort_advice: false,
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             allow_closed: false,
+            ignore_closed: false,
         }
     }
 
@@ -1882,16 +1971,93 @@ mod tests {
     #[test]
     fn closed_issues_are_refused_by_default() {
         let err =
-            validate_options(&[doc(1, ItemState::Closed)], &anthropic(), &opts()).unwrap_err();
+            validate_options(&[&doc(1, ItemState::Closed)], &anthropic(), &opts()).unwrap_err();
         assert!(err.to_string().contains("rust-works/omni-dev#1"), "{err}");
         assert!(err.to_string().contains("--allow-closed"), "{err}");
+        assert!(err.to_string().contains("--ignore-closed"), "{err}");
+    }
+
+    /// Checked before the batch is split, so an all-closed batch still
+    /// reports the conflict rather than "nothing to route".
+    #[test]
+    fn allow_closed_and_ignore_closed_are_mutually_exclusive() {
+        let mut o = opts();
+        o.allow_closed = true;
+        o.ignore_closed = true;
+        for state in [ItemState::Open, ItemState::Closed] {
+            let err = drop_closed(&[doc(1, state)], &o).unwrap_err();
+            assert!(err.to_string().contains("cannot be used together"), "{err}");
+        }
+    }
+
+    // ── drop_closed (#2000) ─────────────────────────────────────────
+
+    #[test]
+    fn drop_closed_keeps_every_issue_without_the_flag() {
+        let docs = [doc(1, ItemState::Open), doc(2, ItemState::Closed)];
+        let (kept, ignored) = drop_closed(&docs, &opts()).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(ignored.is_empty());
+    }
+
+    #[test]
+    fn drop_closed_skips_closed_issues_in_request_order() {
+        let mut o = opts();
+        o.ignore_closed = true;
+        let docs = [
+            doc(3, ItemState::Closed),
+            doc(1, ItemState::Open),
+            doc(2, ItemState::Closed),
+        ];
+        let (kept, ignored) = drop_closed(&docs, &o).unwrap();
+        assert_eq!(kept.iter().map(|d| d.number).collect::<Vec<_>>(), [1]);
+        assert_eq!(
+            ignored,
+            [
+                IgnoredIssue {
+                    item_ref: "rust-works/omni-dev#3".to_string(),
+                    url: "https://github.com/rust-works/omni-dev/issues/3".to_string(),
+                    title: "Route issues".to_string(),
+                },
+                IgnoredIssue {
+                    item_ref: "rust-works/omni-dev#2".to_string(),
+                    url: "https://github.com/rust-works/omni-dev/issues/2".to_string(),
+                    title: "Route issues".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn drop_closed_refuses_a_batch_with_no_open_issue_left() {
+        let mut o = opts();
+        o.ignore_closed = true;
+        let docs = [doc(1, ItemState::Closed), doc(2, ItemState::Closed)];
+        let err = drop_closed(&docs, &o).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rust-works/omni-dev#1, rust-works/omni-dev#2"),
+            "{msg}"
+        );
+        assert!(msg.contains("nothing to route"), "{msg}");
+    }
+
+    /// An empty batch passes through, keeping `validate_options`' generic
+    /// "no issues to route" error.
+    #[test]
+    fn drop_closed_passes_an_empty_batch_through() {
+        let mut o = opts();
+        o.ignore_closed = true;
+        let (kept, ignored) = drop_closed(&[], &o).unwrap();
+        assert!(kept.is_empty());
+        assert!(ignored.is_empty());
     }
 
     #[test]
     fn closed_issues_are_allowed_on_request() {
         let mut o = opts();
         o.allow_closed = true;
-        validate_options(&[doc(1, ItemState::Closed)], &anthropic(), &o).unwrap();
+        validate_options(&[&doc(1, ItemState::Closed)], &anthropic(), &o).unwrap();
     }
 
     #[test]
@@ -1899,21 +2065,21 @@ mod tests {
         assert!(validate_options(&[], &anthropic(), &opts()).is_err());
         let mut o = opts();
         o.close_call = 1.5;
-        assert!(validate_options(&[doc(1, ItemState::Open)], &anthropic(), &o).is_err());
+        assert!(validate_options(&[&doc(1, ItemState::Open)], &anthropic(), &o).is_err());
         let mut o = opts();
         o.max_input_chars = 0;
-        assert!(validate_options(&[doc(1, ItemState::Open)], &anthropic(), &o).is_err());
+        assert!(validate_options(&[&doc(1, ItemState::Open)], &anthropic(), &o).is_err());
     }
 
     #[test]
     fn empty_and_duplicate_providers_are_rejected() {
-        let err = validate_options(&[doc(1, ItemState::Open)], &[], &opts()).unwrap_err();
+        let err = validate_options(&[&doc(1, ItemState::Open)], &[], &opts()).unwrap_err();
         assert!(err.to_string().contains("no ladders"), "{err}");
         let twice = [
             class_only(Provider::Gemini).unwrap(),
             class_only(Provider::Gemini).unwrap(),
         ];
-        let err = validate_options(&[doc(1, ItemState::Open)], &twice, &opts()).unwrap_err();
+        let err = validate_options(&[&doc(1, ItemState::Open)], &twice, &opts()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("\"gemini\" is listed more than once"),
@@ -1994,6 +2160,83 @@ mod tests {
                 "anthropic.stage_review"
             ]
         );
+    }
+
+    /// `--ignore-closed` sends one request per *open* issue, lists the closed
+    /// ones under `ignored_closed`, and a closed-only batch sends nothing
+    /// (#2000).
+    #[tokio::test]
+    async fn run_route_ignore_closed_routes_only_open_issues() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "jev-1.13.0",
+                    "answers": {
+                        "anthropic.stage_design": choice_json("opus", 0.52),
+                        "anthropic.stage_implement": choice_json("sonnet", 0.83),
+                        "anthropic.stage_review": choice_json("opus", 0.61),
+                    },
+                    "usage": {"input_tokens": 100, "output_tokens": 10}
+                })),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = JevClient::new(&server.uri(), "key").unwrap();
+        let mut o = opts();
+        o.ignore_closed = true;
+
+        let report = run_route(
+            &client,
+            &[
+                doc(7, ItemState::Open),
+                doc(8, ItemState::Closed),
+                doc(9, ItemState::Open),
+            ],
+            &anthropic(),
+            &o,
+            &OpenDependencies::new(),
+        )
+        .await
+        .unwrap();
+
+        let refs: Vec<&str> = report.issues.iter().map(|i| i.item_ref.as_str()).collect();
+        assert_eq!(refs, ["rust-works/omni-dev#7", "rust-works/omni-dev#9"]);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["ignored_closed"],
+            serde_json::json!([{
+                "ref": "rust-works/omni-dev#8",
+                "url": "https://github.com/rust-works/omni-dev/issues/8",
+                "title": "Route issues",
+            }])
+        );
+
+        let err = run_route(
+            &client,
+            &[doc(8, ItemState::Closed)],
+            &anthropic(),
+            &o,
+            &OpenDependencies::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("nothing to route"), "{err}");
+    }
+
+    /// A report that skipped nothing serialises without `ignored_closed`, so
+    /// existing consumers see the same shape as before #2000.
+    #[test]
+    fn route_report_omits_an_empty_ignored_closed() {
+        let report = RouteReport {
+            model: "m".to_string(),
+            issues: vec![],
+            ignored_closed: vec![],
+            usage: Usage::default(),
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json.get("ignored_closed").is_none(), "{json}");
     }
 
     /// Two ladders ride one request and come back as two independent
@@ -2364,6 +2607,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let value = serde_json::to_value(&report).unwrap();
@@ -2433,6 +2677,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage {
                 input_tokens: 1432,
                 output_tokens: 61,
@@ -2485,6 +2730,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
@@ -2522,6 +2768,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
@@ -2544,6 +2791,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
@@ -2565,10 +2813,45 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
         assert!(text.starts_with("o/r#1 — t (closed)\n"), "{text}");
+        assert!(!text.contains("ignored closed"), "{text}");
+    }
+
+    #[test]
+    fn render_route_text_lists_ignored_closed_issues_before_the_footer() {
+        let ignored = |n: u64| IgnoredIssue {
+            item_ref: format!("o/r#{n}"),
+            url: format!("https://github.com/o/r/issues/{n}"),
+            title: "t".to_string(),
+        };
+        let report = RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![],
+            ignored_closed: vec![ignored(2), ignored(3)],
+            usage: Usage::default(),
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(
+            text.contains("ignored closed: o/r#2, o/r#3\n\nmodel: jev-1.13.0"),
+            "{text}"
+        );
+        let styled = render_route_text_styled(
+            &report,
+            DEFAULT_MAX_INPUT_CHARS,
+            &[],
+            TerminalStyle {
+                color: false,
+                hyperlinks: true,
+            },
+        );
+        assert!(
+            styled.contains("https://github.com/o/r/issues/2"),
+            "{styled}"
+        );
     }
 
     #[test]
@@ -2594,6 +2877,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
@@ -2631,6 +2915,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
@@ -2662,6 +2947,7 @@ mod tests {
         let report = |truncated| RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![issue(truncated)],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let truncated_text = render_route_text(&report(true), 60_000);
@@ -2696,6 +2982,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
@@ -2738,6 +3025,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
@@ -2780,6 +3068,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
@@ -2823,6 +3112,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
@@ -2868,6 +3158,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
@@ -2909,6 +3200,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
@@ -2934,6 +3226,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![issue("o/r#1"), issue("o/r#2")],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
@@ -2951,6 +3244,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![],
+            ignored_closed: vec![],
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 20,
@@ -3105,6 +3399,7 @@ mod tests {
         let report = RouteReport {
             model: "jev".to_string(),
             issues: vec![issue, failed],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let style = TerminalStyle {
@@ -3176,6 +3471,7 @@ mod tests {
                 },
                 truncated: false,
             }],
+            ignored_closed: vec![],
             usage: Usage::default(),
         };
         let text = render_route_text_styled(
