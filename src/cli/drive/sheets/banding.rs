@@ -389,6 +389,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_bandings_reads_a_pure_black_footer_with_every_channel_omitted() {
+        // Issue #1929: a pure black (`#000000`) footer colour has every
+        // channel omitted by proto3 (`{"rgbColor": {}}`) — contrast the
+        // test above, whose fixture spells every channel explicitly
+        // (`"red": 0, "green": 0, "blue": 0`) and so never exercised this.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{
+                        "properties": {"title": "Sheet1"},
+                        "bandedRanges": [
+                            {
+                                "bandedRangeId": 1,
+                                "rowProperties": {
+                                    "firstBandColorStyle": {"rgbColor": {"red": 1, "green": 1, "blue": 1}},
+                                    "footerColorStyle": {"rgbColor": {}},
+                                },
+                            },
+                        ],
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListBandingsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn list_bandings_yaml_output_short_circuits_before_printing_lines() {
         let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();

@@ -342,6 +342,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_dimension_groups_reads_a_group_on_the_first_sheet_starting_at_row_one() {
+        // Issue #1929: a row group on the first sheet (`sheetId: 0`)
+        // starting at row 1 (`startIndex: 0`) has both fields omitted by
+        // proto3 — contrast the fixture above, which spells every index
+        // explicitly (`"sheetId": 0, ..., "startIndex": 0`) and so never
+        // exercised this.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{
+                        "properties": {"title": "Sheet1"},
+                        "rowGroups": [
+                            {"range": {"dimension": "ROWS", "endIndex": 3}, "depth": 1},
+                        ],
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListDimensionGroupsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn list_dimension_groups_yaml_output_short_circuits_before_printing_lines() {
         let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();

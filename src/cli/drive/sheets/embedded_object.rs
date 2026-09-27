@@ -984,6 +984,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_charts_reads_back_a_chart_anchored_at_a1_on_sheet_0() {
+        // Issue #1929, confirmed live: a chart anchored in row 1 / column A
+        // on the first sheet has every `GridCoordinate` field omitted by
+        // proto3 (`{}` on the wire, not `{"sheetId":0,"rowIndex":0,
+        // "columnIndex":0}`). Before the fix, this made `list-charts` (and
+        // every other embedded-object verb) fail to parse the workbook at
+        // all with `missing field \`rowIndex\``.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{
+                        "properties": {"sheetId": 0, "title": "Sheet1"},
+                        "charts": [{
+                            "chartId": 1,
+                            "spec": {
+                                "title": "Sales",
+                                "basicChart": {"chartType": "COLUMN"},
+                            },
+                            "position": {
+                                "overlayPosition": {"anchorCell": {}},
+                            },
+                        }],
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListChartsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn add_slicer_command_reports_blocked_with_no_rules() {
         let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();
