@@ -1059,6 +1059,15 @@ fn describe_effect(verb: &FormatVerb, discarded_cells: &[String]) -> Result<Stri
             if discarded_cells.is_empty() {
                 Ok(format!("merge ({merge_type})"))
             } else {
+                // `discarded_cells` is deliberately not elided — ADR-0078
+                // §4 / #1880. This preview substitutes for a confirmation
+                // flag and names exactly what would be lost; eliding it
+                // would silently weaken that guarantee, which is an ADR
+                // change, not a formatting one. The list only ever
+                // contains non-top-left, non-blank cells of a
+                // caller-chosen merge range, which in practice is small,
+                // and it is already one line rather than one line per
+                // entry (unlike `paste`'s pre-#1880 shape).
                 Ok(format!(
                     "merge ({merge_type}), discarding {} cell(s): {}",
                     discarded_cells.len(),

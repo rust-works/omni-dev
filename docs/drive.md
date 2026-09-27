@@ -1913,6 +1913,10 @@ Would auto-fill within 'Q1'!A1:A10 (Sheets decides which cells are the source an
   the filled values are computed by Sheets' own series detection and are never reported, before or after the request
 ```
 
+Past 50 addresses the rendered line elides the remainder (`… and N more`);
+the `-o json` outcome keeps the full list, and the count in the sentence
+stays exact either way (issue #1880).
+
 Both `--range` and `--source` require a **fully bounded** range (`A1:D10`,
 not `A:A` or `5:5`) — `merge-cells`' own requirement — since neither the
 destination arithmetic nor the preview read has a fixed extent to work
@@ -1982,6 +1986,10 @@ overwrite count is **always** an upper bound (unlike `auto-fill`, where
 only `--range` is): the API decides for itself how many columns each row's
 split needs, and a quoted delimiter or a run of consecutive separators can
 make the local split wider than the real one.
+
+Past 50 addresses the rendered line elides the remainder (`… and N more`);
+the `-o json` outcome keeps the full list, and the count in the sentence
+stays exact either way (issue #1880).
 
 `--delimiter auto` is different, and **not** in a way a caveat alone
 covers. For every other delimiter the local split uses the same separator
@@ -3001,6 +3009,10 @@ restores every dependent formula to working order, since the name is what
 changed,
 not the formula text.
 
+Past 50 addresses the rendered line elides the remainder (`… and N more`);
+the `-o json` outcome keeps the full list, and the count in the sentence
+stays exact either way (issue #1880).
+
 #### drive sheets add-chart / update-chart / delete-chart / list-charts / add-slicer / update-slicer / delete-slicer / list-slicers
 
 Charts and slicers (issue #1797), sharing one module and one delete request
@@ -3373,6 +3385,12 @@ reported in full in that case, but the *read* backing the preview is
 clipped to the rows and columns the sheet actually has, since `values.get`
 refuses a range past the edge ("exceeds grid limits"); cells that don't
 exist yet hold nothing to overwrite.
+
+Both the destination-overwrite and the cut-paste cleared-source lists
+render as one line of comma-separated A1 addresses (issue #1880 — before
+it, each address printed on its own line). Past 50 addresses the rendered
+line elides the remainder (`… and N more`); the `-o json` outcome keeps
+the full list, and the count in the sentence stays exact either way.
 
 ## Docs
 
