@@ -20,8 +20,10 @@
 //! - Aliases keep their existing precedence: the first name whose pair is set
 //!   wins, and a conflict is only ever within one name's pair.
 //! - The path must be absolute; symlinks are followed and the **target** must
-//!   be a regular file, owner-only (`mode & 0o077 == 0`) and owned by the
-//!   effective uid (Unix only — Windows has no check).
+//!   be a regular file. On Unix it must be either owned by the effective uid
+//!   and owner-only (`mode & 0o077 == 0`), or owned by root and not writable
+//!   by group or other (`mode & 0o022 == 0`) — the shape of Kubernetes and
+//!   Docker Swarm secrets. Windows has no check.
 //! - Exactly one trailing `\n` or `\r\n` is trimmed; an empty result is an
 //!   error, not "unset".
 //! - Errors name variables, paths, modes and uids — never the file's bytes.
@@ -152,7 +154,8 @@ pub enum SecretEnvError {
         path: PathBuf,
     },
 
-    /// The file grants group or other permission bits.
+    /// A file owned by the current user grants group or other permission
+    /// bits.
     #[error(
         "the secret file {path} named by {file_var} has mode {mode}, which grants group or \
          other access; restrict it with `chmod 600 {path}`",
@@ -168,10 +171,27 @@ pub enum SecretEnvError {
         mode: u32,
     },
 
-    /// The file is owned by a different user.
+    /// A root-owned file that group or other users can write.
     #[error(
-        "the secret file {} named by {file_var} is owned by uid {owner}, not the current \
-         user (uid {expected}); take ownership of it (or copy it) and `chmod 600` it",
+        "the secret file {path} named by {file_var} is owned by root but has mode {mode}, \
+         which lets group or other users write it; remove that with `chmod go-w {path}`",
+        path = path.display(),
+        mode = OctalMode(*mode)
+    )]
+    WritableByOthers {
+        /// The variable naming the file.
+        file_var: String,
+        /// The file's path.
+        path: PathBuf,
+        /// The permission bits found (`st_mode & 0o777`).
+        mode: u32,
+    },
+
+    /// The file is owned by neither the current user nor root.
+    #[error(
+        "the secret file {} named by {file_var} is owned by uid {owner}, which is neither \
+         the current user (uid {expected}) nor root; take ownership of it (or copy it) and \
+         `chmod 600` it",
         path.display()
     )]
     WrongOwner {
@@ -207,8 +227,8 @@ pub fn file_var_name(name: &str) -> String {
 /// # Errors
 ///
 /// See [`SecretEnvError`]: both set in one layer, or a `_FILE` that is
-/// relative, unreadable, not a regular file, empty, not UTF-8, or not
-/// owner-only and owned by the current user.
+/// relative, unreadable, not a regular file, empty, not UTF-8, or neither
+/// the current user's and owner-only nor root's and read-only to others.
 pub fn secret_var(env: &impl EnvSource, name: &str) -> Result<Option<Secret>, SecretEnvError> {
     debug_assert!(
         SECRET_ENV_VARS.contains(&name),
@@ -261,9 +281,9 @@ pub fn secret_var_is_set(env: &impl EnvSource, name: &str) -> bool {
 
 /// Reads a secret from `path`, which the variable `file_var` named.
 ///
-/// Checks the path is absolute, follows symlinks, requires a regular
-/// owner-only file owned by the current user (Unix), and trims exactly one
-/// trailing newline.
+/// Checks the path is absolute, follows symlinks, requires a regular file
+/// that is either the current user's and owner-only or root's and not
+/// writable by others (Unix), and trims exactly one trailing newline.
 ///
 /// # Errors
 ///
@@ -315,8 +335,7 @@ fn trim_one_newline(text: &mut String) {
     }
 }
 
-/// Requires a regular file and, on Unix, owner-only permissions and
-/// ownership by the effective uid.
+/// Requires a regular file and, on Unix, passes [`check_unix_security`].
 fn check_metadata(
     file_var: &str,
     path: &Path,
@@ -342,8 +361,22 @@ fn check_metadata(
     Ok(())
 }
 
-/// The pure half of [`check_metadata`]'s Unix check, so the wrong-owner case
-/// is testable without root.
+/// The uid of `root`, whose read-only files are accepted as secrets.
+#[cfg(unix)]
+const ROOT_UID: u32 = 0;
+
+/// The pure half of [`check_metadata`]'s Unix check, so the root-owned and
+/// wrong-owner cases are testable without root.
+///
+/// - A **root-owned** file is accepted when no group or other user can write
+///   it (`mode & 0o022 == 0`). Group and other *read* is allowed, because
+///   that is how Kubernetes (`fsGroup`, default `0644`) and Docker Swarm
+///   (`0444`) project secrets. Only root could have put it there, so a
+///   same-user process can't have planted or swapped it.
+/// - A file **owned by the effective uid** must be owner-only
+///   (`mode & 0o077 == 0`): on a workstation there is no reason for anyone
+///   else to see it.
+/// - Any other owner is refused.
 #[cfg(unix)]
 fn check_unix_security(
     file_var: &str,
@@ -353,12 +386,15 @@ fn check_unix_security(
     euid: u32,
 ) -> Result<(), SecretEnvError> {
     let mode = mode & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(SecretEnvError::LoosePermissions {
-            file_var: file_var.to_string(),
-            path: path.to_path_buf(),
-            mode,
-        });
+    if owner == ROOT_UID {
+        if mode & 0o022 != 0 {
+            return Err(SecretEnvError::WritableByOthers {
+                file_var: file_var.to_string(),
+                path: path.to_path_buf(),
+                mode,
+            });
+        }
+        return Ok(());
     }
     if owner != euid {
         return Err(SecretEnvError::WrongOwner {
@@ -366,6 +402,13 @@ fn check_unix_security(
             path: path.to_path_buf(),
             owner,
             expected: euid,
+        });
+    }
+    if mode & 0o077 != 0 {
+        return Err(SecretEnvError::LoosePermissions {
+            file_var: file_var.to_string(),
+            path: path.to_path_buf(),
+            mode,
         });
     }
     Ok(())
@@ -557,21 +600,65 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn wrong_owner_is_rejected_by_the_pure_check() {
-        let path = Path::new("/run/secrets/key");
-        let err = check_unix_security(FILE_VAR, path, 0o100_600, 0, 501).unwrap_err();
+    fn another_users_file_is_rejected_by_the_pure_check() {
+        let path = Path::new("/home/other/key");
+        let err = check_unix_security(FILE_VAR, path, 0o100_600, 502, 501).unwrap_err();
         assert!(matches!(
             err,
             SecretEnvError::WrongOwner {
-                owner: 0,
+                owner: 502,
                 expected: 501,
                 ..
             }
         ));
         let msg = err.to_string();
-        assert!(msg.contains("uid 0") && msg.contains("uid 501"), "{msg}");
+        assert!(msg.contains("uid 502") && msg.contains("uid 501"), "{msg}");
         // The file type bits are masked off before the mode check.
         assert!(check_unix_security(FILE_VAR, path, 0o100_600, 501, 501).is_ok());
+    }
+
+    /// Container secrets are root-owned and often group/world-readable:
+    /// Kubernetes projects `0644` (or `0440` with `fsGroup`), Docker Swarm
+    /// `0444`. They are accepted whether the process runs as root or not.
+    #[cfg(unix)]
+    #[test]
+    fn root_owned_read_only_secrets_are_accepted() {
+        let path = Path::new("/run/secrets/key");
+        for mode in [0o100_400, 0o100_440, 0o100_444, 0o100_600, 0o100_644] {
+            for euid in [0, 501] {
+                assert!(
+                    check_unix_security(FILE_VAR, path, mode, ROOT_UID, euid).is_ok(),
+                    "mode {mode:o} euid {euid}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_owned_secrets_writable_by_others_are_rejected() {
+        let path = Path::new("/run/secrets/key");
+        for mode in [0o100_664, 0o100_646, 0o100_666, 0o100_620] {
+            let err = check_unix_security(FILE_VAR, path, mode, ROOT_UID, 501).unwrap_err();
+            assert!(
+                matches!(err, SecretEnvError::WritableByOthers { .. }),
+                "mode {mode:o}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("chmod go-w /run/secrets/key"), "{msg}");
+        }
+    }
+
+    /// Running as root doesn't loosen the rule for root's own files beyond
+    /// the container shape: still no group/other write.
+    #[cfg(unix)]
+    #[test]
+    fn root_process_still_rejects_group_writable_root_files() {
+        let path = Path::new("/run/secrets/key");
+        assert!(matches!(
+            check_unix_security(FILE_VAR, path, 0o100_660, ROOT_UID, ROOT_UID).unwrap_err(),
+            SecretEnvError::WritableByOthers { .. }
+        ));
     }
 
     #[cfg(unix)]

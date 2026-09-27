@@ -118,8 +118,7 @@ Get a key from [console.anthropic.com](https://console.anthropic.com/).
 Each of these also accepts a `<NAME>_FILE` companion (`CLAUDE_API_KEY_FILE`,
 `ANTHROPIC_API_KEY_FILE`, `ANTHROPIC_AUTH_TOKEN_FILE`) naming an absolute path
 to a file holding the secret, instead of the value itself — the
-Docker/Kubernetes secrets convention. The file must be a regular file owned
-by you with no group/other permission bits; setting both `NAME` and
+Docker/Kubernetes secrets convention. The file must be a regular file that is either yours and owner-only (`chmod 600`), or owned by root and not writable by others (the shape Kubernetes and Docker secrets take); setting both `NAME` and
 `NAME_FILE` in the same place (both exported, or both in the same settings.json map) is an error. See [ADR-0089](adrs/adr-0089.md).
 
 **Model.** Resolved from the precedence chain above. The registry default is

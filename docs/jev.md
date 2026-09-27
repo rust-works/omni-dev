@@ -74,8 +74,7 @@ One of the two key variables is required. An empty value counts as unset.
 Both `TYPESAFE_API_KEY` and `OMNI_DEV_JEV_API_KEY` also accept a `<NAME>_FILE`
 companion (`TYPESAFE_API_KEY_FILE`, `OMNI_DEV_JEV_API_KEY_FILE`) naming an
 absolute path to a file holding the key instead of the value itself — the
-Docker/Kubernetes secrets convention. The file must be a regular file owned
-by you with no group/other permission bits, its contents are trimmed of one
+Docker/Kubernetes secrets convention. The file must be a regular file that is either yours and owner-only (`chmod 600`), or owned by root and not writable by others (the shape Kubernetes and Docker secrets take), its contents are trimmed of one
 trailing newline, and setting both `NAME` and `NAME_FILE` in the same place (both exported, or both in the same settings.json map)
 is an error. See [ADR-0089](adrs/adr-0089.md).
 

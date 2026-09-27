@@ -1599,7 +1599,7 @@ let api_key = env.var(DATADOG_API_KEY).ok_or(DatadogError::CredentialsNotFound)?
 ```
 
 The resolver gives every secret a `<NAME>_FILE` companion with one set of rules
-(absolute path, owner-only and owned by the current user, one trailing newline
+(absolute path, yours and owner-only or root's and read-only to others, one trailing newline
 trimmed, both-set is an error per layer) — see
 [ADR-0089](adrs/adr-0089.md). Document `<NAME>_FILE` next to the variable in
 its operator guide. A secret-shaped name that genuinely must not accept `_FILE`
