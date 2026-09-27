@@ -1057,6 +1057,30 @@ mod tests {
     }
 
     #[test]
+    fn build_update_removing_the_last_editor_still_sends_an_editors_object() {
+        // The wire-level check issue #1931 asked for: an emptied list must
+        // still put `editors` in the body its mask names, not vanish the
+        // way an empty filter-view `sortSpecs` once did. `users` itself
+        // skips when empty, so the body carries `"editors": {}`.
+        let existing = ProtectedRange {
+            protected_range_id: Some(1),
+            editors: Some(ProtectedRangeEditors {
+                users: vec!["a@example.com".to_string()],
+            }),
+            ..Default::default()
+        };
+        let request =
+            build_update(&existing, &None, None, &[], &["a@example.com".to_string()]).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "protectedRange": {"protectedRangeId": 1, "editors": {}},
+                "fields": "editors",
+            })
+        );
+    }
+
+    #[test]
     fn build_update_leaves_editors_untouched_when_neither_add_nor_remove_given() {
         let existing = ProtectedRange {
             protected_range_id: Some(1),
