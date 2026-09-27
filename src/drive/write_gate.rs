@@ -120,8 +120,13 @@ pub enum DriveOperation {
     /// boundary within a spreadsheet.
     ///
     /// Since issue #1842 ([ADR-0083](../../docs/adrs/adr-0083.md) §3), also
-    /// covers `sort-range`: it permutes values within a caller-named range,
-    /// which a `sheets-write` grant could already replace or clear.
+    /// one half of `sort-range`'s gate, alongside [`Self::SheetsStructure`]
+    /// — re-gated by issue #1870 after live verification found a sorted row
+    /// carries its formatting, notes and data-validation rules with it (see
+    /// that variant's doc comment). It shipped first on this operation
+    /// alone, on a values-only reading: it permutes values within a
+    /// caller-named range, which a `sheets-write` grant could already
+    /// replace or clear.
     ///
     /// Since issue #1843 ([ADR-0083](../../docs/adrs/adr-0083.md) §1),
     /// also one half of `text-to-columns`' gate, for the cell content the
@@ -139,9 +144,7 @@ pub enum DriveOperation {
     /// provisional on live verification, same as `text-to-columns`; the
     /// live run found a reordered row carries its formatting, notes and
     /// data-validation rules with it, so §5's fixed consequence applies
-    /// here too. (`sort-range`, #1842, predates this measurement and
-    /// still gates on this operation alone — a mis-gating filed as a
-    /// follow-up, #1870, not corrected by this change.)
+    /// here too.
     ///
     /// Since issue #1940, also one half of `set-basic-filter --sort-by`'s
     /// gate, alongside [`Self::SheetsStructure`]: a basic filter's sort is
@@ -288,6 +291,13 @@ pub enum DriveOperation {
     /// and a relative formula moved all four with the row. That is this
     /// operation's own subject matter, so a `sheets-write` grant alone
     /// cannot confer it.
+    ///
+    /// Since issue #1870, `sort-range` needs this operation too, alongside
+    /// [`Self::SheetsWrite`] — the same live-verification finding as
+    /// `randomize-range`: formatting, notes and data-validation rules
+    /// travel with a reordered row, and an in-range relative formula
+    /// rewrites to keep pointing at its own row. It shipped first (#1842)
+    /// on `SheetsWrite` alone, before this was measured.
     ///
     /// Since issue #1940, `set-basic-filter --sort-by` resolves this
     /// operation *and* [`Self::SheetsWrite`] — every other filter verb, and

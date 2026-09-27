@@ -1,8 +1,30 @@
 //! `sort-range` — reorder rows in a caller-named range (issue #1842).
 //!
-//! ADR-0083 §§3 and 6 place this under `SheetsWrite`: it permutes cells in
-//! the named range and discards none. Preview intentionally does not read
-//! values or attempt to reproduce Sheets' comparison semantics.
+//! ADR-0083 §§3 and 6 initially placed `sortRange` under `SheetsWrite`
+//! alone, on a values-only reading — a permutation of the range's own
+//! cells is a strict special case of what a `sheets-write` grant already
+//! permits via `clear`+`write`. §5 made that provisional on live
+//! verification: whether the server carries a row's formatting, notes and
+//! data-validation rules along with it when reordering, and what happens
+//! to an in-range formula.
+//!
+//! Live-verified 2026-09-22 against a probe sheet in `omni-dev-test`
+//! (issue #1870's plan comments): **formatting, notes and data-validation
+//! rules move with the row**, and **an in-range formula moves with its row
+//! with its relative references rewritten** to keep pointing at its own
+//! row (e.g. `=B3*2` becomes `=B2*2` when its row moves up one). Formatting
+//! is `SheetsStructure`'s own subject matter, so §5's fixed consequence
+//! applies and the gate is the union of `SheetsWrite` and
+//! `SheetsStructure` — [`target_gate::resolve_all`], the same shape
+//! `randomize_range.rs` (#1845) and `text_to_columns.rs` took.
+//! `sort-range` shipped first on `SheetsWrite` alone (#1842) and was
+//! re-gated by #1870 after this verification. The same live run also
+//! confirmed §3's record-decoupling caveat: cells in the same rows but
+//! outside the selected columns do not move, so a range narrower than its
+//! rows can silently detach a record's other columns.
+//!
+//! Preview intentionally does not read values or attempt to reproduce
+//! Sheets' comparison semantics.
 
 #![allow(missing_docs)]
 
@@ -28,6 +50,14 @@ use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermiss
 use crate::request_log::{self, DriveMutationOutcome};
 
 const LOG_OPERATION: &str = "sheets-sort-range";
+
+/// The operations this verb's gate is the union of, in the order a
+/// refusal reports them. `SheetsWrite` for the cell values a sort
+/// permutes, `SheetsStructure` for the formatting, notes and
+/// data-validation rules live verification found travelling with each
+/// row — see the module docs.
+const GATE_OPERATIONS: &[DriveOperation] =
+    &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SortRangeOptions {
@@ -67,6 +97,10 @@ pub enum SortRangeResult {
         available: Vec<String>,
     },
     Blocked {
+        /// Which of [`GATE_OPERATIONS`] denied first — the union gate
+        /// refuses as soon as one of the two does, and which one it was
+        /// is the only actionable part of the message.
+        operation: DriveOperation,
         decided_by: Option<DecidingRule>,
     },
     RefusedNoLease,
@@ -173,56 +207,58 @@ async fn sort_range_inner(
         }
         Err(detail) => return bare(SortRangeResult::RefusedInvalidRequest { detail }),
     };
-    let (target, decision, resolved_folder_id, requires_lease) = match target_gate::resolve(
-        drive,
-        &opts.spreadsheet_id,
-        DriveOperation::SheetsWrite,
-        rules,
-    )
-    .await
-    {
-        target_gate::TargetGateOutcome::MetadataFetchFailed { detail } => {
-            return bare(SortRangeResult::Failed { detail })
-        }
-        target_gate::TargetGateOutcome::Refused { target, refusal } => {
-            let result = match refusal {
-                SheetTargetRefusal::Shortcut => SortRangeResult::RefusedShortcut,
-                SheetTargetRefusal::NotASpreadsheet { mime_type } => {
-                    SortRangeResult::RefusedNotASpreadsheet { mime_type }
-                }
-                SheetTargetRefusal::NoVisibleParents => SortRangeResult::RefusedNoVisibleParents,
-            };
-            return SortRangeOutcome {
-                spreadsheet_id: opts.spreadsheet_id.clone(),
-                file_name: Some(target.name),
-                resolved_folder_id: None,
-                result,
-            };
-        }
-        target_gate::TargetGateOutcome::GateFetchFailed { target, detail } => {
-            return SortRangeOutcome {
-                spreadsheet_id: opts.spreadsheet_id.clone(),
-                file_name: Some(target.name),
-                resolved_folder_id: None,
-                result: SortRangeResult::Failed { detail },
+    let (target, verdict, denied, resolved_folder_id, requires_lease) =
+        match target_gate::resolve_all(drive, &opts.spreadsheet_id, GATE_OPERATIONS, rules).await {
+            target_gate::TargetGateUnionOutcome::MetadataFetchFailed { detail } => {
+                return bare(SortRangeResult::Failed { detail })
             }
-        }
-        target_gate::TargetGateOutcome::Gated {
-            target,
-            decision,
-            resolved_folder_id,
-            requires_lease,
-        } => (target, decision, resolved_folder_id, requires_lease),
-    };
+            target_gate::TargetGateUnionOutcome::Refused { target, refusal } => {
+                let result = match refusal {
+                    SheetTargetRefusal::Shortcut => SortRangeResult::RefusedShortcut,
+                    SheetTargetRefusal::NotASpreadsheet { mime_type } => {
+                        SortRangeResult::RefusedNotASpreadsheet { mime_type }
+                    }
+                    SheetTargetRefusal::NoVisibleParents => {
+                        SortRangeResult::RefusedNoVisibleParents
+                    }
+                };
+                return SortRangeOutcome {
+                    spreadsheet_id: opts.spreadsheet_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id: None,
+                    result,
+                };
+            }
+            target_gate::TargetGateUnionOutcome::GateFetchFailed { target, detail } => {
+                return SortRangeOutcome {
+                    spreadsheet_id: opts.spreadsheet_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id: None,
+                    result: SortRangeResult::Failed { detail },
+                }
+            }
+            target_gate::TargetGateUnionOutcome::Gated {
+                target,
+                verdict,
+                denied,
+                resolved_folder_id,
+                requires_lease,
+            } => (target, verdict, denied, resolved_folder_id, requires_lease),
+        };
     let gated = |result| SortRangeOutcome {
         spreadsheet_id: opts.spreadsheet_id.clone(),
         file_name: Some(target.name.clone()),
         resolved_folder_id: resolved_folder_id.clone(),
         result,
     };
-    if decision.verdict == write_gate::Verdict::Deny {
+    if verdict == write_gate::Verdict::Deny {
+        // `denied` is `Some` whenever the verdict is `Deny`; the fallback
+        // names the first operation rather than inventing one, matching
+        // `randomize_range.rs`'s own arm.
+        let (operation, decided_by) = denied.unwrap_or((GATE_OPERATIONS[0], None));
         return gated(SortRangeResult::Blocked {
-            decided_by: decision.decided_by,
+            operation,
+            decided_by,
         });
     }
     let api = SheetsApi::new(sheets);
@@ -349,7 +385,7 @@ fn parse_sort_specs(flags: &[String]) -> Result<Vec<SortSpec>, String> {
 
 fn record_attempt(outcome: &SortRangeOutcome, duration: Duration) {
     let decided_by = match &outcome.result {
-        SortRangeResult::Blocked { decided_by } => decided_by.as_ref(),
+        SortRangeResult::Blocked { decided_by, .. } => decided_by.as_ref(),
         _ => None,
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
@@ -425,9 +461,21 @@ pub fn describe_lines(outcome: &SortRangeOutcome) -> Vec<String> {
             "Refused: {book} has no sheet titled '{title}'. Available: {}",
             available.join(", ")
         )],
-        SortRangeResult::Blocked { .. } => vec![format!(
-            "Blocked: sort-range on {book} requires an allowing sheets-write rule"
-        )],
+        SortRangeResult::Blocked {
+            operation,
+            decided_by,
+        } => vec![match decided_by {
+            Some(rule) => format!(
+                "Blocked: sort-range on {book} refused for {operation} by rule on {} {}{}",
+                rule.kind_label(),
+                rule.id(),
+                rule.depth_suffix()
+            ),
+            None => format!(
+                "Blocked: sort-range on {book} refused by default policy (no matching rule \
+                 for {operation})"
+            ),
+        }],
         SortRangeResult::RefusedNoLease => LeaseGateRefusal::NoLease
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
@@ -604,7 +652,7 @@ mod tests {
             folder_id: Some("parent-1".into()),
             file_id: None,
             recursive: true,
-            allow: std::iter::once(DriveOperation::SheetsWrite).collect(),
+            allow: GATE_OPERATIONS.iter().copied().collect(),
             deny: HashSet::default(),
             require_lease: false,
         }
@@ -614,6 +662,20 @@ mod tests {
         FolderPermissionRule {
             require_lease: true,
             ..rule()
+        }
+    }
+
+    /// Allows `sheets-write` but explicitly denies `sheets-structure` — the
+    /// union gate must refuse even though one of its two operations would
+    /// have allowed it.
+    fn rule_missing_sheets_structure() -> FolderPermissionRule {
+        FolderPermissionRule {
+            folder_id: Some("parent-1".into()),
+            file_id: None,
+            recursive: true,
+            allow: std::iter::once(DriveOperation::SheetsWrite).collect(),
+            deny: std::iter::once(DriveOperation::SheetsStructure).collect(),
+            require_lease: false,
         }
     }
 
@@ -658,7 +720,11 @@ mod tests {
             .unwrap()
             .contains("3 of the sheet's 6 allocated columns"));
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 4); // OAuth refresh plus three metadata reads.
+        // OAuth refresh, the target and workbook reads, plus the parent
+        // folder read once per gated operation: `resolve_all` walks the
+        // ancestor chain independently for each of `GATE_OPERATIONS`'s two
+        // operations, so `parent-1` is fetched twice.
+        assert_eq!(requests.len(), 5);
         assert!(requests
             .iter()
             .all(|request| { request.method.as_str() == "GET" || request.url.path() == "/token" }));
@@ -896,11 +962,38 @@ mod tests {
         assert!(
             matches!(
                 outcome.result,
-                SortRangeResult::Blocked { decided_by: None }
+                SortRangeResult::Blocked {
+                    decided_by: None,
+                    ..
+                }
             ),
             "{:?}",
             outcome.result
         );
+    }
+
+    #[tokio::test]
+    async fn a_rule_allowing_sheets_write_but_denying_sheets_structure_is_still_blocked() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        let outcome = sort_range(
+            &drive,
+            &sheets,
+            &options(false),
+            &[rule_missing_sheets_structure()],
+        )
+        .await;
+        let lines = describe_lines(&outcome).join("\n");
+        assert!(lines.contains("sheets-structure"), "{lines}");
+        assert!(lines.contains("rule on folder parent-1"), "{lines}");
+        let SortRangeResult::Blocked { operation, .. } = outcome.result else {
+            panic!("expected Blocked, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+        };
+        assert_eq!(operation, DriveOperation::SheetsStructure);
     }
 
     #[tokio::test]
@@ -1177,14 +1270,19 @@ mod tests {
                 title: "Nope".into(),
                 available: vec!["Q1".into()],
             },
-            SortRangeResult::Blocked { decided_by: None },
             SortRangeResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: None,
+            },
+            SortRangeResult::Blocked {
+                operation: DriveOperation::SheetsStructure,
                 decided_by: Some(DecidingRule::Folder {
                     folder_id: "folder-1".into(),
                     depth: 2,
                 }),
             },
             SortRangeResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
                 decided_by: Some(DecidingRule::File {
                     file_id: "sheet-1".into(),
                 }),
@@ -1256,12 +1354,31 @@ mod tests {
     }
 
     #[test]
+    fn blocked_with_no_deciding_rule_names_the_denied_operation() {
+        let outcome = SortRangeOutcome {
+            spreadsheet_id: "sheet-1".into(),
+            file_name: Some("Budget".into()),
+            resolved_folder_id: None,
+            result: SortRangeResult::Blocked {
+                operation: DriveOperation::SheetsStructure,
+                decided_by: None,
+            },
+        };
+        let lines = describe_lines(&outcome).join("\n");
+        assert!(lines.contains("sheets-structure"), "{lines}");
+    }
+
+    #[test]
     fn log_status_covers_every_variant() {
         for result in every_sort_range_result() {
             assert!(!result.log_status().is_empty());
         }
         assert_eq!(
-            SortRangeResult::Blocked { decided_by: None }.log_status(),
+            SortRangeResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: None
+            }
+            .log_status(),
             "blocked"
         );
         assert_eq!(
