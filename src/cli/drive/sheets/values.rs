@@ -103,39 +103,27 @@ pub fn parse(content: &str, format: ValuesFormat) -> Result<Vec<Vec<String>>> {
 /// first means every terminator csv_core sees is a plain `\n`, so this
 /// never happens. The trade-off is minor: an embedded `\r\n` inside a
 /// quoted multi-line field is written back as a bare `\n`, losing the
-/// carriage return. Plain `\r` line endings (old Mac style) are not
-/// normalised and are not treated as line breaks by this function at all —
-/// `csv_core`'s line counter only counts `\n`, so a lone `\r` terminator
-/// would desynchronise the count. That is an accepted limitation: RFC 4180
-/// specifies CRLF, and Windows/Unix line endings are the ones actually
-/// seen in practice.
+/// carriage return.
+///
+/// The reader is also built with `.terminator(csv::Terminator::Any(b'\n'))`
+/// to force `\n` as the *only* record terminator. By default the `csv`
+/// crate also treats a bare `\r` outside quotes as a terminator — RFC 4180
+/// has no such rule, but `csv_core`'s line counter only counts `\n`, so a
+/// bare `\r` splits a record without advancing the line count, the same
+/// desync #1936 was about (`"a\r\rb"` silently lost its blank line). With
+/// this set, a bare `\r` is ordinary field content instead.
 ///
 /// **Design decision — a blank line is one empty cell (`[""]`), not zero
 /// cells (`[]`).** This matches RFC 4180 (an empty line is a row with one
 /// empty field) and how a quoted `""` line already parses, so the two
 /// blank forms can't disagree — pinned by
 /// `csv_quoted_empty_and_blank_line_agree`. A live check against the
-/// Sheets API (`values.update` and `values.append` against a throwaway tab,
-/// September 2026) confirmed `[""]` is the right choice operationally, and
-/// specifically why: `values.update` actually accepts a `[]` row just
-/// fine and keeps later rows in position (writing `[["x"], [], ["y"]]`
-/// reported `updated_cells: 2` and left `"y"` on row 3, not shifted to row
-/// 2), so an *update* would have worked with either representation. The
-/// real problem is `values.append`: appending
-/// `[["p"], [], ["q"], []]` (a trailing `[]` row) reported
-/// `updated_range: '...'!D1:D3` — the append silently dropped the
-/// trailing blank row from the write itself, not merely from a later
-/// read. The identical shape with `[""]` instead —
-/// `[["p"], [""], ["q"], [""]]` — reported `updated_range: '...'!E1:E4`
-/// and `updated_cells: 4`: every row, including the trailing blank one,
-/// was actually written. (A subsequent `values.get` read of either range
-/// back trims a trailing blank row from its *response* regardless of how
-/// it was written — Sheets doesn't distinguish "no cell" from "a cell
-/// holding an empty string" once trailing-empty trimming applies — so the
-/// difference is only visible in the write call's own reported range and
-/// cell count, not in a naive read-it-back check.) So `[]` would silently
-/// reintroduce this issue's row-loss bug specifically for `append` with a
-/// trailing blank CSV line, which `[""]` avoids.
+/// Sheets API also confirmed it operationally: `values.update` accepts a
+/// `[]` row and keeps later rows in position, but `values.append` silently
+/// drops a *trailing* `[]` row from the write itself — exactly this
+/// issue's row-loss bug, reintroduced through the API layer — while
+/// `[""]` writes every row including a trailing blank one (see the PR
+/// description for the exact request/response pairs).
 fn parse_csv(content: &str) -> Result<Vec<Vec<String>>> {
     let content = content.replace("\r\n", "\n");
     // A blank line needs a newline to exist at all, so a file with no
@@ -146,6 +134,16 @@ fn parse_csv(content: &str) -> Result<Vec<Vec<String>>> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
+        // Force LF as the only record terminator: by default the `csv`
+        // crate also treats a bare `\r` outside quotes as one (RFC 4180
+        // has no such rule; this is the crate's own leniency), and unlike
+        // `\n` it does not advance `csv_core`'s line counter — a
+        // differential fuzzer found this desynchronises row counting from
+        // record counting exactly like #1936 (`"a\r\rb"` parses as two
+        // records but the blank line between them is invisible to the
+        // line-position math below, so it vanishes instead of becoming a
+        // row). With this set, a bare `\r` is ordinary field content.
+        .terminator(csv::Terminator::Any(b'\n'))
         .from_reader(content.as_bytes());
 
     let mut rows: Vec<Vec<String>> = Vec::new();
@@ -388,6 +386,48 @@ mod tests {
     fn csv_crlf_blank_lines_are_rows() {
         let rows = parse("a\r\n\r\nb\r\n", ValuesFormat::Csv).unwrap();
         assert_eq!(rows, vec![vec!["a"], vec![""], vec!["b"]]);
+    }
+
+    #[test]
+    fn csv_bare_cr_is_not_a_line_break() {
+        // A differential fuzzer found the `csv` crate treats a bare `\r`
+        // outside quotes as a record terminator by default, but its line
+        // counter (which the blank-line math above relies on) does not
+        // advance for one — desynchronising row counting from record
+        // counting and silently losing the blank line, #1936 all over
+        // again. `.terminator(Any(b'\n'))` forces every bare `\r` to be
+        // ordinary content instead, so none of these split into extra
+        // records or drop a row.
+        assert_eq!(
+            parse("a\rb", ValuesFormat::Csv).unwrap(),
+            vec![vec!["a\rb"]]
+        );
+        assert_eq!(
+            parse("a\r\rb", ValuesFormat::Csv).unwrap(),
+            vec![vec!["a\r\rb"]]
+        );
+        assert_eq!(parse("\r", ValuesFormat::Csv).unwrap(), vec![vec!["\r"]]);
+        assert_eq!(
+            parse("\r\r", ValuesFormat::Csv).unwrap(),
+            vec![vec!["\r\r"]]
+        );
+        assert_eq!(
+            parse("\r\r\r", ValuesFormat::Csv).unwrap(),
+            vec![vec!["\r\r\r"]]
+        );
+    }
+
+    #[test]
+    fn csv_bare_cr_does_not_swallow_a_real_blank_line() {
+        // Before the terminator fix, "x\ny\r\rz\n" parsed the bare `\r\r`
+        // as a record boundary invisible to the line counter, dropping the
+        // blank line between y and z. With `\r` forced to content, the
+        // input's only real line break is the `\n` between y and z... but
+        // that `\n` is inside neither a quote nor immediately doubled, so
+        // this is one row per `\n`-delimited line, with `\r\r` as content
+        // on y's line.
+        let rows = parse("x\ny\r\rz\n", ValuesFormat::Csv).unwrap();
+        assert_eq!(rows, vec![vec!["x"], vec!["y\r\rz"]]);
     }
 
     #[test]
