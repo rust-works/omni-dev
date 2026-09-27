@@ -2,9 +2,22 @@
 //! #1794, [ADR-0081](../../../docs/adrs/adr-0081.md)).
 //!
 //! Gated by [`DriveOperation::SheetsStructure`] — every mutating verb here
-//! reaches the same operation, unlike `structure.rs`'s split between
+//! reaches that operation, unlike `structure.rs`'s split between
 //! `SheetsStructure` and `SheetsDelete`. ADR-0081 §1 settles this: a filter
 //! hides rows, which is view state, not data.
+//!
+//! **One exception: `set-basic-filter --sort-by`** (issue #1940). A basic
+//! filter's `sortSpecs` are not view state — the server applies them by
+//! physically reordering the rows of the filtered range, `sortRange`-style,
+//! and the reorder survives `clear-basic-filter`. That is the same
+//! permutation `randomize-range` performs, which live verification found
+//! carries each row's formatting, notes and data-validation rules with it
+//! (ADR-0083 §5), so it takes the same union of [`DriveOperation::SheetsWrite`]
+//! and [`DriveOperation::SheetsStructure`] — see
+//! `FilterVerb::gate_operations`. Its preview and report carry
+//! `sort-range`'s record-integrity caveats. A filter view's sort
+//! (`add-filter-view`/`update-filter-view --sort-by`) is per-view and never
+//! touches the grid, so it stays on `SheetsStructure` alone.
 //!
 //! Two shapes, each with its own upsert/CRUD story:
 //!
@@ -63,6 +76,16 @@ use crate::drive::sheets::types::{
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
+
+/// The gate for every verb that only changes view state.
+const GATE_STRUCTURE_ONLY: &[DriveOperation] = &[DriveOperation::SheetsStructure];
+/// The gate for `set-basic-filter --sort-by`, which physically reorders
+/// rows (module docs). `SheetsWrite` first:
+/// `target_gate::TargetGateUnionOutcome::Gated::denied` names the first of
+/// these that denied, and under the `sheets-structure`-only grant every
+/// other verb here needs, `sheets-write` is the operation actually missing.
+const GATE_WRITE_AND_STRUCTURE: &[DriveOperation] =
+    &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure];
 
 /// Which mutation to perform.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +171,24 @@ impl FilterVerb {
             Self::DeleteFilterView { .. } => "delete-filter-view",
         }
     }
+
+    /// Whether this verb physically reorders the grid's rows: only
+    /// `set-basic-filter` with at least one `--sort-by` (issue #1940). A
+    /// filter view's sort is per-view and reorders nothing.
+    fn reorders_rows(&self) -> bool {
+        matches!(self, Self::SetBasicFilter { sort_by, .. } if !sort_by.is_empty())
+    }
+
+    /// The operations this verb's gate is the union of, in the order a
+    /// refusal reports them — `SheetsStructure` alone, except for a row
+    /// reorder (see [`Self::reorders_rows`] and the module docs).
+    fn gate_operations(&self) -> &'static [DriveOperation] {
+        if self.reorders_rows() {
+            GATE_WRITE_AND_STRUCTURE
+        } else {
+            GATE_STRUCTURE_ONLY
+        }
+    }
 }
 
 /// Per-call options.
@@ -178,6 +219,11 @@ pub enum FilterResult {
     WouldChange {
         /// A human-readable summary of the effect.
         summary: String,
+        /// For a row reorder (`set-basic-filter --sort-by`) whose range
+        /// is narrower than its sheet, the record-integrity caveat
+        /// `sort-range` leads with (ADR-0083 §6). Omitted otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width_warning: Option<String>,
     },
     /// The target is not a Google Sheet.
     RefusedNotASpreadsheet {
@@ -210,6 +256,11 @@ pub enum FilterResult {
     },
     /// The folder write-permission gate refused it.
     Blocked {
+        /// Which of `FilterVerb::gate_operations` denied first — only
+        /// ever not `sheets-structure` for `set-basic-filter --sort-by`'s
+        /// union gate, where which of the two denied is the actionable
+        /// part of the message.
+        operation: DriveOperation,
         /// The rule that decided the refusal, if any.
         decided_by: Option<DecidingRule>,
     },
@@ -232,6 +283,9 @@ pub enum FilterResult {
         /// `add-filter-view`, otherwise the one resolved against. `None`
         /// for `set-basic-filter`/`clear-basic-filter`.
         filter_view_id: Option<i64>,
+        /// Same as [`Self::WouldChange`]'s.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width_warning: Option<String>,
     },
     /// An API or validation error.
     Failed {
@@ -357,51 +411,48 @@ async fn filter_inner(
         return bare(FilterResult::RefusedInvalidRange { detail });
     }
 
-    let (target, decision, resolved_folder_id, requires_lease) = match target_gate::resolve(
-        drive,
-        &opts.spreadsheet_id,
-        DriveOperation::SheetsStructure,
-        rules,
-    )
-    .await
-    {
-        target_gate::TargetGateOutcome::MetadataFetchFailed { detail } => {
-            return bare(FilterResult::Failed { detail })
-        }
-        target_gate::TargetGateOutcome::Refused { target, refusal } => {
-            let result = match refusal {
-                SheetTargetRefusal::Shortcut => FilterResult::RefusedShortcut,
-                SheetTargetRefusal::NotASpreadsheet { mime_type } => {
-                    FilterResult::RefusedNotASpreadsheet { mime_type }
-                }
-                SheetTargetRefusal::NoVisibleParents => FilterResult::RefusedNoVisibleParents,
-            };
-            return FilterOutcome {
-                spreadsheet_id: opts.spreadsheet_id.clone(),
-                file_name: Some(target.name),
-                resolved_folder_id: None,
-                sheet_id: None,
-                verb: opts.verb.clone(),
-                result,
-            };
-        }
-        target_gate::TargetGateOutcome::GateFetchFailed { target, detail } => {
-            return FilterOutcome {
-                spreadsheet_id: opts.spreadsheet_id.clone(),
-                file_name: Some(target.name),
-                resolved_folder_id: None,
-                sheet_id: None,
-                verb: opts.verb.clone(),
-                result: FilterResult::Failed { detail },
-            };
-        }
-        target_gate::TargetGateOutcome::Gated {
-            target,
-            decision,
-            resolved_folder_id,
-            requires_lease,
-        } => (target, decision, resolved_folder_id, requires_lease),
-    };
+    let operations = opts.verb.gate_operations();
+
+    let (target, verdict, denied, resolved_folder_id, requires_lease) =
+        match target_gate::resolve_all(drive, &opts.spreadsheet_id, operations, rules).await {
+            target_gate::TargetGateUnionOutcome::MetadataFetchFailed { detail } => {
+                return bare(FilterResult::Failed { detail })
+            }
+            target_gate::TargetGateUnionOutcome::Refused { target, refusal } => {
+                let result = match refusal {
+                    SheetTargetRefusal::Shortcut => FilterResult::RefusedShortcut,
+                    SheetTargetRefusal::NotASpreadsheet { mime_type } => {
+                        FilterResult::RefusedNotASpreadsheet { mime_type }
+                    }
+                    SheetTargetRefusal::NoVisibleParents => FilterResult::RefusedNoVisibleParents,
+                };
+                return FilterOutcome {
+                    spreadsheet_id: opts.spreadsheet_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id: None,
+                    sheet_id: None,
+                    verb: opts.verb.clone(),
+                    result,
+                };
+            }
+            target_gate::TargetGateUnionOutcome::GateFetchFailed { target, detail } => {
+                return FilterOutcome {
+                    spreadsheet_id: opts.spreadsheet_id.clone(),
+                    file_name: Some(target.name),
+                    resolved_folder_id: None,
+                    sheet_id: None,
+                    verb: opts.verb.clone(),
+                    result: FilterResult::Failed { detail },
+                };
+            }
+            target_gate::TargetGateUnionOutcome::Gated {
+                target,
+                verdict,
+                denied,
+                resolved_folder_id,
+                requires_lease,
+            } => (target, verdict, denied, resolved_folder_id, requires_lease),
+        };
 
     // Returns before the sheet/range resolution just below always have
     // `sheet_id: None` — there is nothing to resolve it against yet.
@@ -418,9 +469,13 @@ async fn filter_inner(
         result,
     };
 
-    if decision.verdict == write_gate::Verdict::Deny {
+    if verdict == write_gate::Verdict::Deny {
+        // `denied` is `Some` whenever the verdict is `Deny`; the fallback
+        // only keeps this total.
+        let (operation, decided_by) = denied.unwrap_or((operations[0], None));
         return pre_gated(FilterResult::Blocked {
-            decided_by: decision.decided_by,
+            operation,
+            decided_by,
         });
     }
 
@@ -474,9 +529,19 @@ async fn filter_inner(
     };
 
     let summary = describe_effect(&opts.verb);
+    let width_warning = if opts.verb.reorders_rows() {
+        resolved_target
+            .as_ref()
+            .and_then(|grid| reorder_width_warning(&workbook, grid))
+    } else {
+        None
+    };
 
     if opts.dry_run {
-        return gated(FilterResult::WouldChange { summary });
+        return gated(FilterResult::WouldChange {
+            summary,
+            width_warning,
+        });
     }
 
     // Only past the dry-run return does building the actual request do any
@@ -600,6 +665,7 @@ async fn filter_inner(
             FilterResult::Changed {
                 summary,
                 filter_view_id,
+                width_warning,
             }
         }
         Err(err) => FilterResult::Failed {
@@ -608,6 +674,27 @@ async fn filter_inner(
     };
     drop(lease_grant);
     gated(result)
+}
+
+/// `sort-range`'s range-width-vs-sheet-width caveat for a row reorder over
+/// `grid` (ADR-0083 §6): a reorder moves only the cells inside the range,
+/// so any data in the same rows but outside the selected columns is left
+/// behind. An open-ended column span reaches the sheet's last column.
+fn reorder_width_warning(workbook: &Spreadsheet, grid: &GridRange) -> Option<String> {
+    let allocated_columns = grid_range::find_sheet_by_id(workbook, grid.sheet_id)
+        .and_then(|sheet| sheet.properties.as_ref())
+        .and_then(|props| props.grid_properties.as_ref())
+        .and_then(|props| props.column_count);
+    let start_column = grid.start_column_index.unwrap_or(0);
+    match grid.end_column_index.or(allocated_columns) {
+        Some(end_column) => {
+            grid_range::width_warning("sorting", start_column, end_column, allocated_columns)
+        }
+        // Open-ended to the right on a sheet of unknown width: only a
+        // span that also starts past column A can leave columns behind.
+        None if start_column == 0 => None,
+        None => grid_range::width_warning("sorting", start_column, start_column, None),
+    }
 }
 
 /// `--sort-by` flags for whichever verb carries them.
@@ -956,7 +1043,7 @@ fn record_attempt(outcome: &FilterOutcome, opts: &FilterOptions, duration: Durat
         _ => None,
     };
     let decided_by = match &outcome.result {
-        FilterResult::Blocked { decided_by } => decided_by.as_ref(),
+        FilterResult::Blocked { decided_by, .. } => decided_by.as_ref(),
         _ => None,
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
@@ -1006,7 +1093,15 @@ pub fn describe_lines(outcome: &FilterOutcome) -> Vec<String> {
         |n| format!("'{n}'"),
     );
     match &outcome.result {
-        FilterResult::WouldChange { summary } => vec![format!("Would {summary} in {book}")],
+        FilterResult::WouldChange {
+            summary,
+            width_warning,
+        } => change_lines(
+            verb,
+            format!("Would {summary} in {book}"),
+            width_warning.as_deref(),
+            false,
+        ),
         FilterResult::RefusedNotASpreadsheet { mime_type } => vec![format!(
             "Refused: {book} is not a Google Sheet (mimeType: {mime_type}); \
              `drive sheets {}` only works on spreadsheets",
@@ -1016,11 +1111,19 @@ pub fn describe_lines(outcome: &FilterOutcome) -> Vec<String> {
             "Refused: {book} is a shortcut; `drive sheets {}` doesn't follow shortcuts",
             verb.label()
         )],
-        FilterResult::RefusedNoVisibleParents => vec![format!(
-            "Refused: {book} has no parent folder visible to this account, so no folder \
-             rule can apply to it. Grant it by id instead: add {{\"file_id\": \"<spreadsheet \
-             id>\", \"allow\": [\"sheets-structure\"]}} to write_permissions.rules."
-        )],
+        FilterResult::RefusedNoVisibleParents => {
+            let ops = verb
+                .gate_operations()
+                .iter()
+                .map(|op| format!("\"{op}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            vec![format!(
+                "Refused: {book} has no parent folder visible to this account, so no folder \
+                 rule can apply to it. Grant it by id instead: add {{\"file_id\": \
+                 \"<spreadsheet id>\", \"allow\": [{ops}]}} to write_permissions.rules."
+            )]
+        }
         FilterResult::RefusedSheetNotFound { title, available } => {
             let list = if available.is_empty() {
                 "none".to_string()
@@ -1040,7 +1143,10 @@ pub fn describe_lines(outcome: &FilterOutcome) -> Vec<String> {
             "Refused: {book} has no filter view with id {filter_view_id}; run \
              `drive sheets list-filter-views` to see what exists"
         )],
-        FilterResult::Blocked { decided_by } => vec![match decided_by {
+        FilterResult::Blocked {
+            operation,
+            decided_by,
+        } => vec![match decided_by {
             Some(rule) => format!(
                 "Blocked: {} on {book} refused by rule on {} {}{}",
                 verb.label(),
@@ -1050,7 +1156,7 @@ pub fn describe_lines(outcome: &FilterOutcome) -> Vec<String> {
             ),
             None => format!(
                 "Blocked: {} on {book} refused by default policy (no matching rule for \
-                 sheets-structure)",
+                 {operation})",
                 verb.label()
             ),
         }],
@@ -1073,12 +1179,46 @@ pub fn describe_lines(outcome: &FilterOutcome) -> Vec<String> {
         FilterResult::Changed {
             summary,
             filter_view_id,
+            width_warning,
         } => {
             let id = filter_view_id.map_or_else(String::new, |id| format!(" (id {id})"));
-            vec![format!("Applied: {summary}{id} in {book}")]
+            change_lines(
+                verb,
+                format!("Applied: {summary}{id} in {book}"),
+                width_warning.as_deref(),
+                true,
+            )
         }
         FilterResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
+}
+
+/// A would-change/changed report's lines. A row reorder
+/// (`set-basic-filter --sort-by`) gets `sort-range`'s caveats around the
+/// summary — the width warning first, when there is one, then the
+/// out-of-range-references line (ADR-0083 §6); every other verb is the
+/// summary alone.
+fn change_lines(
+    verb: &FilterVerb,
+    summary: String,
+    width_warning: Option<&str>,
+    changed: bool,
+) -> Vec<String> {
+    if !verb.reorders_rows() {
+        return vec![summary];
+    }
+    let mut lines = Vec::new();
+    if let Some(warning) = width_warning {
+        lines.push(format!("Warning: {warning}"));
+    }
+    lines.push(summary);
+    lines.push(if changed {
+        "  references outside the range may now observe values from a different row".to_string()
+    } else {
+        "  references outside the range may observe values from a different row after sorting"
+            .to_string()
+    });
+    lines
 }
 
 #[cfg(test)]
@@ -1404,6 +1544,7 @@ mod tests {
             result: FilterResult::Changed {
                 summary: "delete filter view".to_string(),
                 filter_view_id: Some(3),
+                width_warning: None,
             },
         };
         let mut buf = Vec::new();
@@ -1418,7 +1559,8 @@ mod tests {
     fn filter_result_log_status_names_every_variant() {
         assert_eq!(
             FilterResult::WouldChange {
-                summary: String::new()
+                summary: String::new(),
+                width_warning: None,
             }
             .log_status(),
             "would-change"
@@ -1494,11 +1636,15 @@ mod tests {
     }
 
     fn allow_rule(folder: &str) -> FolderPermissionRule {
+        allow_rule_for(folder, &[DriveOperation::SheetsStructure])
+    }
+
+    fn allow_rule_for(folder: &str, operations: &[DriveOperation]) -> FolderPermissionRule {
         FolderPermissionRule {
             folder_id: Some(folder.to_string()),
             file_id: None,
             recursive: true,
-            allow: std::iter::once(DriveOperation::SheetsStructure).collect(),
+            allow: operations.iter().copied().collect(),
             deny: HashSet::default(),
             require_lease: true,
         }
@@ -1545,6 +1691,299 @@ mod tests {
         assert!(matches!(outcome.result, FilterResult::Blocked { .. }));
     }
 
+    // ── set-basic-filter --sort-by's union gate (issue #1940) ────────────
+
+    #[test]
+    fn gate_operations_are_the_union_only_for_a_sorting_basic_filter() {
+        let sort = || vec!["2:desc".to_string()];
+        assert_eq!(
+            set_verb(sort(), Vec::new()).gate_operations(),
+            GATE_WRITE_AND_STRUCTURE
+        );
+        assert_eq!(
+            set_verb(Vec::new(), vec!["1:Foo".to_string()]).gate_operations(),
+            GATE_STRUCTURE_ONLY
+        );
+        // A filter view's sort is per-view — it reorders nothing.
+        for verb in [
+            FilterVerb::ClearBasicFilter {
+                sheet: "Q1".to_string(),
+            },
+            FilterVerb::AddFilterView {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                title: None,
+                sort_by: sort(),
+                hide_values: Vec::new(),
+            },
+            FilterVerb::UpdateFilterView {
+                filter_view_id: 7,
+                sheet: None,
+                range: None,
+                title: None,
+                sort_by: sort(),
+                hide_values: Vec::new(),
+                clear_sort: false,
+                clear_criteria: false,
+            },
+            FilterVerb::DeleteFilterView { filter_view_id: 7 },
+        ] {
+            assert_eq!(verb.gate_operations(), GATE_STRUCTURE_ONLY, "{verb:?}");
+        }
+    }
+
+    async fn gated_server() -> (wiremock::MockServer, DriveClient, SheetsClient) {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        (server, drive, sheets)
+    }
+
+    fn dry_run_opts(verb: FilterVerb) -> FilterOptions {
+        FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sorting_basic_filter_under_a_structure_only_grant_is_blocked_on_sheets_write() {
+        // No workbook or batchUpdate mock: the gate must refuse before
+        // either call.
+        let (_server, drive, sheets) = gated_server().await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = dry_run_opts(set_verb(vec!["2:desc".to_string()], Vec::new()));
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert_eq!(
+            outcome.result,
+            FilterResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sorting_basic_filter_under_a_write_only_grant_is_blocked_on_sheets_structure() {
+        let (_server, drive, sheets) = gated_server().await;
+        let rules = vec![allow_rule_for("folder-1", &[DriveOperation::SheetsWrite])];
+        let opts = dry_run_opts(set_verb(vec!["2:desc".to_string()], Vec::new()));
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert_eq!(
+            outcome.result,
+            FilterResult::Blocked {
+                operation: DriveOperation::SheetsStructure,
+                decided_by: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_sorting_basic_filter_and_a_sorting_filter_view_still_pass_a_structure_only_grant(
+    ) {
+        let (server, drive, sheets) = gated_server().await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        for verb in [
+            set_verb(Vec::new(), vec!["1:Foo".to_string()]),
+            FilterVerb::AddFilterView {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                title: None,
+                sort_by: vec!["2:desc".to_string()],
+                hide_values: Vec::new(),
+            },
+        ] {
+            let outcome = filter(&drive, &sheets, &dry_run_opts(verb), &rules).await;
+            assert!(
+                matches!(
+                    outcome.result,
+                    FilterResult::WouldChange {
+                        width_warning: None,
+                        ..
+                    }
+                ),
+                "{:?}",
+                outcome.result
+            );
+            let text = describe(&outcome);
+            assert!(!text.contains("different row"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sorting_basic_filter_narrower_than_its_sheet_previews_the_reorder_caveats() {
+        let (server, drive, sheets) = gated_server().await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0,
+                            "gridProperties": {"rowCount": 100, "columnCount": 10}}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule_for("folder-1", GATE_WRITE_AND_STRUCTURE)];
+        let opts = dry_run_opts(set_verb(vec!["2:desc".to_string()], Vec::new()));
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert_eq!(
+            outcome.result,
+            FilterResult::WouldChange {
+                summary: "set basic filter (sort 2:desc)".to_string(),
+                width_warning: grid_range::width_warning("sorting", 0, 4, Some(10)),
+            }
+        );
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].starts_with("Warning: selected columns 0..4"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            "Would set basic filter (sort 2:desc) in 'sheet-1'"
+        );
+        assert!(lines[2].ends_with("after sorting"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn a_sorting_basic_filter_spanning_every_column_has_no_width_warning() {
+        let (server, drive, sheets) = gated_server().await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0,
+                            "gridProperties": {"rowCount": 100, "columnCount": 4}}},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule_for("folder-1", GATE_WRITE_AND_STRUCTURE)];
+        let opts = dry_run_opts(set_verb(vec!["2:desc".to_string()], Vec::new()));
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            FilterResult::WouldChange {
+                width_warning: None,
+                ..
+            }
+        ));
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+    }
+
+    #[test]
+    fn reorder_width_warning_handles_open_ended_column_spans() {
+        let workbook = |column_count: Option<i64>| -> Spreadsheet {
+            serde_json::from_value(serde_json::json!({
+                "spreadsheetId": "sheet-1",
+                "sheets": [{"properties": {
+                    "sheetId": 0, "title": "Q1", "index": 0,
+                    "gridProperties": {"columnCount": column_count},
+                }}],
+            }))
+            .unwrap()
+        };
+        let grid = |start: Option<i64>, end: Option<i64>| GridRange {
+            sheet_id: 0,
+            start_column_index: start,
+            end_column_index: end,
+            ..Default::default()
+        };
+        // Open-ended to the right on a known-width sheet reaches its edge.
+        assert_eq!(
+            reorder_width_warning(&workbook(Some(5)), &grid(None, None)),
+            None
+        );
+        assert!(reorder_width_warning(&workbook(Some(5)), &grid(Some(1), None)).is_some());
+        // Unknown width: only a span starting past column A can warn.
+        assert_eq!(
+            reorder_width_warning(&workbook(None), &grid(None, None)),
+            None
+        );
+        assert!(reorder_width_warning(&workbook(None), &grid(Some(1), None)).is_some());
+        assert!(reorder_width_warning(&workbook(None), &grid(None, Some(3))).is_some());
+    }
+
+    #[test]
+    fn describe_lines_adds_the_reorder_caveats_only_for_a_sorting_basic_filter() {
+        let changed = outcome_with(
+            set_verb(vec!["2:desc".to_string()], Vec::new()),
+            Some("Budget"),
+            FilterResult::Changed {
+                summary: "set basic filter (sort 2:desc)".to_string(),
+                filter_view_id: None,
+                width_warning: Some("narrow".to_string()),
+            },
+        );
+        assert_eq!(
+            describe_lines(&changed),
+            vec![
+                "Warning: narrow".to_string(),
+                "Applied: set basic filter (sort 2:desc) in 'Budget'".to_string(),
+                "  references outside the range may now observe values from a different row"
+                    .to_string(),
+            ]
+        );
+
+        let would = outcome_with(
+            set_verb(vec!["2:desc".to_string()], Vec::new()),
+            Some("Budget"),
+            FilterResult::WouldChange {
+                summary: "set basic filter (sort 2:desc)".to_string(),
+                width_warning: None,
+            },
+        );
+        assert_eq!(
+            describe_lines(&would),
+            vec![
+                "Would set basic filter (sort 2:desc) in 'Budget'".to_string(),
+                "  references outside the range may observe values from a different row after sorting"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn describe_lines_names_the_denied_operation_and_the_union_grant_hint() {
+        let blocked = outcome_with(
+            set_verb(vec!["2:desc".to_string()], Vec::new()),
+            Some("Budget"),
+            FilterResult::Blocked {
+                operation: DriveOperation::SheetsWrite,
+                decided_by: None,
+            },
+        );
+        let text = describe(&blocked);
+        assert!(text.contains("no matching rule for sheets-write"), "{text}");
+
+        let orphan = outcome_with(
+            set_verb(vec!["2:desc".to_string()], Vec::new()),
+            Some("Budget"),
+            FilterResult::RefusedNoVisibleParents,
+        );
+        let text = describe(&orphan);
+        assert!(
+            text.contains(r#""allow": ["sheets-write", "sheets-structure"]"#),
+            "{text}"
+        );
+        let orphan = outcome_with(
+            set_verb(Vec::new(), Vec::new()),
+            Some("Budget"),
+            FilterResult::RefusedNoVisibleParents,
+        );
+        let text = describe(&orphan);
+        assert!(text.contains(r#""allow": ["sheets-structure"]"#), "{text}");
+    }
+
     #[tokio::test]
     async fn set_basic_filter_sends_a_set_basic_filter_request() {
         let server = wiremock::MockServer::start().await;
@@ -1573,7 +2012,9 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let rules = vec![allow_rule("folder-1")];
+        // `--sort-by` physically reorders rows, so it needs the union
+        // grant (issue #1940).
+        let rules = vec![allow_rule_for("folder-1", GATE_WRITE_AND_STRUCTURE)];
         let (lease_token, ledger_path) = leased_opts_for("sheet-1");
         let opts = FilterOptions {
             spreadsheet_id: "sheet-1".to_string(),
@@ -2163,6 +2604,7 @@ mod tests {
             FilterResult::Changed {
                 filter_view_id,
                 summary,
+                ..
             } => {
                 assert_eq!(filter_view_id, Some(7));
                 assert_eq!(
@@ -2209,7 +2651,7 @@ mod tests {
         };
         let outcome = filter(&drive, &sheets, &opts, &rules).await;
         match outcome.result {
-            FilterResult::WouldChange { summary } => {
+            FilterResult::WouldChange { summary, .. } => {
                 assert_eq!(summary, "update filter view");
             }
             other => panic!("expected WouldChange, got {other:?}"),
@@ -2339,6 +2781,7 @@ mod tests {
             Some("Budget"),
             FilterResult::WouldChange {
                 summary: "set basic filter".to_string(),
+                width_warning: None,
             },
         );
         assert_eq!(describe(&out), "Would set basic filter in 'Budget'");
@@ -2428,6 +2871,7 @@ mod tests {
             update_verb(),
             Some("Budget"),
             FilterResult::Blocked {
+                operation: DriveOperation::SheetsStructure,
                 decided_by: Some(DecidingRule::Folder {
                     folder_id: "folder-1".to_string(),
                     depth: 2,
@@ -2443,7 +2887,10 @@ mod tests {
                 sheet: "Q1".to_string(),
             },
             Some("Budget"),
-            FilterResult::Blocked { decided_by: None },
+            FilterResult::Blocked {
+                operation: DriveOperation::SheetsStructure,
+                decided_by: None,
+            },
         );
         let text = describe(&default_policy);
         assert!(text.contains("default policy"), "{text}");
@@ -2482,6 +2929,7 @@ mod tests {
             FilterResult::Changed {
                 summary: "delete filter view".to_string(),
                 filter_view_id: Some(7),
+                width_warning: None,
             },
         );
         assert_eq!(
@@ -2495,6 +2943,7 @@ mod tests {
             FilterResult::Changed {
                 summary: "set basic filter".to_string(),
                 filter_view_id: None,
+                width_warning: None,
             },
         );
         assert_eq!(

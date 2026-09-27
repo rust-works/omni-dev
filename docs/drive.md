@@ -627,8 +627,8 @@ operation anywhere in a target's ancestor chain:
 | `create`            | deny    | `create`, `sheets create` |
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets sort-range`, `sheets trim-whitespace` — cell values; `sheets text-to-columns` (also needs `sheets-structure`); `sheets randomize-range` (also needs `sheets-structure`); `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter`, `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `text-to-columns` (also needs `sheets-write`), `randomize-range` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets sort-range`, `sheets trim-whitespace` — cell values; `sheets text-to-columns` (also needs `sheets-structure`); `sheets randomize-range` (also needs `sheets-structure`); `sheets set-basic-filter --sort-by` (also needs `sheets-structure`); `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter` (with `--sort-by`, also needs `sheets-write`), `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `text-to-columns` (also needs `sheets-write`), `randomize-range` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`, `delete-duplicates` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -2913,6 +2913,20 @@ omni-dev drive sheets update-filter-view <ID> --filter-view-id 3 \
   --hide-values 2:Closed,Cancelled
 omni-dev drive sheets delete-filter-view <ID> --filter-view-id 3
 ```
+
+**`set-basic-filter --sort-by` also needs `sheets-write`** (issue #1940).
+Unlike a filter view's sort, a basic filter's sort is not view state: Sheets
+applies it by physically reordering the filtered range's rows, and the new
+order stays after `clear-basic-filter`. That is the same permutation
+`randomize-range` performs — each row carries its formatting, notes and
+data-validation rules with it — so it resolves the same union of
+`sheets-write` and `sheets-structure` ([ADR-0083](adrs/adr-0083.md) §5).
+`--dry-run` and the real run carry `sort-range`'s caveats: a warning when
+the range is narrower than its sheet (data outside the selected columns
+does not move, so records can be separated), and a note that references
+outside the range may observe a different row's values. `set-basic-filter`
+without `--sort-by`, and `add-filter-view`/`update-filter-view --sort-by`,
+stay on `sheets-structure` alone.
 
 `--sort-by`/`--hide-values` take `COLUMN:...` pairs, where `COLUMN` is a
 0-based column index (not an A1 letter) — the same indexing the underlying

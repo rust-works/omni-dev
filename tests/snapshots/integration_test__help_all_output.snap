@@ -5930,7 +5930,7 @@ Arguments:
 Options:
       --sheet <NAME>                 Sheet (tab) title. Supplies the prefix for a bare `--range`
       --range <A1>                   A1 range to filter, optionally carrying its own `Sheet!` prefix
-      --sort-by <COLUMN:asc|desc>    A `COLUMN:asc|desc` sort spec, in priority order. Repeatable
+      --sort-by <COLUMN:asc|desc>    A `COLUMN:asc|desc` sort spec, in priority order. Repeatable. Physically reorders the range's rows (the reorder outlives `clear-basic-filter`), so it also needs the `sheets-write` operation (issue #1940)
       --hide-values <COLUMN:VALUES>  A `COLUMN:VALUE[,VALUE...]` hidden-value criterion, one per column. Repeatable
       --dry-run                      Reports the gate verdict and the change that would be made, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>                The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`

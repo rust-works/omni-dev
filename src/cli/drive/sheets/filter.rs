@@ -4,8 +4,10 @@
 //!
 //! The first five are gated by
 //! [`DriveOperation::SheetsStructure`](crate::drive::write_gate::DriveOperation::SheetsStructure)
-//! (ADR-0081). `list-filter-views` is a plain read, ungated like
-//! `list-protections`.
+//! (ADR-0081) — `set-basic-filter --sort-by` additionally by
+//! [`DriveOperation::SheetsWrite`](crate::drive::write_gate::DriveOperation::SheetsWrite),
+//! since it physically reorders rows (issue #1940). `list-filter-views` is
+//! a plain read, ungated like `list-protections`.
 
 use anyhow::Result;
 use clap::Parser;
@@ -32,6 +34,9 @@ pub struct SetBasicFilterCommand {
     pub range: String,
 
     /// A `COLUMN:asc|desc` sort spec, in priority order. Repeatable.
+    /// Physically reorders the range's rows (the reorder outlives
+    /// `clear-basic-filter`), so it also needs the `sheets-write`
+    /// operation (issue #1940).
     #[arg(long = "sort-by", value_name = "COLUMN:asc|desc")]
     pub sort_by: Vec<String>,
 
