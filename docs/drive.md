@@ -2780,6 +2780,8 @@ EOF
 # Anchor a pivot table at 'Report'!A1, sourced from 'Data'!A1:D1000 (a
 # bounded rectangle is required). --row/--column/--value/--filter name a
 # 0-based column offset *into the source*, not an absolute sheet column.
+# A --row/--column sort order is optional and defaults to asc: the API
+# rejects a grouping without one, so a bare `--row 0` is sent as `0:asc`.
 omni-dev drive sheets add-pivot-table <ID> --sheet Report --anchor A1 \
   --source 'Data!A1:D1000' \
   --row 0:asc --value 3:sum

@@ -4766,9 +4766,9 @@ Options:
       --source <[SHEET!]A1_RANGE>
           The pivot's source range. May carry its own `Sheet!` prefix (a pivot commonly sources from a different tab than it's anchored on); falls back to `--sheet` when it doesn't. Must be a bounded rectangle
       --row <COLUMN[:asc|desc]>
-          A row grouping, by 0-based column offset into `--source`, optionally followed by a sort order. Repeatable, outermost first
+          A row grouping, by 0-based column offset into `--source`, optionally followed by a sort order (default `asc`). Repeatable, outermost first
       --column <COLUMN[:asc|desc]>
-          A column grouping, by 0-based column offset into `--source`, optionally followed by a sort order. Repeatable, outermost first
+          A column grouping, by 0-based column offset into `--source`, optionally followed by a sort order (default `asc`). Repeatable, outermost first
       --value <COLUMN:FUNC>
           An aggregated value column, by 0-based column offset into `--source` and a summarize function (`sum`, `counta`, `count`, `countunique`, `average`, `max`, `min`, `median`, `product`, `stdev`, `stdevp`, `var`, `varp`). Repeatable; at least one is required
       --filter <COLUMN:VALUE[,VALUE...]>

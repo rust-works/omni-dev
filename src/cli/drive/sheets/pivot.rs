@@ -71,12 +71,14 @@ pub struct AddPivotTableCommand {
     pub source: String,
 
     /// A row grouping, by 0-based column offset into `--source`, optionally
-    /// followed by a sort order. Repeatable, outermost first.
+    /// followed by a sort order (default `asc`). Repeatable, outermost
+    /// first.
     #[arg(long = "row", value_name = "COLUMN[:asc|desc]")]
     pub rows: Vec<String>,
 
     /// A column grouping, by 0-based column offset into `--source`,
-    /// optionally followed by a sort order. Repeatable, outermost first.
+    /// optionally followed by a sort order (default `asc`). Repeatable,
+    /// outermost first.
     #[arg(long = "column", value_name = "COLUMN[:asc|desc]")]
     pub columns: Vec<String>,
 
