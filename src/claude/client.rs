@@ -812,6 +812,7 @@ impl ClaudeClient {
     }
 
     /// Creates a new Claude client with API key from environment variables.
+    // omni-dev: coverage ignore reason="process-bound: hardcodes SystemEnv with no injectable seam (unlike create_default_claude_client_with's tested Default arm, which this mirrors) and has no in-crate caller; testing it would mean mutating real process env for shared credential vars"
     pub fn from_env(model: String) -> Result<Self> {
         // Try to get API key from environment variables
         let api_key = secret_var_any(
@@ -823,6 +824,7 @@ impl ClaudeClient {
         let ai_client = ClaudeAiClient::new(model, api_key.expose_secret().to_string(), None)?;
         Ok(Self::new(Box::new(ai_client)))
     }
+    // omni-dev: coverage end
 
     /// Generates commit message amendments from repository view.
     pub async fn generate_amendments(&self, repo_view: &RepositoryView) -> Result<AmendmentFile> {
@@ -5154,6 +5156,20 @@ mod tests {
     #[tokio::test]
     async fn factory_default_claude_branch_errors_without_api_key() {
         let result = create_default_claude_client_with(&MapEnv::new(), None, None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn factory_default_claude_branch_errors_on_conflicting_key_and_file() {
+        // CLAUDE_API_KEY and its _FILE companion both set in the same layer is
+        // a secret_env::SecretEnvError::Conflict (issue #2006), a distinct
+        // failure from the plain-unset ApiKeyNotFound case above — exercising
+        // the `?` that propagates it out of secret_var_any in this arm.
+        let key_file = crate::utils::secret_env::file_var_name("CLAUDE_API_KEY");
+        let env = MapEnv::new()
+            .with("CLAUDE_API_KEY", "sk-test")
+            .with(&key_file, "/tmp/should-not-be-read");
+        let result = create_default_claude_client_with(&env, None, None).await;
         assert!(result.is_err());
     }
 

@@ -931,6 +931,48 @@ mod tests {
     }
 
     #[test]
+    fn from_env_and_settings_reads_the_private_key_from_snowflake_private_key_path() {
+        // SNOWFLAKE_PRIVATE_KEY_PATH predates the _FILE convention (ADR-0089)
+        // and is kept as an alias read through read_secret_file directly —
+        // a distinct code path from the SNOWFLAKE_PRIVATE_KEY/_FILE pair
+        // secret_var resolves below it.
+        let _lock = crate::test_support::HOME_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev_home = std::env::var("HOME").ok();
+        let prev_authenticator = std::env::var(ENV_AUTHENTICATOR).ok();
+        let prev_path = std::env::var(ENV_PRIVATE_KEY_PATH).ok();
+        let home = tempfile::tempdir().unwrap();
+        let (_key_dir, key_path) = crate::test_support::env::secret_file("pem-contents");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var(ENV_AUTHENTICATOR, "jwt");
+        std::env::set_var(ENV_PRIVATE_KEY_PATH, &key_path);
+
+        let result = SnowflakeEngineConfig::from_env_and_settings();
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_authenticator {
+            Some(v) => std::env::set_var(ENV_AUTHENTICATOR, v),
+            None => std::env::remove_var(ENV_AUTHENTICATOR),
+        }
+        match prev_path {
+            Some(v) => std::env::set_var(ENV_PRIVATE_KEY_PATH, v),
+            None => std::env::remove_var(ENV_PRIVATE_KEY_PATH),
+        }
+
+        let config = result.expect("from_env_and_settings should succeed");
+        match config.auth {
+            AuthMethod::KeyPairJwt(KeyPairConfig { private_key_pem }) => {
+                assert_eq!(private_key_pem.expose_secret(), "pem-contents");
+            }
+            other => panic!("expected KeyPairJwt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn heartbeat_interval_from_parses_seconds_zero_and_garbage() {
         assert_eq!(heartbeat_interval_from(None), DEFAULT_HEARTBEAT_INTERVAL);
         assert_eq!(
