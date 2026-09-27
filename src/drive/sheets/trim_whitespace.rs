@@ -605,7 +605,7 @@ fn candidate_line(candidate_cells: &[String]) -> String {
     format!(
         "  {} non-blank cell(s) may be trimmed: {}",
         candidate_cells.len(),
-        grid_range::truncate_locations(candidate_cells, grid_range::RENDERED_LOCATION_LIMIT)
+        grid_range::render_locations(candidate_cells)
     )
 }
 
