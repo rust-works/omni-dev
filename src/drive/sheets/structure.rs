@@ -3150,25 +3150,34 @@ mod tests {
         }
     }
 
+    /// The `spreadsheets.get` reply body shared by [`mount_workbook`] and
+    /// its variants: `Q1` (1000 x 26) fixed, plus whatever `Q2` object the
+    /// caller supplies — the one thing every variant actually varies.
+    fn workbook_body(q2: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "spreadsheetId": "sheet-1",
+            "properties": {"title": "Budget"},
+            "sheets": [
+                {"properties": {
+                    "sheetId": 0, "title": "Q1", "index": 0,
+                    "gridProperties": {"rowCount": 1000, "columnCount": 26}}},
+                q2,
+            ],
+        })
+    }
+
+    /// The `Q2` sheet object [`mount_workbook`] mounts: 500 x 10, no extra
+    /// properties.
+    fn default_q2() -> serde_json::Value {
+        serde_json::json!({"properties": {
+            "sheetId": 118_293, "title": "Q2", "index": 1,
+            "gridProperties": {"rowCount": 500, "columnCount": 10}}})
+    }
+
     /// A `spreadsheets.get` reply with two sheets, `Q1` (1000 x 26) and
     /// `Q2` (500 x 10).
     fn mount_workbook() -> wiremock::Mock {
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "spreadsheetId": "sheet-1",
-                    "properties": {"title": "Budget"},
-                    "sheets": [
-                        {"properties": {
-                            "sheetId": 0, "title": "Q1", "index": 0,
-                            "gridProperties": {"rowCount": 1000, "columnCount": 26}}},
-                        {"properties": {
-                            "sheetId": 118_293, "title": "Q2", "index": 1,
-                            "gridProperties": {"rowCount": 500, "columnCount": 10}}}
-                    ],
-                })),
-            )
+        mount_workbook_with_q2(default_q2())
     }
 
     fn mount_batch_update(body: serde_json::Value) -> wiremock::Mock {
@@ -5705,25 +5714,13 @@ mod tests {
         row_count: i64,
         frozen_row_count: i64,
     ) -> wiremock::Mock {
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "spreadsheetId": "sheet-1",
-                    "properties": {"title": "Budget"},
-                    "sheets": [
-                        {"properties": {
-                            "sheetId": 0, "title": "Q1", "index": 0,
-                            "gridProperties": {"rowCount": 1000, "columnCount": 26}}},
-                        {"properties": {
-                            "sheetId": sheet_id, "title": "Q2", "index": 1,
-                            "gridProperties": {
-                                "rowCount": row_count, "columnCount": 10,
-                                "frozenRowCount": frozen_row_count,
-                            }}}
-                    ],
-                })),
-            )
+        mount_workbook_with_q2(serde_json::json!({
+        "properties": {
+            "sheetId": sheet_id, "title": "Q2", "index": 1,
+            "gridProperties": {
+                "rowCount": row_count, "columnCount": 10,
+                "frozenRowCount": frozen_row_count,
+            }}}))
     }
 
     /// A `spreadsheets.get` reply like [`mount_workbook`], but `Q2` already
@@ -5736,27 +5733,15 @@ mod tests {
     /// the description would never be exercised for anything but frozen
     /// rows (issue #1835).
     fn mount_workbook_with_view_state() -> wiremock::Mock {
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "spreadsheetId": "sheet-1",
-                    "properties": {"title": "Budget"},
-                    "sheets": [
-                        {"properties": {
-                            "sheetId": 0, "title": "Q1", "index": 0,
-                            "gridProperties": {"rowCount": 1000, "columnCount": 26}}},
-                        {"properties": {
-                            "sheetId": 118_293, "title": "Q2", "index": 1,
-                            "rightToLeft": true,
-                            "gridProperties": {
-                                "rowCount": 500, "columnCount": 10,
-                                "frozenColumnCount": 2,
-                                "hideGridlines": true,
-                            }}}
-                    ],
-                })),
-            )
+        mount_workbook_with_q2(serde_json::json!({
+        "properties": {
+            "sheetId": 118_293, "title": "Q2", "index": 1,
+            "rightToLeft": true,
+            "gridProperties": {
+                "rowCount": 500, "columnCount": 10,
+                "frozenColumnCount": 2,
+                "hideGridlines": true,
+            }}}))
     }
 
     #[tokio::test]
@@ -6707,18 +6692,7 @@ mod tests {
     fn mount_workbook_with_q2(q2: serde_json::Value) -> wiremock::Mock {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "spreadsheetId": "sheet-1",
-                    "properties": {"title": "Budget"},
-                    "sheets": [
-                        {"properties": {
-                            "sheetId": 0, "title": "Q1", "index": 0,
-                            "gridProperties": {"rowCount": 1000, "columnCount": 26}}},
-                        q2,
-                    ],
-                })),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(workbook_body(q2)))
     }
 
     /// Everything a move's real run needs mounted, minus the workbook.
