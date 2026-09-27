@@ -342,17 +342,30 @@ field and its `_file` on the same account is an error that names both keys.
 
 When `drive auth login` writes a new secret to an account whose entry already has
 the `_file` field, the value goes **into that file** and the plain field is
-removed from `settings.json`. A file that already holds the same value is
-left alone, so one shared file or a root-owned read-only mount keeps
-working. Any other file is replaced atomically with a new owner-only file.
-Its directory must already exist. Accounts without a `_file` field are
-written exactly as before.
+removed from `settings.json`. Accounts without a `_file` field are written
+exactly as before. The file rules are:
+
+- A file that already holds the same value is left alone, so one shared file
+  or a root-owned read-only mount keeps working.
+- Any other file is replaced atomically with a new owner-only file, but only
+  if the file-reading rules above would accept it (an empty file is also
+  fine). A file with loose permissions, a file owned by someone else, a
+  dangling symlink or a file holding JSON is refused and left untouched. The
+  file's directory must already exist.
+- A `client_secret_file` holding another value is not replaced when the
+  login's client id differs from the account's `client_id`. That file most
+  likely belongs to another OAuth client's accounts.
+- Every file is checked before any is written, and `settings.json` is
+  written last, so a refused write changes nothing.
 
 Several accounts that use one Google Cloud OAuth client can point their
 `client_secret_file` at the **same** file, so the secret is kept in one
-place. Rotating it then takes one file write, followed by one
-`drive auth login --account <name>` per account. Each login writes the new
-refresh token into that account's own `refresh_token_file`.
+place. To rotate it, write the new secret to that file. Then, for each
+account, run `drive auth login --account <name>` with the client secret
+supplied through `DRIVE_CLIENT_SECRET_FILE` set to that same path, or
+pasted at the prompt. Each login writes the account's new refresh token
+into its own `refresh_token_file`, and leaves the shared file alone, since
+it already holds that value.
 
 `drive auth logout` removes the account's entry from `settings.json`. It
 does not delete the files the entry named, because they may be shared or
