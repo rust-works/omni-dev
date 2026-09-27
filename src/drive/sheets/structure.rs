@@ -2543,10 +2543,7 @@ fn describe_would_insert(
         format!(
             "; existing {plural} {at}-{before} shift {direction}",
             plural = plural(dimension),
-            direction = match dimension {
-                Dimension::Rows => "down",
-                Dimension::Columns => "right",
-            },
+            direction = shift_word(dimension, true),
         )
     } else {
         format!(
@@ -2607,44 +2604,29 @@ fn describe_would_move(
         return vec![summary];
     };
     // `validate_move_bounds` refuses every `before` in `at..=at + count`, so
-    // exactly one of these two branches describes a real move.
+    // exactly one of these two branches applies. Each yields the same five
+    // facts — the shifted range's old and new bounds, and which way it
+    // moved — which the single `format!` below turns into the line.
     let (land_first, land_last) = move_landing_span(before, count, last);
-    let detail = if before > last {
+    let (shift_first, shift_last, shifted_first, shifted_last, forward) = if before > last {
         // Downward: the rows/columns strictly between the block and the
         // destination slide back to close the gap — `count` short of the
         // number typed, which is the convention this line exists to spell
         // out.
-        format!(
-            "  ({current} {plural} unchanged; {plural} {shift_first}-{shift_last} shift \
-             {direction} to {at}-{shifted_last}; moved {plural} land at {land_first}-\
-             {land_last})",
-            plural = plural(dimension),
-            direction = match dimension {
-                Dimension::Rows => "up",
-                Dimension::Columns => "left",
-            },
-            shift_first = last + 1,
-            shift_last = before - 1,
-            shifted_last = before - 1 - count,
-        )
+        (last + 1, before - 1, at, before - 1 - count, false)
     } else {
         // Upward (`before < at`): the block lands exactly on the number
         // typed, and everything from there to the block's old start slides
         // forward by `count`.
-        format!(
-            "  ({current} {plural} unchanged; {plural} {before}-{shift_last} shift \
-             {direction} to {shifted_first}-{shifted_last}; moved {plural} land at \
-             {land_first}-{land_last})",
-            plural = plural(dimension),
-            direction = match dimension {
-                Dimension::Rows => "down",
-                Dimension::Columns => "right",
-            },
-            shift_last = at - 1,
-            shifted_first = before + count,
-            shifted_last = at - 1 + count,
-        )
+        (before, at - 1, before + count, at - 1 + count, true)
     };
+    let detail = format!(
+        "  ({current} {plural} unchanged; {plural} {shift_first}-{shift_last} shift \
+         {direction} to {shifted_first}-{shifted_last}; moved {plural} land at {land_first}-\
+         {land_last})",
+        plural = plural(dimension),
+        direction = shift_word(dimension, forward),
+    );
     vec![summary, detail]
 }
 
@@ -3072,6 +3054,21 @@ const fn plural(dimension: Dimension) -> &'static str {
     match dimension {
         Dimension::Rows => "rows",
         Dimension::Columns => "columns",
+    }
+}
+
+/// The direction word for a shift along `dimension`: `forward` is the
+/// direction rows/columns move when something is inserted or a block moves
+/// upward past them (`down`/`right`); the other way (a downward move's
+/// displaced rows/columns closing the gap) is `!forward` (`up`/`left`).
+/// Shared by [`describe_would_insert`] and [`describe_would_move`] so the
+/// two direction vocabularies can't drift apart.
+const fn shift_word(dimension: Dimension, forward: bool) -> &'static str {
+    match (dimension, forward) {
+        (Dimension::Rows, true) => "down",
+        (Dimension::Rows, false) => "up",
+        (Dimension::Columns, true) => "right",
+        (Dimension::Columns, false) => "left",
     }
 }
 
@@ -7151,6 +7148,84 @@ mod tests {
         assert_eq!(
             lines[1],
             "  (500 rows unchanged; rows 2-5 shift down to 4-7; moved rows land at 2-3)"
+        );
+    }
+
+    /// [`move_rows_dry_run_describes_a_downward_move_and_its_landing_rows`]'s
+    /// twin on the other dimension, pinning `describe_would_move`'s
+    /// `Dimension::Columns` wording (noun, plural, and `left`/`right`
+    /// direction words) before the two branches are collapsed into one
+    /// template.
+    #[tokio::test]
+    async fn move_columns_dry_run_describes_a_downward_move_and_its_landing_columns() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::MoveColumns {
+                    sheet: "Q2".to_string(),
+                    at: 2,
+                    count: 2,
+                    before: 6,
+                },
+                true,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("Would move 2 column(s) 2-3"), "{lines:?}");
+        assert!(lines[0].contains("to before column 6"), "{lines:?}");
+        assert_eq!(
+            lines[1],
+            "  (10 columns unchanged; columns 4-5 shift left to 2-3; moved columns land at 4-5)"
+        );
+    }
+
+    /// [`move_rows_dry_run_describes_an_upward_move_and_its_landing_rows`]'s
+    /// twin on the other dimension — see the downward test above for why
+    /// this pins the refactor.
+    #[tokio::test]
+    async fn move_columns_dry_run_describes_an_upward_move_and_its_landing_columns() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(
+                StructureVerb::MoveColumns {
+                    sheet: "Q2".to_string(),
+                    at: 6,
+                    count: 2,
+                    before: 2,
+                },
+                true,
+            ),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("Would move 2 column(s) 6-7"), "{lines:?}");
+        assert!(lines[0].contains("to before column 2"), "{lines:?}");
+        assert_eq!(
+            lines[1],
+            "  (10 columns unchanged; columns 2-5 shift right to 4-7; moved columns land at 2-3)"
         );
     }
 
