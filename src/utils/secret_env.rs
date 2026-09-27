@@ -127,6 +127,17 @@ pub enum SecretEnvError {
         source: std::io::Error,
     },
 
+    /// The file could not be written.
+    #[error("cannot write the secret file {} named by {file_var}: {source}", path.display())]
+    Unwritable {
+        /// The key naming the file.
+        file_var: String,
+        /// The file's path.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
     /// The path (after following symlinks) is not a regular file.
     #[error("the secret file {} named by {file_var} is not a regular file", path.display())]
     NotAFile {
@@ -236,15 +247,37 @@ pub fn secret_var(env: &impl EnvSource, name: &str) -> Result<Option<Secret>, Se
     );
     let file_var = file_var_name(name);
     let (value, file) = env.var_pair(name, &file_var);
+    resolve_secret_pair(name, value.as_deref(), &file_var, file.as_deref())
+}
+
+/// Resolves one already-read secret pair: the secret held directly
+/// (`value`, labelled `name`) or a path to a file holding it (`file`,
+/// labelled `file_var`). `Ok(None)` means neither is set.
+///
+/// [`secret_var`]'s rules, for secrets that are not environment variables:
+/// the named-account `client_secret`/`client_secret_file` and
+/// `refresh_token`/`refresh_token_file` fields in settings.json (#2008). The
+/// labels only name the pair in errors, e.g.
+/// `drive.accounts.work.client_secret`.
+///
+/// # Errors
+///
+/// As [`secret_var`].
+pub fn resolve_secret_pair(
+    name: &str,
+    value: Option<&str>,
+    file_var: &str,
+    file: Option<&str>,
+) -> Result<Option<Secret>, SecretEnvError> {
     let value = value.filter(|v| !v.is_empty());
     let file = file.filter(|v| !v.is_empty());
     match (value, file) {
         (Some(_), Some(_)) => Err(SecretEnvError::Conflict {
             name: name.to_string(),
-            file_var,
+            file_var: file_var.to_string(),
         }),
         (Some(value), None) => Ok(Some(Secret::new(value))),
-        (None, Some(path)) => read_secret_file(&file_var, Path::new(&path)).map(Some),
+        (None, Some(path)) => read_secret_file(file_var, Path::new(path)).map(Some),
         (None, None) => Ok(None),
     }
 }
@@ -323,6 +356,87 @@ pub fn read_secret_file(file_var: &str, path: &Path) -> Result<Secret, SecretEnv
         });
     }
     Ok(Secret::new(text))
+}
+
+/// Stores `secret` in the file at `path`, which the key `file_var` named,
+/// so the next [`read_secret_file`] returns it. Returns whether anything was
+/// written.
+///
+/// Used when a login or import has a new value for a settings.json secret
+/// field whose `_file` companion is set (#2008): the value goes where the
+/// user said it lives, never back into settings.json.
+///
+/// - If the file already holds `secret`, nothing is written. That keeps a
+///   file shared by several accounts untouched, and keeps a root-owned
+///   read-only mount usable while the secret is unchanged.
+/// - Otherwise the write is atomic: symlinks are followed to the target (as
+///   [`read_secret_file`] does), a `0600` temp file is created beside it,
+///   synced, and renamed over it. The parent directory must already exist.
+///
+/// # Errors
+///
+/// [`SecretEnvError::RelativePath`] for a relative path, and
+/// [`SecretEnvError::Unwritable`] when the file can't be written.
+pub fn write_secret_file(
+    file_var: &str,
+    path: &Path,
+    secret: &Secret,
+) -> Result<bool, SecretEnvError> {
+    if !path.is_absolute() {
+        return Err(SecretEnvError::RelativePath {
+            file_var: file_var.to_string(),
+            path: path.to_path_buf(),
+        });
+    }
+    if read_secret_file(file_var, path)
+        .is_ok_and(|current| current.expose_secret() == secret.expose_secret())
+    {
+        return Ok(false);
+    }
+    let unwritable = |source| SecretEnvError::Unwritable {
+        file_var: file_var.to_string(),
+        path: path.to_path_buf(),
+        source,
+    };
+    let target = match std::fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(e) => return Err(unwritable(e)),
+    };
+    let (Some(dir), Some(file_name)) = (target.parent(), target.file_name()) else {
+        return Err(unwritable(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the path has no parent directory",
+        )));
+    };
+    let mut temp_name = std::ffi::OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(".{}.tmp", std::process::id()));
+    let temp = dir.join(temp_name);
+    let result = write_new_0600(&temp, secret.expose_secret())
+        .and_then(|()| std::fs::rename(&temp, &target));
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(unwritable(e));
+    }
+    Ok(true)
+}
+
+/// Creates `path` (which must not exist) owner-only and writes `contents`
+/// plus a trailing newline, synced to disk.
+fn write_new_0600(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()
 }
 
 /// Removes exactly one trailing `\n` or `\r\n`, and nothing else: secrets may
@@ -1076,6 +1190,114 @@ mod tests {
     fn balanced_args_counts_nested_parens_and_degrades_when_unclosed() {
         assert_eq!(balanced_args("f(x), y) rest"), "f(x), y");
         assert_eq!(balanced_args("no closing paren"), "no closing paren");
+    }
+
+    // ── resolve_secret_pair / write_secret_file (#2008) ─────────────────
+
+    #[test]
+    fn resolve_secret_pair_uses_the_given_labels_in_a_conflict() {
+        let err = resolve_secret_pair(
+            "drive.accounts.work.client_secret",
+            Some("v"),
+            "drive.accounts.work.client_secret_file",
+            Some("/x"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "both drive.accounts.work.client_secret and \
+             drive.accounts.work.client_secret_file are set; set only one of them"
+        );
+    }
+
+    #[test]
+    fn resolve_secret_pair_treats_empty_members_as_unset() {
+        assert!(resolve_secret_pair("a", Some(""), "a_file", Some(""))
+            .unwrap()
+            .is_none());
+        let resolved = resolve_secret_pair("a", Some("v"), "a_file", Some("")).unwrap();
+        assert_eq!(resolved.unwrap().expose_secret(), "v");
+    }
+
+    #[test]
+    fn write_secret_file_creates_an_owner_only_file_the_reader_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let written =
+            write_secret_file("k_file", &path, &Secret::new(SECRET_BYTES.to_string())).unwrap();
+        assert!(written);
+        assert_eq!(
+            read_secret_file("k_file", &path).unwrap().expose_secret(),
+            SECRET_BYTES
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // No temp file is left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn write_secret_file_replaces_a_different_value() {
+        let (_dir, path) = secret_file(b"old\n", 0o600);
+        assert!(write_secret_file("k_file", &path, &Secret::new("new".to_string())).unwrap());
+        assert_eq!(
+            read_secret_file("k_file", &path).unwrap().expose_secret(),
+            "new"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_leaves_an_unchanged_file_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let (_dir, path) = secret_file(b"same\n", 0o600);
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        assert!(!write_secret_file("k_file", &path, &Secret::new("same".to_string())).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_writes_through_a_symlink_to_its_target() {
+        let (dir, target) = secret_file(b"old\n", 0o600);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(write_secret_file("k_file", &link, &Secret::new("new".to_string())).unwrap());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            read_secret_file("k_file", &target).unwrap().expose_secret(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn write_secret_file_rejects_a_relative_path() {
+        let err = write_secret_file(
+            "k_file",
+            Path::new("rel/token"),
+            &Secret::new("v".to_string()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SecretEnvError::RelativePath { .. }), "{err}");
+    }
+
+    #[test]
+    fn write_secret_file_reports_a_missing_directory_without_the_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("token");
+        let err =
+            write_secret_file("k_file", &path, &Secret::new(SECRET_BYTES.to_string())).unwrap_err();
+        assert!(matches!(err, SecretEnvError::Unwritable { .. }), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("k_file"), "{message}");
+        assert!(!message.contains(SECRET_BYTES), "{message}");
     }
 
     /// Self-check: the guards see the real read sites (so an empty scan
