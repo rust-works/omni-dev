@@ -138,6 +138,20 @@ pub enum SecretEnvError {
         source: std::io::Error,
     },
 
+    /// An existing secret file to be replaced holds JSON, which no secret
+    /// this resolver stores does: most likely a `client_secret.json`.
+    #[error(
+        "the secret file {} named by {file_var} holds JSON, not a bare secret; refusing to \
+         replace it. Point {file_var} at a file of its own",
+        path.display()
+    )]
+    HoldsJson {
+        /// The key naming the file.
+        file_var: String,
+        /// The file's path.
+        path: PathBuf,
+    },
+
     /// The path (after following symlinks) is not a regular file.
     #[error("the secret file {} named by {file_var} is not a regular file", path.display())]
     NotAFile {
@@ -358,85 +372,148 @@ pub fn read_secret_file(file_var: &str, path: &Path) -> Result<Secret, SecretEnv
     Ok(Secret::new(text))
 }
 
-/// Stores `secret` in the file at `path`, which the key `file_var` named,
-/// so the next [`read_secret_file`] returns it. Returns whether anything was
-/// written.
+/// Stores `secret` in the file at `path`, which the key `file_var` named.
 ///
-/// Used when a login or import has a new value for a settings.json secret
-/// field whose `_file` companion is set (#2008): the value goes where the
-/// user said it lives, never back into settings.json.
-///
-/// - If the file already holds `secret`, nothing is written. That keeps a
-///   file shared by several accounts untouched, and keeps a root-owned
-///   read-only mount usable while the secret is unchanged.
-/// - Otherwise the write is atomic: symlinks are followed to the target (as
-///   [`read_secret_file`] does), a `0600` temp file is created beside it,
-///   synced, and renamed over it. The parent directory must already exist.
+/// [`plan_secret_file_write`] then [`SecretFileWrite::write`], for a single
+/// file; the next [`read_secret_file`] returns `secret`. Returns whether
+/// anything was written.
 ///
 /// # Errors
 ///
-/// [`SecretEnvError::RelativePath`] for a relative path, and
-/// [`SecretEnvError::Unwritable`] when the file can't be written.
+/// As [`plan_secret_file_write`] and [`SecretFileWrite::write`].
 pub fn write_secret_file(
     file_var: &str,
     path: &Path,
     secret: &Secret,
 ) -> Result<bool, SecretEnvError> {
+    match plan_secret_file_write(file_var, path, secret)? {
+        Some(write) => write.write(secret).map(|()| true),
+        None => Ok(false),
+    }
+}
+
+/// A checked, not yet performed, write of a secret file: see
+/// [`plan_secret_file_write`].
+#[derive(Debug)]
+pub struct SecretFileWrite {
+    file_var: String,
+    path: PathBuf,
+    target: PathBuf,
+    replaces_existing: bool,
+}
+
+/// Checks that `secret` can be stored in the file at `path`, which the key
+/// `file_var` named, without writing anything. `Ok(None)` means the file
+/// already holds `secret`, so there is nothing to write.
+///
+/// Used when a login or import has a new value for a settings.json secret
+/// field whose `_file` companion is set (#2008): the value goes where the
+/// user said it lives, never back into settings.json. Checking every file
+/// before writing any keeps a multi-file update from failing half way on
+/// anything but an I/O error.
+///
+/// - A file that already holds `secret` is left alone. That keeps a file
+///   shared by several accounts untouched, and keeps a root-owned read-only
+///   mount usable while the secret is unchanged.
+/// - An existing file is only replaced when [`read_secret_file`] accepts it
+///   (or it is empty) and it doesn't hold JSON, so a mispointed path can't
+///   destroy a `client_secret.json` or a file that isn't the user's own.
+/// - Symlinks are followed to the target, as [`read_secret_file`] does; a
+///   dangling one is refused rather than replaced by a regular file.
+/// - The parent directory must already exist.
+///
+/// # Errors
+///
+/// [`SecretEnvError::RelativePath`] for a relative path,
+/// [`SecretEnvError::HoldsJson`] for a JSON file, [`read_secret_file`]'s
+/// errors for an existing file it rejects, and
+/// [`SecretEnvError::Unwritable`] when the directory is missing.
+pub fn plan_secret_file_write(
+    file_var: &str,
+    path: &Path,
+    secret: &Secret,
+) -> Result<Option<SecretFileWrite>, SecretEnvError> {
     if !path.is_absolute() {
         return Err(SecretEnvError::RelativePath {
             file_var: file_var.to_string(),
             path: path.to_path_buf(),
         });
     }
-    if read_secret_file(file_var, path)
-        .is_ok_and(|current| current.expose_secret() == secret.expose_secret())
-    {
-        return Ok(false);
-    }
     let unwritable = |source| SecretEnvError::Unwritable {
         file_var: file_var.to_string(),
         path: path.to_path_buf(),
         source,
     };
-    let target = match std::fs::canonicalize(path) {
-        Ok(target) => target,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+    let (target, replaces_existing) = match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (path.to_path_buf(), false),
         Err(e) => return Err(unwritable(e)),
+        Ok(_) => {
+            match read_secret_file(file_var, path) {
+                Ok(current) if current.expose_secret() == secret.expose_secret() => {
+                    return Ok(None)
+                }
+                Ok(current) if current.expose_secret().trim_start().starts_with('{') => {
+                    return Err(SecretEnvError::HoldsJson {
+                        file_var: file_var.to_string(),
+                        path: path.to_path_buf(),
+                    })
+                }
+                Ok(_) | Err(SecretEnvError::Empty { .. }) => {}
+                Err(e) => return Err(e),
+            }
+            (std::fs::canonicalize(path).map_err(unwritable)?, true)
+        }
     };
-    let (Some(dir), Some(file_name)) = (target.parent(), target.file_name()) else {
+    if !target.parent().is_some_and(Path::is_dir) {
         return Err(unwritable(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the path has no parent directory",
+            std::io::ErrorKind::NotFound,
+            "its directory does not exist",
         )));
-    };
-    let mut temp_name = std::ffi::OsString::from(".");
-    temp_name.push(file_name);
-    temp_name.push(format!(".{}.tmp", std::process::id()));
-    let temp = dir.join(temp_name);
-    let result = write_new_0600(&temp, secret.expose_secret())
-        .and_then(|()| std::fs::rename(&temp, &target));
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&temp);
-        return Err(unwritable(e));
     }
-    Ok(true)
+    Ok(Some(SecretFileWrite {
+        file_var: file_var.to_string(),
+        path: path.to_path_buf(),
+        target,
+        replaces_existing,
+    }))
 }
 
-/// Creates `path` (which must not exist) owner-only and writes `contents`
-/// plus a trailing newline, synced to disk.
-fn write_new_0600(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+impl SecretFileWrite {
+    /// Whether this write replaces a file that exists (with another value).
+    #[must_use]
+    pub fn replaces_existing(&self) -> bool {
+        self.replaces_existing
     }
-    let mut file = options.open(path)?;
-    file.write_all(contents.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()
+
+    /// Writes `secret` (plus a trailing newline) atomically: a `0600` temp
+    /// file with a unique name is created beside the target, synced, and
+    /// renamed over it. A failed write leaves no temp file behind.
+    ///
+    /// # Errors
+    ///
+    /// [`SecretEnvError::Unwritable`] when the file can't be written.
+    pub fn write(self, secret: &Secret) -> Result<(), SecretEnvError> {
+        use std::io::Write;
+        let unwritable = |source| SecretEnvError::Unwritable {
+            file_var: self.file_var.clone(),
+            path: self.path.clone(),
+            source,
+        };
+        let dir = self.target.parent().unwrap_or(Path::new("/"));
+        // tempfile creates the file owner-only (0600) on Unix and removes it
+        // on drop unless it is persisted.
+        let mut temp = tempfile::Builder::new()
+            .prefix(".omni-dev-secret-")
+            .tempfile_in(dir)
+            .map_err(unwritable)?;
+        temp.write_all(secret.expose_secret().as_bytes())
+            .and_then(|()| temp.write_all(b"\n"))
+            .and_then(|()| temp.as_file().sync_all())
+            .map_err(unwritable)?;
+        temp.persist(&self.target)
+            .map_err(|e| unwritable(e.error))?;
+        Ok(())
+    }
 }
 
 /// Removes exactly one trailing `\n` or `\r\n`, and nothing else: secrets may
@@ -1298,6 +1375,70 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("k_file"), "{message}");
         assert!(!message.contains(SECRET_BYTES), "{message}");
+    }
+
+    #[test]
+    fn write_secret_file_replaces_an_empty_placeholder() {
+        let (_dir, path) = secret_file(b"", 0o600);
+        assert!(write_secret_file("k_file", &path, &Secret::new("v".to_string())).unwrap());
+        assert_eq!(
+            read_secret_file("k_file", &path).unwrap().expose_secret(),
+            "v"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_refuses_to_replace_a_file_the_reader_rejects() {
+        let (_dir, path) = secret_file(b"old\n", 0o644);
+        let err = write_secret_file("k_file", &path, &Secret::new("new".to_string())).unwrap_err();
+        assert!(
+            matches!(err, SecretEnvError::LoosePermissions { .. }),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
+    }
+
+    #[test]
+    fn write_secret_file_refuses_to_replace_a_json_file() {
+        let json = b"{\"installed\": {\"client_secret\": \"s\"}}\n";
+        let (_dir, path) = secret_file(json, 0o600);
+        let err = write_secret_file("k_file", &path, &Secret::new("s".to_string())).unwrap_err();
+        assert!(matches!(err, SecretEnvError::HoldsJson { .. }), "{err}");
+        assert!(!err.to_string().contains("installed"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), json);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_refuses_a_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path().join("absent"), &link).unwrap();
+        let err = write_secret_file("k_file", &link, &Secret::new("v".to_string())).unwrap_err();
+        assert!(matches!(err, SecretEnvError::Unreadable { .. }), "{err}");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!dir.path().join("absent").exists());
+    }
+
+    #[test]
+    fn plan_secret_file_write_reports_whether_it_replaces_a_file() {
+        let (dir, path) = secret_file(b"old\n", 0o600);
+        let secret = Secret::new("new".to_string());
+        let replace = plan_secret_file_write("k_file", &path, &secret)
+            .unwrap()
+            .unwrap();
+        assert!(replace.replaces_existing());
+        let create = plan_secret_file_write("k_file", &dir.path().join("fresh"), &secret)
+            .unwrap()
+            .unwrap();
+        assert!(!create.replaces_existing());
+        // Planning writes nothing.
+        assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
+        assert!(!dir.path().join("fresh").exists());
     }
 
     /// Self-check: the guards see the real read sites (so an empty scan
