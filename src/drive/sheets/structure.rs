@@ -2543,6 +2543,7 @@ fn describe_would_insert(
         format!(
             "; existing {plural} {at}-{before} shift {direction}",
             plural = plural(dimension),
+            // An insert always pushes the existing rows/columns forward.
             direction = shift_word(dimension, true),
         )
     } else {
@@ -2691,10 +2692,7 @@ fn describe_would_delete_dimension(
             "; existing {plural} {next}-{before} shift {direction}",
             plural = plural(dimension),
             next = last + 1,
-            direction = match dimension {
-                Dimension::Rows => "up",
-                Dimension::Columns => "left",
-            },
+            direction = shift_word(dimension, false),
         )
     } else {
         format!(
@@ -2728,10 +2726,7 @@ fn describe_would_delete_range(
     shift: ShiftDimension,
     book: &str,
 ) -> String {
-    let direction = match shift {
-        ShiftDimension::Rows => "up",
-        ShiftDimension::Columns => "left",
-    };
+    let direction = shift_word(shift.into(), false);
     format!(
         "Would delete rows {start_row}-{end_row}, columns {start_column}-{end_column} of \
          '{from}'{id} in {book}, shifting remaining cells {direction} to close the gap; \
@@ -2751,10 +2746,7 @@ fn describe_would_insert_range(
     shift: ShiftDimension,
     book: &str,
 ) -> String {
-    let direction = match shift {
-        ShiftDimension::Rows => "down",
-        ShiftDimension::Columns => "right",
-    };
+    let direction = shift_word(shift.into(), true);
     format!(
         "Would insert empty cells at rows {start_row}-{end_row}, columns {start_column}-{end_column} \
          of '{from}'{id} in {book}, shifting existing cells {direction}; \
@@ -3017,10 +3009,7 @@ fn describe_deleted_range(
     book: &str,
     recovery: &str,
 ) -> String {
-    let direction = match shift {
-        ShiftDimension::Rows => "up",
-        ShiftDimension::Columns => "left",
-    };
+    let direction = shift_word(shift.into(), false);
     format!(
         "Deleted rows {start_row}-{end_row}, columns {start_column}-{end_column} of '{from}'{id} \
          in {book}, shifted remaining cells {direction}; {recovery}"
@@ -3039,10 +3028,7 @@ fn describe_inserted_range(
     shift: ShiftDimension,
     book: &str,
 ) -> String {
-    let direction = match shift {
-        ShiftDimension::Rows => "down",
-        ShiftDimension::Columns => "right",
-    };
+    let direction = shift_word(shift.into(), true);
     format!(
         "Inserted empty cells at rows {start_row}-{end_row}, columns {start_column}-{end_column} \
          of '{from}'{id} in {book}, shifting existing cells {direction}; \
@@ -3060,9 +3046,11 @@ const fn plural(dimension: Dimension) -> &'static str {
 /// The direction word for a shift along `dimension`: `forward` is the
 /// direction rows/columns move when something is inserted or a block moves
 /// upward past them (`down`/`right`); the other way (a downward move's
-/// displaced rows/columns closing the gap) is `!forward` (`up`/`left`).
-/// Shared by [`describe_would_insert`] and [`describe_would_move`] so the
-/// two direction vocabularies can't drift apart.
+/// displaced rows/columns closing the gap, or a deletion closing the gap
+/// left behind) is `!forward` (`up`/`left`). Shared by every `describe_*`
+/// preview/post-execution message in this module (insert, move, delete
+/// dimension, delete/insert range) so the direction vocabulary can't drift
+/// apart between them.
 const fn shift_word(dimension: Dimension, forward: bool) -> &'static str {
     match (dimension, forward) {
         (Dimension::Rows, true) => "down",
