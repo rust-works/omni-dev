@@ -14,6 +14,19 @@
 //!   row, and trailing empty rows entirely, so row 1 may have 5 cells and
 //!   row 2 only 2. Renderers must decide explicitly what to do about that
 //!   rather than assuming a rectangle.
+//! - **Sheets speaks proto3 JSON, where a scalar's zero value (`0`, `0.0`,
+//!   `false`, `""`) is omitted from the wire entirely**, not sent
+//!   explicitly. A required, non-`Option` scalar field (`i32`/`i64`/`f32`/
+//!   `f64`/`bool`/`String`) on any `Deserialize` struct here therefore
+//!   needs a field-level `#[serde(default)]`, or a value of exactly zero —
+//!   the first sheet, row 1, column A, an unset color channel, a `false`
+//!   flag, an empty pattern — makes the whole parse fail, bricking every
+//!   read of a spreadsheet in that state (issue #1929). This has nothing to
+//!   do with whether the field is ever *sent* that way: `#[serde(default)]`
+//!   only affects deserialisation, so a field this crate always sends
+//!   explicitly (like [`PivotGroup::show_totals`]) keeps doing so. Give the
+//!   next scalar field added here the same treatment on sight, rather than
+//!   waiting for a live failure to reveal it.
 
 use std::collections::BTreeMap;
 
@@ -1105,16 +1118,20 @@ impl Dimension {
 /// site.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DimensionRange {
-    /// The sheet the span belongs to.
-    #[serde(rename = "sheetId")]
+    /// The sheet the span belongs to. Proto3 omits this when it's `0` (the
+    /// first sheet in the workbook), so `#[serde(default)]` is load-bearing,
+    /// not decorative — see the module doc.
+    #[serde(default, rename = "sheetId")]
     pub sheet_id: i64,
     /// Rows or columns.
     pub dimension: Dimension,
-    /// First index, inclusive, zero-based.
-    #[serde(rename = "startIndex")]
+    /// First index, inclusive, zero-based. Omitted on the wire when `0`
+    /// (row 1 / column A) — see the module doc.
+    #[serde(default, rename = "startIndex")]
     pub start_index: i64,
-    /// Last index, **exclusive**, zero-based.
-    #[serde(rename = "endIndex")]
+    /// Last index, **exclusive**, zero-based. Omitted on the wire when `0`;
+    /// defaulted defensively even though a zero-length range is degenerate.
+    #[serde(default, rename = "endIndex")]
     pub end_index: i64,
 }
 
@@ -1214,11 +1231,15 @@ pub struct GridRange {
 /// purely outbound use of the same type.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct Color {
-    /// Red channel, 0.0-1.0.
+    /// Red channel, 0.0-1.0. Proto3 omits this on the wire when it's `0.0`
+    /// — see the module doc.
+    #[serde(default)]
     pub red: f32,
-    /// Green channel, 0.0-1.0.
+    /// Green channel, 0.0-1.0. Omitted on the wire when `0.0`.
+    #[serde(default)]
     pub green: f32,
-    /// Blue channel, 0.0-1.0.
+    /// Blue channel, 0.0-1.0. Omitted on the wire when `0.0`.
+    #[serde(default)]
     pub blue: f32,
 }
 
@@ -1272,9 +1293,14 @@ pub struct TextFormat {
 pub struct NumberFormat {
     /// One of Sheets' type strings (`"TEXT"`, `"NUMBER"`, `"PERCENT"`,
     /// `"CURRENCY"`, `"DATE"`, `"TIME"`, `"DATE_TIME"`, `"SCIENTIFIC"`).
-    #[serde(rename = "type")]
+    /// Defaulted defensively (empty string is not a real Sheets type), the
+    /// same posture the module doc asks for on every scalar here.
+    #[serde(default, rename = "type")]
     pub format_type: String,
-    /// The display pattern, e.g. `"#,##0.00"`.
+    /// The display pattern, e.g. `"#,##0.00"`. Proto3 omits this on the
+    /// wire when it's `""` (a format with an empty pattern) — see the
+    /// module doc.
+    #[serde(default)]
     pub pattern: String,
 }
 
@@ -1721,8 +1747,11 @@ pub enum SortOrder {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SortSpec {
     /// The 0-based column index within the sheet — absolute, not relative
-    /// to the filter's own range.
-    #[serde(rename = "dimensionIndex")]
+    /// to the filter's own range. Proto3 omits this on the wire when it's
+    /// `0` (a sort on column A) — see the module doc. `Sheet` embeds the
+    /// basic filter, so this reaches **every** metadata read, not just the
+    /// filter verbs.
+    #[serde(default, rename = "dimensionIndex")]
     pub dimension_index: i64,
     /// The direction to sort that column.
     #[serde(rename = "sortOrder")]
@@ -2391,14 +2420,16 @@ pub struct OverlayPosition {
 /// anchor is one cell, never a range.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GridCoordinate {
-    /// The sheet this coordinate is on.
-    #[serde(rename = "sheetId")]
+    /// The sheet this coordinate is on. Proto3 omits this on the wire when
+    /// it's `0` (the first sheet) — see the module doc.
+    #[serde(default, rename = "sheetId")]
     pub sheet_id: i64,
-    /// 0-based row.
-    #[serde(rename = "rowIndex")]
+    /// 0-based row. Omitted on the wire when `0` (row 1) — a chart or
+    /// slicer anchored at row 1 hits this.
+    #[serde(default, rename = "rowIndex")]
     pub row_index: i64,
-    /// 0-based column.
-    #[serde(rename = "columnIndex")]
+    /// 0-based column. Omitted on the wire when `0` (column A).
+    #[serde(default, rename = "columnIndex")]
     pub column_index: i64,
 }
 
@@ -2562,6 +2593,10 @@ pub struct UpdateEmbeddedObjectPositionRequest {
 /// Sets or clears an existing chart's border colour (`update-chart-border`,
 /// issue #1837). Charts only; a [`Slicer`] carries no `border` field, so
 /// there is no `update-slicer-border` counterpart.
+///
+/// Confirmed live (issue #1929): clearing and setting an explicit black
+/// (`0,0,0`) both read back as the same wire shape — see
+/// `embedded_object.rs`'s module doc and `describe_border_color`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct UpdateEmbeddedObjectBorderRequest {
     /// Which chart to update.
@@ -2669,13 +2704,17 @@ pub struct PivotTable {
 pub struct PivotGroup {
     /// Which source column this groups by, 0-based and relative to
     /// [`PivotTable::source`]'s first column — not an absolute sheet
-    /// column index.
-    #[serde(rename = "sourceColumnOffset")]
+    /// column index. Proto3 omits this on the wire when it's `0`
+    /// (grouping by the source's first column) — see the module doc.
+    #[serde(default, rename = "sourceColumnOffset")]
     pub source_column_offset: i64,
     /// Whether to show a totals row/column for this grouping. Always sent
     /// explicitly (never omitted) since the API's own default (`true`)
     /// would otherwise silently differ from a caller's expectation.
-    #[serde(rename = "showTotals")]
+    /// `#[serde(default)]` only affects *deserialisation*: it's needed
+    /// because proto3 omits `false` on the wire (`--no-totals`), and
+    /// doesn't change what this crate sends.
+    #[serde(default, rename = "showTotals")]
     pub show_totals: bool,
     /// `"ASCENDING"` or `"DESCENDING"`. Optional only so a read-back of
     /// an existing pivot table tolerates its absence: the API rejects a
@@ -2691,8 +2730,10 @@ pub struct PivotGroup {
 #[serde(rename_all = "camelCase")]
 pub struct PivotValue {
     /// Which source column this aggregates, 0-based and relative to
-    /// [`PivotTable::source`]'s first column.
-    #[serde(rename = "sourceColumnOffset")]
+    /// [`PivotTable::source`]'s first column. Proto3 omits this on the wire
+    /// when it's `0` (aggregating the source's first column) — see the
+    /// module doc.
+    #[serde(default, rename = "sourceColumnOffset")]
     pub source_column_offset: i64,
     /// One of Sheets' `SUM`/`COUNTA`/`COUNT`/`COUNTUNIQUE`/`AVERAGE`/
     /// `MAX`/`MIN`/`MEDIAN`/`PRODUCT`/`STDEV`/`STDEVP`/`VAR`/`VARP`
@@ -2717,8 +2758,10 @@ pub struct PivotValue {
 #[serde(rename_all = "camelCase")]
 pub struct PivotFilterSpec {
     /// Which source column this filters, 0-based and relative to
-    /// [`PivotTable::source`]'s first column.
-    #[serde(rename = "columnOffsetIndex")]
+    /// [`PivotTable::source`]'s first column. Proto3 omits this on the
+    /// wire when it's `0` (filtering the source's first column) — see the
+    /// module doc.
+    #[serde(default, rename = "columnOffsetIndex")]
     pub column_offset_index: i64,
     /// The filter itself.
     #[serde(rename = "filterCriteria")]
@@ -4450,5 +4493,399 @@ mod tests {
                 .occurrences_changed,
             6
         );
+    }
+
+    // ── issue #1929: proto3 zero-value omission ─────────────────────────
+    //
+    // Sheets omits a scalar field from its JSON entirely when it holds
+    // proto3's default (`0`, `0.0`, `false`, `""`) — see the module doc.
+    // Each test below feeds exactly that omitted shape to the struct that
+    // broke on it live, and asserts the zero default is recovered rather
+    // than the parse failing.
+
+    #[test]
+    fn grid_coordinate_defaults_every_field_when_all_are_zero() {
+        // sheet 0, row 1 (index 0), column A (index 0) — add-chart's own
+        // live failure (issue #1929).
+        let parsed: GridCoordinate = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(parsed.sheet_id, 0);
+        assert_eq!(parsed.row_index, 0);
+        assert_eq!(parsed.column_index, 0);
+    }
+
+    #[test]
+    fn dimension_range_defaults_sheet_and_start_index() {
+        let parsed: DimensionRange = serde_json::from_value(serde_json::json!({
+            "dimension": "ROWS",
+            "endIndex": 3,
+        }))
+        .unwrap();
+        assert_eq!(parsed.sheet_id, 0);
+        assert_eq!(parsed.start_index, 0);
+        assert_eq!(parsed.end_index, 3);
+        assert_eq!(parsed.dimension, Dimension::Rows);
+    }
+
+    #[test]
+    fn color_defaults_the_channels_it_wasnt_given() {
+        let parsed: Color = serde_json::from_value(serde_json::json!({"red": 1.0})).unwrap();
+        assert_eq!(parsed.red, 1.0);
+        assert_eq!(parsed.green, 0.0);
+        assert_eq!(parsed.blue, 0.0);
+    }
+
+    #[test]
+    fn color_style_defaults_an_all_omitted_rgb_color() {
+        let parsed: ColorStyle =
+            serde_json::from_value(serde_json::json!({"rgbColor": {}})).unwrap();
+        assert_eq!(parsed.rgb_color, Color::default());
+    }
+
+    #[test]
+    fn pivot_group_defaults_offset_and_totals() {
+        // A grouping by the source's first column, with `--no-totals`.
+        let parsed: PivotGroup = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(parsed.source_column_offset, 0);
+        assert!(!parsed.show_totals);
+        assert_eq!(parsed.sort_order, None);
+    }
+
+    #[test]
+    fn pivot_value_defaults_the_source_column_offset() {
+        let parsed: PivotValue =
+            serde_json::from_value(serde_json::json!({"summarizeFunction": "SUM"})).unwrap();
+        assert_eq!(parsed.source_column_offset, 0);
+        assert_eq!(parsed.summarize_function, "SUM");
+    }
+
+    #[test]
+    fn pivot_filter_spec_defaults_the_column_offset_index() {
+        let parsed: PivotFilterSpec =
+            serde_json::from_value(serde_json::json!({"filterCriteria": {}})).unwrap();
+        assert_eq!(parsed.column_offset_index, 0);
+        assert!(parsed.filter_criteria.visible_values.is_empty());
+    }
+
+    #[test]
+    fn sort_spec_defaults_the_dimension_index_to_column_a() {
+        let parsed: SortSpec =
+            serde_json::from_value(serde_json::json!({"sortOrder": "ASCENDING"})).unwrap();
+        assert_eq!(parsed.dimension_index, 0);
+        assert_eq!(parsed.sort_order, SortOrder::Ascending);
+    }
+
+    #[test]
+    fn number_format_defaults_an_empty_pattern() {
+        let parsed: NumberFormat =
+            serde_json::from_value(serde_json::json!({"type": "NUMBER"})).unwrap();
+        assert_eq!(parsed.format_type, "NUMBER");
+        assert_eq!(parsed.pattern, "");
+    }
+
+    /// Strips proto3's default scalar values (`0`, `0.0`, `false`, `""`)
+    /// from a JSON value exactly as the real Sheets API omits them from a
+    /// response, so a round-trip test can simulate what a `Deserialize`
+    /// struct here actually has to tolerate. Only scalars at any nesting
+    /// depth are stripped — a `Vec`/array's own elements are left alone,
+    /// since proto3 does not omit elements of a non-empty repeated field.
+    fn proto3_omit_zeros(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                for (key, val) in map {
+                    let val = proto3_omit_zeros(val);
+                    let is_zero_scalar = match &val {
+                        serde_json::Value::Bool(b) => !*b,
+                        serde_json::Value::Number(n) => n.as_f64() == Some(0.0),
+                        serde_json::Value::String(s) => s.is_empty(),
+                        _ => false,
+                    };
+                    if !is_zero_scalar {
+                        out.insert(key, val);
+                    }
+                }
+                serde_json::Value::Object(out)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.into_iter().map(proto3_omit_zeros).collect())
+            }
+            other => other,
+        }
+    }
+
+    /// A `Spreadsheet` exercising every struct this issue touched, with
+    /// every **required** (non-`Option`) scalar field this issue fixed
+    /// sitting right on its proto3 zero boundary (sheet id 0, row 1,
+    /// column A, a zero colour channel, `--no-totals`, offset 0, a
+    /// column-A sort).
+    ///
+    /// Deliberately avoids putting a zero value in any `Option`-typed
+    /// scalar field (e.g. `GridRange::start_row_index`,
+    /// `SlicerSpec::column_index`): those already collapse `Some(0)` and
+    /// `None` to the same wire shape independent of this issue (an
+    /// `Option` defaults to `None` whether the key is absent or its own
+    /// `#[serde(default)]` fires), so a round-trip through them is
+    /// ambiguous by construction and would make this guard fail on
+    /// something it was never meant to catch — see
+    /// `SlicerSpec::column_index`'s own doc comment and the
+    /// `update-slicer` carry-forward this issue fixed for that specific,
+    /// already-known case.
+    fn zero_boundary_spreadsheet() -> Spreadsheet {
+        let sheet_id = 0; // the first sheet — an omitted `sheetId` means this
+        let full_range = GridRange {
+            sheet_id,
+            start_row_index: Some(1),
+            end_row_index: Some(6),
+            start_column_index: Some(1),
+            end_column_index: Some(3),
+        };
+        Spreadsheet {
+            spreadsheet_id: Some("zero-boundary".to_string()),
+            properties: Some(SpreadsheetProperties {
+                title: "Zero boundaries".to_string(),
+                ..Default::default()
+            }),
+            sheets: vec![Sheet {
+                properties: Some(SheetProperties {
+                    sheet_id: Some(1), // an unrelated `Option<i64>`; see doc comment
+                    title: "Sheet1".to_string(),
+                    ..Default::default()
+                }),
+                basic_filter: Some(BasicFilter {
+                    range: Some(full_range),
+                    sort_specs: vec![SortSpec {
+                        dimension_index: 0, // column A
+                        sort_order: SortOrder::Ascending,
+                    }],
+                    criteria: BTreeMap::new(),
+                }),
+                conditional_formats: vec![ConditionalFormatRule {
+                    ranges: vec![full_range],
+                    boolean_rule: Some(BooleanRule {
+                        condition: BooleanCondition {
+                            condition_type: "NUMBER_GREATER".to_string(),
+                            values: vec![ConditionValue {
+                                user_entered_value: Some("0".to_string()),
+                                relative_date: None,
+                            }],
+                        },
+                        format: CellFormat {
+                            background_color_style: Some(ColorStyle {
+                                rgb_color: Color {
+                                    red: 0.0,
+                                    green: 0.0,
+                                    blue: 0.0,
+                                },
+                            }),
+                            number_format: Some(NumberFormat {
+                                format_type: "NUMBER".to_string(),
+                                pattern: String::new(),
+                            }),
+                            ..Default::default()
+                        },
+                    }),
+                    gradient_rule: None,
+                }],
+                charts: vec![EmbeddedChart {
+                    chart_id: Some(1),
+                    spec: Some(ChartSpec {
+                        title: Some("Chart".to_string()),
+                        subtitle: None,
+                        basic_chart: Some(BasicChartSpec {
+                            chart_type: "COLUMN".to_string(),
+                            legend_position: None,
+                            stacked_type: None,
+                            header_count: None,
+                            axis: Vec::new(),
+                            domains: vec![BasicChartDomain {
+                                domain: ChartData {
+                                    source_range: ChartSourceRange {
+                                        sources: vec![GridRange {
+                                            sheet_id,
+                                            start_row_index: Some(1),
+                                            end_row_index: Some(4),
+                                            start_column_index: Some(1),
+                                            end_column_index: Some(2),
+                                        }],
+                                    },
+                                    extra: BTreeMap::new(),
+                                },
+                                extra: BTreeMap::new(),
+                            }],
+                            series: vec![BasicChartSeries {
+                                series: ChartData {
+                                    source_range: ChartSourceRange {
+                                        sources: vec![GridRange {
+                                            sheet_id,
+                                            start_row_index: Some(1),
+                                            end_row_index: Some(4),
+                                            start_column_index: Some(2),
+                                            end_column_index: Some(3),
+                                        }],
+                                    },
+                                    extra: BTreeMap::new(),
+                                },
+                                target_axis: None,
+                                extra: BTreeMap::new(),
+                            }],
+                            extra: BTreeMap::new(),
+                        }),
+                        pie_chart: None,
+                        extra: BTreeMap::new(),
+                    }),
+                    position: Some(EmbeddedObjectPosition {
+                        sheet_id: None,
+                        overlay_position: Some(OverlayPosition {
+                            // Anchored at A1 on sheet 0 — every field zero.
+                            anchor_cell: GridCoordinate {
+                                sheet_id,
+                                row_index: 0,
+                                column_index: 0,
+                            },
+                            offset_x_pixels: None,
+                            offset_y_pixels: None,
+                            width_pixels: None,
+                            height_pixels: None,
+                        }),
+                        new_sheet: None,
+                    }),
+                    border: None,
+                }],
+                slicers: vec![Slicer {
+                    slicer_id: Some(2),
+                    spec: Some(SlicerSpec {
+                        data_range: Some(full_range),
+                        filter_criteria: None,
+                        // Deliberately non-zero — see this function's doc
+                        // comment on `Option`-typed scalar ambiguity.
+                        // Column 0's own read-back is covered separately by
+                        // `embedded_object.rs`'s carry-forward tests.
+                        column_index: Some(2),
+                        apply_to_pivot_tables: Some(true),
+                        title: None,
+                        extra: BTreeMap::new(),
+                    }),
+                    position: Some(EmbeddedObjectPosition {
+                        sheet_id: None,
+                        overlay_position: Some(OverlayPosition {
+                            anchor_cell: GridCoordinate {
+                                sheet_id,
+                                row_index: 10,
+                                column_index: 3,
+                            },
+                            offset_x_pixels: None,
+                            offset_y_pixels: None,
+                            width_pixels: None,
+                            height_pixels: None,
+                        }),
+                        new_sheet: None,
+                    }),
+                }],
+                banded_ranges: vec![BandedRange {
+                    banded_range_id: Some(3),
+                    range: Some(full_range),
+                    row_properties: Some(BandingProperties {
+                        header_color_style: None,
+                        first_band_color_style: Some(ColorStyle {
+                            rgb_color: Color {
+                                red: 0.0,
+                                green: 0.0,
+                                blue: 0.0,
+                            },
+                        }),
+                        second_band_color_style: Some(ColorStyle {
+                            rgb_color: Color {
+                                red: 1.0,
+                                green: 1.0,
+                                blue: 1.0,
+                            },
+                        }),
+                        footer_color_style: None,
+                    }),
+                    column_properties: None,
+                }],
+                row_groups: vec![DimensionGroup {
+                    range: DimensionRange {
+                        sheet_id, // sheet 0
+                        dimension: Dimension::Rows,
+                        start_index: 0, // row 1
+                        end_index: 3,
+                    },
+                    depth: 1,
+                    collapsed: false,
+                }],
+                data: vec![GridData {
+                    // Non-zero — see this function's doc comment on
+                    // `Option`-typed scalar ambiguity.
+                    start_row: Some(1),
+                    start_column: Some(1),
+                    row_data: vec![RowData {
+                        values: vec![CellSnapshot {
+                            pivot_table: Some(PivotTable {
+                                source: full_range,
+                                rows: vec![PivotGroup {
+                                    source_column_offset: 0, // source's first column
+                                    show_totals: false,      // --no-totals
+                                    sort_order: Some("ASCENDING".to_string()),
+                                }],
+                                columns: Vec::new(),
+                                values: vec![PivotValue {
+                                    source_column_offset: 0, // source's first column
+                                    summarize_function: "SUM".to_string(),
+                                    name: None,
+                                }],
+                                filter_specs: vec![PivotFilterSpec {
+                                    column_offset_index: 0, // source's first column
+                                    filter_criteria: PivotFilterCriteria {
+                                        visible_values: vec!["keep".to_string()],
+                                    },
+                                }],
+                                value_layout: None,
+                            }),
+                            formatted_value: None,
+                        }],
+                    }],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn proto3_omit_zeros_strips_only_zero_valued_scalars() {
+        let stripped = proto3_omit_zeros(serde_json::json!({
+            "a": 0,
+            "b": 0.0,
+            "c": false,
+            "d": "",
+            "e": 1,
+            "f": "kept",
+            "g": [0, "", {"h": 0, "i": 1}],
+            "j": {},
+        }));
+        assert_eq!(
+            stripped,
+            serde_json::json!({
+                "e": 1,
+                "f": "kept",
+                "g": [0, "", {"i": 1}],
+                "j": {},
+            })
+        );
+    }
+
+    #[test]
+    fn proto3_omit_zeros_round_trip_recovers_every_zero_boundary_field() {
+        // Guards against the next scalar field added to this file skipping
+        // `#[serde(default)]`: simulate the wire dropping every zero-valued
+        // scalar (exactly what a real Sheets response does), then confirm
+        // deserializing that stripped shape still recovers the original.
+        let original = zero_boundary_spreadsheet();
+        let json = serde_json::to_value(&original).unwrap();
+        let wire_shape = proto3_omit_zeros(json);
+        let round_tripped: Spreadsheet = serde_json::from_value(wire_shape)
+            .expect("every zero-valued scalar here must have #[serde(default)]");
+        assert_eq!(round_tripped, original);
     }
 }
