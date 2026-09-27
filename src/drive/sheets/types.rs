@@ -2781,6 +2781,20 @@ impl ShiftDimension {
     }
 }
 
+/// Same two axes as [`Dimension`] but for a range shift rather than a
+/// `DimensionRange`; kept as a distinct type since the two operations are
+/// conceptually different, but the axis itself converts freely so callers
+/// that describe a shift direction (e.g. `structure.rs::shift_word`) can
+/// share one implementation.
+impl From<ShiftDimension> for Dimension {
+    fn from(shift: ShiftDimension) -> Self {
+        match shift {
+            ShiftDimension::Rows => Self::Rows,
+            ShiftDimension::Columns => Self::Columns,
+        }
+    }
+}
+
 /// `InsertRangeRequest` — inserts empty cells into `range`, shifting existing
 /// cells along `shift_dimension` to make room.
 ///
