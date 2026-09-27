@@ -230,7 +230,9 @@ mod tests {
         DriveAccountSettings {
             client_id: Some("id".to_string()),
             client_secret: Some("secret".to_string()),
+            client_secret_file: None,
             refresh_token: Some("token".to_string()),
+            refresh_token_file: None,
             scope: scope.map(str::to_string),
             email_address: email.map(str::to_string),
             chrome_profile_from_email: false,
@@ -254,7 +256,9 @@ mod tests {
                         DriveAccountSettings {
                             client_id: acc.client_id.clone(),
                             client_secret: acc.client_secret.clone(),
+                            client_secret_file: acc.client_secret_file.clone(),
                             refresh_token: acc.refresh_token.clone(),
+                            refresh_token_file: acc.refresh_token_file.clone(),
                             scope: acc.scope.clone(),
                             email_address: acc.email_address.clone(),
                             chrome_profile_from_email: acc.chrome_profile_from_email,

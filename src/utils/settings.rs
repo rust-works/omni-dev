@@ -146,9 +146,18 @@ pub struct GmailAccountSettings {
     /// OAuth2 client secret from the account's Google Cloud project.
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// Absolute path to a file holding `client_secret` instead (#2008) —
+    /// the raw secret, not a `client_secret.json`. Setting both is an error.
+    #[serde(default)]
+    pub client_secret_file: Option<String>,
     /// The long-lived refresh token obtained by `gmail auth login`.
     #[serde(default)]
     pub refresh_token: Option<String>,
+    /// Absolute path to a file holding `refresh_token` instead (#2008);
+    /// `gmail auth login` writes a new token there. Setting both is an
+    /// error.
+    #[serde(default)]
+    pub refresh_token_file: Option<String>,
     /// The OAuth2 scope this account was authorized with.
     #[serde(default)]
     pub scope: Option<String>,
@@ -218,10 +227,19 @@ pub struct DriveAccountSettings {
     /// OAuth2 client secret from the account's Google Cloud project.
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// Absolute path to a file holding `client_secret` instead (#2008).
+    /// Setting both is an error.
+    #[serde(default)]
+    pub client_secret_file: Option<String>,
     /// The long-lived refresh token obtained by `drive auth login`
     /// (issue #1523).
     #[serde(default)]
     pub refresh_token: Option<String>,
+    /// Absolute path to a file holding `refresh_token` instead (#2008);
+    /// `drive auth login` writes a new token there. Setting both is an
+    /// error.
+    #[serde(default)]
+    pub refresh_token_file: Option<String>,
     /// The OAuth2 scope this account was authorized with, as the raw string
     /// Google granted. Stays a plain `String` here (unlike Gmail's
     /// equivalent settings field, for the same reason): this is a
@@ -816,14 +834,7 @@ impl Settings {
         account: &str,
         vars: &[(&str, serde_json::Value)],
     ) -> Result<()> {
-        let mut settings_value = read_or_default_settings(path)?;
-
-        let entry = ensure_object_at(&mut settings_value, &["gmail", "accounts", account])?;
-        for (key, value) in vars {
-            entry.insert((*key).to_string(), value.clone());
-        }
-
-        write_settings(path, &settings_value)
+        upsert_account(path, "gmail", account, vars)
     }
 
     /// Removes `gmail.accounts.<account>` entirely — an account is coherent
@@ -898,14 +909,7 @@ impl Settings {
         account: &str,
         vars: &[(&str, serde_json::Value)],
     ) -> Result<()> {
-        let mut settings_value = read_or_default_settings(path)?;
-
-        let entry = ensure_object_at(&mut settings_value, &["drive", "accounts", account])?;
-        for (key, value) in vars {
-            entry.insert((*key).to_string(), value.clone());
-        }
-
-        write_settings(path, &settings_value)
+        upsert_account(path, "drive", account, vars)
     }
 
     /// Removes `drive.accounts.<account>` entirely — an account is coherent
@@ -1042,6 +1046,88 @@ fn read_or_default_settings(path: &Path) -> Result<serde_json::Value> {
     } else {
         Ok(serde_json::json!({}))
     }
+}
+
+/// The named-account secret fields that accept a `<field>_file` companion
+/// (#2008).
+const ACCOUNT_SECRET_FIELDS: &[&str] = &["client_secret", "refresh_token"];
+
+/// The shared body of [`Settings::upsert_gmail_account`] and
+/// [`Settings::upsert_drive_account`]: merges `vars` into
+/// `<section>.accounts.<account>`.
+///
+/// A secret field ([`ACCOUNT_SECRET_FIELDS`]) whose entry already names a
+/// `<field>_file` is written into that file through
+/// [`secret_env::write_secret_file`] instead, and the plain field is removed,
+/// so the secret never lands in settings.json and the entry can't hold both
+/// (#2008). Every such file is written before settings.json, so a failed
+/// secret write leaves settings.json untouched.
+fn upsert_account(
+    path: &Path,
+    section: &str,
+    account: &str,
+    vars: &[(&str, serde_json::Value)],
+) -> Result<()> {
+    let mut settings_value = read_or_default_settings(path)?;
+
+    let entry = ensure_object_at(&mut settings_value, &[section, "accounts", account])?;
+    for (key, value) in vars {
+        if let Some(file) = account_secret_file(entry, key, value) {
+            let file_key = format!("{key}_file");
+            let label = format!("{section}.accounts.{account}.{file_key}");
+            let secret = crate::utils::secret::Secret::new(value.as_str().unwrap_or_default());
+            secret_env::write_secret_file(&label, Path::new(&file), &secret)?;
+            entry.remove(*key);
+        } else {
+            entry.insert((*key).to_string(), value.clone());
+        }
+    }
+
+    write_settings(path, &settings_value)
+}
+
+/// Resolves the secret field `<section>.accounts.<account>.<field>` from its
+/// plain `value` or its `<field>_file` companion, with the `<NAME>_FILE`
+/// rules (#2008); errors name the full settings key. `Ok(None)` means
+/// neither is set.
+///
+/// # Errors
+///
+/// See [`secret_env::SecretEnvError`].
+pub(crate) fn account_secret(
+    section: &str,
+    account: &str,
+    field: &str,
+    value: Option<&str>,
+    file: Option<&str>,
+) -> std::result::Result<Option<crate::utils::secret::Secret>, secret_env::SecretEnvError> {
+    let name = format!("{section}.accounts.{account}.{field}");
+    secret_env::resolve_secret_pair(&name, value, &format!("{name}_file"), file)
+}
+
+/// Whether a named-account secret field or its `_file` companion is set
+/// (non-empty), without reading the file — for presence-only reports. Only
+/// the MCP `*_auth_status` tools report a named account's presence flags.
+#[cfg(feature = "mcp")]
+pub(crate) fn account_secret_is_set(value: Option<&str>, file: Option<&str>) -> bool {
+    value.is_some_and(|v| !v.is_empty()) || file.is_some_and(|f| !f.is_empty())
+}
+
+/// The `<key>_file` path to write `value` into instead of `entry.<key>`, when
+/// `key` is a secret field, `value` a string, and the companion set.
+fn account_secret_file(
+    entry: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+) -> Option<String> {
+    if !ACCOUNT_SECRET_FIELDS.contains(&key) || !value.is_string() {
+        return None;
+    }
+    entry
+        .get(&format!("{key}_file"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|file| !file.is_empty())
+        .map(str::to_string)
 }
 
 /// The single hardened write site for the settings file: creates the parent
@@ -2383,6 +2469,125 @@ mod tests {
             let file_mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(file_mode & 0o777, 0o600);
         }
+    }
+
+    // ── named-account `_file` secrets (#2008) ────────────────────────────
+
+    /// A settings file whose `drive.accounts.work` names `refresh_token_file`
+    /// (and optionally `client_secret_file`) under `dir`.
+    fn settings_with_secret_files(
+        path: &Path,
+        client_secret_file: Option<&Path>,
+        refresh_token_file: &Path,
+    ) {
+        let mut work = serde_json::json!({
+            "client_id": "id",
+            "refresh_token_file": refresh_token_file.to_str().unwrap(),
+        });
+        if let Some(file) = client_secret_file {
+            work["client_secret_file"] = serde_json::json!(file.to_str().unwrap());
+        }
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            serde_json::json!({ "drive": { "accounts": { "work": work } } }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn account_secret_file_fields_deserialize() {
+        let (_tmp, path) = temp_settings_path();
+        settings_with_secret_files(&path, Some(Path::new("/s/cs")), Path::new("/s/rt"));
+        let settings = Settings::load_from_path(&path).unwrap();
+        let work = &settings.drive.accounts["work"];
+        assert_eq!(work.client_secret_file.as_deref(), Some("/s/cs"));
+        assert_eq!(work.refresh_token_file.as_deref(), Some("/s/rt"));
+        assert!(work.client_secret.is_none());
+    }
+
+    #[test]
+    fn upsert_account_writes_a_secret_into_its_file_not_settings() {
+        let (tmp, path) = temp_settings_path();
+        let token_file = tmp.path().join("refresh-token");
+        settings_with_secret_files(&path, None, &token_file);
+
+        Settings::upsert_drive_account(
+            &path,
+            "work",
+            &[
+                ("client_secret", serde_json::json!("plain-secret")),
+                ("refresh_token", serde_json::json!("new-token")),
+                ("scope", serde_json::json!("s")),
+            ],
+        )
+        .unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("new-token"), "{raw}");
+        let val = read_json(&path);
+        let work = &val["drive"]["accounts"]["work"];
+        assert!(work.get("refresh_token").is_none());
+        assert_eq!(work["refresh_token_file"], token_file.to_str().unwrap());
+        // A secret field without a companion is written as before.
+        assert_eq!(work["client_secret"], "plain-secret");
+        assert_eq!(work["scope"], "s");
+        assert_eq!(fs::read_to_string(&token_file).unwrap(), "new-token\n");
+    }
+
+    #[test]
+    fn upsert_account_drops_a_plain_field_that_would_conflict_with_its_file() {
+        let (tmp, path) = temp_settings_path();
+        let secret_file = tmp.path().join("client-secret");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::json!({ "gmail": { "accounts": { "work": {
+                "client_secret": "stale",
+                "client_secret_file": secret_file.to_str().unwrap(),
+            }}}})
+            .to_string(),
+        )
+        .unwrap();
+
+        Settings::upsert_gmail_account(
+            &path,
+            "work",
+            &[("client_secret", serde_json::json!("fresh"))],
+        )
+        .unwrap();
+
+        let val = read_json(&path);
+        assert!(val["gmail"]["accounts"]["work"]
+            .get("client_secret")
+            .is_none());
+        assert_eq!(fs::read_to_string(&secret_file).unwrap(), "fresh\n");
+    }
+
+    #[test]
+    fn upsert_account_leaves_settings_untouched_when_the_secret_write_fails() {
+        let (tmp, path) = temp_settings_path();
+        let token_file = tmp.path().join("missing-dir").join("refresh-token");
+        settings_with_secret_files(&path, None, &token_file);
+        let before = fs::read_to_string(&path).unwrap();
+
+        let err = Settings::upsert_drive_account(
+            &path,
+            "work",
+            &[
+                ("scope", serde_json::json!("s")),
+                ("refresh_token", serde_json::json!("new-token")),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("drive.accounts.work.refresh_token_file"),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("new-token"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
     }
 
     /// Drive's twin of
