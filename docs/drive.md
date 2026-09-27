@@ -2119,6 +2119,21 @@ rewrites ordinary cell content in place, doing nothing a `sheets clear`
 followed by a `sheets write` of the same range could not already do under
 that grant.
 
+**Formatting is left alone, measured live** (issue #1877, the
+[ADR-0083](adrs/adr-0083.md) §5 check, run 2026-09-27). A trim over cells
+carrying a background colour, bold and italic text, a percent number
+format, borders, a note and a data-validation rule changed none of them.
+Cells in the range that needed no trimming were not touched at all, and a
+cell outside the range was unaffected. §5's move to the `sheets-structure`
+union therefore does not apply, and the verb stays on `sheets-write` alone.
+
+Rich text inside a cell survives too. The API shifts each formatting run's
+offsets to follow the removed characters, so `"  rich text  "` with *rich*
+bold and *text* italic becomes `"rich text"` with the same words formatted
+the same way. That is gentler than `sheets write`, which drops a cell's
+rich-text formatting whenever it writes the cell, even when the new value
+is the same text.
+
 **What "trims" means**, measured against the live API rather than assumed —
 the request reference describes it in one sentence, so each of these was
 confirmed by running it:
@@ -2129,6 +2144,7 @@ confirmed by running it:
 | `"a   b"` | `"a b"` | **internal runs collapse to one space** |
 | `"   "` | `""` | an all-whitespace cell becomes blank |
 | `"  =1+1  "` | `"=1+1"` (still text) | not reinterpreted as a formula |
+| `"  12  "` | `"12"` (still text) | not reinterpreted as a number, even under a number format |
 | `=A5` (a real formula) | unchanged | formula text is not touched |
 
 The second row is the one to note: this is not a leading/trailing trim, so

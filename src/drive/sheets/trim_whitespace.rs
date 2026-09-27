@@ -6,6 +6,13 @@
 //! place, which a `sheets clear` followed by a `sheets write` of the same
 //! range could already do under that grant.
 //!
+//! That placement is measured, not provisional: issue #1877 ran §5's live
+//! formatting check and nothing moved. Backgrounds, text and number
+//! formats, borders, notes and validation rules all survive a trim, and
+//! cells the trim skips are left untouched. Rich-text runs are rebased by
+//! the API so every character keeps its formatting — gentler than a plain
+//! `sheets write`, which drops those runs outright.
+//!
 //! The trim rule, measured live against the API (issue #1844): leading
 //! and trailing whitespace is stripped **and each internal run collapses
 //! to a single space** (`a   b` becomes `a b`), a cell of nothing but
