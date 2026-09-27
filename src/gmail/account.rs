@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::gmail::auth::{GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN};
 use crate::utils::env::EnvSource;
+use crate::utils::secret_env::secret_var_is_set;
 use crate::utils::settings::GmailSettings;
 
 /// Selects the active Gmail account for every command, mirroring
@@ -120,7 +121,7 @@ pub fn resolve_account_for_write<E: EnvSource>(
 fn has_literal_credentials<E: EnvSource>(raw: &E) -> bool {
     raw.var(GMAIL_CLIENT_ID).is_some()
         && raw.var(GMAIL_CLIENT_SECRET).is_some()
-        && raw.var(GMAIL_REFRESH_TOKEN).is_some()
+        && secret_var_is_set(raw, GMAIL_REFRESH_TOKEN)
 }
 
 /// Validates that `name` is a known Gmail account.

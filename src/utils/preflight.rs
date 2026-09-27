@@ -7,6 +7,7 @@
 use anyhow::{bail, Context, Result};
 
 use crate::claude::model_config::get_model_registry;
+use crate::utils::secret_env::{secret_var, secret_var_any};
 
 /// Result of AI credential validation.
 #[derive(Debug)]
@@ -144,15 +145,14 @@ pub(crate) fn check_ai_credentials_with(
 
         AiBackend::OpenAi => {
             // Verify API key exists
-            env.var_any(&["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"])
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "OpenAI API key not found.\n\
-                 Set one of these environment variables:\n\
+            secret_var_any(env, &["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"])?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OpenAI API key not found.\n\
+                 Set one of these environment variables (or its _FILE companion):\n\
                  - OPENAI_API_KEY\n\
                  - OPENAI_AUTH_TOKEN"
-                    )
-                })?;
+                )
+            })?;
 
             Ok(AiCredentialInfo {
                 provider: AiProvider::OpenAi,
@@ -162,10 +162,10 @@ pub(crate) fn check_ai_credentials_with(
 
         AiBackend::Bedrock => {
             // Verify Bedrock configuration
-            env.var("ANTHROPIC_AUTH_TOKEN").ok_or_else(|| {
+            secret_var(env, "ANTHROPIC_AUTH_TOKEN")?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "AWS Bedrock authentication not configured.\n\
-                 Set ANTHROPIC_AUTH_TOKEN environment variable."
+                 Set ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_AUTH_TOKEN_FILE)."
                 )
             })?;
 
@@ -184,15 +184,18 @@ pub(crate) fn check_ai_credentials_with(
 
         AiBackend::Default => {
             // Verify API key exists
-            env.var_any(&[
-                "CLAUDE_API_KEY",
-                "ANTHROPIC_API_KEY",
-                "ANTHROPIC_AUTH_TOKEN",
-            ])
+            secret_var_any(
+                env,
+                &[
+                    "CLAUDE_API_KEY",
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                ],
+            )?
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Claude API key not found.\n\
-                 Set one of these environment variables:\n\
+                 Set one of these environment variables (or its _FILE companion):\n\
                  - CLAUDE_API_KEY\n\
                  - ANTHROPIC_API_KEY\n\
                  - ANTHROPIC_AUTH_TOKEN"
@@ -405,6 +408,27 @@ mod tests {
         let info = check_ai_credentials_with(&env, None).unwrap();
         assert_eq!(info.provider, AiProvider::OpenAi);
         assert_eq!(info.model, "gpt-5-mini");
+    }
+
+    #[test]
+    fn claude_key_can_come_from_a_file() {
+        let (_dir, path) = crate::test_support::env::secret_file("sk-from-file\n");
+        let env = MapEnv::new().with("ANTHROPIC_API_KEY_FILE", &path);
+        assert!(check_ai_credentials_with(&env, None).is_ok());
+    }
+
+    #[test]
+    fn a_bad_key_file_fails_preflight_naming_the_variable() {
+        let env = MapEnv::new().with("ANTHROPIC_API_KEY_FILE", "relative/key");
+        let err = check_ai_credentials_with(&env, None).unwrap_err();
+        assert!(err.to_string().contains("ANTHROPIC_API_KEY_FILE"), "{err}");
+
+        let env = MapEnv::new()
+            .with("OPENAI_API_KEY", "a")
+            .with("OPENAI_API_KEY_FILE", "/x")
+            .with("USE_OPENAI", "true");
+        let err = check_ai_credentials_with(&env, None).unwrap_err();
+        assert!(err.to_string().contains("both OPENAI_API_KEY"), "{err}");
     }
 
     #[test]

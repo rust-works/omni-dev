@@ -18,6 +18,7 @@ use base64::Engine;
 use rand::Rng;
 
 use crate::utils::env::{EnvSource, SystemEnv};
+use crate::utils::secret_env::{file_var_name, secret_var};
 
 /// Environment variable an operator may use to pin the session token instead of
 /// letting the bridge generate one. Never read from argv (`ps`/`/proc` expose
@@ -60,7 +61,9 @@ pub fn generate_token() -> String {
 ///
 /// 1. `--token-file` — read its trimmed contents. On Unix the file must be
 ///    `0600` (owner-only) or resolution fails closed.
-/// 2. `OMNI_BRIDGE_TOKEN` — read from the environment.
+/// 2. `OMNI_BRIDGE_TOKEN`, or the file its `OMNI_BRIDGE_TOKEN_FILE` companion
+///    names (ADR-0089) — setting both is an error, as is a token file holding
+///    only whitespace.
 /// 3. Otherwise a fresh token is generated.
 ///
 /// The token is **never** accepted from argv.
@@ -77,10 +80,16 @@ pub(crate) fn resolve_token_with(
     if let Some(path) = token_file {
         return read_token_file(path);
     }
-    if let Some(value) = env.var(TOKEN_ENV) {
-        let trimmed = value.trim();
+    if let Some(value) = secret_var(env, TOKEN_ENV)? {
+        let trimmed = value.expose_secret().trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
+        }
+        // A blank variable is ignored below, but a file the operator pointed
+        // at must not silently fall back to a random token.
+        let file_var = file_var_name(TOKEN_ENV);
+        if env.var(&file_var).is_some_and(|v| !v.is_empty()) {
+            bail!("The token file named by {file_var} holds only whitespace");
         }
     }
     Ok(generate_token())
@@ -104,11 +113,13 @@ pub(crate) fn resolve_existing_token_with(
     if let Some(path) = token_file {
         return read_token_file(path);
     }
-    match env.var(TOKEN_ENV) {
-        Some(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+    match secret_var(env, TOKEN_ENV)? {
+        Some(value) if !value.expose_secret().trim().is_empty() => {
+            Ok(value.expose_secret().trim().to_string())
+        }
         _ => bail!(
-            "No session token found. Set {TOKEN_ENV} or pass --token-file with the token the \
-             running bridge printed."
+            "No session token found. Set {TOKEN_ENV} (or {TOKEN_ENV}_FILE) or pass --token-file \
+             with the token the running bridge printed."
         ),
     }
 }
@@ -660,6 +671,25 @@ mod tests {
     fn resolve_token_reads_trimmed_env_var() {
         let env = MapEnv::new().with(TOKEN_ENV, "  env-token  ");
         assert_eq!(resolve_token_with(&env, None).unwrap(), "env-token");
+    }
+
+    #[test]
+    fn token_can_come_from_the_file_companion() {
+        let (_dir, path) = crate::test_support::env::secret_file("file-token\n");
+        let env = MapEnv::new().with("OMNI_BRIDGE_TOKEN_FILE", &path);
+        assert_eq!(resolve_token_with(&env, None).unwrap(), "file-token");
+        assert_eq!(
+            resolve_existing_token_with(&env, None).unwrap(),
+            "file-token"
+        );
+        // A whitespace-only file is an error, not a silently generated token.
+        let (_dir2, blank) = crate::test_support::env::secret_file("   \n");
+        let blank_env = MapEnv::new().with("OMNI_BRIDGE_TOKEN_FILE", &blank);
+        let err = resolve_token_with(&blank_env, None).unwrap_err();
+        assert!(err.to_string().contains("whitespace"), "{err}");
+        // Both set is an error, never a silent pick.
+        let env = env.with(TOKEN_ENV, "env-token");
+        assert!(resolve_token_with(&env, None).is_err());
     }
 
     #[test]

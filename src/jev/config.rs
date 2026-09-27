@@ -11,6 +11,7 @@ use crate::jev::error::JevError;
 use crate::jev::protocol::DEFAULT_MODEL;
 use crate::utils::env::{non_empty_var, EnvSource};
 use crate::utils::secret::Secret;
+use crate::utils::secret_env::secret_var_any;
 
 /// Vendor-primary environment variable / settings key for the Jev API key,
 /// matching TypeSafe's own SDK (mirrors `DATADOG_API_KEY`'s precedent of an
@@ -69,9 +70,7 @@ impl JevConfig {
     /// Tests pass a pure `MapEnv` to exercise precedence without mutating
     /// the process environment (STYLE-0028).
     pub(crate) fn from_env_with(env: &impl EnvSource) -> Result<Self> {
-        let api_key = [TYPESAFE_API_KEY, OMNI_DEV_JEV_API_KEY]
-            .into_iter()
-            .find_map(|key| non_empty_var(env, key))
+        let api_key = secret_var_any(env, &[TYPESAFE_API_KEY, OMNI_DEV_JEV_API_KEY])?
             .ok_or(JevError::CredentialsNotFound)?;
 
         let base_url = non_empty_var(env, OMNI_DEV_JEV_BASE_URL)
@@ -82,7 +81,7 @@ impl JevConfig {
         let model = non_empty_var(env, TYPESAFE_MODEL).unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
         Ok(Self {
-            api_key: api_key.into(),
+            api_key,
             base_url,
             model,
         })
@@ -178,5 +177,13 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("sekret-value"));
         assert!(debug.contains("api_key: <redacted>"));
+    }
+
+    #[test]
+    fn api_key_can_come_from_a_file() {
+        let (_dir, path) = crate::test_support::env::secret_file("from-file\n");
+        let env = MapEnv::new().with("OMNI_DEV_JEV_API_KEY_FILE", &path);
+        let config = JevConfig::from_env_with(&env).unwrap();
+        assert_eq!(config.api_key.expose_secret(), "from-file");
     }
 }

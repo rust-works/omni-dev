@@ -13,6 +13,7 @@ use crate::drive::auth::{self, DriveGrantedScopes};
 use crate::drive::client::DriveClient;
 use crate::utils::env::EnvSource;
 use crate::utils::secret::Secret;
+use crate::utils::secret_env::secret_var;
 use crate::utils::settings::{Settings, SettingsEnv};
 use crate::utils::terminal::RawModeGuard;
 
@@ -119,8 +120,8 @@ fn resolve_login_credentials(
         Some(v) => v,
         None => prompt_client_id()?,
     };
-    let client_secret = match env.var(auth::DRIVE_CLIENT_SECRET) {
-        Some(v) => Secret::new(v),
+    let client_secret = match secret_var(env, auth::DRIVE_CLIENT_SECRET)? {
+        Some(v) => v,
         None => prompt_client_secret()?,
     };
     Ok((client_id, client_secret))

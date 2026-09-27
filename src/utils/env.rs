@@ -30,6 +30,18 @@ pub trait EnvSource {
     fn var_any(&self, keys: &[&str]) -> Option<String> {
         keys.iter().find_map(|k| self.var(k))
     }
+
+    /// Returns `key` and `file_key` **from the same layer**, for the secret
+    /// resolver's `NAME`/`NAME_FILE` pairs
+    /// ([`crate::utils::secret_env`]).
+    ///
+    /// A single-layer source returns both lookups. A layered source
+    /// (settings.json's [`SettingsEnv`](crate::utils::settings::SettingsEnv))
+    /// overrides this to return the pair from the highest-precedence layer
+    /// that sets either, so a conflict is only ever detected within one layer.
+    fn var_pair(&self, key: &str, file_key: &str) -> (Option<String>, Option<String>) {
+        (self.var(key), self.var(file_key))
+    }
 }
 
 /// The real process environment, backed by [`std::env::var`].
@@ -50,6 +62,10 @@ impl EnvSource for SystemEnv {
 impl<T: EnvSource + ?Sized> EnvSource for &T {
     fn var(&self, key: &str) -> Option<String> {
         (**self).var(key)
+    }
+
+    fn var_pair(&self, key: &str, file_key: &str) -> (Option<String>, Option<String>) {
+        (**self).var_pair(key, file_key)
     }
 }
 

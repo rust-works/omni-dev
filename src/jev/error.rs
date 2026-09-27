@@ -23,8 +23,8 @@ pub fn is_auth_failure(err: &anyhow::Error) -> bool {
 pub enum JevError {
     /// No Jev API key was found in the environment or `settings.json`.
     #[error(
-        "Jev credentials not configured. Set TYPESAFE_API_KEY (or OMNI_DEV_JEV_API_KEY), \
-         or add one to ~/.omni-dev/settings.json"
+        "Jev credentials not configured. Set TYPESAFE_API_KEY (or OMNI_DEV_JEV_API_KEY, or \
+         either's _FILE companion), or add one to ~/.omni-dev/settings.json"
     )]
     CredentialsNotFound,
 

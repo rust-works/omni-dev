@@ -217,6 +217,23 @@ pub(crate) mod env {
             self.0.get(key).cloned()
         }
     }
+
+    /// Writes `contents` to an owner-only (`0600`) file in a fresh temp dir,
+    /// for tests of a secret's `<NAME>_FILE` companion (issue #2006). Returns
+    /// the dir (keep it alive) and the file's absolute path.
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn secret_file(contents: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        std::fs::write(&path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let path = path.to_str().unwrap().to_string();
+        (dir, path)
+    }
 }
 
 pub(crate) mod atlassian_env {
