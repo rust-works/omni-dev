@@ -227,8 +227,8 @@ pub enum NamedRangeResult {
     RefusedAmbiguousName {
         /// The name that was searched for.
         name: String,
-        /// The matching ids, for cross-referencing with
-        /// `list-named-ranges` (neither verb can target a range by id).
+        /// The matching ids — pass one of these to `--id` (issue #1975) to
+        /// act on a specific range instead of retrying by name.
         candidates: Vec<String>,
     },
     /// `update-named-range --new-name` matches another, different named
@@ -1037,8 +1037,9 @@ pub fn describe_lines(outcome: &NamedRangeOutcome) -> Vec<String> {
         )],
         NamedRangeResult::RefusedAmbiguousName { name, candidates } => vec![format!(
             "Refused: more than one named range in {book} is named '{name}' (ids: {}); \
-             this is ambiguous and nothing was changed. Rename or delete all but one \
-             in the Sheets UI (Data > Named ranges), then retry",
+             this is ambiguous and nothing was changed. Retry with `--id` naming one \
+             of those ids, or rename/delete all but one in the Sheets UI \
+             (Data > Named ranges)",
             candidates.join(", ")
         )],
         NamedRangeResult::RefusedDuplicateName {
