@@ -1807,7 +1807,9 @@ several changed occurrences.
 array of arrays) when the path ends in `.json` or `--values-format json` is
 given. Ragged rows are preserved rather than padded — padding would write
 empty strings over cells you never mentioned. The first CSV row is **data,
-not a header**.
+not a header**. Blank lines are rows too: each input line maps to exactly
+one sheet row, written as a single empty cell, so a blank line in the
+middle of pasted data doesn't shift every later row up by one.
 
 **`--input` is the one option whose wrong value silently mangles data:**
 
