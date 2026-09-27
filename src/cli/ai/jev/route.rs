@@ -153,6 +153,7 @@ impl RouteCommand {
         let client = JevClient::from_config(&config)?;
         let opts = self.route_options(config.model);
 
+        // omni-dev: coverage ignore reason="RouteCommand::execute is the process-bound wiring shell; fetch_docs, run_route_with_reference_fetch_failures, render_output_with_style and terminal_style_with provide its deterministic seams"
         let bin = crate::pr_status::resolve_gh_binary();
         let cwd = self
             .repo
@@ -187,7 +188,6 @@ impl RouteCommand {
             &reference_fetch_failures,
         )
         .await?;
-        // omni-dev: coverage ignore reason="RouteCommand::execute is the process-bound wiring shell; render_output_with_style and terminal_style_with provide its deterministic seams"
         print!(
             "{}",
             render_output_with_style(
@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn route_rejects_ignore_closed_with_allow_closed() {
         let Err(err) = parse(&["#1", "--ignore-closed", "--allow-closed"]) else {
-            panic!("expected a conflict");
+            panic!("expected a conflict"); // omni-dev: coverage ignore-line reason="guards this test's assumption; the parse above always fails on --ignore-closed with --allow-closed"
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
