@@ -3293,8 +3293,19 @@ and log record.
 mutually exclusive, one of them required. There is no `--style`/`--width`
 flag — the API's `EmbeddedObjectBorder` models neither, unlike a cell's
 `Border`. Clearing sends an empty border (`{}`) with the same
-`"colorStyle"` mask a set does; this has not been verified against a live
-account.
+`"colorStyle"` mask a set does.
+
+**Confirmed live (issue #1929)**: a chart that never had its border touched
+reads back with no `border` field at all, but `--clear` does *not* return a
+chart to that state — it reads back with `border` present and an
+all-omitted `rgbColor` (proto3 dropping every zero channel). Sending an
+explicit `--color 000000` (pure black) reads back **byte-for-byte
+identical**: `{"colorStyle": {"rgbColor": {}}}` either way, with no second
+field to tell them apart. `list-charts`/`update-chart-border`'s preview
+report that shape as `#000000 (or cleared — indistinguishable on read)`
+rather than asserting either as fact. Whether the Sheets UI actually paints
+a visible black border after `--clear` was not checked — this crate has no
+way to inspect the rendered UI, only the wire shape.
 
 #### drive sheets add-banding / update-banding / delete-banding / list-bandings
 
