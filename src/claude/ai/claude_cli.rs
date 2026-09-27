@@ -41,6 +41,7 @@ use super::{
 };
 use crate::claude::error::ClaudeError;
 use crate::request_log;
+use crate::utils::secret_env;
 use crate::utils::settings::EnvValueSource;
 
 /// Default subprocess timeout.
@@ -142,14 +143,35 @@ fn parse_keep_env(value: Option<&str>) -> Vec<String> {
 }
 
 /// Returns whether `key` is a secret env var the tool-enabled scrub must
-/// remove: it matches [`SECRET_ENV_SUFFIXES`] or [`SECRET_ENV_EXACT`] and
-/// is neither in the built-in [`SECRET_ENV_KEEP`] allowlist nor in the
-/// user-supplied `keep` list.
+/// remove, unless the user-supplied `keep` list names it:
+///
+/// - a `<NAME>_FILE` companion (ADR-0089) of any secret `NAME` — even one in
+///   [`SECRET_ENV_KEEP`], since the nested `claude` never reads omni-dev's
+///   `_FILE` convention and the path only points it at the secret;
+/// - otherwise, a name matching [`SECRET_ENV_SUFFIXES`] or
+///   [`SECRET_ENV_EXACT`] that is not in [`SECRET_ENV_KEEP`].
 fn is_scrubbed_secret(key: &str, keep: &[String]) -> bool {
-    if SECRET_ENV_KEEP.contains(&key) || keep.iter().any(|k| k == key) {
+    if keep.iter().any(|k| k == key) {
         return false;
     }
-    SECRET_ENV_EXACT.contains(&key) || SECRET_ENV_SUFFIXES.iter().any(|s| key.ends_with(s))
+    if let Some(base) = key.strip_suffix(secret_env::FILE_SUFFIX) {
+        if is_secret_name(base) {
+            return true;
+        }
+    }
+    !SECRET_ENV_KEEP.contains(&key) && is_secret_name(key)
+}
+
+/// Whether `key` is a secret: listed in [`SECRET_ENV_EXACT`], matching
+/// [`SECRET_ENV_SUFFIXES`], or one of omni-dev's own registered secrets
+/// ([`secret_env::SECRET_ENV_VARS`] — which catches names like
+/// `DATADOG_APP_KEY` / `SNOWFLAKE_PRIVATE_KEY` the suffixes miss) or its
+/// legacy key-file alias.
+fn is_secret_name(key: &str) -> bool {
+    SECRET_ENV_EXACT.contains(&key)
+        || SECRET_ENV_SUFFIXES.iter().any(|s| key.ends_with(s))
+        || secret_env::SECRET_ENV_VARS.contains(&key)
+        || key == "SNOWFLAKE_PRIVATE_KEY_PATH"
 }
 
 /// Subset of the `claude -p --output-format json` envelope we care about.
@@ -1330,6 +1352,10 @@ mod tests {
             "GOOGLE_APPLICATION_CREDENTIALS",
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
+            // Registered omni-dev secrets the suffix list misses.
+            "DATADOG_APP_KEY",
+            "SNOWFLAKE_PRIVATE_KEY",
+            "SNOWFLAKE_PRIVATE_KEY_PATH",
         ] {
             assert!(is_scrubbed_secret(key, &[]), "{key} should match");
         }
@@ -1340,6 +1366,29 @@ mod tests {
         for key in ["PATH", "HOME", "EDITOR", "TOKENIZER", "API_KEYRING"] {
             assert!(!is_scrubbed_secret(key, &[]), "{key} should not match");
         }
+    }
+
+    #[test]
+    fn is_scrubbed_secret_removes_file_companions_of_secrets() {
+        for key in [
+            "DATADOG_API_KEY_FILE",
+            "GH_TOKEN_FILE",
+            "AWS_SECRET_ACCESS_KEY_FILE",
+            // The nested claude never reads our `_FILE` convention, so even a
+            // kept name's companion goes.
+            "ANTHROPIC_API_KEY_FILE",
+            "ANTHROPIC_AUTH_TOKEN_FILE",
+        ] {
+            assert!(is_scrubbed_secret(key, &[]), "{key} should match");
+        }
+        for key in ["CONFIG_FILE", "HISTFILE", "TOKENIZER_FILE"] {
+            assert!(!is_scrubbed_secret(key, &[]), "{key} should not match");
+        }
+        // An explicit keep still wins.
+        assert!(!is_scrubbed_secret(
+            "ANTHROPIC_API_KEY_FILE",
+            &["ANTHROPIC_API_KEY_FILE".to_string()]
+        ));
     }
 
     #[test]
