@@ -32,7 +32,9 @@ use crate::utils::browser_command::split_browser_command;
 use crate::utils::env::SystemEnv;
 use crate::utils::secret::Secret;
 use crate::utils::secret_env::{secret_var, secret_var_is_set};
-use crate::utils::settings::{active_profile_from, DriveAccountSettings, DriveSettings, Settings};
+use crate::utils::settings::{
+    account_secret, active_profile_from, DriveAccountSettings, DriveSettings, Settings,
+};
 
 /// Environment variable / settings key for the user's Google Cloud OAuth2
 /// client id.
@@ -400,8 +402,8 @@ pub(crate) fn load_credentials_for(explicit: Option<&str>) -> Result<DriveCreden
 }
 
 /// Reads `drive.accounts.<name>` into [`DriveCredentials`], wrapping
-/// `client_secret`/`refresh_token` into [`Secret`] immediately, mirroring
-/// [`load_credentials_with`].
+/// `client_secret`/`refresh_token` (or their `_file` companions, #2008)
+/// into [`Secret`] immediately, mirroring [`load_credentials_with`].
 fn load_named_credentials(drive: &DriveSettings, name: &str) -> Result<DriveCredentials> {
     let account = drive
         .accounts
@@ -411,14 +413,22 @@ fn load_named_credentials(drive: &DriveSettings, name: &str) -> Result<DriveCred
         .client_id
         .clone()
         .ok_or(DriveError::CredentialsNotFound)?;
-    let client_secret = account
-        .client_secret
-        .clone()
-        .ok_or(DriveError::CredentialsNotFound)?;
-    let refresh_token = account
-        .refresh_token
-        .clone()
-        .ok_or(DriveError::CredentialsNotFound)?;
+    let client_secret = account_secret(
+        "drive",
+        name,
+        "client_secret",
+        account.client_secret.as_deref(),
+        account.client_secret_file.as_deref(),
+    )?
+    .ok_or(DriveError::CredentialsNotFound)?;
+    let refresh_token = account_secret(
+        "drive",
+        name,
+        "refresh_token",
+        account.refresh_token.as_deref(),
+        account.refresh_token_file.as_deref(),
+    )?
+    .ok_or(DriveError::CredentialsNotFound)?;
     let scope = account
         .scope
         .as_deref()
@@ -427,8 +437,8 @@ fn load_named_credentials(drive: &DriveSettings, name: &str) -> Result<DriveCred
 
     Ok(DriveCredentials {
         client_id,
-        client_secret: client_secret.into(),
-        refresh_token: refresh_token.into(),
+        client_secret,
+        refresh_token,
         scope,
     })
 }
@@ -521,8 +531,18 @@ fn status_from_named(drive: &DriveSettings, name: &str) -> DriveAuthStatus {
     let account = drive.accounts.get(name);
     DriveAuthStatus {
         has_client_id: account.is_some_and(|a| a.client_id.is_some()),
-        has_client_secret: account.is_some_and(|a| a.client_secret.is_some()),
-        has_refresh_token: account.is_some_and(|a| a.refresh_token.is_some()),
+        has_client_secret: account.is_some_and(|a| {
+            crate::utils::settings::account_secret_is_set(
+                a.client_secret.as_deref(),
+                a.client_secret_file.as_deref(),
+            )
+        }),
+        has_refresh_token: account.is_some_and(|a| {
+            crate::utils::settings::account_secret_is_set(
+                a.refresh_token.as_deref(),
+                a.refresh_token_file.as_deref(),
+            )
+        }),
         scope: account.and_then(|a| a.scope.clone()),
     }
 }
@@ -3040,6 +3060,90 @@ mod tests {
     // These exercise the production `*_for` wrappers, so — like
     // `save_and_remove_credentials_resolve_default_settings_path` above —
     // they must redirect `HOME` via `EnvGuard`.
+
+    // ── named-account `_file` secrets (#2008) ────────────────────────────
+
+    /// Writes `contents` to `name` under `dir`, owner-only, and returns its
+    /// absolute path as a settings value.
+    fn owner_only_file(dir: &tempfile::TempDir, name: &str, contents: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path.to_str().unwrap().to_string()
+    }
+
+    fn named_settings(account: DriveAccountSettings) -> DriveSettings {
+        DriveSettings {
+            accounts: std::iter::once(("work".to_string(), account)).collect(),
+            ..DriveSettings::default()
+        }
+    }
+
+    #[test]
+    fn load_named_credentials_reads_secrets_from_their_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = DriveAccountSettings {
+            client_id: Some("id".to_string()),
+            client_secret_file: Some(owner_only_file(&dir, "cs", "cs-from-file\n")),
+            refresh_token_file: Some(owner_only_file(&dir, "rt", "rt-from-file\n")),
+            ..DriveAccountSettings::default()
+        };
+        let creds = load_named_credentials(&named_settings(account), "work").unwrap();
+        assert_eq!(creds.client_secret.expose_secret(), "cs-from-file");
+        assert_eq!(creds.refresh_token.expose_secret(), "rt-from-file");
+    }
+
+    #[test]
+    fn load_named_credentials_rejects_a_field_and_its_file_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = DriveAccountSettings {
+            client_id: Some("id".to_string()),
+            client_secret: Some("cs".to_string()),
+            refresh_token: Some("rt".to_string()),
+            refresh_token_file: Some(owner_only_file(&dir, "rt", "rt\n")),
+            ..DriveAccountSettings::default()
+        };
+        let err = load_named_credentials(&named_settings(account), "work").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "both drive.accounts.work.refresh_token and drive.accounts.work.refresh_token_file \
+             are set; set only one of them"
+        );
+    }
+
+    #[test]
+    fn load_named_credentials_rejects_a_relative_secret_file() {
+        let account = DriveAccountSettings {
+            client_id: Some("id".to_string()),
+            client_secret_file: Some("secrets/cs".to_string()),
+            refresh_token: Some("rt".to_string()),
+            ..DriveAccountSettings::default()
+        };
+        let err = load_named_credentials(&named_settings(account), "work").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("drive.accounts.work.client_secret_file must be an absolute path"),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn status_from_named_counts_a_secret_file_as_present() {
+        let account = DriveAccountSettings {
+            client_id: Some("id".to_string()),
+            client_secret_file: Some("/never/read".to_string()),
+            refresh_token_file: Some("/never/read".to_string()),
+            ..DriveAccountSettings::default()
+        };
+        let status = status_from_named(&named_settings(account), "work");
+        assert!(status.has_client_secret);
+        assert!(status.has_refresh_token);
+    }
 
     #[test]
     fn load_credentials_for_named_reads_from_drive_accounts() {
