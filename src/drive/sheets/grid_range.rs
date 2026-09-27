@@ -136,6 +136,45 @@ pub(crate) fn width_warning(
     }
 }
 
+/// Renders a physical-row-reorder's warning/summary/reference-caveat lines
+/// — the width warning first, when there is one, then the summary, then an
+/// optional operation-specific caveat, then the out-of-range-references line
+/// (ADR-0083 §6). `verb` is the same gerund [`width_warning`] takes
+/// (`"sorting"`, `"randomizing"`) and only appears in the reference-caveat
+/// line's *not-yet-changed* tense (`"... after {verb}"`); `order_caveat`,
+/// when present, is inserted between the summary and that line
+/// (`randomize-range`'s the-order-can't-be-known caveat has no analog for a
+/// deterministic sort).
+///
+/// Shared by `sort_range.rs`, `randomize_range.rs`, and `filter.rs`'s
+/// `set-basic-filter --sort-by` caveat (issue #1996) — the same "one tested
+/// implementation, not a per-file convention" reasoning [`width_warning`]'s
+/// doc comment gives.
+pub(crate) fn reorder_caveat_lines(
+    verb: &str,
+    summary: String,
+    width_warning: Option<&str>,
+    changed: bool,
+    order_caveat: Option<&str>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(warning) = width_warning {
+        lines.push(format!("Warning: {warning}"));
+    }
+    lines.push(summary);
+    if let Some(caveat) = order_caveat {
+        lines.push(format!("  {caveat}"));
+    }
+    lines.push(if changed {
+        "  references outside the range may now observe values from a different row".to_string()
+    } else {
+        format!(
+            "  references outside the range may observe values from a different row after {verb}"
+        )
+    });
+    lines
+}
+
 /// The default number of A1 addresses [`truncate_locations`] renders
 /// before eliding the rest.
 pub(crate) const RENDERED_LOCATION_LIMIT: usize = 50;
@@ -881,5 +920,79 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(render_grid_range(&range), "sheetId 0, rows 1-5");
+    }
+
+    #[test]
+    fn reorder_caveat_lines_would_change_has_no_warning_and_names_the_verb() {
+        let lines =
+            reorder_caveat_lines("sorting", "Would sort A1:B2".to_string(), None, false, None);
+        assert_eq!(
+            lines,
+            vec![
+                "Would sort A1:B2".to_string(),
+                "  references outside the range may observe values from a different row after sorting"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reorder_caveat_lines_changed_drops_the_verb_and_switches_to_now() {
+        let lines = reorder_caveat_lines(
+            "randomizing",
+            "Randomized A1:B2".to_string(),
+            None,
+            true,
+            None,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Randomized A1:B2".to_string(),
+                "  references outside the range may now observe values from a different row"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reorder_caveat_lines_prepends_the_width_warning_when_present() {
+        let lines = reorder_caveat_lines(
+            "sorting",
+            "Applied sort of A1:B2".to_string(),
+            Some("selected columns 0..2 of the sheet's 5 allocated columns"),
+            true,
+            None,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Warning: selected columns 0..2 of the sheet's 5 allocated columns".to_string(),
+                "Applied sort of A1:B2".to_string(),
+                "  references outside the range may now observe values from a different row"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reorder_caveat_lines_inserts_the_order_caveat_between_summary_and_reference_line() {
+        let lines = reorder_caveat_lines(
+            "randomizing",
+            "Would randomize the row order of A1:B2".to_string(),
+            None,
+            false,
+            Some("the resulting order is chosen by the server and cannot be previewed"),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Would randomize the row order of A1:B2".to_string(),
+                "  the resulting order is chosen by the server and cannot be previewed"
+                    .to_string(),
+                "  references outside the range may observe values from a different row after randomizing"
+                    .to_string(),
+            ]
+        );
     }
 }
