@@ -4528,10 +4528,18 @@ mod tests {
 
     #[test]
     fn color_defaults_the_channels_it_wasnt_given() {
+        // Struct-level comparison, not a direct float `==`, so this doesn't
+        // trip clippy's `float_cmp` — see `Color`'s own doc comment on why
+        // it has no meaningful `Eq`.
         let parsed: Color = serde_json::from_value(serde_json::json!({"red": 1.0})).unwrap();
-        assert_eq!(parsed.red, 1.0);
-        assert_eq!(parsed.green, 0.0);
-        assert_eq!(parsed.blue, 0.0);
+        assert_eq!(
+            parsed,
+            Color {
+                red: 1.0,
+                green: 0.0,
+                blue: 0.0,
+            }
+        );
     }
 
     #[test]
