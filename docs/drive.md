@@ -627,8 +627,8 @@ operation anywhere in a target's ancestor chain:
 | `create`            | deny    | `create`, `sheets create` |
 | `upload`            | deny    | `upload` |
 | `edit`              | deny    | `edit` — raw file content only |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets sort-range`, `sheets trim-whitespace` — cell values; `sheets text-to-columns` (also needs `sheets-structure`); `sheets randomize-range` (also needs `sheets-structure`); `sheets set-basic-filter --sort-by` (also needs `sheets-structure`); `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
-| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter` (with `--sort-by`, also needs `sheets-write`), `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `text-to-columns` (also needs `sheets-write`), `randomize-range` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets trim-whitespace` — cell values; `sheets text-to-columns` (also needs `sheets-structure`); `sheets sort-range` (also needs `sheets-structure`); `sheets randomize-range` (also needs `sheets-structure`); `sheets set-basic-filter --sort-by` (also needs `sheets-structure`); `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
+| `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter` (with `--sort-by`, also needs `sheets-write`), `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `text-to-columns` (also needs `sheets-write`), `sort-range` (also needs `sheets-write`), `randomize-range` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`, `delete-duplicates` |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
 | `docs-write`        | deny    | `docs replace`, `docs append` |
@@ -1777,11 +1777,24 @@ the output, not `$?`.
 
 #### `drive sheets sort-range`
 
-Reorders rows in a fully bounded range by one or more column keys. It is
-gated by **`sheets-write`** (issue #1842, [ADR-0083](adrs/adr-0083.md) §3):
-the request only permutes the named range's cells, which is strictly less
-than clearing or replacing that same range under an existing `sheets-write`
-grant.
+Reorders rows in a fully bounded range by one or more column keys. Gated
+under **both `sheets-write` and `sheets-structure`** (issue #1842, #1870,
+[ADR-0083](adrs/adr-0083.md) §§3, 5).
+
+ADR-0083 §3 proposed `sheets-write` alone — the request only permutes the
+named range's cells, which is strictly less than clearing or replacing that
+same range under an existing `sheets-write` grant — and §5 made that
+provisional on live verification, same as `randomize-range`. The live run
+(2026-09-22) settled it the other way: sorting a probe range whose rows
+carried formatting, notes and a data-validation rule moved all three with
+each row, and a relative formula inside the range moved with its row with
+its reference rewritten to match (`=B3*2` becomes `=B2*2` when its row
+moves up one). Formatting, notes and validation rules are
+`sheets-structure`'s own subject matter, so the union is the honest gate.
+`sort-range` shipped first (#1842) on `sheets-write` alone, before this was
+measured. Neither half opens it alone, and a refusal names the half that
+was missing. Cells in the same rows but outside the selected columns do not
+move.
 
 ```bash
 # Sort first by column 0 ascending, then column 2 descending.
