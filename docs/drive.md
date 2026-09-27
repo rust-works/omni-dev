@@ -2006,12 +2006,15 @@ row/column count is clipped, not grown or refused** — the opposite of
 `copy-paste`/`cut-paste`/`paste-data` (below), which do grow the grid.
 `--dry-run` and the real run both report the *applied* (clipped)
 destination as the headline range, plus the unclipped destination that was
-requested when the two differ:
+requested when the two differ. The `extending N row(s)/column(s)` count in
+that same head line is the applied span too (`994`, not the `--fill-length
+1000` that was asked for) — the unclipped length is named only in the
+caveat line's requested range, not as a second count:
 
 ```
 $ omni-dev drive sheets auto-fill <ID> --sheet AF --source G5:G6 \
     --dimension rows --fill-length 1000 --dry-run
-Would auto-fill 'AF'!G7:G1000 from source 'AF'!G5:G6, extending 1000 row(s) down in 'Budget'
+Would auto-fill 'AF'!G7:G1000 from source 'AF'!G5:G6, extending 994 row(s) down in 'Budget'
   no non-blank cells in the destination
   the destination runs past the sheet's current extent; auto-fill clips to it, so only 'AF'!G7:G1000 would be filled — 'AF'!G7:G1006 was requested
   the filled values are computed by Sheets' own series detection and are never reported, before or after the request

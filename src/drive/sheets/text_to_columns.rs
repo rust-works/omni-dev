@@ -746,11 +746,12 @@ fn spill_span(source: GridRange, width: usize) -> Option<GridRange> {
 
 /// Whether `extent` runs past `workbook`'s currently allocated rows or
 /// columns on `extent`'s sheet — `paste.rs`'s own
-/// `sheet_exceeds_dimensions`/`auto_fill.rs`'s own `extends_past_grid`,
-/// this module's own copy since each is reached from a different
-/// construction pass. `None` on either axis (the API reported no grid
-/// dimensions) never counts as exceeding — there's nothing to compare
-/// against.
+/// `sheet_exceeds_dimensions`, this module's own copy since each is
+/// reached from a different construction pass. `auto_fill.rs` no longer
+/// has an equivalent: since #1937 it clips to the grid via
+/// `clamp_to_grid` instead of asking whether a destination exceeds it.
+/// `None` on either axis (the API reported no grid dimensions) never
+/// counts as exceeding — there's nothing to compare against.
 fn extends_past_grid(workbook: &Spreadsheet, extent: &GridRange) -> bool {
     let Some(sheet) = grid_range::find_sheet_by_id(workbook, extent.sheet_id) else {
         return false;

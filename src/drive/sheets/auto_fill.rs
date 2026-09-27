@@ -594,6 +594,7 @@ async fn auto_fill_inner(
         &opts.form,
         &source_a1,
         &destination_a1,
+        applied_fill_length(&opts.form, &source_grid, &applied_destination),
         opts.use_alternate_series,
     );
 
@@ -814,9 +815,60 @@ fn past_grid_extent_caveat(applied: &str, requested: &str) -> String {
     )
 }
 
+/// The signed fill length actually applied, form B only — same sign as
+/// the requested `--fill-length`, but its magnitude shrinks to match
+/// `applied_destination` when clipping happened (verified live, #1937:
+/// the *destination* is clipped, so the head line's "extending N row(s)"
+/// count must be clipped too, or it overstates how many cells were
+/// touched — the triage plan's "applied count in the head" decision).
+/// `0` for form A, whose head line never reads this value.
+///
+/// Sound because `clamp_to_grid` only ever shrinks a range's *end*: a
+/// forward fill's destination starts at the source's far edge, so only
+/// its end can be clipped; a backward fill's destination *ends* at the
+/// source's near edge, so it is never clipped and this always returns
+/// exactly `fill_length`.
+fn applied_fill_length(
+    form: &AutoFillForm,
+    source_grid: &GridRange,
+    applied_destination: &GridRange,
+) -> i64 {
+    let AutoFillForm::SourceAndDestination {
+        dimension,
+        fill_length,
+        ..
+    } = form
+    else {
+        return 0;
+    };
+    let (source_start, source_end, applied_start, applied_end) = match dimension {
+        Dimension::Rows => (
+            source_grid.start_row_index,
+            source_grid.end_row_index,
+            applied_destination.start_row_index,
+            applied_destination.end_row_index,
+        ),
+        Dimension::Columns => (
+            source_grid.start_column_index,
+            source_grid.end_column_index,
+            applied_destination.start_column_index,
+            applied_destination.end_column_index,
+        ),
+    };
+    if *fill_length >= 0 {
+        applied_end.unwrap_or(0) - source_end.unwrap_or(0)
+    } else {
+        applied_start.unwrap_or(0) - source_start.unwrap_or(0)
+    }
+}
+
 /// The **tense-neutral** head of the summary: the destination, the source
 /// it extends and the direction (form B), or the server-decided-split
 /// note (form A), plus the alternate-series flag.
+///
+/// `applied_fill_length` (form B only, see its own docs) is what names
+/// the count and the direction — never the form's raw `--fill-length`,
+/// which would overstate a clipped fill.
 ///
 /// Deliberately carries neither the overwrite count nor either caveat.
 /// Both of those vary with tense, and this string is reused verbatim by
@@ -829,6 +881,7 @@ fn describe_effect(
     form: &AutoFillForm,
     source_a1: &str,
     destination_a1: &str,
+    applied_fill_length: i64,
     use_alternate_series: bool,
 ) -> String {
     let mut summary = match form {
@@ -836,12 +889,8 @@ fn describe_effect(
             "auto-fill within {destination_a1} (Sheets decides which cells are the source and \
              which are filled)"
         ),
-        AutoFillForm::SourceAndDestination {
-            dimension,
-            fill_length,
-            ..
-        } => {
-            let direction = match (dimension, *fill_length >= 0) {
+        AutoFillForm::SourceAndDestination { dimension, .. } => {
+            let direction = match (dimension, applied_fill_length >= 0) {
                 (Dimension::Rows, true) => "down",
                 (Dimension::Rows, false) => "up",
                 (Dimension::Columns, true) => "right",
@@ -850,7 +899,7 @@ fn describe_effect(
             format!(
                 "auto-fill {destination_a1} from source {source_a1}, extending {} {}(s) \
                  {direction}",
-                fill_length.abs(),
+                applied_fill_length.abs(),
                 dimension.noun(),
             )
         }
@@ -1369,19 +1418,19 @@ mod tests {
             fill_length,
         };
         assert!(
-            describe_effect(&form(Dimension::Rows, 3), "A1:A3", "A4:A6", false)
+            describe_effect(&form(Dimension::Rows, 3), "A1:A3", "A4:A6", 3, false)
                 .contains("3 row(s) down")
         );
         assert!(
-            describe_effect(&form(Dimension::Rows, -3), "A4:A6", "A1:A3", false)
+            describe_effect(&form(Dimension::Rows, -3), "A4:A6", "A1:A3", -3, false)
                 .contains("3 row(s) up")
         );
         assert!(
-            describe_effect(&form(Dimension::Columns, 2), "A1:A1", "B1:C1", false)
+            describe_effect(&form(Dimension::Columns, 2), "A1:A1", "B1:C1", 2, false)
                 .contains("2 column(s) right")
         );
         assert!(
-            describe_effect(&form(Dimension::Columns, -2), "C1:C1", "A1:B1", false)
+            describe_effect(&form(Dimension::Columns, -2), "C1:C1", "A1:B1", -2, false)
                 .contains("2 column(s) left")
         );
     }
@@ -1396,8 +1445,27 @@ mod tests {
         };
         // The request log's `range` key is the destination, so without
         // this the record could not say what was extended.
-        let summary = describe_effect(&form, "'Q1'!A1:A3", "'Q1'!A4:A10", false);
+        let summary = describe_effect(&form, "'Q1'!A1:A3", "'Q1'!A4:A10", 7, false);
         assert!(summary.contains("from source 'Q1'!A1:A3"), "{summary}");
+    }
+
+    /// The triage plan's decision: the head line names the *applied*
+    /// (clipped) count, never the raw `--fill-length` — a destination
+    /// clipped to fit the grid must not have the head line claim more
+    /// rows/columns were touched than actually were.
+    #[test]
+    fn describe_effect_uses_the_applied_fill_length_not_the_requested_one() {
+        let form = AutoFillForm::SourceAndDestination {
+            sheet: None,
+            source: None,
+            dimension: Dimension::Rows,
+            fill_length: 1000,
+        };
+        let summary = describe_effect(&form, "'Q1'!A1:A3", "'Q1'!A4:A1000", 997, false);
+        assert!(summary.contains("997 row(s) down"), "{summary}");
+        // "1000" legitimately appears in the destination A1 address
+        // (A4:A1000); the count itself must not be 1000.
+        assert!(!summary.contains("1000 row(s)"), "{summary}");
     }
 
     #[test]
@@ -1406,7 +1474,7 @@ mod tests {
             sheet: None,
             range: None,
         };
-        let summary = describe_effect(&form, "A1:A10", "A1:A10", false);
+        let summary = describe_effect(&form, "A1:A10", "A1:A10", 0, false);
         assert!(summary.contains("Sheets decides"), "{summary}");
     }
 
@@ -1418,7 +1486,7 @@ mod tests {
             dimension: Dimension::Rows,
             fill_length: 1,
         };
-        let summary = describe_effect(&form, "A1:A1", "A2:A2", true);
+        let summary = describe_effect(&form, "A1:A1", "A2:A2", 1, true);
         assert!(summary.contains("alternate series"), "{summary}");
     }
 
@@ -1433,10 +1501,47 @@ mod tests {
             dimension: Dimension::Rows,
             fill_length: 1,
         };
-        let summary = describe_effect(&form, "A1:A1", "A2:A2", true);
+        let summary = describe_effect(&form, "A1:A1", "A2:A2", 1, true);
         for conditional in ["would", "cannot", "may "] {
             assert!(!summary.contains(conditional), "{summary}");
         }
+    }
+
+    #[test]
+    fn applied_fill_length_shrinks_to_the_clipped_destination_forward() {
+        let form = AutoFillForm::SourceAndDestination {
+            sheet: None,
+            source: None,
+            dimension: Dimension::Rows,
+            fill_length: 1000,
+        };
+        let source = bounded(0, 0, 3, 0, 1); // A1:A3
+        let applied = bounded(0, 3, 1000, 0, 1); // clipped to A4:A1000
+        assert_eq!(applied_fill_length(&form, &source, &applied), 997);
+    }
+
+    #[test]
+    fn applied_fill_length_is_unaffected_by_a_backward_fill() {
+        let form = AutoFillForm::SourceAndDestination {
+            sheet: None,
+            source: None,
+            dimension: Dimension::Rows,
+            fill_length: -3,
+        };
+        let source = bounded(0, 5, 8, 0, 1); // A6:A8
+        let applied = bounded(0, 2, 5, 0, 1); // A3:A5 — clamp_to_grid never
+                                              // touches a range's start.
+        assert_eq!(applied_fill_length(&form, &source, &applied), -3);
+    }
+
+    #[test]
+    fn applied_fill_length_is_zero_for_the_range_form() {
+        let form = AutoFillForm::Range {
+            sheet: None,
+            range: None,
+        };
+        let grid = bounded(0, 0, 1, 0, 1);
+        assert_eq!(applied_fill_length(&form, &grid, &grid), 0);
     }
 
     #[test]
@@ -2321,9 +2426,74 @@ mod tests {
         assert_eq!(requested_destination.as_deref(), Some("'Q1'!A4:A1003"));
         assert_eq!(overwritten_cells, &vec!["A4".to_string()]);
         let lines = describe_lines(&outcome);
+        // The head line's count is the *applied* span (1000 - 3 = 997),
+        // never the raw --fill-length (1000) — the triage plan's decision,
+        // and the bug this test guards against: a clipped destination
+        // must not have its head line claim more rows were touched than
+        // actually were.
+        assert_eq!(
+            lines[0],
+            "Would auto-fill 'Q1'!A4:A1000 from source 'Q1'!A1:A3, extending 997 row(s) down in \
+             'sheet-1'"
+        );
         assert_eq!(
             lines[2],
             past_grid_extent_caveat_dry_run("'Q1'!A4:A1000", "'Q1'!A4:A1003")
+        );
+    }
+
+    /// The real-run (past-tense) counterpart of the head-line assertion
+    /// above: `Changed`'s head line also names the applied count, not the
+    /// requested one.
+    #[tokio::test]
+    async fn a_clipped_real_run_reports_the_applied_count_in_the_head_line() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A4:A1000",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1", "replies": [{}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = AutoFillOptions {
+            lease_token,
+            ledger_path,
+            ..base_opts(source_and_destination_form(Dimension::Rows, 1000), false)
+        };
+        let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(outcome.result, AutoFillResult::Changed { .. }));
+        let lines = describe_lines(&outcome);
+        assert_eq!(
+            lines[0],
+            "Applied: auto-fill 'Q1'!A4:A1000 from source 'Q1'!A1:A3, extending 997 row(s) \
+             down in 'sheet-1'"
+        );
+        assert_eq!(
+            lines[2],
+            past_grid_extent_caveat("'Q1'!A4:A1000", "'Q1'!A4:A1003")
         );
     }
 
