@@ -1789,9 +1789,28 @@ pub struct FilterView {
     /// A human-readable name for the view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// The filtered range.
+    /// The filtered range. Sheets reports the resolved range even for a
+    /// view bound to a table (see [`Self::table_id`]), but rejects an
+    /// `addFilterView` that sets both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<GridRange>,
+    /// The named range the view is bound to, when it is. Never set by an
+    /// `add-filter-view` this crate builds. Live testing found Sheets
+    /// accepts it on `addFilterView` but does not report it back (only the
+    /// resolved `range`), so it is modelled for completeness: read back,
+    /// it is carried over wherever [`Self::table_id`] is (issue #1931).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "namedRangeId"
+    )]
+    pub named_range_id: Option<String>,
+    /// The table the view is bound to, when it is. Never set by an
+    /// `add-filter-view` this crate builds; read back so that
+    /// `update-filter-view`'s re-creation re-binds the view to its table
+    /// instead of pinning it to the table's current range (issue #1931).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "tableId")]
+    pub table_id: Option<String>,
     /// Sort order applied on top of the filter, in priority order.
     #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "sortSpecs")]
     pub sort_specs: Vec<SortSpec>,

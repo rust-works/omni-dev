@@ -59,7 +59,7 @@ const SPREADSHEET_FIELDS_WITH_PROTECTIONS: &str = "spreadsheetId,properties.titl
 const SPREADSHEET_FIELDS_WITH_FILTER_VIEWS: &str = "spreadsheetId,properties.title,\
     sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)),\
     sheets.basicFilter(range,sortSpecs,criteria),\
-    sheets.filterViews(filterViewId,title,range,sortSpecs,criteria)";
+    sheets.filterViews(filterViewId,title,range,namedRangeId,tableId,sortSpecs,criteria)";
 
 /// `fields` mask for `spreadsheets.get` when conditional format rules are
 /// needed too (issue #1793's `add-conditional-format`/
