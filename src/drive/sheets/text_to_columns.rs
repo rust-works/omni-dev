@@ -886,7 +886,7 @@ fn overwritten_line(
     Some(format!(
         "  up to {} non-blank cell(s) {tense}: {}",
         overwritten_cells.len(),
-        overwritten_cells.join(", ")
+        grid_range::render_locations(overwritten_cells)
     ))
 }
 
@@ -1403,6 +1403,18 @@ mod tests {
             overwritten_line(&[], &Delimiter::Comma, false),
             Some("  no non-blank cells in the spill columns".to_string())
         );
+    }
+
+    #[test]
+    fn overwritten_line_elides_past_the_render_limit_but_keeps_the_true_count() {
+        let cells: Vec<String> = (1..=60).map(|row| format!("A{row}")).collect();
+        let line = overwritten_line(&cells, &Delimiter::Comma, true).unwrap();
+        assert!(line.contains("… and 10 more"), "{line}");
+        assert!(
+            line.starts_with("  up to 60 non-blank cell(s) would be overwritten:"),
+            "{line}"
+        );
+        assert_eq!(cells.len(), 60);
     }
 
     /// An `auto` run with nothing to list says nothing, rather than
