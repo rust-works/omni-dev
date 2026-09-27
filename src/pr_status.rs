@@ -567,7 +567,8 @@ pub(crate) fn run_gh_graphql(bin: &Path, query: &str) -> Result<Value> {
 
 /// Like [`run_gh_graphql`], but returns a partial GraphQL response when `gh`
 /// exits nonzero with both `data` and `errors`. The caller must inspect every
-/// error before using that data; `fetch_items` permits only per-item `NOT_FOUND`.
+/// error before using that data; `fetch_items` permits only a `NOT_FOUND` on an
+/// item or repository it aliased.
 pub(crate) fn run_gh_graphql_with_partial_data(bin: &Path, query: &str) -> Result<Value> {
     run_gh_graphql_inner(bin, query, true)
 }

@@ -485,7 +485,10 @@ usage: {input_tokens: 1432, output_tokens: 61}
   suppression threshold: every open citation gets a score, unfiltered.
 - **`reference_fetch_failures`** lists citations GitHub could not fetch, so a
   stale or mistyped reference is visible rather than being indistinguishable
-  from no citation. Each entry preserves the citation's original `ref` and
+  from no citation. That includes a citation into a repository that doesn't
+  exist or that `gh` can't see, such as an `owner/repo#123` quoted in an error
+  message ([#2001](https://github.com/rust-works/omni-dev/issues/2001)): it no
+  longer aborts the run. Each entry preserves the citation's original `ref` and
   reports its `error`; it is not included in `depends_on` because its state is
   unknown. It remains visible if the Jev request fails; the field is omitted
   when every cited reference resolved.
