@@ -39,6 +39,11 @@ csv = "1.3"
 termcolor = "1.1"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
+# The embedded IANA zone database, so `sheets update-workbook-properties
+# --time-zone` can refuse an unknown zone locally: the Sheets API accepts one
+# with a 200 and silently resets the workbook to `Etc/GMT` (issue #1938).
+# Compile-time data, no system-zoneinfo I/O.
+chrono-tz = "0.10"
 tempfile = "3.27"
 # Cross-platform file-identity comparison (inode on unix, a file handle on
 # Windows) for request_log.rs's audit-file collision guard (issue #1694) —

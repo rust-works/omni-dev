@@ -1292,6 +1292,20 @@ fn validate_verb_args(
                     ));
                 }
             }
+            // Checked locally because the API will not: an unrecognised zone
+            // is accepted with a 200 and the workbook is silently reset to
+            // `Etc/GMT`, discarding its previous zone (issue #1938). An
+            // unknown `--locale`, by contrast, is a 400 from the API.
+            if let Some(tz) = time_zone {
+                if tz.parse::<chrono_tz::Tz>().is_err() {
+                    return invalid(format!(
+                        "--time-zone '{tz}' is not a recognised IANA time zone name \
+                         (for example 'America/New_York' or 'Europe/London'); the \
+                         Sheets API would silently reset the workbook to 'Etc/GMT' \
+                         instead of rejecting it"
+                    ));
+                }
+            }
             if locale.is_none()
                 && time_zone.is_none()
                 && auto_recalc.is_none()
@@ -7354,6 +7368,45 @@ mod tests {
         );
     }
 
+    fn update_time_zone(time_zone: &str) -> StructureVerb {
+        StructureVerb::UpdateWorkbookProperties {
+            locale: None,
+            time_zone: Some(time_zone.to_string()),
+            auto_recalc: None,
+            iterative_calculation: None,
+            iterative_calculation_max_iterations: None,
+            iterative_calculation_convergence_threshold: None,
+        }
+    }
+
+    #[test]
+    fn validate_verb_args_refuses_an_unrecognised_time_zone() {
+        // The API accepts this with a 200 and resets the workbook to
+        // `Etc/GMT` (issue #1938), so the refusal has to be local.
+        let workbook = Spreadsheet::default();
+        let err =
+            validate_verb_args(&workbook, &update_time_zone("Bogus/Zone9"), None).unwrap_err();
+        assert!(
+            matches!(&err, StructureResult::RefusedInvalidRange { detail }
+                if detail.contains("'Bogus/Zone9'")
+                    && detail.contains("IANA")
+                    && detail.contains("America/New_York")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_verb_args_accepts_recognised_iana_time_zones() {
+        let workbook = Spreadsheet::default();
+        for tz in ["Europe/London", "America/New_York", "Etc/GMT", "UTC"] {
+            assert_eq!(
+                validate_verb_args(&workbook, &update_time_zone(tz), None),
+                Ok(()),
+                "{tz}"
+            );
+        }
+    }
+
     #[test]
     fn validate_verb_args_refuses_iterative_calculation_settings_without_the_toggle() {
         let verb = StructureVerb::UpdateWorkbookProperties {
@@ -7577,6 +7630,42 @@ mod tests {
         assert!(!requests
             .iter()
             .any(|r| r.url.path().ends_with(":batchUpdate")));
+    }
+
+    #[tokio::test]
+    async fn update_workbook_properties_refuses_an_unrecognised_time_zone_on_dry_run_and_apply() {
+        // Issue #1938: a dry run used to report "would change" for a zone the
+        // API silently replaces with `Etc/GMT`. Both paths now refuse it.
+        for dry_run in [true, false] {
+            let server = wiremock::MockServer::start().await;
+            let (drive, sheets) = clients(&server).await;
+            mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+                .mount(&server)
+                .await;
+            mount_folder("parent-1").mount(&server).await;
+            mount_workbook().mount(&server).await;
+
+            let outcome = structure(
+                &drive,
+                &sheets,
+                &opts(update_time_zone("Bogus/Zone9"), dry_run),
+                &[allow_rule("parent-1")],
+            )
+            .await;
+            assert!(
+                matches!(&outcome.result, StructureResult::RefusedInvalidRange { detail }
+                    if detail.contains("'Bogus/Zone9'")),
+                "dry_run={dry_run}: {:?}",
+                outcome.result
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert!(
+                !requests
+                    .iter()
+                    .any(|r| r.url.path().ends_with(":batchUpdate")),
+                "dry_run={dry_run}"
+            );
+        }
     }
 
     #[tokio::test]
