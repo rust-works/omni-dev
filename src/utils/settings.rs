@@ -1093,7 +1093,7 @@ fn upsert_account(
                     refuse_client_change(&label, stored_client_id.as_deref(), vars)?;
                 }
                 secret_writes.push((write, secret));
-            }
+            } // omni-dev: coverage ignore-line reason="this closing brace reports 0 hits under llvm-cov regardless of test count — verified locally: upsert_account_writes_a_secret_into_its_file_not_settings and several other tests complete the block above (the push on the line just before, and entry.remove(*key) right after, both measure as hit), yet this specific brace, immediately after an if-let whose scrutinee ends in a `?` operator, never registers a hit; an llvm-cov region-attribution artifact, not an untested path"
             entry.remove(*key);
         } else {
             entry.insert((*key).to_string(), value.clone());

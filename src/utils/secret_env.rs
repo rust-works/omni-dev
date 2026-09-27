@@ -1441,6 +1441,36 @@ mod tests {
         assert!(!dir.path().join("fresh").exists());
     }
 
+    /// A `symlink_metadata` failure other than "not found" (here, a path
+    /// walking through a regular file as if it were a directory) is
+    /// reported as [`SecretEnvError::Unwritable`] rather than treated as
+    /// "the file doesn't exist yet".
+    #[test]
+    fn plan_secret_file_write_reports_a_non_not_found_stat_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let path = not_a_dir.join("secret");
+        let err =
+            plan_secret_file_write("k_file", &path, &Secret::new("v".to_string())).unwrap_err();
+        assert!(matches!(err, SecretEnvError::Unwritable { .. }), "{err}");
+    }
+
+    /// A [`SecretFileWrite::write`] I/O failure (here, a parent directory
+    /// with no write permission, so the temp file can't be created) is
+    /// reported as [`SecretEnvError::Unwritable`] rather than partially
+    /// applied.
+    #[test]
+    fn write_secret_file_reports_an_io_error_from_an_unwritable_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        set_mode(dir.path(), 0o500);
+        let err = write_secret_file("k_file", &path, &Secret::new("v".to_string())).unwrap_err();
+        set_mode(dir.path(), 0o700);
+        assert!(matches!(err, SecretEnvError::Unwritable { .. }), "{err}");
+        assert!(!path.exists());
+    }
+
     /// Self-check: the guards see the real read sites (so an empty scan
     /// can't pass vacuously).
     #[test]
