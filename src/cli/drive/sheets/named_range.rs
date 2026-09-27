@@ -81,16 +81,26 @@ impl AddNamedRangeCommand {
 }
 
 /// Changes an existing named range's name and/or the range it covers. The
-/// target is resolved by a case-insensitive exact name match — see
-/// `drive sheets list-named-ranges` to find it.
+/// target is resolved by `--name` (case-insensitive exact match) or `--id`
+/// — exactly one is required — see `drive sheets list-named-ranges` to find
+/// either. `--id` is the escape hatch when `--name` matches more than one
+/// named range (issue #1975): the ambiguity refusal lists the candidate
+/// ids.
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("target").args(["name", "id"]).required(true)))]
 pub struct UpdateNamedRangeCommand {
     /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
     pub spreadsheet_id: String,
 
     /// The existing name to change, by case-insensitive exact match.
+    /// Mutually exclusive with `--id`.
     #[arg(long, value_name = "NAME")]
-    pub name: String,
+    pub name: Option<String>,
+
+    /// The existing named range's id, by exact match. Mutually exclusive
+    /// with `--name`. Find it with `drive sheets list-named-ranges`.
+    #[arg(long, value_name = "ID")]
+    pub id: Option<String>,
 
     /// The new name, when renaming.
     #[arg(long, value_name = "NAME")]
@@ -133,6 +143,7 @@ impl UpdateNamedRangeCommand {
             spreadsheet_id: self.spreadsheet_id,
             verb: NamedRangeVerb::UpdateNamedRange {
                 name: self.name,
+                id: self.id,
                 new_name: self.new_name,
                 sheet: self.sheet,
                 range: self.range,
@@ -146,8 +157,11 @@ impl UpdateNamedRangeCommand {
     }
 }
 
-/// Removes a named range. The target is resolved by a case-insensitive
-/// exact name match — see `drive sheets list-named-ranges` to find it.
+/// Removes a named range. The target is resolved by `--name`
+/// (case-insensitive exact match) or `--id` — exactly one is required —
+/// see `drive sheets list-named-ranges` to find either. `--id` is the
+/// escape hatch when `--name` matches more than one named range (issue
+/// #1975): the ambiguity refusal lists the candidate ids.
 ///
 /// Every cell formula referencing the removed name starts evaluating to
 /// `#NAME?` (conditional formatting, data validation and chart references
@@ -155,13 +169,20 @@ impl UpdateNamedRangeCommand {
 /// reports the count and A1 locations of every such cell formula — read it
 /// before running for real.
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("target").args(["name", "id"]).required(true)))]
 pub struct DeleteNamedRangeCommand {
     /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
     pub spreadsheet_id: String,
 
     /// The existing name to remove, by case-insensitive exact match.
+    /// Mutually exclusive with `--id`.
     #[arg(long, value_name = "NAME")]
-    pub name: String,
+    pub name: Option<String>,
+
+    /// The existing named range's id, by exact match. Mutually exclusive
+    /// with `--name`. Find it with `drive sheets list-named-ranges`.
+    #[arg(long, value_name = "ID")]
+    pub id: Option<String>,
 
     /// Reports the gate verdict and the referencing-formula preview,
     /// without calling `spreadsheets.batchUpdate`.
@@ -181,7 +202,10 @@ impl DeleteNamedRangeCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         let opts = NamedRangeOptions {
             spreadsheet_id: self.spreadsheet_id,
-            verb: NamedRangeVerb::DeleteNamedRange { name: self.name },
+            verb: NamedRangeVerb::DeleteNamedRange {
+                name: self.name,
+                id: self.id,
+            },
             dry_run: self.dry_run,
             lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
@@ -433,7 +457,36 @@ mod tests {
 
         let cmd = UpdateNamedRangeCommand {
             spreadsheet_id: "sheet-1".to_string(),
-            name: "Foo".to_string(),
+            name: Some("Foo".to_string()),
+            id: None,
+            new_name: Some("Bar".to_string()),
+            range: None,
+            sheet: None,
+            whole_sheet: false,
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    /// The `--id` selector's own end-to-end pass — mirrors
+    /// `update_named_range_command_runs_end_to_end` but selects by id
+    /// instead of by name (issue #1975).
+    #[tokio::test]
+    async fn update_named_range_command_by_id_runs_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let cmd = UpdateNamedRangeCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            name: None,
+            id: Some("id-1".to_string()),
             new_name: Some("Bar".to_string()),
             range: None,
             sheet: None,
@@ -457,11 +510,77 @@ mod tests {
 
         let cmd = DeleteNamedRangeCommand {
             spreadsheet_id: "sheet-1".to_string(),
-            name: "Foo".to_string(),
+            name: Some("Foo".to_string()),
+            id: None,
             dry_run: true,
             lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
             output: crate::cli::drive::format::OutputFormat::Yaml,
         };
         assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    /// The `--id` selector's own end-to-end pass — mirrors
+    /// `delete_named_range_command_runs_end_to_end` but selects by id
+    /// instead of by name (issue #1975).
+    #[tokio::test]
+    async fn delete_named_range_command_by_id_runs_end_to_end() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        mount_ungated_target(&server).await;
+
+        let cmd = DeleteNamedRangeCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            name: None,
+            id: Some("id-1".to_string()),
+            dry_run: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: crate::cli::drive::format::OutputFormat::Yaml,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    /// clap's `ArgGroup` refuses `--name`/`--id` together and neither, for
+    /// both `update-named-range` and `delete-named-range` (issue #1975).
+    #[test]
+    fn update_and_delete_named_range_require_exactly_one_of_name_or_id() {
+        let err = UpdateNamedRangeCommand::try_parse_from(["update-named-range", "sheet-1"])
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let err = UpdateNamedRangeCommand::try_parse_from([
+            "update-named-range",
+            "sheet-1",
+            "--name",
+            "Foo",
+            "--id",
+            "id-1",
+            "--new-name",
+            "Bar",
+        ])
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let err = DeleteNamedRangeCommand::try_parse_from(["delete-named-range", "sheet-1"])
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let err = DeleteNamedRangeCommand::try_parse_from([
+            "delete-named-range",
+            "sheet-1",
+            "--name",
+            "Foo",
+            "--id",
+            "id-1",
+        ])
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

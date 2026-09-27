@@ -623,7 +623,8 @@ mod tests {
         assert!(dispatch(
             SheetsSubcommands::UpdateNamedRange(named_range::UpdateNamedRangeCommand {
                 spreadsheet_id: "sheet-1".to_string(),
-                name: "Foo".to_string(),
+                name: Some("Foo".to_string()),
+                id: None,
                 new_name: Some("Bar".to_string()),
                 range: None,
                 sheet: None,
@@ -640,7 +641,8 @@ mod tests {
         assert!(dispatch(
             SheetsSubcommands::DeleteNamedRange(named_range::DeleteNamedRangeCommand {
                 spreadsheet_id: "sheet-1".to_string(),
-                name: "Foo".to_string(),
+                name: Some("Foo".to_string()),
+                id: None,
                 dry_run: true,
                 lease: no_lease(),
                 output: crate::cli::drive::format::OutputFormat::Table,
