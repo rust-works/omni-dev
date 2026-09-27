@@ -3058,8 +3058,13 @@ merge, never a replacement, whatever the `fields` mask says:
   deletes the view and re-adds it **under the same id** with the full
   resulting state, in one atomic `batchUpdate`. The view's
   `--filter-view-id` does not change. `--dry-run` and the report say when
-  this re-creation happens. A view that reads back with no grid range
-  cannot be re-created that way, so the command refuses unless you pass
+  this re-creation happens. The re-creation rebuilds the view from the
+  snapshot read just before it, so a concurrent edit to the same view made
+  in between is lost. A view bound to a table is re-bound to that table
+  rather than pinned to its current range (Sheets rejects a view with both),
+  and passing `--sheet`/`--range` in that case is refused, since it would
+  unbind the view. A view that reads back with no grid range and no binding
+  cannot be re-created, so the command refuses unless you pass
   `--sheet`/`--range`.
 - **Criteria:** each column sent replaces that column's criteria, and a
   column not sent is left alone; an empty `criteria` changes nothing. So
