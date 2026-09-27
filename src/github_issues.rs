@@ -1121,6 +1121,22 @@ mod tests {
         assert_eq!(numbers, vec![1, 2]);
     }
 
+    #[test]
+    fn list_open_issue_numbers_errors_when_gh_is_missing() {
+        let err = list_open_issue_numbers(Path::new("/no/such/gh/xyzzy"), "rust-works/omni-dev")
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed to run"));
+    }
+
+    #[test]
+    fn list_open_issue_numbers_errors_on_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(dir.path(), "", 1);
+        let err =
+            retry_on_etxtbsy(|| list_open_issue_numbers(&bin, "rust-works/omni-dev")).unwrap_err();
+        assert!(err.to_string().contains("gh issue list failed"));
+    }
+
     // ── fetch_items (fake-gh shim) ────────────────────────────────────
 
     fn pr_ref(project: &str, number: u64) -> ItemRef {
