@@ -1893,9 +1893,7 @@ fn build_add_slicer(
     let filter_criteria = if hide_values.is_empty() {
         None
     } else {
-        Some(FilterCriteria {
-            hidden_values: hide_values.clone(),
-        })
+        Some(FilterCriteria::hiding(hide_values.clone()))
     };
 
     let summary = format!(
@@ -1965,9 +1963,7 @@ fn build_update_slicer(
         fields.push("filterCriteria");
         changed.push("clear criteria");
     } else if !hide_values.is_empty() {
-        spec.filter_criteria = Some(FilterCriteria {
-            hidden_values: hide_values.clone(),
-        });
+        spec.filter_criteria = Some(FilterCriteria::hiding(hide_values.clone()));
         fields.push("filterCriteria");
         changed.push("criteria");
     }
