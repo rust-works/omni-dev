@@ -2000,8 +2000,10 @@ pub struct InterpolationPoint {
     /// One of Sheets' `MIN`/`MAX`/`NUMBER`/`PERCENT`/`PERCENTILE`. A plain
     /// string, the same tolerate-unmodelled stance as
     /// [`BooleanCondition::condition_type`] — a rule read back with a type
-    /// this crate doesn't build still round-trips.
-    #[serde(rename = "type")]
+    /// this crate doesn't build still round-trips. Defaulted defensively
+    /// like that field — see the module doc on proto3 zero-value omission
+    /// (issue #1929).
+    #[serde(default, rename = "type")]
     pub point_type: String,
     /// The threshold value, untouched — Sheets parses it at evaluation
     /// time, the same trust-the-caller stance the rest of this module
@@ -2216,8 +2218,9 @@ pub struct ChartSpec {
 pub struct BasicChartSpec {
     /// `"COLUMN"`, `"BAR"`, `"LINE"`, `"AREA"`, `"SCATTER"` (this crate's
     /// supported set), or another wire value read back from an existing
-    /// chart this crate didn't create.
-    #[serde(rename = "chartType")]
+    /// chart this crate didn't create. Defaulted defensively — see the
+    /// module doc on proto3 zero-value omission (issue #1929).
+    #[serde(default, rename = "chartType")]
     pub chart_type: String,
     /// Where the legend is drawn, e.g. `"BOTTOM_LEGEND"`, `"NONE"`.
     #[serde(
@@ -2263,7 +2266,9 @@ pub struct BasicChartAxis {
     /// `"RIGHT_AXIS"`. `--horizontal-axis-title`/`--vertical-axis-title`
     /// map to `BOTTOM_AXIS`/`LEFT_AXIS` literally — the physical axis, not
     /// the domain/series role, since a BAR chart's domain axis is
-    /// `LEFT_AXIS`.
+    /// `LEFT_AXIS`. Defaulted defensively — see the module doc on proto3
+    /// zero-value omission (issue #1929).
+    #[serde(default)]
     pub position: String,
     /// The axis title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2739,8 +2744,10 @@ pub struct PivotValue {
     /// `MAX`/`MIN`/`MEDIAN`/`PRODUCT`/`STDEV`/`STDEVP`/`VAR`/`VARP`
     /// (`CUSTOM`, a value driven by a formula rather than a source column,
     /// is a documented cut). A plain string, the same tolerate-unmodelled
-    /// stance as [`InterpolationPoint::point_type`].
-    #[serde(rename = "summarizeFunction")]
+    /// stance as [`InterpolationPoint::point_type`]. Defaulted defensively
+    /// like that field — see the module doc on proto3 zero-value omission
+    /// (issue #1929).
+    #[serde(default, rename = "summarizeFunction")]
     pub summarize_function: String,
     /// An optional display name overriding the default
     /// (`"<function> of <column>"`).
@@ -4588,6 +4595,27 @@ mod tests {
             serde_json::from_value(serde_json::json!({"type": "NUMBER"})).unwrap();
         assert_eq!(parsed.format_type, "NUMBER");
         assert_eq!(parsed.pattern, "");
+    }
+
+    #[test]
+    fn proto3_enum_wire_strings_default_to_empty_when_omitted() {
+        // A `String` field carrying an enum-shaped wire value is never
+        // actually empty on a real response, but proto3 still omits it
+        // whenever it happens to be an empty string, so these need the
+        // same defensive `#[serde(default)]` as every other scalar here
+        // (issue #1929's follow-up review finding).
+        let point: InterpolationPoint =
+            serde_json::from_value(serde_json::json!({"colorStyle": {"rgbColor": {}}})).unwrap();
+        assert_eq!(point.point_type, "");
+
+        let basic_chart: BasicChartSpec = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(basic_chart.chart_type, "");
+
+        let axis: BasicChartAxis = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(axis.position, "");
+
+        let pivot_value: PivotValue = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(pivot_value.summarize_function, "");
     }
 
     /// Strips proto3's default scalar values (`0`, `0.0`, `false`, `""`)
