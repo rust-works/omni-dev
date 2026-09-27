@@ -632,6 +632,8 @@ async fn filter_inner(
                             filter_view_id: None,
                             title: title.clone(),
                             range: Some(grid),
+                            named_range_id: None,
+                            table_id: None,
                             sort_specs,
                             criteria,
                         },
@@ -1008,12 +1010,36 @@ fn build_update(
     });
 
     if removes_sort_column {
-        let range = range.or(existing.range).ok_or_else(|| {
-            format!(
-                "removing a sort column re-creates filter view {filter_view_id}, but it has no \
-                 grid range to re-create it over; pass --sheet/--range"
-            )
-        })?;
+        // A view bound to a table or named range is re-bound, not pinned
+        // to its current range: Sheets rejects `addFilterView` with both a
+        // binding and a `range` (live-verified), and a binding follows its
+        // table/named range as it grows.
+        let binding = existing
+            .table_id
+            .as_ref()
+            .map(|id| format!("table {id}"))
+            .or_else(|| {
+                existing
+                    .named_range_id
+                    .as_ref()
+                    .map(|id| format!("named range {id}"))
+            });
+        let range = match (binding, range) {
+            (Some(binding), Some(_)) => {
+                return Err(format!(
+                    "removing a sort column re-creates filter view {filter_view_id}, which is \
+                     bound to {binding}; re-creating it with --sheet/--range would unbind it, so \
+                     drop --sheet/--range, or change the range in a separate update first"
+                ))
+            }
+            (Some(_), None) => None,
+            (None, range) => Some(range.or(existing.range).ok_or_else(|| {
+                format!(
+                    "removing a sort column re-creates filter view {filter_view_id}, but it has \
+                     no grid range to re-create it over; pass --sheet/--range"
+                )
+            })?),
+        };
         let mut criteria: BTreeMap<String, FilterCriteria> = if clear_criteria {
             BTreeMap::new()
         } else {
@@ -1028,7 +1054,9 @@ fn build_update(
         return Ok(FilterViewWrite::Replace(FilterView {
             filter_view_id: Some(filter_view_id),
             title: title.clone().or_else(|| existing.title.clone()),
-            range: Some(range),
+            range,
+            named_range_id: existing.named_range_id.clone(),
+            table_id: existing.table_id.clone(),
             sort_specs: sort_specs.unwrap_or_default(),
             criteria,
         }));
@@ -1516,6 +1544,8 @@ mod tests {
                 start_column_index: Some(0),
                 end_column_index: Some(4),
             }),
+            named_range_id: None,
+            table_id: None,
             sort_specs: vec![
                 spec(2, SortOrder::Descending),
                 spec(3, SortOrder::Descending),
@@ -1841,6 +1871,8 @@ mod tests {
                 filter_view_id: Some(3),
                 title: Some("Renamed".to_string()),
                 range: Some(range),
+                named_range_id: None,
+                table_id: None,
                 sort_specs: Vec::new(),
                 criteria,
             })
@@ -1885,6 +1917,104 @@ mod tests {
     }
 
     #[test]
+    fn build_update_recreation_rebinds_a_table_bound_view_without_its_range() {
+        // Sheets reports a table-bound view's resolved range too, but
+        // rejects an `addFilterView` carrying both ("Only one of tableId and
+        // range may be set") — live-verified — so only the binding goes.
+        let mut existing = sorted_filtered_view(3);
+        existing.table_id = Some("454645209".to_string());
+        let write = build_update(
+            &existing,
+            3,
+            &None,
+            None,
+            vec![spec(0, SortOrder::Ascending)],
+            BTreeMap::new(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            wire(write, 3),
+            serde_json::json!([
+                {"deleteFilterView": {"filterId": 3}},
+                {"addFilterView": {"filter": {
+                    "filterViewId": 3,
+                    "title": "Old",
+                    "tableId": "454645209",
+                    "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "ASCENDING"}],
+                    "criteria": {"1": {"hiddenValues": ["b"]}},
+                }}},
+            ])
+        );
+    }
+
+    #[test]
+    fn build_update_recreation_rebinds_a_named_range_bound_view_without_its_range() {
+        let mut existing = sorted_filtered_view(3);
+        existing.named_range_id = Some("2014020481".to_string());
+        let write = build_update(
+            &existing,
+            3,
+            &None,
+            None,
+            Vec::new(),
+            BTreeMap::new(),
+            true,
+            false,
+        )
+        .unwrap();
+        let FilterViewWrite::Replace(view) = write else {
+            panic!("expected a re-creation, got {write:?}");
+        };
+        assert_eq!(view.named_range_id.as_deref(), Some("2014020481"));
+        assert_eq!(view.table_id, None);
+        assert_eq!(view.range, None);
+    }
+
+    #[test]
+    fn build_update_recreation_of_a_bound_view_with_a_new_range_is_refused() {
+        let mut existing = sorted_filtered_view(3);
+        existing.table_id = Some("454645209".to_string());
+        let detail = build_update(
+            &existing,
+            3,
+            &None,
+            sorted_filtered_view(3).range,
+            Vec::new(),
+            BTreeMap::new(),
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(detail.contains("bound to table 454645209"), "{detail}");
+        assert!(detail.contains("would unbind it"), "{detail}");
+    }
+
+    #[test]
+    fn build_update_plain_update_of_a_bound_view_sends_no_binding() {
+        // Only the re-creation re-sends the binding; an in-place update
+        // leaves it alone.
+        let mut existing = sorted_filtered_view(3);
+        existing.table_id = Some("454645209".to_string());
+        let write = build_update(
+            &existing,
+            3,
+            &None,
+            None,
+            vec![spec(1, SortOrder::Ascending)],
+            BTreeMap::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let FilterViewWrite::Update(update) = write else {
+            panic!("expected an in-place update, got {write:?}");
+        };
+        assert_eq!(update.fields, "sortSpecs");
+    }
+
+    #[test]
     fn filter_criteria_keeps_unmodelled_fields_across_a_round_trip() {
         let json = serde_json::json!({
             "hiddenValues": ["a"],
@@ -1907,6 +2037,8 @@ mod tests {
                 filter_view_id: None,
                 title: Some("T".to_string()),
                 range: sorted_filtered_view(3).range,
+                named_range_id: None,
+                table_id: None,
                 sort_specs: vec![spec(2, SortOrder::Descending)],
                 criteria: hiding("1", &["b"]),
             },
@@ -3148,6 +3280,103 @@ mod tests {
                               "startColumnIndex": 0, "endColumnIndex": 4},
                     "sortSpecs": [{"dimensionIndex": 2, "sortOrder": "DESCENDING"}],
                     "criteria": {"0": {"hiddenValues": ["Old"]}},
+                }}},
+            ]})
+        );
+    }
+
+    /// Mounts the gate and a workbook whose view 7 is table-bound and
+    /// carries an unmodelled `condition` criterion, as a read-back would.
+    async fn run_clear_sort_on_bound_view_with_condition() -> (FilterOutcome, serde_json::Value) {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0},
+             "filterViews": [{
+                 "filterViewId": 7,
+                 "title": "Bound",
+                 "range": {"sheetId": 0, "startRowIndex": 10, "endRowIndex": 16,
+                           "startColumnIndex": 0, "endColumnIndex": 4},
+                 "tableId": "454645209",
+                 "sortSpecs": [{"dimensionIndex": 2, "sortOrder": "DESCENDING"}],
+                 "criteria": {
+                     "1": {"hiddenValues": ["b"]},
+                     "2": {"condition": {"type": "NUMBER_GREATER",
+                                         "values": [{"userEnteredValue": "2"}]}},
+                 },
+             }]},
+        ]))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{}, {"addFilterView": {"filter": {"filterViewId": 7}}}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: update_view_seven(&["0:asc"], &[], true, false),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        let body = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.url.path().ends_with(":batchUpdate"))
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .unwrap();
+        (outcome, body)
+    }
+
+    #[tokio::test]
+    async fn update_filter_view_recreation_carries_unmodelled_criteria_and_the_table_binding() {
+        let (outcome, body) = run_clear_sort_on_bound_view_with_condition().await;
+        assert!(
+            matches!(
+                outcome.result,
+                FilterResult::Changed {
+                    filter_view_id: Some(7),
+                    ..
+                }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(
+            body,
+            serde_json::json!({"requests": [
+                {"deleteFilterView": {"filterId": 7}},
+                {"addFilterView": {"filter": {
+                    "filterViewId": 7,
+                    "title": "Bound",
+                    "tableId": "454645209",
+                    "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "ASCENDING"}],
+                    "criteria": {
+                        "1": {"hiddenValues": ["b"]},
+                        "2": {"condition": {"type": "NUMBER_GREATER",
+                                            "values": [{"userEnteredValue": "2"}]}},
+                    },
                 }}},
             ]})
         );
