@@ -3185,7 +3185,13 @@ colors, or both; passing none of `--sheet`/`--range`/`--header-color`/
 nothing to change. A changed color merges onto the selected axis's
 *existing* colors — an unset color flag leaves that color untouched — so
 `update-banding --header-color '#000000'` alone does not clear the
-existing first/second band colors.
+existing first/second band colors. The exception is an `--axis` the
+banded range does not band yet (e.g. `--axis columns` on a range that
+bands only rows): there are no existing colors to merge onto, so the
+change adds that axis from scratch, and Sheets requires both band colors
+for it. Any color flag on such an axis therefore needs both
+`--first-band-color` and `--second-band-color`, and is refused locally —
+under `--dry-run` too — naming whichever is missing (issue #1935).
 
 #### drive sheets add-dimension-group / update-dimension-group / delete-dimension-group / list-dimension-groups
 
