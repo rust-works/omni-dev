@@ -558,7 +558,7 @@ async fn auto_fill_inner(
             });
         }
     } else {
-        destination
+        destination // omni-dev: coverage ignore-line reason="unreachable by construction: source_grid.sheet_id was itself resolved from this same workbook by resolve_grid_range above, so find_sheet_by_id always finds it"
     };
     let destination_a1 = grid_range_to_a1(&sheet_title, &applied_destination);
     // `None` in the common case (no clipping happened), so the JSON output
@@ -1836,6 +1836,47 @@ mod tests {
         assert!(describe(&blocked).contains("folder-1"));
     }
 
+    /// `RefusedDestinationPastGrid`'s message names whichever axis extent
+    /// the sheet actually reported — `describe_handles_missing_metadata_and_identifies_a_deciding_rule`
+    /// and the live-clip tests above only exercise the both-known and
+    /// both-unknown corners; this pins the two single-axis-known ones too.
+    #[test]
+    fn refused_destination_past_grid_message_names_only_the_known_axes() {
+        let base = AutoFillOutcome {
+            spreadsheet_id: "sheet-1".into(),
+            file_name: None,
+            resolved_folder_id: None,
+            sheet_id: None,
+            form: range_form(),
+            result: AutoFillResult::RefusedDestinationPastGrid {
+                requested_destination: "'Q1'!A2001:A2010".into(),
+                row_count: Some(1000),
+                column_count: None,
+            },
+        };
+        assert!(describe(&base).contains("(1000 rows)"));
+
+        let column_only = AutoFillOutcome {
+            result: AutoFillResult::RefusedDestinationPastGrid {
+                requested_destination: "'Q1'!AA1:AZ10".into(),
+                row_count: None,
+                column_count: Some(26),
+            },
+            ..base.clone()
+        };
+        assert!(describe(&column_only).contains("(26 columns)"));
+
+        let neither_known = AutoFillOutcome {
+            result: AutoFillResult::RefusedDestinationPastGrid {
+                requested_destination: "'Q1'!A2001:A2010".into(),
+                row_count: None,
+                column_count: None,
+            },
+            ..base
+        };
+        assert!(describe(&neither_known).contains("current grid;"));
+    }
+
     fn range_form() -> AutoFillForm {
         AutoFillForm::Range {
             sheet: Some("Q1".to_string()),
@@ -2537,7 +2578,7 @@ mod tests {
             ..
         } = &outcome.result
         else {
-            panic!("{:?}", outcome.result);
+            panic!("{:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; the mocked response above always leads to WouldChange"
         };
         assert_eq!(destination, "'Q1'!B1:Z3");
         assert!(requested_destination.is_some(), "{requested_destination:?}");
@@ -2585,7 +2626,7 @@ mod tests {
             ..
         } = &outcome.result
         else {
-            panic!("{:?}", outcome.result);
+            panic!("{:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; the mocked response above always leads to WouldChange"
         };
         assert_eq!(destination, "'Q1'!A990:A1000");
         assert_eq!(requested_destination.as_deref(), Some("'Q1'!A990:A1010"));
@@ -2623,7 +2664,7 @@ mod tests {
             ..
         } = &outcome.result
         else {
-            panic!("{:?}", outcome.result);
+            panic!("{:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; the mocked response above always leads to WouldChange"
         };
         assert!(requested_destination.is_none());
         let mut out = Vec::new();
@@ -2677,7 +2718,7 @@ mod tests {
             ..
         } = &outcome.result
         else {
-            panic!("{:?}", outcome.result);
+            panic!("{:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; the mocked response above always leads to WouldChange"
         };
         assert_eq!(destination, "'Q1'!A4:A1003");
         assert!(requested_destination.is_none());
