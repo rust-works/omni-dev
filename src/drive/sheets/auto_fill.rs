@@ -50,12 +50,30 @@
 //!
 //! ## The grid edge
 //!
-//! A destination that runs past the sheet's current `rowCount`/
-//! `columnCount` is **not refused client-side** — ADR-0083 §5: growth by
-//! writing past the grid's edge is what `sheets append` already does under
-//! `sheets-write`. It is surfaced as a caveat in the summary text instead,
-//! and the verb never prepends a `updateSheetProperties`/`appendDimension`
-//! request to grow the sheet first (ADR-0083 §5's smuggling rule).
+//! **Verified live (#1937): `autoFill` clips to the sheet's current
+//! `rowCount`/`columnCount` rather than growing it or erroring**, on both
+//! axes (rows were measured first; columns confirmed identically — a
+//! 5-column sheet stayed 5 columns after a fill requesting 10 more). This
+//! is the opposite of `copyPaste`/`cutPaste`/`pasteData` (see
+//! [`paste`](super::paste)'s module docs), which do grow the grid — so a
+//! destination past the extent is reported as **clipped**, not as a
+//! caveat naming an unknown outcome: [`AutoFillResult::WouldChange`]/
+//! [`AutoFillResult::Changed`] carry the *applied* (clipped) destination
+//! as `destination`, plus the unclipped one as `requested_destination`
+//! when the two differ, and the summary's caveat line names both. The
+//! request itself is never rewritten to match — `--fill-length` reaches
+//! the API exactly as given, since clipping is this crate's read of what
+//! the API will do with it, not a request this crate gets to make. A
+//! destination that lies **wholly** past the grid on some axis is
+//! refused before any lease is checked or `batchUpdate` is called
+//! ([`AutoFillResult::RefusedDestinationPastGrid`]), identically for
+//! `--dry-run` and a real run: nothing would be written, so reporting
+//! `Changed`/`WouldChange` would misstate what happened. An axis the
+//! sheet reports no `gridProperties` for is left alone (extent unknown ⇒
+//! don't act on it), matching the pre-#1937 stance for that case. The
+//! verb still never prepends a `updateSheetProperties`/`appendDimension`
+//! request to grow the sheet first (ADR-0083 §5's smuggling rule) — there
+//! is nothing to smuggle now that clipping is the verified answer.
 //!
 //! ## Shape
 //!
@@ -175,8 +193,18 @@ pub enum AutoFillResult {
         /// so this same string reads correctly under both `Would …` and
         /// `Applied: …`.
         summary: String,
-        /// The destination range's A1 address.
+        /// The destination range's A1 address, **as `autoFill` will
+        /// actually fill it** — clamped to the sheet's current extent
+        /// when the computed/named destination runs past it (verified
+        /// live, #1937: `autoFill` clips rather than growing the sheet).
+        /// This is what the request log's `range` records.
         destination: String,
+        /// The unclamped destination, when it differs from `destination`
+        /// — i.e. when clipping happened. `None` in the common case
+        /// (destination inside the grid, or the sheet's extent is
+        /// unknown), so the JSON output carries no new key then.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        requested_destination: Option<String>,
         /// The non-blank cells within the destination that would be
         /// overwritten, as bare A1 addresses — **never their values**,
         /// unlike `merge-cells`' own `discarded_cells` (ADR-0083 §6).
@@ -188,11 +216,6 @@ pub enum AutoFillResult {
         /// fill will actually touch. `false` for form B, where the
         /// destination — and so this list — is exact.
         destination_is_upper_bound: bool,
-        /// The destination runs past the sheet's current row/column count.
-        /// Never a refusal (ADR-0083 §5) — it only earns the summary's
-        /// grid-extent caveat line, which is why it is carried here rather
-        /// than baked into the tense-neutral [`Self::WouldChange`] summary.
-        past_grid_extent: bool,
     },
     /// The target is not a Google Sheet.
     RefusedNotASpreadsheet {
@@ -215,6 +238,20 @@ pub enum AutoFillResult {
     RefusedInvalidRange {
         /// What was wrong and why.
         detail: String,
+    },
+    /// The destination lies wholly past the sheet's current extent on some
+    /// axis — clipping (see the module docs' "The grid edge" section)
+    /// would leave nothing to fill, and reporting `Changed`/`WouldChange`
+    /// for a no-op would misstate what happened. Checked, and refused,
+    /// before any lease is checked or `batchUpdate` is called — identically
+    /// for `--dry-run` and a real run.
+    RefusedDestinationPastGrid {
+        /// The unclamped destination A1 address that was requested.
+        requested_destination: String,
+        /// The sheet's current row count, when known.
+        row_count: Option<i64>,
+        /// The sheet's current column count, when known.
+        column_count: Option<i64>,
     },
     /// The folder write-permission gate refused it.
     Blocked {
@@ -240,6 +277,9 @@ pub enum AutoFillResult {
         summary: String,
         /// Same as [`Self::WouldChange`].
         destination: String,
+        /// Same as [`Self::WouldChange`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        requested_destination: Option<String>,
         /// Same as [`Self::WouldChange`] — read *before* the mutating call
         /// (the same read serves both paths), so this names what was
         /// overwritten, not a post-hoc guess.
@@ -247,8 +287,6 @@ pub enum AutoFillResult {
         overwritten_cells: Vec<String>,
         /// Same as [`Self::WouldChange`].
         destination_is_upper_bound: bool,
-        /// Same as [`Self::WouldChange`].
-        past_grid_extent: bool,
     },
     /// An API or validation error.
     Failed {
@@ -284,6 +322,7 @@ impl AutoFillResult {
             Self::RefusedNoVisibleParents => "refused-no-visible-parents",
             Self::RefusedSheetNotFound { .. } => "refused-sheet-not-found",
             Self::RefusedInvalidRange { .. } => "refused-invalid-range",
+            Self::RefusedDestinationPastGrid { .. } => "refused-destination-past-grid",
             Self::Blocked { .. } => "blocked",
             Self::RefusedNoLease => LeaseGateRefusal::NoLease.log_status(),
             Self::RefusedLeaseExpired => LeaseGateRefusal::Expired.log_status(),
@@ -482,54 +521,71 @@ async fn auto_fill_inner(
             Err(detail) => return gated(AutoFillResult::RefusedInvalidRange { detail }),
         },
     };
-    let destination_a1 = grid_range_to_a1(&sheet_title, &destination);
+    let requested_destination_a1 = grid_range_to_a1(&sheet_title, &destination);
     // Form B's summary names the source it extends: the request log's
     // `range` key is the *destination*, so without this the record could
     // not say what was extended. Form A's source is the range itself, and
     // its summary says so instead.
     let source_a1 = grid_range_to_a1(&sheet_title, &source_grid);
 
+    // `autoFill` clips a destination that runs past the sheet's current
+    // extent rather than growing it or erroring (verified live, #1937) —
+    // see the module docs' "The grid edge" section. `applied_destination`
+    // is what the pre-read predicts the API will actually fill, and is
+    // what `destination`/the request log's `range` report from here on;
+    // the request itself (built later, from `source_grid`/`fill_length`)
+    // is never rewritten to match. An axis the sheet reports no
+    // `gridProperties` for is left alone — extent unknown ⇒ don't act on
+    // it, the pre-#1937 stance for that case.
     let sheet = grid_range::find_sheet_by_id(&workbook, source_grid.sheet_id);
-    let past_grid_extent = sheet.is_some_and(|sheet| extends_past_grid(sheet, &destination));
-    // The *read* is clamped to the grid; the request is not. A destination
-    // running past the sheet's extent is deliberately left to the server
-    // (ADR-0083 §5), but reading it back is this crate's own call — and a
-    // read that Sheets refuses would return `Failed` before `batchUpdate`
-    // was ever attempted, turning §5's "left to the server" into a
-    // client-side refusal in all but name. Clamping costs nothing, since a
-    // cell past the grid extent cannot hold a value and so can never
-    // appear in `overwritten_cells` anyway. `None` means the destination
-    // lies wholly past the extent: nothing to read, nothing to overwrite.
-    let read_range = sheet.map_or(Some(destination), |sheet| {
-        clamp_to_grid(sheet, &destination)
-    });
+    let applied_destination = if let Some(sheet) = sheet {
+        if let Some(applied) = clamp_to_grid(sheet, &destination) {
+            applied
+        } else {
+            // The destination lies wholly past the grid on some axis:
+            // nothing would be written. Refused before any lease is
+            // checked or `batchUpdate` is called, identically for
+            // `--dry-run` and a real run — reporting `Changed`/
+            // `WouldChange` for a no-op would misstate what happened.
+            let grid = sheet
+                .properties
+                .as_ref()
+                .and_then(|props| props.grid_properties.as_ref());
+            return gated(AutoFillResult::RefusedDestinationPastGrid {
+                requested_destination: requested_destination_a1,
+                row_count: grid.and_then(|g| g.row_count),
+                column_count: grid.and_then(|g| g.column_count),
+            });
+        }
+    } else {
+        destination
+    };
+    let destination_a1 = grid_range_to_a1(&sheet_title, &applied_destination);
+    // `None` in the common case (no clipping happened), so the JSON output
+    // carries no new key then.
+    let requested_destination =
+        (applied_destination != destination).then_some(requested_destination_a1);
 
-    // The destination's current values are read once, before the
-    // --dry-run branch, so both paths report the same overwritten cells
-    // from the same read — `merge-cells`' own `read_discarded_cells`
-    // precedent.
-    let overwritten_cells = match read_range {
-        None => Vec::new(),
-        Some(read_range) => {
-            let read_a1 = grid_range_to_a1(&sheet_title, &read_range);
-            match api
-                .values_get(&opts.spreadsheet_id, &read_a1, ValueRenderOption::Formatted)
-                .await
-            {
-                // Offsets are the *read* range's own start, not the
-                // destination's — clamping can only move the end, but
-                // `grid_range::non_blank_locations` is indexed off
-                // whichever range was actually read.
-                Ok(values) => grid_range::non_blank_locations(
-                    &values,
-                    read_range.start_row_index.unwrap_or(0),
-                    read_range.start_column_index.unwrap_or(0),
-                ),
-                Err(err) => {
-                    return gated(AutoFillResult::Failed {
-                        detail: format!("{err:#}"),
-                    })
-                }
+    // The destination's current values are read once, off the *applied*
+    // (already-clipped) range, before the --dry-run branch, so both paths
+    // report the same overwritten cells from the same read — `merge-cells`'
+    // own `read_discarded_cells` precedent. Since the wholly-past case is
+    // refused above, `applied_destination` always names cells that exist.
+    let overwritten_cells = {
+        let read_a1 = grid_range_to_a1(&sheet_title, &applied_destination);
+        match api
+            .values_get(&opts.spreadsheet_id, &read_a1, ValueRenderOption::Formatted)
+            .await
+        {
+            Ok(values) => grid_range::non_blank_locations(
+                &values,
+                applied_destination.start_row_index.unwrap_or(0),
+                applied_destination.start_column_index.unwrap_or(0),
+            ),
+            Err(err) => {
+                return gated(AutoFillResult::Failed {
+                    detail: format!("{err:#}"),
+                })
             }
         }
     };
@@ -545,9 +601,9 @@ async fn auto_fill_inner(
         return gated(AutoFillResult::WouldChange {
             summary,
             destination: destination_a1,
+            requested_destination,
             overwritten_cells,
             destination_is_upper_bound: is_upper_bound,
-            past_grid_extent,
         });
     }
 
@@ -590,9 +646,9 @@ async fn auto_fill_inner(
         Ok(_response) => AutoFillResult::Changed {
             summary,
             destination: destination_a1,
+            requested_destination,
             overwritten_cells,
             destination_is_upper_bound: is_upper_bound,
-            past_grid_extent,
         },
         Err(err) => AutoFillResult::Failed {
             detail: format!("{err:#}"),
@@ -661,38 +717,14 @@ fn compute_destination(
     Ok(destination)
 }
 
-/// Whether `destination` extends past `sheet`'s current known extent on
-/// either axis. `false` when the sheet reports no `gridProperties` for an
-/// axis (nothing to compare against), matching `dimension_group.rs`'s
-/// `validate_span`'s own "extent unknown ⇒ don't refuse" stance — except
-/// this never refuses either way (ADR-0083 §5); it only decides whether
-/// the summary carries the caveat.
-fn extends_past_grid(sheet: &Sheet, destination: &GridRange) -> bool {
-    let grid = sheet
-        .properties
-        .as_ref()
-        .and_then(|props| props.grid_properties.as_ref());
-    let past_rows = match (destination.end_row_index, grid.and_then(|g| g.row_count)) {
-        (Some(end), Some(current)) => end > current,
-        _ => false,
-    };
-    let past_columns = match (
-        destination.end_column_index,
-        grid.and_then(|g| g.column_count),
-    ) {
-        (Some(end), Some(current)) => end > current,
-        _ => false,
-    };
-    past_rows || past_columns
-}
-
-/// `destination` with each axis' end clamped to `sheet`'s current extent,
-/// or `None` when that leaves nothing — the destination lies wholly past
-/// the grid on some axis, so there is no cell to read back.
+/// `destination` with each axis' end clamped to `sheet`'s current extent —
+/// what `autoFill` actually fills (verified live, #1937: it clips rather
+/// than growing the sheet or erroring) — or `None` when that leaves
+/// nothing: the destination lies wholly past the grid on some axis, so
+/// there is no cell to fill or read back, and the caller refuses instead.
 ///
 /// An axis the sheet reports no extent for is left alone: there is nothing
-/// to clamp against, the same "extent unknown ⇒ don't act on it" stance
-/// [`extends_past_grid`] takes.
+/// to clamp against, so "extent unknown ⇒ don't act on it".
 fn clamp_to_grid(sheet: &Sheet, destination: &GridRange) -> Option<GridRange> {
     let grid = sheet
         .properties
@@ -750,20 +782,37 @@ fn grid_range_to_a1(sheet_title: &str, grid: &GridRange) -> String {
 
 /// The caveat every auto-fill carries, in both tenses at once — the
 /// values are never reported, before *or* after the request, so unlike
-/// [`PAST_GRID_EXTENT_CAVEAT_DRY_RUN`] this is one constant rather than
-/// two ([`structure.rs`](super::structure)'s `FORMULA_CAVEAT` shape).
+/// [`past_grid_extent_caveat_dry_run`]/[`past_grid_extent_caveat`] this is
+/// one constant rather than two ([`structure.rs`](super::structure)'s
+/// `FORMULA_CAVEAT` shape).
 const UNPREVIEWABLE_VALUES_CAVEAT: &str =
     "  the filled values are computed by Sheets' own series detection and are never reported, \
      before or after the request";
 
-/// Shared by the `--dry-run` and post-execution lines so the wording
-/// can't drift; tense differs, so this is two constants rather than one —
-/// `structure.rs`'s `INSERT_RANGE_EDGE_CAVEAT` pair, for the same reason.
-const PAST_GRID_EXTENT_CAVEAT_DRY_RUN: &str =
-    "  the destination extends past the sheet's current extent — Sheets may grow the sheet or \
-     refuse the request";
-const PAST_GRID_EXTENT_CAVEAT: &str =
-    "  the destination extended past the sheet's current extent, so Sheets may have grown it";
+/// The grid-edge caveat, dry-run tense: names both the applied (clipped)
+/// destination and the requested (unclipped) one, since `--dry-run`
+/// reports what the pre-read predicts `autoFill` will do (verified live,
+/// #1937: it clips rather than growing the sheet or erroring). A format
+/// function rather than a constant, unlike [`UNPREVIEWABLE_VALUES_CAVEAT`],
+/// since the two ranges are call-specific; shared by both tenses' call
+/// sites so the wording can't drift — `structure.rs`'s
+/// `INSERT_RANGE_EDGE_CAVEAT` pair's own reason for being two functions
+/// rather than one.
+fn past_grid_extent_caveat_dry_run(applied: &str, requested: &str) -> String {
+    format!(
+        "  the destination runs past the sheet's current extent; auto-fill clips to it, so only \
+         {applied} would be filled — {requested} was requested"
+    )
+}
+
+/// The grid-edge caveat, past tense — see
+/// [`past_grid_extent_caveat_dry_run`].
+fn past_grid_extent_caveat(applied: &str, requested: &str) -> String {
+    format!(
+        "  the destination ran past the sheet's current extent; auto-fill clipped to it, so \
+         only {applied} was filled — {requested} was requested"
+    )
+}
 
 /// The **tense-neutral** head of the summary: the destination, the source
 /// it extends and the direction (form B), or the server-decided-split
@@ -815,7 +864,8 @@ fn describe_effect(
 /// The indented overwrite line. `up to` marks form A's upper bound (Sheets
 /// picks the source/destination split itself, so some of these cells are
 /// the source and will not be touched); the tense follows `dry_run`, the
-/// [`PAST_GRID_EXTENT_CAVEAT_DRY_RUN`] pair's own rule.
+/// same rule [`past_grid_extent_caveat_dry_run`]/[`past_grid_extent_caveat`]
+/// follow.
 fn overwritten_line(
     overwritten_cells: &[String],
     destination_is_upper_bound: bool,
@@ -937,15 +987,16 @@ pub fn describe_lines(outcome: &AutoFillOutcome) -> Vec<String> {
     match &outcome.result {
         AutoFillResult::WouldChange {
             summary,
+            destination,
+            requested_destination,
             overwritten_cells,
             destination_is_upper_bound,
-            past_grid_extent,
-            ..
         } => change_lines(
             &format!("Would {summary} in {book}"),
             overwritten_cells,
             *destination_is_upper_bound,
-            *past_grid_extent,
+            destination,
+            requested_destination.as_deref(),
             true,
         ),
         AutoFillResult::RefusedNotASpreadsheet { mime_type } => vec![format!(
@@ -975,6 +1026,23 @@ pub fn describe_lines(outcome: &AutoFillOutcome) -> Vec<String> {
             )]
         }
         AutoFillResult::RefusedInvalidRange { detail } => vec![format!("Refused: {detail}")],
+        AutoFillResult::RefusedDestinationPastGrid {
+            requested_destination,
+            row_count,
+            column_count,
+        } => {
+            let extent = match (row_count, column_count) {
+                (Some(rows), Some(cols)) => format!(" ({rows} rows x {cols} columns)"),
+                (Some(rows), None) => format!(" ({rows} rows)"),
+                (None, Some(cols)) => format!(" ({cols} columns)"),
+                (None, None) => String::new(),
+            };
+            vec![format!(
+                "Refused: {requested_destination} lies wholly past {book}'s current grid{extent}; \
+                 auto-fill does not grow the sheet. Grow it first (e.g. `sheets append`, \
+                 `sheets insert-rows`/`insert-columns`), or choose a destination within the grid."
+            )]
+        }
         AutoFillResult::Blocked { decided_by } => vec![match decided_by {
             Some(rule) => format!(
                 "Blocked: auto-fill on {book} refused by rule on {} {}{}",
@@ -1005,15 +1073,16 @@ pub fn describe_lines(outcome: &AutoFillOutcome) -> Vec<String> {
             .collect(),
         AutoFillResult::Changed {
             summary,
+            destination,
+            requested_destination,
             overwritten_cells,
             destination_is_upper_bound,
-            past_grid_extent,
-            ..
         } => change_lines(
             &format!("Applied: {summary} in {book}"),
             overwritten_cells,
             *destination_is_upper_bound,
-            *past_grid_extent,
+            destination,
+            requested_destination.as_deref(),
             false,
         ),
         AutoFillResult::Failed { detail } => vec![format!("Failed: {detail}")],
@@ -1028,22 +1097,20 @@ fn change_lines(
     head: &str,
     overwritten_cells: &[String],
     destination_is_upper_bound: bool,
-    past_grid_extent: bool,
+    destination: &str,
+    requested_destination: Option<&str>,
     dry_run: bool,
 ) -> Vec<String> {
     let mut lines = vec![
         head.to_string(),
         overwritten_line(overwritten_cells, destination_is_upper_bound, dry_run),
     ];
-    if past_grid_extent {
-        lines.push(
-            if dry_run {
-                PAST_GRID_EXTENT_CAVEAT_DRY_RUN
-            } else {
-                PAST_GRID_EXTENT_CAVEAT
-            }
-            .to_string(),
-        );
+    if let Some(requested) = requested_destination {
+        lines.push(if dry_run {
+            past_grid_extent_caveat_dry_run(destination, requested)
+        } else {
+            past_grid_extent_caveat(destination, requested)
+        });
     }
     lines.push(UNPREVIEWABLE_VALUES_CAVEAT.to_string());
     lines
@@ -1201,40 +1268,6 @@ mod tests {
             }),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn extends_past_grid_is_false_within_the_current_extent() {
-        let sheet = sheet_with_extent(1000, 26);
-        assert!(!extends_past_grid(&sheet, &bounded(0, 0, 10, 0, 5)));
-    }
-
-    #[test]
-    fn extends_past_grid_detects_rows_past_the_extent() {
-        let sheet = sheet_with_extent(10, 26);
-        assert!(extends_past_grid(&sheet, &bounded(0, 5, 15, 0, 5)));
-    }
-
-    #[test]
-    fn extends_past_grid_detects_columns_past_the_extent() {
-        let sheet = sheet_with_extent(1000, 5);
-        assert!(extends_past_grid(&sheet, &bounded(0, 0, 10, 0, 10)));
-    }
-
-    #[test]
-    fn extends_past_grid_is_false_when_the_extent_is_unknown() {
-        let sheet = Sheet {
-            properties: Some(SheetProperties {
-                sheet_id: Some(0),
-                title: "Q1".to_string(),
-                index: Some(0),
-                hidden: None,
-                grid_properties: None,
-                right_to_left: None,
-            }),
-            ..Default::default()
-        };
-        assert!(!extends_past_grid(&sheet, &bounded(0, 0, 1_000_000, 0, 26)));
     }
 
     #[test]
@@ -1447,18 +1480,36 @@ mod tests {
 
     #[test]
     fn change_lines_name_the_grid_extent_caveat_in_the_matching_tense() {
-        let dry = change_lines("Would x in 'B'", &[], false, true, true);
+        let dry = change_lines(
+            "Would x in 'B'",
+            &[],
+            false,
+            "'Q1'!A1:A10",
+            Some("'Q1'!A1:A20"),
+            true,
+        );
         assert!(
-            dry.contains(&PAST_GRID_EXTENT_CAVEAT_DRY_RUN.to_string()),
+            dry.contains(&past_grid_extent_caveat_dry_run(
+                "'Q1'!A1:A10",
+                "'Q1'!A1:A20"
+            )),
             "{dry:?}"
         );
-        let real = change_lines("Applied: x in 'B'", &[], false, true, false);
+        let real = change_lines(
+            "Applied: x in 'B'",
+            &[],
+            false,
+            "'Q1'!A1:A10",
+            Some("'Q1'!A1:A20"),
+            false,
+        );
         assert!(
-            real.contains(&PAST_GRID_EXTENT_CAVEAT.to_string()),
+            real.contains(&past_grid_extent_caveat("'Q1'!A1:A10", "'Q1'!A1:A20")),
             "{real:?}"
         );
-        // Omitted entirely when the destination fits.
-        let within = change_lines("Would x in 'B'", &[], false, false, true);
+        // Omitted entirely when the destination fits (`requested_destination`
+        // is `None`).
+        let within = change_lines("Would x in 'B'", &[], false, "'Q1'!A1:A10", None, true);
         assert!(
             !within.iter().any(|l| l.contains("current extent")),
             "{within:?}"
@@ -1468,7 +1519,7 @@ mod tests {
     #[test]
     fn change_lines_always_state_the_server_decides_the_values() {
         for dry_run in [true, false] {
-            let lines = change_lines("head", &[], false, false, dry_run);
+            let lines = change_lines("head", &[], false, "'Q1'!A1:A10", None, dry_run);
             assert!(
                 lines.contains(&UNPREVIEWABLE_VALUES_CAVEAT.to_string()),
                 "{lines:?}"
@@ -1482,9 +1533,9 @@ mod tests {
             AutoFillResult::WouldChange {
                 summary: String::new(),
                 destination: String::new(),
+                requested_destination: None,
                 overwritten_cells: Vec::new(),
                 destination_is_upper_bound: false,
-                past_grid_extent: false,
             }
             .log_status(),
             "would-change"
@@ -1520,6 +1571,15 @@ mod tests {
             "refused-invalid-range"
         );
         assert_eq!(
+            AutoFillResult::RefusedDestinationPastGrid {
+                requested_destination: String::new(),
+                row_count: None,
+                column_count: None,
+            }
+            .log_status(),
+            "refused-destination-past-grid"
+        );
+        assert_eq!(
             AutoFillResult::Blocked { decided_by: None }.log_status(),
             "blocked"
         );
@@ -1543,9 +1603,9 @@ mod tests {
             AutoFillResult::Changed {
                 summary: String::new(),
                 destination: String::new(),
+                requested_destination: None,
                 overwritten_cells: Vec::new(),
                 destination_is_upper_bound: false,
-                past_grid_extent: false,
             }
             .log_status(),
             "changed"
@@ -1593,9 +1653,9 @@ mod tests {
             AutoFillResult::WouldChange {
                 summary: "auto-fill within 'Q1'!A1:A10".to_string(),
                 destination: "'Q1'!A1:A10".to_string(),
+                requested_destination: Some("'Q1'!A1:A20".to_string()),
                 overwritten_cells: vec!["A1".to_string()],
                 destination_is_upper_bound: true,
-                past_grid_extent: true,
             },
             AutoFillResult::RefusedNotASpreadsheet {
                 mime_type: "application/pdf".to_string(),
@@ -1609,6 +1669,11 @@ mod tests {
             AutoFillResult::RefusedInvalidRange {
                 detail: "bad range".to_string(),
             },
+            AutoFillResult::RefusedDestinationPastGrid {
+                requested_destination: "'Q1'!A2001:A2010".to_string(),
+                row_count: Some(1000),
+                column_count: Some(26),
+            },
             AutoFillResult::Blocked { decided_by: None },
             AutoFillResult::RefusedNoLease,
             AutoFillResult::RefusedLeaseExpired,
@@ -1617,9 +1682,9 @@ mod tests {
             AutoFillResult::Changed {
                 summary: "auto-fill within 'Q1'!A1:A10".to_string(),
                 destination: "'Q1'!A1:A10".to_string(),
+                requested_destination: None,
                 overwritten_cells: Vec::new(),
                 destination_is_upper_bound: true,
-                past_grid_extent: false,
             },
             AutoFillResult::Failed {
                 detail: "boom".to_string(),
@@ -2141,18 +2206,19 @@ mod tests {
         assert!(matches!(outcome.result, AutoFillResult::Changed { .. }));
     }
 
-    /// ADR-0083 §5 leaves a past-extent destination to the server. The
-    /// *read* must not pre-empt that: with no mock mounted for any
-    /// `values.get` path, a request would 404 and the run would report
-    /// `Failed` before `batchUpdate` was ever attempted. Clamping means
-    /// the read is skipped entirely, the fill still goes out, and the
-    /// grid-extent caveat is what tells the user.
+    /// Verified live (#1937): `autoFill` clips rather than growing the
+    /// sheet or erroring — but a destination that lies *wholly* past the
+    /// grid on some axis would leave nothing to fill, so this is refused
+    /// before any lease is checked or `batchUpdate` is called, identically
+    /// for `--dry-run` and a real run. Neither the read nor the mutation
+    /// is ever attempted: with no mock mounted for either, a stray call
+    /// would fail this test outright.
     ///
     /// Only form A can reach this: form B extends from a source range's
     /// own edge, so its destination always *starts* inside the grid and
     /// can only straddle the edge (the test below), never clear it.
     #[tokio::test]
-    async fn a_destination_wholly_past_the_grid_extent_skips_the_read_and_still_fills() {
+    async fn a_destination_wholly_past_the_grid_extent_is_refused_before_any_lease_or_mutation() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
         mount_file(
@@ -2164,59 +2230,56 @@ mod tests {
         .await;
         mount_folder("folder-1").mount(&server).await;
         mount_workbook().mount(&server).await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path(
-                "/v4/spreadsheets/sheet-1:batchUpdate",
-            ))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "spreadsheetId": "sheet-1", "replies": [{}]
-                })),
-            )
-            .mount(&server)
-            .await;
         let rules = vec![allow_rule("folder-1")];
-        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
         // The fixture sheet has 1000 rows; this --range names rows
         // 2000..2010, wholly past the extent.
-        let opts = AutoFillOptions {
-            lease_token,
-            ledger_path,
-            form: AutoFillForm::Range {
-                sheet: Some("Q1".to_string()),
-                range: Some("A2001:A2010".to_string()),
-            },
-            ..base_opts(range_form(), false)
+        let form = AutoFillForm::Range {
+            sheet: Some("Q1".to_string()),
+            range: Some("A2001:A2010".to_string()),
         };
-        let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
-        let AutoFillResult::Changed {
-            overwritten_cells,
-            past_grid_extent,
-            ..
-        } = &outcome.result
-        else {
-            panic!("{:?}", outcome.result);
-        };
-        assert!(overwritten_cells.is_empty(), "{overwritten_cells:?}");
-        assert!(past_grid_extent);
+        for dry_run in [true, false] {
+            let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+            let opts = AutoFillOptions {
+                lease_token,
+                ledger_path,
+                form: form.clone(),
+                ..base_opts(range_form(), dry_run)
+            };
+            let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
+            let AutoFillResult::RefusedDestinationPastGrid {
+                requested_destination,
+                row_count,
+                column_count,
+            } = &outcome.result
+            else {
+                panic!("dry_run={dry_run}: {:?}", outcome.result);
+            };
+            assert_eq!(requested_destination, "'Q1'!A2001:A2010");
+            assert_eq!(*row_count, Some(1000));
+            assert_eq!(*column_count, Some(26));
+            let lines = describe_lines(&outcome);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains("lies wholly past"), "{lines:?}");
+        }
         assert!(
             !server
                 .received_requests()
                 .await
                 .unwrap_or_default()
                 .iter()
-                .any(|r| r.url.path().contains("/values/")),
-            "the read must be skipped, not attempted and failed"
+                .any(
+                    |r| r.url.path().contains("/values/") || r.url.path().ends_with(":batchUpdate")
+                ),
+            "neither the read nor the mutation must be attempted"
         );
-        let lines = describe_lines(&outcome);
-        assert_eq!(lines[1], "  no non-blank cells in the destination");
-        assert_eq!(lines[2], PAST_GRID_EXTENT_CAVEAT);
     }
 
     /// The partial case: the destination straddles the grid edge, so the
-    /// read is trimmed to the in-grid part rather than skipped.
+    /// *applied* (clipped) destination is what `destination` reports and
+    /// what backs the read; the unclipped one survives only as
+    /// `requested_destination`.
     #[tokio::test]
-    async fn a_destination_straddling_the_grid_edge_reads_only_the_in_grid_part() {
+    async fn a_destination_straddling_the_grid_edge_is_clipped_and_reports_both_ranges() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
         mount_file(
@@ -2228,8 +2291,9 @@ mod tests {
         .await;
         mount_folder("folder-1").mount(&server).await;
         mount_workbook().mount(&server).await;
-        // Source A1:A3 filled 1000 rows down lands at rows 4..1003; the
-        // 1000-row sheet clamps the read to 'Q1'!A4:A1000.
+        // Source A1:A3 filled 1000 rows down would land at rows 4..1003
+        // (unclipped); the 1000-row sheet clips the applied destination —
+        // and the read backing it — to 'Q1'!A4:A1000.
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
                 "/v4/spreadsheets/sheet-1/values/'Q1'!A4:A1000",
@@ -2246,18 +2310,207 @@ mod tests {
         let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
         let AutoFillResult::WouldChange {
             destination,
+            requested_destination,
             overwritten_cells,
-            past_grid_extent,
             ..
         } = &outcome.result
         else {
             panic!("{:?}", outcome.result);
         };
-        // The *destination* reported is the unclamped one — only the read
-        // was trimmed.
-        assert_eq!(destination, "'Q1'!A4:A1003");
+        assert_eq!(destination, "'Q1'!A4:A1000");
+        assert_eq!(requested_destination.as_deref(), Some("'Q1'!A4:A1003"));
         assert_eq!(overwritten_cells, &vec!["A4".to_string()]);
-        assert!(past_grid_extent);
+        let lines = describe_lines(&outcome);
+        assert_eq!(
+            lines[2],
+            past_grid_extent_caveat_dry_run("'Q1'!A4:A1000", "'Q1'!A4:A1003")
+        );
+    }
+
+    /// The same clip, along the COLUMNS axis instead of rows — verified
+    /// live (#1937): a 5-column sheet stayed 5 columns after a fill that
+    /// requested 10 more, exactly mirroring the rows behaviour above.
+    #[tokio::test]
+    async fn a_destination_straddling_the_grid_edge_clips_along_columns_too() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // Source A1:A3 (column A, rows 1-3) filled 30 columns right would
+        // land at columns 1..31 (unclipped); the 26-column fixture sheet
+        // clips the applied destination to columns 1..26 ('Q1'!B1:Z3).
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!B1:Z3",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [["keep"]]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = base_opts(source_and_destination_form(Dimension::Columns, 30), true);
+        let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
+        let AutoFillResult::WouldChange {
+            destination,
+            requested_destination,
+            overwritten_cells,
+            ..
+        } = &outcome.result
+        else {
+            panic!("{:?}", outcome.result);
+        };
+        assert_eq!(destination, "'Q1'!B1:Z3");
+        assert!(requested_destination.is_some(), "{requested_destination:?}");
+        assert_eq!(overwritten_cells, &vec!["B1".to_string()]);
+    }
+
+    /// Form A (`--range`) reaches the same clip: `resolve_grid_range`
+    /// performs no grid-extent validation of its own, so a `--range`
+    /// straddling the edge is clipped exactly like form B's computed
+    /// destination.
+    #[tokio::test]
+    async fn a_range_form_destination_straddling_the_grid_edge_is_clipped_too() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A990:A1000",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [["keep"]]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let form = AutoFillForm::Range {
+            sheet: Some("Q1".to_string()),
+            range: Some("A990:A1010".to_string()),
+        };
+        let outcome = auto_fill(&drive, &sheets, &base_opts(form, true), &rules).await;
+        let AutoFillResult::WouldChange {
+            destination,
+            requested_destination,
+            destination_is_upper_bound,
+            ..
+        } = &outcome.result
+        else {
+            panic!("{:?}", outcome.result);
+        };
+        assert_eq!(destination, "'Q1'!A990:A1000");
+        assert_eq!(requested_destination.as_deref(), Some("'Q1'!A990:A1010"));
+        assert!(destination_is_upper_bound);
+    }
+
+    /// A destination inside the grid carries no `requested_destination`,
+    /// and the JSON output has no corresponding key — a regression pin on
+    /// the wire shape in the common (unclipped) case.
+    #[tokio::test]
+    async fn a_destination_inside_the_grid_has_no_requested_destination_key_in_json() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A4:A10",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = base_opts(source_and_destination_form(Dimension::Rows, 7), true);
+        let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
+        let AutoFillResult::WouldChange {
+            requested_destination,
+            ..
+        } = &outcome.result
+        else {
+            panic!("{:?}", outcome.result);
+        };
+        assert!(requested_destination.is_none());
+        let mut out = Vec::new();
+        outcome.write_jsonl(&mut out).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(value["result"].get("requested_destination").is_none());
+    }
+
+    /// An axis the sheet reports no `gridProperties` for is left alone —
+    /// "extent unknown ⇒ don't act on it", the pre-#1937 stance for that
+    /// case — so no clipping and no refusal happen even for a destination
+    /// that would be wildly past a typical sheet's extent.
+    #[tokio::test]
+    async fn unknown_grid_extent_leaves_the_destination_unclamped_and_never_refuses() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+                    ],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A4:A1003",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = base_opts(source_and_destination_form(Dimension::Rows, 1000), true);
+        let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
+        let AutoFillResult::WouldChange {
+            destination,
+            requested_destination,
+            ..
+        } = &outcome.result
+        else {
+            panic!("{:?}", outcome.result);
+        };
+        assert_eq!(destination, "'Q1'!A4:A1003");
+        assert!(requested_destination.is_none());
     }
 
     #[tokio::test]
