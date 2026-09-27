@@ -2001,14 +2001,44 @@ not `A:A` or `5:5`) — `merge-cells`' own requirement — since neither the
 destination arithmetic nor the preview read has a fixed extent to work
 from otherwise.
 
-A destination that runs past the sheet's current row/column count is **not
-refused client-side**: `sheets append` already grows the grid under
-`sheets-write`, so `auto-fill` follows the same rule. The summary carries a
-caveat instead, and the verb never prepends a request to grow the sheet
-first. The preflight read that reports the overwritten cells is clamped to
-the grid's current extent, so it can never fail on the out-of-grid part and
-turn "left to the server" into a client-side refusal; a cell past the extent
-holds no value, so nothing is lost by not reading it.
+**Verified live (#1937): a destination that runs past the sheet's current
+row/column count is clipped, not grown or refused** — the opposite of
+`copy-paste`/`cut-paste`/`paste-data` (below), which do grow the grid.
+`--dry-run` and the real run both report the *applied* (clipped)
+destination as the headline range, plus the unclipped destination that was
+requested when the two differ:
+
+```
+$ omni-dev drive sheets auto-fill <ID> --sheet AF --source G5:G6 \
+    --dimension rows --fill-length 1000 --dry-run
+Would auto-fill 'AF'!G7:G1000 from source 'AF'!G5:G6, extending 1000 row(s) down in 'Budget'
+  no non-blank cells in the destination
+  the destination runs past the sheet's current extent; auto-fill clips to it, so only 'AF'!G7:G1000 would be filled — 'AF'!G7:G1006 was requested
+  the filled values are computed by Sheets' own series detection and are never reported, before or after the request
+```
+
+The real run prints the same shape in the past tense. The `-o json` outcome
+carries the clipped range as `destination` and the unclipped one as
+`requested_destination`, a key omitted entirely when the two match — the
+common case, so the JSON shape is unchanged for a destination that fits.
+The verb still never prepends a request to grow the sheet first, and it
+never rewrites `--fill-length` to match what the pre-read predicts — the
+`batchUpdate` request goes out exactly as given; clipping is only this
+crate's read of what the API does with it.
+
+A destination that lies **wholly** past the grid on some axis is refused
+before any lease is checked or the request is sent — under `--dry-run` and
+a real run alike, since nothing would be written:
+
+```
+$ omni-dev drive sheets auto-fill <ID> --sheet AF --source G999:G1000 \
+    --dimension rows --fill-length 20
+Refused: 'AF'!G1001:G1020 lies wholly past 'Budget''s current grid (1000 rows x 26 columns); auto-fill does not grow the sheet. Grow it first (e.g. `sheets append`, `sheets insert-rows`/`insert-columns`), or choose a destination within the grid.
+```
+
+An axis the sheet reports no `gridProperties` for (a metadata gap this
+crate has otherwise never observed live) is left alone: no clipping and no
+refusal, matching the pre-#1937 behaviour for that case.
 
 #### `drive sheets text-to-columns`
 
@@ -3523,15 +3553,29 @@ destination overwrite. Both also name the `--paste-type` (and, for
 `copy-paste`, the orientation) that was used, since that decides both what
 lands in the destination and which grants were consumed. When the written
 extent runs past the sheet's currently allocated rows or columns, the
-preview and the real run both carry a caveat: whether the Sheets API
-errors or silently expands the grid in that case is undocumented and has
-not been verified against a live workbook — this tool never prepends a
+preview and the real run both carry a caveat — **verified live (#1937): the
+Sheets API grows the grid to fit** rather than erroring, for all three
+verbs (`copy-paste`/`paste-data` were measured first, 1000x26 → 1001x27;
+`cut-paste` confirmed identically, a 10-row sheet growing to 11 rows to fit
+a 3-row-tall block landing on rows 8-10) — this tool still never prepends a
 structural request to grow the grid first, since that would smuggle
-`sheets-structure` into a `sheets-write`-gated batch. The extent is
+`sheets-structure` into a `sheets-write`-gated batch; there is simply
+nothing left to smuggle once growth is the verified outcome. The extent is
 reported in full in that case, but the *read* backing the preview is
 clipped to the rows and columns the sheet actually has, since `values.get`
 refuses a range past the edge ("exceeds grid limits"); cells that don't
 exist yet hold nothing to overwrite.
+
+`cut-paste`'s destination is a single *coordinate*, not a range, and that
+coordinate is a separate question from the block it anchors: measured
+live, the API refuses outright (a plain 400, naming the offending
+`GridCoordinate`) when the coordinate itself lies past the sheet's last
+existing row or column — only a coordinate that is itself inside the grid,
+whose pasted block then spills past the edge, triggers growth. This crate
+performs no extent check of its own on the destination coordinate, so that
+refusal surfaces as an ordinary `Failed` result, unlike `auto-fill`'s own
+client-side refusal for a destination range that lies wholly past the
+grid.
 
 Both the destination-overwrite and the cut-paste cleared-source lists
 render as one line of comma-separated A1 addresses (issue #1880 — before
