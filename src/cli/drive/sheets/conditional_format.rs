@@ -1136,4 +1136,49 @@ mod tests {
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
+
+    #[tokio::test]
+    async fn execute_list_conditional_formats_reads_a_pure_red_rule_with_channels_omitted() {
+        // Issue #1929: a pure `#FF0000` colour has its green and blue
+        // channels omitted entirely by proto3 (`{"red": 1.0}`, not
+        // `{"red": 1.0, "green": 0.0, "blue": 0.0}` — contrast
+        // `mount_workbook`'s hand-written fixture above, which happens to
+        // spell every channel explicitly and so never exercised this).
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [
+                        {
+                            "properties": {"title": "Q1"},
+                            "conditionalFormats": [
+                                {
+                                    "ranges": [{"endRowIndex": 1}],
+                                    "booleanRule": {
+                                        "condition": {"type": "BLANK"},
+                                        "format": {"backgroundColorStyle": {"rgbColor": {"red": 1.0}}},
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListConditionalFormatsCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
 }

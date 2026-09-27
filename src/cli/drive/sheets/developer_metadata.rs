@@ -442,6 +442,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_command_execute_reads_a_dimension_range_on_the_first_sheet_row_one() {
+        // Issue #1929: a `dimensionRange` location on the first sheet
+        // (`sheetId: 0`), spanning from row 1 (`startIndex: 0`), has both
+        // fields omitted by proto3 — contrast the entry above, which only
+        // ever uses `{"spreadsheet": true}` and never a `dimensionRange`.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        mount_workbook().mount(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": [
+            {"developerMetadata": {
+                "metadataKey": "owner", "metadataValue": "team-a",
+                "location": {"dimensionRange": {"dimension": "ROWS", "endIndex": 3}},
+                "visibility": "DOCUMENT",
+            }},
+        ]}))
+        .mount(&server)
+        .await;
+
+        let cmd = search_cmd(Some("owner"), None, OutputFormat::Table);
+        cmd.execute(&client).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn search_command_execute_json_output_short_circuits_before_the_text_lines() {
         let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();

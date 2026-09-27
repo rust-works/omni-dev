@@ -432,6 +432,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_pivot_tables_reads_a_no_totals_grouping_on_the_source_first_column() {
+        // Issue #1929: `--no-totals` (`showTotals: false`) and a grouping
+        // by the source's first column (`sourceColumnOffset: 0`) are both
+        // proto3 zero values, so a real API response omits them entirely
+        // rather than sending `false`/`0` — contrast the test above, whose
+        // fixture only ever uses non-zero offsets and never a `rows`
+        // grouping, so it never exercised this.
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{
+                        "properties": {"title": "Report"},
+                        "data": [{
+                            "rowData": [{"values": [{"pivotTable": {
+                                "source": {
+                                    "startRowIndex": 0, "endRowIndex": 100,
+                                    "endColumnIndex": 4,
+                                },
+                                "rows": [{"sortOrder": "ASCENDING"}],
+                                "filterSpecs": [{"filterCriteria": {}}],
+                            }}]}],
+                        }],
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cmd = ListPivotTablesCommand {
+            spreadsheet_id: "sheet-1".to_string(),
+            output: crate::cli::drive::format::OutputFormat::Table,
+        };
+        assert!(cmd.execute(&client).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn list_pivot_tables_json_output_skips_the_table() {
         let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();
