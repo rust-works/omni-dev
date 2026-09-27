@@ -55,10 +55,20 @@
 //!
 //! **`update-chart-border` is colour-only.** `EmbeddedObjectBorder` models
 //! `colorStyle` alone — no style, no width — so `--clear` sends an empty
-//! border (`border: {}`) with the same `"colorStyle"` mask a set does. This
-//! is unverified against a live account; see
-//! [`UpdateEmbeddedObjectBorderRequest`](crate::drive::sheets::types::UpdateEmbeddedObjectBorderRequest)'s
-//! doc comment.
+//! border (`border: {}`) with the same `"colorStyle"` mask a set does.
+//!
+//! **Confirmed live (issue #1929).** A chart that never had its border
+//! touched reads back with no `border` field at all. But `--clear` does
+//! *not* return a chart to that state: it reads back with `border` present
+//! and an all-omitted `colorStyle.rgbColor` — proto3 dropping every
+//! zero-valued channel. Sending an explicit `--color 000000` (pure black)
+//! reads back **byte-for-byte identical** to a clear: `{"colorStyle":
+//! {"rgbColor": {}}}` either way. There is no second field to break the
+//! tie, so "cleared" and "explicit black" are genuinely indistinguishable
+//! from a read alone — [`describe_border_color`] reports that ambiguity
+//! rather than guessing. Whether the Sheets UI actually paints a visible
+//! black border after `--clear` was not checked (this crate cannot inspect
+//! the rendered UI); what's confirmed is only the wire shape.
 //!
 //! **Documented cuts, matching this feature's general stance:**
 //! `COMBO`/`STEPPED_AREA` basic charts (need a per-series `type` this crate
@@ -91,7 +101,7 @@ use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
     AddChartRequest, AddSlicerRequest, BasicChartAxis, BasicChartDomain, BasicChartSeries,
     BasicChartSpec, BatchUpdateRequestItem, BatchUpdateResponse, ChartData, ChartSourceRange,
-    ChartSpec, ColorStyle, DeleteEmbeddedObjectRequest, EmbeddedChart, EmbeddedObjectBorder,
+    ChartSpec, Color, ColorStyle, DeleteEmbeddedObjectRequest, EmbeddedChart, EmbeddedObjectBorder,
     EmbeddedObjectPosition, FilterCriteria, GridCoordinate, GridRange, OverlayPosition,
     PieChartSpec, Sheet, Slicer, SlicerSpec, Spreadsheet, UpdateChartSpecRequest,
     UpdateEmbeddedObjectBorderRequest, UpdateEmbeddedObjectPositionRequest,
@@ -1466,6 +1476,26 @@ fn describe_position(sheet: &Sheet, position: Option<&EmbeddedObjectPosition>) -
     }
 }
 
+/// Renders a chart border's colour for display.
+///
+/// Confirmed live against issue #1929: `update-chart-border --clear` and an
+/// explicit `--color 000000` (pure black) read back as the **exact same**
+/// wire shape — `border: {"colorStyle": {"rgbColor": {}}}`, proto3 omitting
+/// every zero-valued channel either way. A chart whose border was never
+/// touched at all comes back with no `border` field whatsoever, so that
+/// case stays distinguishable (see [`summarise_chart`]) — but once a
+/// `border` is present, an all-zero colour is genuinely ambiguous between
+/// "explicitly cleared" and "explicitly set to black", with no second field
+/// to break the tie. Reporting a bare `#000000` here would present a guess
+/// as a fact, so black is called out as ambiguous instead.
+fn describe_border_color(rgb: Color) -> String {
+    if rgb == Color::default() {
+        "#000000 (or cleared — indistinguishable on read)".to_string()
+    } else {
+        format_hex_color(rgb)
+    }
+}
+
 fn summarise_chart(sheet: &Sheet, chart: &EmbeddedChart) -> Option<EmbeddedObjectSummary> {
     let object_id = chart.chart_id?;
     let spec = chart.spec.as_ref();
@@ -1487,7 +1517,7 @@ fn summarise_chart(sheet: &Sheet, chart: &EmbeddedChart) -> Option<EmbeddedObjec
         border: chart
             .border
             .and_then(|b| b.color_style)
-            .map(|c| format_hex_color(c.rgb_color)),
+            .map(|c| describe_border_color(c.rgb_color)),
     })
 }
 
@@ -1982,9 +2012,21 @@ fn build_update_slicer(
             .data_range
             .as_ref()
             .or_else(|| existing.and_then(|s| s.data_range.as_ref()));
-        let effective_column = spec
-            .column_index
-            .or_else(|| existing.and_then(|s| s.column_index));
+        // `existing.column_index` reads back `None` for a slicer filtering
+        // column 0 (column A) — proto3 omits the zero value on the wire
+        // (issue #1929), indistinguishable from "no column was ever set".
+        // We only resolve that ambiguity toward 0 when `existing` also
+        // carries a `data_range`: every slicer *this crate* creates always
+        // sends `dataRange` and `columnIndex` together, so a stored spec
+        // that has one but is missing the other is a real Google Sheets
+        // slicer whose column just happens to be 0, not a bare/degenerate
+        // spec. A spec with neither (predating this validation, or created
+        // outside omni-dev — see the `..._refuses_when_an_existing_spec_
+        // has_no_range_or_column` test) still falls through to the
+        // refusal below rather than guessing.
+        let effective_column = spec.column_index.or_else(|| {
+            existing.and_then(|s| s.data_range.is_some().then(|| s.column_index.unwrap_or(0)))
+        });
         match (effective_range, effective_column) {
             (Some(effective_range), Some(effective_column)) => {
                 check_slicer_column_in_range(effective_column, effective_range)?;
@@ -5419,6 +5461,62 @@ mod tests {
     }
 
     #[test]
+    fn build_update_slicer_treats_a_stored_column_index_of_none_as_column_zero() {
+        // Issue #1929, confirmed live: a slicer filtering column 0 (column
+        // A) reads back with `columnIndex` entirely omitted — proto3
+        // dropping the zero value — not with an explicit `0`. Before the
+        // fix, a `--range`-only `update-slicer` against such a slicer
+        // refused with "has no column on record" even though the slicer
+        // plainly has one. `data_range` being present (a real slicer
+        // always sends `dataRange`) is what tells this apart from the
+        // genuinely bare/degenerate spec the sibling refusal test covers.
+        let workbook = workbook_with_sheet(Sheet {
+            properties: Some(crate::drive::sheets::types::SheetProperties {
+                sheet_id: Some(0),
+                title: "Q1".to_string(),
+                ..Default::default()
+            }),
+            slicers: vec![Slicer {
+                slicer_id: Some(4),
+                spec: Some(SlicerSpec {
+                    title: Some("Region".to_string()),
+                    data_range: Some(GridRange {
+                        sheet_id: 0,
+                        start_row_index: Some(0),
+                        end_row_index: Some(10),
+                        start_column_index: Some(0),
+                        end_column_index: Some(4),
+                    }),
+                    column_index: None, // column 0, proto3-omitted
+                    ..Default::default()
+                }),
+                position: Some(EmbeddedObjectPosition {
+                    overlay_position: Some(OverlayPosition {
+                        anchor_cell: GridCoordinate {
+                            sheet_id: 0,
+                            row_index: 0,
+                            column_index: 5,
+                        },
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        });
+
+        let verb = update_slicer_verb(|verb| {
+            let EmbeddedObjectVerb::UpdateSlicer { range, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+            };
+            *range = Some("A1:D20".to_string());
+        });
+        let plan = build_update_slicer(&workbook, &verb, 4).unwrap();
+        let request = serde_json::to_value(&plan.request).unwrap();
+        assert_eq!(request["updateSlicerSpec"]["fields"], "dataRange");
+    }
+
+    #[test]
     fn build_update_slicer_refuses_an_unknown_id() {
         let workbook = slicer_workbook();
         let verb = update_slicer_verb(|verb| {
@@ -6721,5 +6819,77 @@ mod tests {
         );
         assert!(rendered.contains("Sales"), "{rendered}");
         assert_eq!(describe_lines(&outcome).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_real_add_chart_parses_a_reply_anchored_at_a1_on_sheet_0() {
+        // Issue #1929, confirmed live: `add-chart --anchor A1` on the first
+        // sheet creates the chart server-side, but the batchUpdate reply's
+        // echoed `EmbeddedChart` anchors at row 1 / column A on sheet 0
+        // with every `GridCoordinate` field proto3-omitted
+        // (`anchorCell: {}`) — not the explicit-zero shape a hand-written
+        // fixture would guess. Before this issue's fix, that made the
+        // whole reply fail to parse and the verb report `Failed` even
+        // though the chart existed.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Sheet1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{
+                        "addChart": {
+                            "chart": {
+                                "chartId": 7,
+                                "spec": {"basicChart": {"chartType": "COLUMN"}},
+                                "position": {"overlayPosition": {"anchorCell": {}}},
+                            },
+                        },
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let mut verb = add_chart_verb();
+        let EmbeddedObjectVerb::AddChart { anchor, .. } = &mut verb else {
+            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+        };
+        *anchor = Some("A1".to_string());
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        let rendered = format!("{:?}", outcome.result);
+        assert!(
+            matches!(
+                outcome.result,
+                EmbeddedObjectResult::Changed {
+                    object_id: Some(7),
+                    ..
+                }
+            ),
+            "{rendered}"
+        );
     }
 }
