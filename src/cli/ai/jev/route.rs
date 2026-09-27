@@ -1285,6 +1285,7 @@ mod tests {
                 &["#1".to_string()],
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
+                false,
             )
         })
         .unwrap();
