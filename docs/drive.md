@@ -2461,6 +2461,18 @@ Refused: update-workbook-properties needs at least one property to set (--locale
 Refused: --iterative-calculation-max-iterations/--iterative-calculation-convergence-threshold require --iterative-calculation on
 ```
 
+`--time-zone` is checked locally against the IANA time zone database
+(embedded in the binary, names are case-sensitive) before any request is
+sent, on `--dry-run` too. The check exists because the Sheets API does not
+make it: an unrecognised zone is accepted with a 200 and the workbook is
+silently reset to `Etc/GMT`, losing its previous zone
+([#1938](https://github.com/rust-works/omni-dev/issues/1938)). An unknown
+`--locale` needs no local check, since the API rejects it with an HTTP 400:
+
+```
+Refused: --time-zone 'Bogus/Zone9' is not a recognised IANA time zone name (for example 'America/New_York' or 'Europe/London'); the Sheets API would silently reset the workbook to 'Etc/GMT' instead of rejecting it
+```
+
 #### drive sheets delete-sheet / delete-rows / delete-columns / delete-range
 
 Destructive edits — the same `spreadsheets.batchUpdate` mechanism as above,
