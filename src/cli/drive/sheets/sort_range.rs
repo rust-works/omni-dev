@@ -142,7 +142,7 @@ mod tests {
             "rules": [{
                 "folder_id": "parent-1",
                 "recursive": true,
-                "allow": ["sheets-write"],
+                "allow": ["sheets-write", "sheets-structure"],
                 "require_lease": false,
             }],
         })

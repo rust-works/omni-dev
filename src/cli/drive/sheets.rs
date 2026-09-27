@@ -363,7 +363,9 @@ pub enum SheetsSubcommands {
     /// see `auto-fill --help`.
     AutoFill(auto_fill::AutoFillCommand),
     /// Reorders rows in a range by one or more column keys. Gated by the
-    /// folder `sheets-write` operation (issue #1842, ADR-0083 §3).
+    /// folder `sheets-write` **and** `sheets-structure` operations (issue
+    /// #1842, #1870, ADR-0083 §§3, 5) — a sorted row was measured carrying
+    /// its formatting, notes and data-validation rules with it.
     SortRange(sort_range::SortRangeCommand),
     /// Shuffles the row order within a range into an order chosen by the
     /// server. Gated by the folder `sheets-write` **and** `sheets-structure`
