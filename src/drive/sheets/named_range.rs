@@ -998,21 +998,24 @@ pub fn describe_lines(outcome: &NamedRangeOutcome) -> Vec<String> {
     }
 }
 
-/// Renders the referencing-formula preview (ADR-0081 §2) as human-readable
-/// lines: a count line, then each A1 location on its own line. Empty when
-/// nothing references the name, and for every verb but `delete-named-range`.
+/// Renders the referencing-formula preview (ADR-0081 §2) as one
+/// human-readable line: the count sentence, then the rendered locations.
+/// Empty when nothing references the name, and for every verb but
+/// `delete-named-range`. ADR-0081 §2 requires the preview to be
+/// *mandatory*, not exhaustive-in-text, so eliding the rendered line past
+/// [`grid_range::RENDERED_LOCATION_LIMIT`] is consistent — the structured
+/// outcome keeps the full list.
 fn referencing_formula_lines(referencing_formulas: &[String]) -> Vec<String> {
     if referencing_formulas.is_empty() {
         return Vec::new();
     }
-    let mut lines = vec![format!(
+    vec![format!(
         "{} cell formula(s) reference this name and will start evaluating to #NAME? once \
          it's removed (conditional formatting, data validation and chart references are not \
-         scanned):",
-        referencing_formulas.len()
-    )];
-    lines.extend(referencing_formulas.iter().map(|loc| format!("  {loc}")));
-    lines
+         scanned): {}",
+        referencing_formulas.len(),
+        grid_range::render_locations(referencing_formulas)
+    )]
 }
 
 #[cfg(test)]
@@ -1893,8 +1896,34 @@ mod tests {
             text.contains("2 cell formula(s) reference this name"),
             "{text}"
         );
-        assert!(text.contains("  'Q1'!A1"), "{text}");
-        assert!(text.contains("  'Q2'!B2"), "{text}");
+        assert!(
+            text.contains(
+                "this name and will start evaluating to #NAME? once it's removed \
+                (conditional formatting, data validation and chart references are not \
+                scanned): 'Q1'!A1, 'Q2'!B2"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn referencing_formula_lines_elides_past_the_render_limit_but_keeps_the_true_count() {
+        let formulas: Vec<String> = (1..=60).map(|row| format!("'Q1'!A{row}")).collect();
+        let some = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            NamedRangeResult::WouldChange {
+                summary: "delete named range 'Foo'".to_string(),
+                referencing_formulas: formulas.clone(),
+            },
+        );
+        let text = describe(&some);
+        assert!(
+            text.contains("60 cell formula(s) reference this name"),
+            "{text}"
+        );
+        assert!(text.contains("… and 10 more"), "{text}");
+        assert_eq!(formulas.len(), 60);
     }
 
     #[test]
@@ -2113,7 +2142,7 @@ mod tests {
         let text = describe(&without_id);
         assert!(!text.contains("(id"), "{text}");
         assert!(text.contains("1 cell formula(s)"), "{text}");
-        assert!(text.contains("  'Q1'!A1"), "{text}");
+        assert!(text.contains("scanned): 'Q1'!A1"), "{text}");
     }
 
     #[test]
