@@ -143,6 +143,12 @@ pub enum DriveOperation {
     /// still gates on this operation alone — a mis-gating filed as a
     /// follow-up, #1870, not corrected by this change.)
     ///
+    /// Since issue #1940, also one half of `set-basic-filter --sort-by`'s
+    /// gate, alongside [`Self::SheetsStructure`]: a basic filter's sort is
+    /// applied by physically reordering the rows, the same permutation as
+    /// `randomize-range`, so it takes the same union (see that variant's
+    /// doc comment).
+    ///
     /// Since issue #1844 ([ADR-0083](../../docs/adrs/adr-0083.md) §1),
     /// also `trim-whitespace`: it rewrites cell content in place, which a
     /// `sheets write` of the same range could already replace outright.
@@ -282,6 +288,14 @@ pub enum DriveOperation {
     /// and a relative formula moved all four with the row. That is this
     /// operation's own subject matter, so a `sheets-write` grant alone
     /// cannot confer it.
+    ///
+    /// Since issue #1940, `set-basic-filter --sort-by` resolves this
+    /// operation *and* [`Self::SheetsWrite`] — every other filter verb, and
+    /// `set-basic-filter` without `--sort-by`, still resolves this one
+    /// alone (ADR-0081 §1). A basic filter's sort physically reorders the
+    /// filtered range's rows, the same permutation `randomize-range`
+    /// performs, and the reorder outlives `clear-basic-filter`; so it takes
+    /// `randomize-range`'s union rather than being treated as view state.
     SheetsStructure,
     /// Destructively edit an existing Google Sheet via `spreadsheets.batchUpdate`
     /// (issue #1623, [ADR-0077](../../docs/adrs/adr-0077-sheets-deletion-via-batchupdate.md)) — deleting a
