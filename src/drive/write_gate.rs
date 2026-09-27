@@ -155,6 +155,9 @@ pub enum DriveOperation {
     /// Since issue #1844 ([ADR-0083](../../docs/adrs/adr-0083.md) §1),
     /// also `trim-whitespace`: it rewrites cell content in place, which a
     /// `sheets write` of the same range could already replace outright.
+    /// Unlike the reorder verbs above, it stays on this operation alone:
+    /// issue #1877's live check found a trim moves no formatting, and even
+    /// rebases rich-text runs to keep them on their characters.
     /// Its sibling verb in that issue, `delete-duplicates`, takes
     /// [`Self::SheetsDelete`] instead — two verbs shipped together under
     /// two different operations, which is the per-verb mapping working as
