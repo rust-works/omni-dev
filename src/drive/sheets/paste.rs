@@ -1020,10 +1020,10 @@ fn paste_change_lines(
         }
         Some(locations) => {
             lines.push(format!(
-                "  {} non-blank cell(s) in the destination {overwritten_verb}:",
-                locations.len()
+                "  {} non-blank cell(s) in the destination {overwritten_verb}: {}",
+                locations.len(),
+                grid_range::render_locations(locations)
             ));
-            lines.extend(locations.iter().map(|loc| format!("    {loc}")));
         }
         None => lines.push(
             "  destination overwrite: not previewed (this paste type writes no cell values)"
@@ -1038,15 +1038,15 @@ fn paste_change_lines(
             ));
         } else {
             lines.push(format!(
-                "  {} non-blank cell(s) in the source {}:",
+                "  {} non-blank cell(s) in the source {}: {}",
                 locations.len(),
                 if applied {
                     "were cleared"
                 } else {
                     "will be cleared"
-                }
+                },
+                grid_range::render_locations(locations)
             ));
-            lines.extend(locations.iter().map(|loc| format!("    {loc}")));
         }
     }
     if let Some(caveat) = &change.grid_edge_caveat {
@@ -2843,7 +2843,10 @@ mod tests {
             rendered.contains("2 non-blank cell(s) in the destination"),
             "{rendered}"
         );
-        assert!(rendered.contains("    D1"), "{rendered}");
+        assert!(
+            rendered.contains("in the destination would be overwritten: D1"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("4 non-blank cell(s) in the source"),
             "{rendered}"
@@ -3614,6 +3617,68 @@ mod tests {
             lines.iter().any(|l| l.contains("no non-blank cells")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn describe_lines_elides_a_destination_overwrite_past_the_render_limit() {
+        let overwritten: Vec<String> = (1..=60).map(|row| format!("A{row}")).collect();
+        let change = PasteChange {
+            destination: "'Q1'!D1".to_string(),
+            source: Some("'Q1'!A1:B60".to_string()),
+            written_extent: "'Q1'!D1:D60".to_string(),
+            overwritten: Some(overwritten.clone()),
+            cleared: None,
+            grid_edge_caveat: None,
+        };
+        let outcome = PasteOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: PasteVerb::CopyPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B60".to_string(),
+                destination: "D1".to_string(),
+                paste_type: PasteType::Values,
+                orientation: PasteOrientation::Normal,
+            },
+            result: PasteResult::WouldChange(change),
+        };
+        let rendered = describe_lines(&outcome).join("\n");
+        assert!(rendered.contains("60 non-blank cell(s)"), "{rendered}");
+        assert!(rendered.contains("… and 10 more"), "{rendered}");
+        assert_eq!(overwritten.len(), 60);
+    }
+
+    #[test]
+    fn describe_lines_elides_a_cut_paste_cleared_source_past_the_render_limit() {
+        let cleared: Vec<String> = (1..=60).map(|row| format!("A{row}")).collect();
+        let change = PasteChange {
+            destination: "'Q1'!D1".to_string(),
+            source: Some("'Q1'!A1:B60".to_string()),
+            written_extent: "'Q1'!D1:D60".to_string(),
+            overwritten: Some(vec![]),
+            cleared: Some(cleared.clone()),
+            grid_edge_caveat: None,
+        };
+        let outcome = PasteOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: PasteVerb::CutPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B60".to_string(),
+                destination: "D1".to_string(),
+                paste_type: PasteType::Normal,
+            },
+            result: PasteResult::WouldChange(change),
+        };
+        let rendered = describe_lines(&outcome).join("\n");
+        assert!(
+            rendered.contains("60 non-blank cell(s) in the source"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("… and 10 more"), "{rendered}");
+        assert_eq!(cleared.len(), 60);
     }
 
     #[test]
