@@ -142,10 +142,9 @@ pub(crate) const RENDERED_LOCATION_LIMIT: usize = 50;
 
 /// Joins A1 addresses for a *rendered* line, eliding past `limit`.
 ///
-/// Every preview before issue #1844 joined its whole list into one line,
-/// which was fine when the list described a paste destination or a merge.
 /// `trim-whitespace --whole-sheet` names every non-blank cell in a tab, so
-/// the same join produces a multi-kilobyte line. Only the rendered line is
+/// joining its whole list into one line (as every preview did before issue
+/// #1844) produces a multi-kilobyte line. Only the rendered line is
 /// elided: the structured outcome and the `drivemutation` record keep the
 /// full list, so nothing a machine reads is lost.
 pub(crate) fn truncate_locations(locations: &[String], limit: usize) -> String {
@@ -157,6 +156,18 @@ pub(crate) fn truncate_locations(locations: &[String], limit: usize) -> String {
         locations[..limit].join(", "),
         locations.len() - limit
     )
+}
+
+/// [`truncate_locations`] at [`RENDERED_LOCATION_LIMIT`] — the one
+/// rendering path for every address-list preview. #1844 introduced
+/// `truncate_locations` for `trim-whitespace`; #1880 adopted this wrapper
+/// at every other address-only preview (`auto-fill`, `text-to-columns`,
+/// `paste`/`cut-paste`, `delete-named-range`'s referencing-formula list),
+/// so a caller never repeats the limit constant. `format.rs`'s
+/// `MergeCells` discard list deliberately does not use this — see the
+/// comment at that call site.
+pub(crate) fn render_locations(locations: &[String]) -> String {
+    truncate_locations(locations, RENDERED_LOCATION_LIMIT)
 }
 
 /// Whether every bound of `grid` is set — i.e. it names a fixed rectangle
@@ -492,6 +503,18 @@ mod tests {
     fn truncate_locations_elides_past_the_limit_and_counts_the_remainder() {
         let cells: Vec<String> = (1..=5).map(|row| format!("A{row}")).collect();
         assert_eq!(truncate_locations(&cells, 2), "A1, A2, … and 3 more");
+    }
+
+    #[test]
+    fn render_locations_elides_at_fifty_one_but_not_fifty() {
+        let fifty: Vec<String> = (1..=50).map(|row| format!("A{row}")).collect();
+        let rendered_fifty = render_locations(&fifty);
+        assert!(!rendered_fifty.contains('…'));
+        assert_eq!(rendered_fifty, fifty.join(", "));
+
+        let fifty_one: Vec<String> = (1..=51).map(|row| format!("A{row}")).collect();
+        let rendered_fifty_one = render_locations(&fifty_one);
+        assert!(rendered_fifty_one.ends_with("… and 1 more"));
     }
 
     #[test]
