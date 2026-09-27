@@ -112,3 +112,4 @@ by Michael Nygard.
 | [ADR-0086](adr-0086-workbook-properties.md)             | ✅ Accepted                              | 2026-09-22 | Workbook Properties via `updateSpreadsheetProperties`                                       |
 | [ADR-0087](adr-0087.md)                                 | ✅ Accepted                              | 2026-09-22 | Codex as a Second Hook Feed of the Agent-Tagged Sessions Service                            |
 | [ADR-0088](adr-0088.md)                                 | ✅ Accepted                              | 2026-09-25 | Exact Codex Session State from a Private, Poll-Only App-Server                              |
+| [ADR-0089](adr-0089.md)                                 | ✅ Accepted                              | 2026-09-27 | `<NAME>_FILE` for Every Secret Environment Variable                                         |
