@@ -497,6 +497,10 @@ usage: {input_tokens: 1432, output_tokens: 61}
   most. The longest input tested was about 48,000 characters, so no tested
   input was ever cut and this policy is itself untested; Jev's own input limit
   is undocumented.
+- **`ignored_closed`** lists the closed issues `--ignore-closed` dropped
+  from the batch (`ref`, `url`, `title`), in request order, so a caller can
+  tell why fewer issues came back than were passed in. Omitted when nothing
+  was skipped.
 - **`model`** and **`usage`** are summed over every call and never stripped.
 - **`error`** replaces `providers` and `depends_on` on an issue whose Jev
   call failed (after the usual 429/529 retries) or whose answer was unusable
@@ -518,7 +522,9 @@ clutter. Each issue is a header line (`ref — title`, with a trailing
 run-on sentence — which keeps a multi-`--ladders` issue readable. Its wording
 is **not** a stable contract and may change without notice; scripts should
 keep using `json` or `yaml`, which carry the same information as an
-additive `state` field (`"open"`/`"closed"`).
+additive `state` field (`"open"`/`"closed"`). Issues `--ignore-closed`
+skipped get one `ignored closed:` line before the footer, carrying the same
+information as `ignored_closed`.
 
 The class-summary examples below show the default text output. With
 `--effort-advice`, a per-model table follows each summary; see
@@ -628,6 +634,16 @@ lookup, not extra tokens in the routing call itself.
 comments often describe how the work was actually done, which leaks the
 answer. `--allow-closed` is for evaluation runs against issues whose outcome
 you already know.
+
+The refusal covers the whole batch: one closed issue among twenty explicit
+`ISSUE` arguments aborts the run before any Jev call is made. When the list
+comes from something that doesn't filter by state (a saved backlog list, a
+project export), pass `--ignore-closed` instead: closed issues are dropped
+from the batch without being routed or fetching their citations, the open
+ones are routed as usual, and the skipped ones are listed under
+`ignored_closed`. A batch with no open issue left is still an error.
+`--ignore-closed` and `--allow-closed` conflict. `--all-open` never needs
+either, since it only lists open issues.
 
 ### Built-in ladders
 

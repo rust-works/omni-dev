@@ -485,6 +485,7 @@ async fn all_ladders_and_efforts_share_one_request_and_fail_only_the_bad_issue()
         effort_advice: true,
         max_input_chars: 60000,
         allow_closed: false,
+        ignore_closed: false,
     };
     let mut bad_doc = doc.clone();
     bad_doc.number = 2;
@@ -603,6 +604,7 @@ async fn class_only_route_omits_effort_questions_and_output_for_builtin_and_cust
             effort_advice: false,
             max_input_chars: 60000,
             allow_closed: false,
+            ignore_closed: false,
         },
         &dependencies,
     )

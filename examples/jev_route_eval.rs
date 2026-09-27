@@ -52,6 +52,7 @@ async fn main() -> Result<()> {
         effort_advice: false,
         max_input_chars: DEFAULT_MAX_INPUT_CHARS,
         allow_closed: true,
+        ignore_closed: false,
     };
     let builtins = Provider::ALL
         .into_iter()
