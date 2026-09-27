@@ -162,17 +162,8 @@ pub struct SetDataValidationCommand {
     #[arg(long)]
     pub show_warning: bool,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 /// Selects the one condition flag the `ArgGroup` on
@@ -243,11 +234,11 @@ impl SetDataValidationCommand {
                 input_message: self.input_message,
                 show_warning: self.show_warning,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_validation(client, &opts, &self.output).await
+        run_validation(client, &opts, &self.write.output).await
     }
 }
 
@@ -266,17 +257,8 @@ pub struct ClearDataValidationCommand {
     #[arg(long, value_name = "NAME")]
     pub sheet: Option<String>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl ClearDataValidationCommand {
@@ -288,11 +270,11 @@ impl ClearDataValidationCommand {
                 sheet: self.sheet,
                 range: self.range,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_validation(client, &opts, &self.output).await
+        run_validation(client, &opts, &self.write.output).await
     }
 }
 
@@ -365,9 +347,11 @@ mod tests {
             custom_formula: None,
             input_message: None,
             show_warning: false,
-            dry_run: false,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         }
     }
 

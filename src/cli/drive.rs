@@ -193,8 +193,8 @@ mod tests {
 
     /// The `StructureWriteArgs` every dispatch-routing test below wants:
     /// live (non-dry-run), no lease, table output.
-    fn no_write_args() -> sheets::structure::StructureWriteArgs {
-        sheets::structure::StructureWriteArgs {
+    fn no_write_args() -> helpers::StructureWriteArgs {
+        helpers::StructureWriteArgs {
             dry_run: false,
             lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
             output: OutputFormat::Table,
@@ -803,9 +803,11 @@ mod tests {
                     width: None,
                     height: None,
                     new_sheet: false,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -829,9 +831,11 @@ mod tests {
                     offset_y: None,
                     width: None,
                     height: None,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -851,9 +855,11 @@ mod tests {
                     chart_id: 1,
                     color: Some("#4A86E8".to_string()),
                     clear: false,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1066,9 +1072,11 @@ mod tests {
                 padding_bottom: None,
                 padding_left: None,
                 text_direction: None,
-                dry_run: false,
-                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                output: OutputFormat::Table,
+                write: helpers::StructureWriteArgs {
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
             }),
         });
         assert!(cmd.dispatch(&dead_client()).await.is_ok());
@@ -1100,9 +1108,11 @@ mod tests {
             padding_bottom: None,
             padding_left: None,
             text_direction: None,
-            dry_run: false,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: OutputFormat::Table,
+            },
         }
     }
 
@@ -1154,9 +1164,11 @@ mod tests {
                     inner_vertical: false,
                     style: sheets::format::BorderStyle::Dashed,
                     color: Some("#FF0000".to_string()),
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1192,9 +1204,11 @@ mod tests {
                 spreadsheet_id: "sheet-1".to_string(),
                 range: Some("A1:B2".to_string()),
                 sheet: None,
-                dry_run: false,
-                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                output: OutputFormat::Table,
+                write: helpers::StructureWriteArgs {
+                    dry_run: false,
+                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                    output: OutputFormat::Table,
+                },
             }),
         });
         assert!(cmd.dispatch(&dead_client()).await.is_ok());
@@ -1213,9 +1227,11 @@ mod tests {
                     dimension: sheets::format::DimensionArg::Columns,
                     start: 1,
                     end: 3,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1236,9 +1252,11 @@ mod tests {
                     start: 1,
                     end: 3,
                     pixel_size: 42,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1281,9 +1299,11 @@ mod tests {
                     custom_formula: None,
                     input_message: Some("Pick one".to_string()),
                     show_warning: false,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             )),
         });
@@ -1301,9 +1321,11 @@ mod tests {
                     spreadsheet_id: "sheet-1".to_string(),
                     range: Some("A1:A10".to_string()),
                     sheet: None,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1325,9 +1347,11 @@ mod tests {
                     dimension: None,
                     start: None,
                     end: None,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1399,9 +1423,11 @@ mod tests {
                     description: Some("locked".to_string()),
                     warning_only: false,
                     editors: vec!["alice@example.com".to_string()],
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1424,9 +1450,11 @@ mod tests {
                     warning_only: Some(true),
                     add_editors: vec!["bob@example.com".to_string()],
                     remove_editors: vec!["alice@example.com".to_string()],
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1445,9 +1473,11 @@ mod tests {
                     range: Some("A1:B2".to_string()),
                     sheet: None,
                     whole_sheet: false,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1525,9 +1555,11 @@ mod tests {
                     ranges: vec!["A1:A10".to_string()],
                     index: None,
                     rule: cell_empty_only_rule_args(),
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             )),
         });
@@ -1608,9 +1640,11 @@ mod tests {
                     range: "A1:D10".to_string(),
                     sort_by: vec!["0:asc".to_string()],
                     hide_values: vec!["1:Closed".to_string()],
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1627,9 +1661,11 @@ mod tests {
                 sheets::filter::ClearBasicFilterCommand {
                     spreadsheet_id: "sheet-1".to_string(),
                     sheet: "Q1".to_string(),
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1650,9 +1686,11 @@ mod tests {
                     title: Some("Open only".to_string()),
                     sort_by: Vec::new(),
                     hide_values: Vec::new(),
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1676,9 +1714,11 @@ mod tests {
                     hide_values: Vec::new(),
                     clear_sort: false,
                     clear_criteria: false,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });
@@ -1695,9 +1735,11 @@ mod tests {
                 sheets::filter::DeleteFilterViewCommand {
                     spreadsheet_id: "sheet-1".to_string(),
                     filter_view_id: 7,
-                    dry_run: false,
-                    lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-                    output: OutputFormat::Table,
+                    write: helpers::StructureWriteArgs {
+                        dry_run: false,
+                        lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                        output: OutputFormat::Table,
+                    },
                 },
             ),
         });

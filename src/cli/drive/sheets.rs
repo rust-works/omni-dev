@@ -613,9 +613,11 @@ mod tests {
                 range: Some("A1:A5".to_string()),
                 sheet: Some("Q1".to_string()),
                 whole_sheet: false,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -631,9 +633,11 @@ mod tests {
                 range: None,
                 sheet: None,
                 whole_sheet: false,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -805,9 +809,11 @@ mod tests {
                 width: None,
                 height: None,
                 new_sheet: false,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             })),
             &client,
         )
@@ -830,9 +836,11 @@ mod tests {
                 horizontal_axis_title: None,
                 vertical_axis_title: None,
                 pie_hole: None,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             })),
             &client,
         )
@@ -876,9 +884,11 @@ mod tests {
                 offset_y: None,
                 width: None,
                 height: None,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -896,9 +906,11 @@ mod tests {
                 clear_criteria: true,
                 title: None,
                 apply_to_pivot_tables: None,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -939,9 +951,11 @@ mod tests {
                 width: None,
                 height: None,
                 new_sheet: false,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -958,9 +972,11 @@ mod tests {
                 offset_y: None,
                 width: None,
                 height: None,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -973,9 +989,11 @@ mod tests {
                 chart_id: 1,
                 color: Some("#4A86E8".to_string()),
                 clear: false,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -1146,9 +1164,11 @@ mod tests {
                 first_band_color: "#FFFFFF".to_string(),
                 second_band_color: "#EEEEEE".to_string(),
                 footer_color: None,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -1166,9 +1186,11 @@ mod tests {
                 first_band_color: None,
                 second_band_color: None,
                 footer_color: None,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -1179,9 +1201,11 @@ mod tests {
             SheetsSubcommands::DeleteBanding(banding::DeleteBandingCommand {
                 spreadsheet_id: "sheet-1".to_string(),
                 banded_range_id: 1,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -1260,9 +1284,11 @@ mod tests {
                 dimension: crate::cli::drive::sheets::format::DimensionArg::Rows,
                 start: 1,
                 end: 5,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -1278,9 +1304,11 @@ mod tests {
                 end: 5,
                 depth: None,
                 collapsed: true,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -1294,9 +1322,11 @@ mod tests {
                 dimension: crate::cli::drive::sheets::format::DimensionArg::Rows,
                 start: 1,
                 end: 5,
-                dry_run: true,
-                lease: no_lease(),
-                output: crate::cli::drive::format::OutputFormat::Table,
+                write: crate::cli::drive::helpers::StructureWriteArgs {
+                    dry_run: true,
+                    lease: no_lease(),
+                    output: crate::cli::drive::format::OutputFormat::Table
+                },
             }),
             &client,
         )
@@ -1366,7 +1396,7 @@ mod tests {
                 clear_tab_color: false,
                 right_to_left: None,
                 hide_gridlines: None,
-                write: structure::StructureWriteArgs {
+                write: crate::cli::drive::helpers::StructureWriteArgs {
                     dry_run: true,
                     lease: no_lease(),
                     output: crate::cli::drive::format::OutputFormat::Table,

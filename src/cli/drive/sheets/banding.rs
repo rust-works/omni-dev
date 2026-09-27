@@ -82,17 +82,8 @@ pub struct AddBandingCommand {
     #[arg(long, value_name = "HEX")]
     pub footer_color: Option<String>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl AddBandingCommand {
@@ -109,11 +100,11 @@ impl AddBandingCommand {
                 second_band_color: self.second_band_color,
                 footer_color: self.footer_color,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_banding(client, &opts, &self.output).await
+        run_banding(client, &opts, &self.write.output).await
     }
 }
 
@@ -164,17 +155,8 @@ pub struct UpdateBandingCommand {
     #[arg(long, value_name = "HEX")]
     pub footer_color: Option<String>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl UpdateBandingCommand {
@@ -192,11 +174,11 @@ impl UpdateBandingCommand {
                 second_band_color: self.second_band_color,
                 footer_color: self.footer_color,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_banding(client, &opts, &self.output).await
+        run_banding(client, &opts, &self.write.output).await
     }
 }
 
@@ -211,17 +193,8 @@ pub struct DeleteBandingCommand {
     #[arg(long, value_name = "ID")]
     pub banded_range_id: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl DeleteBandingCommand {
@@ -232,11 +205,11 @@ impl DeleteBandingCommand {
             verb: BandingVerb::DeleteBanding {
                 banded_range_id: self.banded_range_id,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_banding(client, &opts, &self.output).await
+        run_banding(client, &opts, &self.write.output).await
     }
 }
 
@@ -497,9 +470,11 @@ mod tests {
             first_band_color: "#FFFFFF".to_string(),
             second_band_color: "#EEEEEE".to_string(),
             footer_color: None,
-            dry_run: true,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: true,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -524,9 +499,11 @@ mod tests {
             first_band_color: None,
             second_band_color: None,
             footer_color: None,
-            dry_run: true,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Yaml,
+            write: helpers::StructureWriteArgs {
+                dry_run: true,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Yaml,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -544,9 +521,11 @@ mod tests {
         let cmd = DeleteBandingCommand {
             spreadsheet_id: "sheet-1".to_string(),
             banded_range_id: 7,
-            dry_run: true,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: true,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }

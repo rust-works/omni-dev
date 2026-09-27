@@ -323,17 +323,8 @@ pub struct AddConditionalFormatCommand {
     #[command(flatten)]
     pub rule: ConditionalFormatRuleArgs,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl AddConditionalFormatCommand {
@@ -347,11 +338,11 @@ impl AddConditionalFormatCommand {
                 index: self.index,
                 rule: self.rule.select_rule(),
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_conditional_format(client, &opts, &self.output).await
+        run_conditional_format(client, &opts, &self.write.output).await
     }
 }
 

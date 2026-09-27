@@ -48,17 +48,8 @@ pub struct AddDimensionGroupCommand {
     #[arg(long, value_name = "N")]
     pub end: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl AddDimensionGroupCommand {
@@ -72,11 +63,11 @@ impl AddDimensionGroupCommand {
                 start: self.start,
                 end: self.end,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_dimension_group(client, &opts, &self.output).await
+        run_dimension_group(client, &opts, &self.write.output).await
     }
 }
 
@@ -123,17 +114,8 @@ pub struct UpdateDimensionGroupCommand {
     #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
     pub collapsed: bool,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl UpdateDimensionGroupCommand {
@@ -149,11 +131,11 @@ impl UpdateDimensionGroupCommand {
                 depth: self.depth,
                 collapsed: self.collapsed,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_dimension_group(client, &opts, &self.output).await
+        run_dimension_group(client, &opts, &self.write.output).await
     }
 }
 
@@ -183,17 +165,8 @@ pub struct DeleteDimensionGroupCommand {
     #[arg(long, value_name = "N")]
     pub end: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl DeleteDimensionGroupCommand {
@@ -207,11 +180,11 @@ impl DeleteDimensionGroupCommand {
                 start: self.start,
                 end: self.end,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_dimension_group(client, &opts, &self.output).await
+        run_dimension_group(client, &opts, &self.write.output).await
     }
 }
 
@@ -449,9 +422,11 @@ mod tests {
             dimension: DimensionArg::Rows,
             start: 1,
             end: 5,
-            dry_run: false,
-            lease: no_lease(),
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -472,9 +447,11 @@ mod tests {
             dimension: DimensionArg::Rows,
             start: 1,
             end: 5,
-            dry_run: false,
-            lease: no_lease(),
-            output: crate::cli::drive::format::OutputFormat::Yaml,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Yaml,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -497,9 +474,11 @@ mod tests {
             end: 5,
             depth: None,
             collapsed: true,
-            dry_run: false,
-            lease: no_lease(),
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -520,9 +499,11 @@ mod tests {
             dimension: DimensionArg::Rows,
             start: 1,
             end: 5,
-            dry_run: false,
-            lease: no_lease(),
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: no_lease(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }

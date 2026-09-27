@@ -25,35 +25,13 @@ use clap::Parser;
 
 use crate::cli::drive::format::{output_as, OutputFormat};
 use crate::cli::drive::helpers;
+use crate::cli::drive::helpers::StructureWriteArgs;
 use crate::cli::format::sanitize_for_terminal;
 use crate::drive::client::DriveClient;
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::structure::{
     describe_lines, structure, IterativeCalculationToggle, StructureOptions, StructureVerb,
 };
-
-/// The `--dry-run`/`--lease`/`-o` trio every structural verb accepts,
-/// repeated verbatim at the end of each command struct below. Flattened
-/// rather than left duplicated, and always as the struct's **last** field —
-/// clap flattens in declaration order, so this keeps every command's help
-/// text in the order it printed before. The fields ahead of it differ
-/// per-dimension in ways that are genuinely user-facing (`value_name`,
-/// doc wording), which is why those structs stay separate rather than
-/// merging into one `--dimension rows|columns` command.
-#[derive(Parser)]
-pub struct StructureWriteArgs {
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
-    #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
-}
 
 /// Adds a new sheet to a spreadsheet.
 #[derive(Parser)]
