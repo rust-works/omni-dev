@@ -1989,9 +1989,28 @@ fn build_update_slicer(
         let effective_column = spec
             .column_index
             .or_else(|| existing.and_then(|s| s.column_index));
-        if let (Some(effective_range), Some(effective_column)) = (effective_range, effective_column)
-        {
-            check_slicer_column_in_range(effective_column, effective_range)?;
+        match (effective_range, effective_column) {
+            (Some(effective_range), Some(effective_column)) => {
+                check_slicer_column_in_range(effective_column, effective_range)?;
+            }
+            _ => {
+                // A stored slicer with no range and/or no column predates
+                // this validation (or was created outside omni-dev); refuse
+                // rather than silently skip the check this change exists to
+                // enforce.
+                return Err(EmbeddedObjectResult::RefusedInvalidRange {
+                    detail: format!(
+                        "slicer {slicer_id} has no {} on record, so its column can't be checked against its range locally — set --range and --column together to establish both"
+                        ,
+                        match (effective_range.is_some(), effective_column.is_some()) {
+                            (false, false) => "range or column",
+                            (false, true) => "range",
+                            (true, false) => "column",
+                            (true, true) => unreachable!(),
+                        }
+                    ),
+                });
+            }
         }
     }
     if let Some(title) = title {
@@ -5223,6 +5242,17 @@ mod tests {
                 slicer_id: Some(4),
                 spec: Some(SlicerSpec {
                     title: Some("Region".to_string()),
+                    // A real slicer always carries both, per the API; see
+                    // build_update_slicer_refuses_when_an_existing_spec_has_no_range_or_column
+                    // for the legacy/corrupted-state case this deliberately excludes.
+                    data_range: Some(GridRange {
+                        sheet_id: 0,
+                        start_row_index: Some(0),
+                        end_row_index: Some(10),
+                        start_column_index: Some(0),
+                        end_column_index: Some(4),
+                    }),
+                    column_index: Some(1),
                     ..Default::default()
                 }),
                 position: Some(EmbeddedObjectPosition {
@@ -5340,6 +5370,56 @@ mod tests {
             );
             assert_eq!(plan.summary, format!("update slicer 4 ({changed})"));
         }
+    }
+
+    #[test]
+    fn build_update_slicer_refuses_when_an_existing_spec_has_no_range_or_column() {
+        // A bare spec (no data_range, no column_index) predates this
+        // validation, or was created outside omni-dev — see #1945's review.
+        let workbook = workbook_with_sheet(Sheet {
+            properties: Some(crate::drive::sheets::types::SheetProperties {
+                sheet_id: Some(0),
+                title: "Q1".to_string(),
+                ..Default::default()
+            }),
+            slicers: vec![Slicer {
+                slicer_id: Some(4),
+                spec: Some(SlicerSpec {
+                    title: Some("Region".to_string()),
+                    ..Default::default()
+                }),
+                position: Some(EmbeddedObjectPosition {
+                    overlay_position: Some(OverlayPosition {
+                        anchor_cell: GridCoordinate {
+                            sheet_id: 0,
+                            row_index: 0,
+                            column_index: 5,
+                        },
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        });
+
+        let verb = update_slicer_verb(|verb| {
+            let EmbeddedObjectVerb::UpdateSlicer { range, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+            };
+            *range = Some("A1:D20".to_string());
+        });
+        let err = refusal(build_update_slicer(&workbook, &verb, 4));
+        assert_invalid(&err, "has no column on record");
+
+        let verb = update_slicer_verb(|verb| {
+            let EmbeddedObjectVerb::UpdateSlicer { column, .. } = verb else {
+                unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+            };
+            *column = Some(2);
+        });
+        let err = refusal(build_update_slicer(&workbook, &verb, 4));
+        assert_invalid(&err, "has no range on record");
     }
 
     #[test]

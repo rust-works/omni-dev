@@ -2355,10 +2355,11 @@ pub struct SlicerSpec {
         rename = "filterCriteria"
     )]
     pub filter_criteria: Option<FilterCriteria>,
-    /// The column within `data_range` the criteria apply to. See
-    /// `embedded_object.rs`'s `--column` doc comment for the
-    /// absolute-vs-relative indexing this needs to be verified against a
-    /// live account.
+    /// The column the criteria apply to, as an absolute sheet column index
+    /// (0 = column A) — confirmed live against #1945; see
+    /// `embedded_object.rs`'s `--column` doc comment and
+    /// `check_slicer_column_in_range`, which locally validates this against
+    /// `data_range` before either `--dry-run` or a real run reaches the API.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
