@@ -7,7 +7,7 @@ use thiserror::Error;
 pub enum ClaudeError {
     /// API key not found in environment variables.
     #[error(
-        "Claude API key not found. Set CLAUDE_API_KEY or ANTHROPIC_API_KEY environment variable"
+        "Claude API key not found. Set CLAUDE_API_KEY or ANTHROPIC_API_KEY (or its _FILE companion)"
     )]
     ApiKeyNotFound,
 

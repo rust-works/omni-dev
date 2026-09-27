@@ -28,6 +28,7 @@ use crate::request_log;
 use crate::utils::browser_command::split_browser_command;
 use crate::utils::env::SystemEnv;
 use crate::utils::secret::Secret;
+use crate::utils::secret_env::{secret_var, secret_var_is_set};
 use crate::utils::settings::{active_profile_from, GmailAccountSettings, GmailSettings, Settings};
 
 /// Environment variable / settings key for the user's Google Cloud OAuth2
@@ -336,9 +337,8 @@ pub(crate) fn load_credentials_with(
     let client_secret = env
         .var(GMAIL_CLIENT_SECRET)
         .ok_or(GmailError::CredentialsNotFound)?;
-    let refresh_token = env
-        .var(GMAIL_REFRESH_TOKEN)
-        .ok_or(GmailError::CredentialsNotFound)?;
+    let refresh_token =
+        secret_var(env, GMAIL_REFRESH_TOKEN)?.ok_or(GmailError::CredentialsNotFound)?;
     // Unlike login (which rejects an unparseable grant outright), a stored
     // scope that no longer parses degrades to ReadOnly rather than erroring:
     // it was already validated when written, and failing closed here is
@@ -352,7 +352,7 @@ pub(crate) fn load_credentials_with(
     Ok(GmailCredentials {
         client_id,
         client_secret: client_secret.into(),
-        refresh_token: refresh_token.into(),
+        refresh_token,
         scope,
     })
 }
@@ -370,7 +370,7 @@ pub(crate) fn status_with(env: &impl crate::utils::env::EnvSource) -> GmailAuthS
     GmailAuthStatus {
         has_client_id: env.var(GMAIL_CLIENT_ID).is_some(),
         has_client_secret: env.var(GMAIL_CLIENT_SECRET).is_some(),
-        has_refresh_token: env.var(GMAIL_REFRESH_TOKEN).is_some(),
+        has_refresh_token: secret_var_is_set(env, GMAIL_REFRESH_TOKEN),
         scope: env.var(GMAIL_SCOPE),
     }
 }
@@ -2420,6 +2420,18 @@ mod tests {
     // ── Env-DI boundary tests ────────────────────────────────────────
 
     use crate::test_support::env::MapEnv;
+
+    #[test]
+    fn refresh_token_can_come_from_a_file() {
+        let (_dir, path) = crate::test_support::env::secret_file("rt-from-file\n");
+        let env = MapEnv::new()
+            .with(GMAIL_CLIENT_ID, "id")
+            .with(GMAIL_CLIENT_SECRET, "secret")
+            .with("GMAIL_REFRESH_TOKEN_FILE", &path);
+        let creds = load_credentials_with(&env).unwrap();
+        assert_eq!(creds.refresh_token.expose_secret(), "rt-from-file");
+        assert!(status_with(&env).has_refresh_token);
+    }
 
     #[test]
     fn status_reports_all_false_when_nothing_configured() {

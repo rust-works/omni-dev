@@ -18,10 +18,11 @@
 pub mod client;
 pub mod session;
 
+use std::path::Path;
 use std::sync::{Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::utils::browser_command::split_browser_command;
 use crate::utils::env::EnvSource;
 use crate::utils::secret::Secret;
+use crate::utils::secret_env::{read_secret_file, secret_var};
 use crate::utils::settings::Settings;
 use client::{
     AuthMethod, BrowserConfig, BrowserLaunch, Error as ClientError, KeyPairConfig, Row,
@@ -71,6 +73,10 @@ const ENV_AUTHENTICATOR: &str = "SNOWFLAKE_AUTHENTICATOR";
 /// Env var for the programmatic access token (PAT auth).
 const ENV_TOKEN: &str = "SNOWFLAKE_TOKEN";
 /// Env var for the path to an unencrypted PKCS#8 PEM private key (JWT auth).
+/// It predates the `SNOWFLAKE_PRIVATE_KEY_FILE` convention (ADR-0089), so it
+/// is kept as an alias that outranks it, and is read through
+/// [`read_secret_file`] so it gets the same absolute-path, owner-only and
+/// ownership checks.
 const ENV_PRIVATE_KEY_PATH: &str = "SNOWFLAKE_PRIVATE_KEY_PATH";
 /// Env var for an inline unencrypted PKCS#8 PEM private key (alternative to the
 /// path).
@@ -189,18 +195,19 @@ impl SnowflakeEngineConfig {
                 .filter(|&n| n >= 1)
                 .map(Duration::from_secs)
         };
-        let private_key_pem = match settings.get_env_var(ENV_PRIVATE_KEY_PATH) {
-            Some(path) => Some(
-                std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading {ENV_PRIVATE_KEY_PATH} '{path}'"))?,
-            ),
-            None => settings.get_env_var(ENV_PRIVATE_KEY),
+        let secrets = settings.env_source();
+        let private_key_pem = match settings
+            .get_env_var(ENV_PRIVATE_KEY_PATH)
+            .filter(|p| !p.is_empty())
+        {
+            Some(path) => Some(read_secret_file(ENV_PRIVATE_KEY_PATH, Path::new(&path))?),
+            None => secret_var(&secrets, ENV_PRIVATE_KEY)?,
         };
         let auth = resolve_auth_method(
             settings.get_env_var(ENV_AUTHENTICATOR).as_deref(),
             settings.get_env_var(ENV_BROWSER_COMMAND),
-            settings.get_env_var(ENV_TOKEN),
-            private_key_pem,
+            secret_var(&secrets, ENV_TOKEN)?.map(|t| t.expose_secret().to_string()),
+            private_key_pem.map(|k| k.expose_secret().to_string()),
             settings.get_env_var(ENV_PRIVATE_KEY_PASSPHRASE),
         )?;
         Ok(Self {
@@ -285,7 +292,10 @@ fn resolve_auth_method(
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty())
                 .ok_or_else(|| {
-                    anyhow!("{ENV_AUTHENTICATOR}={selector} requires {ENV_TOKEN} to be set")
+                    anyhow!(
+                        "{ENV_AUTHENTICATOR}={selector} requires {ENV_TOKEN} (or \
+                         {ENV_TOKEN}_FILE) to be set"
+                    )
                 })?;
             Ok(AuthMethod::ProgrammaticAccessToken {
                 token: Secret::from(token),
@@ -303,8 +313,8 @@ fn resolve_auth_method(
                 .filter(|k| !k.trim().is_empty())
                 .ok_or_else(|| {
                     anyhow!(
-                        "{ENV_AUTHENTICATOR}={selector} requires {ENV_PRIVATE_KEY_PATH} or \
-                         {ENV_PRIVATE_KEY}"
+                        "{ENV_AUTHENTICATOR}={selector} requires {ENV_PRIVATE_KEY_PATH}, \
+                         {ENV_PRIVATE_KEY}_FILE or {ENV_PRIVATE_KEY}"
                     )
                 })?;
             Ok(AuthMethod::KeyPairJwt(KeyPairConfig {

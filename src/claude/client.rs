@@ -17,6 +17,7 @@ use crate::data::{
     context::CommitContext,
     RepositoryView, RepositoryViewForAI,
 };
+use crate::utils::secret_env::{secret_var, secret_var_any};
 
 /// Returned when the full diff does not fit the token budget.
 ///
@@ -813,11 +814,13 @@ impl ClaudeClient {
     /// Creates a new Claude client with API key from environment variables.
     pub fn from_env(model: String) -> Result<Self> {
         // Try to get API key from environment variables
-        let api_key = std::env::var("CLAUDE_API_KEY")
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .map_err(|_| ClaudeError::ApiKeyNotFound)?;
+        let api_key = secret_var_any(
+            &crate::utils::env::SystemEnv,
+            &["CLAUDE_API_KEY", "ANTHROPIC_API_KEY"],
+        )?
+        .ok_or(ClaudeError::ApiKeyNotFound)?;
 
-        let ai_client = ClaudeAiClient::new(model, api_key, None)?;
+        let ai_client = ClaudeAiClient::new(model, api_key.expose_secret().to_string(), None)?;
         Ok(Self::new(Box::new(ai_client)))
     }
 
@@ -1942,23 +1945,24 @@ pub(crate) async fn create_default_claude_client_with(
             debug!("Creating OpenAI client");
             warn_beta_header_ignored(AiBackend::OpenAi, beta_header.as_ref());
 
-            let api_key = env
-                .var_any(&["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"])
+            let api_key = secret_var_any(env, &["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"])?
                 .ok_or_else(|| {
                     debug!("Failed to get OpenAI API key");
                     ClaudeError::ApiKeyNotFound
                 })?;
             debug!("OpenAI API key found");
 
-            let ai_client = OpenAiAiClient::new_openai(model, api_key, None)?;
+            let ai_client =
+                OpenAiAiClient::new_openai(model, api_key.expose_secret().to_string(), None)?;
             debug!("OpenAI client created successfully");
             Box::new(ai_client)
         }
         AiBackend::Bedrock => {
             validate_beta_header(&model, &beta_header)?;
-            let auth_token = env
-                .var("ANTHROPIC_AUTH_TOKEN")
-                .ok_or(ClaudeError::ApiKeyNotFound)?;
+            let auth_token = secret_var(env, "ANTHROPIC_AUTH_TOKEN")?
+                .ok_or(ClaudeError::ApiKeyNotFound)?
+                .expose_secret()
+                .to_string();
 
             let base_url = env
                 .var("ANTHROPIC_BEDROCK_BASE_URL")
@@ -1974,15 +1978,18 @@ pub(crate) async fn create_default_claude_client_with(
         AiBackend::Default => {
             debug!("Creating direct Claude API client");
             validate_beta_header(&model, &beta_header)?;
-            let api_key = env
-                .var_any(&[
+            let api_key = secret_var_any(
+                env,
+                &[
                     "CLAUDE_API_KEY",
                     "ANTHROPIC_API_KEY",
                     "ANTHROPIC_AUTH_TOKEN",
-                ])
-                .ok_or(ClaudeError::ApiKeyNotFound)?;
+                ],
+            )?
+            .ok_or(ClaudeError::ApiKeyNotFound)?;
 
-            let ai_client = ClaudeAiClient::new(model, api_key, beta_header)?;
+            let ai_client =
+                ClaudeAiClient::new(model, api_key.expose_secret().to_string(), beta_header)?;
             debug!("Claude client created successfully");
             Box::new(ai_client)
         }

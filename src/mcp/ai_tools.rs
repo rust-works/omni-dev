@@ -296,6 +296,12 @@ mod tests {
         "OLLAMA_BASE_URL",
         "ANTHROPIC_MODEL",
         "HOME",
+        // `_FILE` companions (ADR-0089), so an exported one cannot leak in.
+        "CLAUDE_API_KEY_FILE",
+        "ANTHROPIC_API_KEY_FILE",
+        "ANTHROPIC_AUTH_TOKEN_FILE",
+        "OPENAI_API_KEY_FILE",
+        "OPENAI_AUTH_TOKEN_FILE",
     ];
 
     fn snapshot_ai_env() -> Vec<(&'static str, Option<String>)> {

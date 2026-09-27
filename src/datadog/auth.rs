@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::datadog::error::DatadogError;
 use crate::utils::env::SystemEnv;
 use crate::utils::secret::Secret;
+use crate::utils::secret_env::{secret_var, secret_var_is_set};
 use crate::utils::settings::{active_profile_from, Settings};
 
 /// Environment variable / settings key for the Datadog API key.
@@ -95,12 +96,8 @@ pub fn load_credentials() -> Result<DatadogCredentials> {
 pub(crate) fn load_credentials_with(
     env: &impl crate::utils::env::EnvSource,
 ) -> Result<DatadogCredentials> {
-    let api_key = env
-        .var(DATADOG_API_KEY)
-        .ok_or(DatadogError::CredentialsNotFound)?;
-    let app_key = env
-        .var(DATADOG_APP_KEY)
-        .ok_or(DatadogError::CredentialsNotFound)?;
+    let api_key = secret_var(env, DATADOG_API_KEY)?.ok_or(DatadogError::CredentialsNotFound)?;
+    let app_key = secret_var(env, DATADOG_APP_KEY)?.ok_or(DatadogError::CredentialsNotFound)?;
     let site = env
         .var(DATADOG_SITE)
         .map(|s| normalize_site(&s))
@@ -112,8 +109,8 @@ pub(crate) fn load_credentials_with(
     }
 
     Ok(DatadogCredentials {
-        api_key: api_key.into(),
-        app_key: app_key.into(),
+        api_key,
+        app_key,
         site,
     })
 }
@@ -157,8 +154,8 @@ pub fn status() -> AuthStatus {
 /// Tests pass a pure `MapEnv` to report presence without mutating the process
 /// environment or `HOME` (issue #1030).
 pub(crate) fn status_with(env: &impl crate::utils::env::EnvSource) -> AuthStatus {
-    let has_api_key = env.var(DATADOG_API_KEY).is_some();
-    let has_app_key = env.var(DATADOG_APP_KEY).is_some();
+    let has_api_key = secret_var_is_set(env, DATADOG_API_KEY);
+    let has_app_key = secret_var_is_set(env, DATADOG_APP_KEY);
     let site = env
         .var(DATADOG_SITE)
         .map(|s| normalize_site(&s))
@@ -332,6 +329,17 @@ mod tests {
     // ── Env-parsing boundary tests (injected, no process-env mutation) ──
 
     use crate::test_support::env::MapEnv;
+
+    #[test]
+    fn keys_can_come_from_files_and_count_as_present() {
+        let (_dir, path) = crate::test_support::env::secret_file("app-from-file\n");
+        let env = MapEnv::new()
+            .with(DATADOG_API_KEY, "api")
+            .with("DATADOG_APP_KEY_FILE", &path);
+        let creds = load_credentials_with(&env).unwrap();
+        assert_eq!(creds.app_key.expose_secret(), "app-from-file");
+        assert!(status_with(&env).scopes[0].has_app_key);
+    }
 
     #[test]
     fn status_reports_all_false_when_nothing_configured() {

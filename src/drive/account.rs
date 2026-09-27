@@ -22,6 +22,7 @@ use serde::Serialize;
 
 use crate::drive::auth::{DRIVE_CLIENT_ID, DRIVE_CLIENT_SECRET, DRIVE_REFRESH_TOKEN};
 use crate::utils::env::EnvSource;
+use crate::utils::secret_env::secret_var_is_set;
 use crate::utils::settings::DriveSettings;
 
 /// Selects the active Drive account for every command, mirroring
@@ -128,8 +129,8 @@ pub fn resolve_account_for_write<E: EnvSource>(
 /// process environment (rule 1 of [`resolve_account`]).
 fn has_literal_credentials<E: EnvSource>(raw: &E) -> bool {
     raw.var(DRIVE_CLIENT_ID).is_some()
-        && raw.var(DRIVE_CLIENT_SECRET).is_some()
-        && raw.var(DRIVE_REFRESH_TOKEN).is_some()
+        && secret_var_is_set(raw, DRIVE_CLIENT_SECRET)
+        && secret_var_is_set(raw, DRIVE_REFRESH_TOKEN)
 }
 
 /// Validates that `name` is a known Drive account.

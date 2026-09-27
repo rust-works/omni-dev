@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::atlassian::error::AtlassianError;
 use crate::utils::env::SystemEnv;
 use crate::utils::secret::Secret;
+use crate::utils::secret_env::{secret_var, secret_var_is_set};
 use crate::utils::settings::{active_profile_from, Settings};
 
 /// Environment variable / settings key for the Atlassian instance URL.
@@ -78,8 +79,7 @@ pub fn load_credentials_with_instance(
     let email = settings
         .get_env_var(ATLASSIAN_EMAIL)
         .ok_or(AtlassianError::CredentialsNotFound)?;
-    let api_token = settings
-        .get_env_var(ATLASSIAN_API_TOKEN)
+    let api_token = secret_var(&settings.env_source(), ATLASSIAN_API_TOKEN)?
         .ok_or(AtlassianError::CredentialsNotFound)?;
 
     // Normalize: strip trailing slash from instance URL
@@ -88,7 +88,7 @@ pub fn load_credentials_with_instance(
     Ok(AtlassianCredentials {
         instance_url,
         email,
-        api_token: api_token.into(),
+        api_token,
     })
 }
 
@@ -134,7 +134,7 @@ pub fn status() -> AuthStatus {
         .get_env_var(ATLASSIAN_INSTANCE_URL)
         .map(|v| v.trim_end_matches('/').to_string());
     let has_email = settings.get_env_var(ATLASSIAN_EMAIL).is_some();
-    let has_token = settings.get_env_var(ATLASSIAN_API_TOKEN).is_some();
+    let has_token = secret_var_is_set(&settings.env_source(), ATLASSIAN_API_TOKEN);
 
     AuthStatus {
         scopes: vec![AtlassianScopeStatus {

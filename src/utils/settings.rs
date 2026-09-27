@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::utils::env::{EnvSource, SystemEnv};
+use crate::utils::secret_env;
 
 /// Where a resolved environment value came from, for provenance reporting
 /// (issue #1143).
@@ -458,6 +459,32 @@ impl EnvSource for SettingsEnv {
         self.settings
             .resolve_with(&SystemEnv, self.active_profile.as_deref(), key)
     }
+
+    fn var_pair(&self, key: &str, file_key: &str) -> (Option<String>, Option<String>) {
+        self.settings
+            .resolve_pair_with(&SystemEnv, self.active_profile.as_deref(), key, file_key)
+    }
+}
+
+/// A borrowed [`SettingsEnv`]: the settings/profile fallback over an
+/// already-loaded [`Settings`], for callers that keep using the `Settings`
+/// afterwards. Built by [`Settings::env_source`].
+#[derive(Debug)]
+pub struct SettingsEnvRef<'a> {
+    settings: &'a Settings,
+    active_profile: Option<String>,
+}
+
+impl EnvSource for SettingsEnvRef<'_> {
+    fn var(&self, key: &str) -> Option<String> {
+        self.settings
+            .resolve_with(&SystemEnv, self.active_profile.as_deref(), key)
+    }
+
+    fn var_pair(&self, key: &str, file_key: &str) -> (Option<String>, Option<String>) {
+        self.settings
+            .resolve_pair_with(&SystemEnv, self.active_profile.as_deref(), key, file_key)
+    }
 }
 
 /// Process-wide de-duplication for [`Settings::load_or_warn_default`]'s
@@ -494,6 +521,11 @@ impl LoadWarnDedup {
 }
 
 static LOAD_WARN_DEDUP: LoadWarnDedup = LoadWarnDedup::new();
+
+/// Whether `key` is a registered secret, so it has a `_FILE` companion.
+fn is_secret_env_var(key: &str) -> bool {
+    secret_env::SECRET_ENV_VARS.contains(&key)
+}
 
 impl Settings {
     /// Loads settings from the default location.
@@ -589,6 +621,45 @@ impl Settings {
             .map(|(value, _)| value)
     }
 
+    /// Resolves `key` and `file_key` **as a pair from one layer**, for the
+    /// secret resolver ([`crate::utils::secret_env`], ADR-0089): the raw
+    /// environment's pair if it sets either (even to an empty value, which
+    /// neutralises the lower layers exactly as [`Settings::resolve_with`]
+    /// does); otherwise the active profile's `env` pair, or the base `env`
+    /// pair when no profile is active. So `NAME_FILE` in the process env
+    /// overrides `NAME` in settings.json, while both in one layer is left for
+    /// the resolver to reject.
+    pub fn resolve_pair_with<E: EnvSource>(
+        &self,
+        raw: &E,
+        active: Option<&str>,
+        key: &str,
+        file_key: &str,
+    ) -> (Option<String>, Option<String>) {
+        let raw_pair = (raw.var(key), raw.var(file_key));
+        if raw_pair.0.is_some() || raw_pair.1.is_some() {
+            return raw_pair;
+        }
+        let layer = match active {
+            Some(name) => self.profiles.get(name).map(|p| &p.env),
+            None => Some(&self.env),
+        };
+        layer.map_or((None, None), |env| {
+            (env.get(key).cloned(), env.get(file_key).cloned())
+        })
+    }
+
+    /// An [`EnvSource`] over these settings with the process environment in
+    /// front and the active profile read from `OMNI_DEV_PROFILE` — the
+    /// borrowed form of [`SettingsEnv`], for the secret resolver.
+    #[must_use]
+    pub fn env_source(&self) -> SettingsEnvRef<'_> {
+        SettingsEnvRef {
+            settings: self,
+            active_profile: active_profile_from(&SystemEnv),
+        }
+    }
+
     /// Like [`Settings::resolve_with`], but also reports which layer supplied
     /// the value: the raw process environment, the active profile's `env`, or
     /// the base `env` (issue #1143). Same precedence, same profile isolation.
@@ -653,6 +724,12 @@ impl Settings {
                 (*key).to_string(),
                 serde_json::Value::String((*value).to_string()),
             );
+            // A registered secret's `_FILE` companion in the same map would
+            // make every later read a same-layer conflict (ADR-0089), so the
+            // value just written replaces it.
+            if is_secret_env_var(key) {
+                env.remove(&secret_env::file_var_name(key));
+            }
         }
 
         write_settings(path, &settings_value)
@@ -684,6 +761,11 @@ impl Settings {
         if let Some(env) = env_object_mut(&mut settings_value, profile) {
             for key in keys {
                 if env.remove(*key).is_some() {
+                    removed = true;
+                }
+                // Logging out must not leave a registered secret still
+                // resolvable through its `_FILE` companion (ADR-0089).
+                if is_secret_env_var(key) && env.remove(&secret_env::file_var_name(key)).is_some() {
                     removed = true;
                 }
             }
@@ -1277,6 +1359,147 @@ mod tests {
             settings.resolve_with(&raw, Some("nope"), "ATLASSIAN_EMAIL"),
             None
         );
+    }
+
+    // ── pair resolution (issue #2006: NAME / NAME_FILE per layer) ──
+
+    #[test]
+    fn upsert_of_a_secret_replaces_its_file_companion_in_the_same_map() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"env": {"DATADOG_API_KEY_FILE": "/run/k", "OTHER_FILE": "/keep"},
+                "profiles": {"work": {"env": {"DATADOG_API_KEY_FILE": "/w"}}}}"#,
+        )
+        .unwrap();
+
+        Settings::upsert_env_vars_in(&path, None, &[("DATADOG_API_KEY", "v")]).unwrap();
+
+        let val = read_json(&path);
+        assert_eq!(val["env"]["DATADOG_API_KEY"], "v");
+        assert!(val["env"].get("DATADOG_API_KEY_FILE").is_none());
+        // Non-secret keys and other maps are untouched.
+        assert_eq!(val["env"]["OTHER_FILE"], "/keep");
+        assert_eq!(val["profiles"]["work"]["env"]["DATADOG_API_KEY_FILE"], "/w");
+    }
+
+    #[test]
+    fn remove_of_a_secret_also_removes_its_file_companion() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"env": {"DATADOG_API_KEY_FILE": "/run/k"}}"#).unwrap();
+
+        assert!(Settings::remove_env_vars_in(&path, None, &["DATADOG_API_KEY"]).unwrap());
+        assert!(read_json(&path)["env"]
+            .get("DATADOG_API_KEY_FILE")
+            .is_none());
+    }
+
+    fn settings_with_env(base: &[(&str, &str)], work: &[(&str, &str)]) -> Settings {
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect::<HashMap<_, _>>()
+        };
+        let mut profiles = HashMap::new();
+        profiles.insert("work".to_string(), Profile { env: map(work) });
+        Settings {
+            env: map(base),
+            profiles,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn resolve_pair_takes_the_process_env_pair_over_settings() {
+        // `NAME_FILE` in the process env beats `NAME` in settings.json: the
+        // layers never mix, so this is not a conflict.
+        let settings = settings_with_env(&[("K", "from-settings")], &[]);
+        let raw = MapEnv::new().with("K_FILE", "/run/k");
+        assert_eq!(
+            settings.resolve_pair_with(&raw, None, "K", "K_FILE"),
+            (None, Some("/run/k".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_pair_falls_back_to_one_settings_layer_as_a_pair() {
+        let settings = settings_with_env(&[("K", "v"), ("K_FILE", "/f")], &[("K_FILE", "/w")]);
+        let raw = MapEnv::new();
+        // Both in the base layer come back together (the resolver rejects it).
+        assert_eq!(
+            settings.resolve_pair_with(&raw, None, "K", "K_FILE"),
+            (Some("v".to_string()), Some("/f".to_string()))
+        );
+        // A profile replaces the base layer entirely.
+        assert_eq!(
+            settings.resolve_pair_with(&raw, Some("work"), "K", "K_FILE"),
+            (None, Some("/w".to_string()))
+        );
+        assert_eq!(
+            settings.resolve_pair_with(&raw, Some("nope"), "K", "K_FILE"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn resolve_pair_empty_process_env_value_neutralises_settings() {
+        // Matches `resolve_with`: an exported `K=` shadows the settings layer.
+        let settings = settings_with_env(&[("K", "from-settings")], &[]);
+        let raw = MapEnv::new().with("K", "");
+        assert_eq!(
+            settings.resolve_pair_with(&raw, None, "K", "K_FILE"),
+            (Some(String::new()), None)
+        );
+    }
+
+    #[test]
+    fn secret_resolver_over_settings_layers() {
+        use crate::utils::secret_env::{secret_var, SecretEnvError};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, "from-file\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let path = path.to_str().unwrap();
+
+        struct Layered<'a>(&'a Settings, MapEnv);
+        impl EnvSource for Layered<'_> {
+            fn var(&self, key: &str) -> Option<String> {
+                self.0.resolve_with(&self.1, None, key)
+            }
+            fn var_pair(&self, key: &str, file_key: &str) -> (Option<String>, Option<String>) {
+                self.0.resolve_pair_with(&self.1, None, key, file_key)
+            }
+        }
+
+        // Env file overrides a settings value.
+        let settings = settings_with_env(&[("DATADOG_API_KEY", "from-settings")], &[]);
+        let env = Layered(&settings, MapEnv::new().with("DATADOG_API_KEY_FILE", path));
+        let got = secret_var(&env, "DATADOG_API_KEY").unwrap().unwrap();
+        assert_eq!(got.expose_secret(), "from-file");
+
+        // A settings `_FILE` works on its own.
+        let settings = settings_with_env(&[("DATADOG_API_KEY_FILE", path)], &[]);
+        let env = Layered(&settings, MapEnv::new());
+        let got = secret_var(&env, "DATADOG_API_KEY").unwrap().unwrap();
+        assert_eq!(got.expose_secret(), "from-file");
+
+        // Both in settings is a conflict.
+        let settings = settings_with_env(
+            &[("DATADOG_API_KEY", "v"), ("DATADOG_API_KEY_FILE", path)],
+            &[],
+        );
+        let env = Layered(&settings, MapEnv::new());
+        assert!(matches!(
+            secret_var(&env, "DATADOG_API_KEY").unwrap_err(),
+            SecretEnvError::Conflict { .. }
+        ));
     }
 
     // ── sourced resolution (issue #1143: provenance for warnings) ──
