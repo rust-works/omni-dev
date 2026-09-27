@@ -340,12 +340,25 @@ fn render_sort_specs(specs: &[crate::drive::sheets::types::SortSpec]) -> String 
 }
 
 /// Renders a filter view's criteria map as `"1: [Foo, Bar]"`.
+///
+/// Skips a column whose criteria are empty: Sheets keeps a reset column's
+/// key as `{}` rather than dropping it (issue #1931), and it filters
+/// nothing. A criterion this crate doesn't model (a `condition`, say) is
+/// named after its values, so the column still reads as filtered.
 fn render_criteria(
     criteria: &std::collections::BTreeMap<String, crate::drive::sheets::types::FilterCriteria>,
 ) -> String {
     criteria
         .iter()
-        .map(|(col, c)| format!("{col}: [{}]", c.hidden_values.join(", ")))
+        .filter(|(_, c)| !c.is_empty())
+        .map(|(col, c)| {
+            let mut rendered = format!("{col}: [{}]", c.hidden_values.join(", "));
+            for key in c.extra.keys() {
+                rendered.push_str(" +");
+                rendered.push_str(key);
+            }
+            rendered
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -419,11 +432,20 @@ mod tests {
         let mut criteria = std::collections::BTreeMap::new();
         criteria.insert(
             "1".to_string(),
-            FilterCriteria {
-                hidden_values: vec!["Foo".to_string(), "Bar".to_string()],
-            },
+            FilterCriteria::hiding(vec!["Foo".to_string(), "Bar".to_string()]),
         );
         assert_eq!(render_criteria(&criteria), "1: [Foo, Bar]");
+    }
+
+    #[test]
+    fn render_criteria_skips_reset_columns_and_names_unmodelled_ones() {
+        let mut criteria = std::collections::BTreeMap::new();
+        criteria.insert("0".to_string(), FilterCriteria::default());
+        criteria.insert(
+            "2".to_string(),
+            serde_json::from_value(serde_json::json!({"condition": {"type": "BLANK"}})).unwrap(),
+        );
+        assert_eq!(render_criteria(&criteria), "2: [] +condition");
     }
 
     fn test_credentials() -> DriveCredentials {

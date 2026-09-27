@@ -1666,6 +1666,11 @@ pub struct DeleteProtectedRangeRequest {
 /// `BooleanCondition` vocabulary `validation.rs` curates for data
 /// validation; that is a documented cut for this issue, not a silent gap —
 /// see `filter.rs`'s module docs.
+///
+/// The unmodelled fields a column read back from Sheets may carry
+/// (`condition`, `visibleBackgroundColorStyle`, …) are kept in
+/// [`Self::extra`] rather than dropped, so a filter view `update-filter-view`
+/// re-creates wholesale (issue #1931) keeps them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FilterCriteria {
     /// Values to hide in this column.
@@ -1675,6 +1680,31 @@ pub struct FilterCriteria {
         rename = "hiddenValues"
     )]
     pub hidden_values: Vec<String>,
+    /// Every other `FilterCriteria` field this crate doesn't model,
+    /// preserved verbatim across a read-then-write cycle — the same
+    /// `flatten` technique as [`ChartSpec::extra`].
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl FilterCriteria {
+    /// A criterion hiding exactly `hidden_values`, with nothing unmodelled.
+    #[must_use]
+    pub fn hiding(hidden_values: Vec<String>) -> Self {
+        Self {
+            hidden_values,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    /// A criterion that hides nothing: no hidden values and no unmodelled
+    /// condition. This is what Sheets leaves behind for a column whose
+    /// criteria were reset with `{}` — it keeps the column key, so a read
+    /// back returns `"1": {}` rather than dropping the entry (issue #1931).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hidden_values.is_empty() && self.extra.is_empty()
+    }
 }
 
 /// Sort direction within a [`SortSpec`].
@@ -1746,8 +1776,10 @@ pub struct ClearBasicFilterRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FilterView {
     /// The server-assigned stable id. Absent on an `add-filter-view`
-    /// request this crate is building; always present on one read back or
-    /// on an `update-filter-view`/`delete-filter-view` request.
+    /// request this crate is building; always present on one read back.
+    /// `update-filter-view` also sets it on the `addFilterView` half of
+    /// the delete-and-re-add it uses to remove sort columns, which Sheets
+    /// honours, so the view keeps its id (issue #1931).
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -1777,22 +1809,53 @@ pub struct AddFilterViewRequest {
     pub filter: FilterView,
 }
 
-/// `UpdateFilterViewRequest`.
+/// The body of an `updateFilterView` request: every field but the id is
+/// optional, present exactly when [`UpdateFilterViewRequest::fields`] names
+/// it (issue #1931).
 ///
-/// Reuses [`FilterView`] itself, unlike `update-protection`'s
-/// `ProtectedRangeUpdate` split: every field here (`title`/`range`/
-/// `sortSpecs`/`criteria`) is independently updatable, and `filter_view_id`
-/// must be set to select the target, so there is no "response-only field a
-/// caller could accidentally overwrite" hazard to guard against.
+/// Deliberately not [`FilterView`]: that type skips an *empty*
+/// `sortSpecs`/`criteria` on the wire, which is right for an add or a
+/// read-back but let an update name a field in its mask while sending no
+/// value for it. Here presence is an `Option`, so a masked field is always
+/// in the body, even when empty.
+///
+/// **Sheets merges these, it never replaces them** (live-verified for issue
+/// #1931): the sent `sortSpecs` go first, followed by every existing entry
+/// for a column not sent; `criteria` merges per column; an empty
+/// `sortSpecs: []`/`criteria: {}` changes nothing, even with
+/// `fields: "*"`. So `filter.rs::build_update` sends only what that merge
+/// turns into the intended result, and removes a sort column by
+/// re-creating the view instead.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct FilterViewUpdate {
+    /// Which filter view to change.
+    #[serde(rename = "filterViewId")]
+    pub filter_view_id: i64,
+    /// The new title, when changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The new filtered range, when changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<GridRange>,
+    /// The complete resulting sort order, when changing it. It always
+    /// names every column the view already sorts by, so the server's merge
+    /// yields exactly this list.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "sortSpecs")]
+    pub sort_specs: Option<Vec<SortSpec>>,
+    /// The criteria columns to change, when changing any: each one replaces
+    /// that column's criteria wholesale, and a column absent here is left
+    /// alone. `{}` resets a column (see [`FilterCriteria::is_empty`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub criteria: Option<BTreeMap<String, FilterCriteria>>,
+}
+
+/// `UpdateFilterViewRequest`.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct UpdateFilterViewRequest {
     /// The properties to write. `filter_view_id` selects the target.
-    pub filter: FilterView,
-    /// The field mask limiting what this request may change. Sheets
-    /// replaces `sortSpecs`/`criteria` wholesale when named, never merging
-    /// per-entry — `filter.rs` computes the full resulting state
-    /// client-side before sending, the same way `protection.rs` does for
-    /// `editors`.
+    pub filter: FilterViewUpdate,
+    /// The field mask limiting what this request may change. Names exactly
+    /// the fields [`FilterViewUpdate`] carries a value for.
     pub fields: String,
 }
 
@@ -2915,7 +2978,7 @@ pub struct AddBandingRequest {
 
 /// `UpdateBandingRequest`.
 ///
-/// Reuses [`BandedRange`] itself, like `UpdateFilterViewRequest`: every
+/// Reuses [`BandedRange`] itself: every
 /// field here (`range`/`rowProperties`/`columnProperties`) is
 /// independently updatable, and `banded_range_id` must be set to select the
 /// target.

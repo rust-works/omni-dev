@@ -70,12 +70,17 @@ use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
     AddFilterViewRequest, BasicFilter, BatchUpdateRequestItem, ClearBasicFilterRequest,
-    DeleteFilterViewRequest, FilterCriteria, FilterView, GridRange, SetBasicFilterRequest,
-    SortOrder, SortSpec, Spreadsheet, UpdateFilterViewRequest,
+    DeleteFilterViewRequest, FilterCriteria, FilterView, FilterViewUpdate, GridRange,
+    SetBasicFilterRequest, SortOrder, SortSpec, Spreadsheet, UpdateFilterViewRequest,
 };
 use crate::drive::types::SheetTargetRefusal;
 use crate::drive::write_gate::{self, DecidingRule, DriveOperation, FolderPermissionRule};
 use crate::request_log::{self, DriveMutationOutcome};
+
+/// Appended to `update-filter-view`'s summary when the change is sent as a
+/// re-creation ([`FilterViewWrite::Replace`]).
+const REPLACE_NOTE: &str = " — re-created under the same id, since Sheets cannot remove a \
+     sort column in place";
 
 /// The gate for every verb that only changes view state.
 const GATE_STRUCTURE_ONLY: &[DriveOperation] = &[DriveOperation::SheetsStructure];
@@ -528,7 +533,44 @@ async fn filter_inner(
         | FilterVerb::AddFilterView { .. } => None,
     };
 
-    let summary = describe_effect(&opts.verb);
+    // `update-filter-view`'s write is decided here, before the dry-run
+    // return, because it can refuse (a re-creation with no range to
+    // re-create over) and because a re-creation is worth saying in the
+    // preview. It only merges onto the already-fetched view, so it costs
+    // no call.
+    let update_write = match &opts.verb {
+        FilterVerb::UpdateFilterView {
+            filter_view_id,
+            title,
+            clear_sort,
+            clear_criteria,
+            ..
+        } => {
+            let Some(existing) = existing else {
+                // omni-dev: coverage ignore-line reason="find_existing_filter_view returns Some for UpdateFilterView or has already returned RefusedFilterViewNotFound; this else-arm exists only to unwrap the shared Option"
+                unreachable!("existing is resolved for UpdateFilterView above")
+            };
+            match build_update(
+                existing,
+                *filter_view_id,
+                title,
+                resolved_target,
+                sort_specs.clone(),
+                criteria.clone(),
+                *clear_sort,
+                *clear_criteria,
+            ) {
+                Ok(write) => Some(write),
+                Err(detail) => return gated(FilterResult::RefusedInvalidRange { detail }),
+            }
+        }
+        _ => None,
+    };
+
+    let mut summary = describe_effect(&opts.verb);
+    if matches!(update_write, Some(FilterViewWrite::Replace(_))) {
+        summary.push_str(REPLACE_NOTE);
+    }
     let width_warning = if opts.verb.reorders_rows() {
         resolved_target
             .as_ref()
@@ -544,25 +586,25 @@ async fn filter_inner(
         });
     }
 
-    // Only past the dry-run return does building the actual request do any
-    // work — in particular `update-filter-view`'s merge onto the existing
-    // view's `sort_specs`/`criteria`. Every branch here reuses
-    // `resolved_target` rather than re-parsing `composed_range` a second
-    // time; `resolve_sheet_target` already did that work once, above.
-    let (request, existing_id) = match &opts.verb {
+    // Every branch here reuses `resolved_target` rather than re-parsing
+    // `composed_range` a second time; `resolve_sheet_target` already did
+    // that work once, above.
+    let (requests, existing_id) = match &opts.verb {
         FilterVerb::SetBasicFilter { .. } => {
             let Some(grid) = resolved_target else {
                 // omni-dev: coverage ignore-line reason="resolve_sheet_target returns Some for SetBasicFilter or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
                 unreachable!("resolved_target is resolved for SetBasicFilter above")
             };
             (
-                BatchUpdateRequestItem::SetBasicFilter(SetBasicFilterRequest {
-                    filter: BasicFilter {
-                        range: Some(grid),
-                        sort_specs,
-                        criteria,
+                vec![BatchUpdateRequestItem::SetBasicFilter(
+                    SetBasicFilterRequest {
+                        filter: BasicFilter {
+                            range: Some(grid),
+                            sort_specs,
+                            criteria,
+                        },
                     },
-                }),
+                )],
                 None,
             )
         }
@@ -572,7 +614,9 @@ async fn filter_inner(
                 unreachable!("sheet_id is resolved for ClearBasicFilter above")
             };
             (
-                BatchUpdateRequestItem::ClearBasicFilter(ClearBasicFilterRequest { sheet_id }),
+                vec![BatchUpdateRequestItem::ClearBasicFilter(
+                    ClearBasicFilterRequest { sheet_id },
+                )],
                 None,
             )
         }
@@ -582,48 +626,33 @@ async fn filter_inner(
                 unreachable!("resolved_target is resolved for AddFilterView above")
             };
             (
-                BatchUpdateRequestItem::AddFilterView(AddFilterViewRequest {
-                    filter: FilterView {
-                        filter_view_id: None,
-                        title: title.clone(),
-                        range: Some(grid),
-                        sort_specs,
-                        criteria,
+                vec![BatchUpdateRequestItem::AddFilterView(
+                    AddFilterViewRequest {
+                        filter: FilterView {
+                            filter_view_id: None,
+                            title: title.clone(),
+                            range: Some(grid),
+                            sort_specs,
+                            criteria,
+                        },
                     },
-                }),
+                )],
                 None,
             )
         }
-        FilterVerb::UpdateFilterView {
-            filter_view_id,
-            title,
-            clear_sort,
-            clear_criteria,
-            ..
-        } => {
-            let Some(existing) = existing else {
-                // omni-dev: coverage ignore-line reason="find_existing_filter_view returns Some for UpdateFilterView or has already returned RefusedFilterViewNotFound; this else-arm exists only to unwrap the shared Option"
-                unreachable!("existing is resolved for UpdateFilterView above")
+        FilterVerb::UpdateFilterView { filter_view_id, .. } => {
+            let Some(write) = update_write else {
+                // omni-dev: coverage ignore-line reason="update_write is built for UpdateFilterView above or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
+                unreachable!("update_write is built for UpdateFilterView above")
             };
-            let update = build_update(
-                existing,
-                *filter_view_id,
-                title,
-                resolved_target,
-                sort_specs,
-                criteria,
-                *clear_sort,
-                *clear_criteria,
-            );
-            (
-                BatchUpdateRequestItem::UpdateFilterView(update),
-                Some(*filter_view_id),
-            )
+            (write.into_requests(*filter_view_id), Some(*filter_view_id))
         }
         FilterVerb::DeleteFilterView { filter_view_id } => (
-            BatchUpdateRequestItem::DeleteFilterView(DeleteFilterViewRequest {
-                filter_id: *filter_view_id,
-            }),
+            vec![BatchUpdateRequestItem::DeleteFilterView(
+                DeleteFilterViewRequest {
+                    filter_id: *filter_view_id,
+                },
+            )],
             Some(*filter_view_id),
         ),
     };
@@ -655,7 +684,7 @@ async fn filter_inner(
         leased,
         &lease_grant,
         &files_api,
-        api.batch_update(&opts.spreadsheet_id, vec![request]).await,
+        api.batch_update(&opts.spreadsheet_id, requests).await,
         |err| format!("{err:#}"),
     )
     .await
@@ -759,7 +788,7 @@ fn parse_hidden_values(flags: &[String]) -> Result<BTreeMap<String, FilterCriter
         let hidden_values: Vec<String> = values.split(',').map(str::to_string).collect();
         criteria.insert(
             dimension_index.to_string(),
-            FilterCriteria { hidden_values },
+            FilterCriteria::hiding(hidden_values),
         );
     }
     Ok(criteria)
@@ -889,14 +918,58 @@ fn find_existing_filter_view(
         .ok_or(FilterResult::RefusedFilterViewNotFound { filter_view_id })
 }
 
-/// Builds the `updateFilterView` request, merging onto the existing view's
-/// current `sort_specs`/`criteria` — the full resulting state, since
-/// Sheets' `fields` mask replaces each named field wholesale, never merging
-/// per-entry (the same reasoning as `protection.rs::build_update`'s editor
-/// list). `--clear-sort`/`--clear-criteria` reset to empty first; each
-/// parsed `SortSpec` then replaces any existing entry sharing its
-/// `dimension_index` (else appends), and each parsed criteria column
-/// overwrites that key (else the existing entry survives untouched).
+/// How `update-filter-view` reaches the server (issue #1931).
+///
+/// `updateFilterView` can only *merge* (see [`FilterViewUpdate`]): it has
+/// no way to remove a sort column. So an update that drops one is sent
+/// instead as a delete of the view plus an `addFilterView` carrying the
+/// view's own id and the complete resulting state, in one atomic
+/// `batchUpdate`. Sheets honours the requested id, so the view keeps its
+/// `filterViewId` (live-verified).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilterViewWrite {
+    /// A plain `updateFilterView`.
+    Update(UpdateFilterViewRequest),
+    /// Delete and re-add the view under its own id, with this full state.
+    Replace(FilterView),
+}
+
+impl FilterViewWrite {
+    fn into_requests(self, filter_view_id: i64) -> Vec<BatchUpdateRequestItem> {
+        match self {
+            Self::Update(update) => vec![BatchUpdateRequestItem::UpdateFilterView(update)],
+            Self::Replace(filter) => vec![
+                BatchUpdateRequestItem::DeleteFilterView(DeleteFilterViewRequest {
+                    filter_id: filter_view_id,
+                }),
+                BatchUpdateRequestItem::AddFilterView(AddFilterViewRequest { filter }),
+            ],
+        }
+    }
+}
+
+/// Builds the write for `update-filter-view` from the existing view's
+/// current state.
+///
+/// The resulting sort order is computed client-side: `--clear-sort`
+/// starts from empty, else from the existing order; each parsed `SortSpec`
+/// then replaces any entry sharing its `dimension_index` (else appends).
+/// When that result still names every column the view already sorts by,
+/// it is sent as-is in an `updateFilterView` — Sheets puts the sent list
+/// first and appends the existing columns it doesn't name, so there are
+/// none left over to append. When it drops one (only `--clear-sort` can),
+/// the view is re-created instead ([`FilterViewWrite::Replace`]), since no
+/// `updateFilterView` body removes a sort column.
+///
+/// Criteria merge per column on the server, so an update sends only the
+/// columns that change: each `--hide-values` column, plus — under
+/// `--clear-criteria` — a `{}` reset for every other column the view
+/// currently filters on. A column neither names is left alone rather than
+/// re-sent, so criteria this crate doesn't model survive.
+///
+/// Errors when a re-creation is needed but there is no range to re-create
+/// the view over: the existing view read back with none (it is not bound
+/// to a grid range this crate models) and no `--range` was given.
 #[allow(clippy::too_many_arguments)]
 fn build_update(
     existing: &FilterView,
@@ -907,21 +980,8 @@ fn build_update(
     hide_values: BTreeMap<String, FilterCriteria>,
     clear_sort: bool,
     clear_criteria: bool,
-) -> UpdateFilterViewRequest {
-    let mut fields = Vec::new();
-    let mut update = FilterView {
-        filter_view_id: Some(filter_view_id),
-        ..Default::default()
-    };
-    if let Some(title) = title {
-        update.title = Some(title.clone());
-        fields.push("title");
-    }
-    if let Some(range) = range {
-        update.range = Some(range);
-        fields.push("range");
-    }
-    if clear_sort || !sort_by.is_empty() {
+) -> Result<FilterViewWrite, String> {
+    let sort_specs = (clear_sort || !sort_by.is_empty()).then(|| {
         let mut resulting = if clear_sort {
             Vec::new()
         } else {
@@ -937,25 +997,79 @@ fn build_update(
                 resulting.push(spec);
             }
         }
-        update.sort_specs = resulting;
-        fields.push("sortSpecs");
-    }
-    if clear_criteria || !hide_values.is_empty() {
-        let mut resulting = if clear_criteria {
+        resulting
+    });
+    let removes_sort_column = sort_specs.as_ref().is_some_and(|resulting| {
+        existing.sort_specs.iter().any(|old| {
+            !resulting
+                .iter()
+                .any(|new| new.dimension_index == old.dimension_index)
+        })
+    });
+
+    if removes_sort_column {
+        let range = range.or(existing.range).ok_or_else(|| {
+            format!(
+                "removing a sort column re-creates filter view {filter_view_id}, but it has no \
+                 grid range to re-create it over; pass --sheet/--range"
+            )
+        })?;
+        let mut criteria: BTreeMap<String, FilterCriteria> = if clear_criteria {
             BTreeMap::new()
         } else {
-            existing.criteria.clone()
+            existing
+                .criteria
+                .iter()
+                .filter(|(_, criteria)| !criteria.is_empty())
+                .map(|(col, criteria)| (col.clone(), criteria.clone()))
+                .collect()
         };
-        for (col, criteria) in hide_values {
-            resulting.insert(col, criteria);
-        }
-        update.criteria = resulting;
-        fields.push("criteria");
+        criteria.extend(hide_values);
+        return Ok(FilterViewWrite::Replace(FilterView {
+            filter_view_id: Some(filter_view_id),
+            title: title.clone().or_else(|| existing.title.clone()),
+            range: Some(range),
+            sort_specs: sort_specs.unwrap_or_default(),
+            criteria,
+        }));
     }
-    UpdateFilterViewRequest {
+
+    let criteria = (clear_criteria || !hide_values.is_empty()).then(|| {
+        let mut changes: BTreeMap<String, FilterCriteria> = if clear_criteria {
+            existing
+                .criteria
+                .iter()
+                .filter(|(_, criteria)| !criteria.is_empty())
+                .map(|(col, _)| (col.clone(), FilterCriteria::default()))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        changes.extend(hide_values);
+        changes
+    });
+
+    let update = FilterViewUpdate {
+        filter_view_id,
+        title: title.clone(),
+        range,
+        sort_specs,
+        criteria,
+    };
+    let fields = [
+        ("title", update.title.is_some()),
+        ("range", update.range.is_some()),
+        ("sortSpecs", update.sort_specs.is_some()),
+        ("criteria", update.criteria.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect::<Vec<_>>()
+    .join(",");
+    Ok(FilterViewWrite::Update(UpdateFilterViewRequest {
         filter: update,
-        fields: fields.join(","),
-    }
+        fields,
+    }))
 }
 
 fn added_filter_view_id(
@@ -1373,54 +1487,112 @@ mod tests {
         }
     }
 
+    fn spec(dimension_index: i64, sort_order: SortOrder) -> SortSpec {
+        SortSpec {
+            dimension_index,
+            sort_order,
+        }
+    }
+
+    fn hiding(col: &str, values: &[&str]) -> BTreeMap<String, FilterCriteria> {
+        let mut criteria = BTreeMap::new();
+        criteria.insert(
+            col.to_string(),
+            FilterCriteria::hiding(values.iter().map(|v| (*v).to_string()).collect()),
+        );
+        criteria
+    }
+
+    /// A view shaped like the one the #1931 live probe started from:
+    /// sorted by columns 2 then 3, hiding `b` in column 1.
+    fn sorted_filtered_view(id: i64) -> FilterView {
+        FilterView {
+            filter_view_id: Some(id),
+            title: Some("Old".to_string()),
+            range: Some(GridRange {
+                sheet_id: 0,
+                start_row_index: Some(0),
+                end_row_index: Some(6),
+                start_column_index: Some(0),
+                end_column_index: Some(4),
+            }),
+            sort_specs: vec![
+                spec(2, SortOrder::Descending),
+                spec(3, SortOrder::Descending),
+            ],
+            criteria: hiding("1", &["b"]),
+        }
+    }
+
+    /// The `batchUpdate` `requests` array the write turns into, as JSON —
+    /// what actually reaches the wire, which is where #1931 hid.
+    fn wire(write: FilterViewWrite, filter_view_id: i64) -> serde_json::Value {
+        serde_json::to_value(write.into_requests(filter_view_id)).unwrap()
+    }
+
     #[test]
-    fn build_update_preserves_untouched_criteria_columns() {
+    fn build_update_sends_only_the_changed_criteria_columns() {
         let mut existing = filter_view(3);
-        existing.criteria.insert(
-            "0".to_string(),
-            FilterCriteria {
-                hidden_values: vec!["Keep".to_string()],
-            },
-        );
-        let mut hide_values = BTreeMap::new();
-        hide_values.insert(
-            "1".to_string(),
-            FilterCriteria {
-                hidden_values: vec!["New".to_string()],
-            },
-        );
-        let request = build_update(
+        existing.criteria = hiding("0", &["Keep"]);
+        let write = build_update(
             &existing,
             3,
             &None,
             None,
             Vec::new(),
-            hide_values,
+            hiding("1", &["New"]),
             false,
             false,
-        );
+        )
+        .unwrap();
+        // Sheets merges criteria per column, so column 0 is left out of
+        // the body rather than re-sent — which is also what keeps any
+        // criteria this crate doesn't model on it intact.
         assert_eq!(
-            request.filter.criteria.get("0").unwrap().hidden_values,
-            vec!["Keep".to_string()]
+            wire(write, 3),
+            serde_json::json!([{"updateFilterView": {
+                "fields": "criteria",
+                "filter": {"filterViewId": 3, "criteria": {"1": {"hiddenValues": ["New"]}}},
+            }}])
         );
-        assert_eq!(
-            request.filter.criteria.get("1").unwrap().hidden_values,
-            vec!["New".to_string()]
-        );
-        assert_eq!(request.fields, "criteria");
     }
 
     #[test]
-    fn build_update_clear_criteria_drops_untouched_columns() {
-        let mut existing = filter_view(3);
-        existing.criteria.insert(
-            "0".to_string(),
-            FilterCriteria {
-                hidden_values: vec!["Keep".to_string()],
-            },
-        );
-        let request = build_update(
+    fn build_update_clear_criteria_resets_each_filtered_column_with_an_empty_object() {
+        let mut existing = sorted_filtered_view(3);
+        existing.criteria.extend(hiding("3", &["x"]));
+        // A column an earlier reset left behind as `{}` needs no second
+        // reset.
+        existing
+            .criteria
+            .insert("0".to_string(), FilterCriteria::default());
+        let write = build_update(
             &existing,
+            3,
+            &None,
+            None,
+            Vec::new(),
+            hiding("3", &["y"]),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            wire(write, 3),
+            serde_json::json!([{"updateFilterView": {
+                "fields": "criteria",
+                "filter": {"filterViewId": 3, "criteria": {
+                    "1": {},
+                    "3": {"hiddenValues": ["y"]},
+                }},
+            }}])
+        );
+    }
+
+    #[test]
+    fn build_update_clear_criteria_on_an_unfiltered_view_still_names_the_field() {
+        let write = build_update(
+            &filter_view(3),
             3,
             &None,
             None,
@@ -1428,67 +1600,80 @@ mod tests {
             BTreeMap::new(),
             false,
             true,
+        )
+        .unwrap();
+        assert_eq!(
+            wire(write, 3),
+            serde_json::json!([{"updateFilterView": {
+                "fields": "criteria",
+                "filter": {"filterViewId": 3, "criteria": {}},
+            }}])
         );
-        assert!(request.filter.criteria.is_empty());
-        assert_eq!(request.fields, "criteria");
     }
 
     #[test]
     fn build_update_sort_spec_replaces_matching_column_and_appends_others() {
         let mut existing = filter_view(3);
-        existing.sort_specs = vec![
-            SortSpec {
-                dimension_index: 0,
-                sort_order: SortOrder::Ascending,
-            },
-            SortSpec {
-                dimension_index: 1,
-                sort_order: SortOrder::Ascending,
-            },
-        ];
-        let request = build_update(
+        existing.sort_specs = vec![spec(0, SortOrder::Ascending), spec(1, SortOrder::Ascending)];
+        let write = build_update(
             &existing,
             3,
             &None,
             None,
             vec![
-                SortSpec {
-                    dimension_index: 0,
-                    sort_order: SortOrder::Descending,
-                },
-                SortSpec {
-                    dimension_index: 2,
-                    sort_order: SortOrder::Ascending,
-                },
+                spec(0, SortOrder::Descending),
+                spec(2, SortOrder::Ascending),
             ],
             BTreeMap::new(),
             false,
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(
-            request.filter.sort_specs,
-            vec![
-                SortSpec {
-                    dimension_index: 0,
-                    sort_order: SortOrder::Descending
-                },
-                SortSpec {
-                    dimension_index: 1,
-                    sort_order: SortOrder::Ascending
-                },
-                SortSpec {
-                    dimension_index: 2,
-                    sort_order: SortOrder::Ascending
-                },
-            ]
+            wire(write, 3),
+            serde_json::json!([{"updateFilterView": {
+                "fields": "sortSpecs",
+                "filter": {"filterViewId": 3, "sortSpecs": [
+                    {"dimensionIndex": 0, "sortOrder": "DESCENDING"},
+                    {"dimensionIndex": 1, "sortOrder": "ASCENDING"},
+                    {"dimensionIndex": 2, "sortOrder": "ASCENDING"},
+                ]},
+            }}])
         );
     }
 
     #[test]
-    fn build_update_sets_title_and_field_mask() {
-        let existing = filter_view(3);
-        let request = build_update(
+    fn build_update_sort_by_a_new_column_sends_the_whole_list() {
+        // The issue's non-clear case: `--sort-by 1:asc` on `[2 desc]`.
+        let mut existing = filter_view(3);
+        existing.sort_specs = vec![spec(2, SortOrder::Descending)];
+        let write = build_update(
             &existing,
+            3,
+            &None,
+            None,
+            vec![spec(1, SortOrder::Ascending)],
+            BTreeMap::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            wire(write, 3),
+            serde_json::json!([{"updateFilterView": {
+                "fields": "sortSpecs",
+                "filter": {"filterViewId": 3, "sortSpecs": [
+                    {"dimensionIndex": 2, "sortOrder": "DESCENDING"},
+                    {"dimensionIndex": 1, "sortOrder": "ASCENDING"},
+                ]},
+            }}])
+        );
+    }
+
+    #[test]
+    fn build_update_title_only_sends_no_sort_or_criteria() {
+        let write = build_update(
+            &sorted_filtered_view(3),
             3,
             &Some("New title".to_string()),
             None,
@@ -1496,9 +1681,240 @@ mod tests {
             BTreeMap::new(),
             false,
             false,
+        )
+        .unwrap();
+        assert_eq!(
+            wire(write, 3),
+            serde_json::json!([{"updateFilterView": {
+                "fields": "title",
+                "filter": {"filterViewId": 3, "title": "New title"},
+            }}])
         );
-        assert_eq!(request.filter.title, Some("New title".to_string()));
-        assert_eq!(request.fields, "title");
+    }
+
+    #[test]
+    fn build_update_clear_sort_then_sort_by_recreates_the_view_with_exactly_that_order() {
+        // The issue's second symptom: `--clear-sort --sort-by 0:asc` on
+        // `[2 desc, 3 desc]` came back `[0 asc, 2 desc, 3 desc]`, because
+        // `updateFilterView` merges. Re-creating is the only way to drop 2
+        // and 3.
+        let write = build_update(
+            &sorted_filtered_view(3),
+            3,
+            &None,
+            None,
+            vec![spec(0, SortOrder::Ascending)],
+            BTreeMap::new(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            wire(write, 3),
+            serde_json::json!([
+                {"deleteFilterView": {"filterId": 3}},
+                {"addFilterView": {"filter": {
+                    "filterViewId": 3,
+                    "title": "Old",
+                    "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 6,
+                              "startColumnIndex": 0, "endColumnIndex": 4},
+                    "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "ASCENDING"}],
+                    "criteria": {"1": {"hiddenValues": ["b"]}},
+                }}},
+            ])
+        );
+    }
+
+    #[test]
+    fn build_update_clear_sort_alone_recreates_the_view_with_no_sort() {
+        let write = build_update(
+            &sorted_filtered_view(3),
+            3,
+            &None,
+            None,
+            Vec::new(),
+            BTreeMap::new(),
+            true,
+            false,
+        )
+        .unwrap();
+        let FilterViewWrite::Replace(view) = write else {
+            panic!("expected a re-creation, got {write:?}");
+        };
+        assert!(view.sort_specs.is_empty());
+        assert_eq!(view.criteria, hiding("1", &["b"]));
+        assert_eq!(view.filter_view_id, Some(3));
+    }
+
+    #[test]
+    fn build_update_clear_sort_on_an_unsorted_view_is_a_plain_update() {
+        let mut existing = sorted_filtered_view(3);
+        existing.sort_specs.clear();
+        let write = build_update(
+            &existing,
+            3,
+            &None,
+            None,
+            Vec::new(),
+            BTreeMap::new(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            wire(write, 3),
+            serde_json::json!([{"updateFilterView": {
+                "fields": "sortSpecs",
+                "filter": {"filterViewId": 3, "sortSpecs": []},
+            }}])
+        );
+    }
+
+    #[test]
+    fn build_update_clear_sort_keeping_every_column_reorders_in_place() {
+        // Every existing column is still named, so the server's merge
+        // (sent entries first) yields exactly `[3 desc, 2 asc]` — live-
+        // verified — with no re-creation.
+        let write = build_update(
+            &sorted_filtered_view(3),
+            3,
+            &None,
+            None,
+            vec![
+                spec(3, SortOrder::Descending),
+                spec(2, SortOrder::Ascending),
+            ],
+            BTreeMap::new(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            wire(write, 3),
+            serde_json::json!([{"updateFilterView": {
+                "fields": "sortSpecs",
+                "filter": {"filterViewId": 3, "sortSpecs": [
+                    {"dimensionIndex": 3, "sortOrder": "DESCENDING"},
+                    {"dimensionIndex": 2, "sortOrder": "ASCENDING"},
+                ]},
+            }}])
+        );
+    }
+
+    #[test]
+    fn build_update_recreation_applies_every_other_change_too() {
+        let mut existing = sorted_filtered_view(3);
+        // A reset column and an unmodelled condition, both as a read-back
+        // would carry them.
+        existing
+            .criteria
+            .insert("0".to_string(), FilterCriteria::default());
+        let condition: FilterCriteria = serde_json::from_value(serde_json::json!({
+            "condition": {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "2"}]}
+        }))
+        .unwrap();
+        existing.criteria.insert("2".to_string(), condition.clone());
+        let range = GridRange {
+            sheet_id: 0,
+            start_row_index: Some(0),
+            end_row_index: Some(20),
+            start_column_index: Some(0),
+            end_column_index: Some(4),
+        };
+        let write = build_update(
+            &existing,
+            3,
+            &Some("Renamed".to_string()),
+            Some(range),
+            Vec::new(),
+            hiding("3", &["x"]),
+            true,
+            false,
+        )
+        .unwrap();
+        let mut criteria = hiding("1", &["b"]);
+        criteria.insert("2".to_string(), condition);
+        criteria.extend(hiding("3", &["x"]));
+        assert_eq!(
+            write,
+            FilterViewWrite::Replace(FilterView {
+                filter_view_id: Some(3),
+                title: Some("Renamed".to_string()),
+                range: Some(range),
+                sort_specs: Vec::new(),
+                criteria,
+            })
+        );
+    }
+
+    #[test]
+    fn build_update_recreation_with_clear_criteria_keeps_only_the_new_columns() {
+        let write = build_update(
+            &sorted_filtered_view(3),
+            3,
+            &None,
+            None,
+            Vec::new(),
+            hiding("3", &["x"]),
+            true,
+            true,
+        )
+        .unwrap();
+        let FilterViewWrite::Replace(view) = write else {
+            panic!("expected a re-creation, got {write:?}");
+        };
+        assert_eq!(view.criteria, hiding("3", &["x"]));
+    }
+
+    #[test]
+    fn build_update_recreation_without_a_range_is_refused() {
+        let mut existing = sorted_filtered_view(3);
+        existing.range = None;
+        let detail = build_update(
+            &existing,
+            3,
+            &None,
+            None,
+            Vec::new(),
+            BTreeMap::new(),
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(detail.contains("--sheet/--range"), "{detail}");
+    }
+
+    #[test]
+    fn filter_criteria_keeps_unmodelled_fields_across_a_round_trip() {
+        let json = serde_json::json!({
+            "hiddenValues": ["a"],
+            "condition": {"type": "TEXT_CONTAINS", "values": [{"userEnteredValue": "x"}]},
+        });
+        let criteria: FilterCriteria = serde_json::from_value(json.clone()).unwrap();
+        assert!(!criteria.is_empty());
+        assert_eq!(serde_json::to_value(&criteria).unwrap(), json);
+        assert!(FilterCriteria::default().is_empty());
+        assert_eq!(
+            serde_json::to_value(FilterCriteria::default()).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn add_filter_view_wire_shape_is_unchanged() {
+        let request = AddFilterViewRequest {
+            filter: FilterView {
+                filter_view_id: None,
+                title: Some("T".to_string()),
+                range: sorted_filtered_view(3).range,
+                sort_specs: vec![spec(2, SortOrder::Descending)],
+                criteria: hiding("1", &["b"]),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"filter":{"title":"T","range":{"sheetId":0,"startRowIndex":0,"endRowIndex":6,"startColumnIndex":0,"endColumnIndex":4},"sortSpecs":[{"dimensionIndex":2,"sortOrder":"DESCENDING"}],"criteria":{"1":{"hiddenValues":["b"]}}}}"#
+        );
     }
 
     // ── find_existing_filter_view ───────────────────────────────────────
@@ -2547,10 +2963,11 @@ mod tests {
         .await;
         mount_folder("folder-1").mount(&server).await;
         mount_workbook_with_view_seven().mount(&server).await;
-        // The `fields` mask names every changed field, and the merged
-        // `sortSpecs`/`criteria` carry the existing entries alongside the
-        // new ones — a partial body that would 404 (and so fail the
-        // outcome) if the merge dropped either.
+        // The `fields` mask names every changed field; the merged
+        // `sortSpecs` carry the existing entry alongside the new one, and
+        // `criteria` carries only the changed column, since the server
+        // merges criteria per column (issue #1931) — a partial body that
+        // would 404 (and so fail the outcome) if either were wrong.
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(
                 "/v4/spreadsheets/sheet-1:batchUpdate",
@@ -2568,7 +2985,6 @@ mod tests {
                             {"dimensionIndex": 2, "sortOrder": "DESCENDING"},
                         ],
                         "criteria": {
-                            "0": {"hiddenValues": ["Old"]},
                             "1": {"hiddenValues": ["Closed"]},
                         },
                     },
@@ -2617,6 +3033,176 @@ mod tests {
         // A filter view is identified by its own id, so `sheet_id` stays
         // unset even though a range was resolved to build the request.
         assert_eq!(outcome.sheet_id, None);
+    }
+
+    /// Runs `update-filter-view` against view seven with a mocked
+    /// `batchUpdate` answering `reply`, returning the outcome and the one
+    /// `batchUpdate` body the server received.
+    async fn run_update_on_view_seven(
+        verb: FilterVerb,
+        reply: serde_json::Value,
+    ) -> (FilterOutcome, serde_json::Value) {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_view_seven(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(reply))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb,
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        let body = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.url.path().ends_with(":batchUpdate"))
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .unwrap();
+        (outcome, body)
+    }
+
+    fn update_view_seven(
+        sort_by: &[&str],
+        hide_values: &[&str],
+        clear_sort: bool,
+        clear_criteria: bool,
+    ) -> FilterVerb {
+        FilterVerb::UpdateFilterView {
+            filter_view_id: 7,
+            sheet: None,
+            range: None,
+            title: None,
+            sort_by: sort_by.iter().map(|s| (*s).to_string()).collect(),
+            hide_values: hide_values.iter().map(|s| (*s).to_string()).collect(),
+            clear_sort,
+            clear_criteria,
+        }
+    }
+
+    #[tokio::test]
+    async fn update_filter_view_clear_criteria_sends_an_explicit_reset() {
+        let (outcome, body) = run_update_on_view_seven(
+            update_view_seven(&[], &[], false, true),
+            serde_json::json!({"replies": [{}]}),
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, FilterResult::Changed { .. }),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(
+            body,
+            serde_json::json!({"requests": [{"updateFilterView": {
+                "fields": "criteria",
+                "filter": {"filterViewId": 7, "criteria": {"0": {}}},
+            }}]})
+        );
+    }
+
+    #[tokio::test]
+    async fn update_filter_view_clear_sort_recreates_the_view_under_its_own_id() {
+        let (outcome, body) = run_update_on_view_seven(
+            update_view_seven(&["2:desc"], &[], true, false),
+            serde_json::json!({"replies": [
+                {},
+                {"addFilterView": {"filter": {"filterViewId": 7}}},
+            ]}),
+        )
+        .await;
+        match outcome.result {
+            FilterResult::Changed {
+                filter_view_id,
+                summary,
+                ..
+            } => {
+                assert_eq!(filter_view_id, Some(7));
+                assert_eq!(
+                    summary,
+                    format!("update filter view (clear sort sort 2:desc){REPLACE_NOTE}")
+                );
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+        assert_eq!(
+            body,
+            serde_json::json!({"requests": [
+                {"deleteFilterView": {"filterId": 7}},
+                {"addFilterView": {"filter": {
+                    "filterViewId": 7,
+                    "title": "Old",
+                    "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 10,
+                              "startColumnIndex": 0, "endColumnIndex": 4},
+                    "sortSpecs": [{"dimensionIndex": 2, "sortOrder": "DESCENDING"}],
+                    "criteria": {"0": {"hiddenValues": ["Old"]}},
+                }}},
+            ]})
+        );
+    }
+
+    #[tokio::test]
+    async fn update_filter_view_dry_run_says_when_it_would_recreate_the_view() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_granted_gate_with_view_seven(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let mut opts = unleased_opts(update_view_seven(&[], &[], true, false));
+        opts.dry_run = true;
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            FilterResult::WouldChange { summary, .. } => {
+                assert_eq!(
+                    summary,
+                    format!("update filter view (clear sort){REPLACE_NOTE}")
+                );
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_filter_view_recreation_with_no_range_is_refused_before_any_write() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0},
+             "filterViews": [{
+                 "filterViewId": 7,
+                 "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "ASCENDING"}],
+             }]},
+        ]))
+        .mount(&server)
+        .await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = unleased_opts(update_view_seven(&[], &[], true, false));
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            FilterResult::RefusedInvalidRange { detail } => {
+                assert!(detail.contains("re-creates filter view 7"), "{detail}");
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3094,36 +3680,6 @@ mod tests {
             outcome.result,
             FilterResult::RefusedSheetNotFound { .. }
         ));
-    }
-
-    #[test]
-    fn build_update_clear_sort_discards_the_existing_order_before_merging() {
-        let mut existing = filter_view(3);
-        existing.sort_specs = vec![SortSpec {
-            dimension_index: 0,
-            sort_order: SortOrder::Ascending,
-        }];
-        let request = build_update(
-            &existing,
-            3,
-            &None,
-            None,
-            vec![SortSpec {
-                dimension_index: 2,
-                sort_order: SortOrder::Descending,
-            }],
-            BTreeMap::new(),
-            true,
-            false,
-        );
-        assert_eq!(
-            request.filter.sort_specs,
-            vec![SortSpec {
-                dimension_index: 2,
-                sort_order: SortOrder::Descending,
-            }]
-        );
-        assert_eq!(request.fields, "sortSpecs");
     }
 
     #[tokio::test]
