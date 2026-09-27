@@ -315,6 +315,49 @@ When a command runs, the account it uses is resolved in this order:
    values above, or a clear "not configured, run `drive auth login`"
    error if those are absent too.
 
+### Keeping an account's secrets in files
+
+A named account's `client_secret` and `refresh_token` can live in files
+instead of in `settings.json`. Replace either field with its `_file`
+companion, which holds an absolute path to a file whose contents are the
+secret ([#2008](https://github.com/rust-works/omni-dev/issues/2008)):
+
+```json
+"drive": {
+  "accounts": {
+    "work": {
+      "client_id": "123456789-abc.apps.googleusercontent.com",
+      "client_secret_file": "/Users/me/.secrets/google-oauth-client-secret",
+      "refresh_token_file": "/Users/me/.secrets/drive-work-refresh-token"
+    }
+  }
+}
+```
+
+The file rules are the ones `DRIVE_REFRESH_TOKEN_FILE` uses
+([ADR-0089](adrs/adr-0089.md)). The path must be absolute. The file must be
+a regular file, and either yours and owner-only (`chmod 600`) or owned by
+root and not writable by others. One trailing newline is ignored. Setting a
+field and its `_file` on the same account is an error that names both keys.
+
+When `drive auth login` writes a new secret to an account whose entry already has
+the `_file` field, the value goes **into that file** and the plain field is
+removed from `settings.json`. A file that already holds the same value is
+left alone, so one shared file or a root-owned read-only mount keeps
+working. Any other file is replaced atomically with a new owner-only file.
+Its directory must already exist. Accounts without a `_file` field are
+written exactly as before.
+
+Several accounts that use one Google Cloud OAuth client can point their
+`client_secret_file` at the **same** file, so the secret is kept in one
+place. Rotating it then takes one file write, followed by one
+`drive auth login --account <name>` per account. Each login writes the new
+refresh token into that account's own `refresh_token_file`.
+
+`drive auth logout` removes the account's entry from `settings.json`. It
+does not delete the files the entry named, because they may be shared or
+not yours to delete.
+
 ### Browser profile targeting
 
 With several named accounts, `drive auth login` opening whatever profile

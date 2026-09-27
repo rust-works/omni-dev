@@ -1606,6 +1606,12 @@ its operator guide. A secret-shaped name that genuinely must not accept `_FILE`
 goes in `EXEMPT_SECRET_ENV_VARS` with its reason. Test the call site's `_FILE`
 path with `MapEnv` and `test_support::env::secret_file` (STYLE-0028).
 
+A secret stored as a settings.json field rather than an environment variable
+(a named Drive or Gmail account's `client_secret`/`refresh_token`) gets a
+`<field>_file` companion. Resolve the pair with
+`secret_env::resolve_secret_pair`, labelled with the full settings key, and
+never `.clone()` the plain field into a credential.
+
 ### Motivation
 
 A secret in an environment variable leaks into `env` listings,
