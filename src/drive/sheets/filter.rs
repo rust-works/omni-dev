@@ -1349,18 +1349,7 @@ fn change_lines(
     if !verb.reorders_rows() {
         return vec![summary];
     }
-    let mut lines = Vec::new();
-    if let Some(warning) = width_warning {
-        lines.push(format!("Warning: {warning}"));
-    }
-    lines.push(summary);
-    lines.push(if changed {
-        "  references outside the range may now observe values from a different row".to_string()
-    } else {
-        "  references outside the range may observe values from a different row after sorting"
-            .to_string()
-    });
-    lines
+    grid_range::reorder_caveat_lines("sorting", summary, width_warning, changed, None)
 }
 
 #[cfg(test)]

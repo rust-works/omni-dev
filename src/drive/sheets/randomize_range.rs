@@ -378,18 +378,22 @@ pub fn describe_lines(outcome: &RandomizeRangeOutcome) -> Vec<String> {
         RandomizeRangeResult::WouldChange {
             range,
             width_warning,
-        } => change_lines(
+        } => grid_range::reorder_caveat_lines(
+            "randomizing",
             format!("Would randomize the row order of {range} in {book}"),
             width_warning.as_deref(),
             false,
+            Some(ORDER_CAVEAT),
         ),
         RandomizeRangeResult::Changed {
             range,
             width_warning,
-        } => change_lines(
+        } => grid_range::reorder_caveat_lines(
+            "randomizing",
             format!("Randomized the row order of {range} in {book}"),
             width_warning.as_deref(),
             true,
+            Some(ORDER_CAVEAT),
         ),
         RandomizeRangeResult::RefusedInvalidRequest { detail } => {
             vec![format!("Refused: {detail}")]
@@ -440,22 +444,6 @@ pub fn describe_lines(outcome: &RandomizeRangeOutcome) -> Vec<String> {
             .collect(),
         RandomizeRangeResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
-}
-
-fn change_lines(summary: String, width_warning: Option<&str>, changed: bool) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(warning) = width_warning {
-        lines.push(format!("Warning: {warning}"));
-    }
-    lines.push(summary);
-    lines.push(format!("  {ORDER_CAVEAT}"));
-    lines.push(if changed {
-        "  references outside the range may now observe values from a different row".to_string()
-    } else {
-        "  references outside the range may observe values from a different row after randomizing"
-            .to_string()
-    });
-    lines
 }
 
 #[cfg(test)]

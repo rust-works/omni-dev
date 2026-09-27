@@ -427,25 +427,29 @@ pub fn describe_lines(outcome: &SortRangeOutcome) -> Vec<String> {
             range,
             sort_specs,
             width_warning,
-        } => change_lines(
+        } => grid_range::reorder_caveat_lines(
+            "sorting",
             format!(
                 "Would sort {range} in {book} by {}",
                 render_specs(sort_specs)
             ),
             width_warning.as_deref(),
             false,
+            None,
         ),
         SortRangeResult::Changed {
             range,
             sort_specs,
             width_warning,
-        } => change_lines(
+        } => grid_range::reorder_caveat_lines(
+            "sorting",
             format!(
                 "Applied sort of {range} in {book} by {}",
                 render_specs(sort_specs)
             ),
             width_warning.as_deref(),
             true,
+            None,
         ),
         SortRangeResult::RefusedInvalidRequest { detail } => vec![format!("Refused: {detail}")],
         SortRangeResult::RefusedNotASpreadsheet { mime_type } => vec![format!(
@@ -494,21 +498,6 @@ pub fn describe_lines(outcome: &SortRangeOutcome) -> Vec<String> {
             .collect(),
         SortRangeResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
-}
-
-fn change_lines(summary: String, width_warning: Option<&str>, changed: bool) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(warning) = width_warning {
-        lines.push(format!("Warning: {warning}"));
-    }
-    lines.push(summary);
-    lines.push(if changed {
-        "  references outside the range may now observe values from a different row".to_string()
-    } else {
-        "  references outside the range may observe values from a different row after sorting"
-            .to_string()
-    });
-    lines
 }
 
 fn render_specs(specs: &[SortSpec]) -> String {
