@@ -5200,13 +5200,14 @@ omni-dev drive sheets delete-named-range - Removes a named range. Gated by the f
 
 Removes a named range. Gated by the folder write-permission rules' `sheets-structure` operation — not `sheets-delete`, since a named range is a label, not grid data (issue #1796, ADR-0081 §2). Reports every cell formula that referenced the name before removing it
 
-Usage: delete-named-range [OPTIONS] --name <NAME> <SPREADSHEET_ID>
+Usage: delete-named-range [OPTIONS] <--name <NAME>|--id <ID>> <SPREADSHEET_ID>
 
 Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
 
 Options:
-      --name <NAME>      The existing name to remove, by case-insensitive exact match
+      --name <NAME>      The existing name to remove, by case-insensitive exact match. Mutually exclusive with `--id`
+      --id <ID>          The existing named range's id, by exact match. Mutually exclusive with `--name`. Find it with `drive sheets list-named-ranges`
       --dry-run          Reports the gate verdict and the referencing-formula preview, without calling `spreadsheets.batchUpdate`
       --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
@@ -6382,13 +6383,14 @@ omni-dev drive sheets update-named-range - Changes an existing named range's nam
 
 Changes an existing named range's name and/or the range it covers. Gated by the folder write-permission rules' `sheets-structure` operation (issue #1796)
 
-Usage: update-named-range [OPTIONS] --name <NAME> <SPREADSHEET_ID>
+Usage: update-named-range [OPTIONS] <--name <NAME>|--id <ID>> <SPREADSHEET_ID>
 
 Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
 
 Options:
-      --name <NAME>      The existing name to change, by case-insensitive exact match
+      --name <NAME>      The existing name to change, by case-insensitive exact match. Mutually exclusive with `--id`
+      --id <ID>          The existing named range's id, by exact match. Mutually exclusive with `--name`. Find it with `drive sheets list-named-ranges`
       --new-name <NAME>  The new name, when renaming
       --range <A1>       A1 range for the new target, optionally carrying its own `Sheet!` prefix. Mutually exclusive with `--whole-sheet`. Omitting this, `--sheet` and `--whole-sheet` together keeps the existing range unchanged — this command may be a rename only
       --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`, or the target sheet directly with `--whole-sheet`

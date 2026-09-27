@@ -2951,26 +2951,30 @@ omni-dev drive sheets list-named-ranges <ID>
 omni-dev drive sheets update-named-range <ID> --name Prices --new-name UnitPrices
 omni-dev drive sheets update-named-range <ID> --name Prices --sheet Q3 --range B2:B50
 
+# Or resolve it by id instead — see `--id` below.
+omni-dev drive sheets update-named-range <ID> --id id-1 --new-name UnitPrices
+
 # Remove a named range — read --dry-run first.
 omni-dev drive sheets delete-named-range <ID> --name Prices --dry-run
 omni-dev drive sheets delete-named-range <ID> --name Prices
 ```
 
-`update-named-range`/`delete-named-range` resolve their target by a
-case-insensitive *exact* name match — `list-named-ranges` is how you find
-it. Sheets enforces unique names on `add-named-range` but not on
-`update-named-range`'s `--new-name` (issue #1932): renaming a range to
-another's name is not rejected server-side, so a name can in principle
-match more than one named range. `update-named-range` refuses a
-`--new-name` that collides (case-insensitively) with a different existing
-named range before that can happen; if a workbook already has two ranges
-sharing a name — from before this check existed, or from another client —
-`--name` matching more than one is refused as ambiguous rather than acting
-on whichever came first, naming every matching id. Neither verb can target
-a range by id, so resolve it by renaming or deleting all but one in the
-Sheets UI (**Data › Named ranges**), then retry. `update-named-range` may rename only, re-point only, or
-both — passing neither `--new-name` nor a new range is refused as nothing
-to change.
+`update-named-range`/`delete-named-range` resolve their target by `--name`
+(a case-insensitive *exact* match) or `--id` (an exact match) — exactly one
+is required — `list-named-ranges` is how you find either. Sheets enforces
+unique names on `add-named-range` but not on `update-named-range`'s
+`--new-name` (issue #1932): renaming a range to another's name is not
+rejected server-side, so a name can in principle match more than one named
+range. `update-named-range` refuses a `--new-name` that collides
+(case-insensitively) with a different existing named range before that can
+happen; if a workbook already has two ranges sharing a name — from before
+this check existed, or from another client — `--name` matching more than
+one is refused as ambiguous rather than acting on whichever came first,
+naming every matching id. **`--id` is the escape hatch for that ambiguity**
+(issue #1975): pass one of the ids the refusal listed to act on that exact
+range without needing the Sheets UI. `update-named-range` may rename only,
+re-point only, or both — passing neither `--new-name` nor a new range is
+refused as nothing to change.
 
 `delete-named-range --dry-run` (and the real run, before mutating) scans
 every sheet's *cell* formulas for the name being removed and reports the

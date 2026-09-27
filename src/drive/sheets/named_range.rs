@@ -41,6 +41,19 @@
 //! [`find_existing_named_range`] refuses rather than picks the first match
 //! when more than one range shares a name, and [`check_new_name_available`]
 //! refuses a rename that would create that state in the first place.
+//!
+//! **`--id` is the escape hatch for that ambiguity** (issue #1975,
+//! follow-up to #1932/#1974): the `--name` refusal above lists the matching
+//! ids but, before this, gave no way to act on one — the Sheets UI was the
+//! only workaround. `--id`/`--name` are mutually exclusive and exactly one
+//! is required (a clap `ArgGroup` on both CLI commands); [`find_existing_named_range_by_id`]
+//! looks up by exact `named_range_id` match (not case-insensitive — it's a
+//! server-assigned opaque id, not a user-typed name) and refuses with
+//! [`NamedRangeResult::RefusedIdNotFound`] rather than
+//! [`NamedRangeResult::RefusedNotFound`] when nothing matches, so the error
+//! message can point back at `list-named-ranges` without implying a `--name`
+//! typo. An id match is always unique (`named_range_id` is server-assigned),
+//! so `--id` has no ambiguous-match branch to speak of.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -88,8 +101,13 @@ pub enum NamedRangeVerb {
     },
     /// Change an existing named range's name and/or the range it covers.
     UpdateNamedRange {
-        /// The existing name to change, by exact match.
-        name: String,
+        /// The existing name to change, by exact match. Mutually exclusive
+        /// with `id`; exactly one of the two is set.
+        name: Option<String>,
+        /// The existing named range's id, by exact match (from
+        /// `list-named-ranges`). Mutually exclusive with `name`; exactly
+        /// one of the two is set.
+        id: Option<String>,
         /// The new name, when renaming.
         new_name: Option<String>,
         /// A sheet title for the new range, supplying a prefix for a bare
@@ -106,8 +124,13 @@ pub enum NamedRangeVerb {
     },
     /// Remove a named range.
     DeleteNamedRange {
-        /// The existing name to remove, by exact match.
-        name: String,
+        /// The existing name to remove, by exact match. Mutually exclusive
+        /// with `id`; exactly one of the two is set.
+        name: Option<String>,
+        /// The existing named range's id, by exact match (from
+        /// `list-named-ranges`). Mutually exclusive with `name`; exactly
+        /// one of the two is set.
+        id: Option<String>,
     },
 }
 
@@ -190,6 +213,12 @@ pub enum NamedRangeResult {
     RefusedNotFound {
         /// The name that was searched for.
         name: String,
+    },
+    /// `update-named-range`/`delete-named-range`'s `--id` matched no named
+    /// range.
+    RefusedIdNotFound {
+        /// The id that was searched for.
+        id: String,
     },
     /// `update-named-range`/`delete-named-range`'s `--name` matched more
     /// than one named range (issue #1932: `updateNamedRange` does not
@@ -275,6 +304,7 @@ impl NamedRangeResult {
             Self::RefusedSheetNotFound { .. } => "refused-sheet-not-found",
             Self::RefusedInvalidRange { .. } => "refused-invalid-range",
             Self::RefusedNotFound { .. } => "refused-not-found",
+            Self::RefusedIdNotFound { .. } => "refused-id-not-found",
             Self::RefusedAmbiguousName { .. } => "refused-ambiguous-name",
             Self::RefusedDuplicateName { .. } => "refused-duplicate-name",
             Self::Blocked { .. } => "blocked",
@@ -414,14 +444,14 @@ async fn named_range_inner(
     };
 
     // `update-named-range`/`delete-named-range` resolve their target by
-    // exact name match against the workbook's current named ranges — done
-    // once, here, before the dry-run check, so a preview refuses a
+    // exact name or id match against the workbook's current named ranges —
+    // done once, here, before the dry-run check, so a preview refuses a
     // nonexistent target exactly like a real attempt would.
     let existing = match &opts.verb {
         NamedRangeVerb::AddNamedRange { .. } => None,
-        NamedRangeVerb::UpdateNamedRange { name, .. }
-        | NamedRangeVerb::DeleteNamedRange { name } => {
-            match find_existing_named_range(&workbook, name) {
+        NamedRangeVerb::UpdateNamedRange { name, id, .. }
+        | NamedRangeVerb::DeleteNamedRange { name, id } => {
+            match find_existing_named_range_target(&workbook, name.as_deref(), id.as_deref()) {
                 Ok(existing) => Some(existing),
                 Err(result) => return gated(result),
             }
@@ -480,9 +510,16 @@ async fn named_range_inner(
 
     // `delete-named-range` only (ADR-0081 §2): scan the workbook's formulas
     // for the name being removed — unconditionally, before the dry-run
-    // check, so `--dry-run` and the real run report identically.
-    let referencing_formulas = if let NamedRangeVerb::DeleteNamedRange { name } = &opts.verb {
-        match scan_referencing_formulas(&api, &opts.spreadsheet_id, &workbook, name).await {
+    // check, so `--dry-run` and the real run report identically. Scans by
+    // `existing.name`, the resolved named range's canonical name, rather
+    // than the verb's own `name` field — the latter is `None` when the
+    // target was selected by `--id`.
+    let referencing_formulas = if let NamedRangeVerb::DeleteNamedRange { .. } = &opts.verb {
+        let Some(existing) = existing else {
+            unreachable!("existing is resolved for DeleteNamedRange above") // omni-dev: coverage ignore-line reason="existing is always Some for DeleteNamedRange: find_existing_named_range_target above either returns it or refuses and returns early"
+        };
+        match scan_referencing_formulas(&api, &opts.spreadsheet_id, &workbook, &existing.name).await
+        {
             Ok(locations) => locations,
             Err(detail) => return gated(NamedRangeResult::Failed { detail }),
         }
@@ -651,10 +688,11 @@ fn find_sheet_id(workbook: &Spreadsheet, title: &str) -> Result<i64, NamedRangeR
 }
 
 /// Finds the one existing named range with a case-insensitive exact `name`
-/// match — `update-named-range`/`delete-named-range`'s only stable handle,
-/// since a named range's server-assigned id is discoverable only via
-/// `list-named-ranges`. Refuses rather than guesses on zero or multiple
-/// matches, like `protection.rs::find_existing_protection`.
+/// match — `update-named-range`/`delete-named-range`'s `--name` selector.
+/// Refuses rather than guesses on zero or multiple matches, like
+/// `protection.rs::find_existing_protection`. See
+/// [`find_existing_named_range_by_id`] for the `--id` selector, which a
+/// user reaches for when this refuses as ambiguous.
 ///
 /// Sheets enforces unique names on `addNamedRange` but not on
 /// `updateNamedRange` (issue #1932): renaming one named range to another's
@@ -692,6 +730,46 @@ fn find_existing_named_range<'a>(
                 .filter_map(|nr| nr.named_range_id.clone())
                 .collect(),
         }),
+    }
+}
+
+/// Finds the one existing named range with an exact `named_range_id` match
+/// — `update-named-range`/`delete-named-range`'s `--id` selector (issue
+/// #1975), the escape hatch for [`find_existing_named_range`]'s
+/// `RefusedAmbiguousName` refusal, which lists matching ids but gives no way
+/// to act on one otherwise. Case-sensitive, unlike name resolution: a
+/// server-assigned opaque id is never something a user would type in a
+/// different case. An id match is always unique, so unlike
+/// [`find_existing_named_range`] there is no "ambiguous" branch — only
+/// found-or-not-found.
+fn find_existing_named_range_by_id<'a>(
+    workbook: &'a Spreadsheet,
+    id: &str,
+) -> Result<&'a NamedRange, NamedRangeResult> {
+    workbook
+        .named_ranges
+        .iter()
+        .find(|nr| nr.named_range_id.as_deref() == Some(id))
+        .ok_or_else(|| NamedRangeResult::RefusedIdNotFound { id: id.to_string() })
+}
+
+/// Resolves `update-named-range`/`delete-named-range`'s target by whichever
+/// of `name`/`id` the CLI's `ArgGroup` set — mutually exclusive, exactly one
+/// required. A direct library caller passing neither (impossible through
+/// the CLI) is refused rather than panicking.
+fn find_existing_named_range_target<'a>(
+    workbook: &'a Spreadsheet,
+    name: Option<&str>,
+    id: Option<&str>,
+) -> Result<&'a NamedRange, NamedRangeResult> {
+    if let Some(id) = id {
+        find_existing_named_range_by_id(workbook, id)
+    } else if let Some(name) = name {
+        find_existing_named_range(workbook, name)
+    } else {
+        Err(NamedRangeResult::RefusedInvalidRange {
+            detail: "one of --name/--id is required".to_string(),
+        })
     }
 }
 
@@ -831,11 +909,32 @@ async fn scan_referencing_formulas(
 fn describe_effect(verb: &NamedRangeVerb) -> String {
     match verb {
         NamedRangeVerb::AddNamedRange { name, .. } => format!("add named range '{name}'"),
-        NamedRangeVerb::UpdateNamedRange { name, new_name, .. } => match new_name {
-            Some(new_name) => format!("rename named range '{name}' to '{new_name}'"),
-            None => format!("update named range '{name}'"),
-        },
-        NamedRangeVerb::DeleteNamedRange { name } => format!("delete named range '{name}'"),
+        NamedRangeVerb::UpdateNamedRange {
+            name, id, new_name, ..
+        } => {
+            let target = target_descriptor(name.as_deref(), id.as_deref());
+            match new_name {
+                Some(new_name) => format!("rename named range {target} to '{new_name}'"),
+                None => format!("update named range {target}"),
+            }
+        }
+        NamedRangeVerb::DeleteNamedRange { name, id } => format!(
+            "delete named range {}",
+            target_descriptor(name.as_deref(), id.as_deref())
+        ),
+    }
+}
+
+/// Renders `update-named-range`/`delete-named-range`'s resolved target for
+/// a human-readable summary — whichever of `--name`/`--id` was set. `(None,
+/// None)` is unreachable via the CLI (the `ArgGroup` requires exactly one)
+/// but rendered rather than panicking, matching
+/// [`find_existing_named_range_target`]'s own refuse-don't-panic stance.
+fn target_descriptor(name: Option<&str>, id: Option<&str>) -> String {
+    match (name, id) {
+        (Some(name), _) => format!("'{name}'"),
+        (None, Some(id)) => format!("(id '{id}')"),
+        (None, None) => "?".to_string(),
     }
 }
 
@@ -930,6 +1029,10 @@ pub fn describe_lines(outcome: &NamedRangeOutcome) -> Vec<String> {
         NamedRangeResult::RefusedInvalidRange { detail } => vec![format!("Refused: {detail}")],
         NamedRangeResult::RefusedNotFound { name } => vec![format!(
             "Refused: {book} has no named range '{name}'; run \
+             `drive sheets list-named-ranges` to see what exists"
+        )],
+        NamedRangeResult::RefusedIdNotFound { id } => vec![format!(
+            "Refused: {book} has no named range with id '{id}'; run \
              `drive sheets list-named-ranges` to see what exists"
         )],
         NamedRangeResult::RefusedAmbiguousName { name, candidates } => vec![format!(
@@ -1104,6 +1207,55 @@ mod tests {
         ]);
         let err = find_existing_named_range(&workbook, "UNITS").unwrap_err();
         assert!(matches!(err, NamedRangeResult::RefusedAmbiguousName { .. }));
+    }
+
+    // ── the `--id` selector (issue #1975) ───────────────────────────────
+
+    #[test]
+    fn find_existing_named_range_by_id_matches_by_exact_id() {
+        let workbook = workbook_with(vec![
+            named("id-1", "AllS1", grid(0)),
+            named("id-2", "AllS1", grid(1)),
+        ]);
+        // Two ranges share a name — exactly the ambiguous case `--id` is
+        // the escape hatch for. An exact id match still resolves uniquely.
+        let found = find_existing_named_range_by_id(&workbook, "id-2").unwrap();
+        assert_eq!(found.named_range_id.as_deref(), Some("id-2"));
+    }
+
+    #[test]
+    fn find_existing_named_range_by_id_refuses_when_none_matches() {
+        let workbook = workbook_with(vec![named("id-1", "Foo", grid(0))]);
+        let err = find_existing_named_range_by_id(&workbook, "id-99").unwrap_err();
+        assert!(matches!(err, NamedRangeResult::RefusedIdNotFound { id } if id == "id-99"));
+    }
+
+    #[test]
+    fn find_existing_named_range_by_id_is_case_sensitive() {
+        // Unlike name resolution, an id is a server-assigned opaque token,
+        // not something a user might type in a different case.
+        let workbook = workbook_with(vec![named("id-1", "Foo", grid(0))]);
+        let err = find_existing_named_range_by_id(&workbook, "ID-1").unwrap_err();
+        assert!(matches!(err, NamedRangeResult::RefusedIdNotFound { id } if id == "ID-1"));
+    }
+
+    #[test]
+    fn find_existing_named_range_target_prefers_id_when_both_are_set() {
+        // Unreachable via the CLI (the `ArgGroup` requires exactly one),
+        // but the library function itself must still resolve deterministically.
+        let workbook = workbook_with(vec![
+            named("id-1", "Foo", grid(0)),
+            named("id-2", "Bar", grid(1)),
+        ]);
+        let found = find_existing_named_range_target(&workbook, Some("Bar"), Some("id-1")).unwrap();
+        assert_eq!(found.named_range_id.as_deref(), Some("id-1"));
+    }
+
+    #[test]
+    fn find_existing_named_range_target_refuses_when_neither_is_set() {
+        let workbook = workbook_with(vec![named("id-1", "Foo", grid(0))]);
+        let err = find_existing_named_range_target(&workbook, None, None).unwrap_err();
+        assert!(matches!(err, NamedRangeResult::RefusedInvalidRange { .. }));
     }
 
     #[test]
@@ -1438,7 +1590,8 @@ mod tests {
         let opts = NamedRangeOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: NamedRangeVerb::UpdateNamedRange {
-                name: "Foo".to_string(),
+                name: Some("Foo".to_string()),
+                id: None,
                 new_name: Some("Bar".to_string()),
                 sheet: Some("Q2".to_string()),
                 range: None,
@@ -1474,7 +1627,8 @@ mod tests {
         let opts = NamedRangeOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: NamedRangeVerb::UpdateNamedRange {
-                name: "Foo".to_string(),
+                name: Some("Foo".to_string()),
+                id: None,
                 new_name: Some("Bar".to_string()),
                 sheet: None,
                 range: None,
@@ -1488,6 +1642,41 @@ mod tests {
         assert!(matches!(
             outcome.result,
             NamedRangeResult::RefusedNotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_named_range_by_id_refuses_when_no_id_matches() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        let rules = vec![allow_rule("folder-1")];
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: NamedRangeVerb::UpdateNamedRange {
+                name: None,
+                id: Some("id-99".to_string()),
+                new_name: Some("Bar".to_string()),
+                sheet: None,
+                range: None,
+                whole_sheet: false,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(matches!(
+            outcome.result,
+            NamedRangeResult::RefusedIdNotFound { id } if id == "id-99"
         ));
     }
 
@@ -1528,7 +1717,8 @@ mod tests {
         let opts = NamedRangeOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: NamedRangeVerb::UpdateNamedRange {
-                name: "qty".to_string(),
+                name: Some("qty".to_string()),
+                id: None,
                 new_name: Some("AllS1".to_string()),
                 sheet: None,
                 range: None,
@@ -1590,7 +1780,8 @@ mod tests {
         let opts = NamedRangeOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: NamedRangeVerb::UpdateNamedRange {
-                name: "Foo".to_string(),
+                name: Some("Foo".to_string()),
+                id: None,
                 new_name: Some("foo".to_string()),
                 sheet: Some("Q2".to_string()),
                 range: None,
@@ -1612,14 +1803,16 @@ mod tests {
     async fn update_and_delete_named_range_refuse_as_ambiguous_when_name_matches_two_ranges() {
         let verbs = [
             NamedRangeVerb::UpdateNamedRange {
-                name: "AllS1".to_string(),
+                name: Some("AllS1".to_string()),
+                id: None,
                 new_name: Some("Totals".to_string()),
                 sheet: None,
                 range: None,
                 whole_sheet: false,
             },
             NamedRangeVerb::DeleteNamedRange {
-                name: "AllS1".to_string(),
+                name: Some("AllS1".to_string()),
+                id: None,
             },
         ];
         for verb in verbs {
@@ -1671,6 +1864,73 @@ mod tests {
         }
     }
 
+    /// The actual escape hatch (issue #1975): two named ranges share a
+    /// name, so `--name` alone is refused as ambiguous (the test above),
+    /// but `--id` resolves the same workbook state unambiguously and the
+    /// mutation actually goes through.
+    #[tokio::test]
+    async fn delete_named_range_by_id_succeeds_when_name_would_be_ambiguous() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {
+                "namedRangeId": "id-1",
+                "name": "AllS1",
+                "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 5,
+                          "startColumnIndex": 0, "endColumnIndex": 1},
+            },
+            {
+                "namedRangeId": "id-2",
+                "name": "AllS1",
+                "range": {"sheetId": 0, "startRowIndex": 5, "endRowIndex": 10,
+                          "startColumnIndex": 0, "endColumnIndex": 1},
+            },
+        ]))
+        .mount(&server)
+        .await;
+        mount_batch_get(&[("Q1", serde_json::json!([])), ("Q2", serde_json::json!([]))])
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: NamedRangeVerb::DeleteNamedRange {
+                name: None,
+                id: Some("id-2".to_string()),
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            NamedRangeResult::Changed { named_range_id, .. } => {
+                assert_eq!(named_range_id.as_deref(), Some("id-2"));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn delete_named_range_dry_run_reports_referencing_formulas_without_a_decoy_match() {
         let server = wiremock::MockServer::start().await;
@@ -1706,7 +1966,8 @@ mod tests {
         let opts = NamedRangeOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: NamedRangeVerb::DeleteNamedRange {
-                name: "Foo".to_string(),
+                name: Some("Foo".to_string()),
+                id: None,
             },
             dry_run: true,
             lease_token: None,
@@ -1750,7 +2011,8 @@ mod tests {
         let opts = NamedRangeOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: NamedRangeVerb::DeleteNamedRange {
-                name: "Foo".to_string(),
+                name: Some("Foo".to_string()),
+                id: None,
             },
             dry_run: true,
             lease_token: None,
@@ -1807,7 +2069,8 @@ mod tests {
         let opts = NamedRangeOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: NamedRangeVerb::DeleteNamedRange {
-                name: "Foo".to_string(),
+                name: Some("Foo".to_string()),
+                id: None,
             },
             dry_run: false,
             lease_token,
@@ -1854,7 +2117,8 @@ mod tests {
 
     fn update_verb() -> NamedRangeVerb {
         NamedRangeVerb::UpdateNamedRange {
-            name: "Foo".to_string(),
+            name: Some("Foo".to_string()),
+            id: None,
             new_name: Some("Bar".to_string()),
             sheet: None,
             range: None,
@@ -1864,7 +2128,8 @@ mod tests {
 
     fn delete_verb() -> NamedRangeVerb {
         NamedRangeVerb::DeleteNamedRange {
-            name: "Foo".to_string(),
+            name: Some("Foo".to_string()),
+            id: None,
         }
     }
 
@@ -2035,6 +2300,17 @@ mod tests {
         let text = describe(&not_found);
         assert!(text.contains("no named range 'Foo'"), "{text}");
         assert!(text.contains("list-named-ranges"), "{text}");
+
+        let id_not_found = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            NamedRangeResult::RefusedIdNotFound {
+                id: "id-99".to_string(),
+            },
+        );
+        let text = describe(&id_not_found);
+        assert!(text.contains("no named range with id 'id-99'"), "{text}");
+        assert!(text.contains("list-named-ranges"), "{text}");
     }
 
     #[test]
@@ -2131,13 +2407,36 @@ mod tests {
     #[test]
     fn describe_effect_update_without_a_new_name_says_update_not_rename() {
         let verb = NamedRangeVerb::UpdateNamedRange {
-            name: "Foo".to_string(),
+            name: Some("Foo".to_string()),
+            id: None,
             new_name: None,
             sheet: Some("Q1".to_string()),
             range: Some("A1:A5".to_string()),
             whole_sheet: false,
         };
         assert_eq!(describe_effect(&verb), "update named range 'Foo'");
+    }
+
+    #[test]
+    fn describe_effect_uses_the_id_target_descriptor_when_selected_by_id() {
+        let update = NamedRangeVerb::UpdateNamedRange {
+            name: None,
+            id: Some("id-1".to_string()),
+            new_name: Some("Bar".to_string()),
+            sheet: None,
+            range: None,
+            whole_sheet: false,
+        };
+        assert_eq!(
+            describe_effect(&update),
+            "rename named range (id 'id-1') to 'Bar'"
+        );
+
+        let delete = NamedRangeVerb::DeleteNamedRange {
+            name: None,
+            id: Some("id-1".to_string()),
+        };
+        assert_eq!(describe_effect(&delete), "delete named range (id 'id-1')");
     }
 
     // ── resolve_grid/resolve_optional_grid error branches ──────────────
@@ -2518,7 +2817,8 @@ mod tests {
         let opts = NamedRangeOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: NamedRangeVerb::UpdateNamedRange {
-                name: "Foo".to_string(),
+                name: Some("Foo".to_string()),
+                id: None,
                 new_name: None,
                 sheet: None,
                 range: None,
@@ -2558,7 +2858,8 @@ mod tests {
         let opts = NamedRangeOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: NamedRangeVerb::UpdateNamedRange {
-                name: "Foo".to_string(),
+                name: Some("Foo".to_string()),
+                id: None,
                 new_name: None,
                 sheet: Some("Missing".to_string()),
                 range: None,
@@ -2724,7 +3025,8 @@ mod tests {
         let opts = NamedRangeOptions {
             spreadsheet_id: "sheet-1".to_string(),
             verb: NamedRangeVerb::DeleteNamedRange {
-                name: "Foo".to_string(),
+                name: Some("Foo".to_string()),
+                id: None,
             },
             dry_run: true,
             lease_token: None,
