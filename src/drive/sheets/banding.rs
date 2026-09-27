@@ -452,6 +452,14 @@ async fn banding_inner(
         result,
     };
 
+    // Checked before the `--dry-run` branch (unlike `build_request`'s color
+    // parsing) because it depends only on the workbook just read, and a
+    // preview that approves a request Sheets is certain to reject is the
+    // #1935 bug this check exists to close.
+    if let Err(detail) = validate_new_axis_colors(&opts.verb, existing) {
+        return gated(BandingResult::RefusedInvalidRange { detail });
+    }
+
     let summary = describe_effect(&opts.verb);
 
     if opts.dry_run {
@@ -612,6 +620,66 @@ fn find_existing_banded_range(
         .flat_map(|sheet| sheet.banded_ranges.iter())
         .find(|banded| banded.banded_range_id == Some(banded_range_id))
         .ok_or(BandingResult::RefusedBandedRangeNotFound { banded_range_id })
+}
+
+/// Refuses an `update-banding` color change on an axis the banded range
+/// does not band yet unless both band colors are given (#1935).
+///
+/// `build_update` merges changed colors onto the axis's *existing*
+/// properties, but an axis with no properties has nothing to merge onto:
+/// the request then creates that axis's [`BandingProperties`] from
+/// scratch, and Sheets requires both `firstBandColor` and
+/// `secondBandColor` for a new one (HTTP 400 "secondBandColor must be
+/// specified"). A range-only change sends no axis properties, so it is
+/// never affected.
+fn validate_new_axis_colors(
+    verb: &BandingVerb,
+    existing: Option<&BandedRange>,
+) -> Result<(), String> {
+    let BandingVerb::UpdateBanding {
+        axis,
+        header_color,
+        first_band_color,
+        second_band_color,
+        footer_color,
+        ..
+    } = verb
+    else {
+        return Ok(());
+    };
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    let axis_exists = match axis {
+        BandingAxis::Rows => existing.row_properties.is_some(),
+        BandingAxis::Columns => existing.column_properties.is_some(),
+    };
+    let colors_changed = header_color.is_some()
+        || first_band_color.is_some()
+        || second_band_color.is_some()
+        || footer_color.is_some();
+    if axis_exists || !colors_changed {
+        return Ok(());
+    }
+    let missing: Vec<&str> = [
+        ("--first-band-color", first_band_color.is_none()),
+        ("--second-band-color", second_band_color.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, is_missing)| is_missing.then_some(flag))
+    .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let label = axis.label();
+    Err(format!(
+        "banded range {} has no {label} banding, so setting {label} colors adds it from \
+         scratch, which requires both --first-band-color and --second-band-color; missing: {}",
+        existing
+            .banded_range_id
+            .map_or_else(|| "?".to_string(), |id| id.to_string()),
+        missing.join(", ")
+    ))
 }
 
 /// Parses a `#RRGGBB` flag into a [`ColorStyle`], via `format.rs`'s shared
@@ -1196,8 +1264,8 @@ mod tests {
             range: None,
             axis: BandingAxis::Columns,
             header_color: Some("#123456".to_string()),
-            first_band_color: None,
-            second_band_color: None,
+            first_band_color: Some("#111111".to_string()),
+            second_band_color: Some("#222222".to_string()),
             footer_color: None,
         };
         let (request, _) = build_request(&verb, None, Some(&existing)).unwrap();
@@ -1206,7 +1274,91 @@ mod tests {
         };
         assert_eq!(update.fields, "columnProperties");
         assert!(update.banded_range.row_properties.is_none());
-        assert!(update.banded_range.column_properties.is_some());
+        let properties = update.banded_range.column_properties.unwrap();
+        assert!(properties.first_band_color_style.is_some());
+        assert!(properties.second_band_color_style.is_some());
+    }
+
+    fn band_color_update_verb(
+        axis: BandingAxis,
+        first_band_color: Option<&str>,
+        second_band_color: Option<&str>,
+    ) -> BandingVerb {
+        BandingVerb::UpdateBanding {
+            banded_range_id: 7,
+            sheet: None,
+            range: None,
+            axis,
+            header_color: None,
+            first_band_color: first_band_color.map(str::to_string),
+            second_band_color: second_band_color.map(str::to_string),
+            footer_color: None,
+        }
+    }
+
+    #[test]
+    fn validate_new_axis_colors_refuses_a_new_axis_with_only_one_band_color() {
+        let existing = sheet_with_banding(0, 7).banded_ranges.remove(0);
+        let verb = band_color_update_verb(BandingAxis::Columns, Some("#ABCDEF"), None);
+        let detail = validate_new_axis_colors(&verb, Some(&existing)).unwrap_err();
+        assert!(detail.contains("no column banding"), "{detail}");
+        assert!(detail.ends_with("missing: --second-band-color"), "{detail}");
+    }
+
+    #[test]
+    fn validate_new_axis_colors_names_both_missing_flags_for_a_header_only_change() {
+        let existing = sheet_with_banding(0, 7).banded_ranges.remove(0);
+        let verb = BandingVerb::UpdateBanding {
+            banded_range_id: 7,
+            sheet: None,
+            range: None,
+            axis: BandingAxis::Columns,
+            header_color: Some("#123456".to_string()),
+            first_band_color: None,
+            second_band_color: None,
+            footer_color: None,
+        };
+        let detail = validate_new_axis_colors(&verb, Some(&existing)).unwrap_err();
+        assert!(
+            detail.ends_with("missing: --first-band-color, --second-band-color"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn validate_new_axis_colors_accepts_a_new_axis_with_both_band_colors() {
+        let existing = sheet_with_banding(0, 7).banded_ranges.remove(0);
+        let verb = band_color_update_verb(BandingAxis::Columns, Some("#ABCDEF"), Some("#FEDCBA"));
+        assert!(validate_new_axis_colors(&verb, Some(&existing)).is_ok());
+    }
+
+    #[test]
+    fn validate_new_axis_colors_accepts_one_color_on_an_existing_axis() {
+        let existing = sheet_with_banding(0, 7).banded_ranges.remove(0);
+        let verb = band_color_update_verb(BandingAxis::Rows, Some("#ABCDEF"), None);
+        assert!(validate_new_axis_colors(&verb, Some(&existing)).is_ok());
+    }
+
+    #[test]
+    fn validate_new_axis_colors_ignores_a_range_only_change_on_a_new_axis() {
+        let existing = sheet_with_banding(0, 7).banded_ranges.remove(0);
+        let verb = BandingVerb::UpdateBanding {
+            banded_range_id: 7,
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:D20".to_string()),
+            axis: BandingAxis::Columns,
+            header_color: None,
+            first_band_color: None,
+            second_band_color: None,
+            footer_color: None,
+        };
+        assert!(validate_new_axis_colors(&verb, Some(&existing)).is_ok());
+    }
+
+    #[test]
+    fn validate_new_axis_colors_ignores_other_verbs() {
+        let verb = BandingVerb::DeleteBanding { banded_range_id: 7 };
+        assert!(validate_new_axis_colors(&verb, None).is_ok());
     }
 
     #[test]
@@ -1562,6 +1714,156 @@ mod tests {
             }
         );
         assert_eq!(outcome.sheet_id, Some(0));
+    }
+
+    /// Mounts the drive metadata and a workbook whose banded range 7 bands
+    /// rows only — the #1935 reproduction's starting state. `batch_update`
+    /// mounts a `batchUpdate` responder expected exactly that many times.
+    async fn mount_row_only_banding(server: &wiremock::MockServer, batch_updates: u64) {
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(server)
+        .await;
+        mount_folder("folder-1").mount(server).await;
+        mount_workbook(serde_json::json!([
+            {
+                "properties": {"sheetId": 0, "title": "Q1", "index": 0},
+                "bandedRanges": [{
+                    "bandedRangeId": 7,
+                    "range": {"sheetId": 0},
+                    "rowProperties": {
+                        "firstBandColorStyle": {"rgbColor": {"red": 1, "green": 1, "blue": 1}},
+                        "secondBandColorStyle": {"rgbColor": {"red": 0, "green": 0, "blue": 0}},
+                    },
+                }],
+            },
+        ]))
+        .mount(server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "replies": [{}]
+                })),
+            )
+            .expect(batch_updates)
+            .mount(server)
+            .await;
+    }
+
+    async fn run_update_on_row_only_banding(
+        axis: BandingAxis,
+        first_band_color: Option<&str>,
+        second_band_color: Option<&str>,
+        dry_run: bool,
+        batch_updates: u64,
+    ) -> (BandingOutcome, wiremock::MockServer) {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_row_only_banding(&server, batch_updates).await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: band_color_update_verb(axis, first_band_color, second_band_color),
+            dry_run,
+            lease_token,
+            ledger_path,
+        };
+        (banding(&drive, &sheets, &opts, &rules).await, server)
+    }
+
+    fn assert_refused_missing_second_band_color(outcome: &BandingOutcome) {
+        let BandingResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; only reached when the refusal regresses"
+        };
+        assert!(detail.contains("no column banding"), "{detail}");
+        assert!(detail.ends_with("missing: --second-band-color"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn update_banding_dry_run_refuses_a_new_axis_with_only_one_band_color() {
+        let (outcome, server) =
+            run_update_on_row_only_banding(BandingAxis::Columns, Some("#ABCDEF"), None, true, 0)
+                .await;
+        assert_refused_missing_second_band_color(&outcome);
+        assert_eq!(outcome.sheet_id, Some(0));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn update_banding_refuses_a_new_axis_with_only_one_band_color_without_calling_the_api() {
+        let (outcome, server) =
+            run_update_on_row_only_banding(BandingAxis::Columns, Some("#ABCDEF"), None, false, 0)
+                .await;
+        assert_refused_missing_second_band_color(&outcome);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn update_banding_adds_a_new_axis_when_both_band_colors_are_given() {
+        let (outcome, server) = run_update_on_row_only_banding(
+            BandingAxis::Columns,
+            Some("#ABCDEF"),
+            Some("#FEDCBA"),
+            false,
+            1,
+        )
+        .await;
+        assert_eq!(
+            outcome.result,
+            BandingResult::Changed {
+                summary: "update column banding id 7".to_string(),
+                banded_range_id: Some(7),
+            }
+        );
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with(":batchUpdate"))
+            .unwrap()
+            .body_json()
+            .unwrap();
+        let update = &body["requests"][0]["updateBanding"];
+        assert_eq!(update["fields"], "columnProperties");
+        let columns = &update["bandedRange"]["columnProperties"];
+        assert!(columns["firstBandColorStyle"].is_object(), "{update}");
+        assert!(columns["secondBandColorStyle"].is_object(), "{update}");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn update_banding_changes_one_color_on_an_existing_axis() {
+        let (outcome, server) =
+            run_update_on_row_only_banding(BandingAxis::Rows, Some("#ABCDEF"), None, false, 1)
+                .await;
+        assert_eq!(
+            outcome.result,
+            BandingResult::Changed {
+                summary: "update row banding id 7".to_string(),
+                banded_range_id: Some(7),
+            }
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn update_banding_dry_run_accepts_one_color_on_an_existing_axis() {
+        let (outcome, server) =
+            run_update_on_row_only_banding(BandingAxis::Rows, Some("#ABCDEF"), None, true, 0).await;
+        assert_eq!(
+            outcome.result,
+            BandingResult::WouldChange {
+                summary: "update row banding id 7".to_string(),
+            }
+        );
+        server.verify().await;
     }
 
     #[tokio::test]
