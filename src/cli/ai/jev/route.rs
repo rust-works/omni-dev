@@ -1248,4 +1248,54 @@ mod tests {
             }])
         );
     }
+
+    /// #2001: an issue quoting `owner/repo#123` (say, in an error message)
+    /// cites a repository that doesn't exist. GitHub answers with a
+    /// repository-level `NOT_FOUND`; routing must report it as a reference
+    /// fetch failure rather than abort.
+    #[test]
+    fn fetch_docs_reports_a_citation_into_a_missing_repository_as_a_reference_fetch_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let _shim = shim_lock();
+        let citing = serde_json::json!({
+            "__typename": "Issue",
+            "title": "t",
+            "body": "```\nError: gh api graphql failed: see owner/repo#123\n```",
+            "state": "OPEN", "url": "u",
+            "comments": {"totalCount": 0, "nodes": []},
+            "closedByPullRequestsReferences": {"nodes": []}
+        });
+        let bin = dir.path().join("fake-gh");
+        write_exec_script(
+            &bin,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n\
+                 repo) echo rust-works/omni-dev ;;\n\
+                 *) case \"$4\" in\n\
+                    *'number:123'*) cat <<'JSON'\n{{\"data\": {{\"r0\": null}}, \"errors\": [{{\"type\": \"NOT_FOUND\", \"path\": [\"r0\"], \"message\": \"Could not resolve to a Repository with the name 'owner/repo'.\"}}]}}\nJSON\nexit 1 ;;\n\
+                    *) cat <<'JSON'\n{{\"data\": {{\"r0\": {{\"i0\": {citing}}}}}}}\nJSON\n;;\n\
+                    esac ;;\n\
+                 esac\n",
+            ),
+        );
+        let (docs, dependencies, failures) = retry_on_etxtbsy(|| {
+            fetch_docs(
+                &bin,
+                dir.path(),
+                &["#1".to_string()],
+                false,
+                DEFAULT_MAX_INPUT_CHARS,
+            )
+        })
+        .unwrap();
+        let key = (docs[0].project.clone(), docs[0].number);
+        assert!(dependencies.is_empty(), "{dependencies:?}");
+        assert_eq!(
+            failures.get(&key),
+            Some(&vec![ReferenceFetchFailure {
+                item_ref: "owner/repo#123".to_string(),
+                error: "not found".to_string(),
+            }])
+        );
+    }
 }

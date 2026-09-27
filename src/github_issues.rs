@@ -602,17 +602,21 @@ fn build_item_doc(item_ref: &ItemRef, node: &Value) -> Result<IssueDoc> {
 
 /// Reads every aliased item out of an [`item_fragment`] query reply.
 ///
-/// Unlike [`parse_issue_response`], a per-item `NOT_FOUND` is **tolerated**
-/// as `None` rather than failing the whole batch: a decision comment's
-/// citation can be stale or point at a typo, and one bad citation must not
-/// stop `verify-decision` from checking the rest. Any other GraphQL error
-/// (a missing repository, a rate limit) still fails the batch — retrying it
-/// per item would not help.
+/// Unlike [`parse_issue_response`], a `NOT_FOUND` is **tolerated** as
+/// `None` rather than failing the whole batch: a citation can be stale, a
+/// typo, or a quoted example (`owner/repo#123`), and one bad citation must
+/// not stop `route` or `verify-decision` from handling the rest. That covers
+/// both a missing item (path `["rK", "iN"]`) and a missing or inaccessible
+/// repository (path `["rK"]`), which resolves every item cited in it to
+/// `None` (#2001). Any other GraphQL error (a rate limit, a `NOT_FOUND` on a
+/// path this query didn't alias) still fails the batch — retrying it per
+/// item would not help.
 fn parse_item_response(
     body: &Value,
     index: &QueryIndex,
 ) -> Result<HashMap<(String, u64), Option<IssueDoc>>> {
     let mut not_found: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut missing_repos: std::collections::HashSet<usize> = std::collections::HashSet::new();
     if let Some(errors) = body.get("errors").and_then(Value::as_array) {
         for error in errors {
             let is_not_found = error.get("type").and_then(Value::as_str) == Some("NOT_FOUND");
@@ -629,6 +633,9 @@ fn parse_item_response(
                 (true, Some(ri), Some(ii)) if index.contains_key(&(ri, ii)) => {
                     not_found.insert((ri, ii));
                 }
+                (true, Some(ri), None) if index.keys().any(|(r, _)| *r == ri) => {
+                    missing_repos.insert(ri);
+                }
                 _ => bail!(
                     "{}",
                     describe_graphql_errors(std::slice::from_ref(error), index)
@@ -644,7 +651,7 @@ fn parse_item_response(
     let mut docs = HashMap::with_capacity(index.len());
     for ((ri, ii), item_ref) in index {
         let key = (item_ref.project.clone(), item_ref.number);
-        if not_found.contains(&(*ri, *ii)) {
+        if missing_repos.contains(ri) || not_found.contains(&(*ri, *ii)) {
             docs.insert(key, None);
             continue;
         }
@@ -667,7 +674,8 @@ fn parse_item_response(
 /// Fetches a set of references that may be issues or pull requests.
 ///
 /// Tolerates a per-reference "not found" (`None`) rather than failing the
-/// whole call — used by `verify-decision` to resolve a decision comment's
+/// whole call, including a reference into a repository that doesn't exist
+/// or that gh can't see — used by `route` and `verify-decision` to resolve
 /// citations. Returns one entry per `refs`, in the same order.
 /// **Blocking** — callers must be on a blocking thread.
 pub fn fetch_items(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<IssueDoc>>> {
@@ -1225,8 +1233,10 @@ mod tests {
         assert_eq!(docs[1].as_ref().unwrap().title, "Valid");
     }
 
+    /// #2001: a repository-level `NOT_FOUND` (a quoted `owner/repo#123`)
+    /// resolves every item cited in that repository to `None`.
     #[test]
-    fn fetch_items_still_bails_on_a_missing_repository() {
+    fn fetch_items_tolerates_a_missing_repository() {
         let dir = tempfile::tempdir().unwrap();
         let (bin, _shim) = fake_gh(
             dir.path(),
@@ -1237,8 +1247,60 @@ mod tests {
             .to_string(),
             1,
         );
-        let err = retry_on_etxtbsy(|| fetch_items(&bin, &[pr_ref("no/such", 1)])).unwrap_err();
-        assert!(err.to_string().contains("no/such"), "{err}");
+        let refs = [pr_ref("no/such", 1), item_ref("no/such", 2)];
+        let docs = retry_on_etxtbsy(|| fetch_items(&bin, &refs)).unwrap();
+        assert!(docs.iter().all(Option::is_none), "{docs:?}");
+    }
+
+    /// A missing repository doesn't take down items in a repository that
+    /// exists: the partial-data reply's valid node still resolves.
+    #[test]
+    fn fetch_items_keeps_items_in_other_repositories_when_one_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // `build_item_query` aliases projects in sorted order, so `no/such`
+        // is `r0` and `rust-works/omni-dev` is `r1`.
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            &serde_json::json!({
+                "data": {
+                    "r0": null,
+                    "r1": {"i0": {
+                        "__typename": "Issue",
+                        "title": "Valid", "body": "b",
+                        "state": "OPEN", "url": "u"
+                    }}
+                },
+                "errors": [{"type": "NOT_FOUND", "path": ["r0"], "message": "Could not resolve"}]
+            })
+            .to_string(),
+            1,
+        );
+        let refs = [
+            item_ref("rust-works/omni-dev", 1871),
+            item_ref("no/such", 123),
+        ];
+        let docs = retry_on_etxtbsy(|| fetch_items(&bin, &refs)).unwrap();
+        assert_eq!(docs[0].as_ref().unwrap().title, "Valid");
+        assert!(docs[1].is_none());
+    }
+
+    /// A repository-level `NOT_FOUND` on an alias this query never issued
+    /// isn't a citation miss we can attribute, so it still fails the batch.
+    #[test]
+    fn fetch_items_bails_on_a_not_found_for_an_unknown_repository_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(
+            dir.path(),
+            &serde_json::json!({
+                "data": {"r0": {"i0": null}},
+                "errors": [{"type": "NOT_FOUND", "path": ["r7"], "message": "Could not resolve"}]
+            })
+            .to_string(),
+            1,
+        );
+        let err = retry_on_etxtbsy(|| fetch_items(&bin, &[item_ref("rust-works/omni-dev", 1)]))
+            .unwrap_err();
+        assert!(err.to_string().contains("was not found"), "{err}");
     }
 
     #[test]
