@@ -3630,6 +3630,33 @@ mod tests {
     }
 
     #[test]
+    fn summarise_chart_reports_a_non_default_border_colour_as_hex() {
+        let mut sheet = basic_chart_sheet(7, "LINE");
+        sheet.charts[0].border = Some(EmbeddedObjectBorder {
+            color_style: Some(ColorStyle {
+                rgb_color: parse_hex_color("#4A86E8").unwrap(),
+            }),
+        });
+        let summary = summarise_chart(&sheet, &sheet.charts[0]).unwrap();
+        assert_eq!(summary.border.as_deref(), Some("#4A86E8"));
+    }
+
+    #[test]
+    fn summarise_chart_reports_a_default_border_colour_as_ambiguous() {
+        let mut sheet = basic_chart_sheet(7, "LINE");
+        sheet.charts[0].border = Some(EmbeddedObjectBorder {
+            color_style: Some(ColorStyle {
+                rgb_color: Color::default(),
+            }),
+        });
+        let summary = summarise_chart(&sheet, &sheet.charts[0]).unwrap();
+        assert_eq!(
+            summary.border.as_deref(),
+            Some("#000000 (or cleared — indistinguishable on read)")
+        );
+    }
+
+    #[test]
     fn summarise_slicer_reports_title_and_position() {
         let sheet = Sheet {
             properties: Some(crate::drive::sheets::types::SheetProperties {
