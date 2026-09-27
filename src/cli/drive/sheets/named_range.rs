@@ -48,17 +48,8 @@ pub struct AddNamedRangeCommand {
     #[arg(long)]
     pub whole_sheet: bool,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl AddNamedRangeCommand {
@@ -72,11 +63,11 @@ impl AddNamedRangeCommand {
                 range: self.range,
                 whole_sheet: self.whole_sheet,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_named_range(client, &opts, &self.output).await
+        run_named_range(client, &opts, &self.write.output).await
     }
 }
 
@@ -123,17 +114,8 @@ pub struct UpdateNamedRangeCommand {
     #[arg(long)]
     pub whole_sheet: bool,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl UpdateNamedRangeCommand {
@@ -149,11 +131,11 @@ impl UpdateNamedRangeCommand {
                 range: self.range,
                 whole_sheet: self.whole_sheet,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_named_range(client, &opts, &self.output).await
+        run_named_range(client, &opts, &self.write.output).await
     }
 }
 
@@ -438,9 +420,11 @@ mod tests {
             range: Some("A1:A5".to_string()),
             sheet: Some("Q1".to_string()),
             whole_sheet: false,
-            dry_run: true,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: true,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -463,9 +447,11 @@ mod tests {
             range: None,
             sheet: None,
             whole_sheet: false,
-            dry_run: true,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: true,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -491,9 +477,11 @@ mod tests {
             range: None,
             sheet: None,
             whole_sheet: false,
-            dry_run: true,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: true,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }

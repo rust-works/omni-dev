@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+use crate::cli::drive::format::OutputFormat;
 use crate::drive::account::ResolvedAccount;
 use crate::drive::auth;
 use crate::drive::client::DriveClient;
@@ -21,6 +22,31 @@ pub struct LeaseTokenArg {
     /// needed with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
     pub lease: Option<String>,
+}
+
+/// The `--dry-run`/`--lease`/`-o` trio most Drive write commands accept,
+/// flattened as the struct's **last** field — clap flattens in declaration
+/// order, so this keeps every command's help text in the order it printed
+/// before. Originally local to `sheets/structure.rs` (#1854/PR #1987);
+/// moved here (#1990) so the other `sheets/*.rs` modules that repeat the
+/// same trio can share it too. A handful of write commands whose
+/// `--dry-run` doc text is genuinely command-specific (e.g.
+/// `format.rs`'s `MergeCellsCommand`) keep their own hand-written trio
+/// rather than flattening this, since doing so would silently replace
+/// that text with the generic wording below.
+#[derive(Parser)]
+pub struct StructureWriteArgs {
+    /// Reports the gate verdict and the change that would be made, without
+    /// calling `spreadsheets.batchUpdate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub lease: LeaseTokenArg,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 /// Creates an authenticated Drive API client from environment/settings-resolved credentials.

@@ -45,17 +45,8 @@ pub struct SetBasicFilterCommand {
     #[arg(long = "hide-values", value_name = "COLUMN:VALUES")]
     pub hide_values: Vec<String>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl SetBasicFilterCommand {
@@ -69,11 +60,11 @@ impl SetBasicFilterCommand {
                 sort_by: self.sort_by,
                 hide_values: self.hide_values,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_filter(client, &opts, &self.output).await
+        run_filter(client, &opts, &self.write.output).await
     }
 }
 
@@ -87,17 +78,8 @@ pub struct ClearBasicFilterCommand {
     #[arg(long, value_name = "NAME")]
     pub sheet: String,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl ClearBasicFilterCommand {
@@ -106,11 +88,11 @@ impl ClearBasicFilterCommand {
         let opts = FilterOptions {
             spreadsheet_id: self.spreadsheet_id,
             verb: FilterVerb::ClearBasicFilter { sheet: self.sheet },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_filter(client, &opts, &self.output).await
+        run_filter(client, &opts, &self.write.output).await
     }
 }
 
@@ -141,17 +123,8 @@ pub struct AddFilterViewCommand {
     #[arg(long = "hide-values", value_name = "COLUMN:VALUES")]
     pub hide_values: Vec<String>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl AddFilterViewCommand {
@@ -166,11 +139,11 @@ impl AddFilterViewCommand {
                 sort_by: self.sort_by,
                 hide_values: self.hide_values,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_filter(client, &opts, &self.output).await
+        run_filter(client, &opts, &self.write.output).await
     }
 }
 
@@ -222,17 +195,8 @@ pub struct UpdateFilterViewCommand {
     #[arg(long)]
     pub clear_criteria: bool,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl UpdateFilterViewCommand {
@@ -250,11 +214,11 @@ impl UpdateFilterViewCommand {
                 clear_sort: self.clear_sort,
                 clear_criteria: self.clear_criteria,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_filter(client, &opts, &self.output).await
+        run_filter(client, &opts, &self.write.output).await
     }
 }
 
@@ -269,17 +233,8 @@ pub struct DeleteFilterViewCommand {
     #[arg(long, value_name = "ID")]
     pub filter_view_id: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl DeleteFilterViewCommand {
@@ -290,11 +245,11 @@ impl DeleteFilterViewCommand {
             verb: FilterVerb::DeleteFilterView {
                 filter_view_id: self.filter_view_id,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_filter(client, &opts, &self.output).await
+        run_filter(client, &opts, &self.write.output).await
     }
 }
 
@@ -572,9 +527,11 @@ mod tests {
             range: "A1:D10".to_string(),
             sort_by: Vec::new(),
             hide_values: Vec::new(),
-            dry_run: false,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         // No `write_permissions.rules` configured in this test's account,
         // so the default-deny policy blocks it — proves the CLI leaf wires
@@ -612,9 +569,11 @@ mod tests {
             range: "A1:D10".to_string(),
             sort_by: Vec::new(),
             hide_values: Vec::new(),
-            dry_run: true,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Json,
+            write: helpers::StructureWriteArgs {
+                dry_run: true,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Json,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -632,9 +591,11 @@ mod tests {
         let cmd = ClearBasicFilterCommand {
             spreadsheet_id: "sheet-1".to_string(),
             sheet: "Q1".to_string(),
-            dry_run: false,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -656,9 +617,11 @@ mod tests {
             title: Some("Open only".to_string()),
             sort_by: vec!["0:asc".to_string()],
             hide_values: vec!["1:Closed".to_string()],
-            dry_run: false,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -683,9 +646,11 @@ mod tests {
             hide_values: vec!["1:Closed".to_string()],
             clear_sort: true,
             clear_criteria: true,
-            dry_run: false,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -703,9 +668,11 @@ mod tests {
         let cmd = DeleteFilterViewCommand {
             spreadsheet_id: "sheet-1".to_string(),
             filter_view_id: 7,
-            dry_run: false,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: crate::cli::drive::format::OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: crate::cli::drive::format::OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }

@@ -124,17 +124,8 @@ pub struct AddChartCommand {
     #[arg(long)]
     pub new_sheet: bool,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl AddChartCommand {
@@ -162,11 +153,11 @@ impl AddChartCommand {
                 height: self.height,
                 new_sheet: self.new_sheet,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_embedded_object(client, &opts, &self.output).await
+        run_embedded_object(client, &opts, &self.write.output).await
     }
 }
 
@@ -233,17 +224,8 @@ pub struct UpdateChartCommand {
     #[arg(long, value_name = "0.0-1.0", allow_hyphen_values = true)]
     pub pie_hole: Option<f64>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl UpdateChartCommand {
@@ -266,11 +248,11 @@ impl UpdateChartCommand {
                 vertical_axis_title: self.vertical_axis_title,
                 pie_hole: self.pie_hole,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_embedded_object(client, &opts, &self.output).await
+        run_embedded_object(client, &opts, &self.write.output).await
     }
 }
 
@@ -401,17 +383,8 @@ pub struct AddSlicerCommand {
     #[arg(long, value_name = "PX")]
     pub height: Option<i64>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl AddSlicerCommand {
@@ -432,11 +405,11 @@ impl AddSlicerCommand {
                 width: self.width,
                 height: self.height,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_embedded_object(client, &opts, &self.output).await
+        run_embedded_object(client, &opts, &self.write.output).await
     }
 }
 
@@ -489,17 +462,8 @@ pub struct UpdateSlicerCommand {
     #[arg(long, value_name = "BOOL")]
     pub apply_to_pivot_tables: Option<bool>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl UpdateSlicerCommand {
@@ -517,11 +481,11 @@ impl UpdateSlicerCommand {
                 title: self.title,
                 apply_to_pivot_tables: self.apply_to_pivot_tables,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_embedded_object(client, &opts, &self.output).await
+        run_embedded_object(client, &opts, &self.write.output).await
     }
 }
 
@@ -640,17 +604,8 @@ pub struct MoveChartCommand {
     #[arg(long)]
     pub new_sheet: bool,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl MoveChartCommand {
@@ -668,11 +623,11 @@ impl MoveChartCommand {
                 height: self.height,
                 new_sheet: self.new_sheet,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_embedded_object(client, &opts, &self.output).await
+        run_embedded_object(client, &opts, &self.write.output).await
     }
 }
 
@@ -713,17 +668,8 @@ pub struct MoveSlicerCommand {
     #[arg(long, value_name = "PX")]
     pub height: Option<i64>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl MoveSlicerCommand {
@@ -740,11 +686,11 @@ impl MoveSlicerCommand {
                 width: self.width,
                 height: self.height,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_embedded_object(client, &opts, &self.output).await
+        run_embedded_object(client, &opts, &self.write.output).await
     }
 }
 
@@ -768,17 +714,8 @@ pub struct UpdateChartBorderCommand {
     #[arg(long, conflicts_with = "color")]
     pub clear: bool,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl UpdateChartBorderCommand {
@@ -791,11 +728,11 @@ impl UpdateChartBorderCommand {
                 color: self.color,
                 clear: self.clear,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_embedded_object(client, &opts, &self.output).await
+        run_embedded_object(client, &opts, &self.write.output).await
     }
 }
 
@@ -919,9 +856,11 @@ mod tests {
             width: None,
             height: None,
             new_sheet: false,
-            dry_run: false,
-            lease: lease_arg(),
-            output: OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: lease_arg(),
+                output: OutputFormat::Table,
+            },
         };
         // No `write_permissions.rules` configured, so the default-deny
         // policy blocks it — proves the leaf wires the gate through.
@@ -953,9 +892,11 @@ mod tests {
             horizontal_axis_title: None,
             vertical_axis_title: None,
             pie_hole: None,
-            dry_run: false,
-            lease: lease_arg(),
-            output: OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: lease_arg(),
+                output: OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -1065,9 +1006,11 @@ mod tests {
             offset_y: None,
             width: None,
             height: None,
-            dry_run: false,
-            lease: lease_arg(),
-            output: OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: lease_arg(),
+                output: OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -1092,9 +1035,11 @@ mod tests {
             clear_criteria: true,
             title: None,
             apply_to_pivot_tables: None,
-            dry_run: false,
-            lease: lease_arg(),
-            output: OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: lease_arg(),
+                output: OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&client).await.is_ok());
     }
@@ -1140,9 +1085,11 @@ mod tests {
                 width: None,
                 height: None,
                 new_sheet: false,
-                dry_run: false,
-                lease: lease_arg(),
-                output,
+                write: helpers::StructureWriteArgs {
+                    dry_run: false,
+                    lease: lease_arg(),
+                    output,
+                },
             };
             assert!(cmd.execute(&client).await.is_ok());
         }
@@ -1168,9 +1115,11 @@ mod tests {
                 offset_y: None,
                 width: None,
                 height: None,
-                dry_run: false,
-                lease: lease_arg(),
-                output,
+                write: helpers::StructureWriteArgs {
+                    dry_run: false,
+                    lease: lease_arg(),
+                    output,
+                },
             };
             assert!(cmd.execute(&client).await.is_ok());
         }
@@ -1192,9 +1141,11 @@ mod tests {
                 chart_id: 1,
                 color: Some("#4A86E8".to_string()),
                 clear: false,
-                dry_run: false,
-                lease: lease_arg(),
-                output,
+                write: helpers::StructureWriteArgs {
+                    dry_run: false,
+                    lease: lease_arg(),
+                    output,
+                },
             };
             assert!(cmd.execute(&client).await.is_ok());
         }

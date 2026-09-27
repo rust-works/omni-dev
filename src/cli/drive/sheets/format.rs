@@ -294,17 +294,8 @@ pub struct FormatCellsCommand {
     #[arg(long, value_enum, value_name = "DIR")]
     pub text_direction: Option<TextDirection>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl FormatCellsCommand {
@@ -358,11 +349,11 @@ impl FormatCellsCommand {
                 range: self.range,
                 format: Box::new(format),
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_format(client, &opts, &self.output).await
+        run_format(client, &opts, &self.write.output).await
     }
 }
 
@@ -412,17 +403,8 @@ pub struct UpdateBordersCommand {
     #[arg(long, value_name = "HEX")]
     pub color: Option<String>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 /// `#[arg(default_value_t = ...)]` requires `Display`, which `ValueEnum`
@@ -453,11 +435,11 @@ impl UpdateBordersCommand {
                 style: self.style.wire().to_string(),
                 color: self.color,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_format(client, &opts, &self.output).await
+        run_format(client, &opts, &self.write.output).await
     }
 }
 
@@ -526,17 +508,8 @@ pub struct UnmergeCellsCommand {
     #[arg(long, value_name = "NAME")]
     pub sheet: Option<String>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl UnmergeCellsCommand {
@@ -548,11 +521,11 @@ impl UnmergeCellsCommand {
                 sheet: self.sheet,
                 range: self.range,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_format(client, &opts, &self.output).await
+        run_format(client, &opts, &self.write.output).await
     }
 }
 
@@ -578,17 +551,8 @@ pub struct AutoResizeDimensionCommand {
     #[arg(long, value_name = "N")]
     pub end: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl AutoResizeDimensionCommand {
@@ -602,11 +566,11 @@ impl AutoResizeDimensionCommand {
                 start: self.start,
                 end: self.end,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_format(client, &opts, &self.output).await
+        run_format(client, &opts, &self.write.output).await
     }
 }
 
@@ -636,17 +600,8 @@ pub struct UpdateDimensionPropertiesCommand {
     #[arg(long, value_name = "N")]
     pub pixel_size: i64,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl UpdateDimensionPropertiesCommand {
@@ -661,11 +616,11 @@ impl UpdateDimensionPropertiesCommand {
                 end: self.end,
                 pixel_size: self.pixel_size,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_format(client, &opts, &self.output).await
+        run_format(client, &opts, &self.write.output).await
     }
 }
 

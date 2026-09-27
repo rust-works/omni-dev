@@ -52,17 +52,8 @@ pub struct ProtectRangeCommand {
     #[arg(long = "editor", value_name = "EMAIL")]
     pub editors: Vec<String>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl ProtectRangeCommand {
@@ -78,11 +69,11 @@ impl ProtectRangeCommand {
                 warning_only: self.warning_only,
                 editors: self.editors,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_protection(client, &opts, &self.output).await
+        run_protection(client, &opts, &self.write.output).await
     }
 }
 
@@ -129,17 +120,8 @@ pub struct UpdateProtectionCommand {
     #[arg(long = "remove-editor", value_name = "EMAIL")]
     pub remove_editors: Vec<String>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl UpdateProtectionCommand {
@@ -156,11 +138,11 @@ impl UpdateProtectionCommand {
                 add_editors: self.add_editors,
                 remove_editors: self.remove_editors,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_protection(client, &opts, &self.output).await
+        run_protection(client, &opts, &self.write.output).await
     }
 }
 
@@ -189,17 +171,8 @@ pub struct UnprotectRangeCommand {
     #[arg(long)]
     pub whole_sheet: bool,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl UnprotectRangeCommand {
@@ -212,11 +185,11 @@ impl UnprotectRangeCommand {
                 range: self.range,
                 whole_sheet: self.whole_sheet,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_protection(client, &opts, &self.output).await
+        run_protection(client, &opts, &self.write.output).await
     }
 }
 

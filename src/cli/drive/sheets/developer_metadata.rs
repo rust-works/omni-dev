@@ -61,17 +61,8 @@ pub struct SetDeveloperMetadataCommand {
     #[arg(long, value_name = "N")]
     pub end: Option<i64>,
 
-    /// Reports the gate verdict and the change that would be made, without
-    /// calling `spreadsheets.batchUpdate`.
-    #[arg(long)]
-    pub dry_run: bool,
-
     #[command(flatten)]
-    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
-
-    /// Output format.
-    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    pub write: helpers::StructureWriteArgs,
 }
 
 impl SetDeveloperMetadataCommand {
@@ -87,11 +78,11 @@ impl SetDeveloperMetadataCommand {
                 start: self.start,
                 end: self.end,
             },
-            dry_run: self.dry_run,
-            lease_token: self.lease.lease,
-            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+            dry_run: self.write.dry_run,
+            lease_token: self.write.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.write.dry_run)?,
         };
-        run_developer_metadata(client, &opts, &self.output).await
+        run_developer_metadata(client, &opts, &self.write.output).await
     }
 }
 
@@ -361,9 +352,11 @@ mod tests {
             dimension: None,
             start: None,
             end: None,
-            dry_run: false,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: OutputFormat::Table,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: OutputFormat::Table,
+            },
         };
         assert!(cmd.execute(&dead_client()).await.is_ok());
     }
@@ -381,9 +374,11 @@ mod tests {
             dimension: None,
             start: None,
             end: None,
-            dry_run: false,
-            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
-            output: OutputFormat::Json,
+            write: helpers::StructureWriteArgs {
+                dry_run: false,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: OutputFormat::Json,
+            },
         };
         assert!(cmd.execute(&dead_client()).await.is_ok());
     }
