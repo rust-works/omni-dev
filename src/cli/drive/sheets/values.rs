@@ -192,7 +192,7 @@ fn parse_csv(content: &str) -> Result<Vec<Vec<String>>> {
             if consumed > embedded_newlines {
                 rows.insert(idx, vec![String::new()]);
             }
-        }
+        } // omni-dev: coverage ignore-line reason="this closing brace of the `if let Some(...) = last` (no else) reports 0 hits under llvm-cov even though both inner branches are exercised (csv_interior_blank_line_before_an_unterminated_last_row_is_kept hits the insert path, csv_single_trailing_newline_adds_no_row hits the no-insert path); `last` is always `Some` once `missing_final_newline` is true, since the loop above always runs at least once for non-empty content, so there is no reachable skip path — the same llvm-cov region-attribution artifact on an if-let's closing brace as src/utils/settings.rs:1096"
     } else {
         let trailing = (reader.position().line() - line) as usize;
         rows.extend((0..trailing).map(|_| vec![String::new()]));
