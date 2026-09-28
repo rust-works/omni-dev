@@ -483,18 +483,17 @@ impl ListConditionalFormatsCommand {
         if output_as(&workbook, &self.output)? {
             return Ok(());
         }
+        let mut rows = Vec::new();
         for sheet in &workbook.sheets {
             for (index, rule) in sheet.conditional_formats.iter().enumerate() {
-                println!(
-                    "{}",
-                    sanitize_for_terminal(&format!(
-                        "index {index}: {}  sheet={}",
-                        describe_existing_rule(rule),
-                        sheet.title()
-                    ))
-                );
+                rows.push(format!(
+                    "index {index}: {}  sheet={}",
+                    describe_existing_rule(rule),
+                    sheet.title()
+                ));
             }
         }
+        helpers::print_list(&rows, "No conditional formats.");
         Ok(())
     }
 }

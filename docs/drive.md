@@ -3086,7 +3086,10 @@ only `--sheet`; clearing a sheet that has no basic filter sends nothing and
 reports `Unchanged: sheet 'Q2' has no basic filter to clear` (JSON
 `"status":"unchanged"`). Filter views are **many, named and id-addressed** —
 `list-filter-views` is how you discover a view's numeric id, the same way
-`list-protections` is for protected ranges.
+`list-protections` is for protected ranges. Its table lists each sheet's
+basic filter (as a `basic filter: …` row) ahead of that sheet's views, as
+the JSON output does. Every `list-*` verb prints a `No <things>.` line
+rather than nothing when there is nothing to list.
 
 ```bash
 # The basic filter — one per sheet.
@@ -3439,6 +3442,9 @@ both row and column banding at once; this crate exposes only one, selected
 by `--axis` (default `rows`). Wanting both on the same range needs two
 separate `add-banding` calls with the same `--range` — the API accepts
 overlapping bandings on different axes — or the Sheets UI.
+
+`list-bandings` shows each banded axis's colors next to its id and range,
+e.g. `rows=[header=#000000 first=#FFFFFF second=#EEEEEE]`.
 
 **`update-banding`/`delete-banding` are addressed directly by
 `--banded-range-id`** — the server-assigned id `list-bandings` discovers,
