@@ -214,6 +214,7 @@ impl ListDimensionGroupsCommand {
         if output_as(&workbook, &self.output)? {
             return Ok(());
         }
+        let mut rows = Vec::new();
         for sheet in &workbook.sheets {
             for (axis, groups) in [
                 ("rows", &sheet.row_groups),
@@ -221,18 +222,16 @@ impl ListDimensionGroupsCommand {
             ] {
                 for group in groups {
                     let span = format!("{}:{}", group.range.start_index + 1, group.range.end_index);
-                    println!(
-                        "{}",
-                        sanitize_for_terminal(&format!(
-                            "{axis} {span}  depth={}  collapsed={}  sheet={}",
-                            group.depth,
-                            group.collapsed,
-                            sheet.title()
-                        ))
-                    );
+                    rows.push(format!(
+                        "{axis} {span}  depth={}  collapsed={}  sheet={}",
+                        group.depth,
+                        group.collapsed,
+                        sheet.title()
+                    ));
                 }
             }
         }
+        helpers::print_list(&rows, "No dimension groups.");
         Ok(())
     }
 }

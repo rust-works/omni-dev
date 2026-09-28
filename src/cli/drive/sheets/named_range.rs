@@ -222,19 +222,18 @@ impl ListNamedRangesCommand {
         if output_as(&workbook, &self.output)? {
             return Ok(());
         }
+        let mut rows = Vec::new();
         for named in &workbook.named_ranges {
             let id = named.named_range_id.as_deref().unwrap_or("?");
             let sheet = sheet_title_by_id(&workbook, named.range.sheet_id)
                 .unwrap_or_else(|| "?".to_string());
-            println!(
-                "{}",
-                sanitize_for_terminal(&format!(
-                    "id {id}: {}  {}  sheet={sheet:?}",
-                    named.name,
-                    render_grid_range(&named.range)
-                ))
-            );
+            rows.push(format!(
+                "id {id}: {}  {}  sheet={sheet:?}",
+                named.name,
+                render_grid_range(&named.range)
+            ));
         }
+        helpers::print_list(&rows, "No named ranges.");
         Ok(())
     }
 }

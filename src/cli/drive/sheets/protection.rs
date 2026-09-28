@@ -219,6 +219,7 @@ impl ListProtectionsCommand {
         if output_as(&workbook, &self.output)? {
             return Ok(());
         }
+        let mut rows = Vec::new();
         for sheet in &workbook.sheets {
             for protected in &sheet.protected_ranges {
                 let id = protected
@@ -235,17 +236,15 @@ impl ListProtectionsCommand {
                     .as_ref()
                     .map(|e| e.users.join(", "))
                     .unwrap_or_default();
-                println!(
-                    "{}",
-                    sanitize_for_terminal(&format!(
-                        "id {id}: {range}  description={description:?}  \
+                rows.push(format!(
+                    "id {id}: {range}  description={description:?}  \
                          warning_only={warning_only}  editors=[{editors}]  \
                          sheet={}",
-                        sheet.title()
-                    ))
-                );
+                    sheet.title()
+                ));
             }
         }
+        helpers::print_list(&rows, "No protected ranges.");
         Ok(())
     }
 }

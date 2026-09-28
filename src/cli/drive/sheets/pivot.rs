@@ -214,15 +214,14 @@ impl ListPivotTablesCommand {
         if output_as(&workbook, &self.output)? {
             return Ok(());
         }
+        let mut rows = Vec::new();
         for entry in list_entries(&workbook) {
-            println!(
-                "{}",
-                sanitize_for_terminal(&format!(
-                    "sheet={} anchor={} {}",
-                    entry.sheet, entry.anchor, entry.summary
-                ))
-            );
+            rows.push(format!(
+                "sheet={} anchor={} {}",
+                entry.sheet, entry.anchor, entry.summary
+            ));
         }
+        helpers::print_list(&rows, "No pivot tables.");
         Ok(())
     }
 }

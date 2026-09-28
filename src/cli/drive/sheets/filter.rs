@@ -279,30 +279,46 @@ impl ListFilterViewsCommand {
         if output_as(&workbook, &self.output)? {
             return Ok(());
         }
-        for sheet in &workbook.sheets {
-            for view in &sheet.filter_views {
-                let id = view
-                    .filter_view_id
-                    .map_or_else(|| "?".to_string(), |id| id.to_string());
-                let title = view.title.as_deref().unwrap_or("");
-                let range = view
-                    .range
-                    .as_ref()
-                    .map_or_else(|| "(unresolvable)".to_string(), render_grid_range);
-                let sort = render_sort_specs(&view.sort_specs);
-                let hidden = render_criteria(&view.criteria);
-                println!(
-                    "{}",
-                    sanitize_for_terminal(&format!(
-                        "id {id} '{title}': {range}  sort=[{sort}]  hidden={{{hidden}}}  \
-                         sheet={}",
-                        sheet.title()
-                    ))
-                );
-            }
-        }
+        helpers::print_list(
+            &filter_view_rows(&workbook),
+            "No basic filters or filter views.",
+        );
         Ok(())
     }
+}
+
+/// One `list-filter-views` table row per sheet's basic filter (which the
+/// JSON output already carries) followed by one per filter view.
+fn filter_view_rows(workbook: &crate::drive::sheets::types::Spreadsheet) -> Vec<String> {
+    let range_of = |range: Option<&crate::drive::sheets::types::GridRange>| {
+        range.map_or_else(|| "(unresolvable)".to_string(), render_grid_range)
+    };
+    let mut rows = Vec::new();
+    for sheet in &workbook.sheets {
+        if let Some(basic) = &sheet.basic_filter {
+            rows.push(format!(
+                "basic filter: {}  sort=[{}]  hidden={{{}}}  sheet={}",
+                range_of(basic.range.as_ref()),
+                render_sort_specs(&basic.sort_specs),
+                render_criteria(&basic.criteria),
+                sheet.title()
+            ));
+        }
+        for view in &sheet.filter_views {
+            let id = view
+                .filter_view_id
+                .map_or_else(|| "?".to_string(), |id| id.to_string());
+            let title = view.title.as_deref().unwrap_or("");
+            rows.push(format!(
+                "id {id} '{title}': {}  sort=[{}]  hidden={{{}}}  sheet={}",
+                range_of(view.range.as_ref()),
+                render_sort_specs(&view.sort_specs),
+                render_criteria(&view.criteria),
+                sheet.title()
+            ));
+        }
+    }
+    rows
 }
 
 /// Renders a numeric [`GridRange`](crate::drive::sheets::types::GridRange)
@@ -390,6 +406,34 @@ mod tests {
     use crate::drive::sheets::client::SHEETS_API_URL;
     use crate::drive::sheets::types::{FilterCriteria, GridRange, SortOrder, SortSpec};
     use crate::utils::secret::Secret;
+
+    #[test]
+    fn filter_view_rows_list_a_sheets_basic_filter_before_its_views() {
+        let workbook: crate::drive::sheets::types::Spreadsheet =
+            serde_json::from_value(serde_json::json!({
+                "sheets": [{
+                    "properties": {"sheetId": 0, "title": "Q1"},
+                    "basicFilter": {
+                        "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 5,
+                                  "startColumnIndex": 0, "endColumnIndex": 2},
+                        "sortSpecs": [{"dimensionIndex": 1, "sortOrder": "DESCENDING"}]
+                    },
+                    "filterViews": [{"filterViewId": 3, "title": "Open"}]
+                }]
+            }))
+            .unwrap();
+        let rows = filter_view_rows(&workbook);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            rows[0].starts_with("basic filter: sheetId 0, rows 1-5, cols 1-2  sort=[1 desc]"),
+            "{rows:?}"
+        );
+        assert!(rows[0].ends_with("sheet=Q1"), "{rows:?}");
+        assert!(
+            rows[1].starts_with("id 3 'Open': (unresolvable)"),
+            "{rows:?}"
+        );
+    }
 
     #[test]
     fn render_grid_range_whole_sheet_when_all_bounds_none() {

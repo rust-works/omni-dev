@@ -133,10 +133,42 @@ pub fn resolve_ledger_path(dry_run: bool) -> Result<std::path::PathBuf> {
     }
 }
 
+/// Renders a `list-*` verb's table rows, one per line with control
+/// characters stripped, or `empty` (e.g. `No bandings.`) when there are
+/// none — so an empty table says so rather than printing nothing, matching
+/// `search-developer-metadata`.
+pub fn render_list(rows: &[String], empty: &str) -> String {
+    if rows.is_empty() {
+        return format!("{empty}\n");
+    }
+    let mut out = String::new();
+    for row in rows {
+        out.push_str(&crate::cli::drive::format::sanitize_for_terminal(row));
+        out.push('\n');
+    }
+    out
+}
+
+/// Prints [`render_list`]'s output.
+pub fn print_list(rows: &[String], empty: &str) {
+    print!("{}", render_list(rows, empty));
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_list_says_so_when_there_are_no_rows() {
+        assert_eq!(render_list(&[], "No bandings."), "No bandings.\n");
+    }
+
+    #[test]
+    fn render_list_prints_each_row_sanitised() {
+        let rows = vec!["id 1".to_string(), "id \u{1b}[31m2".to_string()];
+        assert_eq!(render_list(&rows, "No bandings."), "id 1\nid [31m2\n");
+    }
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::utils::secret::Secret;
 

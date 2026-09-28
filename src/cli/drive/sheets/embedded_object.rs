@@ -322,9 +322,11 @@ impl ListChartsCommand {
         if output_as(&workbook, &self.output)? {
             return Ok(());
         }
-        for object in charts_from_workbook(&workbook) {
-            println!("{}", sanitize_for_terminal(&describe_summary_line(&object)));
-        }
+        let rows: Vec<String> = charts_from_workbook(&workbook)
+            .iter()
+            .map(describe_summary_line)
+            .collect();
+        helpers::print_list(&rows, "No charts.");
         Ok(())
     }
 }
@@ -552,9 +554,11 @@ impl ListSlicersCommand {
         if output_as(&workbook, &self.output)? {
             return Ok(());
         }
-        for object in slicers_from_workbook(&workbook) {
-            println!("{}", sanitize_for_terminal(&describe_summary_line(&object)));
-        }
+        let rows: Vec<String> = slicers_from_workbook(&workbook)
+            .iter()
+            .map(describe_summary_line)
+            .collect();
+        helpers::print_list(&rows, "No slicers.");
         Ok(())
     }
 }

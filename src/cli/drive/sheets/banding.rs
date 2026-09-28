@@ -18,6 +18,7 @@ use crate::drive::sheets::banding::{
 };
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::render_grid_range;
+use crate::drive::sheets::types::{BandingProperties, Spreadsheet};
 
 /// The `--axis` values for `add-banding`/`update-banding` — mirrors
 /// [`BandingAxis`] with a `clap::ValueEnum` derive, since the engine type
@@ -239,35 +240,66 @@ impl ListBandingsCommand {
         if output_as(&workbook, &self.output)? {
             return Ok(());
         }
-        for sheet in &workbook.sheets {
-            for banded in &sheet.banded_ranges {
-                let id = banded
-                    .banded_range_id
-                    .map_or_else(|| "?".to_string(), |id| id.to_string());
-                let range = banded
-                    .range
-                    .as_ref()
-                    .map_or_else(|| "(unresolvable)".to_string(), render_grid_range);
-                let axes = match (
-                    banded.row_properties.is_some(),
-                    banded.column_properties.is_some(),
-                ) {
-                    (true, true) => "rows+columns",
-                    (true, false) => "rows",
-                    (false, true) => "columns",
-                    (false, false) => "none",
-                };
-                println!(
-                    "{}",
-                    sanitize_for_terminal(&format!(
-                        "id {id}: {range}  axis={axes}  sheet={}",
-                        sheet.title()
-                    ))
-                );
-            }
-        }
+        helpers::print_list(&banding_rows(&workbook), "No bandings.");
         Ok(())
     }
+}
+
+/// One `list-bandings` table row per banded range: its id, range, axis and
+/// the colors each banded axis carries.
+fn banding_rows(workbook: &Spreadsheet) -> Vec<String> {
+    let mut rows = Vec::new();
+    for sheet in &workbook.sheets {
+        for banded in &sheet.banded_ranges {
+            let id = banded
+                .banded_range_id
+                .map_or_else(|| "?".to_string(), |id| id.to_string());
+            let range = banded
+                .range
+                .as_ref()
+                .map_or_else(|| "(unresolvable)".to_string(), render_grid_range);
+            let axes = match (
+                banded.row_properties.is_some(),
+                banded.column_properties.is_some(),
+            ) {
+                (true, true) => "rows+columns",
+                (true, false) => "rows",
+                (false, true) => "columns",
+                (false, false) => "none",
+            };
+            let colors: String = [
+                ("rows", &banded.row_properties),
+                ("columns", &banded.column_properties),
+            ]
+            .into_iter()
+            .filter_map(|(axis, props)| {
+                props
+                    .as_ref()
+                    .map(|props| format!("  {axis}=[{}]", render_band_colors(props)))
+            })
+            .collect();
+            rows.push(format!(
+                "id {id}: {range}  axis={axes}{colors}  sheet={}",
+                sheet.title()
+            ));
+        }
+    }
+    rows
+}
+
+/// A banded axis's colors as `header=#000000 first=#FFFFFF second=#EEEEEE`,
+/// naming only the ones the API reported.
+fn render_band_colors(props: &BandingProperties) -> String {
+    [
+        ("header", &props.header_color_style),
+        ("first", &props.first_band_color_style),
+        ("second", &props.second_band_color_style),
+        ("footer", &props.footer_color_style),
+    ]
+    .into_iter()
+    .filter_map(|(name, style)| style.as_ref().map(|s| format!("{name}={}", s.describe())))
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 async fn run_banding(
@@ -296,6 +328,31 @@ mod tests {
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::sheets::client::SHEETS_API_URL;
     use crate::utils::secret::Secret;
+
+    #[test]
+    fn banding_rows_show_each_banded_axis_colors() {
+        let workbook: Spreadsheet = serde_json::from_value(serde_json::json!({
+            "sheets": [{
+                "properties": {"sheetId": 0, "title": "Q1"},
+                "bandedRanges": [{
+                    "bandedRangeId": 7,
+                    "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 10,
+                              "startColumnIndex": 0, "endColumnIndex": 4},
+                    "rowProperties": {
+                        "headerColorStyle": {"rgbColor": {}},
+                        "firstBandColorStyle": {"rgbColor": {"red": 1, "green": 1, "blue": 1}},
+                        "secondBandColorStyle": {"themeColor": "ACCENT1"}
+                    }
+                }]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            banding_rows(&workbook),
+            ["id 7: sheetId 0, rows 1-10, cols 1-4  axis=rows  \
+              rows=[header=#000000 first=#FFFFFF second=theme:ACCENT1]  sheet=Q1"]
+        );
+    }
 
     #[test]
     fn banding_axis_arg_converts_to_the_matching_banding_axis() {
