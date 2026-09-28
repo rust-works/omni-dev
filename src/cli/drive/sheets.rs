@@ -1396,7 +1396,9 @@ mod tests {
 
         assert!(dispatch(
             SheetsSubcommands::UpdateSheetProperties(structure::UpdateSheetPropertiesCommand {
-                spreadsheet_id: "sheet-1".to_string(),
+                target: structure::SpreadsheetIdArg {
+                    spreadsheet_id: "sheet-1".to_string(),
+                },
                 sheet: "Q1".to_string(),
                 freeze_rows: Some(1),
                 freeze_columns: None,

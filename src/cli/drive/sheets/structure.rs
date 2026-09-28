@@ -7,7 +7,7 @@
 //! `update-sheet-properties` (issue #1835) and `update-workbook-properties`
 //! (issue #1836).
 //!
-//! Sixteen clap structs over one engine call. They share `run_structure`, so
+//! Seventeen clap structs over one engine call. They share `run_structure`, so
 //! the gate wiring, `--dry-run` handling, output rendering and request
 //! logging cannot drift between them — the same arrangement `write.rs` uses
 //! for its three verbs. The additive verbs are gated on
@@ -33,11 +33,21 @@ use crate::drive::sheets::structure::{
     describe_lines, structure, IterativeCalculationToggle, StructureOptions, StructureVerb,
 };
 
+/// The spreadsheet-id positional argument shared by every structural command
+/// in this file (17 structs at last count) — flattened so a wording tweak
+/// can't drift between them the way `StructureWriteArgs` (#1990) already
+/// stops for the dry-run/lease/output trio.
+#[derive(Parser)]
+pub struct SpreadsheetIdArg {
+    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
+    pub spreadsheet_id: String,
+}
+
 /// Adds a new sheet to a spreadsheet.
 #[derive(Parser)]
 pub struct AddSheetCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title for the new sheet. Must not already exist in the workbook.
     #[arg(long, value_name = "TITLE")]
@@ -62,8 +72,8 @@ pub struct AddSheetCommand {
 /// Renames an existing sheet.
 #[derive(Parser)]
 pub struct RenameSheetCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Current title of the sheet to rename.
     #[arg(long, value_name = "NAME")]
@@ -80,8 +90,8 @@ pub struct RenameSheetCommand {
 /// Inserts empty rows, shifting existing rows down.
 #[derive(Parser)]
 pub struct InsertRowsCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to modify.
     #[arg(long, value_name = "NAME")]
@@ -103,8 +113,8 @@ pub struct InsertRowsCommand {
 /// Inserts empty columns, shifting existing columns right.
 #[derive(Parser)]
 pub struct InsertColumnsCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to modify.
     #[arg(long, value_name = "NAME")]
@@ -126,8 +136,8 @@ pub struct InsertColumnsCommand {
 /// shifting the rows in between to close the gap.
 #[derive(Parser)]
 pub struct MoveRowsCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to modify.
     #[arg(long, value_name = "NAME")]
@@ -158,8 +168,8 @@ pub struct MoveRowsCommand {
 /// shifting the columns in between to close the gap.
 #[derive(Parser)]
 pub struct MoveColumnsCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to modify.
     #[arg(long, value_name = "NAME")]
@@ -198,8 +208,8 @@ pub struct MoveColumnsCommand {
 /// `require_lease: false` takes no backup, and the message then says so.
 #[derive(Parser)]
 pub struct DeleteSheetCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to delete.
     #[arg(long, value_name = "NAME")]
@@ -215,8 +225,8 @@ pub struct DeleteSheetCommand {
 /// comment.
 #[derive(Parser)]
 pub struct DeleteRowsCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to modify.
     #[arg(long, value_name = "NAME")]
@@ -241,8 +251,8 @@ pub struct DeleteRowsCommand {
 /// comment.
 #[derive(Parser)]
 pub struct DeleteColumnsCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to modify.
     #[arg(long, value_name = "NAME")]
@@ -320,8 +330,8 @@ pub struct GridRangeArgs {
 /// the Sheets API.
 #[derive(Parser)]
 pub struct InsertRangeCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to modify.
     #[arg(long, value_name = "NAME")]
@@ -343,8 +353,8 @@ pub struct InsertRangeCommand {
 /// case.
 #[derive(Parser)]
 pub struct DeleteRangeCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to modify.
     #[arg(long, value_name = "NAME")]
@@ -360,8 +370,8 @@ pub struct DeleteRangeCommand {
 /// Copies an existing sheet within the same workbook.
 #[derive(Parser)]
 pub struct DuplicateSheetCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to copy.
     #[arg(long, value_name = "NAME")]
@@ -387,8 +397,8 @@ pub struct DuplicateSheetCommand {
 /// Moves an existing sheet to a new position among its siblings.
 #[derive(Parser)]
 pub struct ReorderSheetCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to move.
     #[arg(long, value_name = "NAME")]
@@ -405,8 +415,8 @@ pub struct ReorderSheetCommand {
 /// Hides an existing sheet.
 #[derive(Parser)]
 pub struct HideSheetCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to hide.
     #[arg(long, value_name = "NAME")]
@@ -419,8 +429,8 @@ pub struct HideSheetCommand {
 /// Shows an existing hidden sheet.
 #[derive(Parser)]
 pub struct ShowSheetCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to show.
     #[arg(long, value_name = "NAME")]
@@ -440,8 +450,8 @@ pub struct ShowSheetCommand {
     .multiple(true)
     .required(true)))]
 pub struct UpdateSheetPropertiesCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// Title of the sheet to modify.
     #[arg(long, value_name = "NAME")]
@@ -536,8 +546,8 @@ impl From<IterativeCalculationArg> for IterativeCalculationToggle {
 /// (`structure.rs::validate_verb_args`).
 #[derive(Parser)]
 pub struct UpdateWorkbookPropertiesCommand {
-    /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
-    pub spreadsheet_id: String,
+    #[command(flatten)]
+    pub target: SpreadsheetIdArg,
 
     /// The workbook's new locale, e.g. `en_US`. Omitted leaves it unchanged.
     #[arg(long, value_name = "LOCALE")]
@@ -577,7 +587,7 @@ impl AddSheetCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::AddSheet {
                 title: self.title,
                 index: self.index,
@@ -595,7 +605,7 @@ impl RenameSheetCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::RenameSheet {
                 sheet: self.sheet,
                 new_title: self.title,
@@ -611,7 +621,7 @@ impl InsertRowsCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::InsertRows {
                 sheet: self.sheet,
                 at: self.at,
@@ -628,7 +638,7 @@ impl InsertColumnsCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::InsertColumns {
                 sheet: self.sheet,
                 at: self.at,
@@ -645,7 +655,7 @@ impl MoveRowsCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::MoveRows {
                 sheet: self.sheet,
                 at: self.at,
@@ -663,7 +673,7 @@ impl MoveColumnsCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::MoveColumns {
                 sheet: self.sheet,
                 at: self.at,
@@ -681,7 +691,7 @@ impl DeleteSheetCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::DeleteSheet { sheet: self.sheet },
             self.write,
         )
@@ -694,7 +704,7 @@ impl DeleteRowsCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::DeleteRows {
                 sheet: self.sheet,
                 at: self.at,
@@ -711,7 +721,7 @@ impl DeleteColumnsCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::DeleteColumns {
                 sheet: self.sheet,
                 at: self.at,
@@ -728,7 +738,7 @@ impl InsertRangeCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::InsertRange {
                 sheet: self.sheet,
                 start_row: self.range.start_row,
@@ -748,7 +758,7 @@ impl DeleteRangeCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::DeleteRange {
                 sheet: self.sheet,
                 start_row: self.range.start_row,
@@ -768,7 +778,7 @@ impl DuplicateSheetCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::DuplicateSheet {
                 sheet: self.sheet,
                 title: self.title,
@@ -785,7 +795,7 @@ impl ReorderSheetCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::ReorderSheet {
                 sheet: self.sheet,
                 index: self.index,
@@ -801,7 +811,7 @@ impl HideSheetCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::SetSheetVisibility {
                 sheet: self.sheet,
                 hidden: true,
@@ -817,7 +827,7 @@ impl ShowSheetCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::SetSheetVisibility {
                 sheet: self.sheet,
                 hidden: false,
@@ -833,7 +843,7 @@ impl UpdateSheetPropertiesCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::UpdateSheetProperties {
                 sheet: self.sheet,
                 freeze_rows: self.freeze_rows,
@@ -854,7 +864,7 @@ impl UpdateWorkbookPropertiesCommand {
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
         run_verb(
             client,
-            self.spreadsheet_id,
+            self.target.spreadsheet_id,
             StructureVerb::UpdateWorkbookProperties {
                 locale: self.locale,
                 time_zone: self.time_zone,
@@ -944,6 +954,68 @@ mod tests {
 
     fn line(s: &str) -> Vec<String> {
         vec![s.to_string()]
+    }
+
+    #[test]
+    fn add_sheet_still_parses_spreadsheet_id_positionally() {
+        let cmd =
+            AddSheetCommand::try_parse_from(["add-sheet", "abc123", "--title", "Sheet2"]).unwrap();
+        assert_eq!(cmd.target.spreadsheet_id, "abc123");
+
+        let err = AddSheetCommand::try_parse_from(["add-sheet", "--title", "Sheet2"])
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn rename_sheet_still_parses_spreadsheet_id_positionally() {
+        let cmd = RenameSheetCommand::try_parse_from([
+            "rename-sheet",
+            "abc123",
+            "--sheet",
+            "Sheet1",
+            "--title",
+            "Sheet2",
+        ])
+        .unwrap();
+        assert_eq!(cmd.target.spreadsheet_id, "abc123");
+
+        let err = RenameSheetCommand::try_parse_from([
+            "rename-sheet",
+            "--sheet",
+            "Sheet1",
+            "--title",
+            "Sheet2",
+        ])
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn update_sheet_properties_still_parses_spreadsheet_id_positionally() {
+        let cmd = UpdateSheetPropertiesCommand::try_parse_from([
+            "update-sheet-properties",
+            "abc123",
+            "--sheet",
+            "Sheet1",
+            "--freeze-rows",
+            "1",
+        ])
+        .unwrap();
+        assert_eq!(cmd.target.spreadsheet_id, "abc123");
+
+        let err = UpdateSheetPropertiesCommand::try_parse_from([
+            "update-sheet-properties",
+            "--sheet",
+            "Sheet1",
+            "--freeze-rows",
+            "1",
+        ])
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     #[test]

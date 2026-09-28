@@ -675,7 +675,9 @@ mod tests {
 
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::AddSheet(sheets::structure::AddSheetCommand {
-                spreadsheet_id: "sheet-1".to_string(),
+                target: sheets::structure::SpreadsheetIdArg {
+                    spreadsheet_id: "sheet-1".to_string(),
+                },
                 title: "Q3".to_string(),
                 index: None,
                 rows: None,
@@ -697,7 +699,9 @@ mod tests {
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::RenameSheet(
                 sheets::structure::RenameSheetCommand {
-                    spreadsheet_id: "sheet-1".to_string(),
+                    target: sheets::structure::SpreadsheetIdArg {
+                        spreadsheet_id: "sheet-1".to_string(),
+                    },
                     sheet: "Q2".to_string(),
                     title: "Q3".to_string(),
                     write: no_write_args(),
@@ -715,7 +719,9 @@ mod tests {
 
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::InsertRows(sheets::structure::InsertRowsCommand {
-                spreadsheet_id: "sheet-1".to_string(),
+                target: sheets::structure::SpreadsheetIdArg {
+                    spreadsheet_id: "sheet-1".to_string(),
+                },
                 sheet: "Q2".to_string(),
                 at: 5,
                 count: 3,
@@ -734,7 +740,9 @@ mod tests {
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::InsertColumns(
                 sheets::structure::InsertColumnsCommand {
-                    spreadsheet_id: "sheet-1".to_string(),
+                    target: sheets::structure::SpreadsheetIdArg {
+                        spreadsheet_id: "sheet-1".to_string(),
+                    },
                     sheet: "Q2".to_string(),
                     at: 2,
                     count: 1,
@@ -753,7 +761,9 @@ mod tests {
 
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::MoveRows(sheets::structure::MoveRowsCommand {
-                spreadsheet_id: "sheet-1".to_string(),
+                target: sheets::structure::SpreadsheetIdArg {
+                    spreadsheet_id: "sheet-1".to_string(),
+                },
                 sheet: "Q2".to_string(),
                 at: 5,
                 count: 3,
@@ -773,7 +783,9 @@ mod tests {
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::MoveColumns(
                 sheets::structure::MoveColumnsCommand {
-                    spreadsheet_id: "sheet-1".to_string(),
+                    target: sheets::structure::SpreadsheetIdArg {
+                        spreadsheet_id: "sheet-1".to_string(),
+                    },
                     sheet: "Q2".to_string(),
                     at: 5,
                     count: 3,
@@ -875,7 +887,9 @@ mod tests {
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::DeleteSheet(
                 sheets::structure::DeleteSheetCommand {
-                    spreadsheet_id: "sheet-1".to_string(),
+                    target: sheets::structure::SpreadsheetIdArg {
+                        spreadsheet_id: "sheet-1".to_string(),
+                    },
                     sheet: "Q2".to_string(),
                     write: no_write_args(),
                 },
@@ -894,7 +908,9 @@ mod tests {
 
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::DeleteRows(sheets::structure::DeleteRowsCommand {
-                spreadsheet_id: "sheet-1".to_string(),
+                target: sheets::structure::SpreadsheetIdArg {
+                    spreadsheet_id: "sheet-1".to_string(),
+                },
                 sheet: "Q2".to_string(),
                 at: 5,
                 count: 3,
@@ -913,7 +929,9 @@ mod tests {
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::DeleteColumns(
                 sheets::structure::DeleteColumnsCommand {
-                    spreadsheet_id: "sheet-1".to_string(),
+                    target: sheets::structure::SpreadsheetIdArg {
+                        spreadsheet_id: "sheet-1".to_string(),
+                    },
                     sheet: "Q2".to_string(),
                     at: 2,
                     count: 1,
@@ -933,7 +951,9 @@ mod tests {
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::DeleteRange(
                 sheets::structure::DeleteRangeCommand {
-                    spreadsheet_id: "sheet-1".to_string(),
+                    target: sheets::structure::SpreadsheetIdArg {
+                        spreadsheet_id: "sheet-1".to_string(),
+                    },
                     sheet: "Q2".to_string(),
                     range: sheets::structure::GridRangeArgs {
                         start_row: 2,
@@ -957,7 +977,9 @@ mod tests {
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::DuplicateSheet(
                 sheets::structure::DuplicateSheetCommand {
-                    spreadsheet_id: "sheet-1".to_string(),
+                    target: sheets::structure::SpreadsheetIdArg {
+                        spreadsheet_id: "sheet-1".to_string(),
+                    },
                     sheet: "Q2".to_string(),
                     title: Some("Q2 copy".to_string()),
                     index: None,
@@ -976,7 +998,9 @@ mod tests {
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::ReorderSheet(
                 sheets::structure::ReorderSheetCommand {
-                    spreadsheet_id: "sheet-1".to_string(),
+                    target: sheets::structure::SpreadsheetIdArg {
+                        spreadsheet_id: "sheet-1".to_string(),
+                    },
                     sheet: "Q2".to_string(),
                     index: 0,
                     write: no_write_args(),
@@ -993,7 +1017,9 @@ mod tests {
 
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::HideSheet(sheets::structure::HideSheetCommand {
-                spreadsheet_id: "sheet-1".to_string(),
+                target: sheets::structure::SpreadsheetIdArg {
+                    spreadsheet_id: "sheet-1".to_string(),
+                },
                 sheet: "Q2".to_string(),
                 write: no_write_args(),
             }),
@@ -1008,7 +1034,9 @@ mod tests {
 
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::ShowSheet(sheets::structure::ShowSheetCommand {
-                spreadsheet_id: "sheet-1".to_string(),
+                target: sheets::structure::SpreadsheetIdArg {
+                    spreadsheet_id: "sheet-1".to_string(),
+                },
                 sheet: "Q2".to_string(),
                 write: no_write_args(),
             }),
@@ -1025,7 +1053,9 @@ mod tests {
         let cmd = DriveSubcommands::Sheets(sheets::SheetsCommand {
             command: sheets::SheetsSubcommands::UpdateWorkbookProperties(
                 sheets::structure::UpdateWorkbookPropertiesCommand {
-                    spreadsheet_id: "sheet-1".to_string(),
+                    target: sheets::structure::SpreadsheetIdArg {
+                        spreadsheet_id: "sheet-1".to_string(),
+                    },
                     locale: Some("en_US".to_string()),
                     time_zone: None,
                     auto_recalc: None,
