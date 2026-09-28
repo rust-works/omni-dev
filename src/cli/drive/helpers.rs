@@ -158,6 +158,8 @@ pub fn print_list(rows: &[String], empty: &str) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::utils::secret::Secret;
 
     #[test]
     fn render_list_says_so_when_there_are_no_rows() {
@@ -169,8 +171,6 @@ mod tests {
         let rows = vec!["id 1".to_string(), "id \u{1b}[31m2".to_string()];
         assert_eq!(render_list(&rows, "No bandings."), "id 1\nid [31m2\n");
     }
-    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
-    use crate::utils::secret::Secret;
 
     #[test]
     fn create_client_from_uses_drive_api_host() {

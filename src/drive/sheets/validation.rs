@@ -516,7 +516,9 @@ async fn validation_inner(
     // or erroring, so a range wholly past it would change nothing and one
     // partly past it changes less than it names. Refuse the first and name
     // the clamped range for the second, in both modes.
-    let clamped_to = match grid_range::clamp_to_sheet(&workbook, &grid) {
+    let clamp = grid_range::clamp_to_sheet(&workbook, &grid)
+        .filter(|_| !grid_range::starts_past_grid(&workbook, &grid));
+    let clamped_to = match clamp {
         None => {
             return gated(ValidationResult::RefusedInvalidRange {
                 detail: format!(
@@ -1724,13 +1726,25 @@ mod tests {
 
     #[tokio::test]
     async fn a_range_wholly_past_the_grid_is_refused() {
-        let outcome = dry_run_on_a_sized_grid("AB1:AC5").await;
-        let ValidationResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; only reached when the refusal regresses"
-        };
+        // Bounded, and open-ended with its start past the last row — the
+        // second has no end for `clamp_to_sheet` to clip.
+        for range in ["AB1:AC5", "A2000:A"] {
+            let outcome = dry_run_on_a_sized_grid(range).await;
+            let ValidationResult::RefusedInvalidRange { detail } = &outcome.result else {
+                panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
+                // omni-dev: coverage ignore-line reason="guards this test's assumption; only reached when the refusal regresses"
+            };
+            assert!(
+                detail.contains("wholly past the sheet's current grid"),
+                "{detail}"
+            );
+        }
+        // An open-ended range starting inside the grid is not.
+        let inside = dry_run_on_a_sized_grid("A5:A").await;
         assert!(
-            detail.contains("wholly past the sheet's current grid"),
-            "{detail}"
+            matches!(inside.result, ValidationResult::WouldChange { .. }),
+            "{:?}",
+            inside.result
         );
     }
 

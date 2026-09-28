@@ -1101,11 +1101,6 @@ fn resolve_sheet(
     }
 }
 
-/// Validates the numeric arguments a verb carries against the workbook's
-/// actual state, so a dry run can never promise a change the real run then
-/// rejects. Runs after [`resolve_sheet`] (which is why it can read the
-/// target sheet's real dimensions) and before the `--dry-run` early return,
-/// so both share this classification exactly like the gate above it.
 /// Why `verb` would change nothing, when the workbook is already in the
 /// state it asks for. Only `hide-sheet`/`show-sheet` can tell: their whole
 /// effect is one flag the fetched workbook already reports.
@@ -1135,6 +1130,11 @@ fn already_applied(
     })
 }
 
+/// Validates the numeric arguments a verb carries against the workbook's
+/// actual state, so a dry run can never promise a change the real run then
+/// rejects. Runs after [`resolve_sheet`] (which is why it can read the
+/// target sheet's real dimensions) and before the `--dry-run` early return,
+/// so both share this classification exactly like the gate above it.
 fn validate_verb_args(
     workbook: &Spreadsheet,
     verb: &StructureVerb,
