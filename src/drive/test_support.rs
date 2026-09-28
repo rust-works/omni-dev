@@ -278,11 +278,13 @@ mod tests {
             let text = std::fs::read_to_string(&path).unwrap();
             for body in text.split("fn ").skip(1) {
                 if mutation.is_match(body) && !body.contains("EnvGuard::take()") {
+                    // omni-dev: coverage ignore reason="only runs if a function mutates a Drive env var without EnvGuard::take(); offenders.is_empty() below is this test's whole point"
                     let name = body.split(['(', '<']).next().unwrap_or_default();
                     offenders.push(format!(
                         "{}: fn {name}",
                         path.strip_prefix(&src).unwrap().display()
                     ));
+                    // omni-dev: coverage end
                 }
             }
         }
@@ -290,7 +292,7 @@ mod tests {
             offenders.is_empty(),
             "these functions mutate a Drive env var without \
              `crate::drive::test_support::EnvGuard::take()`:\n{}",
-            offenders.join("\n")
+            offenders.join("\n") // omni-dev: coverage ignore-line reason="assert! message args only evaluate when the condition is false, i.e. an offender was found"
         );
     }
 }
