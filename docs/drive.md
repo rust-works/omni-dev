@@ -1783,6 +1783,11 @@ $ omni-dev drive sheets write <ID> --range 'A1:B10' --values ./cells.csv --dry-r
 Would write: 10 row(s) x 2 column(s) into A1:B10 of '2026 Budget'
 ```
 
+With `-o json`, the result's `status` names the verb: `would-write` (a
+`write`/`append` dry run, with its `rows`/`columns`), `would-clear` (a
+`clear` dry run, which has no dimensions), and `written`, `appended` or
+`cleared` for a real run.
+
 A dry run never calls the values endpoint and writes no request-log record,
 matching `create`/`upload`/`edit`. When the range names a sheet (through
 `--sheet` or a `Sheet!` prefix), both a dry run and a real run first read the
