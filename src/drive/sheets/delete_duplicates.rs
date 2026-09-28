@@ -26,10 +26,11 @@
 //!   row list it cannot vouch for".
 //!
 //! There is deliberately no `--whole-sheet` scope, unlike
-//! `trim_whitespace.rs`: every fully blank row in a range duplicates every
-//! other, so a whole-sheet dedupe would delete the tab's entire trailing
-//! empty region. The same hazard applies to a bounded range that runs past
-//! the data, which is why it is called out in the preview.
+//! `trim_whitespace.rs`: a fully blank row *between* data rows duplicates
+//! every other such row, so a whole-sheet dedupe would collapse every
+//! intentional gap in the tab to one. A live run left blank rows *after*
+//! the last data row alone, so the hazard is interior gaps rather than the
+//! trailing empty region; the preview calls it out either way.
 
 #![allow(missing_docs)] // The CLI-facing outcome models are self-describing in JSON.
 
@@ -66,11 +67,13 @@ const EQUALITY_RULE: &str = "the API keeps the first instance of each duplicate 
                              case, formatting or formulas still count as duplicates, and rows \
                              hidden by a filter are removed along with visible ones";
 
-/// The hazard a range running past the data creates. Blank rows duplicate
-/// one another, so every blank row after the first inside the range is a
-/// duplicate of it.
-const BLANK_ROW_CAVEAT: &str = "blank rows inside the range duplicate one another, so a range \
-                                extending past the data can remove every blank row but the first";
+/// The hazard blank rows create. Blank rows between data rows duplicate one
+/// another, so every such row after the first is removed. Live, blank rows
+/// after the last data row were left alone (`A1:C10` holding three data
+/// rows removed none of its seven trailing blanks).
+const BLANK_ROW_CAVEAT: &str = "blank rows between data rows duplicate one another, so every such \
+                                blank row after the first is removed; blank rows after the last \
+                                data row are left alone";
 const RANGE_ONLY_CAVEAT: &str = "only cells inside the selected range are removed and shifted up; \
                                  columns outside it stay in place, so a range narrower than the \
                                  sheet can misalign records";
@@ -299,8 +302,9 @@ async fn delete_duplicates_inner(
         Err(result) => return gated(result),
     };
     // Bounded-only, `sort-range`'s rule. An open-ended dedupe would reach
-    // every allocated row of the sheet. A bounded range can still include
-    // blank rows past the data, so the preview warns about that separately.
+    // every allocated row of the sheet. A bounded range can still hold
+    // blank rows between data rows, so the preview warns about that
+    // separately.
     if !grid_range::is_bounded(&grid) {
         return gated(DeleteDuplicatesResult::RefusedInvalidRequest {
             detail: format!(

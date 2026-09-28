@@ -181,7 +181,7 @@ pub enum DriveOperation {
     /// add/update/delete: a named range is a label over a region, not grid
     /// data, so removing one leaves every cell's stored value and formula
     /// text untouched — even though every cell formula referencing the
-    /// removed name starts evaluating to `#NAME?`. That
+    /// removed name starts evaluating to `#REF!`. That
     /// visible-but-not-destructive effect is mitigated, not by a stronger
     /// gate, but by `delete-named-range` scanning the workbook's cell
     /// formulas for the name and reporting the count and A1 locations of

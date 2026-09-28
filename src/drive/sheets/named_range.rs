@@ -6,7 +6,7 @@
 //! renaming/re-pointing, or removing one never touches a cell's stored
 //! value or formula text. `delete-named-range` is the one verb with a
 //! visible consequence: every cell formula referencing the removed name
-//! starts evaluating to `#NAME?` (conditional-formatting rules,
+//! starts evaluating to `#REF!` (conditional-formatting rules,
 //! data-validation custom formulas and chart source references can also
 //! name a named range, but are outside the grid-cell scan below). ADR-0081
 //! §2 mitigates this the way ADR-0078 §8 mitigates `merge-cells`'s data
@@ -1114,7 +1114,7 @@ fn referencing_formula_lines(referencing_formulas: &[String]) -> Vec<String> {
         return Vec::new();
     }
     vec![format!(
-        "{} cell formula(s) reference this name and will start evaluating to #NAME? once \
+        "{} cell formula(s) reference this name and will start evaluating to #REF! once \
          it's removed (conditional formatting, data validation and chart references are not \
          scanned): {}",
         referencing_formulas.len(),
@@ -2164,7 +2164,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "this name and will start evaluating to #NAME? once it's removed \
+                "this name and will start evaluating to #REF! once it's removed \
                 (conditional formatting, data validation and chart references are not \
                 scanned): 'Q1'!A1, 'Q2'!B2"
             ),
