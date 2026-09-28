@@ -505,6 +505,29 @@ async fn filter_inner(
         }
     };
 
+    // `update-filter-view --range` with no `--sheet` means the view's own
+    // sheet.
+    let composed_range = match (&opts.verb, composed_range) {
+        (
+            FilterVerb::UpdateFilterView {
+                filter_view_id,
+                sheet: None,
+                ..
+            },
+            Some(composed),
+        ) => {
+            let current_sheet = find_existing_filter_view(&workbook, *filter_view_id)
+                .ok()
+                .and_then(|view| view.range.as_ref())
+                .map(|range| range.sheet_id);
+            Some(grid_range::default_sheet_prefix(
+                &workbook,
+                composed,
+                current_sheet,
+            ))
+        }
+        (_, composed) => composed,
+    };
     let resolved_target =
         match resolve_sheet_target(&workbook, &opts.verb, composed_range.as_deref()) {
             Ok(resolved) => resolved,
@@ -2920,6 +2943,45 @@ mod tests {
             outcome.result,
             FilterResult::RefusedFilterViewNotFound { filter_view_id: 99 }
         ));
+    }
+
+    /// `update-filter-view --range` with no `--sheet` resolves against the
+    /// view's own sheet rather than being refused for naming none (#1941).
+    #[tokio::test]
+    async fn update_filter_view_range_without_sheet_defaults_to_the_views_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+            {"properties": {"sheetId": 5, "title": "Q2", "index": 1},
+             "filterViews": [{"filterViewId": 7, "range": {"sheetId": 5}}]},
+        ]))
+        .mount(&server)
+        .await;
+        let opts = dry_run_opts(FilterVerb::UpdateFilterView {
+            filter_view_id: 7,
+            sheet: None,
+            range: Some("A1:C9".to_string()),
+            title: None,
+            sort_by: Vec::new(),
+            hide_values: Vec::new(),
+            clear_sort: false,
+            clear_criteria: false,
+        });
+        let outcome = filter(&drive, &sheets, &opts, &[allow_rule("folder-1")]).await;
+        assert!(
+            matches!(outcome.result, FilterResult::WouldChange { .. }),
+            "{:?}",
+            outcome.result
+        );
     }
 
     #[tokio::test]
