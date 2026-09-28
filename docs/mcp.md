@@ -251,15 +251,17 @@ valid names.
 | `gmail_draft_list` | List drafts with their `draft_id` (plus `message_id`, `thread_id`, recipients, subject, date, snippet); `query`, `limit` (default 50) |
 | `gmail_draft_show` | Read one draft by `draft_id` (`format`: `minimal`/`metadata`/`full`/`raw`); `output_file` writes the YAML to disk. Draft create/update is CLI-only |
 
-### Drive (7 tools)
+### Drive (9 tools)
 
-Read-only access (search, dedupe, file metadata/content, Sheets info/read) via
-OAuth2, mirroring the Gmail tool surface one-for-one. Authentication uses
-`DRIVE_CLIENT_ID` + `DRIVE_CLIENT_SECRET` + a refresh token stored by
-`omni-dev drive auth login`. `rename`/`move` (the CLI's write operations,
-gated behind the opt-in `drive.metadata` scope) and `sheets write`/`append`/`clear`
-(gated behind the independent `write_permissions` folder rules — see
-[Write permissions](drive.md#write-permissions)) have no MCP equivalent yet.
+Read-only access (search, dedupe, file metadata/content, Sheets info/read,
+Docs info/read) via OAuth2, mirroring the Gmail tool surface one-for-one.
+Authentication uses `DRIVE_CLIENT_ID` + `DRIVE_CLIENT_SECRET` + a refresh
+token stored by `omni-dev drive auth login`. `rename`/`move` (the CLI's write
+operations, gated behind the opt-in `drive.metadata` scope), `sheets
+write`/`append`/`clear`, and `docs replace`/`append`/`create` (each gated
+behind the independent `write_permissions` folder rules — see
+[Write permissions](drive.md#write-permissions), and `docs` writes further
+behind an ADR-0080 lease) have no MCP equivalent yet.
 See [Drive Guide](drive.md) and [ADR-0069](adrs/adr-0069.md).
 
 Every tool below (except `drive_account_list`) takes an optional `account`
@@ -275,6 +277,8 @@ parameter selecting a named Drive account configured via `drive account`
 | `drive_file_read` | Read a file's metadata (default) or content (`format: "content"`); `output_file` writes binary content to disk; `verify: true` checks the fetched SHA-256 against Drive's reported checksum |
 | `drive_sheets_info` | Show a spreadsheet's title and the sheets (tabs) it contains — dimensions and hidden flag per tab, no cell data |
 | `drive_sheets_read` | Read cell values from one range/sheet, or every sheet in the workbook (capped at 200 sheets); `render` controls formatted/unformatted/formula rendering; `output_file` writes the result to disk |
+| `drive_docs_info` | Show a document's title, revision id and structural outline — named ranges, per-tab heading text with index ranges, no full body |
+| `drive_docs_read` | Read a document's structural elements with `[start,end)` index ranges; `tab`/`suggestions_view` narrow the result; `output_file` writes it to disk |
 | `drive_account_list` | List configured Drive accounts — name, cached email, scope, default. Never a secret |
 
 ### AI / Config (5 tools)

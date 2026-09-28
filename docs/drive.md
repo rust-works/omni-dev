@@ -32,11 +32,12 @@ alone is sufficient. See [Write permissions](#write-permissions) and
 [ADR-0071](adrs/adr-0071.md) for the full design.
 
 The MCP tool surface (`drive_auth_status`/`drive_search`/`drive_dedupe`/
-`drive_file_read`/`drive_sheets_info`/`drive_sheets_read`/`drive_account_list`,
-mirroring the CLI one-for-one like Gmail's `gmail_*` tools) is read-only, like
-the rest of the MCP surface — `rename`/`move`/`create`/`upload`/`edit` and
-`sheets write`/`append`/`clear` have no MCP equivalent. See
-[docs/mcp.md](mcp.md#drive-7-tools) for the full tool reference.
+`drive_file_read`/`drive_sheets_info`/`drive_sheets_read`/`drive_docs_info`/
+`drive_docs_read`/`drive_account_list`, mirroring the CLI one-for-one like
+Gmail's `gmail_*` tools) is read-only, like the rest of the MCP surface —
+`rename`/`move`/`create`/`upload`/`edit`, `sheets write`/`append`/`clear`, and
+`docs replace`/`append`/`create` have no MCP equivalent. See
+[docs/mcp.md](mcp.md#drive-9-tools) for the full tool reference.
 
 New to this integration? Follow the
 [Drive Quickstart](drive-quickstart.md) for a linear, zero-to-first-search
@@ -3642,7 +3643,7 @@ listing the real ones, never an empty result.
 #### `drive docs info`
 
 Shows the document's identity, its revision, its per-tab counts and its
-heading outline.
+heading outline. Also available as the `drive_docs_info` MCP tool.
 
 ```bash
 $ omni-dev drive docs info 1AbC_dEfGhIjKlMnOpQrStUvWxYz
@@ -3681,7 +3682,8 @@ follow-up work.
 
 #### `drive docs read`
 
-One line per structural element, indented by nesting depth.
+One line per structural element, indented by nesting depth. Also available
+as the `drive_docs_read` MCP tool.
 
 ```bash
 $ omni-dev drive docs read 1AbC_dEfGhIjKlMnOpQrStUvWxYz

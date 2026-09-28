@@ -27,9 +27,11 @@ pub struct DocsCommand {
 /// Docs subcommands.
 #[derive(Subcommand)]
 pub enum DocsSubcommands {
-    /// Shows a document's title, revision id and structural outline.
+    /// Shows a document's title, revision id and structural outline
+    /// (mirrors the `drive_docs_info` MCP tool).
     Info(info::InfoCommand),
-    /// Reads a document's structural elements with their index ranges.
+    /// Reads a document's structural elements with their index ranges
+    /// (mirrors the `drive_docs_read` MCP tool).
     Read(read::ReadCommand),
     /// Replaces every occurrence of some text, gated by the
     /// write-permission rules (issue #1615). Requires the `drive.file` or
