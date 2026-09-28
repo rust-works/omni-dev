@@ -19,8 +19,9 @@ use crate::drive::sheets::delete_duplicates::{
 /// `--dry-run` names the range and the compared columns and states that
 /// rule — it cannot list the rows, and deliberately does not guess.
 ///
-/// The range must be fully bounded. Blank rows duplicate one another, so a
-/// range extending past the data can remove every blank row but the first.
+/// The range must be fully bounded. Blank rows between data rows duplicate
+/// one another, so every such blank row after the first is removed; blank
+/// rows after the last data row are left alone.
 /// Content outside the range stays in place; selecting fewer than all sheet
 /// columns can misalign records.
 #[derive(Parser)]

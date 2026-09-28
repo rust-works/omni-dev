@@ -756,7 +756,7 @@ plain read and needs no grant, the same as `list-protections`.
 #1796, [ADR-0081](adrs/adr-0081.md) §2). A named range is a label over a
 region, not grid data, so `delete-named-range` leaves every cell's stored
 value and formula text untouched — even though a cell formula referencing
-the removed name starts evaluating to `#NAME?` (conditional formatting,
+the removed name starts evaluating to `#REF!` (conditional formatting,
 data validation and chart references are not scanned). That effect is
 mitigated the same way `merge-cells`' data loss is: `delete-named-range`'s
 `--dry-run` (and real run) scans the workbook's cell formulas for the name
@@ -1783,33 +1783,11 @@ $ omni-dev drive sheets write <ID> --range 'A1:B10' --values ./cells.csv --dry-r
 Would write: 10 row(s) x 2 column(s) into A1:B10 of '2026 Budget'
 ```
 
-A dry run makes no Sheets API call and writes no request-log record, matching
-`create`/`upload`/`edit`.
-
-#### `drive sheets find-replace`
-
-`find-replace` is also gated by `sheets-write` ([ADR-0083](adrs/adr-0083.md)
-§1). It requires `--find`, `--replacement`, and exactly one scope: `--range`,
-`--whole-sheet --sheet`, or `--all-sheets`.
-
-```bash
-# Replace in one range; an empty replacement removes matches.
-omni-dev drive sheets find-replace <ID> --range 'Q1!A2:B100' \
-  --find 'draft' --replacement 'final'
-
-# Search every sheet, including formulas, with Java-regex syntax.
-omni-dev drive sheets find-replace <ID> --all-sheets --search-by-regex \
-  --include-formulas --find 'FY([0-9]+)' --replacement '202$1'
-```
-
-`--match-case`, `--match-entire-cell`, `--search-by-regex`, and
-`--include-formulas` map directly to the Sheets request. Formula inclusion
-adds formula cells to the search; Sheets has no formulas-only mode. A dry run
-reports the resolved scope, the search and replacement terms, and every
-modifier, without reading cells or estimating matches, because Sheets
-determines matching semantics and counts. A real run reports values,
-formulas, rows, sheets, and occurrences changed; one cell can contain
-several changed occurrences.
+A dry run never calls the values endpoint and writes no request-log record,
+matching `create`/`upload`/`edit`. When the range names a sheet (through
+`--sheet` or a `Sheet!` prefix), both a dry run and a real run first read the
+spreadsheet's sheet titles, and refuse an unknown sheet with the list of
+available ones.
 
 **`--values`** takes a file path or `-` for stdin. CSV by default; JSON (an
 array of arrays) when the path ends in `.json` or `--values-format json` is
@@ -1862,7 +1840,35 @@ presumably behaves the same on an existing cell, but that hasn't been
 measured. See [#1877](https://github.com/rust-works/omni-dev/issues/1877).
 
 Exit code is 0 whether the write succeeded, was blocked, or failed — inspect
-the output, not `$?`.
+the output, not `$?`. The exception is a local input error caught before the
+request is built (malformed CSV or JSON `--values`, an unreadable `--values`
+file, an option combination the command rejects): that exits 1, like any
+other argument error. An *empty* `--values` is a refusal, so it exits 0.
+
+#### `drive sheets find-replace`
+
+`find-replace` is also gated by `sheets-write` ([ADR-0083](adrs/adr-0083.md)
+§1). It requires `--find`, `--replacement`, and exactly one scope: `--range`,
+`--whole-sheet --sheet`, or `--all-sheets`.
+
+```bash
+# Replace in one range; an empty replacement removes matches.
+omni-dev drive sheets find-replace <ID> --range 'Q1!A2:B100' \
+  --find 'draft' --replacement 'final'
+
+# Search every sheet, including formulas, with Java-regex syntax.
+omni-dev drive sheets find-replace <ID> --all-sheets --search-by-regex \
+  --include-formulas --find 'FY([0-9]+)' --replacement '202$1'
+```
+
+`--match-case`, `--match-entire-cell`, `--search-by-regex`, and
+`--include-formulas` map directly to the Sheets request. Formula inclusion
+adds formula cells to the search; Sheets has no formulas-only mode. A dry run
+reports the resolved scope, the search and replacement terms, and every
+modifier, without reading cells or estimating matches, because Sheets
+determines matching semantics and counts. A real run reports values,
+formulas, rows, sheets, and occurrences changed; one cell can contain
+several changed occurrences.
 
 #### `drive sheets sort-range`
 
@@ -2292,7 +2298,7 @@ omni-dev drive sheets delete-duplicates <ID> --sheet Q1 --range A2:D100 --dry-ru
 Each `--comparison-column` must fall inside the selected range, and the
 range must be fully bounded (`A2:D100`, not `A:A`) — an open-ended range
 is refused because it automatically spans every allocated row. A bounded
-range can still include blank rows past the data. The column check is
+range can still hold blank rows between data rows. The column check is
 this tool's own, made before the request: the API rejects an out-of-range
 column too, with `400 INVALID_ARGUMENT: A column used for determining
 duplicates is not contained in the range`, so the local refusal only buys
@@ -2313,7 +2319,7 @@ vouch for ([ADR-0083](adrs/adr-0083.md) §6):
 
 ```
 $ omni-dev drive sheets delete-duplicates <ID> --sheet Q1 --range A2:D100 --dry-run
-Warning: blank rows inside the range duplicate one another, so a range extending past the data can remove every blank row but the first
+Warning: blank rows between data rows duplicate one another, so every such blank row after the first is removed; blank rows after the last data row are left alone
 Warning: only cells inside the selected range are removed and shifted up; columns outside it stay in place, so a range narrower than the sheet can misalign records
 Would remove duplicate rows from 'Q1'!A2:D100 in 'Budget', comparing every column in the range
   the API keeps the first instance of each duplicate and removes the rest; duplicates need not be adjacent, rows differing only in letter case, formatting or formulas still count as duplicates, and rows hidden by a filter are removed along with visible ones
@@ -2325,8 +2331,10 @@ seven-row range comparing every column:
 
 - `["A","1","x"]` was removed as a duplicate of `["a","1","x"]` —
   **case is ignored**.
-- A second blank row was removed as a duplicate of the first —
-  **blank rows duplicate one another**.
+- A second blank row between data rows was removed as a duplicate of the
+  first — **blank rows between data rows duplicate one another**. Blank
+  rows *after* the last data row were not: `A1:C10` holding three data rows
+  and seven trailing blank rows removed none.
 - A row identical to row 1 but five rows below it was removed —
   **duplicates need not be adjacent**.
 - A row differing only in an *uncompared* column was removed when
@@ -2337,9 +2345,9 @@ seven-row range comparing every column:
   when they ran it.
 
 That blank-row behaviour is the reason there is no `--whole-sheet` scope
-here, though `trim-whitespace` has one: blank rows duplicate one another,
-so a whole-sheet dedupe would delete a tab's entire trailing empty region.
-It applies to any bounded range that runs past the data, too.
+here, though `trim-whitespace` has one: blank rows between data rows
+duplicate one another, so a whole-sheet dedupe would collapse every
+intentional gap in a tab to a single blank row.
 
 The real run reports the API's `duplicatesRemovedCount` and, being a
 `sheets-delete` verb, the same recovery tail every destructive verb ends
@@ -3160,7 +3168,7 @@ Named ranges, gated by `sheets-structure` — including `delete-named-range`.
 See [ADR-0081](adrs/adr-0081.md) §2 for why: a named range is a label over a
 region, not grid data, so removing one leaves every cell's stored value and
 formula text untouched, even though every cell formula referencing the
-removed name starts evaluating to `#NAME?` (conditional formatting, data
+removed name starts evaluating to `#REF!` (conditional formatting, data
 validation and chart references are not scanned by the preview below).
 
 ```bash
@@ -3545,8 +3553,10 @@ API does not document it as doing anything beyond values on delimited
 text). `paste-data` takes its block either literally (`--data <TEXT>`) or
 from a file or stdin (`--data-file <PATH|->`); the two are mutually
 exclusive and exactly one is required, and an empty block is refused
-rather than pasted. It is `delimiter`-form only — the Sheets API's `html`
-paste alternative is not exposed.
+rather than pasted, as is an empty `--delimiter`. It is `delimiter`-form
+only — the Sheets API's `html` paste alternative is not exposed.
+`--paste-type values` does not keep pasted text literal: the API still
+parses text such as `=1+1` into a formula, as if typed into the UI.
 
 **`--source`/`--destination`, and `--sheet` as their shared default.** A
 reference already carrying its own `'Sheet'!` prefix is used as-is — a

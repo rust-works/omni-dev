@@ -30,8 +30,10 @@ pub struct SortRangeCommand {
     #[arg(long, value_name = "A1")]
     pub range: String,
 
-    /// A column sort key, as `COLUMN:asc` or `COLUMN:desc`. Repeat to add
-    /// lower-precedence keys.
+    /// A column sort key, as `COLUMN:asc` or `COLUMN:desc`. COLUMN is a
+    /// zero-based absolute sheet column index (`0` is column A, whatever
+    /// the range's first column), and must fall inside the range. Repeat to
+    /// add lower-precedence keys.
     #[arg(long, value_name = "COLUMN:ORDER", required = true)]
     pub sort_by: Vec<String>,
 
