@@ -23,10 +23,10 @@ use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::format::format_hex_color;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::types::{
-    CellFormatSnapshot, ColorStyleSnapshot, DataValidationRule, GridData,
+    BordersSnapshot, CellFormatSnapshot, ColorStyleSnapshot, DataValidationRule, GridData,
 };
 
-/// Refuse a bounded range covering more cells than this budget.
+/// Refuse a range whose cell count is over this budget.
 ///
 /// An `includeGridData`-shaped response grows with the range requested, not
 /// with how much of it is actually populated, so the narrow `fields` mask
@@ -34,9 +34,11 @@ use crate::drive::sheets::types::{
 /// values-only fetch. Errors rather than truncating — the same posture as
 /// `read.rs::MAX_SHEETS_PER_READ`.
 ///
-/// Only ever enforced against a **bounded** range (`A1:D10`); an open-ended
-/// one (`A:A`, `5:20`) is let through unchecked; a follow-up could size-check
-/// those against the returned response instead of refusing up front.
+/// Enforced in two layers: [`check_cell_budget`] refuses a **bounded**
+/// range (`A1:D10`) before any HTTP call; [`check_response_cell_budget`] is
+/// the backstop for an open-ended one (`A:A`, `5:20`) that layer can't
+/// compute up front — it can't avoid the request's own cost, but it does
+/// stop an oversized result from being processed and printed.
 const MAX_CELLS_PER_READ_CELL_FORMAT: i64 = 50_000;
 
 /// Per-call options.
@@ -123,12 +125,14 @@ pub async fn read_cell_formats(
     // sheet carrying any chunk at all is always the one that was read —
     // the same reasoning `pivot.rs::cell_snapshot_at` relies on.
     let sheet = workbook.sheets.iter().find(|sheet| !sheet.data.is_empty());
-    let (title, cells) = match sheet {
-        Some(sheet) => (
+    let (title, cells) = if let Some(sheet) = sheet {
+        check_response_cell_budget(&sheet.data)?;
+        (
             Some(sheet.title().to_string()),
             sheet.data.iter().flat_map(entries_from_grid).collect(),
-        ),
-        None => (opts.sheet.clone(), Vec::new()),
+        )
+    } else {
+        (opts.sheet.clone(), Vec::new())
     };
 
     Ok(CellFormatOutcome {
@@ -163,6 +167,33 @@ fn check_cell_budget(composed: &str) -> Result<()> {
         cells <= MAX_CELLS_PER_READ_CELL_FORMAT,
         "range covers {cells} cells, over the {MAX_CELLS_PER_READ_CELL_FORMAT}-cell budget for \
          read-cell-format; narrow --range"
+    );
+    Ok(())
+}
+
+/// Refuses a response whose actual grid data covers more cells than
+/// [`MAX_CELLS_PER_READ_CELL_FORMAT`] — the backstop for an open-ended
+/// range [`check_cell_budget`] let through unchecked. Runs after the HTTP
+/// call, so it cannot avoid the request's own cost, but it stops an
+/// oversized result from being processed and printed, with the same
+/// message shape the pre-flight cap uses.
+fn check_response_cell_budget(data: &[GridData]) -> Result<()> {
+    let cells: i64 = data
+        .iter()
+        .map(|grid| {
+            let width = grid
+                .row_data
+                .iter()
+                .map(|row| row.values.len() as i64)
+                .max()
+                .unwrap_or(0);
+            grid.row_data.len() as i64 * width
+        })
+        .sum();
+    anyhow::ensure!(
+        cells <= MAX_CELLS_PER_READ_CELL_FORMAT,
+        "response covers {cells} cells, over the {MAX_CELLS_PER_READ_CELL_FORMAT}-cell budget \
+         for read-cell-format; narrow --range"
     );
     Ok(())
 }
@@ -211,6 +242,22 @@ fn render_color_style(style: &ColorStyleSnapshot) -> String {
     }
 }
 
+/// Renders which of the four outer edges carry a border, comma-joined
+/// (e.g. `"top,left"`) — the edge names, not each one's style or color,
+/// which stay in the full structured (`-o json`/`-o yaml`) output.
+fn render_border_edges(borders: &BordersSnapshot) -> String {
+    [
+        ("top", borders.top.is_some()),
+        ("bottom", borders.bottom.is_some()),
+        ("left", borders.left.is_some()),
+        ("right", borders.right.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, set)| set.then_some(name))
+    .collect::<Vec<_>>()
+    .join(",")
+}
+
 /// Renders one entry as a compact, diff-friendly table line — the
 /// before/after-`diff` workflow ADR-0083 §5's verification is built around.
 /// Note *content* is never shown here (only its presence) — the same
@@ -254,6 +301,11 @@ pub(crate) fn render_line(entry: &CellFormatEntry) -> String {
         if let Some(align) = &format.horizontal_alignment {
             attrs.push(format!("align={align}"));
         }
+        if let Some(borders) = &format.borders {
+            if !borders.is_empty() {
+                attrs.push(format!("border={}", render_border_edges(borders)));
+            }
+        }
     }
     if entry.note.is_some() {
         attrs.push("note".to_string());
@@ -280,7 +332,8 @@ pub(crate) fn render_line(entry: &CellFormatEntry) -> String {
 mod tests {
     use super::*;
     use crate::drive::sheets::types::{
-        BooleanCondition, CellSnapshot, Color, NumberFormat, RowData, TextFormatSnapshot,
+        BooleanCondition, BorderSnapshot, CellSnapshot, Color, NumberFormat, RowData,
+        TextFormatSnapshot,
     };
 
     // ── check_cell_budget ──────────────────────────────────────────────
@@ -471,6 +524,12 @@ mod tests {
                     pattern: "$#,##0".to_string(),
                 }),
                 horizontal_alignment: None,
+                borders: Some(BordersSnapshot {
+                    top: Some(BorderSnapshot::default()),
+                    left: Some(BorderSnapshot::default()),
+                    bottom: None,
+                    right: None,
+                }),
             }),
             note: Some("a note".to_string()),
             data_validation: Some(DataValidationRule {
@@ -485,6 +544,7 @@ mod tests {
         assert!(line.starts_with("B3  "), "{line}");
         assert!(line.contains("bg=#FF0000"), "{line}");
         assert!(line.contains("bold"), "{line}");
+        assert!(line.contains("border=top,left"), "{line}");
         assert!(line.contains("number=CURRENCY:\"$#,##0\""), "{line}");
         assert!(line.contains("note"), "{line}");
         assert!(line.contains("validation=ONE_OF_LIST"), "{line}");
@@ -501,5 +561,66 @@ mod tests {
             data_validation: None,
         };
         assert_eq!(render_line(&entry), "A1");
+    }
+
+    #[test]
+    fn render_line_omits_an_empty_borders_object() {
+        // A cell whose `borders` key is present but every edge is absent
+        // must not print a bare `border=`.
+        let entry = CellFormatEntry {
+            cell: "A1".to_string(),
+            format: Some(CellFormatSnapshot {
+                borders: Some(BordersSnapshot::default()),
+                ..Default::default()
+            }),
+            note: None,
+            data_validation: None,
+        };
+        assert_eq!(render_line(&entry), "A1");
+    }
+
+    // ── render_border_edges ────────────────────────────────────────────
+
+    #[test]
+    fn render_border_edges_lists_only_the_set_edges_in_a_fixed_order() {
+        let borders = BordersSnapshot {
+            top: None,
+            bottom: Some(BorderSnapshot::default()),
+            left: None,
+            right: Some(BorderSnapshot::default()),
+        };
+        assert_eq!(render_border_edges(&borders), "bottom,right");
+    }
+
+    // ── check_response_cell_budget ─────────────────────────────────────
+
+    #[test]
+    fn check_response_cell_budget_allows_a_response_within_the_cap() {
+        let data = vec![GridData {
+            start_row: Some(0),
+            start_column: Some(0),
+            row_data: vec![RowData {
+                values: vec![CellSnapshot::default(); 10],
+            }],
+        }];
+        assert!(check_response_cell_budget(&data).is_ok());
+    }
+
+    #[test]
+    fn check_response_cell_budget_refuses_an_oversized_response() {
+        // This is exactly the backstop `check_cell_budget` can't provide
+        // for an unbounded range: a huge actual response, caught here.
+        let data = vec![GridData {
+            start_row: Some(0),
+            start_column: Some(0),
+            row_data: vec![
+                RowData {
+                    values: vec![CellSnapshot::default(); 1000],
+                };
+                1000
+            ],
+        }];
+        let err = check_response_cell_budget(&data).unwrap_err();
+        assert!(err.to_string().contains("cell budget"), "{err}");
     }
 }

@@ -2920,6 +2920,64 @@ pub struct CellFormatSnapshot {
         rename = "horizontalAlignment"
     )]
     pub horizontal_alignment: Option<String>,
+    /// The four outer edge borders (issue #1878). A border is still part of
+    /// `userEnteredFormat`, so omitting it here would let a verb that moves
+    /// only borders show as "no formatting changed".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub borders: Option<BordersSnapshot>,
+}
+
+/// Read-only mirror of the write-side [`Border`] (issue #1878).
+///
+/// Tolerant of a `colorStyle` carrying a theme color — see
+/// [`ColorStyleSnapshot`]'s doc comment. [`Border`] itself has no
+/// `Deserialize` impl (it is write-only), so this is a genuinely separate
+/// type, not just a field-level patch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BorderSnapshot {
+    /// `"SOLID"` / `"SOLID_MEDIUM"` / `"SOLID_THICK"` / `"DASHED"` /
+    /// `"DOTTED"` / `"DOUBLE"` / `"NONE"`.
+    #[serde(default)]
+    pub style: String,
+    /// The line color.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "colorStyle"
+    )]
+    pub color_style: Option<ColorStyleSnapshot>,
+}
+
+/// The four outer edges of `CellFormatSnapshot.borders` (issue #1878).
+///
+/// Mirrors [`UpdateBordersRequest`]'s shape, but read-only. Each edge is
+/// independently optional: an unset edge simply wasn't requested-and-present
+/// on this cell, the same "absent means not asked for or not set"
+/// convention every other `*Snapshot` field follows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BordersSnapshot {
+    /// Top edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<BorderSnapshot>,
+    /// Bottom edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<BorderSnapshot>,
+    /// Left edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<BorderSnapshot>,
+    /// Right edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right: Option<BorderSnapshot>,
+}
+
+impl BordersSnapshot {
+    /// Whether every edge is absent — used to skip an empty `borders`
+    /// object from a table-line rendering the same way a cell carrying no
+    /// format at all is skipped.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.top.is_none() && self.bottom.is_none() && self.left.is_none() && self.right.is_none()
+    }
 }
 
 /// One cell, read back only for the properties a caller's `fields` mask

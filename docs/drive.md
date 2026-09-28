@@ -3643,8 +3643,11 @@ preview).
 scope for v1**, since the underlying `spreadsheets.get` response grows with
 the range requested rather than with what's actually populated. A bounded
 range (`A1:D10`) over roughly 50,000 cells is refused locally before any
-HTTP call; an open-ended range (`A:A`, `5:20`) is let through unchecked —
-narrowing it is the caller's responsibility.
+HTTP call. An open-ended range (`A:A`, `5:20`) is let through unchecked at
+that point — computing its true extent up front would need its own
+metadata fetch — but the same cap is checked again against the response
+actually returned, so an oversized result is still refused rather than
+processed and printed; it just can't avoid that one request's own cost.
 
 **A theme color is reported by name (`theme:ACCENT1`), never guessed as
 black.** The Sheets API's `ColorStyle` union has two arms — an explicit RGB
@@ -3652,11 +3655,16 @@ color, or a theme color set via the UI's "Theme colors" picker — and only
 the former carries `rgbColor`; a cell carrying the latter has no `rgbColor`
 key to default.
 
-**Borders and merges are a documented cut for v1** — they read from
-different mask paths (`userEnteredFormat.borders`, `sheets.merges`) than
-the four properties ADR-0083 §5's verification actually turns on
-(background, bold, note, validation-presence), and adding either later is
-non-breaking.
+**The four outer edge borders are reported too** (`border=top,left`, the
+edge names only — a border's style and color are in `-o json`/`-o yaml`).
+A border is still part of `userEnteredFormat`, so leaving it out would let
+a verb that moves only borders show as "no formatting changed" and be
+wrongly concluded formatting-safe.
+
+**Merges are a documented cut for v1** — `sheets.merges` is a different
+mask path entirely (a per-sheet list, not a per-cell property), so
+reporting them needs their own field and outcome shape; a non-breaking
+follow-up.
 
 ## Docs
 
