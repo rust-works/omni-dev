@@ -293,7 +293,7 @@ async fn sort_range_inner(
     let end_column = grid.end_column_index.unwrap_or(0);
     if let Some(spec) = sort_specs
         .iter()
-        .find(|spec| spec.dimension_index < start_column || spec.dimension_index >= end_column)
+        .find(|spec| grid_range::check_column_in_range(spec.dimension_index, &grid).is_err())
     {
         return gated(SortRangeResult::RefusedInvalidRequest {
             detail: format!(
