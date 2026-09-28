@@ -10,12 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-29
+
 ### Added
 - **Session cues name their agent** ([#1908](https://github.com/rust-works/omni-dev/issues/1908)): a worktree row's session tooltip now starts with the agents running there (`Codex: 1 working`, `Claude, pi: 1 waiting on you, 1 idle`) instead of always `Claude:`, and the model-family marker gains a `g` for Codex's `gpt-*` models (`[sg]`), which previously fell to `*`. A daemon that predates the `agent` tag still reads as Claude. Glyphs and colours stay state-driven.
 - **Agent menu with pi.dev launcher** ([#1895](https://github.com/rust-works/omni-dev/issues/1895)): the editor title-bar's direct Claude action is now an **Agent** menu, which holds **Launch Claude Code** and **Launch pi.dev**. Opening or dismissing the menu does not start a terminal. Each pi selection starts a new `pi` session in its own editor-area terminal named `pi.dev`, `pi.dev 2`, and so on, using the focused workspace folder or the first workspace folder as its working directory.
   - pi always runs in an explicit interactive login zsh shell, independent of the user's default VS Code terminal profile. The extension checks zsh and pi before creating a terminal and shows an actionable error when either is unavailable.
 - **pi.dev tabs show just the session name** ([#1899](https://github.com/rust-works/omni-dev/issues/1899)): after `/name Blah`, a pi.dev tab now reads `Blah` instead of pi's own `pi - Blah - <directory>`. pi always adds the working directory's name to its title, and in a worktree that looks like a branch name and widens the tab. **Launch pi.dev** now starts pi with a small pi extension bundled with this extension (`pi -e …/dist/pi-title.mjs`), which retitles the terminal whenever pi does: at startup, after `/name`, and on switching sessions. Until a session is named, the tab keeps its `pi.dev`, `pi.dev 2`, … title.
   - The new `omniDevWorktrees.piTabTitle` setting chooses between `name` (the default) and `native`, which runs plain `pi` and keeps pi's own title. It applies to newly launched terminals. Claude Code tabs are unaffected.
+
+### Changed
+- **Agent terminal tabs follow the session's own title** ([#1897](https://github.com/rust-works/omni-dev/issues/1897)): Claude Code and pi.dev tabs now start as `Claude Code`/`pi.dev` (numbered when several are open) and then take whatever title the CLI sets, so `/rename` in Claude Code or `/name` in pi renames the tab. To make that work the extension now defaults **Terminal › Integrated › Tabs: Title** (`terminal.integrated.tabs.title`) to `${sequence}`. This default applies to **every** terminal tab, not only agent ones, and an explicit user or workspace setting still wins. Tabs opened by an older extension version keep their fixed name until closed and relaunched.
 
 ### Fixed
 - **A resumed Claude Code session no longer shows as busy until its first prompt** ([#1946](https://github.com/rust-works/omni-dev/issues/1946)): a worktree row now counts a `starting` session (one that has launched or resumed but hasn't been prompted, as after a window reload) as idle rather than working. The matching daemon fix, which stops the old process's exit write from moving the resumed session to `working`, ships in the omni-dev crate. Both are needed for the row to read idle.
