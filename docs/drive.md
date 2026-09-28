@@ -2507,7 +2507,12 @@ Refused: --before 502 is past the end of the sheet, which has 500 row(s); the fu
 Refused: --before 3 is inside or immediately after the block being moved (rows 2-3), so nothing would move
 ```
 
-The last of these is unique to `move-rows`/`move-columns`: no other verb has
+`hide-sheet` on a sheet that is already hidden, or `show-sheet` on one
+that is already visible, sends nothing and reports `Unchanged: sheet 'Q2'
+is already hidden in 'Budget'` (JSON `"status":"unchanged"`), in a dry run
+and a real run alike, rather than claiming a change.
+
+The last refusal above is unique to `move-rows`/`move-columns`: no other verb has
 a destination that can collide with its own source, so only a move can be
 refused for moving nothing.
 
@@ -3077,7 +3082,9 @@ The basic filter and filter views (issue #1794), gated by
 [ADR-0081](adrs/adr-0081.md): a filter hides rows, which is view state, not
 data. The two are shaped differently: a sheet has **at most one** basic
 filter, so `set-basic-filter` is an upsert and `clear-basic-filter` needs
-only `--sheet`. Filter views are **many, named and id-addressed** —
+only `--sheet`; clearing a sheet that has no basic filter sends nothing and
+reports `Unchanged: sheet 'Q2' has no basic filter to clear` (JSON
+`"status":"unchanged"`). Filter views are **many, named and id-addressed** —
 `list-filter-views` is how you discover a view's numeric id, the same way
 `list-protections` is for protected ranges.
 
