@@ -1522,6 +1522,7 @@ mod tests {
         let value_cell = CellSnapshot {
             pivot_table: None,
             formatted_value: Some("Q2 totals".to_string()),
+            ..Default::default()
         };
         assert_eq!(
             describe_anchor_currently(Some(&value_cell)),
@@ -1535,6 +1536,7 @@ mod tests {
                 ..Default::default()
             }),
             formatted_value: None,
+            ..Default::default()
         };
         let pivot_desc = describe_anchor_currently(Some(&pivot_cell));
         assert!(pivot_desc.contains("a pivot table"), "{pivot_desc}");
@@ -1544,11 +1546,13 @@ mod tests {
         let blank_cell = CellSnapshot {
             pivot_table: None,
             formatted_value: None,
+            ..Default::default()
         };
         assert_eq!(describe_anchor_currently(Some(&blank_cell)), "empty");
         let empty_string_cell = CellSnapshot {
             pivot_table: None,
             formatted_value: Some(String::new()),
+            ..Default::default()
         };
         assert_eq!(describe_anchor_currently(Some(&empty_string_cell)), "empty");
     }

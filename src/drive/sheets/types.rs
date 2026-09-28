@@ -2795,7 +2795,10 @@ pub struct PivotFilterCriteria {
 /// requests one contiguous range at a time, so `Sheet::data` is a
 /// single-element `Vec` in practice, but the type stays a `Vec` because
 /// that is the wire shape.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `PartialEq` only, **not** `Eq` (issue #1878) — see [`CellSnapshot`]'s doc
+/// comment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct GridData {
     /// The zero-based row this chunk starts at.
@@ -2810,13 +2813,113 @@ pub struct GridData {
 }
 
 /// One row of [`GridData::row_data`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `PartialEq` only, **not** `Eq` (issue #1878) — see [`CellSnapshot`]'s doc
+/// comment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RowData {
     /// The row's cells, in the `fields` mask the caller requested — every
     /// property not asked for is simply absent, even one that exists on
     /// the real cell.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<CellSnapshot>,
+}
+
+/// Read-only mirror of [`ColorStyle`], tolerant of the API's alternative
+/// `themeColor` arm (issue #1878).
+///
+/// [`ColorStyle`] itself requires `rgbColor`, because every write this crate
+/// sends carries an explicit RGB color. But a cell's *existing*
+/// `userEnteredFormat` can carry a theme color instead — set via the
+/// Sheets UI's "Theme colors" picker — which comes back as
+/// `{"themeColor": "TEXT"}` with **no** `rgbColor` key at all, and would
+/// fail to deserialize into [`ColorStyle`]. Exactly one of the two fields is
+/// ever present; `read-cell-format`'s rendering falls back to naming the
+/// theme color (`theme:TEXT`) when `rgb_color` is absent, rather than
+/// defaulting it to a misleading black.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ColorStyleSnapshot {
+    /// The explicit RGB color, when this is the `rgbColor` arm.
+    #[serde(default, rename = "rgbColor", skip_serializing_if = "Option::is_none")]
+    pub rgb_color: Option<Color>,
+    /// The theme color's name (e.g. `"TEXT"`, `"ACCENT1"`), when this is the
+    /// `themeColor` arm.
+    #[serde(
+        default,
+        rename = "themeColor",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub theme_color: Option<String>,
+}
+
+/// Read-only mirror of [`TextFormat`] (issue #1878's `read-cell-format`).
+///
+/// Covers exactly the sub-fields its `fields` mask requests: bold, italic,
+/// strikethrough, underline and the foreground color. Kept separate from
+/// [`TextFormat`] only because its color field is [`ColorStyleSnapshot`],
+/// not [`ColorStyle`] — see that type's doc comment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TextFormatSnapshot {
+    /// Bold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    /// Italic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+    /// Strikethrough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strikethrough: Option<bool>,
+    /// Underline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underline: Option<bool>,
+    /// Text color.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "foregroundColorStyle"
+    )]
+    pub foreground_color_style: Option<ColorStyleSnapshot>,
+}
+
+/// Read-only mirror of [`CellFormat`] (issue #1878's `read-cell-format`).
+///
+/// Covers exactly the sub-fields its `fields` mask requests: background
+/// color, text format, number format and horizontal alignment — the
+/// properties ADR-0083 §5's "does this verb move formatting?" question
+/// turns on. Kept separate from [`CellFormat`] for the same reason
+/// [`CellSnapshot`]'s doc comment gives for staying separate from
+/// [`PivotCellData`]: a read-only type must never become a path for
+/// writing a format back.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CellFormatSnapshot {
+    /// Cell background color.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "backgroundColorStyle"
+    )]
+    pub background_color_style: Option<ColorStyleSnapshot>,
+    /// Text formatting (bold, italic, color, …).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "textFormat"
+    )]
+    pub text_format: Option<TextFormatSnapshot>,
+    /// Display number format.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "numberFormat"
+    )]
+    pub number_format: Option<NumberFormat>,
+    /// `"LEFT"` / `"CENTER"` / `"RIGHT"`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "horizontalAlignment"
+    )]
+    pub horizontal_alignment: Option<String>,
 }
 
 /// One cell, read back only for the properties a caller's `fields` mask
@@ -2826,7 +2929,12 @@ pub struct RowData {
 /// type) precisely so this read-only type can carry
 /// [`Self::formatted_value`] without ever creating a path for a literal
 /// value to be written back through it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `PartialEq` only, **not** `Eq` (issue #1878): [`Self::user_entered_format`]
+/// carries [`Color`]'s `f32` channels transitively, which has no meaningful
+/// `Eq` — see that type's doc comment. [`RowData`] and [`GridData`] drop
+/// `Eq` for the same reason.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CellSnapshot {
     /// The pivot table anchored at this cell, if any.
@@ -2836,6 +2944,29 @@ pub struct CellSnapshot {
     /// occupied anchor in a refusal/dry-run message, never parsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formatted_value: Option<String>,
+    /// The cell's user-entered format — background, text formatting, number
+    /// format, horizontal alignment (issue #1878's `read-cell-format`).
+    /// Deliberately **`userEnteredFormat`, not `effectiveFormat`**: what a
+    /// sort or fill physically moves is the user-entered format, while
+    /// `effectiveFormat` folds in conditional formatting, which follows the
+    /// *range* rather than the cell and would give false positives when
+    /// checking whether a verb moved formatting.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "userEnteredFormat"
+    )]
+    pub user_entered_format: Option<CellFormatSnapshot>,
+    /// A note attached to the cell (issue #1878).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// A data validation rule on the cell (issue #1878).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "dataValidation"
+    )]
+    pub data_validation: Option<DataValidationRule>,
 }
 
 /// `InsertDimensionRequest`.
@@ -4879,6 +5010,7 @@ mod tests {
                                 value_layout: None,
                             }),
                             formatted_value: None,
+                            ..Default::default()
                         }],
                     }],
                 }],

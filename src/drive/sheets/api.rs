@@ -127,6 +127,26 @@ const CELL_PIVOT_FIELDS: &str = "spreadsheetId,properties.title,\
     sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)),\
     sheets.data(startRow,startColumn,rowData.values(pivotTable,formattedValue))";
 
+/// `fields` mask for `spreadsheets.get` when a range's cell-level formatting
+/// is needed (issue #1878's `read-cell-format`, the tool that answers
+/// ADR-0083 §5's "does this verb move formatting?" question). Paired with a
+/// `ranges=` query parameter scoping the response to the caller's range
+/// (see [`SheetsApi::get_cell_formats`]), so this mask alone would still
+/// return every sheet's grid data without it.
+///
+/// Narrowed to exactly what that question turns on: background color, text
+/// format (bold/italic/strikethrough/underline/color), number format,
+/// horizontal alignment, notes and data validation. Deliberately
+/// **`userEnteredFormat`, not `effectiveFormat`** — see
+/// [`crate::drive::sheets::types::CellSnapshot::user_entered_format`]'s doc
+/// comment. Borders and merges are documented cuts (they read from
+/// different mask paths — `userEnteredFormat.borders` and `sheets.merges`
+/// respectively — and neither is needed to answer the four things ADR-0083
+/// §5 checks: background, bold, note and validation-presence).
+const CELL_FORMAT_FIELDS: &str = "spreadsheetId,properties.title,\
+    sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)),\
+    sheets.data(startRow,startColumn,rowData.values(userEnteredFormat(backgroundColorStyle,textFormat(bold,italic,strikethrough,underline,foregroundColorStyle),numberFormat,horizontalAlignment),note,dataValidation))";
+
 /// `fields` mask for `spreadsheets.get` when banded ranges are needed too
 /// (issue #1832's `add-banding`/`update-banding`/`delete-banding`/
 /// `list-bandings`, which must resolve an *existing* banded range by id
@@ -418,6 +438,22 @@ impl<'a> SheetsApi<'a> {
         self.client
             .transport()
             .get_parsed(url.as_str(), "Failed to parse Sheets cell pivot response")
+            .await
+    }
+
+    /// Fetches a range's cell-level formatting — `read-cell-format` (issue
+    /// #1878). `composed_a1` may be any range `a1::compose` can build, not
+    /// just a single cell; the response's `sheets.data` is scoped to it by
+    /// the `ranges` query parameter. See [`CELL_FORMAT_FIELDS`].
+    pub async fn get_cell_formats(
+        &self,
+        spreadsheet_id: &str,
+        composed_a1: &str,
+    ) -> Result<Spreadsheet> {
+        let url = build_cell_format_get_url(self.client.base_url(), spreadsheet_id, composed_a1)?;
+        self.client
+            .transport()
+            .get_parsed(url.as_str(), "Failed to parse Sheets cell format response")
             .await
     }
 
@@ -759,6 +795,20 @@ fn build_cell_pivot_get_url(
     Ok(url)
 }
 
+fn build_cell_format_get_url(
+    base_url: &str,
+    spreadsheet_id: &str,
+    composed_a1: &str,
+) -> Result<Url> {
+    let mut url = GoogleApiClient::api_url(base_url, "/v4/spreadsheets")
+        .context("Invalid Sheets base URL")?;
+    GoogleApiClient::push_path_segments(&mut url, &[spreadsheet_id])?;
+    url.query_pairs_mut()
+        .append_pair("ranges", composed_a1)
+        .append_pair("fields", CELL_FORMAT_FIELDS);
+    Ok(url)
+}
+
 fn build_values_get_url(
     base_url: &str,
     spreadsheet_id: &str,
@@ -1062,6 +1112,33 @@ mod tests {
         assert!(fields.contains("formattedValue"));
         // issue #1835: CELL_PIVOT_FIELDS carries the same sheets.properties
         // sub-mask every other SPREADSHEET_FIELDS* constant does.
+        assert!(fields.contains("frozenRowCount"));
+    }
+
+    #[test]
+    fn cell_format_get_url_scopes_ranges_and_masks_fields() {
+        let url = build_cell_format_get_url(BASE, "sheet-1", "'Report'!A1:D10").unwrap();
+        assert_eq!(url.path(), "/v4/spreadsheets/sheet-1");
+        let ranges = url
+            .query_pairs()
+            .find(|(k, _)| k == "ranges")
+            .map(|(_, v)| v.to_string())
+            .expect("ranges must always be sent");
+        assert_eq!(ranges, "'Report'!A1:D10");
+        let fields = url
+            .query_pairs()
+            .find(|(k, _)| k == "fields")
+            .map(|(_, v)| v.to_string())
+            .expect("fields mask must always be sent");
+        assert!(fields.contains("userEnteredFormat"));
+        assert!(fields.contains("backgroundColorStyle"));
+        assert!(fields.contains("note"));
+        assert!(fields.contains("dataValidation"));
+        // issue #1878: read userEnteredFormat, never effectiveFormat — the
+        // latter folds in conditional formatting and would give false
+        // positives when checking whether a verb moved formatting.
+        assert!(!fields.contains("effectiveFormat"));
+        assert!(!fields.contains("formattedValue"));
         assert!(fields.contains("frozenRowCount"));
     }
 

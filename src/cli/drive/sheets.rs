@@ -13,6 +13,7 @@
 
 pub(crate) mod auto_fill;
 pub(crate) mod banding;
+pub(crate) mod cell_format;
 pub(crate) mod conditional_format;
 pub(crate) mod create;
 pub(crate) mod delete_duplicates;
@@ -57,6 +58,12 @@ pub enum SheetsSubcommands {
     Info(info::InfoCommand),
     /// Reads cell values from one range, or from every sheet.
     Read(read::ReadCommand),
+    /// Reads a range's cell-level formatting back — background, text
+    /// format, number format, horizontal alignment, notes and data
+    /// validation. Read-only and ungated, like `sheets read` (issue #1878):
+    /// it discloses no more than opening the file in the UI does. The tool
+    /// ADR-0083 §5 relies on to answer whether a verb moves formatting.
+    ReadCellFormat(cell_format::ReadCellFormatCommand),
     /// Overwrites the cells of a range, gated by the
     /// write-permission rules (issues #1589, #1612). Requires the `drive.file` or
     /// `drive` scope (`drive auth login --write-file`/`--write-full`).
@@ -419,6 +426,7 @@ impl SheetsCommand {
         match self.command {
             SheetsSubcommands::Info(cmd) => cmd.execute(client).await,
             SheetsSubcommands::Read(cmd) => cmd.execute(client).await,
+            SheetsSubcommands::ReadCellFormat(cmd) => cmd.execute(client).await,
             SheetsSubcommands::Write(cmd) => cmd.execute(client).await,
             SheetsSubcommands::Append(cmd) => cmd.execute(client).await,
             SheetsSubcommands::Clear(cmd) => cmd.execute(client).await,

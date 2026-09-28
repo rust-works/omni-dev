@@ -4461,6 +4461,7 @@ Usage: sheets <COMMAND>
 Commands:
   info                         Shows a spreadsheet's title and the sheets (tabs) it contains
   read                         Reads cell values from one range, or from every sheet
+  read-cell-format             Reads a range's cell-level formatting back — background, text format, number format, horizontal alignment, notes and data validation. Read-only and ungated, like `sheets read` (issue #1878): it discloses no more than opening the file in the UI does. The tool ADR-0083 §5 relies on to answer whether a verb moves formatting
   write                        Overwrites the cells of a range, gated by the write-permission rules (issues #1589, #1612). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
   append                       Appends rows after the last row of a range's table, gated by the write-permission rules (issues #1589, #1612)
   clear                        Clears a range's values, leaving formatting intact. Gated by the write-permission rules (issues #1589, #1612)
@@ -5853,6 +5854,24 @@ Options:
       --sheet <NAME>     Sheet (tab) title to read. Supplies the prefix for a bare `--range`, or selects the whole tab on its own. Conflicts with a `--range` that already names a sheet
       --render <RENDER>  How cell values are rendered. `formatted` matches the spreadsheet as displayed; `unformatted` yields raw typed numbers rather than locale-formatted strings; `formula` yields formula text [default: formatted] [possible values: formatted, unformatted, formula]
   -o, --output <OUTPUT>  Output format. The default `table` emits CSV — one block per sheet, each preceded by a `# <title>` comment line when reading more than one. Use `json`/`yaml` to keep values typed and rows ragged [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sheets read-cell-format - Reads a range's cell-level formatting back — background, text format, number format, horizontal alignment, notes and data validation. Read-only and ungated, like `sheets read` (issue #1878): it discloses no more than opening the file in the UI does. The tool ADR-0083 §5 relies on to answer whether a verb moves formatting
+
+Reads a range's cell-level formatting back — background, text format, number format, horizontal alignment, notes and data validation. Read-only and ungated, like `sheets read` (issue #1878): it discloses no more than opening the file in the UI does. The tool ADR-0083 §5 relies on to answer whether a verb moves formatting
+
+Usage: read-cell-format [OPTIONS] --range <A1> <SPREADSHEET_ID>
+
+Arguments:
+  <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
+
+Options:
+      --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
+      --range <A1>       A1 range to read, optionally carrying its own `Sheet!` prefix (e.g. `A1:D10`, `'My Sheet'!A1:D10`). Required — a whole-workbook read is out of scope, since the response grows with the range requested
+  -o, --output <OUTPUT>  Output format. The default `table` emits one compact, diff-friendly line per non-default cell (e.g. `B3  bg=#FF0000 bold note`); a cell carrying none of the reported properties is never listed. Use `json`/`yaml` for the full structured format, including note text [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
