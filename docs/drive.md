@@ -779,6 +779,12 @@ data — so `delete-dimension-group` destroys nothing. `drive sheets
 list-dimension-groups` is a plain read and needs no grant, the same as
 `list-bandings`.
 
+**`drive sheets read-cell-format` needs no grant either** (issue #1878): it
+reports a range's `userEnteredFormat`, note and data validation rule, and
+is the tool that answers whether an above verb's gate should also cover
+`sheets-structure` per this section's own "live-verified to move or write
+formatting" rule.
+
 **`sheets-protection` is separate from `sheets-structure`, and the reason is
 different in kind from every split above.** A protected range is a
 *permission* inside the document — who may edit, not what the sheet
@@ -3592,6 +3598,65 @@ render as one line of comma-separated A1 addresses (issue #1880 — before
 it, each address printed on its own line). Past 50 addresses the rendered
 line elides the remainder (`… and N more`); the `-o json` outcome keeps
 the full list, and the count in the sentence stays exact either way.
+
+#### drive sheets read-cell-format
+
+Reads a range's cell-level formatting back — background color, text format
+(bold/italic/strikethrough/underline/color), number format, horizontal
+alignment, notes and data validation rules (issue #1878). Read-only and
+ungated, like `sheets read` and every `list-*` verb — it discloses no more
+than opening the file in the UI does.
+
+It exists to close [ADR-0083](adrs/adr-0083.md) §5's gate-moving question in
+tooling rather than by eye: "a verb live-verified to move or write
+formatting resolves both `sheets-write` and `sheets-structure`" is an
+obligation every grid-mutation verb has, and until this verb existed
+nothing under `omni-dev drive sheets` could read a cell's format back to
+check it.
+
+```bash
+# Snapshot a range's formatting before running a verb under test, then
+# again after, and diff the two — the ADR-0083 §5 verification recipe.
+omni-dev drive sheets read-cell-format <ID> --sheet Q1 --range A1:D10 -o yaml > before.yaml
+omni-dev drive sheets trim-whitespace <ID> --sheet Q1 --range A1:D10
+omni-dev drive sheets read-cell-format <ID> --sheet Q1 --range A1:D10 -o yaml > after.yaml
+diff before.yaml after.yaml
+```
+
+**Reports `userEnteredFormat`, never `effectiveFormat`.** What a sort, fill
+or paste physically moves is the user-entered format; `effectiveFormat`
+folds in conditional formatting, which follows the *range* rather than the
+cell and would give false positives when checking whether a verb moved
+formatting.
+
+**Only non-default cells are reported.** A cell present in the requested
+range but carrying none of the reported properties is omitted entirely, so
+the table output is a compact, diff-friendly list — one line per cell that
+actually has something to report (e.g. `B3  bg=#FF0000 bold
+number=CURRENCY:"$#,##0" note validation=ONE_OF_LIST`). `-o json`/`-o yaml`
+carry the full structured format, including note text (the table output
+shows only a note's *presence*, never its content — the same "counts and
+locations, never contents" stance ADR-0083 §6 takes for a paste/auto-fill
+preview).
+
+**`--range` is required; a whole-workbook or whole-sheet read is out of
+scope for v1**, since the underlying `spreadsheets.get` response grows with
+the range requested rather than with what's actually populated. A bounded
+range (`A1:D10`) over roughly 50,000 cells is refused locally before any
+HTTP call; an open-ended range (`A:A`, `5:20`) is let through unchecked —
+narrowing it is the caller's responsibility.
+
+**A theme color is reported by name (`theme:ACCENT1`), never guessed as
+black.** The Sheets API's `ColorStyle` union has two arms — an explicit RGB
+color, or a theme color set via the UI's "Theme colors" picker — and only
+the former carries `rgbColor`; a cell carrying the latter has no `rgbColor`
+key to default.
+
+**Borders and merges are a documented cut for v1** — they read from
+different mask paths (`userEnteredFormat.borders`, `sheets.merges`) than
+the four properties ADR-0083 §5's verification actually turns on
+(background, bold, note, validation-presence), and adding either later is
+non-breaking.
 
 ## Docs
 
