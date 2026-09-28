@@ -193,17 +193,17 @@ fn render_info_table(outcome: &InfoOutcome, out: &mut dyn std::io::Write) -> Res
             _ => "Tab: (single body)".to_string(),
         };
         let mut counts = vec![
-            format!("{} chars", tab.characters),
-            format!("{} paragraphs", tab.paragraphs),
+            count(tab.characters, "char"),
+            count(tab.paragraphs, "paragraph"),
         ];
         if tab.tables > 0 {
-            counts.push(format!("{} tables", tab.tables));
+            counts.push(count(tab.tables, "table"));
         }
         if tab.section_breaks > 0 {
-            counts.push(format!("{} section breaks", tab.section_breaks));
+            counts.push(count(tab.section_breaks, "section break"));
         }
         if tab.tables_of_contents > 0 {
-            counts.push(format!("{} TOCs", tab.tables_of_contents));
+            counts.push(count(tab.tables_of_contents, "TOC"));
         }
         writeln!(out, "{label} — {}", counts.join(", ")).context(ctx)?;
 
@@ -220,6 +220,13 @@ fn render_info_table(outcome: &InfoOutcome, out: &mut dyn std::io::Write) -> Res
         }
     }
     Ok(())
+}
+
+/// `n` followed by `noun`, pluralised with an `s` unless `n` is exactly 1.
+fn count(n: impl std::fmt::Display, noun: &str) -> String {
+    let n = n.to_string();
+    let suffix = if n == "1" { "" } else { "s" };
+    format!("{n} {noun}{suffix}")
 }
 
 #[cfg(test)]
@@ -295,6 +302,23 @@ mod tests {
         assert!(text.contains("2 paragraphs"), "{text}");
         assert!(text.contains("30 chars"), "{text}");
         assert!(text.contains("Tab: t.1 \"Appendix\""), "{text}");
+    }
+
+    #[test]
+    fn tab_counts_are_singular_only_for_exactly_one() {
+        assert_eq!(count(1_usize, "section break"), "1 section break");
+        assert_eq!(count(0_usize, "table"), "0 tables");
+        assert_eq!(count(2_i64, "char"), "2 chars");
+        let doc = document(serde_json::json!({
+            "documentId": "d1",
+            "body": {"content": [paragraph(1, 2, "\n", "NORMAL_TEXT")]},
+        }));
+        let text = render(&InfoOutcome::of("d1", &doc));
+        assert!(
+            text.contains("1 paragraph,") || text.ends_with("1 paragraph\n"),
+            "{text}"
+        );
+        assert!(!text.contains("1 paragraphs"), "{text}");
     }
 
     #[test]

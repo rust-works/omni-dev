@@ -597,6 +597,11 @@ async fn filter_inner(
     if matches!(update_write, Some(FilterViewWrite::Replace(_))) {
         summary.push_str(REPLACE_NOTE);
     }
+    // A delete is addressed by a bare id, so name what the id resolved to
+    // — the view was already fetched to confirm it exists.
+    if let (FilterVerb::DeleteFilterView { .. }, Some(view)) = (&opts.verb, existing) {
+        summary.push_str(&describe_existing_view(&workbook, view));
+    }
     let width_warning = if opts.verb.reorders_rows() {
         resolved_target
             .as_ref()
@@ -1195,6 +1200,24 @@ fn describe_effect(verb: &FilterVerb) -> String {
         }
         FilterVerb::DeleteFilterView { .. } => "delete filter view".to_string(),
     }
+}
+
+/// Identifies an existing filter view for a summary: its title and range,
+/// e.g. ` 'Open items' over 'Q1'!A1:D10`. A range that is not fully bounded
+/// falls back to [`grid_range::render_grid_range`]; a view with neither
+/// renders nothing.
+fn describe_existing_view(workbook: &Spreadsheet, view: &FilterView) -> String {
+    let mut text = String::new();
+    if let Some(title) = view.title.as_deref().filter(|t| !t.is_empty()) {
+        text.push_str(&format!(" '{title}'"));
+    }
+    if let Some(grid) = &view.range {
+        let a1 = grid_range::sheet_title_by_id(workbook, grid.sheet_id)
+            .and_then(|sheet| grid_range::bounded_range_to_a1(&sheet, grid))
+            .unwrap_or_else(|| grid_range::render_grid_range(grid));
+        text.push_str(&format!(" over {a1}"));
+    }
+    text
 }
 
 fn describe_filter_effect(prefix: &str, sort_by: &[String], hide_values: &[String]) -> String {
@@ -2081,6 +2104,52 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn describe_existing_view_names_the_title_and_the_range() {
+        let workbook = Spreadsheet {
+            sheets: vec![Sheet {
+                properties: Some(crate::drive::sheets::types::SheetProperties {
+                    sheet_id: Some(0),
+                    title: "Q1".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let view = FilterView {
+            filter_view_id: Some(7),
+            title: Some("Open items".to_string()),
+            range: Some(GridRange {
+                sheet_id: 0,
+                start_row_index: Some(0),
+                end_row_index: Some(10),
+                start_column_index: Some(0),
+                end_column_index: Some(4),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            describe_existing_view(&workbook, &view),
+            " 'Open items' over 'Q1'!A1:D10"
+        );
+        let open_ended = FilterView {
+            title: None,
+            range: Some(GridRange {
+                sheet_id: 0,
+                start_column_index: Some(0),
+                end_column_index: Some(1),
+                ..Default::default()
+            }),
+            ..view
+        };
+        assert_eq!(
+            describe_existing_view(&workbook, &open_ended),
+            " over sheetId 0, cols 1-1"
+        );
+        assert_eq!(describe_existing_view(&workbook, &filter_view(7)), "");
     }
 
     #[test]
