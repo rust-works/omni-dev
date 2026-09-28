@@ -436,6 +436,22 @@ pub(crate) fn clamp_to_sheet(workbook: &Spreadsheet, grid: &GridRange) -> Option
     Some(clamped)
 }
 
+/// Whether `grid` starts at or past its sheet's last row or column, so no
+/// cell of it lies inside the current grid. Catches the open-ended case
+/// [`clamp_to_sheet`] cannot: `A2000:A` on a 1000-row sheet has no end to
+/// clip, so it clamps to itself rather than to nothing. An axis whose count
+/// the workbook does not report is never past it.
+pub(crate) fn starts_past_grid(workbook: &Spreadsheet, grid: &GridRange) -> bool {
+    let Some(props) = find_sheet_by_id(workbook, grid.sheet_id)
+        .and_then(|sheet| sheet.properties.as_ref())
+        .and_then(|p| p.grid_properties.as_ref())
+    else {
+        return false;
+    };
+    let past = |start: Option<i64>, count: Option<i64>| matches!((start, count), (Some(start), Some(count)) if start >= count);
+    past(grid.start_row_index, props.row_count) || past(grid.start_column_index, props.column_count)
+}
+
 /// Renders a numeric [`GridRange`] as a compact 1-based description for a
 /// list verb's human-readable output — e.g. `"sheetId 0, rows 1-5, cols
 /// 1-2"`, `"sheetId 0, rows 5+"` for a bound left open at one end (the

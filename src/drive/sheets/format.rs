@@ -1144,7 +1144,11 @@ fn dimension_span(sheet: &str, dimension: Dimension, start: i64, end: i64) -> St
         ),
         Dimension::Rows => (start.to_string(), end.to_string()),
     };
-    format!("{}(s) {first}:{last} of '{sheet}'", dimension.noun())
+    format!(
+        "{}(s) {first}:{last} of {}",
+        dimension.noun(),
+        a1::quote_sheet_title(sheet)
+    )
 }
 
 /// The real-run line's past-tense opening for `summary`, which
@@ -3698,6 +3702,16 @@ mod tests {
             describe_effect(&auto_resize, &[]).unwrap(),
             "auto-resize column(s) B:D of 'Q1'"
         );
+        let apostrophe = FormatVerb::AutoResizeDimension {
+            sheet: "Bob's".to_string(),
+            dimension: Dimension::Rows,
+            start: 1,
+            end: 1,
+        };
+        assert_eq!(
+            describe_effect(&apostrophe, &[]).unwrap(),
+            "auto-resize row(s) 1:1 of 'Bob''s'"
+        );
         let pixel_size = FormatVerb::UpdateDimensionProperties {
             sheet: "Q1".to_string(),
             dimension: Dimension::Rows,
@@ -3741,6 +3755,29 @@ mod tests {
                 "Auto-resized row(s) 1:3 of 'Q1' in 'Budget'",
             ),
         ];
+        // The two remaining verbs, from `describe_effect` itself, so
+        // rewording either summary away from its "set" opening fails here
+        // rather than silently falling back to "Applied:".
+        for verb in [
+            format_cells_opts(false).verb,
+            FormatVerb::UpdateDimensionProperties {
+                sheet: "Q1".to_string(),
+                dimension: Dimension::Columns,
+                start: 1,
+                end: 1,
+                pixel_size: 80,
+            },
+        ] {
+            let summary = describe_effect(&verb, &[]).unwrap();
+            let lines = lines_for(
+                verb,
+                FormatResult::Changed {
+                    summary,
+                    discarded_cells: Vec::new(),
+                },
+            );
+            assert!(lines[0].starts_with("Set "), "{lines:?}");
+        }
         for (verb, summary, expected) in cases {
             let lines = lines_for(
                 verb,

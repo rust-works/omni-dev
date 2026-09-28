@@ -433,10 +433,12 @@ async fn banding_inner(
             },
             Some(composed),
         ) => {
-            let current_sheet = find_existing_banded_range(&workbook, *banded_range_id)
-                .ok()
-                .and_then(|banded| banded.range.as_ref())
-                .map(|range| range.sheet_id);
+            // An unknown id is reported as such here, before the bare range
+            // could be refused for naming no sheet.
+            let current_sheet = match find_existing_banded_range(&workbook, *banded_range_id) {
+                Ok(banded) => banded.range.as_ref().map(|range| range.sheet_id),
+                Err(result) => return pre_gated(result),
+            };
             Some(grid_range::default_sheet_prefix(
                 &workbook,
                 composed,
@@ -1870,6 +1872,41 @@ mod tests {
             outcome.result
         );
         assert_eq!(outcome.sheet_id, Some(0));
+    }
+
+    /// An unknown id is reported as not found, not as a bare `--range`
+    /// naming no sheet.
+    #[tokio::test]
+    async fn update_banding_range_without_sheet_reports_an_unknown_id_as_not_found() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_row_only_banding(&server, 0).await;
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::UpdateBanding {
+                banded_range_id: 99,
+                sheet: None,
+                range: Some("A1:D20".to_string()),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: None,
+                second_band_color: None,
+                footer_color: None,
+            },
+            dry_run: true,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = banding(&drive, &sheets, &opts, &[allow_rule("folder-1")]).await;
+        assert!(
+            matches!(
+                outcome.result,
+                BandingResult::RefusedBandedRangeNotFound { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
     }
 
     fn assert_refused_missing_second_band_color(outcome: &BandingOutcome) {

@@ -516,10 +516,12 @@ async fn filter_inner(
             },
             Some(composed),
         ) => {
-            let current_sheet = find_existing_filter_view(&workbook, *filter_view_id)
-                .ok()
-                .and_then(|view| view.range.as_ref())
-                .map(|range| range.sheet_id);
+            // An unknown id is reported as such here, before the bare range
+            // could be refused for naming no sheet.
+            let current_sheet = match find_existing_filter_view(&workbook, *filter_view_id) {
+                Ok(view) => view.range.as_ref().map(|range| range.sheet_id),
+                Err(result) => return pre_gated(result),
+            };
             Some(grid_range::default_sheet_prefix(
                 &workbook,
                 composed,
@@ -2981,6 +2983,44 @@ mod tests {
             matches!(outcome.result, FilterResult::WouldChange { .. }),
             "{:?}",
             outcome.result
+        );
+    }
+
+    /// An unknown id is reported as not found, not as a bare `--range`
+    /// naming no sheet — the sheet defaulting must not mask it.
+    #[tokio::test]
+    async fn update_filter_view_range_without_sheet_reports_an_unknown_id_as_not_found() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+            {"properties": {"sheetId": 5, "title": "Q2", "index": 1},
+             "filterViews": [{"filterViewId": 7, "range": {"sheetId": 5}}]},
+        ]))
+        .mount(&server)
+        .await;
+        let opts = dry_run_opts(FilterVerb::UpdateFilterView {
+            filter_view_id: 99,
+            sheet: None,
+            range: Some("A1:C9".to_string()),
+            title: None,
+            sort_by: Vec::new(),
+            hide_values: Vec::new(),
+            clear_sort: false,
+            clear_criteria: false,
+        });
+        let outcome = filter(&drive, &sheets, &opts, &[allow_rule("folder-1")]).await;
+        assert_eq!(
+            outcome.result,
+            FilterResult::RefusedFilterViewNotFound { filter_view_id: 99 }
         );
     }
 
