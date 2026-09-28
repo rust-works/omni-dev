@@ -593,7 +593,19 @@ fn validate_condition(condition: &Condition) -> Result<(), String> {
         Condition::DateOn(date) => validate_single_date(date, "--date-on"),
         Condition::DateBetween(start, end) => reject_invalid_date_between(start, end),
         Condition::Blank | Condition::NotBlank | Condition::Checkbox => Ok(()),
-        Condition::CustomFormula(formula) => reject_blank(formula, "--custom-formula"),
+        Condition::CustomFormula(formula) => {
+            reject_blank(formula, "--custom-formula")?;
+            // A formula with no leading `=` is accepted here and rejected
+            // by the API with a raw, unhelpful 400 once the request lands
+            // — give the hint locally instead (#1941).
+            if !formula.trim_start().starts_with('=') {
+                return Err(format!(
+                    "--custom-formula {formula:?} should start with '=', e.g. '=A1>0'; Sheets \
+                     rejects a custom formula with no leading '='"
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1072,6 +1084,14 @@ mod tests {
     fn validate_condition_rejects_a_blank_custom_formula() {
         let err = validate_condition(&Condition::CustomFormula("   ".to_string())).unwrap_err();
         assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_condition_rejects_a_custom_formula_missing_its_leading_equals() {
+        // `--custom-formula 'F2>0'` (no leading `=`) reached the API and got
+        // a raw 400 with no local hint (#1941).
+        let err = validate_condition(&Condition::CustomFormula("F2>0".to_string())).unwrap_err();
+        assert!(err.contains("should start with '='"), "{err}");
     }
 
     #[test]
