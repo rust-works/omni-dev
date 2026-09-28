@@ -2836,6 +2836,18 @@ omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range K2:K100 --not-
 omni-dev drive sheets clear-data-validation <ID> --sheet Q2 --range C2:C100
 ```
 
+**A `--range` past the sheet's grid is clamped, not grown.** Sheets applies
+the request only to the part of the range inside the sheet's current rows
+and columns, without saying so. Both verbs therefore name the clamped range
+in the dry run and the real run (`-o json`: `clamped_to`), and refuse a
+range lying wholly past the grid, which would change nothing:
+
+```
+$ omni-dev drive sheets set-data-validation <ID> --sheet Q2 --range Z1:AA2000 --checkbox --dry-run
+Would set data validation (boolean, reject invalid entries) in 'Budget'
+  the range runs past the sheet's current grid; Sheets clamps it, so this would apply to 'Q2'!Z1:Z1000 only
+```
+
 Tranche 1 (#1643) shipped `--one-of-list`, `--number-between`, `--checkbox`,
 and `--custom-formula`. Tranche 2 (#1792) added every remaining condition
 type addressable with a flat flag: `--one-of-range`; the numeric comparators
