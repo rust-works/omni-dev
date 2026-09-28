@@ -3353,7 +3353,9 @@ field to tell them apart. `list-charts`/`update-chart-border`'s preview
 report that shape as `#000000 (or cleared — indistinguishable on read)`
 rather than asserting either as fact. Whether the Sheets UI actually paints
 a visible black border after `--clear` was not checked — this crate has no
-way to inspect the rendered UI, only the wire shape.
+way to inspect the rendered UI, only the wire shape. A border colour read
+back from a Sheets UI theme-palette pick, rather than one this crate set,
+renders as `theme:<NAME>` instead (issue #2020).
 
 #### drive sheets add-banding / update-banding / delete-banding / list-bandings
 
@@ -3392,7 +3394,10 @@ The Sheets API's plain `Color` fields (`headerColor`/`firstBandColor`/
 (the `ColorStyle` union's other arm) has no flag surface here either — the
 same cut `format-cells` makes. `--first-band-color`/`--second-band-color`
 are required on `add-banding`; `--header-color`/`--footer-color` are
-optional.
+optional. A theme color set through the Sheets UI (a built-in
+alternating-colors preset, a theme-palette format) is read back and
+rendered as `theme:<NAME>`, and `update-banding` preserves it unchanged on
+any band a color flag doesn't name (issue #2020).
 
 **One axis per call.** The Sheets API allows a single `BandedRange` to carry
 both row and column banding at once; this crate exposes only one, selected

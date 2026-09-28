@@ -516,7 +516,7 @@ fn build_cell_format(flags: &CellFormatFlags) -> Result<(CellFormat, String), St
     }
     if let Some(hex) = &flags.text_color {
         let color = parse_hex_color(hex)?;
-        text_format.foreground_color_style = Some(ColorStyle { rgb_color: color });
+        text_format.foreground_color_style = Some(ColorStyle::rgb(color));
         text_format_used = true;
         fields.push("userEnteredFormat.textFormat.foregroundColorStyle");
     }
@@ -531,7 +531,7 @@ fn build_cell_format(flags: &CellFormatFlags) -> Result<(CellFormat, String), St
 
     if let Some(hex) = &flags.background {
         let color = parse_hex_color(hex)?;
-        format.background_color_style = Some(ColorStyle { rgb_color: color });
+        format.background_color_style = Some(ColorStyle::rgb(color));
         fields.push("userEnteredFormat.backgroundColorStyle");
     }
     if let Some(align) = &flags.horizontal_align {
@@ -1139,7 +1139,7 @@ fn build_request(
             };
             let border = Border {
                 style: style.clone(),
-                color_style: ColorStyle { rgb_color: color },
+                color_style: ColorStyle::rgb(color),
             };
             let mut request = UpdateBordersRequest {
                 range: *grid,

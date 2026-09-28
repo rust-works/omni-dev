@@ -95,7 +95,7 @@ use crate::drive::lease::check::{
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
-use crate::drive::sheets::format::{format_hex_color, parse_hex_color};
+use crate::drive::sheets::format::parse_hex_color;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
@@ -1484,15 +1484,18 @@ fn describe_position(sheet: &Sheet, position: Option<&EmbeddedObjectPosition>) -
 /// every zero-valued channel either way. A chart whose border was never
 /// touched at all comes back with no `border` field whatsoever, so that
 /// case stays distinguishable (see [`summarise_chart`]) — but once a
-/// `border` is present, an all-zero colour is genuinely ambiguous between
-/// "explicitly cleared" and "explicitly set to black", with no second field
-/// to break the tie. Reporting a bare `#000000` here would present a guess
-/// as a fact, so black is called out as ambiguous instead.
-fn describe_border_color(rgb: Color) -> String {
-    if rgb == Color::default() {
-        "#000000 (or cleared — indistinguishable on read)".to_string()
-    } else {
-        format_hex_color(rgb)
+/// `border` is present, an all-zero `rgbColor` is genuinely ambiguous
+/// between "explicitly cleared" and "explicitly set to black", with no
+/// second field to break the tie. Reporting a bare `#000000` here would
+/// present a guess as a fact, so black is called out as ambiguous instead.
+/// A `themeColor` border (issue #2020) has no such ambiguity — it renders
+/// by name via [`ColorStyle::describe`].
+fn describe_border_color(color_style: &ColorStyle) -> String {
+    match color_style.rgb_color {
+        Some(rgb) if rgb == Color::default() => {
+            "#000000 (or cleared — indistinguishable on read)".to_string()
+        }
+        _ => color_style.describe(),
     }
 }
 
@@ -1516,8 +1519,9 @@ fn summarise_chart(sheet: &Sheet, chart: &EmbeddedChart) -> Option<EmbeddedObjec
         position: describe_position(sheet, chart.position.as_ref()),
         border: chart
             .border
-            .and_then(|b| b.color_style)
-            .map(|c| describe_border_color(c.rgb_color)),
+            .as_ref()
+            .and_then(|b| b.color_style.as_ref())
+            .map(describe_border_color),
     })
 }
 
@@ -2393,7 +2397,7 @@ fn build_update_chart_border(
         let rgb_color = parse_hex_color(color).map_err(invalid)?;
         (
             EmbeddedObjectBorder {
-                color_style: Some(ColorStyle { rgb_color }),
+                color_style: Some(ColorStyle::rgb(rgb_color)),
             },
             format!("set chart {chart_id} border to {color}"),
         )
@@ -3633,9 +3637,7 @@ mod tests {
     fn summarise_chart_reports_a_non_default_border_colour_as_hex() {
         let mut sheet = basic_chart_sheet(7, "LINE");
         sheet.charts[0].border = Some(EmbeddedObjectBorder {
-            color_style: Some(ColorStyle {
-                rgb_color: parse_hex_color("#4A86E8").unwrap(),
-            }),
+            color_style: Some(ColorStyle::rgb(parse_hex_color("#4A86E8").unwrap())),
         });
         let summary = summarise_chart(&sheet, &sheet.charts[0]).unwrap();
         assert_eq!(summary.border.as_deref(), Some("#4A86E8"));
@@ -3645,15 +3647,26 @@ mod tests {
     fn summarise_chart_reports_a_default_border_colour_as_ambiguous() {
         let mut sheet = basic_chart_sheet(7, "LINE");
         sheet.charts[0].border = Some(EmbeddedObjectBorder {
-            color_style: Some(ColorStyle {
-                rgb_color: Color::default(),
-            }),
+            color_style: Some(ColorStyle::rgb(Color::default())),
         });
         let summary = summarise_chart(&sheet, &sheet.charts[0]).unwrap();
         assert_eq!(
             summary.border.as_deref(),
             Some("#000000 (or cleared — indistinguishable on read)")
         );
+    }
+
+    #[test]
+    fn summarise_chart_reports_a_theme_border_colour_by_name() {
+        let mut sheet = basic_chart_sheet(7, "LINE");
+        sheet.charts[0].border = Some(EmbeddedObjectBorder {
+            color_style: Some(ColorStyle {
+                rgb_color: None,
+                theme_color: Some("ACCENT1".to_string()),
+            }),
+        });
+        let summary = summarise_chart(&sheet, &sheet.charts[0]).unwrap();
+        assert_eq!(summary.border.as_deref(), Some("theme:ACCENT1"));
     }
 
     #[test]

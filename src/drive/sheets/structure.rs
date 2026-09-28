@@ -1760,7 +1760,7 @@ fn build_request(
                 // verb, matching every sibling arm's shape.
                 let color = parse_hex_color(hex)
                     .map_err(|detail| format!("update-sheet-properties: {detail}"))?;
-                tab_color_style = Some(ColorStyle { rgb_color: color });
+                tab_color_style = Some(ColorStyle::rgb(color));
                 fields.push("tabColorStyle");
             } else if *clear_tab_color {
                 fields.push("tabColorStyle");

@@ -1249,13 +1249,59 @@ pub struct Color {
 // below that embed it.
 
 /// `ColorStyle` — the modern wrapper Sheets expects around a plain
-/// [`Color`]. Only the `rgbColor` arm is modelled; the API's alternative
-/// `themeColor` arm has no CLI flag surface in this feature.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+/// [`Color`].
+///
+/// It is a `oneof` on the wire (`rgbColor` xor `themeColor`), modelled here
+/// as a struct with both arms optional rather than an enum: a serde enum
+/// (tagged or untagged) rejects `{}` — neither arm set, which `Color`'s own
+/// all-omitted-on-`0.0` proto3 encoding makes routine — and a struct keeps
+/// the lossless round-trip in `banding.rs::build_update` simple (clone the
+/// existing value, touch nothing, re-send it).
+///
+/// **This crate only ever *constructs* the `rgbColor` arm** (issue #2020,
+/// same cut as ADR-0078 §5/0082 §1/0085 §8 — no CLI flag surface for a
+/// theme color). `themeColor` is read-and-preserved only: a color set
+/// through the Sheets UI (a built-in alternating-colors preset, a
+/// theme-palette format) can come back this way, and previously failed the
+/// whole parse with `missing field rgbColor`. Use [`ColorStyle::rgb`] to
+/// build one; use [`ColorStyle::describe`] to render one for display.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ColorStyle {
     /// The explicit RGB color.
-    #[serde(rename = "rgbColor")]
-    pub rgb_color: Color,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "rgbColor")]
+    pub rgb_color: Option<Color>,
+    /// The name of a theme color slot (e.g. `"ACCENT1"`), read back
+    /// verbatim and never validated or CLI-settable — see the struct doc.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "themeColor"
+    )]
+    pub theme_color: Option<String>,
+}
+
+impl ColorStyle {
+    /// The one constructor this crate uses to build an outbound
+    /// `ColorStyle` — always the `rgbColor` arm, `themeColor` left unset.
+    pub fn rgb(color: Color) -> Self {
+        Self {
+            rgb_color: Some(color),
+            theme_color: None,
+        }
+    }
+
+    /// Renders a `ColorStyle` for display: `#RRGGBB` for the `rgbColor`
+    /// arm, `theme:<NAME>` for `themeColor`, `(unset)` for neither. Prefers
+    /// `rgb_color` when both are present, which the API treats as a
+    /// `oneof` and so shouldn't send.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match (&self.rgb_color, &self.theme_color) {
+            (Some(rgb), _) => super::format::format_hex_color(*rgb),
+            (None, Some(name)) => format!("theme:{name}"),
+            (None, None) => "(unset)".to_string(),
+        }
+    }
 }
 
 /// The mutable subset of a cell's text formatting this crate can set —
@@ -2141,7 +2187,7 @@ pub struct DeleteNamedRangeRequest {
 /// never sent, the same cut `banding.rs`/`format.rs` make. Unlike a cell
 /// [`Border`], this type has **no style and no width** — a chart border is
 /// a colour and nothing else. A slicer has no border field at all.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct EmbeddedObjectBorder {
     /// The border's colour. Absent means no border (or, on
     /// `update-chart-border --clear`, an explicit reset to none).
@@ -4537,11 +4583,11 @@ mod tests {
         assert_eq!(min.value, None);
         assert_eq!(
             min.color_style.rgb_color,
-            Color {
+            Some(Color {
                 red: 1.0,
                 green: 1.0,
                 blue: 1.0
-            }
+            })
         );
         let max = gradient.maxpoint.as_ref().unwrap();
         assert_eq!(max.point_type, "NUMBER");
@@ -4742,7 +4788,88 @@ mod tests {
     fn color_style_defaults_an_all_omitted_rgb_color() {
         let parsed: ColorStyle =
             serde_json::from_value(serde_json::json!({"rgbColor": {}})).unwrap();
-        assert_eq!(parsed.rgb_color, Color::default());
+        assert_eq!(parsed.rgb_color, Some(Color::default()));
+        assert_eq!(parsed.theme_color, None);
+    }
+
+    #[test]
+    fn color_style_reads_a_theme_color_only_arm() {
+        let parsed: ColorStyle =
+            serde_json::from_value(serde_json::json!({"themeColor": "ACCENT1"})).unwrap();
+        assert_eq!(parsed.rgb_color, None);
+        assert_eq!(parsed.theme_color, Some("ACCENT1".to_string()));
+    }
+
+    #[test]
+    fn color_style_reads_an_empty_object_as_neither_arm() {
+        let parsed: ColorStyle = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(parsed.rgb_color, None);
+        assert_eq!(parsed.theme_color, None);
+    }
+
+    #[test]
+    fn color_style_round_trips_a_theme_color_unchanged() {
+        let original = serde_json::json!({"themeColor": "ACCENT1"});
+        let parsed: ColorStyle = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), original);
+    }
+
+    #[test]
+    fn color_style_rgb_serializes_only_rgb_color() {
+        let style = ColorStyle::rgb(Color {
+            red: 1.0,
+            green: 0.0,
+            blue: 0.0,
+        });
+        let value = serde_json::to_value(&style).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"rgbColor": {"red": 1.0, "green": 0.0, "blue": 0.0}}),
+            "themeColor must not appear on an outbound rgb ColorStyle"
+        );
+    }
+
+    #[test]
+    fn color_style_describe_prefers_rgb_over_theme() {
+        let style = ColorStyle::rgb(Color {
+            red: 1.0,
+            green: 0.0,
+            blue: 0.0,
+        });
+        assert_eq!(style.describe(), "#FF0000");
+    }
+
+    #[test]
+    fn color_style_describe_names_a_theme_color() {
+        let style = ColorStyle {
+            rgb_color: None,
+            theme_color: Some("ACCENT1".to_string()),
+        };
+        assert_eq!(style.describe(), "theme:ACCENT1");
+    }
+
+    #[test]
+    fn color_style_describe_reports_neither_arm_as_unset() {
+        assert_eq!(ColorStyle::default().describe(), "(unset)");
+    }
+
+    #[test]
+    fn gradient_rule_parses_a_theme_color_only_minpoint() {
+        // `InterpolationPoint.color_style` is required (non-`Option`), so
+        // this is the one surface where a theme-only `ColorStyle` sits
+        // directly on a required field rather than behind an `Option`
+        // (issue #2020).
+        let parsed: GradientRule = serde_json::from_value(serde_json::json!({
+            "minpoint": {"colorStyle": {"themeColor": "ACCENT1"}, "type": "MIN"},
+            "maxpoint": {"colorStyle": {"rgbColor": {"red": 1.0}}, "type": "MAX"},
+        }))
+        .unwrap();
+        let minpoint = parsed.minpoint.unwrap();
+        assert_eq!(minpoint.color_style.rgb_color, None);
+        assert_eq!(
+            minpoint.color_style.theme_color,
+            Some("ACCENT1".to_string())
+        );
     }
 
     #[test]
@@ -4895,13 +5022,11 @@ mod tests {
                             }],
                         },
                         format: CellFormat {
-                            background_color_style: Some(ColorStyle {
-                                rgb_color: Color {
-                                    red: 0.0,
-                                    green: 0.0,
-                                    blue: 0.0,
-                                },
-                            }),
+                            background_color_style: Some(ColorStyle::rgb(Color {
+                                red: 0.0,
+                                green: 0.0,
+                                blue: 0.0,
+                            })),
                             number_format: Some(NumberFormat {
                                 format_type: "NUMBER".to_string(),
                                 pattern: String::new(),
@@ -5011,20 +5136,16 @@ mod tests {
                     range: Some(full_range),
                     row_properties: Some(BandingProperties {
                         header_color_style: None,
-                        first_band_color_style: Some(ColorStyle {
-                            rgb_color: Color {
-                                red: 0.0,
-                                green: 0.0,
-                                blue: 0.0,
-                            },
-                        }),
-                        second_band_color_style: Some(ColorStyle {
-                            rgb_color: Color {
-                                red: 1.0,
-                                green: 1.0,
-                                blue: 1.0,
-                            },
-                        }),
+                        first_band_color_style: Some(ColorStyle::rgb(Color {
+                            red: 0.0,
+                            green: 0.0,
+                            blue: 0.0,
+                        })),
+                        second_band_color_style: Some(ColorStyle::rgb(Color {
+                            red: 1.0,
+                            green: 1.0,
+                            blue: 1.0,
+                        })),
                         footer_color_style: None,
                     }),
                     column_properties: None,

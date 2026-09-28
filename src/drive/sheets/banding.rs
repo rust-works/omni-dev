@@ -18,9 +18,13 @@
 //! framing:
 //!
 //! - **Only the modern `*ColorStyle` fields are modelled** — never the
-//!   deprecated plain `Color` fields, never the `themeColor` arm within a
-//!   `ColorStyle`. Same precedent as `format-cells` (`format.rs`'s
-//!   `parse_hex_color`, reused here unchanged).
+//!   deprecated plain `Color` fields. The `themeColor` arm within a
+//!   `ColorStyle` has no CLI flag surface, same precedent as `format-cells`
+//!   (`format.rs`'s `parse_hex_color`, reused here unchanged) — but it is
+//!   read and losslessly preserved: `build_update` clones the axis's
+//!   existing `BandingProperties` and only overwrites the bands a flag
+//!   named, so an existing theme-colored band on the same axis survives a
+//!   partial `update-banding` untouched (issue #2020).
 //! - **At most one of `rowProperties`/`columnProperties` per call,
 //!   selected by `--axis`.** The API allows both simultaneously on one
 //!   `BandedRange` (a checkerboard effect), but that would double every
@@ -685,9 +689,7 @@ fn validate_new_axis_colors(
 /// Parses a `#RRGGBB` flag into a [`ColorStyle`], via `format.rs`'s shared
 /// [`parse_hex_color`].
 fn parse_color_style(hex: &str) -> Result<ColorStyle, String> {
-    Ok(ColorStyle {
-        rgb_color: parse_hex_color(hex)?,
-    })
+    Ok(ColorStyle::rgb(parse_hex_color(hex)?))
 }
 
 /// Builds the request for `verb`. Placed after the `--dry-run` branch in
@@ -1079,20 +1081,20 @@ mod tests {
                 }),
                 row_properties: Some(BandingProperties {
                     header_color_style: None,
-                    first_band_color_style: Some(ColorStyle {
-                        rgb_color: crate::drive::sheets::types::Color {
+                    first_band_color_style: Some(ColorStyle::rgb(
+                        crate::drive::sheets::types::Color {
                             red: 1.0,
                             green: 1.0,
                             blue: 1.0,
                         },
-                    }),
-                    second_band_color_style: Some(ColorStyle {
-                        rgb_color: crate::drive::sheets::types::Color {
+                    )),
+                    second_band_color_style: Some(ColorStyle::rgb(
+                        crate::drive::sheets::types::Color {
                             red: 0.0,
                             green: 0.0,
                             blue: 0.0,
                         },
-                    }),
+                    )),
                     footer_color_style: None,
                 }),
                 column_properties: None,
@@ -1227,6 +1229,51 @@ mod tests {
         assert_eq!(
             properties.first_band_color_style,
             existing.row_properties.unwrap().first_band_color_style
+        );
+    }
+
+    #[test]
+    fn build_request_update_banding_preserves_an_existing_theme_colored_band() {
+        // Issue #2020: the axis's *existing* properties are cloned whole
+        // and only the named colors are overwritten (see `build_update`'s
+        // doc comment) — so before `ColorStyle` round-tripped `themeColor`,
+        // this path would have silently rewritten a theme-colored band to
+        // black rather than merely failing to parse it.
+        let mut sheet = sheet_with_banding(0, 7);
+        sheet.banded_ranges[0]
+            .row_properties
+            .as_mut()
+            .unwrap()
+            .first_band_color_style = Some(ColorStyle {
+            rgb_color: None,
+            theme_color: Some("ACCENT1".to_string()),
+        });
+        let existing = sheet.banded_ranges.remove(0);
+        let verb = BandingVerb::UpdateBanding {
+            banded_range_id: 7,
+            sheet: None,
+            range: None,
+            axis: BandingAxis::Rows,
+            header_color: Some("#123456".to_string()),
+            first_band_color: None,
+            second_band_color: None,
+            footer_color: None,
+        };
+        let (request, _) = build_request(&verb, None, Some(&existing)).unwrap();
+        let BatchUpdateRequestItem::UpdateBanding(update) = request else {
+            panic!("expected UpdateBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
+        };
+        let properties = update.banded_range.row_properties.unwrap();
+        let serialized = serde_json::to_value(&properties).unwrap();
+        let first_band = properties.first_band_color_style.unwrap();
+        assert_eq!(first_band.theme_color, Some("ACCENT1".to_string()));
+        assert_eq!(first_band.rgb_color, None);
+
+        let first_band_json = &serialized["firstBandColorStyle"];
+        assert_eq!(first_band_json["themeColor"], "ACCENT1");
+        assert!(
+            first_band_json.get("rgbColor").is_none(),
+            "a preserved theme-colored band must not gain a rgbColor field: {serialized}"
         );
     }
 
