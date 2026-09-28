@@ -642,6 +642,14 @@ pub enum StructureResult {
     /// The file has moved since the lease's recorded `version` — the
     /// staleness check (ADR-0080 §6).
     RefusedLeaseStale,
+    /// The workbook is already in the requested state (`hide-sheet` on a
+    /// hidden sheet, `show-sheet` on a visible one), so no request is
+    /// sent. Reported identically by a dry run and a real run, and
+    /// distinct from `Changed` so a script can tell a no-op from a change.
+    Unchanged {
+        /// Why nothing needed to change.
+        detail: String,
+    },
     /// The mutation succeeded.
     Changed {
         /// The sheet acted on, as it stood *before* the change.
@@ -715,6 +723,7 @@ impl StructureResult {
             Self::RefusedLeaseExpired => LeaseGateRefusal::Expired.log_status(),
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
+            Self::Unchanged { .. } => "unchanged",
             Self::Changed { .. } => "changed",
             Self::Failed { .. } => "failed",
         }
@@ -931,6 +940,12 @@ async fn structure_inner(
         return gated(result);
     }
 
+    // Before the dry-run branch, so a dry run reports the no-op the real
+    // run would, and before the lease check, since nothing is written.
+    if let Some(detail) = already_applied(&workbook, &opts.verb, sheet.as_ref()) {
+        return gated(StructureResult::Unchanged { detail });
+    }
+
     if opts.dry_run {
         // A move, not a clone: this branch always returns, so `sheet` is
         // never read again on it — the later uses below are only reachable
@@ -1091,6 +1106,35 @@ fn resolve_sheet(
 /// rejects. Runs after [`resolve_sheet`] (which is why it can read the
 /// target sheet's real dimensions) and before the `--dry-run` early return,
 /// so both share this classification exactly like the gate above it.
+/// Why `verb` would change nothing, when the workbook is already in the
+/// state it asks for. Only `hide-sheet`/`show-sheet` can tell: their whole
+/// effect is one flag the fetched workbook already reports.
+fn already_applied(
+    workbook: &Spreadsheet,
+    verb: &StructureVerb,
+    sheet: Option<&SheetSnapshot>,
+) -> Option<String> {
+    let StructureVerb::SetSheetVisibility {
+        sheet: title,
+        hidden,
+    } = verb
+    else {
+        return None;
+    };
+    let target_id = sheet.and_then(|s| s.sheet_id)?;
+    let currently_hidden = workbook
+        .sheets
+        .iter()
+        .filter_map(|s| s.properties.as_ref())
+        .find(|props| props.sheet_id == Some(target_id))?
+        .hidden
+        .unwrap_or(false);
+    (currently_hidden == *hidden).then(|| {
+        let state = if *hidden { "hidden" } else { "shown" };
+        format!("sheet '{title}' is already {state}")
+    })
+}
+
 fn validate_verb_args(
     workbook: &Spreadsheet,
     verb: &StructureVerb,
@@ -2221,6 +2265,7 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
                 &book,
             )]
         }
+        StructureResult::Unchanged { detail } => vec![format!("Unchanged: {detail} in {book}")],
         StructureResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
@@ -3163,6 +3208,14 @@ mod tests {
     fn default_q2() -> serde_json::Value {
         serde_json::json!({"properties": {
             "sheetId": 118_293, "title": "Q2", "index": 1,
+            "gridProperties": {"rowCount": 500, "columnCount": 10}}})
+    }
+
+    /// [`default_q2`], but hidden — what `show-sheet` needs to have
+    /// something to show.
+    fn hidden_q2() -> serde_json::Value {
+        serde_json::json!({"properties": {
+            "sheetId": 118_293, "title": "Q2", "index": 1, "hidden": true,
             "gridProperties": {"rowCount": 500, "columnCount": 10}}})
     }
 
@@ -5575,7 +5628,7 @@ mod tests {
             .mount(&server)
             .await;
         mount_folder("parent-1").mount(&server).await;
-        mount_workbook().mount(&server).await;
+        mount_workbook_with_q2(hidden_q2()).mount(&server).await;
         mount_batch_update(serde_json::json!({"spreadsheetId": "sheet-1", "replies": [{}]}))
             .mount(&server)
             .await;
@@ -5626,7 +5679,7 @@ mod tests {
             .mount(&server)
             .await;
         mount_folder("parent-1").mount(&server).await;
-        mount_workbook().mount(&server).await;
+        mount_workbook_with_q2(hidden_q2()).mount(&server).await;
         let outcome = structure(
             &drive,
             &sheets,
@@ -5636,6 +5689,53 @@ mod tests {
         .await;
         let text = describe(&outcome);
         assert!(text.contains("Would show sheet 'Q2'"), "{text}");
+    }
+
+    /// Hiding a hidden sheet or showing a visible one sends nothing and
+    /// says so, in a dry run exactly as in a real run, rather than
+    /// reporting a change that did not happen.
+    #[tokio::test]
+    async fn a_visibility_no_op_is_unchanged_in_dry_run_and_real_run() {
+        for (verb, q2, state) in [
+            (hide_sheet(), hidden_q2(), "hidden"),
+            (show_sheet(), default_q2(), "shown"),
+        ] {
+            for dry_run in [true, false] {
+                let server = wiremock::MockServer::start().await;
+                let (drive, sheets) = clients(&server).await;
+                mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+                    .mount(&server)
+                    .await;
+                mount_folder("parent-1").mount(&server).await;
+                mount_workbook_with_q2(q2.clone()).mount(&server).await;
+                let outcome = structure(
+                    &drive,
+                    &sheets,
+                    &opts(verb.clone(), dry_run),
+                    &[allow_rule("parent-1")],
+                )
+                .await;
+                assert_eq!(
+                    outcome.result,
+                    StructureResult::Unchanged {
+                        detail: format!("sheet 'Q2' is already {state}")
+                    },
+                    "dry_run={dry_run}"
+                );
+                let text = describe(&outcome);
+                assert!(
+                    text.starts_with(&format!("Unchanged: sheet 'Q2' is already {state} in ")),
+                    "{text}"
+                );
+                let requests = server.received_requests().await.unwrap();
+                assert!(
+                    !requests
+                        .iter()
+                        .any(|r| r.url.path().ends_with(":batchUpdate")),
+                    "a no-op must not call batchUpdate"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -7853,6 +7953,9 @@ mod tests {
             StructureResult::RefusedLeaseExpired,
             StructureResult::RefusedLeaseWrongFile,
             StructureResult::RefusedLeaseStale,
+            StructureResult::Unchanged {
+                detail: "sheet 'Q2' is already hidden".to_string(),
+            },
             StructureResult::Changed {
                 sheet: Some(Box::new(SheetSnapshot {
                     sheet_id: Some(7),
@@ -7885,6 +7988,7 @@ mod tests {
                 | StructureResult::RefusedLeaseExpired
                 | StructureResult::RefusedLeaseWrongFile
                 | StructureResult::RefusedLeaseStale
+                | StructureResult::Unchanged { .. }
                 | StructureResult::Changed { .. }
                 | StructureResult::Failed { .. } => {}
             }
@@ -8101,6 +8205,10 @@ mod tests {
             StructureResult::RefusedLeaseExpired.log_status(),
             StructureResult::RefusedLeaseWrongFile.log_status(),
             StructureResult::RefusedLeaseStale.log_status(),
+            StructureResult::Unchanged {
+                detail: "x".to_string(),
+            }
+            .log_status(),
             StructureResult::Changed {
                 sheet: None,
                 sheet_id: None,

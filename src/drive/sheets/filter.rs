@@ -280,6 +280,13 @@ pub enum FilterResult {
     /// The file has moved since the lease's recorded `version` — the
     /// staleness check (ADR-0080 §6).
     RefusedLeaseStale,
+    /// The workbook is already in the requested state
+    /// (`clear-basic-filter` on a sheet with no basic filter), so no
+    /// request is sent. Reported identically by a dry run and a real run.
+    Unchanged {
+        /// Why nothing needed to change.
+        detail: String,
+    },
     /// The mutation succeeded.
     Changed {
         /// Same summary as [`Self::WouldChange`].
@@ -332,6 +339,7 @@ impl FilterResult {
             Self::RefusedLeaseExpired => LeaseGateRefusal::Expired.log_status(),
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
+            Self::Unchanged { .. } => "unchanged",
             Self::Changed { .. } => "changed",
             Self::Failed { .. } => "failed",
         }
@@ -532,6 +540,20 @@ async fn filter_inner(
         | FilterVerb::ClearBasicFilter { .. }
         | FilterVerb::AddFilterView { .. } => None,
     };
+
+    // Before the dry-run branch, so a dry run reports the no-op the real
+    // run would. The workbook fetch above already carries each sheet's
+    // basic filter.
+    if let FilterVerb::ClearBasicFilter { sheet } = &opts.verb {
+        let has_filter = sheet_id
+            .and_then(|id| grid_range::find_sheet_by_id(&workbook, id))
+            .is_some_and(|found| found.basic_filter.is_some());
+        if !has_filter {
+            return gated(FilterResult::Unchanged {
+                detail: format!("sheet '{sheet}' has no basic filter to clear"),
+            });
+        }
+    }
 
     // A sort column past the target range's width is silently accepted
     // client-side, but the API 500s live rather than rejecting cleanly
@@ -1376,6 +1398,7 @@ pub fn describe_lines(outcome: &FilterOutcome) -> Vec<String> {
                 true,
             )
         }
+        FilterResult::Unchanged { detail } => vec![format!("Unchanged: {detail} in {book}")],
         FilterResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
@@ -2106,6 +2129,46 @@ mod tests {
         }
     }
 
+    /// Clearing a basic filter that isn't there sends nothing and says so,
+    /// in a dry run exactly as in a real run.
+    #[tokio::test]
+    async fn clearing_an_absent_basic_filter_is_unchanged_in_dry_run_and_real_run() {
+        for dry_run in [true, false] {
+            let server = wiremock::MockServer::start().await;
+            let (drive, sheets) = clients(&server).await;
+            mount_file(
+                "sheet-1",
+                crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                &["folder-1"],
+            )
+            .mount(&server)
+            .await;
+            mount_folder("folder-1").mount(&server).await;
+            mount_workbook(serde_json::json!([
+                {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+            ]))
+            .mount(&server)
+            .await;
+            let mut opts = dry_run_opts(FilterVerb::ClearBasicFilter {
+                sheet: "Q1".to_string(),
+            });
+            opts.dry_run = dry_run;
+            let outcome = filter(&drive, &sheets, &opts, &[allow_rule("folder-1")]).await;
+            assert_eq!(
+                outcome.result,
+                FilterResult::Unchanged {
+                    detail: "sheet 'Q1' has no basic filter to clear".to_string()
+                },
+                "dry_run={dry_run}"
+            );
+            assert!(describe(&outcome).starts_with("Unchanged: sheet 'Q1' has no basic filter"));
+            let requests = server.received_requests().await.unwrap();
+            assert!(!requests
+                .iter()
+                .any(|r| r.url.path().ends_with(":batchUpdate")));
+        }
+    }
+
     #[test]
     fn describe_existing_view_names_the_title_and_the_range() {
         let workbook = Spreadsheet {
@@ -2729,7 +2792,8 @@ mod tests {
         .await;
         mount_folder("folder-1").mount(&server).await;
         mount_workbook(serde_json::json!([
-            {"properties": {"sheetId": 7, "title": "Q1", "index": 0}},
+            {"properties": {"sheetId": 7, "title": "Q1", "index": 0},
+             "basicFilter": {"range": {"sheetId": 7}}},
         ]))
         .mount(&server)
         .await;
@@ -2918,7 +2982,8 @@ mod tests {
         .await;
         mount_folder("folder-1").mount(&server).await;
         mount_workbook(serde_json::json!([
-            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0},
+             "basicFilter": {"range": {"sheetId": 0}}},
         ]))
         .mount(&server)
         .await;
