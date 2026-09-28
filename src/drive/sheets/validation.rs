@@ -261,6 +261,12 @@ pub enum ValidationResult {
     WouldChange {
         /// A human-readable summary of the effect.
         summary: String,
+        /// When `--range` runs past the sheet's current grid, the part of
+        /// it inside the grid — all Sheets applies the request to, since it
+        /// clamps the range silently rather than growing the sheet or
+        /// erroring (observed live, #1941). Omitted when the range fits.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        clamped_to: Option<String>,
     },
     /// The target is not a Google Sheet.
     RefusedNotASpreadsheet {
@@ -304,6 +310,9 @@ pub enum ValidationResult {
     Changed {
         /// Same summary as [`Self::WouldChange`].
         summary: String,
+        /// Same as [`Self::WouldChange`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        clamped_to: Option<String>,
     },
     /// An API or validation error.
     Failed {
@@ -493,20 +502,44 @@ async fn validation_inner(
         }
     };
 
-    let grid = match grid_range::resolve_grid_range(
+    let (sheet_title, grid) = match grid_range::resolve_grid_range(
         &workbook,
         &composed_range,
         |detail| ValidationResult::RefusedInvalidRange { detail },
         |title, available| ValidationResult::RefusedSheetNotFound { title, available },
     ) {
-        Ok((_, grid)) => grid,
+        Ok(resolved) => resolved,
         Err(result) => return gated(result),
+    };
+
+    // Sheets clamps a range past the grid rather than growing the sheet
+    // or erroring, so a range wholly past it would change nothing and one
+    // partly past it changes less than it names. Refuse the first and name
+    // the clamped range for the second, in both modes.
+    let clamped_to = match grid_range::clamp_to_sheet(&workbook, &grid) {
+        None => {
+            return gated(ValidationResult::RefusedInvalidRange {
+                detail: format!(
+                    "{composed_range} lies wholly past the sheet's current grid, so there is \
+                     nothing for {} to apply to",
+                    opts.verb.label()
+                ),
+            })
+        }
+        Some(clamped) if clamped != grid => Some(
+            grid_range::bounded_range_to_a1(&sheet_title, &clamped)
+                .unwrap_or_else(|| grid_range::render_grid_range(&clamped)),
+        ),
+        Some(_) => None,
     };
 
     let summary = describe_effect(&opts.verb);
 
     if opts.dry_run {
-        return gated(ValidationResult::WouldChange { summary });
+        return gated(ValidationResult::WouldChange {
+            summary,
+            clamped_to,
+        });
     }
 
     // Built before the gate, not after — unlike its siblings this is
@@ -553,7 +586,10 @@ async fn validation_inner(
     )
     .await
     {
-        Ok(_response) => ValidationResult::Changed { summary },
+        Ok(_response) => ValidationResult::Changed {
+            summary,
+            clamped_to,
+        },
         Err(err) => ValidationResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -729,7 +765,19 @@ pub fn describe_lines(outcome: &ValidationOutcome) -> Vec<String> {
         |n| format!("'{n}'"),
     );
     match &outcome.result {
-        ValidationResult::WouldChange { summary } => vec![format!("Would {summary} in {book}")],
+        ValidationResult::WouldChange {
+            summary,
+            clamped_to,
+        } => {
+            let mut lines = vec![format!("Would {summary} in {book}")];
+            lines.extend(clamped_to.as_ref().map(|applied| {
+                format!(
+                    "  the range runs past the sheet's current grid; Sheets clamps it, so this \
+                     would apply to {applied} only"
+                )
+            }));
+            lines
+        }
         ValidationResult::RefusedNotASpreadsheet { mime_type } => vec![format!(
             "Refused: {book} is not a Google Sheet (mimeType: {mime_type}); \
              `drive sheets {}` only works on spreadsheets",
@@ -778,8 +826,18 @@ pub fn describe_lines(outcome: &ValidationOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
-        ValidationResult::Changed { summary } => {
-            vec![format!("Applied: {summary} in {book}")]
+        ValidationResult::Changed {
+            summary,
+            clamped_to,
+        } => {
+            let mut lines = vec![format!("Applied: {summary} in {book}")];
+            lines.extend(clamped_to.as_ref().map(|applied| {
+                format!(
+                    "  the range ran past the sheet's current grid; Sheets clamped it, so this \
+                     applied to {applied} only"
+                )
+            }));
+            lines
         }
         ValidationResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -1593,6 +1651,89 @@ mod tests {
             .any(|r| r.url.path().ends_with(":batchUpdate")));
     }
 
+    /// Runs a `set-data-validation --range <range>` dry run against a
+    /// 1000 x 26 `Q1`.
+    async fn dry_run_on_a_sized_grid(range: &str) -> ValidationOutcome {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{"properties": {"sheetId": 0, "title": "Q1", "index": 0,
+                        "gridProperties": {"rowCount": 1000, "columnCount": 26}}}],
+                })),
+            )
+            .mount(&server)
+            .await;
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ValidationVerb::SetDataValidation {
+                sheet: Some("Q1".to_string()),
+                range: Some(range.to_string()),
+                condition: Condition::Checkbox,
+                input_message: None,
+                show_warning: false,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        validation(&drive, &sheets, &opts, &[allow_rule("folder-1")]).await
+    }
+
+    /// A range partly past the grid is not refused, but the preview names
+    /// the clamped range Sheets actually applies it to (#1941: live,
+    /// `Z1:AA2000` on a 1000 x 26 sheet was clamped silently).
+    #[tokio::test]
+    async fn a_range_past_the_grid_names_the_clamped_range() {
+        let outcome = dry_run_on_a_sized_grid("Z1:AA2000").await;
+        assert_eq!(
+            outcome.result,
+            ValidationResult::WouldChange {
+                summary: describe_effect(&set_verb(Condition::Checkbox, false)),
+                clamped_to: Some("'Q1'!Z1:Z1000".to_string()),
+            }
+        );
+        let text = describe(&outcome);
+        assert!(text.contains("would apply to 'Q1'!Z1:Z1000 only"), "{text}");
+
+        let inside = dry_run_on_a_sized_grid("A1:B10").await;
+        assert!(
+            matches!(
+                inside.result,
+                ValidationResult::WouldChange {
+                    clamped_to: None,
+                    ..
+                }
+            ),
+            "{:?}",
+            inside.result
+        );
+    }
+
+    #[tokio::test]
+    async fn a_range_wholly_past_the_grid_is_refused() {
+        let outcome = dry_run_on_a_sized_grid("AB1:AC5").await;
+        let ValidationResult::RefusedInvalidRange { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; only reached when the refusal regresses"
+        };
+        assert!(
+            detail.contains("wholly past the sheet's current grid"),
+            "{detail}"
+        );
+    }
+
     #[tokio::test]
     async fn compose_error_returns_refused_invalid_range() {
         let server = wiremock::MockServer::start().await;
@@ -1897,6 +2038,11 @@ mod tests {
         let all = vec![
             ValidationResult::WouldChange {
                 summary: "set data validation".to_string(),
+                clamped_to: None,
+            },
+            ValidationResult::WouldChange {
+                summary: "set data validation".to_string(),
+                clamped_to: Some("'Q1'!Z1:Z1000".to_string()),
             },
             ValidationResult::RefusedNotASpreadsheet {
                 mime_type: "application/pdf".to_string(),
@@ -1927,6 +2073,11 @@ mod tests {
             ValidationResult::RefusedLeaseStale,
             ValidationResult::Changed {
                 summary: "set data validation".to_string(),
+                clamped_to: None,
+            },
+            ValidationResult::Changed {
+                summary: "set data validation".to_string(),
+                clamped_to: Some("'Q1'!Z1:Z1000".to_string()),
             },
             ValidationResult::Failed {
                 detail: "boom".to_string(),
@@ -1965,7 +2116,23 @@ mod tests {
                     result,
                 };
                 let lines = describe_lines(&outcome);
-                assert_eq!(lines.len(), 1, "{:?}", outcome.result);
+                // Only a range clamped to the grid earns a second line.
+                let clamped = matches!(
+                    &outcome.result,
+                    ValidationResult::WouldChange {
+                        clamped_to: Some(_),
+                        ..
+                    } | ValidationResult::Changed {
+                        clamped_to: Some(_),
+                        ..
+                    }
+                );
+                assert_eq!(
+                    lines.len(),
+                    1 + usize::from(clamped),
+                    "{:?}",
+                    outcome.result
+                );
                 assert_eq!(describe(&outcome), lines.join("\n"));
                 for rendered in &lines {
                     assert!(!rendered.chars().any(char::is_control), "{rendered:?}");
@@ -1996,6 +2163,7 @@ mod tests {
             verb: clear_verb(),
             result: ValidationResult::Changed {
                 summary: "clear data validation".to_string(),
+                clamped_to: None,
             },
         };
         let mut buf = Vec::new();
