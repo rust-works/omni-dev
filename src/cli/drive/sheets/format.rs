@@ -449,7 +449,8 @@ pub struct MergeCellsCommand {
     /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
     pub spreadsheet_id: String,
 
-    /// A1 range to merge, optionally carrying its own `Sheet!` prefix.
+    /// A1 range to merge, optionally carrying its own `Sheet!` prefix. Must
+    /// be fully bounded (e.g. `A1:D20`) and at most 50,000 cells.
     #[arg(long, value_name = "A1")]
     pub range: Option<String>,
 
