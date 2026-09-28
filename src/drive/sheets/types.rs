@@ -709,7 +709,7 @@ pub enum BatchUpdateRequestItem {
     /// [`Self::AddNamedRange`] — it removes a label, not grid data; see
     /// [ADR-0081](../../../docs/adrs/adr-0081.md) §2 for why this stays
     /// `SheetsStructure` rather than `SheetsDelete`, and for the mandatory
-    /// referencing-formula preview that mitigates the resulting `#NAME?`
+    /// referencing-formula preview that mitigates the resulting `#REF!`
     /// errors.
     DeleteNamedRange(DeleteNamedRangeRequest),
     /// Add a chart (`add-chart`). Gated by `DriveOperation::SheetsStructure`
