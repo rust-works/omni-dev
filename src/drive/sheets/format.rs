@@ -888,15 +888,30 @@ fn resolve_target(
             // log) must name exactly which cells would be discarded, and an
             // open-ended column/row range (`A:A`) has no fixed extent to
             // check that against.
-            if matches!(verb, FormatVerb::MergeCells { .. }) && !grid_range::is_bounded(&grid) {
-                return Err(FormatResult::RefusedInvalidRange {
-                    detail: format!(
-                        "'{}' is open-ended; merge-cells needs a fully bounded range (e.g. \
-                         A1:D20) so its preview can name exactly what would be discarded",
-                        a1::split_sheet_prefix(composed)
-                            .map_or(composed, |(_, bare_range)| bare_range)
-                    ),
-                });
+            if matches!(verb, FormatVerb::MergeCells { .. }) {
+                let bare_range =
+                    a1::split_sheet_prefix(composed).map_or(composed, |(_, bare_range)| bare_range);
+                let Some(cells) = grid_range::cell_count(&grid) else {
+                    return Err(FormatResult::RefusedInvalidRange {
+                        detail: format!(
+                            "'{bare_range}' is open-ended; merge-cells needs a fully bounded \
+                             range (e.g. A1:D20) so its preview can name exactly what would be \
+                             discarded"
+                        ),
+                    });
+                };
+                // A bounded range can still be pathologically large, and the
+                // discard read behind the preview is proportional to it —
+                // refuse before that read rather than cap what it reports,
+                // so the structured outputs stay complete (#2025).
+                if cells > MAX_CELLS_PER_MERGE {
+                    return Err(FormatResult::RefusedInvalidRange {
+                        detail: format!(
+                            "'{bare_range}' covers {cells} cells, over the \
+                             {MAX_CELLS_PER_MERGE}-cell budget for merge-cells; narrow --range"
+                        ),
+                    });
+                }
             }
             // Inner grid lines only exist *between* rows/columns within the
             // range — refuse when the range is positively known (bounded on
@@ -1028,6 +1043,16 @@ fn discarded_from_values(values: &ValueRange, row_offset: i64, col_offset: i64) 
 /// discarded count and the full list (`-o json` / the `drivemutation`
 /// log's `discarded_cells`) are never elided — only this rendered line.
 const MERGE_DISCARD_RENDER_LIMIT: usize = 200;
+
+/// The largest range, in cells, `merge-cells` accepts. Checked in
+/// `resolve_target`, before `read_discarded_cells`' `values.get`, so it
+/// bounds that read, the in-memory discard list, and both structured
+/// outputs carrying it (`-o json` and the `drivemutation` log's
+/// `discarded_cells`) — which is what lets those outputs stay complete
+/// rather than elide (ADR-0078 §4's second amendment, #2025). Matches
+/// `read-cell-format`'s budget, so the crate has one cell-budget number.
+/// There is deliberately no flag to exceed it (ADR-0075 §3).
+const MAX_CELLS_PER_MERGE: i64 = 50_000;
 
 fn describe_effect(verb: &FormatVerb, discarded_cells: &[String]) -> Result<String, String> {
     match verb {
@@ -1820,6 +1845,95 @@ mod tests {
         // outcome would be `Failed` instead — the absence of that failure
         // is itself the assertion that the refusal happened before any
         // read of the (unbounded) target's values.
+    }
+
+    #[tokio::test]
+    async fn merge_cells_refuses_a_range_over_the_cell_budget_before_reading_it() {
+        for dry_run in [true, false] {
+            let server = wiremock::MockServer::start().await;
+            let (drive, sheets) = clients(&server).await;
+            mount_file(
+                "sheet-1",
+                crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                &["folder-1"],
+            )
+            .mount(&server)
+            .await;
+            mount_folder("folder-1").mount(&server).await;
+            mount_workbook().mount(&server).await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path_regex(
+                    r"^/v4/spreadsheets/sheet-1/values/",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+            mount_batch_update(serde_json::json!({}))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+            let rules = vec![allow_rule("folder-1")];
+
+            // 702 columns x 1000 rows = 702,000 cells. `opts()` seeds a
+            // live, matching lease, so the real run would reach the gate.
+            let opts = opts(merge_cells_verb("A1:ZZ1000"), dry_run);
+            let outcome = format(&drive, &sheets, &opts, &rules).await;
+            match outcome.result {
+                FormatResult::RefusedInvalidRange { detail } => {
+                    assert_eq!(
+                        detail,
+                        "'A1:ZZ1000' covers 702000 cells, over the 50000-cell budget for \
+                         merge-cells; narrow --range",
+                        "dry_run={dry_run}"
+                    );
+                }
+                other => panic!("dry_run={dry_run}: expected RefusedInvalidRange, got {other:?}"),
+            }
+            // Refused before the lease gate, so no `pending` record opens.
+            assert!(audit.records().is_empty(), "{:?}", audit.records());
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_cells_accepts_a_range_exactly_at_the_cell_budget() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // 10 columns x 5000 rows = exactly `MAX_CELLS_PER_MERGE`.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A1:J5000",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [["keep", "gone"]]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let opts = opts(merge_cells_verb("A1:J5000"), true);
+        let outcome = format(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            FormatResult::WouldChange {
+                discarded_cells, ..
+            } => assert_eq!(discarded_cells, vec!["B1: gone"]),
+            other => panic!("expected WouldChange, got {other:?}"),
+        }
     }
 
     // ── Verb helpers ─────────────────────────────────────────────────

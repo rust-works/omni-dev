@@ -5666,7 +5666,7 @@ Arguments:
   <SPREADSHEET_ID>  Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL)
 
 Options:
-      --range <A1>       A1 range to merge, optionally carrying its own `Sheet!` prefix
+      --range <A1>       A1 range to merge, optionally carrying its own `Sheet!` prefix. Must be fully bounded (e.g. `A1:D20`) and at most 50,000 cells
       --sheet <NAME>     Sheet (tab) title. Supplies the prefix for a bare `--range`
       --type <TYPE>      How to merge: one cell for the whole range, one per row, or one per column [default: all] [possible values: all, rows, columns]
       --dry-run          Reports the gate verdict and, critically, every cell value the merge would discard — see `drive sheets merge-cells --help` before running without this flag first
