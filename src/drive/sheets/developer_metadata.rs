@@ -918,6 +918,18 @@ fn describe_entry(entry: &DeveloperMetadataEntry) -> String {
     )
 }
 
+/// Like [`describe_entry`], but renders `new_value` in place of the entry's
+/// own (pre-update) value. [`DeveloperMetadataResult::Updated`] carries its
+/// entries as they were fetched *before* the update — reusing
+/// [`describe_entry`] there rendered the just-replaced value under a header
+/// naming the value it was replaced with (#1941).
+fn describe_updated_entry(entry: &DeveloperMetadataEntry, new_value: &str) -> String {
+    format!(
+        "  id {}: {:?}={:?} at {}",
+        entry.metadata_id, entry.key, new_value, entry.location
+    )
+}
+
 /// Renders an outcome as human-readable text.
 #[must_use]
 pub fn describe(outcome: &DeveloperMetadataOutcome) -> String {
@@ -1042,7 +1054,11 @@ pub fn describe_lines(outcome: &DeveloperMetadataOutcome) -> Vec<String> {
                 previous.len(),
                 plural(previous.len())
             )];
-            lines.extend(previous.iter().map(describe_entry));
+            lines.extend(
+                previous
+                    .iter()
+                    .map(|entry| describe_updated_entry(entry, new_value)),
+            );
             lines
         }
         DeveloperMetadataResult::Deleted { entries } => {
@@ -1936,6 +1952,10 @@ mod tests {
         }
         let text = describe(&outcome);
         assert!(text.contains("Updated 1 entry to \"team-a\""), "{text}");
+        // The listed entry must show the *new* value it was updated to, not
+        // the pre-update value the search matched on (#1941).
+        assert!(text.contains(r#"id 42: "owner"="team-a""#), "{text}");
+        assert!(!text.contains(r#"id 42: "owner"="team-b""#), "{text}");
     }
 
     // ── the Drive write lease (ADR-0080 §9) ──────────────────────────────
