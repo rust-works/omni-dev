@@ -34,6 +34,7 @@ use crate::drive::lease::check::{
 use crate::drive::sheets::a1;
 use crate::drive::sheets::api::{SheetsApi, ValueInputOption};
 use crate::drive::sheets::client::SheetsClient;
+use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::UpdateValuesResponse;
 use crate::drive::types::SheetTargetRefusal;
@@ -137,6 +138,20 @@ pub enum WriteResult {
     /// link or email; since issue #1612 the fix is a `file_id` rule, and
     /// this variant is reached only once that lookup has come up empty.
     RefusedNoVisibleParents,
+    /// The named sheet (from `--sheet`, or the range's own `Sheet!` prefix)
+    /// does not exist in this workbook. Checked client-side, like
+    /// find-replace/sort-range/auto-fill/paste and friends, rather than
+    /// letting the API's opaque "Unable to parse range" stand in for it
+    /// (#1941).
+    RefusedSheetNotFound {
+        /// The title that was not found.
+        title: String,
+        /// The titles that do exist.
+        available: Vec<String>,
+    },
+    /// `write`/`append`'s `--values` resolved to zero rows, so there is
+    /// nothing to write. `clear` takes no values and is unaffected.
+    RefusedEmptyValues,
     /// The folder write-permission gate refused it.
     Blocked {
         /// The rule that decided the refusal, if any (`None` means the bare
@@ -211,6 +226,8 @@ impl WriteResult {
             Self::RefusedNotASpreadsheet { .. } => "refused-not-a-spreadsheet",
             Self::RefusedShortcut => "refused-shortcut",
             Self::RefusedNoVisibleParents => "refused-no-visible-parents",
+            Self::RefusedSheetNotFound { .. } => "refused-sheet-not-found",
+            Self::RefusedEmptyValues => "refused-empty-values",
             Self::Blocked { .. } => "blocked",
             Self::RefusedNoLease => LeaseGateRefusal::NoLease.log_status(),
             Self::RefusedLeaseExpired => LeaseGateRefusal::Expired.log_status(),
@@ -291,6 +308,15 @@ async fn write_inner(
         result,
     };
 
+    // `clear` takes no values; `write`/`append` with zero parsed rows have
+    // nothing to send, and the API silently reports success on the request
+    // it *is* sent (`Wrote to ...`) even though nothing changed — refuse
+    // locally instead, matching `paste-data`'s empty-`--data` refusal
+    // (#1941).
+    if matches!(opts.verb, WriteVerb::Write | WriteVerb::Append) && opts.values.is_empty() {
+        return bare(WriteResult::RefusedEmptyValues);
+    }
+
     // Compose the range first: it is pure, and a conflicting
     // --sheet/--range pair should fail without spending a request.
     let range = match a1::compose(opts.sheet.as_deref(), opts.range.as_deref()) {
@@ -368,6 +394,32 @@ async fn write_inner(
         return gated(WriteResult::Blocked {
             decided_by: decision.decided_by,
         });
+    }
+
+    // The named sheet may not exist — `--sheet`, when given, is
+    // authoritative (`compose` already refused a `--range` naming a
+    // *different* sheet); otherwise fall back to `range`'s own prefix, if
+    // it has one. A bare, unprefixed range names no sheet to check here and
+    // is left to the API, which defaults it to the first sheet. Checked
+    // identically in `--dry-run` and a real run, like find-replace/sort's
+    // own metadata fetch, rather than letting a doomed write/append/clear
+    // pass its dry run and then fail live with an opaque "Unable to parse
+    // range" (#1941).
+    if let Some(title) = opts.sheet.clone().or_else(|| a1::sheet_title_of(&range)) {
+        let api = SheetsApi::new(sheets);
+        let workbook = match api.get_spreadsheet(&opts.spreadsheet_id).await {
+            Ok(workbook) => workbook,
+            Err(err) => {
+                return gated(WriteResult::Failed {
+                    detail: format!("{err:#}"),
+                })
+            }
+        };
+        if let Err(result) = grid_range::find_sheet_id(&workbook, &title, |title, available| {
+            WriteResult::RefusedSheetNotFound { title, available }
+        }) {
+            return gated(result);
+        }
     }
 
     if opts.dry_run {
@@ -552,6 +604,14 @@ pub fn describe(outcome: &WriteOutcome) -> String {
              [\"sheets-write\"]}} to write_permissions.rules. (Adding it to a folder in your \
              own Drive and granting that folder `sheets-write` also works.)"
         ),
+        WriteResult::RefusedSheetNotFound { title, available } => format!(
+            "Refused: '{name}' has no sheet titled '{title}'. Available: {}",
+            available.join(", ")
+        ),
+        WriteResult::RefusedEmptyValues => format!(
+            "Refused: `drive sheets {}` was given no values to write (--values is empty)",
+            verb.label()
+        ),
         WriteResult::Blocked { decided_by } => match decided_by {
             Some(rule) => format!(
                 "Blocked: {range} of '{name}' — refused by rule on {} {}{}",
@@ -669,6 +729,11 @@ mod tests {
             },
             WriteResult::RefusedShortcut,
             WriteResult::RefusedNoVisibleParents,
+            WriteResult::RefusedSheetNotFound {
+                title: "Nope".to_string(),
+                available: vec!["Sheet1".to_string()],
+            },
+            WriteResult::RefusedEmptyValues,
             WriteResult::Blocked { decided_by: None },
             WriteResult::Blocked {
                 decided_by: Some(DecidingRule::Folder {
@@ -707,6 +772,8 @@ mod tests {
                 | WriteResult::RefusedNotASpreadsheet { .. }
                 | WriteResult::RefusedShortcut
                 | WriteResult::RefusedNoVisibleParents
+                | WriteResult::RefusedSheetNotFound { .. }
+                | WriteResult::RefusedEmptyValues
                 | WriteResult::Blocked { .. }
                 | WriteResult::RefusedNoLease
                 | WriteResult::RefusedLeaseExpired
@@ -1025,6 +1092,86 @@ mod tests {
         );
         let text = describe(&outcome);
         assert!(text.contains("2 row(s) x 3 column(s)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn write_refuses_an_unknown_sheet_identically_in_dry_run_and_a_real_run() {
+        // `write --sheet Nope --dry-run` used to say `Would write ...` and
+        // only fail live with `HTTP 400: Unable to parse range` (#1941).
+        // find-replace/sort-range/auto-fill/paste all refuse this locally
+        // in both modes; write/append/clear now do too.
+        for dry_run in [true, false] {
+            let server = wiremock::MockServer::start().await;
+            let (drive, sheets) = clients(&server).await;
+            mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+                .mount(&server)
+                .await;
+            mount_folder("parent-1").mount(&server).await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "spreadsheetId": "sheet-1",
+                        "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1"}}]
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            // No mock for the values endpoint: a call to it would fail the
+            // test with a connection/404 error, distinct from the expected
+            // refusal.
+            let mut o = opts(WriteVerb::Write, dry_run);
+            o.sheet = Some("Nope".to_string());
+            o.range = None;
+            let outcome = write(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+            assert_eq!(
+                outcome.result,
+                WriteResult::RefusedSheetNotFound {
+                    title: "Nope".to_string(),
+                    available: vec!["Sheet1".to_string()],
+                },
+                "dry_run={dry_run}"
+            );
+            let text = describe(&outcome);
+            assert!(text.contains("no sheet titled 'Nope'"), "{text}");
+            assert!(text.contains("Available: Sheet1"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_and_append_refuse_empty_values_before_any_request() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // No mocks at all: the refusal must fire before even the metadata
+        // fetch.
+        for verb in [WriteVerb::Write, WriteVerb::Append] {
+            let mut o = opts(verb, true);
+            o.values = vec![];
+            let outcome = write(&drive, &sheets, &o, &[]).await;
+            assert_eq!(outcome.result, WriteResult::RefusedEmptyValues, "{verb:?}");
+            let text = describe(&outcome);
+            assert!(text.contains("no values to write"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_is_unaffected_by_empty_values() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        let mut o = opts(WriteVerb::Clear, true);
+        o.values = vec![];
+        let outcome = write(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert_eq!(
+            outcome.result,
+            WriteResult::WouldWrite {
+                rows: 0,
+                columns: 0
+            }
+        );
     }
 
     #[tokio::test]
@@ -1509,6 +1656,16 @@ mod tests {
             .mount(&server)
             .await;
         mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "sheets": [{"properties": {"sheetId": 0, "title": "My Sheet"}}]
+                })),
+            )
+            .mount(&server)
+            .await;
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .and(wiremock::matchers::path(
                 "/v4/spreadsheets/sheet-1/values/'My%20Sheet'!A1:B2",
