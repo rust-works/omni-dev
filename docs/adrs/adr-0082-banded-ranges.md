@@ -29,7 +29,10 @@ by precedent elsewhere in the crate rather than by anything new:
    `*ColorStyle` counterpart, and the `*ColorStyle` field wins when both are
    set — so the plain fields are never worth sending. `format-cells`
    (ADR-0078 §5) already settled the same question for cell formatting:
-   `*ColorStyle` only, RGB only (never the `themeColor` arm).
+   `*ColorStyle` only, RGB only (never *constructs* the `themeColor` arm).
+   That stays a write-side cut only: `ColorStyle` reads and losslessly
+   preserves an existing `themeColor` value, which previously failed the
+   whole parse (issue #2020).
 2. **How many axes a call may set.** A `BandedRange` can carry both
    `rowProperties` and `columnProperties` at once (a checkerboard effect).
    That combination has no real-world user asking for it and would double

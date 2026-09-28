@@ -196,16 +196,16 @@ impl FormatEffect {
     fn into_cell_format(self) -> Result<CellFormat, String> {
         let mut format = CellFormat::default();
         if let Some(hex) = self.background {
-            format.background_color_style = Some(ColorStyle {
-                rgb_color: parse_hex_color(&hex).map_err(|e| format!("--background: {e}"))?,
-            });
+            format.background_color_style = Some(ColorStyle::rgb(
+                parse_hex_color(&hex).map_err(|e| format!("--background: {e}"))?,
+            ));
         }
         if self.text_color.is_some() || self.bold.is_some() {
             let mut text_format = TextFormat::default();
             if let Some(hex) = self.text_color {
-                text_format.foreground_color_style = Some(ColorStyle {
-                    rgb_color: parse_hex_color(&hex).map_err(|e| format!("--text-color: {e}"))?,
-                });
+                text_format.foreground_color_style = Some(ColorStyle::rgb(
+                    parse_hex_color(&hex).map_err(|e| format!("--text-color: {e}"))?,
+                ));
             }
             text_format.bold = self.bold;
             format.text_format = Some(text_format);
@@ -269,17 +269,17 @@ impl GradientSpec {
             parse_hex_color(&self.max_color).map_err(|e| format!("--gradient-max-color: {e}"))?;
         let midpoint = match self.mid {
             Some(mid) => Some(InterpolationPoint {
-                color_style: ColorStyle {
-                    rgb_color: parse_hex_color(&mid.color)
+                color_style: ColorStyle::rgb(
+                    parse_hex_color(&mid.color)
                         .map_err(|e| format!("--gradient-mid-color: {e}"))?,
-                },
+                ),
                 point_type: mid.point_type.as_sheets_str().to_string(),
                 value: Some(mid.value),
             }),
             None => None,
         };
         let endpoint = |rgb_color, point_type: &str| InterpolationPoint {
-            color_style: ColorStyle { rgb_color },
+            color_style: ColorStyle::rgb(rgb_color),
             point_type: point_type.to_string(),
             value: None,
         };
@@ -1383,21 +1383,21 @@ mod tests {
             assert_eq!(midpoint.value.as_deref(), Some("50"));
             assert_eq!(
                 midpoint.color_style.rgb_color,
-                parse_hex_color("#FF00FF").unwrap()
+                Some(parse_hex_color("#FF00FF").unwrap())
             );
             let min = built.minpoint.expect("minpoint should be set");
             assert_eq!(min.point_type, "MIN");
             assert_eq!(min.value, None);
             assert_eq!(
                 min.color_style.rgb_color,
-                parse_hex_color("#FFFFFF").unwrap()
+                Some(parse_hex_color("#FFFFFF").unwrap())
             );
             let max = built.maxpoint.expect("maxpoint should be set");
             assert_eq!(max.point_type, "MAX");
             assert_eq!(max.value, None);
             assert_eq!(
                 max.color_style.rgb_color,
-                parse_hex_color("#000000").unwrap()
+                Some(parse_hex_color("#000000").unwrap())
             );
         }
     }
@@ -1821,13 +1821,13 @@ mod tests {
                     values: Vec::new(),
                 },
                 format: CellFormat {
-                    background_color_style: Some(ColorStyle {
-                        rgb_color: parse_hex_color("#FF0000").unwrap(),
-                    }),
+                    background_color_style: Some(ColorStyle::rgb(
+                        parse_hex_color("#FF0000").unwrap(),
+                    )),
                     text_format: Some(TextFormat {
-                        foreground_color_style: Some(ColorStyle {
-                            rgb_color: parse_hex_color("#00FF00").unwrap(),
-                        }),
+                        foreground_color_style: Some(ColorStyle::rgb(
+                            parse_hex_color("#00FF00").unwrap(),
+                        )),
                         bold: Some(true),
                         ..Default::default()
                     }),
