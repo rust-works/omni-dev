@@ -308,7 +308,7 @@ async fn delete_duplicates_inner(
     if !grid_range::is_bounded(&grid) {
         return gated(DeleteDuplicatesResult::RefusedInvalidRequest {
             detail: format!(
-                "'{composed}' is open-ended; delete-duplicates needs a fully bounded range (e.g. \
+                "{composed} is open-ended; delete-duplicates needs a fully bounded range (e.g. \
                  A1:D100) to avoid automatically spanning every allocated row"
             ),
         });
@@ -526,10 +526,9 @@ pub fn describe_lines(outcome: &DeleteDuplicatesOutcome) -> Vec<String> {
         DeleteDuplicatesResult::RefusedNoVisibleParents => {
             vec![format!("Refused: {book} has no visible parent folder")]
         }
-        DeleteDuplicatesResult::RefusedSheetNotFound { title, available } => vec![format!(
-            "Refused: {book} has no sheet titled '{title}'. Available: {}",
-            available.join(", ")
-        )],
+        DeleteDuplicatesResult::RefusedSheetNotFound { title, available } => {
+            vec![grid_range::no_sheet_refusal(&book, title, available)]
+        }
         DeleteDuplicatesResult::Blocked { .. } => vec![format!(
             "Blocked: delete-duplicates on {book} requires an allowing sheets-delete rule"
         )],

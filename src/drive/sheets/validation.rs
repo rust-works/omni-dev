@@ -745,18 +745,7 @@ pub fn describe_lines(outcome: &ValidationOutcome) -> Vec<String> {
              id>\", \"allow\": [\"sheets-structure\"]}} to write_permissions.rules."
         )],
         ValidationResult::RefusedSheetNotFound { title, available } => {
-            let list = if available.is_empty() {
-                "none".to_string()
-            } else {
-                available
-                    .iter()
-                    .map(|t| format!("'{t}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            vec![format!(
-                "Refused: {book} has no sheet titled '{title}'. Available: {list}"
-            )]
+            vec![grid_range::no_sheet_refusal(&book, title, available)]
         }
         ValidationResult::RefusedInvalidRange { detail } => vec![format!("Refused: {detail}")],
         ValidationResult::Blocked { decided_by } => vec![match decided_by {

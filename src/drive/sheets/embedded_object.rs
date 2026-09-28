@@ -2598,18 +2598,7 @@ pub fn describe_lines(outcome: &EmbeddedObjectOutcome) -> Vec<String> {
              id>\", \"allow\": [\"sheets-structure\"]}} to write_permissions.rules."
         )],
         EmbeddedObjectResult::RefusedSheetNotFound { title, available } => {
-            let list = if available.is_empty() {
-                "none".to_string()
-            } else {
-                available
-                    .iter()
-                    .map(|t| format!("'{t}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            vec![format!(
-                "Refused: {book} has no sheet titled '{title}'. Available: {list}"
-            )]
+            vec![grid_range::no_sheet_refusal(&book, title, available)]
         }
         EmbeddedObjectResult::RefusedInvalidRange { detail } => vec![format!("Refused: {detail}")],
         EmbeddedObjectResult::RefusedObjectNotFound { object_id } => vec![format!(

@@ -293,6 +293,32 @@ pub(crate) fn find_sheet_id<E>(
         .ok_or_else(|| not_found(title.to_string(), workbook.sheet_titles()))
 }
 
+/// The one rendering of a [`find_sheet_id`] miss, shared by every verb so
+/// the refusal reads the same everywhere: `book` is the caller's display
+/// name for the spreadsheet (already quoted), and each available title is
+/// quoted, or the list reads `none` for a workbook with no sheets.
+pub(crate) fn no_sheet_refusal(book: &str, title: &str, available: &[String]) -> String {
+    format!(
+        "Refused: {book} has no sheet titled '{title}'. Available: {}",
+        available_sheets(available)
+    )
+}
+
+/// The `Available: …` list of [`no_sheet_refusal`], for the one caller
+/// (`search-developer-metadata`) that phrases the rest of the message
+/// itself.
+pub(crate) fn available_sheets(available: &[String]) -> String {
+    if available.is_empty() {
+        "none".to_string()
+    } else {
+        available
+            .iter()
+            .map(|title| format!("'{title}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// The reverse of [`find_sheet_id`]: a sheet's title by its numeric id, or
 /// `None` if the workbook carries no sheet with that id. Needed by any
 /// list verb (e.g. `list-named-ranges`) that renders a workbook-scoped
@@ -441,12 +467,12 @@ pub(crate) fn resolve_grid_range<E>(
         // to "pass --sheet" when they already did).
         let detail = if a1::is_whole_sheet_reference(composed) {
             format!(
-                "'{composed}' names a sheet but not a range within it; pass --whole-sheet to \
+                "{composed} names a sheet but not a range within it; pass --whole-sheet to \
                  target the whole sheet, or add --range to name a range inside it"
             )
         } else {
             format!(
-                "'{composed}' does not name a sheet; pass --sheet, or a --range carrying its \
+                "{composed} does not name a sheet; pass --sheet, or a --range carrying its \
                  own 'Sheet!' prefix"
             )
         };
@@ -561,6 +587,22 @@ pub(crate) fn parse_grid_range(sheet_id: i64, range: &str) -> Result<GridRange, 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_sheet_refusal_quotes_every_available_title() {
+        assert_eq!(
+            no_sheet_refusal("'Budget'", "Q9", &["Q1".to_string(), "Q2".to_string()]),
+            "Refused: 'Budget' has no sheet titled 'Q9'. Available: 'Q1', 'Q2'"
+        );
+    }
+
+    #[test]
+    fn no_sheet_refusal_says_none_for_a_sheetless_workbook() {
+        assert_eq!(
+            no_sheet_refusal("'Budget'", "Q9", &[]),
+            "Refused: 'Budget' has no sheet titled 'Q9'. Available: none"
+        );
+    }
     use crate::drive::sheets::types::{GridProperties, Sheet, SheetProperties};
 
     #[test]

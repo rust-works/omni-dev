@@ -577,10 +577,9 @@ pub fn describe_lines(outcome: &TrimWhitespaceOutcome) -> Vec<String> {
         TrimWhitespaceResult::RefusedNoVisibleParents => {
             vec![format!("Refused: {book} has no visible parent folder")]
         }
-        TrimWhitespaceResult::RefusedSheetNotFound { title, available } => vec![format!(
-            "Refused: {book} has no sheet titled '{title}'. Available: {}",
-            available.join(", ")
-        )],
+        TrimWhitespaceResult::RefusedSheetNotFound { title, available } => {
+            vec![grid_range::no_sheet_refusal(&book, title, available)]
+        }
         TrimWhitespaceResult::Blocked { .. } => vec![format!(
             "Blocked: trim-whitespace on {book} requires an allowing sheets-write rule"
         )],

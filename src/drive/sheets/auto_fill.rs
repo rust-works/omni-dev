@@ -505,7 +505,7 @@ async fn auto_fill_inner(
     if !grid_range::is_bounded(&source_grid) {
         return gated(AutoFillResult::RefusedInvalidRange {
             detail: format!(
-                "'{composed}' is open-ended; auto-fill needs a fully bounded range (e.g. A1:D10)"
+                "{composed} is open-ended; auto-fill needs a fully bounded range (e.g. A1:D10)"
             ),
         });
     }
@@ -1061,18 +1061,7 @@ pub fn describe_lines(outcome: &AutoFillOutcome) -> Vec<String> {
              id>\", \"allow\": [\"sheets-write\"]}} to write_permissions.rules."
         )],
         AutoFillResult::RefusedSheetNotFound { title, available } => {
-            let list = if available.is_empty() {
-                "none".to_string()
-            } else {
-                available
-                    .iter()
-                    .map(|t| format!("'{t}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            vec![format!(
-                "Refused: {book} has no sheet titled '{title}'. Available: {list}"
-            )]
+            vec![grid_range::no_sheet_refusal(&book, title, available)]
         }
         AutoFillResult::RefusedInvalidRange { detail } => vec![format!("Refused: {detail}")],
         AutoFillResult::RefusedDestinationPastGrid {
@@ -2270,6 +2259,7 @@ mod tests {
         match outcome.result {
             AutoFillResult::RefusedInvalidRange { detail } => {
                 assert!(detail.contains("fully bounded"), "{detail}");
+                assert!(detail.starts_with("'Q1'!A:A is open-ended"), "{detail}");
             }
             other => panic!("expected RefusedInvalidRange, got {other:?}"),
         }

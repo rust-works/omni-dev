@@ -1200,18 +1200,7 @@ pub fn describe_lines(outcome: &PivotOutcome) -> Vec<String> {
             )]
         }
         PivotResult::RefusedSheetNotFound { title, available } => {
-            let list = if available.is_empty() {
-                "none".to_string()
-            } else {
-                available
-                    .iter()
-                    .map(|t| format!("'{t}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            vec![format!(
-                "Refused: {book} has no sheet titled '{title}'. Available: {list}"
-            )]
+            vec![grid_range::no_sheet_refusal(&book, title, available)]
         }
         PivotResult::RefusedInvalidRange { detail }
         | PivotResult::RefusedInvalidAnchor { detail }

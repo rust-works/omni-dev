@@ -535,7 +535,7 @@ async fn text_to_columns_inner(
     if !grid_range::is_bounded(&source_grid) {
         return gated(TextToColumnsResult::RefusedInvalidRange {
             detail: format!(
-                "'{composed}' is open-ended; text-to-columns needs a fully bounded single \
+                "{composed} is open-ended; text-to-columns needs a fully bounded single \
                  column (e.g. A2:A100)"
             ),
         });
@@ -543,7 +543,7 @@ async fn text_to_columns_inner(
     if !is_single_column(&source_grid) {
         return gated(TextToColumnsResult::RefusedInvalidRange {
             detail: format!(
-                "'{composed}' spans more than one column; text-to-columns' source must span \
+                "{composed} spans more than one column; text-to-columns' source must span \
                  exactly one column"
             ),
         });
@@ -999,18 +999,7 @@ pub fn describe_lines(outcome: &TextToColumnsOutcome) -> Vec<String> {
              id>\", \"allow\": [\"sheets-write\"]}} to write_permissions.rules."
         )],
         TextToColumnsResult::RefusedSheetNotFound { title, available } => {
-            let list = if available.is_empty() {
-                "none".to_string()
-            } else {
-                available
-                    .iter()
-                    .map(|t| format!("'{t}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            vec![format!(
-                "Refused: {book} has no sheet titled '{title}'. Available: {list}"
-            )]
+            vec![grid_range::no_sheet_refusal(&book, title, available)]
         }
         TextToColumnsResult::RefusedInvalidRange { detail } => vec![format!("Refused: {detail}")],
         TextToColumnsResult::RefusedInvalidDelimiter { detail } => {
@@ -2059,7 +2048,7 @@ mod tests {
         let outcome = text_to_columns(&client, &sheets, &opts, &rules).await;
         match outcome.result {
             TextToColumnsResult::RefusedInvalidRange { detail } => {
-                assert!(detail.contains("open-ended"));
+                assert!(detail.starts_with("Q1!A:A is open-ended"), "{detail}");
             }
             other => panic!("expected RefusedInvalidRange, got {other:?}"),
         }

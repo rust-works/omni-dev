@@ -513,7 +513,7 @@ pub fn describe_lines(outcome: &FindReplaceOutcome) -> Vec<String> {
         FindReplaceResult::RefusedNotASpreadsheet { mime_type } => vec![format!("Refused: {book} is not a Google Sheet (mimeType: {mime_type})")],
         FindReplaceResult::RefusedShortcut => vec![format!("Refused: {book} is a shortcut; find-replace doesn't follow shortcuts")],
         FindReplaceResult::RefusedNoVisibleParents => vec![format!("Refused: {book} has no visible parent folder")],
-        FindReplaceResult::RefusedSheetNotFound { title, available } => vec![format!("Refused: {book} has no sheet titled '{title}'. Available: {}", available.join(", "))],
+        FindReplaceResult::RefusedSheetNotFound { title, available } => vec![grid_range::no_sheet_refusal(&book, title, available)],
         FindReplaceResult::Blocked { decided_by } => vec![match decided_by { Some(rule) => format!("Blocked: find-replace on {book} refused by rule on {} {}{}", rule.kind_label(), rule.id(), rule.depth_suffix()), None => format!("Blocked: find-replace on {book} refused by default policy (no matching rule for sheets-write)") }],
         FindReplaceResult::RefusedNoLease => LeaseGateRefusal::NoLease.describe_line(&outcome.spreadsheet_id, &book).into_iter().collect(),
         FindReplaceResult::RefusedLeaseExpired => LeaseGateRefusal::Expired.describe_line(&outcome.spreadsheet_id, &book).into_iter().collect(),

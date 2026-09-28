@@ -1124,14 +1124,7 @@ pub fn describe_lines(outcome: &PasteOutcome) -> Vec<String> {
             )]
         }
         PasteResult::RefusedSheetNotFound { title, available } => {
-            let list = if available.is_empty() {
-                "none".to_string()
-            } else {
-                available.join(", ")
-            };
-            vec![format!(
-                "Refused: {book} has no sheet named '{title}' (available: {list})"
-            )]
+            vec![grid_range::no_sheet_refusal(&book, title, available)]
         }
         PasteResult::RefusedInvalidRange { detail }
         | PasteResult::RefusedInvalidDelimiter { detail } => {
@@ -3863,7 +3856,7 @@ mod tests {
             },
         };
         let lines = describe_lines(&outcome);
-        assert!(lines[0].contains("available: none"), "{lines:?}");
+        assert!(lines[0].contains("Available: none"), "{lines:?}");
     }
 
     #[test]
