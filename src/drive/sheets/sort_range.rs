@@ -207,6 +207,9 @@ async fn sort_range_inner(
         }
         Err(detail) => return bare(SortRangeResult::RefusedInvalidRequest { detail }),
     };
+    if let Err(detail) = reject_duplicate_sort_columns(&sort_specs) {
+        return bare(SortRangeResult::RefusedInvalidRequest { detail });
+    }
     let (target, verdict, denied, resolved_folder_id, requires_lease) =
         match target_gate::resolve_all(drive, &opts.spreadsheet_id, GATE_OPERATIONS, rules).await {
             target_gate::TargetGateUnionOutcome::MetadataFetchFailed { detail } => {
@@ -381,6 +384,25 @@ fn parse_sort_specs(flags: &[String]) -> Result<Vec<SortSpec>, String> {
             })
         })
         .collect()
+}
+
+/// Refuses a `--sort-by` list naming the same column more than once
+/// (`--sort-by 3:asc --sort-by 3:desc`), matching `delete-duplicates`'
+/// `--comparison-column` duplicate refusal. Only the API's own last-one-wins
+/// behavior distinguishes such a pair, which is a silent surprise rather
+/// than a caller's evident intent (#1941).
+fn reject_duplicate_sort_columns(specs: &[SortSpec]) -> Result<(), String> {
+    let mut seen = Vec::with_capacity(specs.len());
+    for spec in specs {
+        if seen.contains(&spec.dimension_index) {
+            return Err(format!(
+                "--sort-by column {} is given more than once",
+                spec.dimension_index
+            ));
+        }
+        seen.push(spec.dimension_index);
+    }
+    Ok(())
 }
 
 fn record_attempt(outcome: &SortRangeOutcome, duration: Duration) {
@@ -810,6 +832,26 @@ mod tests {
             panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("pass at least one --sort-by"), "{detail}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_repeated_sort_column_before_any_network_call() {
+        // `--sort-by 3:asc --sort-by 3:desc` silently let the API's
+        // last-one-wins behavior decide, with no way for the caller to tell
+        // from the command which direction won (#1941).
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        let mut opts = options(false);
+        opts.sort_by = vec!["3:asc".into(), "3:desc".into()];
+        let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
+        let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+        };
+        assert!(
+            detail.contains("column 3 is given more than once"),
+            "{detail}"
+        );
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
