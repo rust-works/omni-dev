@@ -71,6 +71,16 @@ pub(crate) fn split_sheet_prefix(range: &str) -> Option<(String, &str)> {
         None
     } else {
         let (title, tail) = range.split_once('!')?;
+        // Google Sheets tab titles cannot contain `:` (or `[`, `]`, `\`,
+        // `?`, `/`, `*`), so a prefix containing one is never a real
+        // unquoted title. Without this check, a malformed range like
+        // `A1:!!` split on its first `!` into the "title" `A1:`, which
+        // `compose` then reported as an ambiguous `--sheet`/`--range`
+        // conflict instead of the malformed-range error it actually is
+        // (#1941).
+        if title.contains([':', '[', ']', '\\', '?', '/', '*']) {
+            return None;
+        }
         Some((title.to_string(), tail))
     }
 }
@@ -249,6 +259,15 @@ mod tests {
     }
 
     #[test]
+    fn split_sheet_prefix_none_for_an_unquoted_prefix_containing_a_colon() {
+        // `A1:!!` split on its first `!` would otherwise yield the bogus
+        // title `A1:` — a real Google Sheets tab title can never contain
+        // `:`, so this is a malformed range, not a sheet-prefixed one
+        // (#1941).
+        assert_eq!(split_sheet_prefix("A1:!!"), None);
+    }
+
+    #[test]
     fn split_sheet_prefix_round_trips_through_quote_sheet_title() {
         for title in ["Sheet1", "My Sheet", "Bob's Sheet", "Q1!", "A1", "''"] {
             let composed = format!("{}!A1", quote_sheet_title(title));
@@ -314,6 +333,15 @@ mod tests {
         // since there's no `!` to split on.
         let err = compose(Some("Other"), Some("'Q1'")).unwrap_err();
         assert!(err.to_string().contains("already names a sheet"), "{err}");
+    }
+
+    #[test]
+    fn compose_does_not_misreport_a_malformed_range_as_naming_a_sheet() {
+        // Before #1941's fix, `split_sheet_prefix` split `A1:!!` on its
+        // first `!` into the bogus title `A1:`, so this raised "already
+        // names a sheet" instead of being forwarded to the server (which
+        // gives its own "Unable to parse range" error).
+        assert_eq!(compose(Some("W"), Some("A1:!!")).unwrap(), "'W'!A1:!!");
     }
 
     #[test]
