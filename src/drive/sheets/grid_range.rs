@@ -226,6 +226,25 @@ pub(crate) fn is_bounded(grid: &GridRange) -> bool {
         && grid.end_column_index.is_some()
 }
 
+/// The number of cells `grid` covers, or `None` when it is open-ended (see
+/// [`is_bounded`]). Saturates rather than overflowing, so a pathological
+/// range still compares as "too big" against a cell budget. The one shared
+/// count behind `read-cell-format`'s and `merge-cells`' cell budgets, so
+/// the two cannot drift in how they measure a range (#2025).
+pub(crate) fn cell_count(grid: &GridRange) -> Option<i64> {
+    match (
+        grid.start_row_index,
+        grid.end_row_index,
+        grid.start_column_index,
+        grid.end_column_index,
+    ) {
+        (Some(start_row), Some(end_row), Some(start_col), Some(end_col)) => {
+            Some((end_row - start_row).saturating_mul(end_col - start_col))
+        }
+        _ => None,
+    }
+}
+
 /// A column index that falls outside a [`GridRange`]'s column span, as
 /// returned by [`check_column_in_range`]. Carries enough structured data
 /// (the offending column plus the range's bounds) for each call site to
@@ -800,6 +819,38 @@ mod tests {
         assert!(is_bounded(&bounded));
         let open_column = parse_grid_range(1, "A:A").unwrap();
         assert!(!is_bounded(&open_column));
+    }
+
+    #[test]
+    fn cell_count_multiplies_rows_by_columns_for_a_bounded_range() {
+        assert_eq!(
+            cell_count(&parse_grid_range(1, "A1:D20").unwrap()),
+            Some(80)
+        );
+        assert_eq!(cell_count(&parse_grid_range(1, "C3").unwrap()), Some(1));
+    }
+
+    #[test]
+    fn cell_count_is_none_for_an_open_ended_range() {
+        assert_eq!(cell_count(&parse_grid_range(1, "A:A").unwrap()), None);
+        assert_eq!(cell_count(&parse_grid_range(1, "5:5").unwrap()), None);
+        assert_eq!(cell_count(&parse_grid_range(1, "A1:A").unwrap()), None);
+    }
+
+    #[test]
+    fn cell_count_handles_a_huge_range_and_saturates_instead_of_overflowing() {
+        assert_eq!(
+            cell_count(&parse_grid_range(1, "A1:ZZZ10000000").unwrap()),
+            Some(18_278 * 10_000_000)
+        );
+        let extreme = GridRange {
+            sheet_id: 1,
+            start_row_index: Some(0),
+            end_row_index: Some(i64::MAX),
+            start_column_index: Some(0),
+            end_column_index: Some(i64::MAX),
+        };
+        assert_eq!(cell_count(&extreme), Some(i64::MAX));
     }
 
     #[test]

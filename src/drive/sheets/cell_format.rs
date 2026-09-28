@@ -155,14 +155,9 @@ fn check_cell_budget(composed: &str) -> Result<()> {
     let Ok(grid) = grid_range::parse_grid_range(0, bare) else {
         return Ok(());
     };
-    if !grid_range::is_bounded(&grid) {
+    let Some(cells) = grid_range::cell_count(&grid) else {
         return Ok(());
-    }
-    // `is_bounded` guarantees every bound is `Some`.
-    let rows = grid.end_row_index.unwrap_or_default() - grid.start_row_index.unwrap_or_default();
-    let cols =
-        grid.end_column_index.unwrap_or_default() - grid.start_column_index.unwrap_or_default();
-    let cells = rows.saturating_mul(cols);
+    };
     anyhow::ensure!(
         cells <= MAX_CELLS_PER_READ_CELL_FORMAT,
         "range covers {cells} cells, over the {MAX_CELLS_PER_READ_CELL_FORMAT}-cell budget for \
