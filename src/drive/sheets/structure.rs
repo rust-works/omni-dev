@@ -85,6 +85,7 @@ use crate::drive::lease::ledger::LeaseBackup;
 use crate::drive::sheets::api::SheetsApi;
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::format::{normalize_hex_for_display, parse_hex_color};
+use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
 use crate::drive::sheets::types::{
     AddSheetRequest, BatchUpdateRequestItem, BatchUpdateResponse, ColorStyle,
@@ -2163,18 +2164,7 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
             )]
         }
         StructureResult::RefusedSheetNotFound { title, available } => {
-            let list = if available.is_empty() {
-                "none".to_string()
-            } else {
-                available
-                    .iter()
-                    .map(|t| format!("'{t}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            vec![format!(
-                "Refused: {book} has no sheet titled '{title}'. Available: {list}"
-            )]
+            vec![grid_range::no_sheet_refusal(&book, title, available)]
         }
         StructureResult::RefusedSheetExists { title } => {
             vec![format!(

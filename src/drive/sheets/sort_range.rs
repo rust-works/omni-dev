@@ -285,7 +285,7 @@ async fn sort_range_inner(
     if !grid_range::is_bounded(&grid) {
         return gated(SortRangeResult::RefusedInvalidRequest {
             detail: format!(
-                "'{composed}' is open-ended; sort-range needs a fully bounded range (e.g. A1:D10)"
+                "{composed} is open-ended; sort-range needs a fully bounded range (e.g. A1:D10)"
             ),
         });
     }
@@ -483,10 +483,9 @@ pub fn describe_lines(outcome: &SortRangeOutcome) -> Vec<String> {
         SortRangeResult::RefusedNoVisibleParents => {
             vec![format!("Refused: {book} has no visible parent folder")]
         }
-        SortRangeResult::RefusedSheetNotFound { title, available } => vec![format!(
-            "Refused: {book} has no sheet titled '{title}'. Available: {}",
-            available.join(", ")
-        )],
+        SortRangeResult::RefusedSheetNotFound { title, available } => {
+            vec![grid_range::no_sheet_refusal(&book, title, available)]
+        }
         SortRangeResult::Blocked {
             operation,
             decided_by,
@@ -1095,7 +1094,10 @@ mod tests {
         let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
             panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
-        assert!(detail.contains("open-ended"), "{detail}");
+        assert!(
+            detail.starts_with("Q1!A:A is open-ended"),
+            "the range is echoed as given, with no extra quotes: {detail}"
+        );
         assert!(server
             .received_requests()
             .await

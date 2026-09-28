@@ -404,18 +404,10 @@ fn resolve_location(
 /// structured result to.
 fn location_error_to_string(result: DeveloperMetadataResult) -> String {
     match result {
-        DeveloperMetadataResult::RefusedSheetNotFound { title, available } => {
-            let list = if available.is_empty() {
-                "none".to_string()
-            } else {
-                available
-                    .iter()
-                    .map(|t| format!("'{t}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            format!("no sheet titled '{title}'. Available: {list}")
-        }
+        DeveloperMetadataResult::RefusedSheetNotFound { title, available } => format!(
+            "no sheet titled '{title}'. Available: {}",
+            grid_range::available_sheets(&available)
+        ),
         DeveloperMetadataResult::RefusedInvalidLocation { detail } => detail,
         other => unreachable!(
             "resolve_location only ever returns RefusedSheetNotFound or \
@@ -989,18 +981,7 @@ pub fn describe_lines(outcome: &DeveloperMetadataOutcome) -> Vec<String> {
              id>\", \"allow\": [\"sheets-structure\"]}} to write_permissions.rules."
         )],
         DeveloperMetadataResult::RefusedSheetNotFound { title, available } => {
-            let list = if available.is_empty() {
-                "none".to_string()
-            } else {
-                available
-                    .iter()
-                    .map(|t| format!("'{t}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            vec![format!(
-                "Refused: {book} has no sheet titled '{title}'. Available: {list}"
-            )]
+            vec![grid_range::no_sheet_refusal(&book, title, available)]
         }
         DeveloperMetadataResult::RefusedInvalidLocation { detail } => {
             vec![format!("Refused: {detail}")]

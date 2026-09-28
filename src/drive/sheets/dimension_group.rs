@@ -806,18 +806,7 @@ pub fn describe_lines(outcome: &DimensionGroupOutcome) -> Vec<String> {
              id>\", \"allow\": [\"sheets-structure\"]}} to write_permissions.rules."
         )],
         DimensionGroupResult::RefusedSheetNotFound { title, available } => {
-            let list = if available.is_empty() {
-                "none".to_string()
-            } else {
-                available
-                    .iter()
-                    .map(|t| format!("'{t}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            vec![format!(
-                "Refused: {book} has no sheet titled '{title}'. Available: {list}"
-            )]
+            vec![grid_range::no_sheet_refusal(&book, title, available)]
         }
         DimensionGroupResult::RefusedInvalidRange { detail }
         | DimensionGroupResult::RefusedDimensionGroupNotFound { detail } => {

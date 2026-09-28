@@ -604,10 +604,9 @@ pub fn describe(outcome: &WriteOutcome) -> String {
              [\"sheets-write\"]}} to write_permissions.rules. (Adding it to a folder in your \
              own Drive and granting that folder `sheets-write` also works.)"
         ),
-        WriteResult::RefusedSheetNotFound { title, available } => format!(
-            "Refused: '{name}' has no sheet titled '{title}'. Available: {}",
-            available.join(", ")
-        ),
+        WriteResult::RefusedSheetNotFound { title, available } => {
+            grid_range::no_sheet_refusal(&format!("'{name}'"), title, available)
+        }
         WriteResult::RefusedEmptyValues => format!(
             "Refused: `drive sheets {}` was given no values to write (--values is empty)",
             verb.label()
@@ -1134,7 +1133,7 @@ mod tests {
             );
             let text = describe(&outcome);
             assert!(text.contains("no sheet titled 'Nope'"), "{text}");
-            assert!(text.contains("Available: Sheet1"), "{text}");
+            assert!(text.contains("Available: 'Sheet1'"), "{text}");
         }
     }
 
