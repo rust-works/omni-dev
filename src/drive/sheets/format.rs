@@ -1087,7 +1087,7 @@ fn describe_effect(verb: &FormatVerb, discarded_cells: &[String]) -> Result<Stri
             if sides.inner_vertical {
                 names.push("inner-vertical");
             }
-            Ok(format!("{} border(s), style {style}", names.join(", ")))
+            Ok(format!("set {} border(s), style {style}", names.join(", ")))
         }
         FormatVerb::MergeCells { merge_type, .. } => {
             if discarded_cells.is_empty() {
@@ -1111,18 +1111,60 @@ fn describe_effect(verb: &FormatVerb, discarded_cells: &[String]) -> Result<Stri
             }
         }
         FormatVerb::UnmergeCells { .. } => Ok("unmerge".to_string()),
-        FormatVerb::AutoResizeDimension { dimension, .. } => {
-            Ok(format!("auto-resize {}(s)", dimension.noun()))
-        }
-        FormatVerb::UpdateDimensionProperties {
+        FormatVerb::AutoResizeDimension {
+            sheet,
             dimension,
-            pixel_size,
-            ..
+            start,
+            end,
         } => Ok(format!(
-            "set {} pixelSize to {pixel_size}",
-            dimension.noun()
+            "auto-resize {}",
+            dimension_span(sheet, *dimension, *start, *end)
+        )),
+        FormatVerb::UpdateDimensionProperties {
+            sheet,
+            dimension,
+            start,
+            end,
+            pixel_size,
+        } => Ok(format!(
+            "set the pixelSize of {} to {pixel_size}",
+            dimension_span(sheet, *dimension, *start, *end)
         )),
     }
+}
+
+/// A 1-based inclusive dimension span as prose naming its sheet, e.g.
+/// `column(s) B:D of 'Q1'` or `row(s) 2:5 of 'Q1'` — columns in A1 letters,
+/// since that is how the grid labels them.
+fn dimension_span(sheet: &str, dimension: Dimension, start: i64, end: i64) -> String {
+    let (first, last) = match dimension {
+        Dimension::Columns => (
+            grid_range::column_index_to_letters(start - 1),
+            grid_range::column_index_to_letters(end - 1),
+        ),
+        Dimension::Rows => (start.to_string(), end.to_string()),
+    };
+    format!("{}(s) {first}:{last} of '{sheet}'", dimension.noun())
+}
+
+/// The real-run line's past-tense opening for `summary`, which
+/// [`describe_effect`] always starts with the verb's imperative (`set`,
+/// `merge`, `unmerge`, `auto-resize`). The summary itself stays imperative:
+/// it is also the JSON `summary` and the request log's `fields_changed`,
+/// and the dry run reads it after "Would".
+fn past_tense_summary(verb: &FormatVerb, summary: &str) -> String {
+    let (imperative, past) = match verb {
+        FormatVerb::FormatCells { .. }
+        | FormatVerb::UpdateBorders { .. }
+        | FormatVerb::UpdateDimensionProperties { .. } => ("set", "Set"),
+        FormatVerb::MergeCells { .. } => ("merge", "Merged cells"),
+        FormatVerb::UnmergeCells { .. } => ("unmerge", "Unmerged cells"),
+        FormatVerb::AutoResizeDimension { .. } => ("auto-resize", "Auto-resized"),
+    };
+    summary.strip_prefix(imperative).map_or_else(
+        || format!("Applied: {summary}"),
+        |rest| format!("{past}{rest}"),
+    )
 }
 
 fn build_request(
@@ -1343,17 +1385,9 @@ pub fn describe_lines(outcome: &FormatOutcome) -> Vec<String> {
             .into_iter()
             .collect(),
         FormatResult::Changed { summary, .. } => {
-            vec![format!("{}: {summary} in {book}", capitalize(verb.label()))]
+            vec![format!("{} in {book}", past_tense_summary(verb, summary))]
         }
         FormatResult::Failed { detail } => vec![format!("Failed: {detail}")],
-    }
-}
-
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
     }
 }
 
@@ -3609,5 +3643,125 @@ mod tests {
         // this write's `drivemutation` record carries, so an auditor can
         // see which verb ran without joining back to `log.jsonl`.
         assert_eq!(records[0].command, ["drive", "sheets-format-cells"]);
+    }
+
+    fn borders_verb() -> FormatVerb {
+        FormatVerb::UpdateBorders {
+            sheet: Some("Q1".to_string()),
+            range: Some("A1:B2".to_string()),
+            sides: BorderSides {
+                top: true,
+                left: true,
+                ..BorderSides::default()
+            },
+            style: "SOLID_MEDIUM".to_string(),
+            color: None,
+        }
+    }
+
+    fn lines_for(verb: FormatVerb, result: FormatResult) -> Vec<String> {
+        describe_lines(&FormatOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb,
+            result,
+        })
+    }
+
+    #[test]
+    fn update_borders_summary_starts_with_a_verb() {
+        let summary = describe_effect(&borders_verb(), &[]).unwrap();
+        assert_eq!(summary, "set top, left border(s), style SOLID_MEDIUM");
+        let lines = lines_for(
+            borders_verb(),
+            FormatResult::WouldChange {
+                summary,
+                discarded_cells: Vec::new(),
+            },
+        );
+        assert_eq!(
+            lines,
+            ["Would set top, left border(s), style SOLID_MEDIUM in 'Budget'"]
+        );
+    }
+
+    #[test]
+    fn dimension_summaries_name_the_sheet_and_the_span() {
+        let auto_resize = FormatVerb::AutoResizeDimension {
+            sheet: "Q1".to_string(),
+            dimension: Dimension::Columns,
+            start: 2,
+            end: 4,
+        };
+        assert_eq!(
+            describe_effect(&auto_resize, &[]).unwrap(),
+            "auto-resize column(s) B:D of 'Q1'"
+        );
+        let pixel_size = FormatVerb::UpdateDimensionProperties {
+            sheet: "Q1".to_string(),
+            dimension: Dimension::Rows,
+            start: 2,
+            end: 5,
+            pixel_size: 40,
+        };
+        assert_eq!(
+            describe_effect(&pixel_size, &[]).unwrap(),
+            "set the pixelSize of row(s) 2:5 of 'Q1' to 40"
+        );
+    }
+
+    #[test]
+    fn a_real_run_reads_as_past_tense_prose_not_the_hyphenated_verb() {
+        let auto_resize = FormatVerb::AutoResizeDimension {
+            sheet: "Q1".to_string(),
+            dimension: Dimension::Rows,
+            start: 1,
+            end: 3,
+        };
+        let cases = [
+            (
+                borders_verb(),
+                "set top, left border(s), style SOLID_MEDIUM",
+                "Set top, left border(s), style SOLID_MEDIUM in 'Budget'",
+            ),
+            (
+                merge_cells_verb("A1:B2"),
+                "merge (MERGE_ALL)",
+                "Merged cells (MERGE_ALL) in 'Budget'",
+            ),
+            (
+                unmerge_cells_verb(),
+                "unmerge",
+                "Unmerged cells in 'Budget'",
+            ),
+            (
+                auto_resize,
+                "auto-resize row(s) 1:3 of 'Q1'",
+                "Auto-resized row(s) 1:3 of 'Q1' in 'Budget'",
+            ),
+        ];
+        for (verb, summary, expected) in cases {
+            let lines = lines_for(
+                verb,
+                FormatResult::Changed {
+                    summary: summary.to_string(),
+                    discarded_cells: Vec::new(),
+                },
+            );
+            assert_eq!(lines, [expected]);
+        }
+    }
+
+    #[test]
+    fn a_summary_without_its_verbs_imperative_falls_back_to_applied() {
+        let lines = lines_for(
+            borders_verb(),
+            FormatResult::Changed {
+                summary: "x".to_string(),
+                discarded_cells: Vec::new(),
+            },
+        );
+        assert_eq!(lines, ["Applied: x in 'Budget'"]);
     }
 }
