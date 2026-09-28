@@ -222,3 +222,75 @@ impl Authenticator for FakeAuthenticator {
         self.0.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    /// The identifiers of every Drive key [`super::EnvGuard::take`]
+    /// snapshots. `HOME` is left out: Gmail's, Atlassian's and other
+    /// domains' own guards mutate it legitimately without this one.
+    const GUARDED_KEYS: &[&str] = &[
+        "DRIVE_CLIENT_ID",
+        "DRIVE_CLIENT_SECRET",
+        "DRIVE_REFRESH_TOKEN",
+        "DRIVE_SCOPE",
+        "DRIVE_ACCOUNT_ENV",
+        "DRIVE_API_URL",
+        "SHEETS_API_URL",
+        "DOCS_API_URL",
+    ];
+
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Grep guard: any function that sets or removes one of the Drive keys
+    /// must hold [`super::EnvGuard`], or it races every guarded test that
+    /// points the same key at its own server — exactly how an unguarded
+    /// `set_var(SHEETS_API_URL, …)` in a text-to-columns test broke
+    /// `the_pivot_table_dispatch_arms_reach_their_leaf_commands` (#2035).
+    ///
+    /// Splitting on `fn ` is a heuristic: a nested `fn` ahead of the
+    /// mutation would hide the `take()` above it and fail here, which is
+    /// the loud direction.
+    #[test]
+    fn every_drive_env_mutation_holds_the_env_guard() {
+        let mutation = regex::Regex::new(&format!(
+            r#"(?:set_var|remove_var)\(\s*"?(?:[A-Za-z_][A-Za-z0-9_]*::)*(?:{})\b"#,
+            GUARDED_KEYS.join("|")
+        ))
+        .unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this_file = src.join("drive").join("test_support.rs");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+
+        let mut offenders = Vec::new();
+        for path in files.into_iter().filter(|p| *p != this_file) {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for body in text.split("fn ").skip(1) {
+                if mutation.is_match(body) && !body.contains("EnvGuard::take()") {
+                    let name = body.split(['(', '<']).next().unwrap_or_default();
+                    offenders.push(format!(
+                        "{}: fn {name}",
+                        path.strip_prefix(&src).unwrap().display()
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these functions mutate a Drive env var without \
+             `crate::drive::test_support::EnvGuard::take()`:\n{}",
+            offenders.join("\n")
+        );
+    }
+}
