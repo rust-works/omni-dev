@@ -226,6 +226,36 @@ pub(crate) fn is_bounded(grid: &GridRange) -> bool {
         && grid.end_column_index.is_some()
 }
 
+/// A column index that falls outside a [`GridRange`]'s column span, as
+/// returned by [`check_column_in_range`]. Carries enough structured data
+/// (the offending column plus the range's bounds) for each call site to
+/// format its own verb-specific error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ColumnOutOfRange {
+    pub(crate) column: i64,
+    pub(crate) start: i64,
+    pub(crate) end: Option<i64>,
+}
+
+/// Checks whether `column` (an absolute, zero-based sheet column index — 0
+/// = column A) falls inside `grid`'s half-open column span `start..end`.
+/// An unset `start_column_index` is treated as 0; an unset
+/// `end_column_index` is treated as unbounded, so whole-row ranges (e.g.
+/// `2:5`) admit any column at or after `start`. The single shared home for
+/// the bounds check `sort-range --sort-by`, `delete-duplicates
+/// --comparison-column` and the slicer `--column` (#1945) each re-derived
+/// independently (#1989).
+pub(crate) fn check_column_in_range(column: i64, grid: &GridRange) -> Result<(), ColumnOutOfRange> {
+    let start = grid.start_column_index.unwrap_or(0);
+    let end = grid.end_column_index;
+    let inside = column >= start && end.is_none_or(|end| column < end);
+    if inside {
+        Ok(())
+    } else {
+        Err(ColumnOutOfRange { column, start, end })
+    }
+}
+
 /// Finds a sheet's numeric id by title. Shared by every verb that resolves
 /// a `--sheet` name (or a range's sheet prefix) against a freshly-fetched
 /// workbook — `not_found` builds the caller's own "sheet not found" error
@@ -702,6 +732,66 @@ mod tests {
             assert_eq!(column_index_to_letters(index), letters);
             assert_eq!(column_letters_to_index(letters), Some(index));
         }
+    }
+
+    #[test]
+    fn check_column_in_range_accepts_start_and_last_column_of_a_bounded_range() {
+        let grid = parse_grid_range(1, "C1:F2").unwrap();
+        assert!(check_column_in_range(2, &grid).is_ok());
+        assert!(check_column_in_range(5, &grid).is_ok());
+    }
+
+    #[test]
+    fn check_column_in_range_rejects_below_start_and_at_exclusive_end() {
+        let grid = parse_grid_range(1, "C1:F2").unwrap();
+        assert_eq!(
+            check_column_in_range(1, &grid),
+            Err(ColumnOutOfRange {
+                column: 1,
+                start: 2,
+                end: Some(6),
+            })
+        );
+        assert_eq!(
+            check_column_in_range(6, &grid),
+            Err(ColumnOutOfRange {
+                column: 6,
+                start: 2,
+                end: Some(6),
+            })
+        );
+    }
+
+    #[test]
+    fn check_column_in_range_treats_an_unset_end_as_unbounded() {
+        let whole_rows = parse_grid_range(1, "2:5").unwrap();
+        assert!(check_column_in_range(0, &whole_rows).is_ok());
+        assert!(check_column_in_range(700, &whole_rows).is_ok());
+    }
+
+    #[test]
+    fn check_column_in_range_treats_an_unset_start_as_zero() {
+        let whole_column = parse_grid_range(1, "A:A").unwrap();
+        assert!(check_column_in_range(0, &whole_column).is_ok());
+        assert!(check_column_in_range(-1, &whole_column).is_err());
+    }
+
+    #[test]
+    fn check_column_in_range_rejects_everything_in_an_empty_range() {
+        let empty = GridRange {
+            sheet_id: 1,
+            start_row_index: Some(0),
+            end_row_index: Some(1),
+            start_column_index: Some(2),
+            end_column_index: Some(2),
+        };
+        assert!(check_column_in_range(2, &empty).is_err());
+    }
+
+    #[test]
+    fn check_column_in_range_rejects_a_negative_column() {
+        let grid = parse_grid_range(1, "A1:F2").unwrap();
+        assert!(check_column_in_range(-1, &grid).is_err());
     }
 
     #[test]

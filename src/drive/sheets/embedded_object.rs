@@ -1865,12 +1865,11 @@ fn check_slicer_column_in_range(
     column: i64,
     range: &GridRange,
 ) -> Result<(), EmbeddedObjectResult> {
-    let start = range.start_column_index.unwrap_or(0);
-    let end = range.end_column_index;
-    let inside = column >= start && end.is_none_or(|end| column < end);
-    if inside {
-        return Ok(());
-    }
+    let grid_range::ColumnOutOfRange { start, end, .. } =
+        match grid_range::check_column_in_range(column, range) {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
     let column_label = if column >= 0 {
         format!(
             "{column} (column {})",

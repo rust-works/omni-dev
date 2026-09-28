@@ -407,18 +407,19 @@ fn validate_comparison_columns(columns: &[i64]) -> Result<(), String> {
     Ok(())
 }
 
-/// Every compared column must lie inside the selected range — `sort-range`'s
-/// rule for `--sort-by`, and the same absolute, zero-based convention.
+/// Every compared column must lie inside the selected range — the same
+/// absolute, zero-based convention as [`grid_range::check_column_in_range`].
 fn columns_within_range(columns: &[i64], grid: &GridRange) -> Result<(), String> {
-    let start = grid.start_column_index.unwrap_or(0);
-    let end = grid.end_column_index.unwrap_or(0);
-    match columns.iter().find(|&&index| index < start || index >= end) {
-        Some(index) => Err(format!(
-            "comparison column {index} is outside the selected range's columns {start}..{end} \
-             (zero-based, end exclusive)"
-        )),
-        None => Ok(()),
-    }
+    columns.iter().try_for_each(|&index| {
+        grid_range::check_column_in_range(index, grid).map_err(|e| {
+            format!(
+                "comparison column {index} is outside the selected range's columns \
+                 {}..{} (zero-based, end exclusive)",
+                e.start,
+                e.end.unwrap_or(0)
+            )
+        })
+    })
 }
 
 fn record_attempt(outcome: &DeleteDuplicatesOutcome, duration: Duration) {
@@ -712,6 +713,20 @@ mod tests {
             .unwrap_err()
             .contains("columns 2..5"));
         assert!(columns_within_range(&[5], &grid).is_err());
+    }
+
+    #[test]
+    fn comparison_columns_within_an_unbounded_range_are_never_rejected() {
+        // `grid_range::check_column_in_range`, not `is_bounded`, now handles
+        // an open-ended `end_column_index` — the latent bug #1989 describes.
+        let whole_rows = GridRange {
+            sheet_id: 0,
+            start_row_index: Some(1),
+            end_row_index: Some(10),
+            start_column_index: Some(2),
+            end_column_index: None,
+        };
+        assert!(columns_within_range(&[2, 700], &whole_rows).is_ok());
     }
 
     // ── rendering (pure) ────────────────────────────────────────────────
