@@ -2775,6 +2775,11 @@ Past 200 entries the rendered line elides the remainder (`… and N more
 (full list in -o json / the drivemutation log's discarded_cells)`); the
 exact count in the sentence and the `-o json` outcome's `discarded_cells`
 stay complete either way (issue #1999).
+A range over 50,000 cells (for example, `A1:ZZ1000`) is refused as
+`refused-invalid-range` before anything is read, on `--dry-run` and the
+real run alike. This keeps the read and `discarded_cells` bounded without
+ever eliding them. There is no flag to exceed the limit, so do a larger
+merge in the Sheets UI (issue #2025).
 
 `format-cells` can never write a *value* — it builds a `repeatCell` request
 whose payload has no field to put one in, regardless of what flags are
