@@ -321,6 +321,14 @@ pub enum PasteResult {
     /// `paste-data`'s `--data`/`--data-file` resolved to an empty string,
     /// so there is nothing to paste and no extent to preview.
     RefusedEmptyData,
+    /// `paste-data`'s `--delimiter` was empty. The API rejects this
+    /// (`Must either set html=true or a delimiter`) only once the request
+    /// reaches it, so refuse locally instead, matching
+    /// `text-to-columns --custom-delimiter ''` (#1941).
+    RefusedInvalidDelimiter {
+        /// What was wrong and why.
+        detail: String,
+    },
     /// The folder write-permission gate refused it.
     Blocked {
         /// Which of [`PasteVerb::gate_operations`] denied first.
@@ -374,6 +382,7 @@ impl PasteResult {
             Self::RefusedSheetNotFound { .. } => "refused-sheet-not-found",
             Self::RefusedInvalidRange { .. } => "refused-invalid-range",
             Self::RefusedEmptyData => "refused-empty-data",
+            Self::RefusedInvalidDelimiter { .. } => "refused-invalid-delimiter",
             Self::Blocked { .. } => "blocked",
             Self::RefusedNoLease => LeaseGateRefusal::NoLease.log_status(),
             Self::RefusedLeaseExpired => LeaseGateRefusal::Expired.log_status(),
@@ -439,9 +448,17 @@ async fn paste_inner(
         result,
     };
 
-    if let PasteVerb::PasteData { data, .. } = &opts.verb {
+    if let PasteVerb::PasteData {
+        data, delimiter, ..
+    } = &opts.verb
+    {
         if data.is_empty() {
             return bare(PasteResult::RefusedEmptyData);
+        }
+        if delimiter.is_empty() {
+            return bare(PasteResult::RefusedInvalidDelimiter {
+                detail: "--delimiter must not be empty".to_string(),
+            });
         }
     }
     if let Some(sheet) = unusable_sheet_default(&opts.verb) {
@@ -1116,7 +1133,10 @@ pub fn describe_lines(outcome: &PasteOutcome) -> Vec<String> {
                 "Refused: {book} has no sheet named '{title}' (available: {list})"
             )]
         }
-        PasteResult::RefusedInvalidRange { detail } => vec![format!("Refused: {detail}")],
+        PasteResult::RefusedInvalidRange { detail }
+        | PasteResult::RefusedInvalidDelimiter { detail } => {
+            vec![format!("Refused: {detail}")]
+        }
         PasteResult::RefusedEmptyData => vec![format!(
             "Refused: `drive sheets {}` was given no data to paste (--data/--data-file is empty)",
             verb.label()
@@ -2638,6 +2658,38 @@ mod tests {
         assert_eq!(outcome.result, PasteResult::RefusedEmptyData);
         let lines = describe_lines(&outcome).join("\n");
         assert!(lines.contains("no data to paste"), "{lines}");
+    }
+
+    #[tokio::test]
+    async fn paste_data_with_an_empty_delimiter_is_refused_before_any_network_call() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // No mocks at all: `--delimiter ''` must be refused before the
+        // metadata fetch. The API rejects it live with `HTTP 400: Must
+        // either set html=true or a delimiter` (#1941) — refuse it
+        // locally instead, matching `text-to-columns --custom-delimiter ''`.
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::PasteData {
+                sheet: Some("Q1".to_string()),
+                destination: "A1".to_string(),
+                data: "a\tb".to_string(),
+                delimiter: String::new(),
+                paste_type: PasteType::Values,
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules_allowing_everything()).await;
+        assert_eq!(
+            outcome.result,
+            PasteResult::RefusedInvalidDelimiter {
+                detail: "--delimiter must not be empty".to_string()
+            }
+        );
+        let lines = describe_lines(&outcome).join("\n");
+        assert!(lines.contains("--delimiter must not be empty"), "{lines}");
     }
 
     #[tokio::test]
