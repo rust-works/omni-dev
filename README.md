@@ -547,6 +547,39 @@ omni-dev worktrees list
 
 Runs on the daemon, so it is Unix-only.
 
+### 🤖 Agent Sessions
+
+Track the Claude Code, Codex and pi.dev sessions running across every terminal
+and VS Code window, each with a coarse live state (working, idle, or waiting on
+you). Opt-in hooks, the `claude-wrap`/`codex-wrap` wrappers, a pi.dev extension
+and transcript watchers feed the daemon, which keeps the sessions in memory and
+serves them to the CLI, the tray, `worktrees ui` and the VS Code worktrees view.
+See [docs/sessions-service.md](docs/sessions-service.md).
+
+```bash
+# Install the Claude Code (and, when present, Codex and pi.dev) hooks
+omni-dev sessions install-hooks
+
+# One line per live session
+omni-dev sessions list
+```
+
+Runs on the daemon, so it is Unix-only.
+
+### ⚖️ Jev Judgments
+
+`omni-dev ai jev` is a client for TypeSafe AI's Jev API, which returns typed
+probabilistic judgments rather than generated text. Beyond the raw
+`choice`/`score`/`noul`/`ask` primitives, `route` asks which model tier each
+GitHub issue needs to design, implement and review, and `verify-decision`
+checks each claim in a decision comment against the sources it cites. See
+[docs/jev.md](docs/jev.md).
+
+```bash
+# Which model tier should handle these issues?
+omni-dev ai jev route '#1779' '#1820' -o text
+```
+
 ### 📈 Coverage Diff
 
 Attribute a per-line coverage report to a git diff and report **patch
