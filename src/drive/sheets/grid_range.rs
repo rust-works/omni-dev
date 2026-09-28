@@ -179,22 +179,29 @@ pub(crate) fn reorder_caveat_lines(
 /// before eliding the rest.
 pub(crate) const RENDERED_LOCATION_LIMIT: usize = 50;
 
-/// Joins A1 addresses for a *rendered* line, eliding past `limit`.
+/// Joins `items` for a *rendered* line with `separator`, eliding past
+/// `limit` (`"{items}{separator}… and N more"`).
 ///
 /// `trim-whitespace --whole-sheet` names every non-blank cell in a tab, so
 /// joining its whole list into one line (as every preview did before issue
 /// #1844) produces a multi-kilobyte line. Only the rendered line is
 /// elided: the structured outcome and the `drivemutation` record keep the
 /// full list, so nothing a machine reads is lost.
-pub(crate) fn truncate_locations(locations: &[String], limit: usize) -> String {
-    if locations.len() <= limit {
-        return locations.join(", ");
+pub(crate) fn truncate_joined(items: &[String], limit: usize, separator: &str) -> String {
+    if items.len() <= limit {
+        return items.join(separator);
     }
     format!(
-        "{}, … and {} more",
-        locations[..limit].join(", "),
-        locations.len() - limit
+        "{}{separator}… and {} more",
+        items[..limit].join(separator),
+        items.len() - limit
     )
+}
+
+/// [`truncate_joined`] with `", "` as the separator — every bare-address
+/// preview's shape.
+pub(crate) fn truncate_locations(locations: &[String], limit: usize) -> String {
+    truncate_joined(locations, limit, ", ")
 }
 
 /// [`truncate_locations`] at [`RENDERED_LOCATION_LIMIT`] — the one
@@ -203,8 +210,9 @@ pub(crate) fn truncate_locations(locations: &[String], limit: usize) -> String {
 /// at every other address-only preview (`auto-fill`, `text-to-columns`,
 /// `paste`/`cut-paste`, `delete-named-range`'s referencing-formula list),
 /// so a caller never repeats the limit constant. `format.rs`'s
-/// `MergeCells` discard list deliberately does not use this — see the
-/// comment at that call site.
+/// `MergeCells` discard list calls [`truncate_joined`] directly with its
+/// own separator (`"; "`) and limit (`MERGE_DISCARD_RENDER_LIMIT`, #1999),
+/// since each entry there carries a value, not just an address.
 pub(crate) fn render_locations(locations: &[String]) -> String {
     truncate_locations(locations, RENDERED_LOCATION_LIMIT)
 }
@@ -542,6 +550,12 @@ mod tests {
     fn truncate_locations_elides_past_the_limit_and_counts_the_remainder() {
         let cells: Vec<String> = (1..=5).map(|row| format!("A{row}")).collect();
         assert_eq!(truncate_locations(&cells, 2), "A1, A2, … and 3 more");
+    }
+
+    #[test]
+    fn truncate_joined_uses_the_given_separator_in_the_body_and_the_suffix() {
+        let items: Vec<String> = (1..=5).map(|row| format!("A{row}")).collect();
+        assert_eq!(truncate_joined(&items, 2, "; "), "A1; A2; … and 3 more");
     }
 
     #[test]

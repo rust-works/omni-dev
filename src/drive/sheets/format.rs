@@ -1020,6 +1020,15 @@ fn discarded_from_values(values: &ValueRange, row_offset: i64, col_offset: i64) 
     discarded
 }
 
+/// The number of discarded cells `describe_effect`'s `MergeCells` arm
+/// renders before eliding the rest. Higher than
+/// `grid_range::RENDERED_LOCATION_LIMIT` (200 vs 50): this preview
+/// substitutes for a missing confirmation flag and shows a value per
+/// cell, not just an address (ADR-0078 §4's amendment, #1999). The exact
+/// discarded count and the full list (`-o json` / the `drivemutation`
+/// log's `discarded_cells`) are never elided — only this rendered line.
+const MERGE_DISCARD_RENDER_LIMIT: usize = 200;
+
 fn describe_effect(verb: &FormatVerb, discarded_cells: &[String]) -> Result<String, String> {
     match verb {
         FormatVerb::FormatCells { format, .. } => {
@@ -1059,19 +1068,20 @@ fn describe_effect(verb: &FormatVerb, discarded_cells: &[String]) -> Result<Stri
             if discarded_cells.is_empty() {
                 Ok(format!("merge ({merge_type})"))
             } else {
-                // `discarded_cells` is deliberately not elided — ADR-0078
-                // §4 / #1880. This preview substitutes for a confirmation
-                // flag and names exactly what would be lost; eliding it
-                // would silently weaken that guarantee, which is an ADR
-                // change, not a formatting one. Nothing bounds the merge
-                // range's populated-cell count, so a large, densely
-                // populated range still produces a long line — accepted
-                // for now (see #1880's follow-up) rather than applying
-                // `render_locations`'s elision here.
+                // Past `MERGE_DISCARD_RENDER_LIMIT` the rendered line
+                // elides the rest (ADR-0078 §4's amendment, #1999); the
+                // exact count above and the full list in `-o json` / the
+                // `drivemutation` log's `discarded_cells` are not.
+                let elided = discarded_cells.len() > MERGE_DISCARD_RENDER_LIMIT;
                 Ok(format!(
-                    "merge ({merge_type}), discarding {} cell(s): {}",
+                    "merge ({merge_type}), discarding {} cell(s): {}{}",
                     discarded_cells.len(),
-                    discarded_cells.join("; ")
+                    grid_range::truncate_joined(discarded_cells, MERGE_DISCARD_RENDER_LIMIT, "; "),
+                    if elided {
+                        " (full list in -o json / the drivemutation log's discarded_cells)"
+                    } else {
+                        ""
+                    }
                 ))
             }
         }
@@ -1594,6 +1604,69 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn merge_cells_dry_run_keeps_the_full_discard_list_past_the_render_limit() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // 202 rows, one column: row 1 is the kept top-left, rows 2..=202
+        // are 201 discarded cells — one past `MERGE_DISCARD_RENDER_LIMIT`.
+        let values: Vec<Vec<String>> = (1..=202).map(|row| vec![format!("v{row}")]).collect();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A1:A202",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "values": values })),
+            )
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let opts = FormatOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: FormatVerb::MergeCells {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A202".to_string()),
+                merge_type: "MERGE_ALL".to_string(),
+            },
+            dry_run: true,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let outcome = format(&drive, &sheets, &opts, &rules).await;
+        let summary = match outcome.result {
+            FormatResult::WouldChange {
+                summary,
+                discarded_cells,
+            } => {
+                assert_eq!(discarded_cells.len(), 201);
+                assert_eq!(discarded_cells[0], "A2: v2");
+                assert_eq!(discarded_cells[200], "A202: v202");
+                summary
+            }
+            other => panic!("expected WouldChange, got {other:?}"),
+        };
+        assert!(summary.contains("discarding 201 cell(s)"), "{summary}");
+        assert!(summary.contains("A201: v201"), "{summary}");
+        assert!(!summary.contains("A202: v202"), "{summary}");
+        assert!(
+            summary.ends_with(
+                "… and 1 more (full list in -o json / the drivemutation log's discarded_cells)"
+            ),
+            "{summary}"
+        );
+    }
+
     #[test]
     fn parse_hex_color_accepts_with_and_without_hash() {
         let a = parse_hex_color("#FF8800").unwrap();
@@ -1684,6 +1757,30 @@ mod tests {
         .unwrap();
         let discarded = discarded_from_values(&values, 4, 2);
         assert_eq!(discarded, vec!["D5: d5"]);
+    }
+
+    #[test]
+    fn merge_cells_summary_lists_every_discard_up_to_the_render_limit() {
+        let discarded: Vec<String> = (1..=200).map(|row| format!("A{row}: v{row}")).collect();
+        let summary = describe_effect(&merge_cells_verb("A1:A201"), &discarded).unwrap();
+        assert!(!summary.contains('…'), "{summary}");
+        assert!(summary.contains("discarding 200 cell(s)"), "{summary}");
+        assert!(summary.ends_with(&discarded.join("; ")), "{summary}");
+    }
+
+    #[test]
+    fn merge_cells_summary_elides_past_the_render_limit_but_keeps_the_exact_count() {
+        let discarded: Vec<String> = (1..=201).map(|row| format!("A{row}: v{row}")).collect();
+        let summary = describe_effect(&merge_cells_verb("A1:A202"), &discarded).unwrap();
+        assert!(summary.contains("discarding 201 cell(s)"), "{summary}");
+        assert!(summary.contains("A200: v200"), "{summary}");
+        assert!(!summary.contains("A201: v201"), "{summary}");
+        assert!(
+            summary.ends_with(
+                "… and 1 more (full list in -o json / the drivemutation log's discarded_cells)"
+            ),
+            "{summary}"
+        );
     }
 
     #[tokio::test]

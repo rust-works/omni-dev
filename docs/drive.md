@@ -728,8 +728,9 @@ both if you want both. See [ADR-0077](adrs/adr-0077-sheets-deletion-via-batchupd
 sheet, and reorder/hide** (issue #1643, [ADR-0078](adrs/adr-0078.md)). None
 of that destroys data — `merge-cells` is the one request that discards
 non-top-left values, and its `--dry-run` (and real run) names every cell
-that would be lost before it happens — so it earns the same operation as
-the original four verbs rather than a new one.
+that would be lost before it happens (past 200 the rendered line elides
+the rest; `-o json` keeps them all, issue #1999) — so it earns the same
+operation as the original four verbs rather than a new one.
 
 **`sheets-structure` also covers developer-metadata management, restricted
 to `DOCUMENT` visibility** (issue #1795, [ADR-0081](adrs/adr-0081.md) §4).
@@ -2747,6 +2748,11 @@ omni-dev drive sheets update-dimension-properties <ID> --sheet Q2 \
 ```
 Would merge (MERGE_ALL), discarding 3 cell(s): B1: old note; C1: 12; D1: draft
 ```
+
+Past 200 entries the rendered line elides the remainder (`… and N more
+(full list in -o json / the drivemutation log's discarded_cells)`); the
+exact count in the sentence and the `-o json` outcome's `discarded_cells`
+stay complete either way (issue #1999).
 
 `format-cells` can never write a *value* — it builds a `repeatCell` request
 whose payload has no field to put one in, regardless of what flags are
