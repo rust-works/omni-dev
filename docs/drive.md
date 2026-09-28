@@ -587,13 +587,13 @@ future caller.
 
 ```bash
 $ omni-dev drive move 1AbCdEfGhIjKlMnOpQrStUvWxYz --to 1FolderIdGoesHere
-STATUS           NAME                           DETAIL
-moved            Q3 Report (final)
+STATUS NAME                           DETAIL
+moved  Q3 Report (final)
 
 $ omni-dev drive move 1AbCd... 1Efgh... --to 1FolderId --dry-run
-STATUS           NAME                           DETAIL
-would-move       Q3 Report (final)
-blocked          Confidential Salary Data       visibility increase (--allow-visibility-increase); adds user:external@partner.com
+STATUS     NAME                           DETAIL
+would-move Q3 Report (final)
+blocked    Confidential Salary Data       visibility increase (--allow-visibility-increase); adds user:external@partner.com
 ```
 
 Moving a file can change **who can see it**: Drive resolves a file's

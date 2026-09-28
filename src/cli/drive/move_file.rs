@@ -93,25 +93,43 @@ async fn run_move(
 }
 
 /// Renders the per-file move result table.
+///
+/// The STATUS column is sized to the longest status word actually present
+/// (never narrower than the "STATUS" header itself) rather than a hardcoded
+/// width, so a future status word longer than today's can't reintroduce the
+/// same misalignment `already-in-folder` once did (#1972) — mirroring
+/// `permissions::show::render_rules_table`'s column sizing.
 fn render_move_outcomes(outcomes: &[MoveOutcome]) -> String {
     if outcomes.is_empty() {
         return "No files specified.".to_string();
     }
-    let mut out = format!("{:<16} {:<30} {}", "STATUS", "NAME", "DETAIL");
-    for outcome in outcomes {
+    let rows: Vec<(&'static str, String)> = outcomes.iter().map(move_status_and_detail).collect();
+    let status_width = "STATUS".len().max(
+        rows.iter()
+            .map(|(status, _)| status.len())
+            .max()
+            .unwrap_or(0),
+    );
+
+    let mut out = format!("{:<status_width$} {:<30} {}", "STATUS", "NAME", "DETAIL");
+    for (outcome, (status, detail)) in outcomes.iter().zip(&rows) {
         out.push('\n');
-        out.push_str(&move_outcome_row(outcome));
+        out.push_str(&move_outcome_row(outcome, status, detail, status_width));
     }
     out
 }
 
 /// One file's row: status, name, and a detail column (visibility changes,
 /// blocking reasons, or the error).
-fn move_outcome_row(outcome: &MoveOutcome) -> String {
-    let (status, detail) = move_status_and_detail(outcome);
+fn move_outcome_row(
+    outcome: &MoveOutcome,
+    status: &str,
+    detail: &str,
+    status_width: usize,
+) -> String {
     let name = sanitize_for_terminal(&outcome.name);
-    let detail = sanitize_for_terminal(&detail);
-    format!("{status:<16} {name:<30} {detail}")
+    let detail = sanitize_for_terminal(detail);
+    format!("{status:<status_width$} {name:<30} {detail}")
 }
 
 /// The status word and human detail for one move outcome.
@@ -320,6 +338,27 @@ mod tests {
         let rendered = render_move_outcomes(&[outcome("Report.pdf", MoveResult::Moved)]);
         assert!(rendered.contains("moved"), "{rendered}");
         assert!(rendered.contains("Report.pdf"), "{rendered}");
+    }
+
+    #[test]
+    fn render_move_outcomes_aligns_columns_when_status_is_already_in_folder() {
+        // "already-in-folder" (17 chars) is longer than the old hardcoded
+        // 16-wide STATUS column (#1972) — mix it with a shorter status
+        // ("moved") in the same call and assert every row's NAME column
+        // starts at the same offset as the header's.
+        let rendered = render_move_outcomes(&[
+            outcome("Short.txt", MoveResult::AlreadyInFolder),
+            outcome("Also Short.txt", MoveResult::Moved),
+        ]);
+        let mut lines = rendered.lines();
+        let header = lines.next().unwrap();
+        let name_offset = header.find("NAME").unwrap();
+        for row in lines {
+            assert!(
+                row[name_offset..].starts_with(|c: char| c.is_alphanumeric()),
+                "row misaligned with header at offset {name_offset}: {row:?}\nheader: {header:?}"
+            );
+        }
     }
 
     #[test]
