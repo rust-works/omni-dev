@@ -395,21 +395,60 @@ impl PasteResult {
 }
 
 /// The full outcome of one attempt.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+///
+/// Serialised by hand (below) rather than derived, so the JSON can name
+/// the `paste_type` (and, for `copy-paste`, the `orientation`) the verb
+/// carries without serialising the whole verb — the text output names
+/// both, since they decide what lands and which grants were consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasteOutcome {
     /// The spreadsheet acted on.
     pub spreadsheet_id: String,
     /// Its Drive file name, when the metadata fetch got that far.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
     /// The folder the gate evaluated against.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_folder_id: Option<String>,
-    /// Which mutation was attempted. Not serialised.
-    #[serde(skip)]
+    /// Which mutation was attempted. Only its `paste_type` and
+    /// `orientation` are serialised.
     pub verb: PasteVerb,
     /// What happened.
     pub result: PasteResult,
+}
+
+impl Serialize for PasteOutcome {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            spreadsheet_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            file_name: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            resolved_folder_id: Option<&'a str>,
+            paste_type: PasteType,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            orientation: Option<PasteOrientation>,
+            result: &'a PasteResult,
+        }
+        let (paste_type, orientation) = match &self.verb {
+            PasteVerb::CutPaste { paste_type, .. } | PasteVerb::PasteData { paste_type, .. } => {
+                (*paste_type, None)
+            }
+            PasteVerb::CopyPaste {
+                paste_type,
+                orientation,
+                ..
+            } => (*paste_type, Some(*orientation)),
+        };
+        Wire {
+            spreadsheet_id: &self.spreadsheet_id,
+            file_name: self.file_name.as_deref(),
+            resolved_folder_id: self.resolved_folder_id.as_deref(),
+            paste_type,
+            orientation,
+            result: &self.result,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl JsonlSerialize for PasteOutcome {
@@ -1513,6 +1552,40 @@ mod tests {
         outcome.write_jsonl(&mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("refused-shortcut"), "{text}");
+    }
+
+    /// The JSON names the paste type every verb used and, for
+    /// `copy-paste` alone, its orientation — as the text output does
+    /// (#1941). The verb's source/destination/data are not serialised.
+    #[test]
+    fn json_names_the_paste_type_and_copy_pastes_orientation() {
+        let expected = [
+            ("PASTE_NORMAL", None),
+            ("PASTE_VALUES", Some("TRANSPOSE")),
+            ("PASTE_VALUES", None),
+        ];
+        for (verb, (paste_type, orientation)) in every_paste_verb().into_iter().zip(expected) {
+            let outcome = PasteOutcome {
+                spreadsheet_id: "sheet-1".to_string(),
+                file_name: None,
+                resolved_folder_id: None,
+                verb,
+                result: PasteResult::RefusedShortcut,
+            };
+            let json = serde_json::to_value(&outcome).unwrap();
+            assert_eq!(json["paste_type"], paste_type, "{json}");
+            assert_eq!(
+                json.get("orientation").and_then(|v| v.as_str()),
+                orientation,
+                "{json}"
+            );
+            assert!(json.get("file_name").is_none(), "{json}");
+            assert!(
+                json.get("data").is_none() && json.get("source").is_none(),
+                "{json}"
+            );
+            assert_eq!(json["result"]["status"], "refused-shortcut", "{json}");
+        }
     }
 
     #[test]

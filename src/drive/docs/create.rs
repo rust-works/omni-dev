@@ -105,14 +105,41 @@ impl CreateResult {
 }
 
 /// The full outcome of one attempt.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+///
+/// Serialised by hand (below) so the JSON carries `parent_folder_id`, the
+/// name `drive create` and `sheets create` use for the same field, while
+/// still emitting the `resolved_folder_id` this verb shipped with, so
+/// existing consumers keep working (#1941).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateOutcome {
     /// The requested title.
     pub name: String,
-    /// The folder the gate evaluated against.
-    pub resolved_folder_id: String,
+    /// The folder the document is created in, which the gate evaluated
+    /// against.
+    pub parent_folder_id: String,
     /// What happened.
     pub result: CreateResult,
+}
+
+impl Serialize for CreateOutcome {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            name: &'a str,
+            parent_folder_id: &'a str,
+            /// The original name for `parent_folder_id`, kept for
+            /// compatibility.
+            resolved_folder_id: &'a str,
+            result: &'a CreateResult,
+        }
+        Wire {
+            name: &self.name,
+            parent_folder_id: &self.parent_folder_id,
+            resolved_folder_id: &self.parent_folder_id,
+            result: &self.result,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl JsonlSerialize for CreateOutcome {
@@ -146,7 +173,7 @@ async fn create_inner(
 ) -> CreateOutcome {
     let finish = |result| CreateOutcome {
         name: opts.name.clone(),
-        resolved_folder_id: opts.parent_folder_id.clone(),
+        parent_folder_id: opts.parent_folder_id.clone(),
         result,
     };
 
@@ -315,7 +342,7 @@ fn record_attempt(outcome: &CreateOutcome, duration: Duration) {
         file_id,
         file_name: outcome.name.clone(),
         status: outcome.result.log_status().to_string(),
-        resolved_folder_id: Some(outcome.resolved_folder_id.clone()),
+        resolved_folder_id: Some(outcome.parent_folder_id.clone()),
         decided_by_folder_id: decided_by.folder_id,
         decided_by_depth: decided_by.depth,
         decided_by_file_id: decided_by.file_id,
@@ -330,7 +357,7 @@ fn record_attempt(outcome: &CreateOutcome, duration: Duration) {
 #[must_use]
 pub fn describe(outcome: &CreateOutcome) -> String {
     let name = &outcome.name;
-    let folder = &outcome.resolved_folder_id;
+    let folder = &outcome.parent_folder_id;
     match &outcome.result {
         CreateResult::WouldCreate { chars, bytes } if *chars > 0 => format!(
             "Would create: document '{name}' in {folder}, seeded with {chars} char(s) / \
@@ -456,6 +483,24 @@ mod tests {
         }
     }
 
+    /// The JSON names the folder `parent_folder_id`, as `drive create` and
+    /// `sheets create` do, and keeps the original `resolved_folder_id`.
+    #[test]
+    fn json_carries_parent_folder_id_and_the_legacy_resolved_folder_id() {
+        let outcome = CreateOutcome {
+            name: "Notes".to_string(),
+            parent_folder_id: "folder-1".to_string(),
+            result: CreateResult::Created {
+                file_id: "doc-1".to_string(),
+                seeded_chars: None,
+            },
+        };
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["parent_folder_id"], "folder-1");
+        assert_eq!(json["resolved_folder_id"], "folder-1");
+        assert_eq!(json["name"], "Notes");
+        assert_eq!(json["result"]["file_id"], "doc-1");
+    }
     #[tokio::test]
     async fn create_without_text_makes_one_files_create_and_zero_docs_calls() {
         let server = MockServer::start().await;
