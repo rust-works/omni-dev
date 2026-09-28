@@ -236,7 +236,8 @@ pub struct PasteDataCommand {
     /// text carries no formats, merges or validation for `normal` to add.
     /// `normal` is still selectable — the API does not document a normal
     /// paste of delimited text as doing anything beyond values — and
-    /// resolves both operations.
+    /// resolves both operations. `values` does not keep text literal:
+    /// the API still parses pasted text such as `=1+1` into a formula.
     #[arg(long, value_enum, default_value_t = PasteTypeArg::Values)]
     pub paste_type: PasteTypeArg,
 

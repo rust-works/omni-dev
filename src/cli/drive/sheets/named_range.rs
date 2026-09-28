@@ -146,7 +146,7 @@ impl UpdateNamedRangeCommand {
 /// #1975): the ambiguity refusal lists the candidate ids.
 ///
 /// Every cell formula referencing the removed name starts evaluating to
-/// `#NAME?` (conditional formatting, data validation and chart references
+/// `#REF!` (conditional formatting, data validation and chart references
 /// are not scanned). `--dry-run` (and the real run, before mutating)
 /// reports the count and A1 locations of every such cell formula — read it
 /// before running for real.
