@@ -1573,4 +1573,44 @@ mod tests {
         .await
         .is_ok());
     }
+
+    #[tokio::test]
+    async fn the_read_cell_format_dispatch_arm_reaches_its_leaf_command() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(crate::drive::sheets::client::SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    "sheets": [{
+                        "properties": {"sheetId": 0, "title": "Q1"},
+                        "data": [{
+                            "startRow": 0,
+                            "startColumn": 0,
+                            "rowData": [{"values": [{}]}],
+                        }],
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        assert!(dispatch(
+            SheetsSubcommands::ReadCellFormat(cell_format::ReadCellFormatCommand {
+                spreadsheet_id: "sheet-1".to_string(),
+                sheet: Some("Q1".to_string()),
+                range: "A1".to_string(),
+                output: crate::cli::drive::format::OutputFormat::Table,
+            }),
+            &client,
+        )
+        .await
+        .is_ok());
+    }
 }
