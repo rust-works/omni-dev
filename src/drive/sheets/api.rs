@@ -134,18 +134,24 @@ const CELL_PIVOT_FIELDS: &str = "spreadsheetId,properties.title,\
 /// (see [`SheetsApi::get_cell_formats`]), so this mask alone would still
 /// return every sheet's grid data without it.
 ///
-/// Narrowed to exactly what that question turns on: background color, text
-/// format (bold/italic/strikethrough/underline/color), number format,
-/// horizontal alignment, notes and data validation. Deliberately
-/// **`userEnteredFormat`, not `effectiveFormat`** — see
+/// Covers background color, text format (bold/italic/strikethrough/
+/// underline/color), number format, horizontal alignment, the four cell
+/// borders, notes and data validation. Deliberately **`userEnteredFormat`,
+/// not `effectiveFormat`** — see
 /// [`crate::drive::sheets::types::CellSnapshot::user_entered_format`]'s doc
-/// comment. Borders and merges are documented cuts (they read from
-/// different mask paths — `userEnteredFormat.borders` and `sheets.merges`
-/// respectively — and neither is needed to answer the four things ADR-0083
-/// §5 checks: background, bold, note and validation-presence).
+/// comment.
+///
+/// Borders are included even though ADR-0083 §5's four checked properties
+/// (background, bold, note, validation-presence) don't strictly need them:
+/// a border is still part of `userEnteredFormat`, so a verb that moves only
+/// borders would otherwise show as "no formatting changed" and be wrongly
+/// left ungated. **Merges are a separate cut** — `sheets.merges` is a
+/// different mask path entirely (a per-sheet list, not a per-cell
+/// property), so they need their own field and outcome shape; deferred as
+/// a follow-up (issue #1878's own open question).
 const CELL_FORMAT_FIELDS: &str = "spreadsheetId,properties.title,\
     sheets.properties(sheetId,title,index,hidden,rightToLeft,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)),\
-    sheets.data(startRow,startColumn,rowData.values(userEnteredFormat(backgroundColorStyle,textFormat(bold,italic,strikethrough,underline,foregroundColorStyle),numberFormat,horizontalAlignment),note,dataValidation))";
+    sheets.data(startRow,startColumn,rowData.values(userEnteredFormat(backgroundColorStyle,textFormat(bold,italic,strikethrough,underline,foregroundColorStyle),numberFormat,horizontalAlignment,borders(top,bottom,left,right)),note,dataValidation))";
 
 /// `fields` mask for `spreadsheets.get` when banded ranges are needed too
 /// (issue #1832's `add-banding`/`update-banding`/`delete-banding`/
@@ -1132,6 +1138,7 @@ mod tests {
             .expect("fields mask must always be sent");
         assert!(fields.contains("userEnteredFormat"));
         assert!(fields.contains("backgroundColorStyle"));
+        assert!(fields.contains("borders(top,bottom,left,right)"));
         assert!(fields.contains("note"));
         assert!(fields.contains("dataValidation"));
         // issue #1878: read userEnteredFormat, never effectiveFormat — the
