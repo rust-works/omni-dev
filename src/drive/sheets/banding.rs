@@ -422,6 +422,29 @@ async fn banding_inner(
         }
     };
 
+    // `update-banding --range` with no `--sheet` means the banded range's
+    // own sheet.
+    let composed_range = match (&opts.verb, composed_range) {
+        (
+            BandingVerb::UpdateBanding {
+                banded_range_id,
+                sheet: None,
+                ..
+            },
+            Some(composed),
+        ) => {
+            let current_sheet = find_existing_banded_range(&workbook, *banded_range_id)
+                .ok()
+                .and_then(|banded| banded.range.as_ref())
+                .map(|range| range.sheet_id);
+            Some(grid_range::default_sheet_prefix(
+                &workbook,
+                composed,
+                current_sheet,
+            ))
+        }
+        (_, composed) => composed,
+    };
     let resolved_target =
         match resolve_sheet_target(&workbook, &opts.verb, composed_range.as_deref()) {
             Ok(resolved) => resolved,
@@ -1814,6 +1837,39 @@ mod tests {
             ledger_path,
         };
         (banding(&drive, &sheets, &opts, &rules).await, server)
+    }
+
+    /// `update-banding --range` with no `--sheet` resolves against the
+    /// banded range's own sheet rather than being refused (#1941).
+    #[tokio::test]
+    async fn update_banding_range_without_sheet_defaults_to_the_banded_ranges_sheet() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_row_only_banding(&server, 0).await;
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: BandingVerb::UpdateBanding {
+                banded_range_id: 7,
+                sheet: None,
+                range: Some("A1:D20".to_string()),
+                axis: BandingAxis::Rows,
+                header_color: None,
+                first_band_color: None,
+                second_band_color: None,
+                footer_color: None,
+            },
+            dry_run: true,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = banding(&drive, &sheets, &opts, &[allow_rule("folder-1")]).await;
+        assert!(
+            matches!(outcome.result, BandingResult::WouldChange { .. }),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.sheet_id, Some(0));
     }
 
     fn assert_refused_missing_second_band_color(outcome: &BandingOutcome) {

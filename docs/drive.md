@@ -3131,7 +3131,8 @@ API uses. `update-filter-view`'s `--sort-by`/`--hide-values` **merge** onto
 the view's existing sort order and criteria: a given column's entry is
 replaced (or appended, for a new sort column), but every other column's
 entry survives untouched. So `--sort-by 1:asc` on a view sorted `[2 desc]`
-leaves it sorted `[2 desc, 1 asc]`.
+leaves it sorted `[2 desc, 1 asc]`. A new `--range` with no `--sheet` (and
+no `Sheet!` prefix of its own) stays on the view's current sheet.
 
 `--clear-sort` and `--clear-criteria` reset to empty first, so they **clear**
 on their own and **replace** when combined with `--sort-by`/`--hide-values`:
@@ -3454,7 +3455,8 @@ e.g. `rows=[header=#000000 first=#FFFFFF second=#EEEEEE]`.
 **`update-banding`/`delete-banding` are addressed directly by
 `--banded-range-id`** — the server-assigned id `list-bandings` discovers,
 not resolved by range match. `update-banding` may change the range, the
-colors, or both; passing none of `--sheet`/`--range`/`--header-color`/
+colors, or both — a new `--range` with no `--sheet` stays on the banded
+range's current sheet; passing none of `--sheet`/`--range`/`--header-color`/
 `--first-band-color`/`--second-band-color`/`--footer-color` is refused as
 nothing to change. A changed color merges onto the selected axis's
 *existing* colors — an unset color flag leaves that color untouched — so

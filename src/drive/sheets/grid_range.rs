@@ -293,6 +293,28 @@ pub(crate) fn find_sheet_id<E>(
         .ok_or_else(|| not_found(title.to_string(), workbook.sheet_titles()))
 }
 
+/// Prefixes an update verb's `--range` with the sheet the object being
+/// updated already sits on, when the range names no sheet of its own and
+/// no `--sheet` was given — `update-filter-view`/`update-banding` know that
+/// sheet from the object they fetched, so refusing for the want of a
+/// `--sheet` would only make the caller repeat it (#1941).
+///
+/// Returns `composed` unchanged when it already names a sheet, when there
+/// is no current sheet, or when that sheet's title can't be found.
+pub(crate) fn default_sheet_prefix(
+    workbook: &Spreadsheet,
+    composed: String,
+    current_sheet_id: Option<i64>,
+) -> String {
+    if a1::split_sheet_prefix(&composed).is_some() || a1::is_whole_sheet_reference(&composed) {
+        return composed;
+    }
+    current_sheet_id
+        .and_then(|id| sheet_title_by_id(workbook, id))
+        .and_then(|title| a1::compose(Some(&title), Some(&composed)).ok())
+        .unwrap_or(composed)
+}
+
 /// The one rendering of a [`find_sheet_id`] miss, shared by every verb so
 /// the refusal reads the same everywhere: `book` is the caller's display
 /// name for the spreadsheet (already quoted), and each available title is
@@ -1027,6 +1049,34 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn default_sheet_prefix_supplies_the_current_sheet_only_when_none_is_named() {
+        let workbook = workbook_with_sheet(5, "Q 2");
+        assert_eq!(
+            default_sheet_prefix(&workbook, "A1:B2".to_string(), Some(5)),
+            "'Q 2'!A1:B2"
+        );
+        // A range naming its own sheet, or a whole-sheet reference, is kept.
+        assert_eq!(
+            default_sheet_prefix(&workbook, "Q1!A1:B2".to_string(), Some(5)),
+            "Q1!A1:B2"
+        );
+        assert_eq!(
+            default_sheet_prefix(&workbook, "'Q1'".to_string(), Some(5)),
+            "'Q1'"
+        );
+        // No current sheet, or one the workbook doesn't have: unchanged, so
+        // the usual "does not name a sheet" refusal still explains it.
+        assert_eq!(
+            default_sheet_prefix(&workbook, "A1:B2".to_string(), None),
+            "A1:B2"
+        );
+        assert_eq!(
+            default_sheet_prefix(&workbook, "A1:B2".to_string(), Some(9)),
+            "A1:B2"
+        );
     }
 
     #[test]
