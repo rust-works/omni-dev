@@ -41,6 +41,9 @@ impl From<InputArg> for ValueInputOption {
 }
 
 /// Overwrites the cells of a range.
+///
+/// Drops a cell's rich-text runs even when the value is unchanged; see
+/// `docs/drive.md`.
 #[derive(Parser)]
 pub struct WriteCommand {
     /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).
@@ -84,6 +87,9 @@ pub struct WriteCommand {
 }
 
 /// Appends rows after the last row of a range's table.
+///
+/// Presumably drops rich-text runs on an existing cell like `sheets write`
+/// does, though this hasn't been measured; see `docs/drive.md`.
 #[derive(Parser)]
 pub struct AppendCommand {
     /// Spreadsheet id (the `/d/<ID>/` segment of a Sheets URL).

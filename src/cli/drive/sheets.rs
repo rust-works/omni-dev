@@ -66,10 +66,14 @@ pub enum SheetsSubcommands {
     ReadCellFormat(cell_format::ReadCellFormatCommand),
     /// Overwrites the cells of a range, gated by the
     /// write-permission rules (issues #1589, #1612). Requires the `drive.file` or
-    /// `drive` scope (`drive auth login --write-file`/`--write-full`).
+    /// `drive` scope (`drive auth login --write-file`/`--write-full`). Drops a
+    /// cell's rich-text runs even when the value is unchanged; see
+    /// `docs/drive.md`.
     Write(write::WriteCommand),
     /// Appends rows after the last row of a range's table, gated by the
-    /// write-permission rules (issues #1589, #1612).
+    /// write-permission rules (issues #1589, #1612). Presumably drops
+    /// rich-text runs on an existing cell like `sheets write` does, though
+    /// this hasn't been measured; see `docs/drive.md`.
     Append(write::AppendCommand),
     /// Clears a range's values, leaving formatting intact. Gated by the
     /// write-permission rules (issues #1589, #1612).

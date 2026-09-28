@@ -1846,6 +1846,21 @@ it deliberately.
   `--write-file` (`drive.file`) only reaches files `omni-dev` itself
   created.
 
+**Writing a cell drops its rich-text runs, even for identical text.**
+`sheets write` sends `values.update`, and the API replaces
+`userEnteredValue` as a plain value without carrying over `textFormatRuns`
+(mixed bold/italic/link formatting within a cell's text) — measured for
+both `--input user-entered` and `--input raw`, and even when the new value
+is byte-identical to the old one. Cell-level `userEnteredFormat`
+(background, number format, borders, notes, data-validation rules) is
+untouched. Rich-text runs are part of a cell's *value*, not its *format*
+([ADR-0083](adrs/adr-0083.md) §5) — that's what keeps this consistent with
+`sheets-write`'s "never changes a cell's format" guarantee even though a
+round-trip through `sheets read` → edit → `sheets write` silently loses
+mixed formatting. `sheets append` sends the same request shape and
+presumably behaves the same on an existing cell, but that hasn't been
+measured. See [#1877](https://github.com/rust-works/omni-dev/issues/1877).
+
 Exit code is 0 whether the write succeeded, was blocked, or failed — inspect
 the output, not `$?`.
 
