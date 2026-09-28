@@ -108,7 +108,7 @@ pub struct WriteOptions {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum WriteResult {
-    /// `--dry-run`, and the gate would allow it.
+    /// `--dry-run` of a `write`/`append`, and the gate would allow it.
     WouldWrite {
         /// Rows of input parsed, so a transposed or ragged input is visible
         /// before it lands.
@@ -116,6 +116,10 @@ pub enum WriteResult {
         /// Widest row, likewise.
         columns: usize,
     },
+    /// `--dry-run` of a `clear`, and the gate would allow it. Its own
+    /// variant rather than a `WouldWrite` of `0 x 0`: a clear takes no
+    /// values, so those dimensions would always be zero (#1941).
+    WouldClear,
     /// The target is not a Google Sheet. Checked client-side before the
     /// gate: writing cells into a PDF isn't disallowed, it's meaningless.
     RefusedNotASpreadsheet {
@@ -169,17 +173,14 @@ pub enum WriteResult {
     /// The file has moved since the lease's recorded `version` — the
     /// staleness check (ADR-0080 §6).
     RefusedLeaseStale,
-    /// The mutation succeeded.
+    /// A `write` succeeded.
     ///
-    /// Every count is optional because the API may omit it — which is why
-    /// [`describe`] reads the *verb* to decide what happened rather than
-    /// inferring "a clear" from an absent cell count.
+    /// Every count is optional because the API may omit it.
     Written {
-        /// The server-normalised range actually written or cleared.
+        /// The server-normalised range actually written.
         #[serde(skip_serializing_if = "Option::is_none")]
         updated_range: Option<String>,
-        /// Rows the API reported changing. `None` for a clear, which
-        /// reports no counts at all.
+        /// Rows the API reported changing.
         #[serde(skip_serializing_if = "Option::is_none")]
         updated_rows: Option<i64>,
         /// Columns the API reported changing.
@@ -188,6 +189,30 @@ pub enum WriteResult {
         /// Cells the API reported changing.
         #[serde(skip_serializing_if = "Option::is_none")]
         updated_cells: Option<i64>,
+    },
+    /// An `append` succeeded. The same counts as [`Self::Written`], under
+    /// its own status so a script can tell an append from an overwrite
+    /// (#1941).
+    Appended {
+        /// The server-normalised range the rows landed in.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        updated_range: Option<String>,
+        /// Rows the API reported appending.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        updated_rows: Option<i64>,
+        /// Columns the API reported appending.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        updated_columns: Option<i64>,
+        /// Cells the API reported appending.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        updated_cells: Option<i64>,
+    },
+    /// A `clear` succeeded. The API reports no counts for a clear, only
+    /// the range.
+    Cleared {
+        /// The server-normalised range actually cleared.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        updated_range: Option<String>,
     },
     /// An API or validation error.
     Failed {
@@ -223,6 +248,7 @@ impl WriteResult {
     fn log_status(&self) -> &'static str {
         match self {
             Self::WouldWrite { .. } => "would-write",
+            Self::WouldClear => "would-clear",
             Self::RefusedNotASpreadsheet { .. } => "refused-not-a-spreadsheet",
             Self::RefusedShortcut => "refused-shortcut",
             Self::RefusedNoVisibleParents => "refused-no-visible-parents",
@@ -234,6 +260,8 @@ impl WriteResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Written { .. } => "written",
+            Self::Appended { .. } => "appended",
+            Self::Cleared { .. } => "cleared",
             Self::Failed { .. } => "failed",
         }
     }
@@ -423,9 +451,12 @@ async fn write_inner(
     }
 
     if opts.dry_run {
-        return gated(WriteResult::WouldWrite {
-            rows: opts.values.len(),
-            columns: opts.values.iter().map(Vec::len).max().unwrap_or(0),
+        return gated(match opts.verb {
+            WriteVerb::Clear => WriteResult::WouldClear,
+            WriteVerb::Write | WriteVerb::Append => WriteResult::WouldWrite {
+                rows: opts.values.len(),
+                columns: opts.values.iter().map(Vec::len).max().unwrap_or(0),
+            },
         });
     }
 
@@ -474,15 +505,12 @@ async fn write_inner(
         WriteVerb::Append => api
             .values_append(&opts.spreadsheet_id, &range, &opts.values, opts.input)
             .await
-            .map(|response| into_written(response.updates.unwrap_or_default())),
+            .map(|response| into_appended(response.updates.unwrap_or_default())),
         WriteVerb::Clear => api
             .values_clear(&opts.spreadsheet_id, &range)
             .await
-            .map(|response| WriteResult::Written {
+            .map(|response| WriteResult::Cleared {
                 updated_range: response.cleared_range,
-                updated_rows: None,
-                updated_columns: None,
-                updated_cells: None,
             }),
     };
 
@@ -515,6 +543,16 @@ fn into_written(response: UpdateValuesResponse) -> WriteResult {
     }
 }
 
+/// [`into_written`] for an `append`, with the same counts.
+fn into_appended(response: UpdateValuesResponse) -> WriteResult {
+    WriteResult::Appended {
+        updated_range: response.updated_range,
+        updated_rows: response.updated_rows,
+        updated_columns: response.updated_columns,
+        updated_cells: response.updated_cells,
+    }
+}
+
 /// Emits the `kind: "drivemutation"` record.
 ///
 /// Inside the engine, never the CLI layer, so a future MCP caller cannot
@@ -536,12 +574,19 @@ fn record_attempt(outcome: &WriteOutcome, opts: &WriteOptions, duration: Duratio
             updated_rows,
             updated_columns,
             updated_cells,
+        }
+        | WriteResult::Appended {
+            updated_range,
+            updated_rows,
+            updated_columns,
+            updated_cells,
         } => (
             updated_range.clone(),
             *updated_rows,
             *updated_columns,
             *updated_cells,
         ),
+        WriteResult::Cleared { updated_range } => (updated_range.clone(), None, None, None),
         _ => (None, None, None, None),
     };
 
@@ -578,11 +623,7 @@ pub fn describe(outcome: &WriteOutcome) -> String {
         .unwrap_or(&outcome.spreadsheet_id);
     let range = outcome.range.as_deref().unwrap_or("(unresolved range)");
     match &outcome.result {
-        // A clear carries no values, so its dimensions are always 0 x 0 —
-        // printing them would be noise, not reassurance.
-        WriteResult::WouldWrite { .. } if verb == WriteVerb::Clear => {
-            format!("Would clear: {range} of '{name}'")
-        }
+        WriteResult::WouldClear => format!("Would clear: {range} of '{name}'"),
         WriteResult::WouldWrite { rows, columns } => format!(
             "Would {}: {rows} row(s) x {columns} column(s) into {range} of '{name}'",
             verb.label()
@@ -634,28 +675,35 @@ pub fn describe(outcome: &WriteOutcome) -> String {
         WriteResult::RefusedLeaseStale => LeaseGateRefusal::Stale
             .describe_line(&outcome.spreadsheet_id, &format!("'{name}'"))
             .unwrap_or_default(),
+        // Each success is its own variant, never inferred from an absent
+        // cell count: the API is allowed to omit the counts (see
+        // `UpdateValuesResponse`), and reading "a clear" into that would
+        // report a destructive outcome for a write that was nothing of the
+        // sort.
+        WriteResult::Cleared { updated_range } => format!(
+            "Cleared {} of '{name}'",
+            updated_range.as_deref().unwrap_or(range)
+        ),
+        WriteResult::Appended {
+            updated_range,
+            updated_cells,
+            ..
+        } => {
+            let where_ = updated_range.as_deref().unwrap_or(range);
+            match updated_cells {
+                Some(cells) => format!("Appended {cells} cell(s) to {where_} of '{name}'"),
+                None => format!("Appended to {where_} of '{name}'"),
+            }
+        }
         WriteResult::Written {
             updated_range,
             updated_cells,
             ..
         } => {
             let where_ = updated_range.as_deref().unwrap_or(range);
-            // Keyed on the verb, never on an absent cell count: the API is
-            // allowed to omit the counts (see `UpdateValuesResponse`), and
-            // inferring "a clear" from that would report a destructive
-            // outcome for a write that was nothing of the sort. `Append` gets
-            // its own wording too, so a successful append doesn't read
-            // identically to a destructive overwrite.
-            match (verb, updated_cells) {
-                (WriteVerb::Clear, _) => format!("Cleared {where_} of '{name}'"),
-                (WriteVerb::Append, Some(cells)) => {
-                    format!("Appended {cells} cell(s) to {where_} of '{name}'")
-                }
-                (WriteVerb::Append, None) => format!("Appended to {where_} of '{name}'"),
-                (WriteVerb::Write, Some(cells)) => {
-                    format!("Wrote {cells} cell(s) to {where_} of '{name}'")
-                }
-                (WriteVerb::Write, None) => format!("Wrote to {where_} of '{name}'"),
+            match updated_cells {
+                Some(cells) => format!("Wrote {cells} cell(s) to {where_} of '{name}'"),
+                None => format!("Wrote to {where_} of '{name}'"),
             }
         }
         WriteResult::Failed { detail } => {
@@ -723,6 +771,7 @@ mod tests {
                 rows: 2,
                 columns: 3,
             },
+            WriteResult::WouldClear,
             WriteResult::RefusedNotASpreadsheet {
                 mime_type: "application/pdf".to_string(),
             },
@@ -761,6 +810,15 @@ mod tests {
                 updated_columns: None,
                 updated_cells: None,
             },
+            WriteResult::Appended {
+                updated_range: Some("Sheet1!A3:B3".to_string()),
+                updated_rows: Some(1),
+                updated_columns: Some(2),
+                updated_cells: Some(2),
+            },
+            WriteResult::Cleared {
+                updated_range: Some("Sheet1!A1:B2".to_string()),
+            },
             WriteResult::Failed {
                 detail: "the API said no".to_string(),
             },
@@ -768,6 +826,7 @@ mod tests {
         for result in &all {
             match result {
                 WriteResult::WouldWrite { .. }
+                | WriteResult::WouldClear
                 | WriteResult::RefusedNotASpreadsheet { .. }
                 | WriteResult::RefusedShortcut
                 | WriteResult::RefusedNoVisibleParents
@@ -779,6 +838,8 @@ mod tests {
                 | WriteResult::RefusedLeaseWrongFile
                 | WriteResult::RefusedLeaseStale
                 | WriteResult::Written { .. }
+                | WriteResult::Appended { .. }
+                | WriteResult::Cleared { .. }
                 | WriteResult::Failed { .. } => (),
             }
         }
@@ -1186,13 +1247,7 @@ mod tests {
         let mut o = opts(WriteVerb::Clear, true);
         o.values = vec![];
         let outcome = write(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
-        assert_eq!(
-            outcome.result,
-            WriteResult::WouldWrite {
-                rows: 0,
-                columns: 0
-            }
-        );
+        assert_eq!(outcome.result, WriteResult::WouldClear);
     }
 
     #[tokio::test]
@@ -1568,7 +1623,7 @@ mod tests {
         .await;
         assert_eq!(
             outcome.result,
-            WriteResult::Written {
+            WriteResult::Appended {
                 updated_range: Some("'Q1'!A4:B4".to_string()),
                 updated_rows: None,
                 updated_columns: None,
@@ -1608,11 +1663,8 @@ mod tests {
         .await;
         assert_eq!(
             outcome.result,
-            WriteResult::Written {
+            WriteResult::Cleared {
                 updated_range: Some("'Q1'!A1:B2".to_string()),
-                updated_rows: None,
-                updated_columns: None,
-                updated_cells: None,
             }
         );
         assert!(describe(&outcome).starts_with("Cleared "));
@@ -1718,6 +1770,33 @@ mod tests {
         assert_eq!(WriteVerb::Clear.label(), "clear");
     }
 
+    /// The JSON `status` names what happened, per verb (#1941): a clear's
+    /// dry run carries no always-zero `rows`/`columns`, and a real append or
+    /// clear is not reported as `written`.
+    #[test]
+    fn json_statuses_name_the_verb() {
+        let json = |result: WriteResult| serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            json(WriteResult::WouldClear),
+            serde_json::json!({"status": "would-clear"})
+        );
+        assert_eq!(
+            json(WriteResult::Cleared {
+                updated_range: Some("Q1!A1:B2".to_string())
+            }),
+            serde_json::json!({"status": "cleared", "updated_range": "Q1!A1:B2"})
+        );
+        assert_eq!(
+            json(WriteResult::Appended {
+                updated_range: None,
+                updated_rows: Some(1),
+                updated_columns: Some(2),
+                updated_cells: Some(2),
+            })["status"],
+            "appended"
+        );
+    }
+
     #[test]
     fn log_status_covers_every_variant() {
         assert_eq!(
@@ -1756,6 +1835,24 @@ mod tests {
             }
             .log_status(),
             "written"
+        );
+        assert_eq!(WriteResult::WouldClear.log_status(), "would-clear");
+        assert_eq!(
+            WriteResult::Appended {
+                updated_range: None,
+                updated_rows: None,
+                updated_columns: None,
+                updated_cells: None,
+            }
+            .log_status(),
+            "appended"
+        );
+        assert_eq!(
+            WriteResult::Cleared {
+                updated_range: None
+            }
+            .log_status(),
+            "cleared"
         );
         assert_eq!(
             WriteResult::Failed {
