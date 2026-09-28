@@ -296,7 +296,7 @@ pub(crate) fn render_line(entry: &CellFormatEntry) -> String {
                         number.format_type, number.pattern
                     ));
                 }
-            }
+            } // omni-dev: coverage ignore-line reason="this closing brace reports 0 hits under llvm-cov regardless of test count — verified locally: render_line_covers_background_bold_number_note_and_validation and render_line_covers_italic_strikethrough_underline_foreground_alignment_and_bare_validation both complete the block above (the pattern and no-pattern pushes both measure as hit), yet this specific brace, closing the format_type.is_empty() check, never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
         }
         if let Some(align) = &format.horizontal_alignment {
             attrs.push(format!("align={align}"));
@@ -336,6 +336,25 @@ mod tests {
         TextFormatSnapshot,
     };
 
+    // ── JsonlSerialize ─────────────────────────────────────────────────
+
+    #[test]
+    fn write_jsonl_emits_the_outcome_as_one_line() {
+        let outcome = CellFormatOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheets: vec![SheetCellFormats {
+                title: Some("Q1".to_string()),
+                range: "A1:B2".to_string(),
+                cells: Vec::new(),
+            }],
+        };
+        let mut buf = Vec::new();
+        outcome.write_jsonl(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("sheet-1"), "{text}");
+    }
+
     // ── check_cell_budget ──────────────────────────────────────────────
 
     #[test]
@@ -363,6 +382,15 @@ mod tests {
         // A defined name, or anything else `parse_grid_range` refuses —
         // the server is authoritative, per `a1.rs`'s stance.
         assert!(check_cell_budget("MyNamedRange").is_ok());
+    }
+
+    #[test]
+    fn check_cell_budget_lets_a_range_parse_never_finishes_through() {
+        // "@@" fails `parse_grid_range` outright (not even a bare column
+        // reference, unlike an all-letters defined name) — the actual
+        // `Err` arm of the `let-else`, distinct from the case above where
+        // parsing succeeds but the resulting column range is unbounded.
+        assert!(check_cell_budget("@@").is_ok());
     }
 
     // ── entries_from_grid ──────────────────────────────────────────────
@@ -501,6 +529,15 @@ mod tests {
         assert_eq!(render_color_style(&style), "theme:TEXT");
     }
 
+    #[test]
+    fn render_color_style_renders_a_question_mark_when_neither_channel_is_set() {
+        let style = ColorStyleSnapshot {
+            rgb_color: None,
+            theme_color: None,
+        };
+        assert_eq!(render_color_style(&style), "?");
+    }
+
     // ── render_line ────────────────────────────────────────────────────
 
     #[test]
@@ -561,6 +598,53 @@ mod tests {
             data_validation: None,
         };
         assert_eq!(render_line(&entry), "A1");
+    }
+
+    #[test]
+    fn render_line_covers_italic_strikethrough_underline_foreground_alignment_and_bare_validation()
+    {
+        let entry = CellFormatEntry {
+            cell: "C4".to_string(),
+            format: Some(CellFormatSnapshot {
+                background_color_style: None,
+                text_format: Some(TextFormatSnapshot {
+                    bold: None,
+                    italic: Some(true),
+                    strikethrough: Some(true),
+                    underline: Some(true),
+                    foreground_color_style: Some(ColorStyleSnapshot {
+                        rgb_color: None,
+                        theme_color: Some("TEXT".to_string()),
+                    }),
+                }),
+                number_format: Some(NumberFormat {
+                    format_type: "PERCENT".to_string(),
+                    pattern: String::new(),
+                }),
+                horizontal_alignment: Some("CENTER".to_string()),
+                borders: None,
+            }),
+            note: None,
+            data_validation: Some(DataValidationRule {
+                condition: BooleanCondition {
+                    condition_type: String::new(),
+                    values: vec![],
+                },
+                ..Default::default()
+            }),
+        };
+        let line = render_line(&entry);
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        assert!(tokens.contains(&"italic"), "{line}");
+        assert!(tokens.contains(&"strikethrough"), "{line}");
+        assert!(tokens.contains(&"underline"), "{line}");
+        assert!(tokens.contains(&"fg=theme:TEXT"), "{line}");
+        // No pattern set: the bare `number=<type>` form, never `type:pattern`.
+        assert!(tokens.contains(&"number=PERCENT"), "{line}");
+        assert!(tokens.contains(&"align=CENTER"), "{line}");
+        // An empty condition type: the bare `validation` form, never
+        // `validation=<type>`.
+        assert!(tokens.contains(&"validation"), "{line}");
     }
 
     #[test]

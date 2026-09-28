@@ -173,6 +173,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_cell_formats_falls_back_to_the_requested_sheet_name_when_no_sheet_carries_data() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        std::env::set_var(SHEETS_API_URL, server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "Budget"},
+                    // No `data` on the sheet at all — `workbook.sheets`
+                    // has an entry, but none carries any grid data.
+                    "sheets": [{"properties": {"sheetId": 0, "title": "Q1"}}],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let opts = ReadCellFormatOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            sheet: Some("Q1".to_string()),
+            range: "A1:B2".to_string(),
+        };
+        let sheets = SheetsClient::from_drive_client(&client).unwrap();
+        let outcome = read_cell_formats(&SheetsApi::new(&sheets), &opts)
+            .await
+            .unwrap();
+        assert_eq!(outcome.sheets.len(), 1);
+        assert_eq!(outcome.sheets[0].title.as_deref(), Some("Q1"));
+        assert!(outcome.sheets[0].cells.is_empty());
+    }
+
+    #[tokio::test]
     async fn read_cell_format_yaml_output_short_circuits_before_printing_lines() {
         let guard = crate::drive::test_support::EnvGuard::take();
         let _dir = guard.clear_credentials();
