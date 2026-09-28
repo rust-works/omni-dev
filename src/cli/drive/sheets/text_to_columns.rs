@@ -424,6 +424,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_fixed_delimiter_with_stray_custom_text_is_refused() {
+        // Unguarded, this `set_var` raced every other `SHEETS_API_URL`
+        // test and redirected their requests to this server (#2035).
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
         let server = wiremock::MockServer::start().await;
         let client = client(&server).await;
         std::env::set_var(SHEETS_API_URL, server.uri());
