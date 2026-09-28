@@ -2150,7 +2150,7 @@ rather than claiming no row spills:
 ```
 $ omni-dev drive sheets text-to-columns <ID> --sheet Q1 --source A2:A4 \
     --delimiter auto --dry-run
-Would split 'Q1'!A2:A4 on auto-detected; no separator this preview tries appears in the source, so the spill span is unknown in 'Budget'
+Would split 'Q1'!A2:A4 on an auto-detected separator (none detected in the preview, so the spill span is unknown) in 'Budget'
   --delimiter auto lets Sheets detect the separator itself, and it detects separators this preview does not try (a tab-separated column splits under auto, though none of comma, semicolon, period or space appears in it) — so for auto the width above and the cells listed are a guess in both directions, not a bound
   the number of columns the split needs, and the values it writes, are computed by Sheets' own splitting and are never reported, before or after the request; the count above is a local upper-bound estimate only
 ```
@@ -3762,7 +3762,7 @@ Tabs: 2
 Named ranges: 1
   intro (1 range(s))
 
-Tab: t.0 "Overview" — 12045 chars, 143 paragraphs, 2 tables, 1 section breaks
+Tab: t.0 "Overview" — 12045 chars, 143 paragraphs, 2 tables, 1 section break
   HEADING_1  [1..18)  Overview
   HEADING_2  [220..241)  Goals
 

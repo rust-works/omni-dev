@@ -963,7 +963,11 @@ pub fn describe_lines(outcome: &BandingOutcome) -> Vec<String> {
             summary,
             banded_range_id,
         } => {
-            let id = banded_range_id.map_or_else(String::new, |id| format!(" (id {id})"));
+            // The update/delete summaries already name the id they were
+            // given; only an add learns its id from the response.
+            let id = banded_range_id
+                .filter(|_| matches!(outcome.verb, BandingVerb::AddBanding { .. }))
+                .map_or_else(String::new, |id| format!(" (id {id})"));
             vec![format!("Applied: {summary}{id} in {book}")]
         }
         BandingResult::Failed { detail } => vec![format!("Failed: {detail}")],
@@ -2909,6 +2913,26 @@ mod tests {
         );
         let text = describe(&without_id);
         assert!(!text.contains("(id"), "{text}");
+    }
+
+    /// An update or delete already names its id in the summary, so a real
+    /// run carrying the same id back must not repeat it in parentheses.
+    #[test]
+    fn describe_lines_names_an_update_or_delete_id_once() {
+        for (verb, summary) in [
+            (update_verb(), "update row banding id 7"),
+            (delete_verb(), "delete banding id 7"),
+        ] {
+            let out = outcome_with(
+                verb,
+                Some("Budget"),
+                BandingResult::Changed {
+                    summary: summary.to_string(),
+                    banded_range_id: Some(7),
+                },
+            );
+            assert_eq!(describe(&out), format!("Applied: {summary} in 'Budget'"));
+        }
     }
 
     #[test]

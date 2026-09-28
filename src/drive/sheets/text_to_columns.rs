@@ -172,7 +172,7 @@ impl Delimiter {
             Self::Semicolon => "semicolon".to_string(),
             Self::Period => "period".to_string(),
             Self::Space => "space".to_string(),
-            Self::Auto => "auto-detected".to_string(),
+            Self::Auto => "an auto-detected separator".to_string(),
             Self::Custom(text) => format!("custom ({text:?})"),
         }
     }
@@ -843,8 +843,8 @@ fn describe_effect(
         // single-column. Claiming "no row spills" there would be the
         // same false all-clear `overwritten_line` suppresses.
         None if matches!(delimiter, Delimiter::Auto) => format!(
-            "split {source_a1} on {}; no separator this preview tries appears in the source, \
-             so the spill span is unknown",
+            "split {source_a1} on {} (none detected in the preview, so the spill span is \
+             unknown)",
             delimiter.describe(),
         ),
         None => format!(
@@ -1146,7 +1146,7 @@ mod tests {
                 Delimiter::Auto,
                 DelimiterType::Autodetect,
                 vec![",", ";", ".", " "],
-                "auto-detected",
+                "an auto-detected separator",
             ),
             (
                 Delimiter::Custom("||".to_string()),
@@ -1360,8 +1360,8 @@ mod tests {
         let summary = describe_effect("'Q1'!A2:A10", None, 1, &Delimiter::Auto);
         assert_eq!(
             summary,
-            "split 'Q1'!A2:A10 on auto-detected; no separator this preview tries appears in the \
-             source, so the spill span is unknown"
+            "split 'Q1'!A2:A10 on an auto-detected separator (none detected in the preview, so \
+             the spill span is unknown)"
         );
     }
 
