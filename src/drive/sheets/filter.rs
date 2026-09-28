@@ -533,6 +533,32 @@ async fn filter_inner(
         | FilterVerb::AddFilterView { .. } => None,
     };
 
+    // A sort column past the target range's width is silently accepted
+    // client-side, but the API 500s live rather than rejecting cleanly
+    // (`set-basic-filter --sort-by 9:asc` on a 5-column range) — validate
+    // it locally, matching `add-pivot-table`'s column-offset check.
+    // `update-filter-view` with no new range falls back to the existing
+    // view's range, since that is what the sort would apply to. A range
+    // whose column bounds are unknown (an open-ended row span) is left
+    // unchecked, as elsewhere.
+    let effective_grid = resolved_target.or_else(|| existing.and_then(|view| view.range));
+    if let Some(grid) = effective_grid {
+        if let (Some(start), Some(end)) = (grid.start_column_index, grid.end_column_index) {
+            if let Some(spec) = sort_specs
+                .iter()
+                .find(|spec| spec.dimension_index < start || spec.dimension_index >= end)
+            {
+                return gated(FilterResult::RefusedInvalidRange {
+                    detail: format!(
+                        "sort column {} is outside the selected range's columns {start}..{end} \
+                         (zero-based, end exclusive)",
+                        spec.dimension_index
+                    ),
+                });
+            }
+        }
+    }
+
     // `update-filter-view`'s write is decided here, before the dry-run
     // return, because it can refuse (a re-creation with no range to
     // re-create over) and because a re-creation is worth saying in the
@@ -788,10 +814,17 @@ fn parse_hidden_values(flags: &[String]) -> Result<BTreeMap<String, FilterCriter
             return Err(format!("'{flag}' names no values to hide"));
         }
         let hidden_values: Vec<String> = values.split(',').map(str::to_string).collect();
-        criteria.insert(
-            dimension_index.to_string(),
-            FilterCriteria::hiding(hidden_values),
-        );
+        let key = dimension_index.to_string();
+        // A `BTreeMap::insert` on a repeated column would silently drop the
+        // earlier `--hide-values` and keep only the last one, with the
+        // dry-run preview (which walks the raw flags, not this map) echoing
+        // both as if they combined (#1941).
+        if criteria.contains_key(&key) {
+            return Err(format!(
+                "--hide-values for column {dimension_index} is given more than once"
+            ));
+        }
+        criteria.insert(key, FilterCriteria::hiding(hidden_values));
     }
     Ok(criteria)
 }
@@ -1421,6 +1454,16 @@ mod tests {
     fn parse_hidden_values_rejects_empty_value_list() {
         let err = parse_hidden_values(&["1:".to_string()]).unwrap_err();
         assert!(err.contains("names no values"), "{err}");
+    }
+
+    #[test]
+    fn parse_hidden_values_rejects_a_repeated_column() {
+        // `--hide-values 1:Cherry --hide-values 1:Apple` silently kept only
+        // the last one via `BTreeMap::insert`, while the dry-run preview
+        // (which walks the raw flags) echoed both (#1941).
+        let err =
+            parse_hidden_values(&["1:Cherry".to_string(), "1:Apple".to_string()]).unwrap_err();
+        assert!(err.contains("column 1 is given more than once"), "{err}");
     }
 
     // ── log_operation / label ────────────────────────────────────────────
@@ -2572,6 +2615,47 @@ mod tests {
         // thing that can tell an audit record which sheet was affected —
         // see `record_attempt`/`docs/log.md`.
         assert_eq!(outcome.sheet_id, Some(0));
+    }
+
+    #[tokio::test]
+    async fn set_basic_filter_refuses_a_sort_column_outside_the_range() {
+        // `--sort-by 9:asc` on a 5-column `A1:E10` range passed dry-run and
+        // then 500'd live (`HTTP 500: Internal error encountered`) — refuse
+        // it locally, matching `add-pivot-table`'s column-offset check
+        // (#1941).
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        // `--sort-by` needs the union grant (issue #1940).
+        let rules = vec![allow_rule_for("folder-1", GATE_WRITE_AND_STRUCTURE)];
+        let opts = unleased_opts(FilterVerb::SetBasicFilter {
+            sheet: "Q1".to_string(),
+            range: "A1:E10".to_string(),
+            sort_by: vec!["9:asc".to_string()],
+            hide_values: Vec::new(),
+        });
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        match outcome.result {
+            FilterResult::RefusedInvalidRange { detail } => {
+                assert!(
+                    detail.contains("sort column 9 is outside the selected range's columns 0..5"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected RefusedInvalidRange, got {other:?}"),
+        }
     }
 
     #[tokio::test]
