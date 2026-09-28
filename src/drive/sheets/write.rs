@@ -1139,6 +1139,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sheet_title_check_metadata_fetch_failure_produces_failed() {
+        // The `--sheet`-existence check (#1941) does its own
+        // `get_spreadsheet` call; a failure there must surface as `Failed`,
+        // not panic or read as success.
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v4/spreadsheets/sheet-1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let mut o = opts(WriteVerb::Write, false);
+        o.sheet = Some("Sheet1".to_string());
+        let outcome = write(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
+        assert!(matches!(outcome.result, WriteResult::Failed { .. }));
+    }
+
+    #[tokio::test]
     async fn write_and_append_refuse_empty_values_before_any_request() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
@@ -1742,6 +1764,10 @@ mod tests {
             }
             .log_status(),
             "failed"
+        );
+        assert_eq!(
+            WriteResult::RefusedEmptyValues.log_status(),
+            "refused-empty-values"
         );
         assert_eq!(WriteResult::RefusedNoLease.log_status(), "refused-no-lease");
         assert_eq!(
