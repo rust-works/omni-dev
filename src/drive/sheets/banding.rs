@@ -1244,10 +1244,7 @@ mod tests {
             .row_properties
             .as_mut()
             .unwrap()
-            .first_band_color_style = Some(ColorStyle {
-            rgb_color: None,
-            theme_color: Some("ACCENT1".to_string()),
-        });
+            .first_band_color_style = Some(ColorStyle::theme("ACCENT1"));
         let existing = sheet.banded_ranges.remove(0);
         let verb = BandingVerb::UpdateBanding {
             banded_range_id: 7,

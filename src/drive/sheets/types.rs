@@ -1281,12 +1281,24 @@ pub struct ColorStyle {
 }
 
 impl ColorStyle {
-    /// The one constructor this crate uses to build an outbound
+    /// The one constructor production code uses to build an outbound
     /// `ColorStyle` — always the `rgbColor` arm, `themeColor` left unset.
     pub fn rgb(color: Color) -> Self {
         Self {
             rgb_color: Some(color),
             theme_color: None,
+        }
+    }
+
+    /// Builds the `themeColor` arm — test-only, since production code never
+    /// constructs one (see the struct doc): it exists so a test fixture
+    /// doesn't have to hand-build the struct literal, which risks setting
+    /// both arms at once, a state the wire's `oneof` can never produce.
+    #[cfg(test)]
+    pub fn theme(name: impl Into<String>) -> Self {
+        Self {
+            rgb_color: None,
+            theme_color: Some(name.into()),
         }
     }
 
@@ -4841,10 +4853,7 @@ mod tests {
 
     #[test]
     fn color_style_describe_names_a_theme_color() {
-        let style = ColorStyle {
-            rgb_color: None,
-            theme_color: Some("ACCENT1".to_string()),
-        };
+        let style = ColorStyle::theme("ACCENT1");
         assert_eq!(style.describe(), "theme:ACCENT1");
     }
 

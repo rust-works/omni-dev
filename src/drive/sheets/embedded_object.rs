@@ -1488,14 +1488,22 @@ fn describe_position(sheet: &Sheet, position: Option<&EmbeddedObjectPosition>) -
 /// between "explicitly cleared" and "explicitly set to black", with no
 /// second field to break the tie. Reporting a bare `#000000` here would
 /// present a guess as a fact, so black is called out as ambiguous instead.
-/// A `themeColor` border (issue #2020) has no such ambiguity — it renders
-/// by name via [`ColorStyle::describe`].
+/// A completely empty `colorStyle` (neither arm set — issue #2020 made this
+/// parse instead of failing) is the same ambiguity by construction: a
+/// `oneof` with nothing set is indistinguishable, on the wire, from an
+/// omitted-by-proto3 all-zero `rgbColor`, so it gets the same message
+/// rather than `ColorStyle::describe`'s generic `(unset)`. A `themeColor`
+/// border has no such ambiguity — it renders by name via
+/// [`ColorStyle::describe`].
 fn describe_border_color(color_style: &ColorStyle) -> String {
-    match color_style.rgb_color {
-        Some(rgb) if rgb == Color::default() => {
-            "#000000 (or cleared — indistinguishable on read)".to_string()
-        }
-        _ => color_style.describe(),
+    let ambiguous = match color_style.rgb_color {
+        Some(rgb) => rgb == Color::default(),
+        None => color_style.theme_color.is_none(),
+    };
+    if ambiguous {
+        "#000000 (or cleared — indistinguishable on read)".to_string()
+    } else {
+        color_style.describe()
     }
 }
 
@@ -3657,13 +3665,27 @@ mod tests {
     }
 
     #[test]
+    fn summarise_chart_reports_an_entirely_empty_color_style_as_ambiguous() {
+        // Issue #2020: before ColorStyle's rgbColor arm became optional, a
+        // colorStyle with neither arm set (`{}`) could not even parse. Now
+        // that it can, it must read as the same ambiguous case as an
+        // all-zero rgbColor, not as ColorStyle::describe()'s "(unset)".
+        let mut sheet = basic_chart_sheet(7, "LINE");
+        sheet.charts[0].border = Some(EmbeddedObjectBorder {
+            color_style: Some(ColorStyle::default()),
+        });
+        let summary = summarise_chart(&sheet, &sheet.charts[0]).unwrap();
+        assert_eq!(
+            summary.border.as_deref(),
+            Some("#000000 (or cleared — indistinguishable on read)")
+        );
+    }
+
+    #[test]
     fn summarise_chart_reports_a_theme_border_colour_by_name() {
         let mut sheet = basic_chart_sheet(7, "LINE");
         sheet.charts[0].border = Some(EmbeddedObjectBorder {
-            color_style: Some(ColorStyle {
-                rgb_color: None,
-                theme_color: Some("ACCENT1".to_string()),
-            }),
+            color_style: Some(ColorStyle::theme("ACCENT1")),
         });
         let summary = summarise_chart(&sheet, &sheet.charts[0]).unwrap();
         assert_eq!(summary.border.as_deref(), Some("theme:ACCENT1"));
