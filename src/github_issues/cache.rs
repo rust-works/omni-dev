@@ -161,7 +161,7 @@ impl IssueCache {
             Err(e) => {
                 debug!(
                     "Ignoring unreadable GitHub cache entry {}: {e}",
-                    path.display()
+                    path.display() // omni-dev: coverage ignore-line reason="this continuation of a multi-line debug! call reports 0 hits under llvm-cov regardless of test count — verified locally: a_corrupt_or_old_schema_entry_is_a_miss hits this exact arm (the surrounding debug!( and remove_entry(&path) lines both measure as hit), yet this trailing argument expression never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
                 );
                 remove_entry(&path);
                 return None;
@@ -275,7 +275,7 @@ fn ttl_from_env(env: &impl EnvSource) -> Duration {
         Err(e) => {
             warn!(
                 "Ignoring {GITHUB_CACHE_TTL_ENV}={raw:?} ({e}); using {}s",
-                DEFAULT_TTL.as_secs()
+                DEFAULT_TTL.as_secs() // omni-dev: coverage ignore-line reason="this continuation of a multi-line warn! call reports 0 hits under llvm-cov regardless of test count — verified locally: env_ttl_defaults_parses_and_ignores_garbage hits this exact arm (the surrounding warn!( line and the DEFAULT_TTL return right after both measure as hit), yet this trailing argument expression never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
             );
             DEFAULT_TTL
         }
@@ -322,9 +322,9 @@ fn remove_entry(path: &Path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             debug!(
                 "Failed to remove GitHub cache entry {}: {e}",
-                path.display()
+                path.display() // omni-dev: coverage ignore-line reason="this continuation of a multi-line debug! call reports 0 hits under llvm-cov regardless of test count — verified locally: remove_entry_logs_and_ignores_a_non_not_found_failure hits this exact arm (the enclosing if e.kind() != NotFound check and the debug!( line both measure as hit), yet this trailing argument expression never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
             );
-        }
+        } // omni-dev: coverage ignore-line reason="this closing brace reports 0 hits under llvm-cov regardless of test count — verified locally: remove_entry_logs_and_ignores_a_non_not_found_failure hits the if e.kind() != NotFound check and the debug!(...) call above (both measure as hit), yet this specific brace, closing that check, never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
     }
 }
 
@@ -632,6 +632,17 @@ mod tests {
         let cache = cache(dir.path());
         cache.store(&doc("o/r", 7, ItemKind::Issue));
         assert!(cache.lookup(&item_ref("o/r", 7), |_| true).is_none());
+    }
+
+    #[test]
+    fn remove_entry_logs_and_ignores_a_non_not_found_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        // remove_file on a directory fails with something other than
+        // NotFound, exercising the branch a missing entry never takes.
+        let path = dir.path().join("looks_like_an_entry");
+        std::fs::create_dir(&path).unwrap();
+        remove_entry(&path);
+        assert!(path.exists(), "a directory can't be removed as a file");
     }
 
     #[test]

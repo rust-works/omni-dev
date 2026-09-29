@@ -150,6 +150,7 @@ pub struct RouteCommand {
 impl RouteCommand {
     /// Executes the route command.
     pub async fn execute(self) -> Result<()> {
+        // omni-dev: coverage ignore reason="RouteCommand::execute is the process-bound wiring shell; fetch_docs, run_route_with_reference_fetch_failures, render_output_with_style and terminal_style_with provide its deterministic seams"
         let env = crate::utils::settings::SettingsEnv::load();
         let mut config = JevConfig::from_env_with(&env)?;
         if let Some(model) = &self.jev_model {
@@ -159,7 +160,6 @@ impl RouteCommand {
         let client = JevClient::from_config(&config)?;
         let opts = self.route_options(config.model);
 
-        // omni-dev: coverage ignore reason="RouteCommand::execute is the process-bound wiring shell; fetch_docs, run_route_with_reference_fetch_failures, render_output_with_style and terminal_style_with provide its deterministic seams"
         let bin = crate::pr_status::resolve_gh_binary();
         let cwd = self
             .repo

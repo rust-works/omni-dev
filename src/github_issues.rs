@@ -774,7 +774,7 @@ pub fn fetch_items_cached(
             }
             *slot = Some(doc);
         }
-    }
+    } // omni-dev: coverage ignore-line reason="this closing brace reports 0 hits under llvm-cov regardless of test count — verified locally: fetch_items_cached_shares_entries_with_fetch_issues_cached and fetch_items_cached_does_not_cache_a_not_found_item both complete the block above (the for loop's own closing brace on the line before, and the following Ok(...) line, both measure as hit), yet this specific brace, closing the misses.is_empty() check, never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
     Ok(found.into_iter().map(Option::flatten).collect())
 }
 
