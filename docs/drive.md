@@ -566,6 +566,15 @@ $ omni-dev drive rename 1AbCdEfGhIjKlMnOpQrStUvWxYz "Q3 Report (final)" --dry-ru
 Would rename: Q3 Report -> Q3 Report (final) (1AbCdEfGhIjKlMnOpQrStUvWxYz)
 ```
 
+An empty or whitespace-only new name is refused locally — before any API
+call, `--dry-run` included — because Drive treats an empty `name` as "no
+change" and would otherwise let a no-op read as a successful rename. The
+outcome reports the name Drive actually stored, not the string you asked
+for: if Drive normalised or ignored it, a `Note: requested … but Drive
+stored …` line goes to stderr and `-o json`/`yaml` output gains a
+`requested_name` field (omitted when the two match). Renaming a file to the
+name it already has prints `Already named: …` instead of `Renamed: a -> a`.
+
 Renaming only ever touches a file's `name` field — it never changes
 `parents`, so it can never change who can see the file (Drive resolves
 visibility from direct permissions plus permissions inherited from the

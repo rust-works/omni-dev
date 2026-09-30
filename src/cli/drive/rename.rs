@@ -73,6 +73,7 @@ async fn run_rename(
     output: &OutputFormat,
 ) -> Result<()> {
     if dry_run {
+        rename::validate_new_name(new_name)?;
         let existing = FilesApi::new(client).get_metadata(file_id).await?;
         let report = DryRunReport {
             file_id: file_id.to_string(),
@@ -82,12 +83,20 @@ async fn run_rename(
         if output_as(&report, output)? {
             return Ok(());
         }
-        println!(
-            "Would rename: {} -> {} ({})",
-            sanitize_for_terminal(&report.old_name),
-            sanitize_for_terminal(&report.new_name),
-            sanitize_for_terminal(&report.file_id)
-        );
+        if report.old_name == report.new_name {
+            println!(
+                "Would not rename: already named {} ({})",
+                sanitize_for_terminal(&report.old_name),
+                sanitize_for_terminal(&report.file_id)
+            );
+        } else {
+            println!(
+                "Would rename: {} -> {} ({})",
+                sanitize_for_terminal(&report.old_name),
+                sanitize_for_terminal(&report.new_name),
+                sanitize_for_terminal(&report.file_id)
+            );
+        }
         return Ok(());
     }
 
@@ -99,12 +108,27 @@ fn print_outcome(outcome: &RenameOutcome, output: &OutputFormat) -> Result<()> {
     if output_as(outcome, output)? {
         return Ok(());
     }
-    println!(
-        "Renamed: {} -> {} ({})",
-        sanitize_for_terminal(&outcome.old_name),
-        sanitize_for_terminal(&outcome.new_name),
-        sanitize_for_terminal(&outcome.file_id)
-    );
+    if let Some(requested) = &outcome.requested_name {
+        eprintln!(
+            "Note: requested {} but Drive stored {}",
+            sanitize_for_terminal(requested),
+            sanitize_for_terminal(&outcome.new_name)
+        );
+    }
+    if outcome.is_unchanged() {
+        println!(
+            "Already named: {} ({})",
+            sanitize_for_terminal(&outcome.new_name),
+            sanitize_for_terminal(&outcome.file_id)
+        );
+    } else {
+        println!(
+            "Renamed: {} -> {} ({})",
+            sanitize_for_terminal(&outcome.old_name),
+            sanitize_for_terminal(&outcome.new_name),
+            sanitize_for_terminal(&outcome.file_id)
+        );
+    }
     Ok(())
 }
 
@@ -181,5 +205,83 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_rejects_a_blank_name_before_any_api_call() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        // No files mocks mounted: reaching `files.get` would 404 instead.
+        for blank in ["", "   "] {
+            let err = run_rename(&client, "f1", blank, true, &OutputFormat::Table)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("empty or whitespace-only"),
+                "{err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_rename_rejects_a_blank_name() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let err = run_rename(&client, "f1", "  ", false, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("empty or whitespace-only"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_and_rename_to_the_current_name_report_already_named() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        for method in ["GET", "PATCH"] {
+            wiremock::Mock::given(wiremock::matchers::method(method))
+                .and(wiremock::matchers::path("/drive/v3/files/f1"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "id": "f1", "name": "Same",
+                    }),
+                ))
+                .mount(&server)
+                .await;
+        }
+
+        run_rename(&client, "f1", "Same", true, &OutputFormat::Table)
+            .await
+            .unwrap();
+        run_rename(&client, "f1", "Same", false, &OutputFormat::Table)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_rename_notes_a_name_drive_stored_differently() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "Old",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "Stored",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        run_rename(&client, "f1", "Asked", false, &OutputFormat::Table)
+            .await
+            .unwrap();
     }
 }
