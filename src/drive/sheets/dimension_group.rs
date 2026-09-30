@@ -1586,15 +1586,12 @@ mod tests {
         opts.lease_token = lease_token;
         opts.ledger_path = ledger_path;
         let outcome = dimension_group(&drive, &sheets, &opts, &rules).await;
-        assert!(
-            matches!(
-                outcome.result,
-                DimensionGroupResult::AppliedReplyUnreadable { .. }
-            ),
+        assert_eq!(
+            outcome.result.log_status(),
+            "applied-reply-unreadable",
             "{:?}",
             outcome.result
         );
-        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         assert!(
             describe(&outcome).starts_with("Applied, but the reply could not be read"),
             "{}",

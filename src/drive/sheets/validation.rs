@@ -2138,15 +2138,12 @@ mod tests {
             ledger_path,
         };
         let outcome = validation(&drive, &sheets, &opts, &rules).await;
-        assert!(
-            matches!(
-                outcome.result,
-                ValidationResult::AppliedReplyUnreadable { .. }
-            ),
+        assert_eq!(
+            outcome.result.log_status(),
+            "applied-reply-unreadable",
             "{:?}",
             outcome.result
         );
-        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         let text = describe(&outcome);
         assert!(
             text.starts_with("Applied, but the reply could not be read"),

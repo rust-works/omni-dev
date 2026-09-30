@@ -1039,6 +1039,21 @@ mod tests {
 
     // ── the gate ────────────────────────────────────────────────────────
 
+    /// A real (non-dry) run records its attempt, so a denied one must reach
+    /// the request log's `Blocked` arm too.
+    #[tokio::test]
+    async fn a_denied_real_run_is_blocked_and_recorded() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_metadata(&server).await;
+        let outcome = delete_duplicates(&drive, &sheets, &options(false), &[]).await;
+        assert_eq!(outcome.result.log_status(), "blocked", "{outcome:?}");
+        assert!(matches!(
+            outcome.result,
+            DeleteDuplicatesResult::Blocked { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn gate_denies_sheets_delete_by_default() {
         let server = wiremock::MockServer::start().await;
@@ -1484,14 +1499,11 @@ mod tests {
             .mount(&server)
             .await;
         let outcome = delete_duplicates(&drive, &sheets, &options(false), &[rule()]).await;
-        assert!(
-            matches!(
-                outcome.result,
-                DeleteDuplicatesResult::AppliedReplyUnreadable { .. }
-            ),
+        assert_eq!(
+            outcome.result.log_status(),
+            "applied-reply-unreadable",
             "{outcome:?}"
         );
-        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         let lines = describe_lines(&outcome);
         assert!(
             lines[0].starts_with("Applied, but the reply could not be read"),

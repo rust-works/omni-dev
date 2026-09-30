@@ -1392,15 +1392,12 @@ mod tests {
             ledger_path,
         };
         let outcome = protection(&drive, &sheets, &opts, &rules).await;
-        assert!(
-            matches!(
-                outcome.result,
-                ProtectionResult::AppliedReplyUnreadable { .. }
-            ),
+        assert_eq!(
+            outcome.result.log_status(),
+            "applied-reply-unreadable",
             "{:?}",
             outcome.result
         );
-        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         assert!(
             describe(&outcome).starts_with("Applied, but the reply could not be read"),
             "{}",

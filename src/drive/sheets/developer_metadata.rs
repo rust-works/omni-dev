@@ -1571,15 +1571,12 @@ mod tests {
             .await;
 
         let outcome = developer_metadata(&drive, &sheets, &set_opts(false), &rules).await;
-        assert!(
-            matches!(
-                outcome.result,
-                DeveloperMetadataResult::AppliedReplyUnreadable { .. }
-            ),
+        assert_eq!(
+            outcome.result.log_status(),
+            "applied-reply-unreadable",
             "{:?}",
             outcome.result
         );
-        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         assert!(
             describe(&outcome).starts_with("Applied, but the reply could not be read"),
             "{}",
@@ -2491,6 +2488,27 @@ mod tests {
                  do not retry; check the spreadsheet first (bad reply)"
                     .to_string(),
                 "  id 42: \"owner\"=\"team-b\" at the whole spreadsheet".to_string(),
+            ]
+        );
+    }
+
+    /// The wrapped result is always Created/Updated/Deleted in practice; if it
+    /// were anything else the line still prints, with no location or entries.
+    #[test]
+    fn describe_lines_prints_a_bare_line_when_the_wrapped_result_carries_no_detail() {
+        let wrapped = DeveloperMetadataResult::AppliedReplyUnreadable {
+            summary: "create key=\"owner\"".to_string(),
+            applied: Box::new(DeveloperMetadataResult::Failed {
+                detail: String::new(),
+            }),
+            detail: "bad reply".to_string(),
+        };
+        assert_eq!(
+            describe_of(set_opts(false).verb, wrapped),
+            vec![
+                "Applied, but the reply could not be read: create key=\"owner\" in 'Budget' \
+                 — do not retry; check the spreadsheet first (bad reply)"
+                    .to_string()
             ]
         );
     }

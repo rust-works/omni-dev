@@ -682,4 +682,44 @@ mod tests {
         assert!(!debug.contains("refresh-1"));
         assert!(!debug.contains("session"));
     }
+
+    /// A 2xx whose body dies mid-stream is still a *successful* request: the
+    /// mutation may have been applied, so it is an inner `Err`, never the
+    /// outer one that a caller would treat as a failure to retry.
+    #[tokio::test]
+    async fn parse_success_response_reports_a_truncated_2xx_body_as_an_inner_error() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Promises 100 bytes, delivers 3, then hangs up.
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc")
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let client = GoogleApiClient::new(
+            &format!("http://{addr}"),
+            &test_credentials(),
+            "drive",
+            "Drive",
+        )
+        .unwrap();
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/x"))
+            .send()
+            .await
+            .unwrap();
+        let parsed = client
+            .parse_success_response::<serde_json::Value>(response, "reading the reply")
+            .await
+            .unwrap();
+        let detail = parsed.unwrap_err();
+        assert!(detail.starts_with("reading the reply: "), "{detail}");
+    }
 }
