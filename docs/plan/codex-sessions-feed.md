@@ -83,10 +83,10 @@ whether that state is **confirmed** (the event *is* the state) or **inferred**
 | `Stop`              | ✅       | ✅      | ✅       | ✅       | `idle`                   | confirmed | `stop_hook_active=false` on a natural end. In the TUI it is **not** fired on an Esc-deny, a Ctrl-C, or an interrupted turn; VS Code's Deny button *does* end in a `Stop`. |
 | `Interrupt`         | n/a      | ✅      | not tested (Deny fires `Stop`) | not tested | `idle`     | confirmed | Fired for Esc mid-turn, Ctrl-C mid-turn, **Esc on an approval prompt** ("No, and tell Codex what to do differently") and Ctrl-C on one. The rollout records `turn_aborted`. The IDE stop button was not exercised. |
 | `SessionEnd`        | ✅ `other` | ✅ `other` | ✅ `other` (chat archived) | ✅ `other` (chat archived) | `ended` | confirmed | `/exit`, Ctrl-C×2 and `exec` completion fire it; `/exit` ends every thread the TUI opened (one per `/new`). **SIGHUP (terminal tab closed), SIGTERM and SIGKILL fire nothing.** No `model`/`permission_mode` in the payload. The documented 30-minute idle end did **not** fire in a TUI left idle for 32 minutes; its only `SessionEnd` came from the `/exit`. |
-| `PreCompact`        | —        | ✅ `manual` | not tested | not tested | `working`       | inferred  | Bracketed by `Stop`s; no `SessionStart(compact)` observed despite the docs.                             |
-| `PostCompact`       | —        | ✅ `manual` | not tested | not tested | `working`       | inferred  |                                                                                                         |
+| `PreCompact`        | —        | ✅ `manual` | not tested | not tested | *state unchanged* (#1928) | inferred  | Bracketed by `Stop`s, so it fires on an idle session; no `SessionStart(compact)` observed despite the docs. |
+| `PostCompact`       | —        | ✅ `manual` | not tested | not tested | *state unchanged* (#1928) | inferred  | Also fires on an idle session.                                                                          |
 | `SubagentStart`     | —        | not tested | ✅ `agent_type=default` | not tested | `working` (parent) | inferred | Carries the **parent's** `session_id` plus `agent_id` (the child thread id). The child fires **no** `SessionStart`, and its own tool calls report the parent's `session_id` too — subagents never create registry entries. |
-| `SubagentStop`      | —        | not tested | ✅       | not tested | `working` (parent)     | inferred  | Spawn/join are ordinary tool calls (`collaborationspawn_agent` / `collaborationwait_agent`).           |
+| `SubagentStop`      | —        | not tested | ✅       | not tested | *state unchanged* (#1928) | inferred  | Spawn/join are ordinary tool calls (`collaborationspawn_agent` / `collaborationwait_agent`).           |
 
 Payload facts common to every event: `session_id` (UUIDv7), `cwd`, `model`,
 `permission_mode` (`default` interactively; `bypassPermissions` for `codex exec`
@@ -195,10 +195,11 @@ unchanged): `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
 `Stop`, `SessionEnd` → the same-named events; `PermissionRequest` →
 `Notification(PermissionPrompt)`; `PreToolUse` with `tool_name ==
 "request_user_input"` → `Notification(AgentNeedsInput)`; `Interrupt` → `Stop`;
-`SubagentStart`/`SubagentStop`/`PreCompact`/`PostCompact` → `PostToolUse`
-(a working-state heartbeat). If reviewers prefer the event log to be truthful
-over the diff being minimal, a `SessionEvent::Activity` variant is the honest
-spelling of the last group.
+`SubagentStart` → `PostToolUse`. `SubagentStop`/`PreCompact`/`PostCompact` were
+first mapped to `PostToolUse` as well (a working-state heartbeat), but each can
+fire on an idle session, where nothing would release the `working` — #1928 moved
+them to the state-preserving `TranscriptDiscovered` sighting, as #1925 did for
+Claude.
 
 Install/uninstall follow the pattern #1901 set for pi: `omni-dev sessions
 install-hooks` also installs into `$CODEX_HOME/hooks.json` (default
