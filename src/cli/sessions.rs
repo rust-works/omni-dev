@@ -531,25 +531,47 @@ pub struct InstallHooksCommand {
 }
 
 impl InstallHooksCommand {
-    /// Executes the install: merges the hook block idempotently, preserving any
-    /// hooks already present, then writes the pi extension if pi is present and
-    /// the Codex hooks if Codex is.
+    /// Executes the install: rewrites any stale sink left by a moved binary,
+    /// merges the hook block idempotently (preserving any other hooks already
+    /// present), then writes the pi extension if pi is present and the Codex
+    /// hooks if Codex is.
     pub fn execute(self) -> Result<()> {
         let path = settings_path(self.settings)?;
         let mut settings = read_settings(&path)?;
         let command = hook_command();
-        let added = merge_hooks(&mut settings, &command, HOOK_EVENTS);
-        write_settings(&path, &settings)?;
-        if added == 0 {
+        let sync = sync_claude_hooks(&mut settings, &command);
+        if sync.is_noop() {
             println!(
                 "sessions hooks already installed in {} (no change)",
                 path.display()
             );
         } else {
-            println!(
-                "installed {added} sessions hook event(s) into {}\ncommand: {command}",
-                path.display()
-            );
+            write_settings(&path, &settings)?;
+            if sync.replaced > 0 {
+                println!(
+                    "rewrote {} stale `sessions hook` entry(ies) in {} in place",
+                    sync.replaced,
+                    path.display()
+                );
+            }
+            if sync.deduped > 0 {
+                println!(
+                    "removed {} duplicate `sessions hook` entry(ies) from {}",
+                    sync.deduped,
+                    path.display()
+                );
+            }
+            if sync.added > 0 {
+                println!(
+                    "installed {} sessions hook event(s) into {}",
+                    sync.added,
+                    path.display()
+                );
+            }
+            println!("command: {command}");
+        }
+        if sync.customised > 0 {
+            println!("{}", customised_note(sync.customised));
         }
         install_pi_extension(self.pi_agent_dir)?;
         install_codex_hooks(self.codex_home)
@@ -577,19 +599,24 @@ pub struct UninstallHooksCommand {
 }
 
 impl UninstallHooksCommand {
-    /// Executes the uninstall: removes any hook entries whose command is ours,
-    /// leaving every other hook untouched, then removes our pi extension and
-    /// Codex hooks.
+    /// Executes the uninstall: removes any hook entries whose command is ours
+    /// (including a stale sink from another path), leaving every other hook
+    /// untouched, then removes our pi extension and Codex hooks.
     pub fn execute(self) -> Result<()> {
         let path = settings_path(self.settings)?;
         if path.exists() {
             let mut settings = read_settings(&path)?;
-            let removed = remove_hooks(&mut settings, &hook_command());
+            let current = hook_command();
+            let removed = remove_hooks(&mut settings, |c| c == current || is_stale_claude_sink(c));
             write_settings(&path, &settings)?;
             println!(
                 "removed {removed} sessions hook entry(ies) from {}",
                 path.display()
             );
+            let customised = count_customised_sinks(&settings, &current);
+            if customised > 0 {
+                println!("{}", customised_note(customised));
+            }
         } else {
             println!("no settings file at {} (nothing to remove)", path.display());
         }
@@ -1112,10 +1139,10 @@ fn merge_hooks(settings: &mut Value, command: &str, specs: &[HookSpec]) -> usize
     added
 }
 
-/// Removes every hook entry whose command is `command` from a settings object,
-/// pruning any group and per-event array left empty, and returning how many hook
-/// entries were removed. Leaves all other hooks in place.
-fn remove_hooks(settings: &mut Value, command: &str) -> usize {
+/// Removes every hook entry whose command `is_ours` matches from a settings
+/// object, pruning any group and per-event array left empty, and returning how
+/// many hook entries were removed. Leaves all other hooks in place.
+fn remove_hooks(settings: &mut Value, is_ours: impl Fn(&str) -> bool) -> usize {
     let Some(root) = settings.as_object_mut() else {
         return 0;
     };
@@ -1131,7 +1158,11 @@ fn remove_hooks(settings: &mut Value, command: &str) -> usize {
         for group in groups.iter_mut() {
             if let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) {
                 let before = inner.len();
-                inner.retain(|h| !hook_has_command(h, command));
+                inner.retain(|h| {
+                    !h.get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(&is_ours)
+                });
                 removed += before - inner.len();
             }
         }
@@ -1186,6 +1217,134 @@ fn hook_has_command(hook: &Value, command: &str) -> bool {
     hook.get("command").and_then(Value::as_str) == Some(command)
 }
 
+// --- Claude stale-sink handling (#1927) ---------------------------------------
+
+/// What [`sync_claude_hooks`] changed in a Claude settings object.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClaudeSync {
+    /// Stale sink entries rewritten to the current command in place.
+    replaced: usize,
+    /// Duplicate entries of the current command removed.
+    deduped: usize,
+    /// Events that gained a group.
+    added: usize,
+    /// Customised sinks (extra arguments) left untouched.
+    customised: usize,
+}
+
+impl ClaudeSync {
+    /// Whether the settings object was left unchanged.
+    fn is_noop(&self) -> bool {
+        self.replaced == 0 && self.deduped == 0 && self.added == 0
+    }
+}
+
+/// Whether `command` is a stale **un-customised** Claude sink: an `omni-dev
+/// sessions hook` from any path whose arguments are empty or only the Claude tag
+/// (`--agent claude`), the two shapes `install-hooks` has written for Claude.
+/// Unlike Codex's [`is_sessions_sink`], a sink with any other argument (a
+/// `--socket`, an `--agent codex`) is a deliberate choice and is **not** stale:
+/// rewriting it to the canonical command would silently discard that choice.
+fn is_stale_claude_sink(command: &str) -> bool {
+    if !is_sessions_sink(command) {
+        return false;
+    }
+    let command = command.trim();
+    let Some(at) = command.find(" sessions hook") else {
+        return false;
+    };
+    let args: Vec<&str> = command[at + " sessions hook".len()..]
+        .split_whitespace()
+        .collect();
+    matches!(
+        args.as_slice(),
+        [] | ["--agent", "claude"] | ["--agent=claude"]
+    )
+}
+
+/// Counts the `omni-dev sessions hook` entries in `settings` that are neither
+/// `current` nor stale-and-rewritable: the customised ones install and uninstall
+/// leave alone.
+fn count_customised_sinks(settings: &Value, current: &str) -> usize {
+    settings
+        .get("hooks")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|hooks| hooks.values())
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|g| g.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|h| h.get("command").and_then(Value::as_str))
+        .filter(|c| *c != current && is_sessions_sink(c) && !is_stale_claude_sink(c))
+        .count()
+}
+
+/// The note printed when customised sinks were left in place.
+fn customised_note(count: usize) -> String {
+    format!(
+        "left {count} customised `sessions hook` entry(ies) (extra arguments such as \
+         `--socket`) untouched: edit or remove them by hand if they point at a moved binary"
+    )
+}
+
+/// Removes the second and later occurrences of exactly `command` under each
+/// event, pruning any group and event this empties, and returns how many it
+/// removed. Settings left by the pre-#1927 bug hold the old and new sink side by
+/// side; once [`replace_stale_sinks`] rewrites the old one they would be two
+/// identical entries, each spawning a sink per event. Claude identifies a hook by
+/// content rather than position, so removing one shifts nothing that matters.
+fn dedupe_command(settings: &mut Value, command: &str) -> usize {
+    let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return 0;
+    };
+    let mut removed = 0;
+    let mut empty_events = Vec::new();
+    for (event, groups) in hooks.iter_mut() {
+        let Some(groups) = groups.as_array_mut() else {
+            continue;
+        };
+        let mut seen = false;
+        for group in groups.iter_mut() {
+            let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let before = inner.len();
+            inner.retain(|h| {
+                if !hook_has_command(h, command) {
+                    return true;
+                }
+                !std::mem::replace(&mut seen, true)
+            });
+            removed += before - inner.len();
+        }
+        groups.retain(|g| !is_empty_group(g));
+        if groups.is_empty() {
+            empty_events.push(event.clone());
+        }
+    }
+    for event in empty_events {
+        hooks.remove(&event);
+    }
+    removed
+}
+
+/// The Claude half of `install-hooks` as a pure transform: rewrite stale
+/// un-customised sinks to `command` in place, drop the duplicates that leaves (or
+/// that an earlier buggy install left), then add whichever events lack a sink.
+/// Customised sinks are counted but never touched.
+fn sync_claude_hooks(settings: &mut Value, command: &str) -> ClaudeSync {
+    let replaced = replace_stale_sinks(settings, command, HOOK_EVENTS, is_stale_claude_sink);
+    let deduped = dedupe_command(settings, command);
+    let added = merge_hooks(settings, command, HOOK_EVENTS);
+    ClaudeSync {
+        replaced,
+        deduped,
+        added,
+        customised: count_customised_sinks(settings, command),
+    }
+}
+
 // --- Codex hooks.json ----------------------------------------------------------
 
 /// The one-time trust step every Codex install needs. Codex skips an untrusted
@@ -1237,15 +1396,22 @@ fn is_sessions_sink(command: &str) -> bool {
             .is_some_and(|name| name == "omni-dev")
 }
 
-/// Rewrites every stale sink entry (see [`is_sessions_sink`]) in `settings` to
-/// `command` **where it sits**, returning how many it rewrote. Left beside the
+/// Rewrites every stale sink entry (one `is_stale` matches, other than `command`
+/// itself) in `settings` to `command` **where it sits**, returning how many it
+/// rewrote. Codex passes [`is_sessions_sink`]; Claude the narrower
+/// [`is_stale_claude_sink`]. Left beside the
 /// tagged entry, an untagged one would race it to be a session's first sighting
 /// and could fix the session's tag as `claude` for good; replacing it in place
 /// moves no other hook, so nothing else loses its Codex trust (ADR-0087). The
 /// replaced entry takes the spec's `timeout` for its event. Extra arguments on
 /// the old entry (a `--socket`, say) are not carried over: the canonical command
 /// is what makes a second install recognise it.
-fn replace_stale_sinks(settings: &mut Value, command: &str, specs: &[HookSpec]) -> usize {
+fn replace_stale_sinks(
+    settings: &mut Value,
+    command: &str,
+    specs: &[HookSpec],
+    is_stale: impl Fn(&str) -> bool,
+) -> usize {
     let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
         return 0;
     };
@@ -1263,7 +1429,7 @@ fn replace_stale_sinks(settings: &mut Value, command: &str, specs: &[HookSpec]) 
             let stale = hook
                 .get("command")
                 .and_then(Value::as_str)
-                .is_some_and(|c| c != command && is_sessions_sink(c));
+                .is_some_and(|c| c != command && is_stale(c));
             if !stale {
                 continue;
             }
@@ -1368,7 +1534,7 @@ fn install_codex_hooks(explicit: Option<PathBuf>) -> Result<()> {
     let path = codex_home.join("hooks.json");
     let mut hooks = read_settings(&path)?;
     let command = codex_hook_command();
-    let replaced = replace_stale_sinks(&mut hooks, &command, CODEX_HOOK_EVENTS);
+    let replaced = replace_stale_sinks(&mut hooks, &command, CODEX_HOOK_EVENTS, is_sessions_sink);
     let added = merge_hooks(&mut hooks, &command, CODEX_HOOK_EVENTS);
     if replaced == 0 && added == 0 {
         println!(
@@ -1975,7 +2141,7 @@ mod tests {
             { "hooks": [{ "type": "command", "command": "mine" }] }
         ] } });
         assert_eq!(
-            replace_stale_sinks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS),
+            replace_stale_sinks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS, is_sessions_sink),
             2
         );
         assert_eq!(
@@ -1999,7 +2165,7 @@ mod tests {
                 { "hooks": [{ "type": "command", "command": "omni-dev sessions hook" }] }
             ]
         }});
-        let replaced = replace_stale_sinks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS);
+        let replaced = replace_stale_sinks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS, is_sessions_sink);
         assert_eq!(replaced, 2);
         let added = merge_hooks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS);
         // Only the events without a (now tagged) sink got a new group.
@@ -2021,7 +2187,7 @@ mod tests {
         assert!(hooks["hooks"].get("Notification").is_none());
         // Idempotent.
         assert_eq!(
-            replace_stale_sinks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS),
+            replace_stale_sinks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS, is_sessions_sink),
             0
         );
         assert_eq!(merge_hooks(&mut hooks, TAGGED, CODEX_HOOK_EVENTS), 0);
@@ -2101,14 +2267,15 @@ mod tests {
         assert_eq!(remove_hooks_stable(&mut odd, |_| true), none);
         assert_eq!(odd["hooks"]["Stop"], 5);
         assert_eq!(
-            replace_stale_sinks(&mut json!({}), TAGGED, CODEX_HOOK_EVENTS),
+            replace_stale_sinks(&mut json!({}), TAGGED, CODEX_HOOK_EVENTS, is_sessions_sink),
             0
         );
         assert_eq!(
             replace_stale_sinks(
                 &mut json!({ "hooks": { "Stop": 5 } }),
                 TAGGED,
-                CODEX_HOOK_EVENTS
+                CODEX_HOOK_EVENTS,
+                is_sessions_sink
             ),
             0
         );
@@ -2298,7 +2465,7 @@ mod tests {
         assert!(settings["hooks"]["StopFailure"][0].get("matcher").is_none());
 
         // Uninstall removes every event, old and new.
-        assert_eq!(remove_hooks(&mut settings, cmd), HOOK_EVENTS.len());
+        assert_eq!(remove_hooks(&mut settings, |c| c == cmd), HOOK_EVENTS.len());
         assert!(settings["hooks"].as_object().unwrap().is_empty());
     }
 
@@ -2313,7 +2480,7 @@ mod tests {
         });
         let cmd = "/usr/bin/omni-dev sessions hook";
         merge_hooks(&mut settings, cmd, HOOK_EVENTS);
-        let removed = remove_hooks(&mut settings, cmd);
+        let removed = remove_hooks(&mut settings, |c| c == cmd);
         assert_eq!(removed, HOOK_EVENTS.len());
 
         // Every one of our entries is gone...
@@ -2329,12 +2496,163 @@ mod tests {
         assert!(pre.iter().any(|g| group_has_command(g, "keep-me")));
     }
 
+    // --- stale Claude sinks (#1927) -----------------------------------------
+
+    const OLD: &str = "/old/bin/omni-dev sessions hook";
+    const NEW: &str = "/new/bin/omni-dev sessions hook";
+
+    fn sinks_under(settings: &Value, event: &str) -> Vec<String> {
+        settings["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|g| g["hooks"].as_array())
+            .flatten()
+            .filter_map(|h| h["command"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn is_stale_claude_sink_matches_only_uncustomised_sinks() {
+        assert!(is_stale_claude_sink(OLD));
+        assert!(is_stale_claude_sink("omni-dev sessions hook"));
+        assert!(is_stale_claude_sink(
+            "/x/omni-dev sessions hook --agent claude"
+        ));
+        assert!(is_stale_claude_sink(
+            "/x/omni-dev sessions hook --agent=claude"
+        ));
+        // Customised: a deliberate choice, never rewritten.
+        assert!(!is_stale_claude_sink(
+            "/x/omni-dev sessions hook --socket /s"
+        ));
+        assert!(!is_stale_claude_sink(
+            "/x/omni-dev sessions hook --agent codex"
+        ));
+        assert!(!is_stale_claude_sink(
+            "/x/omni-dev sessions hook --agent claude --socket /s"
+        ));
+        // Not a sink at all.
+        assert!(!is_stale_claude_sink("/x/other sessions hook"));
+        assert!(!is_stale_claude_sink("/x/omni-dev sessions list"));
+    }
+
+    #[test]
+    fn install_after_the_binary_moves_rewrites_the_old_sink_in_place() {
+        let mut settings = json!({ "model": "sonnet" });
+        merge_hooks(&mut settings, OLD, HOOK_EVENTS);
+        // An unrelated hook sharing an event must survive, in its slot.
+        settings["hooks"]["Stop"].as_array_mut().unwrap().insert(
+            0,
+            json!({ "hooks": [{ "type": "command", "command": "other" }] }),
+        );
+
+        let sync = sync_claude_hooks(&mut settings, NEW);
+        assert_eq!(
+            sync,
+            ClaudeSync {
+                replaced: HOOK_EVENTS.len(),
+                ..ClaudeSync::default()
+            }
+        );
+        for HookSpec { event, .. } in HOOK_EVENTS {
+            assert!(
+                sinks_under(&settings, event).contains(&NEW.to_string()),
+                "{event}"
+            );
+            assert!(
+                !sinks_under(&settings, event).contains(&OLD.to_string()),
+                "{event}"
+            );
+        }
+        assert_eq!(sinks_under(&settings, "Stop"), ["other", NEW]);
+        assert_eq!(settings["model"], "sonnet");
+
+        // A second install is a no-op.
+        assert!(sync_claude_hooks(&mut settings, NEW).is_noop());
+    }
+
+    #[test]
+    fn install_heals_settings_that_already_hold_both_sinks() {
+        // What the pre-#1927 bug left behind: old and new side by side.
+        let mut settings = json!({});
+        merge_hooks(&mut settings, OLD, HOOK_EVENTS);
+        merge_hooks(&mut settings, NEW, HOOK_EVENTS);
+
+        let sync = sync_claude_hooks(&mut settings, NEW);
+        assert_eq!(sync.replaced, HOOK_EVENTS.len());
+        assert_eq!(sync.deduped, HOOK_EVENTS.len());
+        assert_eq!(sync.added, 0);
+        for HookSpec { event, .. } in HOOK_EVENTS {
+            assert_eq!(sinks_under(&settings, event), [NEW], "{event}");
+        }
+        assert!(sync_claude_hooks(&mut settings, NEW).is_noop());
+    }
+
+    #[test]
+    fn install_adds_new_events_while_rewriting_an_old_seven_event_install() {
+        let mut settings = json!({});
+        merge_hooks(&mut settings, OLD, &HOOK_EVENTS[..7]);
+        let sync = sync_claude_hooks(&mut settings, NEW);
+        assert_eq!(sync.replaced, 7);
+        assert_eq!(sync.added, HOOK_EVENTS.len() - 7);
+        for HookSpec { event, .. } in HOOK_EVENTS {
+            assert_eq!(sinks_under(&settings, event), [NEW], "{event}");
+        }
+    }
+
+    #[test]
+    fn install_and_uninstall_preserve_a_customised_sink() {
+        let custom = "/old/bin/omni-dev sessions hook --socket /my/d.sock";
+        let mut settings = json!({
+            "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": custom }] }] }
+        });
+        let sync = sync_claude_hooks(&mut settings, NEW);
+        assert_eq!(sync.replaced, 0);
+        assert_eq!(sync.customised, 1);
+        assert_eq!(sinks_under(&settings, "Stop"), [custom, NEW]);
+
+        let removed = remove_hooks(&mut settings, |c| c == NEW || is_stale_claude_sink(c));
+        assert_eq!(removed, HOOK_EVENTS.len());
+        assert_eq!(sinks_under(&settings, "Stop"), [custom]);
+        assert_eq!(count_customised_sinks(&settings, NEW), 1);
+        assert!(customised_note(1).contains("customised"));
+    }
+
+    #[test]
+    fn uninstall_from_a_new_path_removes_the_old_path_sink() {
+        let mut settings = json!({});
+        merge_hooks(&mut settings, OLD, HOOK_EVENTS);
+        merge_hooks(&mut settings, NEW, HOOK_EVENTS);
+        let removed = remove_hooks(&mut settings, |c| c == NEW || is_stale_claude_sink(c));
+        assert_eq!(removed, 2 * HOOK_EVENTS.len());
+        assert!(settings["hooks"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dedupe_command_keeps_the_first_and_tolerates_odd_shapes() {
+        let mut settings = json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [{ "type": "command", "command": NEW }] },
+                    { "hooks": [{ "type": "command", "command": "other" },
+                                { "type": "command", "command": NEW }] }
+                ],
+                "Notification": 5
+            }
+        });
+        assert_eq!(dedupe_command(&mut settings, NEW), 1);
+        assert_eq!(sinks_under(&settings, "Stop"), [NEW, "other"]);
+        assert_eq!(settings["hooks"]["Notification"], 5);
+        assert_eq!(dedupe_command(&mut json!({}), NEW), 0);
+    }
+
     #[test]
     fn remove_hooks_prunes_empty_events_entirely() {
         let mut settings = json!({});
         let cmd = "cmd sessions hook";
         merge_hooks(&mut settings, cmd, HOOK_EVENTS);
-        remove_hooks(&mut settings, cmd);
+        remove_hooks(&mut settings, |c| c == cmd);
         // With no other hooks, every event array empties and is pruned.
         let hooks = settings["hooks"].as_object().unwrap();
         assert!(hooks.is_empty(), "expected all events pruned: {hooks:?}");
@@ -2354,7 +2672,7 @@ mod tests {
         assert!(reloaded["hooks"]["Stop"].is_array());
 
         let mut settings = read_settings(&path).unwrap();
-        remove_hooks(&mut settings, "cmd sessions hook");
+        remove_hooks(&mut settings, |c| c == "cmd sessions hook");
         write_settings(&path, &settings).unwrap();
         let reloaded = read_settings(&path).unwrap();
         assert!(reloaded["hooks"].as_object().unwrap().is_empty());
@@ -3066,17 +3384,20 @@ mod tests {
         let cmd = "cmd sessions hook";
         // Non-object settings: both are no-ops rather than panics.
         assert_eq!(merge_hooks(&mut json!([]), cmd, HOOK_EVENTS), 0);
-        assert_eq!(remove_hooks(&mut json!([]), cmd), 0);
+        assert_eq!(remove_hooks(&mut json!([]), |c| c == cmd), 0);
         // `hooks` present but not an object → merge leaves it alone.
         assert_eq!(merge_hooks(&mut json!({ "hooks": 5 }), cmd, HOOK_EVENTS), 0);
         // No `hooks` key → remove has nothing to do.
-        assert_eq!(remove_hooks(&mut json!({}), cmd), 0);
+        assert_eq!(remove_hooks(&mut json!({}), |c| c == cmd), 0);
         // A per-event value that is not an array is skipped, not indexed.
         assert_eq!(
             merge_hooks(&mut json!({ "hooks": { "Stop": 5 } }), cmd, HOOK_EVENTS),
             HOOK_EVENTS.len() - 1
         );
-        assert_eq!(remove_hooks(&mut json!({ "hooks": { "Stop": 5 } }), cmd), 0);
+        assert_eq!(
+            remove_hooks(&mut json!({ "hooks": { "Stop": 5 } }), |c| c == cmd),
+            0
+        );
     }
 
     // --- #1361 typed window feed commands -----------------------------------
