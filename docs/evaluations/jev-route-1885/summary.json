@@ -32,6 +32,11 @@
         "implement": 2,
         "review": 1
       },
+      "close_calls_below_0_3": {
+        "design": 1,
+        "implement": 13,
+        "review": 8
+      },
       "usage": {
         "input_tokens": 56578,
         "output_tokens": 4111
@@ -66,6 +71,11 @@
         "design": 0,
         "implement": 0,
         "review": 0
+      },
+      "close_calls_below_0_3": {
+        "design": 7,
+        "implement": 11,
+        "review": 12
       },
       "usage": {
         "input_tokens": 58138,
@@ -106,6 +116,11 @@
         "implement": 1,
         "review": 0
       },
+      "close_calls_below_0_3": {
+        "design": 10,
+        "implement": 1,
+        "review": 4
+      },
       "usage": {
         "input_tokens": 62458,
         "output_tokens": 5091
@@ -140,6 +155,11 @@
         "design": 0,
         "implement": 0,
         "review": 0
+      },
+      "close_calls_below_0_3": {
+        "design": 6,
+        "implement": 0,
+        "review": 2
       },
       "usage": {
         "input_tokens": 58258,

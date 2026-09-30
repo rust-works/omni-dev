@@ -62,6 +62,12 @@ test: near-boundary answers can change between runs.
   21/40 review stage choices in paired comparisons. It selected Sonnet for
   implementation in all 40 E1 calls. This is a material routing change,
   especially for review, where E1 has no independent labels.
+- At the existing 0.3 close-call threshold, the baseline had 1/40 design,
+  13/40 implementation and 8/40 review close calls. The candidate had
+  6/40 design, 0/40 implementation and 2/40 review close calls. #1605's
+  candidate Sonnet design choice was a close call in one repeat (0.23), but
+  #1652's Sonnet design choice was 0.65 in both. The threshold therefore
+  does not flag every disagreement with the old labels.
 - Versioned tier names kept the same overall class on every paired E1 call,
   but changed implementation in 10/40 and review in 5/40 comparisons.
   Criterion names therefore affect stage choices even with byte-identical
@@ -70,9 +76,9 @@ test: near-boundary answers can change between runs.
 - In the six holdouts, the candidate kept the two synthetic controls at
   no remaining design and kept #1861's open research at Opus design in both
   repeats. #1880's design switched between Sonnet and Opus under the
-  candidate. The other full inputs kept their broad design status, while
-  candidate review often moved to Sonnet. These cases are too few to validate
-  review quality.
+  candidate, with confidence 0.26 and 0.29. The other full inputs kept their
+  broad design status, while candidate review often moved to Sonnet. These
+  cases are too few to validate review quality.
 
 ## Decision and limits
 
