@@ -1440,9 +1440,18 @@ few minutes instead of being queried again ([#1858](https://github.com/rust-work
   also be set in the `settings.json` `env` map. `0` turns the cache off: nothing
   is read or written. A value that isn't a whole number of seconds is warned
   about and ignored.
-- **What can be stale:** anything `route` reads, and `verify-decision`'s cited
-  sources, can be up to the TTL old. That includes whether a cited dependency
-  is still open and whether a routed issue is closed.
+- **What is checked every run:** `route`'s decisions that depend on whether an
+  issue is open ([#2041](https://github.com/rust-works/omni-dev/issues/2041)):
+  `--ignore-closed`, the closed-issue refusal, and whether a cited issue is an
+  open dependency. A cached copy is served only if its state still matches
+  GitHub's; a copy that was closed or reopened since is fetched again in full.
+  For `--all-open` the fresh list of open issues already proves the state, so
+  the check costs nothing. Otherwise it is one small extra `gh api graphql`
+  call per run for the cached items, asking for their state and nothing else.
+  A cold cache, `--refresh` and an item fetched earlier in the same run need no
+  check.
+- **What can be stale:** everything else `route` reads (titles, bodies,
+  comments), and `verify-decision`'s cited sources, can be up to the TTL old.
 - **Bypassing it:** `--refresh` re-fetches everything for that run and caches
   the fresh copies. Use it after closing, reopening or commenting on an issue
   you're about to route.

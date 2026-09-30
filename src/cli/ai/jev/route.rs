@@ -8,8 +8,8 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use crate::github_issues::{
-    fetch_issues_cached, fetch_items_cached, list_open_issue_numbers, needs_default_project,
-    parse_issue_arg, resolve_current_project, CacheUsage, IssueCache,
+    fetch_issues_cached_current, fetch_items_cached_current, list_open_issue_numbers,
+    needs_default_project, parse_issue_arg, resolve_current_project, CacheUsage, IssueCache,
 };
 use crate::jev::citations::{find_citations, Citation};
 use crate::jev::client::JevClient;
@@ -453,7 +453,10 @@ fn fetch_docs(
         .into_iter()
         .filter(|r| seen.insert((r.project.clone(), r.number)))
         .collect();
-    let docs = fetch_issues_cached(bin, cache, &refs)?;
+    // The listing already proves every `--all-open` issue is open, so a cached
+    // copy that says otherwise (a reopened issue) is refetched (#2041).
+    let listed = all_open.then_some(ItemState::Open);
+    let docs = fetch_issues_cached_current(bin, cache, &refs, listed)?;
     let routable: Vec<&IssueDoc> = docs
         .iter()
         .filter(|d| !is_ignored_closed(d, ignore_closed))
@@ -498,7 +501,10 @@ fn find_open_dependencies(
     }
 
     let mut resolved: BTreeMap<(String, u64), Option<(ItemState, String)>> = BTreeMap::new();
-    for (item_ref, fetched) in refs.iter().zip(fetch_items_cached(bin, cache, &refs)?) {
+    for (item_ref, fetched) in refs
+        .iter()
+        .zip(fetch_items_cached_current(bin, cache, &refs, None)?)
+    {
         resolved.insert(
             (item_ref.project.clone(), item_ref.number),
             fetched.map(|doc| (doc.state, doc.url)),
@@ -1115,7 +1121,9 @@ mod tests {
             assert_eq!(docs.len(), 1);
             notes.push(cache.reuse_note());
         }
-        assert_eq!(calls(dir.path()), ["api"]);
+        // One full fetch on the cold run, then only the shallow state recheck
+        // (#2041): the cached text is served, but its state is validated.
+        assert_eq!(calls(dir.path()), ["api", "api"]);
         assert!(notes[0].is_none(), "a cold run reuses nothing");
         assert!(notes[1].is_some());
     }
@@ -1176,6 +1184,220 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("-C/--repo"), "{err}");
+    }
+
+    // ── fetch_docs cached state (#2041) ──────────────────────────────
+
+    /// A fake `gh` for which every issue is in `state`, answering both the full
+    /// fetch and the `state`-only recheck, and logging each call's kind.
+    fn fake_gh_at_state(dir: &Path, state: &str) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
+        let guard = shim_lock();
+        let issue = serde_json::json!({
+            "title": "fresh", "body": "b", "state": state, "url": "u",
+            "comments": {"totalCount": 0, "nodes": []},
+            "closedByPullRequestsReferences": {"nodes": []}
+        });
+        let full = serde_json::json!({"data": {"r0": {"i0": issue, "i1": issue}}});
+        let only = serde_json::json!({"__typename": "Issue", "state": state});
+        let shallow = serde_json::json!({"data": {"r0": {"i0": only, "i1": only}}});
+        let path = dir.join("fake-gh");
+        let calls = dir.join("calls");
+        write_exec_script(
+            &path,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n\
+                 repo) echo repo >> '{calls}'; echo rust-works/omni-dev ;;\n\
+                 issue) echo issue >> '{calls}'; echo '[{{\"number\": 5}}, {{\"number\": 6}}]' ;;\n\
+                 *) case \"$4\" in\n\
+                    *'on Issue {{ state }}'*) echo state >> '{calls}'; cat <<'JSON'\n{shallow}\nJSON\n;;\n\
+                    *) echo full >> '{calls}'; cat <<'JSON'\n{full}\nJSON\n;;\n\
+                    esac ;;\n\
+                 esac\n",
+                calls = calls.display()
+            ),
+        );
+        (path, guard)
+    }
+
+    /// Warms `cache_dir` with issues #5 and #6 as GitHub reports them in
+    /// `state`, then forgets the run's call log.
+    fn warm_cache_at_state(dir: &Path, cache_dir: &Path, state: &str) {
+        let (bin, _shim) = fake_gh_at_state(dir, state);
+        let cache = IssueCache::new(
+            cache_dir.to_path_buf(),
+            crate::github_issues::DEFAULT_CACHE_TTL,
+            false,
+        );
+        retry_on_etxtbsy(|| {
+            fetch_docs(
+                &bin,
+                &cache,
+                dir,
+                &[
+                    "rust-works/omni-dev#5".to_string(),
+                    "rust-works/omni-dev#6".to_string(),
+                ],
+                false,
+                DEFAULT_MAX_INPUT_CHARS,
+                false,
+            )
+        })
+        .unwrap();
+        std::fs::remove_file(dir.join("calls")).unwrap();
+    }
+
+    fn fresh_cache(cache_dir: &Path) -> IssueCache {
+        IssueCache::new(
+            cache_dir.to_path_buf(),
+            crate::github_issues::DEFAULT_CACHE_TTL,
+            false,
+        )
+    }
+
+    /// The listing is fresh, so an issue cached as closed but listed as open
+    /// (it was reopened) is refetched rather than skipped as closed.
+    #[test]
+    fn fetch_docs_all_open_refetches_a_reopened_issue_cached_as_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        warm_cache_at_state(dir.path(), cache_dir.path(), "CLOSED");
+        let (bin, _shim) = fake_gh_at_state(dir.path(), "OPEN");
+        let (docs, _deps, _failures) = retry_on_etxtbsy(|| {
+            fetch_docs(
+                &bin,
+                &fresh_cache(cache_dir.path()),
+                dir.path(),
+                &[],
+                true,
+                DEFAULT_MAX_INPUT_CHARS,
+                true,
+            )
+        })
+        .unwrap();
+        assert_eq!(docs.len(), 2);
+        assert!(docs.iter().all(|d| d.state == ItemState::Open), "{docs:?}");
+        assert!(docs.iter().all(|d| !is_ignored_closed(d, true)));
+        // The listing proved the state, so there is no shallow recheck.
+        assert_eq!(calls(dir.path()), ["repo", "issue", "full"]);
+    }
+
+    #[test]
+    fn fetch_docs_all_open_reuses_a_cached_open_issue_without_a_recheck() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        warm_cache_at_state(dir.path(), cache_dir.path(), "OPEN");
+        let (bin, _shim) = fake_gh_at_state(dir.path(), "OPEN");
+        let cache = fresh_cache(cache_dir.path());
+        let (docs, _deps, _failures) = retry_on_etxtbsy(|| {
+            fetch_docs(
+                &bin,
+                &cache,
+                dir.path(),
+                &[],
+                true,
+                DEFAULT_MAX_INPUT_CHARS,
+                false,
+            )
+        })
+        .unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(calls(dir.path()), ["repo", "issue"]);
+        assert!(cache.reuse_note().is_some());
+    }
+
+    /// An explicit issue cached as open but closed since is refetched, so
+    /// `--ignore-closed` drops it instead of routing a closed issue.
+    #[test]
+    fn fetch_docs_refetches_an_explicit_issue_closed_since_it_was_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        warm_cache_at_state(dir.path(), cache_dir.path(), "OPEN");
+        let (bin, _shim) = fake_gh_at_state(dir.path(), "CLOSED");
+        let (docs, _deps, _failures) = retry_on_etxtbsy(|| {
+            fetch_docs(
+                &bin,
+                &fresh_cache(cache_dir.path()),
+                dir.path(),
+                &["rust-works/omni-dev#5".to_string()],
+                false,
+                DEFAULT_MAX_INPUT_CHARS,
+                true,
+            )
+        })
+        .unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].state, ItemState::Closed);
+        assert!(is_ignored_closed(&docs[0], true));
+        assert_eq!(calls(dir.path()), ["state", "full"]);
+    }
+
+    /// A fake `gh` whose issue `#1` (open) cites `#2`, which is in
+    /// `cited_state` for both the full fetch and the `state`-only recheck.
+    fn fake_gh_citing_at(
+        dir: &Path,
+        cited_state: &str,
+    ) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
+        let guard = shim_lock();
+        let citing = serde_json::json!({
+            "__typename": "Issue",
+            "title": "t", "body": "see #2", "state": "OPEN", "url": "u",
+            "comments": {"totalCount": 0, "nodes": []},
+            "closedByPullRequestsReferences": {"nodes": []}
+        });
+        let cited = serde_json::json!({
+            "__typename": "Issue",
+            "title": "t2", "body": "b2", "state": cited_state,
+            "url": "https://github.com/rust-works/omni-dev/issues/2"
+        });
+        let open = serde_json::json!({"__typename": "Issue", "state": "OPEN"});
+        let closed_since = serde_json::json!({"__typename": "Issue", "state": cited_state});
+        let path = dir.join("fake-gh");
+        write_exec_script(
+            &path,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n\
+                 repo) echo rust-works/omni-dev ;;\n\
+                 *) case \"$4\" in\n\
+                    *'number:2'*'on Issue {{ state }}'*) cat <<'JSON'\n{{\"data\": {{\"r0\": {{\"i0\": {closed_since}}}}}}}\nJSON\n;;\n\
+                    *'on Issue {{ state }}'*) cat <<'JSON'\n{{\"data\": {{\"r0\": {{\"i0\": {open}}}}}}}\nJSON\n;;\n\
+                    *'number:2'*) cat <<'JSON'\n{{\"data\": {{\"r0\": {{\"i0\": {cited}}}}}}}\nJSON\n;;\n\
+                    *) cat <<'JSON'\n{{\"data\": {{\"r0\": {{\"i0\": {citing}}}}}}}\nJSON\n;;\n\
+                    esac ;;\n\
+                 esac\n",
+            ),
+        );
+        (path, guard)
+    }
+
+    /// A cited issue cached as open and closed since is not an open
+    /// dependency, even though its cached copy still says so.
+    #[test]
+    fn fetch_docs_drops_a_citation_closed_since_it_was_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let args = ["rust-works/omni-dev#1".to_string()];
+        let run = |bin: &Path| {
+            retry_on_etxtbsy(|| {
+                fetch_docs(
+                    bin,
+                    &fresh_cache(cache_dir.path()),
+                    dir.path(),
+                    &args,
+                    false,
+                    DEFAULT_MAX_INPUT_CHARS,
+                    false,
+                )
+            })
+            .unwrap()
+        };
+        {
+            let (bin, _shim) = fake_gh_citing_at(dir.path(), "OPEN");
+            let (_docs, deps, _failures) = run(&bin);
+            assert_eq!(deps.len(), 1, "the warm run sees an open dependency");
+        }
+        let (bin, _shim) = fake_gh_citing_at(dir.path(), "CLOSED");
+        let (_docs, deps, _failures) = run(&bin);
+        assert!(deps.is_empty(), "{deps:?}");
     }
 
     // ── fetch_docs dependencies (#1812) ────────────────────────────────

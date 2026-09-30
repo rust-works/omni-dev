@@ -13,7 +13,7 @@
 //! `run_gh_graphql`, which already does), so it is counted and logged like
 //! every other `gh` invocation (#1387).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -505,6 +505,33 @@ fn item_fragment(alias: &str, number: u64) -> String {
 /// [`build_issue_query`], but for [`item_fragment`] — same repo-grouping and
 /// alias scheme, so [`parse_item_response`] can reuse [`describe_graphql_errors`].
 fn build_item_query(refs: &[ItemRef]) -> Option<(String, QueryIndex)> {
+    build_aliased_query(refs, item_fragment)
+}
+
+/// The GraphQL fragment resolving only an issue's or pull request's `state`,
+/// under the same `issueOrPullRequest` field as [`item_fragment`].
+fn state_fragment(alias: &str, number: u64) -> String {
+    format!(
+        r"{alias}: issueOrPullRequest(number:{number}){{
+      __typename
+      ... on Issue {{ state }}
+      ... on PullRequest {{ state }}
+    }}"
+    )
+}
+
+/// [`build_item_query`] for [`state_fragment`].
+fn build_state_query(refs: &[ItemRef]) -> Option<(String, QueryIndex)> {
+    build_aliased_query(refs, state_fragment)
+}
+
+/// Builds the single aliased query for every ref, grouped by project so each
+/// repository appears once, resolving each ref with `fragment`. Returns `None`
+/// for an empty slice.
+fn build_aliased_query(
+    refs: &[ItemRef],
+    fragment: fn(&str, u64) -> String,
+) -> Option<(String, QueryIndex)> {
     if refs.is_empty() {
         return None;
     }
@@ -524,7 +551,7 @@ fn build_item_query(refs: &[ItemRef]) -> Option<(String, QueryIndex)> {
         };
         let mut frags = Vec::new();
         for (ii, item_ref) in items.iter().enumerate() {
-            frags.push(item_fragment(&format!("i{ii}"), item_ref.number));
+            frags.push(fragment(&format!("i{ii}"), item_ref.number));
             index.insert((ri, ii), (*item_ref).clone());
         }
         let owner = Value::String(owner.to_string());
@@ -535,6 +562,16 @@ fn build_item_query(refs: &[ItemRef]) -> Option<(String, QueryIndex)> {
         ));
     }
     Some((format!("query{{\n{}\n}}", repos.join("\n")), index))
+}
+
+/// Reads an `issueOrPullRequest` node's `state`. A merged pull request is
+/// closed, as far as `route` is concerned.
+fn parse_item_state(item_ref: &ItemRef, node: &Value) -> Result<ItemState> {
+    match node.get("state").and_then(Value::as_str) {
+        Some("OPEN") => Ok(ItemState::Open),
+        Some("CLOSED" | "MERGED") => Ok(ItemState::Closed),
+        other => bail!("item {item_ref}: unrecognised state {other:?}"),
+    }
 }
 
 /// Builds an [`IssueDoc`] from an `issueOrPullRequest` node, using
@@ -563,11 +600,7 @@ fn build_item_doc(item_ref: &ItemRef, node: &Value) -> Result<IssueDoc> {
         .and_then(Value::as_str)
         .with_context(|| format!("item {item_ref}: response had no `url`"))?
         .to_string();
-    let state = match node.get("state").and_then(Value::as_str) {
-        Some("OPEN") => ItemState::Open,
-        Some("CLOSED" | "MERGED") => ItemState::Closed,
-        other => bail!("item {item_ref}: unrecognised state {other:?}"),
-    };
+    let state = parse_item_state(item_ref, node)?;
     let (comments, closed_by) = if kind == ItemKind::Issue {
         (
             human_comments(item_ref, node),
@@ -605,23 +638,17 @@ fn build_item_doc(item_ref: &ItemRef, node: &Value) -> Result<IssueDoc> {
     })
 }
 
-/// Reads every aliased item out of an [`item_fragment`] query reply.
-///
-/// Unlike [`parse_issue_response`], a `NOT_FOUND` is **tolerated** as
-/// `None` rather than failing the whole batch: a citation can be stale, a
-/// typo, or a quoted example (`owner/repo#123`), and one bad citation must
-/// not stop `route` or `verify-decision` from handling the rest. That covers
-/// both a missing item (path `["rK", "iN"]`) and a missing or inaccessible
-/// repository (path `["rK"]`), which resolves every item cited in it to
-/// `None` (#2001). Any other GraphQL error (a rate limit, a `NOT_FOUND` on a
-/// path this query didn't alias) still fails the batch — retrying it per
-/// item would not help.
-fn parse_item_response(
-    body: &Value,
-    index: &QueryIndex,
-) -> Result<HashMap<(String, u64), Option<IssueDoc>>> {
-    let mut not_found: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-    let mut missing_repos: std::collections::HashSet<usize> = std::collections::HashSet::new();
+/// The `(missing items, missing repositories)` of [`tolerated_not_found`].
+type NotFoundSlots = (HashSet<(usize, usize)>, HashSet<usize>);
+
+/// The aliased slots a reply reports as `NOT_FOUND`: `(repo, item)` pairs for
+/// a missing item (path `["rK", "iN"]`) and repo indexes for a missing or
+/// inaccessible repository (path `["rK"]`), in that order. Any other GraphQL error (a rate
+/// limit, a `NOT_FOUND` on a path the query didn't alias) fails the batch —
+/// retrying it per item would not help.
+fn tolerated_not_found(body: &Value, index: &QueryIndex) -> Result<NotFoundSlots> {
+    let mut not_found = HashSet::new();
+    let mut missing_repos = HashSet::new();
     if let Some(errors) = body.get("errors").and_then(Value::as_array) {
         for error in errors {
             let is_not_found = error.get("type").and_then(Value::as_str) == Some("NOT_FOUND");
@@ -648,16 +675,51 @@ fn parse_item_response(
             }
         }
     }
+    Ok((not_found, missing_repos))
+}
 
+/// Reads every aliased item out of an [`item_fragment`] query reply.
+///
+/// Unlike [`parse_issue_response`], a `NOT_FOUND` is **tolerated** as
+/// `None` rather than failing the whole batch: a citation can be stale, a
+/// typo, or a quoted example (`owner/repo#123`), and one bad citation must
+/// not stop `route` or `verify-decision` from handling the rest. That covers
+/// both a missing item and a missing or inaccessible repository, which
+/// resolves every item cited in it to `None` (#2001); see
+/// [`tolerated_not_found`].
+fn parse_item_response(
+    body: &Value,
+    index: &QueryIndex,
+) -> Result<HashMap<(String, u64), Option<IssueDoc>>> {
+    parse_aliased_response(body, index, build_item_doc)
+}
+
+/// [`parse_item_response`] for a [`state_fragment`] reply: `None` for an item
+/// GitHub can't find.
+fn parse_state_response(
+    body: &Value,
+    index: &QueryIndex,
+) -> Result<HashMap<(String, u64), Option<ItemState>>> {
+    parse_aliased_response(body, index, parse_item_state)
+}
+
+/// Reads each aliased node out of a reply with `build`, mapping a not-found
+/// slot to `None`.
+fn parse_aliased_response<T>(
+    body: &Value,
+    index: &QueryIndex,
+    build: impl Fn(&ItemRef, &Value) -> Result<T>,
+) -> Result<HashMap<(String, u64), Option<T>>> {
+    let (not_found, missing_repos) = tolerated_not_found(body, index)?;
     let data = body
         .get("data")
         .context("gh api graphql response had no `data`")?;
 
-    let mut docs = HashMap::with_capacity(index.len());
+    let mut found = HashMap::with_capacity(index.len());
     for ((ri, ii), item_ref) in index {
         let key = (item_ref.project.clone(), item_ref.number);
         if missing_repos.contains(ri) || not_found.contains(&(*ri, *ii)) {
-            docs.insert(key, None);
+            found.insert(key, None);
             continue;
         }
         let node = data
@@ -666,14 +728,14 @@ fn parse_item_response(
             .filter(|v| !v.is_null());
         match node {
             Some(node) => {
-                docs.insert(key, Some(build_item_doc(item_ref, node)?));
+                found.insert(key, Some(build(item_ref, node)?));
             }
             None => {
-                docs.insert(key, None);
+                found.insert(key, None);
             }
         }
     }
-    Ok(docs)
+    Ok(found)
 }
 
 /// Fetches a set of references that may be issues or pull requests.
@@ -703,6 +765,33 @@ pub fn fetch_items(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<IssueDoc>>
         .collect()
 }
 
+/// Fetches only the `state` of each reference (an issue or a pull request),
+/// one entry per `refs` in the same order, `None` for one GitHub can't find.
+///
+/// The shallow recheck a cached copy's `state` is validated with (#2041): the
+/// same aliased batching as [`fetch_items`] but with no text, so it is the
+/// cheapest way to learn whether a cached item was closed or reopened since.
+/// **Blocking.**
+pub fn fetch_states(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<ItemState>>> {
+    let mut by_key = HashMap::with_capacity(refs.len());
+    for chunk in refs.chunks(MAX_ISSUES_PER_QUERY) {
+        let Some((query, index)) = build_state_query(chunk) else {
+            // omni-dev: coverage ignore-line reason="chunks() never yields an empty chunk from a non-empty refs slice, and build_state_query returns None only for an empty slice"
+            continue;
+        };
+        let body = crate::pr_status::run_gh_graphql_with_partial_data(bin, &query)?;
+        by_key.extend(parse_state_response(&body, &index)?);
+    }
+    refs.iter()
+        .map(|item_ref| {
+            by_key
+                .get(&(item_ref.project.clone(), item_ref.number))
+                .copied()
+                .ok_or_else(|| anyhow!("item {item_ref} missing from the parsed gh reply (bug)"))
+        })
+        .collect()
+}
+
 /// [`fetch_issues`] through `cache`: serves fresh cached issues from disk,
 /// fetches only the rest, and caches what it fetched (#1858).
 ///
@@ -719,6 +808,96 @@ pub fn fetch_issues_cached(
         |misses| fetch_issues(bin, misses),
         |doc| cache.store(doc),
     )
+}
+
+/// [`fetch_issues_cached`], but a cached issue is served only if its `state`
+/// still matches GitHub's (#2041): a mismatch is a miss, fetched in full.
+///
+/// `state` decides what `route` does (skip, refuse, report a dependency), not
+/// just what it says, so it is not trusted for the whole TTL like the text.
+/// `listed` is the state the caller already knows every ref has — `--all-open`
+/// lists its issues as open — which needs no request; with `None`, the cached
+/// refs are rechecked with one shallow [`fetch_states`] call (none when
+/// nothing is cached). **Blocking.**
+pub fn fetch_issues_cached_current(
+    bin: &Path,
+    cache: &IssueCache,
+    refs: &[ItemRef],
+    listed: Option<ItemState>,
+) -> Result<Vec<IssueDoc>> {
+    let current = current_states(bin, cache, refs, listed)?;
+    fetch_through_cache(
+        refs,
+        |item_ref| {
+            cache.lookup(item_ref, |doc| {
+                doc.kind == ItemKind::Issue && state_is_current(&current, doc)
+            })
+        },
+        |misses| fetch_issues(bin, misses),
+        |doc| cache.store(doc),
+    )
+}
+
+/// [`fetch_items_cached`] with the `state` check of
+/// [`fetch_issues_cached_current`]. **Blocking.**
+pub fn fetch_items_cached_current(
+    bin: &Path,
+    cache: &IssueCache,
+    refs: &[ItemRef],
+    listed: Option<ItemState>,
+) -> Result<Vec<Option<IssueDoc>>> {
+    let current = current_states(bin, cache, refs, listed)?;
+    fetch_through_cache(
+        refs,
+        |item_ref| {
+            cache
+                .lookup(item_ref, |doc| state_is_current(&current, doc))
+                .map(Some)
+        },
+        |misses| fetch_items(bin, misses),
+        |doc| {
+            if let Some(doc) = doc {
+                cache.store(doc);
+            }
+        },
+    )
+}
+
+/// The `(lowercased project, number)` key GitHub names are compared by.
+fn state_key(project: &str, number: u64) -> (String, u64) {
+    (project.to_ascii_lowercase(), number)
+}
+
+/// GitHub's current `state` for each of `refs` that `cache` could serve, from
+/// `listed` or one [`fetch_states`] call. `None` marks an item GitHub can't
+/// find; a ref with no cache entry, or one this run stored itself, is absent.
+fn current_states(
+    bin: &Path,
+    cache: &IssueCache,
+    refs: &[ItemRef],
+    listed: Option<ItemState>,
+) -> Result<HashMap<(String, u64), Option<ItemState>>> {
+    let cached: Vec<ItemRef> = cache.cached_refs(refs).into_iter().cloned().collect();
+    let states = match listed {
+        Some(state) => vec![Some(state); cached.len()],
+        None if cached.is_empty() => Vec::new(),
+        None => fetch_states(bin, &cached)?,
+    };
+    Ok(cached
+        .iter()
+        .zip(states)
+        .map(|(item_ref, state)| (state_key(&item_ref.project, item_ref.number), state))
+        .collect())
+}
+
+/// Whether `doc`'s cached `state` is the one GitHub reported. An item GitHub
+/// can't find is not current, so it is fetched in full. One absent from
+/// `current` needed no check: this run stored it, or it was written after the
+/// check, so either way it is as fresh as a fetch.
+fn state_is_current(current: &HashMap<(String, u64), Option<ItemState>>, doc: &IssueDoc) -> bool {
+    current
+        .get(&state_key(&doc.project, doc.number))
+        .is_none_or(|state| *state == Some(doc.state))
 }
 
 /// [`fetch_issues`], always from GitHub, writing the result through to `cache`.
@@ -1705,6 +1884,281 @@ mod tests {
             closed_by: Vec::new(),
             url: "u".to_string(),
         }
+    }
+
+    // ── state recheck (#2041) ────────────────────────────────────────
+
+    /// A fake `gh` answering a `state`-only query with `state_reply` and any
+    /// other query with `full_reply`, logging `state` or `full` per call.
+    fn state_gh(
+        dir: &Path,
+        state_reply: &str,
+        full_reply: &str,
+    ) -> (PathBuf, MutexGuard<'static, ()>) {
+        let guard = shim_lock();
+        let path = dir.join("fake-gh");
+        let calls = dir.join("kinds");
+        write_exec_script(
+            &path,
+            &format!(
+                "#!/bin/sh\ncase \"$4\" in\n\
+                 *'on Issue {{ state }}'*) echo state >> '{calls}'; cat <<'JSON'\n{state_reply}\nJSON\n;;\n\
+                 *) echo full >> '{calls}'; cat <<'JSON'\n{full_reply}\nJSON\n;;\n\
+                 esac\n",
+                calls = calls.display()
+            ),
+        );
+        (path, guard)
+    }
+
+    fn kinds(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("kinds"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn state_reply(state: &str) -> String {
+        serde_json::json!({"data": {"r0": {"i0": {"__typename": "Issue", "state": state}}}})
+            .to_string()
+    }
+
+    fn issue_reply(state: &str) -> String {
+        serde_json::json!({"data": {"r0": {"i0": {
+            "__typename": "Issue",
+            "title": "fresh", "body": "b", "state": state, "url": "u",
+            "comments": {"totalCount": 0, "nodes": []},
+            "closedByPullRequestsReferences": {"nodes": []}
+        }}}})
+        .to_string()
+    }
+
+    fn cache_holding(cache_dir: &Path, state: ItemState) -> IssueCache {
+        let cache = IssueCache::new(cache_dir.to_path_buf(), DEFAULT_CACHE_TTL, false);
+        let mut doc = cached_doc("rust-works/omni-dev", 1);
+        doc.title = "cached".to_string();
+        doc.state = state;
+        cache.store(&doc);
+        // A later run: the entry is on disk, but this instance did not store it.
+        IssueCache::new(cache_dir.to_path_buf(), DEFAULT_CACHE_TTL, false)
+    }
+
+    #[test]
+    fn build_state_query_is_none_for_no_refs() {
+        assert!(build_state_query(&[]).is_none());
+    }
+
+    #[test]
+    fn build_state_query_asks_only_for_state_and_groups_by_project() {
+        let (query, index) = build_state_query(&[
+            item_ref("rust-works/omni-dev", 1),
+            item_ref("rust-works/omni-dev", 2),
+            item_ref("other/repo", 3),
+        ])
+        .unwrap();
+        assert_eq!(query.matches("repository(owner:").count(), 2);
+        assert_eq!(index.len(), 3);
+        assert!(query.contains("... on Issue { state }"), "{query}");
+        assert!(query.contains("... on PullRequest { state }"), "{query}");
+        for text in ["title", "body", "comments"] {
+            assert!(!query.contains(text), "{text} in {query}");
+        }
+    }
+
+    #[test]
+    fn fetch_states_empty_refs_runs_nothing() {
+        let states = fetch_states(Path::new("/no/such/gh/xyzzy"), &[]).unwrap();
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn fetch_states_maps_open_closed_merged_and_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = serde_json::json!({
+            "data": {"r0": {
+                "i0": {"__typename": "Issue", "state": "OPEN"},
+                "i1": {"__typename": "Issue", "state": "CLOSED"},
+                "i2": {"__typename": "PullRequest", "state": "MERGED"},
+                "i3": null
+            }},
+            "errors": [{"type": "NOT_FOUND", "path": ["r0", "i3"], "message": "nope"}]
+        })
+        .to_string();
+        let (bin, _shim) = fake_gh(dir.path(), &reply, 1);
+        let refs: Vec<ItemRef> = (1..=4)
+            .map(|n| item_ref("rust-works/omni-dev", n))
+            .collect();
+        let states = retry_on_etxtbsy(|| fetch_states(&bin, &refs)).unwrap();
+        assert_eq!(
+            states,
+            [
+                Some(ItemState::Open),
+                Some(ItemState::Closed),
+                Some(ItemState::Closed),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_states_reports_a_missing_repository_as_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = serde_json::json!({
+            "data": {"r0": null},
+            "errors": [{"type": "NOT_FOUND", "path": ["r0"], "message": "nope"}]
+        })
+        .to_string();
+        let (bin, _shim) = fake_gh(dir.path(), &reply, 1);
+        let states = retry_on_etxtbsy(|| fetch_states(&bin, &[item_ref("gone/repo", 1)])).unwrap();
+        assert_eq!(states, [None]);
+    }
+
+    #[test]
+    fn fetch_states_fails_on_any_other_graphql_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = serde_json::json!({
+            "data": {"r0": null},
+            "errors": [{"type": "RATE_LIMITED", "message": "slow down"}]
+        })
+        .to_string();
+        let (bin, _shim) = fake_gh(dir.path(), &reply, 1);
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        assert!(retry_on_etxtbsy(|| fetch_states(&bin, &refs)).is_err());
+    }
+
+    #[test]
+    fn fetch_states_rejects_an_unrecognised_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(dir.path(), &state_reply("DRAFT"), 0);
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        let err = retry_on_etxtbsy(|| fetch_states(&bin, &refs)).unwrap_err();
+        assert!(err.to_string().contains("unrecognised state"), "{err}");
+    }
+
+    #[test]
+    fn a_cached_issue_whose_state_is_unchanged_is_served_after_one_shallow_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_holding(cache_dir.path(), ItemState::Open);
+        let (bin, _shim) = state_gh(dir.path(), &state_reply("OPEN"), &issue_reply("OPEN"));
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        let docs =
+            retry_on_etxtbsy(|| fetch_issues_cached_current(&bin, &cache, &refs, None)).unwrap();
+        assert_eq!(docs[0].title, "cached");
+        assert_eq!(kinds(dir.path()), ["state"]);
+        assert!(cache.reuse_note().is_some());
+    }
+
+    #[test]
+    fn a_cached_open_issue_closed_since_is_refetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_holding(cache_dir.path(), ItemState::Open);
+        let (bin, _shim) = state_gh(dir.path(), &state_reply("CLOSED"), &issue_reply("CLOSED"));
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        let docs =
+            retry_on_etxtbsy(|| fetch_issues_cached_current(&bin, &cache, &refs, None)).unwrap();
+        assert_eq!(
+            (docs[0].title.as_str(), docs[0].state),
+            ("fresh", ItemState::Closed)
+        );
+        assert_eq!(kinds(dir.path()), ["state", "full"]);
+        assert!(cache.reuse_note().is_none(), "a refetch is not a reuse");
+
+        // The refetched copy was written back.
+        let later = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        let docs =
+            retry_on_etxtbsy(|| fetch_issues_cached_current(&bin, &later, &refs, None)).unwrap();
+        assert_eq!(docs[0].state, ItemState::Closed);
+        assert_eq!(kinds(dir.path()), ["state", "full", "state"]);
+    }
+
+    #[test]
+    fn a_listed_open_issue_cached_as_closed_is_refetched_without_a_state_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_holding(cache_dir.path(), ItemState::Closed);
+        let (bin, _shim) = state_gh(dir.path(), &state_reply("OPEN"), &issue_reply("OPEN"));
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        let docs = retry_on_etxtbsy(|| {
+            fetch_issues_cached_current(&bin, &cache, &refs, Some(ItemState::Open))
+        })
+        .unwrap();
+        assert_eq!(docs[0].state, ItemState::Open);
+        assert_eq!(kinds(dir.path()), ["full"]);
+    }
+
+    #[test]
+    fn a_listed_open_issue_cached_as_open_costs_no_call_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_holding(cache_dir.path(), ItemState::Open);
+        let (bin, _shim) = state_gh(dir.path(), &state_reply("OPEN"), &issue_reply("OPEN"));
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        let docs = retry_on_etxtbsy(|| {
+            fetch_issues_cached_current(&bin, &cache, &refs, Some(ItemState::Open))
+        })
+        .unwrap();
+        assert_eq!(docs[0].title, "cached");
+        assert!(kinds(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_cold_cache_makes_no_state_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        let (bin, _shim) = state_gh(dir.path(), &state_reply("OPEN"), &issue_reply("OPEN"));
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        retry_on_etxtbsy(|| fetch_issues_cached_current(&bin, &cache, &refs, None)).unwrap();
+        assert_eq!(kinds(dir.path()), ["full"]);
+        // The copy this run stored is as fresh as a fetch: no recheck either.
+        retry_on_etxtbsy(|| fetch_issues_cached_current(&bin, &cache, &refs, None)).unwrap();
+        assert_eq!(kinds(dir.path()), ["full"]);
+    }
+
+    #[test]
+    fn refresh_makes_no_state_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        cache_holding(cache_dir.path(), ItemState::Open);
+        let refresh = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, true);
+        let (bin, _shim) = state_gh(dir.path(), &state_reply("OPEN"), &issue_reply("OPEN"));
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        retry_on_etxtbsy(|| fetch_issues_cached_current(&bin, &refresh, &refs, None)).unwrap();
+        assert_eq!(kinds(dir.path()), ["full"]);
+    }
+
+    #[test]
+    fn a_cached_item_github_cannot_find_is_refetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_holding(cache_dir.path(), ItemState::Open);
+        let gone = serde_json::json!({
+            "data": {"r0": {"i0": null}},
+            "errors": [{"type": "NOT_FOUND", "path": ["r0", "i0"], "message": "nope"}]
+        })
+        .to_string();
+        let (bin, _shim) = state_gh(dir.path(), &gone, &gone);
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        let docs =
+            retry_on_etxtbsy(|| fetch_items_cached_current(&bin, &cache, &refs, None)).unwrap();
+        assert!(docs[0].is_none());
+        assert_eq!(kinds(dir.path()), ["state", "full"]);
+    }
+
+    #[test]
+    fn fetch_items_cached_current_refetches_a_cached_item_closed_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_holding(cache_dir.path(), ItemState::Open);
+        let (bin, _shim) = state_gh(dir.path(), &state_reply("CLOSED"), &issue_reply("CLOSED"));
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        let docs =
+            retry_on_etxtbsy(|| fetch_items_cached_current(&bin, &cache, &refs, None)).unwrap();
+        assert_eq!(docs[0].as_ref().unwrap().state, ItemState::Closed);
+        assert_eq!(kinds(dir.path()), ["state", "full"]);
     }
 
     /// Runs the shim once so its first `execve` (which can hit `ETXTBSY`, and

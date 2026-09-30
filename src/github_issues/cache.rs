@@ -187,13 +187,13 @@ impl IssueCache {
         Self::build(Some(root), dir, ttl, refresh)
     }
 
-    /// Returns the cached doc for `item_ref` if it is fresh and `accept`s it,
-    /// counting the reuse. Never deletes: see the module docs.
-    pub(super) fn lookup(
-        &self,
-        item_ref: &ItemRef,
-        accept: impl Fn(&IssueDoc) -> bool,
-    ) -> Option<IssueDoc> {
+    /// Reads `item_ref`'s entry if it exists, is readable and is still fresh,
+    /// with its age in seconds. Never deletes and never counts a reuse: see
+    /// the module docs.
+    ///
+    /// A corrupt or old-layout entry is a miss; the fetch it triggers rewrites
+    /// it, so it heals itself (debug, not warn).
+    fn read_fresh(&self, item_ref: &ItemRef) -> Option<(IssueDoc, u64)> {
         if self.refresh {
             return None;
         }
@@ -207,8 +207,6 @@ impl IssueCache {
                 return None;
             }
         };
-        // A corrupt or old-layout entry is a miss; the fetch it triggers
-        // rewrites it, so it heals itself (debug, not warn).
         let entry = match serde_json::from_slice::<Entry>(&bytes) {
             Ok(entry) if entry.schema == SCHEMA => entry,
             Ok(_) => return None,
@@ -219,24 +217,46 @@ impl IssueCache {
             }
         };
         let age = self.fresh_age(entry.fetched_at)?;
-        // A mismatched key or a rejected kind is a miss but still a valid
-        // entry (a cached pull request serves `fetch_items`), so it is kept.
+        // A mismatched key is a miss but still a valid entry, so it is kept.
         // GitHub names are case-insensitive, and so is the entry's path.
         if !entry.doc.project.eq_ignore_ascii_case(&item_ref.project)
             || entry.doc.number != item_ref.number
-            || !accept(&entry.doc)
         {
             return None;
         }
+        Some((entry.doc, age))
+    }
+
+    /// Returns the cached doc for `item_ref` if it is fresh and `accept`s it,
+    /// counting the reuse. Never deletes: see the module docs.
+    pub(super) fn lookup(
+        &self,
+        item_ref: &ItemRef,
+        accept: impl Fn(&IssueDoc) -> bool,
+    ) -> Option<IssueDoc> {
+        // A rejected kind or state is a miss but still a valid entry (a cached
+        // pull request serves `fetch_items`), so it is kept.
+        let (mut doc, age) = self.read_fresh(item_ref).filter(|(doc, _)| accept(doc))?;
         if !self.stored_this_run(&item_ref.project, item_ref.number) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.oldest_hit_secs.fetch_max(age, Ordering::Relaxed);
         }
         // The caller's spelling, so the doc is what an uncached fetch of this
         // ref would have returned.
-        let mut doc = entry.doc;
         doc.project.clone_from(&item_ref.project);
         Some(doc)
+    }
+
+    /// The `refs` [`lookup`](Self::lookup) could serve from disk, before any
+    /// `accept` check, except those this run stored itself (as fresh as a
+    /// fetch). For a caller that must validate something about those entries
+    /// (their `state`) against GitHub before trusting them; it counts no
+    /// reuse.
+    pub(super) fn cached_refs<'a>(&self, refs: &'a [ItemRef]) -> Vec<&'a ItemRef> {
+        refs.iter()
+            .filter(|item_ref| !self.stored_this_run(&item_ref.project, item_ref.number))
+            .filter(|item_ref| self.read_fresh(item_ref).is_some())
+            .collect()
     }
 
     /// Deletes every expired entry, and every temp file a crashed write
