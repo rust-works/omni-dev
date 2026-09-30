@@ -220,6 +220,22 @@ omni-dev: coverage tolerate-line reason="…"
   silently to EOF — that would silence an unbounded amount of code nobody looked
   at.
 
+### Check marker syntax locally
+
+```bash
+omni-dev coverage lint-markers
+omni-dev coverage lint-markers src/bits/popcount.rs
+omni-dev coverage lint-markers -C /path/to/repo src/bits/popcount.rs
+```
+
+With no paths, the command checks every tracked `.rs` file in the Git index
+against its current working-tree contents, including staged additions and
+unstaged edits. Deleted worktree files are skipped. Explicit paths select only
+those files, including untracked files, and are relative to the repository root
+unless absolute. Malformed markers print the same `path:line` diagnostics as
+`coverage diff` and make the command exit nonzero. No coverage report or
+`llvm-cov` run is needed. `scripts/build.sh` runs this check after formatting.
+
 ### How masking works, precisely
 
 For each head file, the tolerated head lines are scored with the hit status of

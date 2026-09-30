@@ -1,6 +1,7 @@
 //! Coverage analysis CLI commands.
 
 pub(crate) mod diff;
+pub(crate) mod lint_markers;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -21,7 +22,9 @@ pub struct CoverageCommand {
 #[derive(Subcommand)]
 pub enum CoverageSubcommands {
     /// Analyses diff/patch coverage from a per-line report and a git diff.
-    Diff(diff::DiffCommand),
+    Diff(Box<diff::DiffCommand>),
+    /// Checks source coverage markers without generating a coverage report.
+    LintMarkers(lint_markers::LintMarkersCommand),
 }
 
 impl CoverageCommand {
@@ -33,6 +36,7 @@ impl CoverageCommand {
         let repo = self.repo.path();
         match self.command {
             CoverageSubcommands::Diff(cmd) => cmd.execute(repo),
+            CoverageSubcommands::LintMarkers(cmd) => cmd.execute(repo),
         }
     }
 }
@@ -47,7 +51,7 @@ mod tests {
     #[test]
     fn dispatches_to_diff() {
         let cmd = CoverageCommand {
-            command: CoverageSubcommands::Diff(diff::DiffCommand {
+            command: CoverageSubcommands::Diff(Box::new(diff::DiffCommand {
                 report: std::path::PathBuf::from("/nonexistent/report.lcov"),
                 report_format: diff::ReportFormat::Auto,
                 base_ref: Some("HEAD".to_string()),
@@ -67,7 +71,7 @@ mod tests {
                 base_sha: None,
                 head_sha: None,
                 commit_url: None,
-            }),
+            })),
             repo: crate::cli::repo_arg::RepoArg::default(),
         };
         // Reaches the leaf command and fails on the missing report file.
