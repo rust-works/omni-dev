@@ -1,5 +1,8 @@
-//! The one resolver for secret environment variables and their `_FILE`
-//! companions (issue #2006, [ADR-0089](../../docs/adrs/adr-0089.md),
+//! The one resolver for secret environment variables and their companions.
+//!
+//! Covers `_FILE` and `_COMMAND` (issues #2006 and #2011,
+//! [ADR-0089](../../docs/adrs/adr-0089.md),
+//! [ADR-0090](../../docs/adrs/adr-0090.md),
 //! [STYLE-0030](../../docs/STYLE_GUIDE.md)).
 //!
 //! Every secret omni-dev reads from the environment (or the settings.json
@@ -8,17 +11,21 @@
 //! naming a file whose contents are the secret — the Docker/Kubernetes secrets
 //! convention — so a secret can stay out of `env` listings,
 //! `/proc/<pid>/environ`, shell history, child processes, and settings.json.
+//! Each also accepts a `<NAME>_COMMAND` companion naming a helper program
+//! whose output is the secret, fetched on demand from a store that does not
+//! keep it as plaintext on disk — see the `command` submodule for its rules.
 //!
 //! The rules, each pinned by a test below:
 //!
 //! - Empty values (`NAME=`, `NAME_FILE=`) count as unset, so an exported
 //!   variable can still be neutralised for one invocation.
-//! - `NAME` and `NAME_FILE` both set **in the same layer** is an error naming
-//!   both. Layers (process env, then the active profile's or base settings
-//!   `env`) are resolved as pairs through [`EnvSource::var_pair`], so a
-//!   `NAME_FILE` in the process env overrides a `NAME` in settings.json.
-//! - Aliases keep their existing precedence: the first name whose pair is set
-//!   wins, and a conflict is only ever within one name's pair.
+//! - Two of `NAME`, `NAME_FILE` and `NAME_COMMAND` set **in the same layer**
+//!   is an error naming them. Layers (process env, then the active profile's
+//!   or base settings `env`) are resolved as triples through
+//!   [`EnvSource::var_triple`], so a `NAME_FILE` in the process env overrides
+//!   a `NAME` in settings.json.
+//! - Aliases keep their existing precedence: the first name whose triple is
+//!   set wins, and a conflict is only ever within one name's triple.
 //! - The path must be absolute; symlinks are followed and the **target** must
 //!   be a regular file. On Unix it must be either owned by the effective uid
 //!   and owner-only (`mode & 0o077 == 0`), or owned by root and not writable
@@ -37,8 +44,16 @@ use thiserror::Error;
 use crate::utils::env::EnvSource;
 use crate::utils::secret::Secret;
 
+mod command;
+
+pub use command::{TIMEOUT_VAR as COMMAND_TIMEOUT_VAR, TTL_VAR as COMMAND_TTL_VAR};
+
 /// Suffix of the companion variable naming a file that holds the secret.
 pub const FILE_SUFFIX: &str = "_FILE";
+
+/// Suffix of the companion variable naming a helper command whose output is
+/// the secret (ADR-0090).
+pub const COMMAND_SUFFIX: &str = "_COMMAND";
 
 /// Every secret environment variable omni-dev reads. Each is read only
 /// through this module and so always accepts a `<NAME>_FILE` companion.
@@ -105,6 +120,93 @@ pub enum SecretEnvError {
         name: String,
         /// Its `_FILE` companion.
         file_var: String,
+    },
+
+    /// Two or more of `NAME`, `NAME_FILE` and `NAME_COMMAND` are set in the
+    /// same layer, at least one of them the command.
+    #[error("{} are set; set only one of them", join_names(set))]
+    CommandConflict {
+        /// The variables that are set, in `NAME`, `NAME_FILE`, `NAME_COMMAND`
+        /// order.
+        set: Vec<String>,
+    },
+
+    /// The `_COMMAND` value cannot be split into a program and arguments.
+    #[error("cannot run the command named by {command_var}: {reason}")]
+    CommandSplit {
+        /// The variable naming the command.
+        command_var: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+
+    /// The command's program could not be started.
+    #[error("cannot run {program}, named by {command_var}: {source}{hint}")]
+    CommandSpawn {
+        /// The variable naming the command.
+        command_var: String,
+        /// The program (`argv[0]`); the arguments are never shown.
+        program: String,
+        /// A remedy for a program not found, or empty.
+        hint: &'static str,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// The command ran but did not exit successfully.
+    #[error("{program}, named by {command_var}, failed ({status}){detail}")]
+    CommandFailed {
+        /// The variable naming the command.
+        command_var: String,
+        /// The program (`argv[0]`); the arguments are never shown.
+        program: String,
+        /// `exit code N` or the signal that ended it.
+        status: String,
+        /// Its escaped, truncated standard error as `: <text>`, or empty.
+        detail: String,
+    },
+
+    /// The command did not finish in time and was killed.
+    #[error(
+        "{program}, named by {command_var}, did not finish within {secs}s and was killed; \
+         raise {COMMAND_TIMEOUT_VAR} if it is waiting for you to approve a prompt"
+    )]
+    CommandTimedOut {
+        /// The variable naming the command.
+        command_var: String,
+        /// The program (`argv[0]`); the arguments are never shown.
+        program: String,
+        /// The timeout that expired.
+        secs: u64,
+    },
+
+    /// The command wrote more than the accepted amount to standard output.
+    #[error("{program}, named by {command_var}, wrote more than {limit} bytes of output")]
+    CommandOutputTooLarge {
+        /// The variable naming the command.
+        command_var: String,
+        /// The program (`argv[0]`); the arguments are never shown.
+        program: String,
+        /// The most output accepted.
+        limit: usize,
+    },
+
+    /// The command succeeded but wrote nothing (after trimming one newline).
+    #[error("{program}, named by {command_var}, printed no secret")]
+    CommandEmptyOutput {
+        /// The variable naming the command.
+        command_var: String,
+        /// The program (`argv[0]`); the arguments are never shown.
+        program: String,
+    },
+
+    /// The command's output is not valid UTF-8.
+    #[error("the output of {program}, named by {command_var}, is not valid UTF-8")]
+    CommandNotUtf8 {
+        /// The variable naming the command.
+        command_var: String,
+        /// The program (`argv[0]`); the arguments are never shown.
+        program: String,
     },
 
     /// The `_FILE` value is not an absolute path.
@@ -231,6 +333,15 @@ pub enum SecretEnvError {
     },
 }
 
+/// `a, b and c` / `a and b`, for a conflict message.
+fn join_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => only.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
 /// Formats permission bits as `0644`.
 struct OctalMode(u32);
 
@@ -246,22 +357,50 @@ pub fn file_var_name(name: &str) -> String {
     format!("{name}{FILE_SUFFIX}")
 }
 
-/// Resolves the secret `name`, from `name` itself or from the file its
-/// `name_FILE` companion points at. `Ok(None)` means neither is set.
+/// Returns `<name>_COMMAND`.
+#[must_use]
+pub fn command_var_name(name: &str) -> String {
+    format!("{name}{COMMAND_SUFFIX}")
+}
+
+/// Resolves the secret `name`, from `name` itself, from the file its
+/// `name_FILE` companion points at, or from the output of the helper its
+/// `name_COMMAND` companion names. `Ok(None)` means none is set.
 ///
 /// # Errors
 ///
-/// See [`SecretEnvError`]: both set in one layer, or a `_FILE` that is
-/// relative, unreadable, not a regular file, empty, not UTF-8, or neither
-/// the current user's and owner-only nor root's and read-only to others.
+/// See [`SecretEnvError`]: two set in one layer; a `_FILE` that is relative,
+/// unreadable, not a regular file, empty, not UTF-8, or neither the current
+/// user's and owner-only nor root's and read-only to others; or a `_COMMAND`
+/// that cannot be split or run, fails, times out, or prints nothing usable.
 pub fn secret_var(env: &impl EnvSource, name: &str) -> Result<Option<Secret>, SecretEnvError> {
     debug_assert!(
         SECRET_ENV_VARS.contains(&name),
         "{name} must be registered in SECRET_ENV_VARS"
     );
     let file_var = file_var_name(name);
-    let (value, file) = env.var_pair(name, &file_var);
-    resolve_secret_pair(name, value.as_deref(), &file_var, file.as_deref())
+    let command_var = command_var_name(name);
+    let (value, file, command) = env.var_triple(name, &file_var, &command_var);
+    let value = value.filter(|v| !v.is_empty());
+    let file = file.filter(|v| !v.is_empty());
+    let command = command.filter(|v| !v.is_empty());
+    match (value.as_deref(), file.as_deref(), command.as_deref()) {
+        (value, file, None) => resolve_secret_pair(name, value, &file_var, file),
+        (None, None, Some(command)) => {
+            command::resolve(&command_var, command, command::Limits::from_env(env)).map(Some)
+        }
+        (value, file, Some(_)) => Err(SecretEnvError::CommandConflict {
+            set: [
+                value.map(|_| name),
+                file.map(|_| file_var.as_str()),
+                Some(command_var.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .map(str::to_string)
+            .collect(),
+        }),
+    }
 }
 
 /// Resolves one already-read secret pair: the secret held directly
@@ -314,16 +453,20 @@ pub fn secret_var_any(
     Ok(None)
 }
 
-/// Whether `name` or its `_FILE` companion is set (non-empty), without
-/// reading the file. For presence-only reports such as `auth status`.
+/// Whether any of `name`, `name_FILE` or `name_COMMAND` is set (non-empty).
+///
+/// Reads no file and runs no command — a status report must never prompt. For
+/// presence-only reports such as `auth status`.
 #[must_use]
 pub fn secret_var_is_set(env: &impl EnvSource, name: &str) -> bool {
     debug_assert!(
         SECRET_ENV_VARS.contains(&name),
         "{name} must be registered in SECRET_ENV_VARS"
     );
-    let (value, file) = env.var_pair(name, &file_var_name(name));
-    value.is_some_and(|v| !v.is_empty()) || file.is_some_and(|v| !v.is_empty())
+    let (value, file, command) =
+        env.var_triple(name, &file_var_name(name), &command_var_name(name));
+    let set = |v: Option<String>| v.is_some_and(|v| !v.is_empty());
+    set(value) || set(file) || set(command)
 }
 
 /// Reads a secret from `path`, which the variable `file_var` named.
@@ -918,6 +1061,148 @@ mod tests {
         assert!(!secret_var_is_set(&MapEnv::new(), NAME));
     }
 
+    // ── `_COMMAND` (#2011, ADR-0090) ──
+
+    const COMMAND_VAR: &str = "DATADOG_API_KEY_COMMAND";
+
+    /// Zero disables the cache, so a test never sees another's result.
+    fn command_env(command: &str) -> MapEnv {
+        MapEnv::new()
+            .with(COMMAND_VAR, command)
+            .with(COMMAND_TTL_VAR, "0")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_command_is_run() {
+        let env = command_env("/usr/bin/printf %s from-command");
+        assert_eq!(resolve(&env).unwrap().as_deref(), Some("from-command"));
+    }
+
+    #[test]
+    fn is_set_counts_a_command_without_running_it() {
+        // Would fail if run: the program does not exist.
+        let env = MapEnv::new().with(COMMAND_VAR, "/definitely/not/there");
+        assert!(secret_var_is_set(&env, NAME));
+        assert!(!secret_var_is_set(
+            &MapEnv::new().with(COMMAND_VAR, ""),
+            NAME
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_set_never_spawns_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let env = command_env(&format!("/usr/bin/touch {}", marker.display()));
+        assert!(secret_var_is_set(&env, NAME));
+        assert!(!marker.exists(), "a status check ran the helper");
+    }
+
+    #[test]
+    fn an_empty_command_counts_as_unset() {
+        let env = MapEnv::new().with(COMMAND_VAR, "").with(NAME, "direct");
+        assert_eq!(resolve(&env).unwrap().as_deref(), Some("direct"));
+        assert_eq!(resolve(&MapEnv::new().with(COMMAND_VAR, "")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_command_with_either_other_source_is_a_conflict_naming_every_one_set() {
+        let (_tmp, path) = secret_file(b"x\n", 0o600);
+        let file = path.to_str().unwrap();
+        let cases: [(MapEnv, &str); 3] = [
+            (
+                MapEnv::new().with(NAME, "v").with(COMMAND_VAR, "/bin/true"),
+                "DATADOG_API_KEY and DATADOG_API_KEY_COMMAND are set",
+            ),
+            (
+                MapEnv::new()
+                    .with(FILE_VAR, file)
+                    .with(COMMAND_VAR, "/bin/true"),
+                "DATADOG_API_KEY_FILE and DATADOG_API_KEY_COMMAND are set",
+            ),
+            (
+                MapEnv::new()
+                    .with(NAME, "v")
+                    .with(FILE_VAR, file)
+                    .with(COMMAND_VAR, "/bin/true"),
+                "DATADOG_API_KEY, DATADOG_API_KEY_FILE and DATADOG_API_KEY_COMMAND are set",
+            ),
+        ];
+        for (env, expected) in cases {
+            let err = resolve(&env).unwrap_err();
+            assert!(
+                matches!(err, SecretEnvError::CommandConflict { .. }),
+                "{err}"
+            );
+            assert!(err.to_string().starts_with(expected), "{err}");
+            assert!(err.to_string().ends_with("set only one of them"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_conflict_never_runs_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let env = MapEnv::new()
+            .with(NAME, "v")
+            .with(COMMAND_VAR, &format!("/usr/bin/touch {}", marker.display()));
+        assert!(resolve(&env).is_err());
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliases_keep_precedence_across_commands() {
+        let names = ["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"];
+        let env = MapEnv::new()
+            .with("OPENAI_API_KEY_COMMAND", "/usr/bin/printf %s first")
+            .with("OPENAI_AUTH_TOKEN", "second")
+            .with(COMMAND_TTL_VAR, "0");
+        assert_eq!(
+            secret_var_any(&env, &names)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            "first"
+        );
+        // A conflict within the winning name is still an error; the later
+        // alias is never consulted.
+        let env = MapEnv::new()
+            .with("OPENAI_API_KEY", "a")
+            .with("OPENAI_API_KEY_COMMAND", "/bin/true")
+            .with("OPENAI_AUTH_TOKEN", "b");
+        assert!(secret_var_any(&env, &names).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_command_reports_the_variable_and_never_the_arguments() {
+        let env = command_env("/bin/sh -c 'exit 7' --token=hunter2");
+        let err = resolve(&env).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(COMMAND_VAR), "{text}");
+        assert!(text.contains("exit code 7"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+    }
+
+    #[test]
+    fn the_command_knobs_are_read_through_the_env_source() {
+        // A 1s timeout from the MapEnv, not the process environment.
+        let env = MapEnv::new()
+            .with(COMMAND_VAR, "/bin/sleep 5")
+            .with(COMMAND_TIMEOUT_VAR, "1")
+            .with(COMMAND_TTL_VAR, "0");
+        if cfg!(unix) {
+            let err = resolve(&env).unwrap_err();
+            assert!(
+                matches!(err, SecretEnvError::CommandTimedOut { .. }),
+                "{err}"
+            );
+        }
+    }
+
     #[test]
     fn registry_and_exemptions_are_disjoint_and_unique() {
         let mut seen = std::collections::BTreeSet::new();
@@ -927,6 +1212,7 @@ mod tests {
         {
             assert!(seen.insert(*name), "{name} is listed twice");
             assert!(!name.ends_with(FILE_SUFFIX), "{name}");
+            assert!(!name.ends_with(COMMAND_SUFFIX), "{name}");
         }
     }
 
@@ -1203,13 +1489,16 @@ mod tests {
         after_paren
     }
 
-    /// (c) No registered `<NAME>_FILE` collides with a variable that already
-    /// means something else: the companion names must not appear as literals
-    /// anywhere in production code (they are only ever built by
-    /// [`file_var_name`]).
+    /// (c) No registered `<NAME>_FILE` or `<NAME>_COMMAND` collides with a
+    /// variable that already means something else: the companion names must
+    /// not appear as literals anywhere in production code (they are only ever
+    /// built by [`file_var_name`] and [`command_var_name`]).
     #[test]
     fn no_registered_file_companion_collides_with_an_existing_variable() {
-        let companions: Vec<String> = SECRET_ENV_VARS.iter().map(|n| file_var_name(n)).collect();
+        let companions: Vec<String> = SECRET_ENV_VARS
+            .iter()
+            .flat_map(|n| [file_var_name(n), command_var_name(n)])
+            .collect();
         let mut collisions = Vec::new();
         for source in production_sources() {
             for name in env_like_literals(&source.code) {
@@ -1220,11 +1509,39 @@ mod tests {
         }
         assert!(
             collisions.is_empty(),
-            "a registered secret's _FILE companion is already a variable with another \
-             meaning; rename it or exempt the secret (ADR-0089): {collisions:#?}"
+            "a registered secret's _FILE or _COMMAND companion is already a variable with \
+             another meaning; rename it or exempt the secret (ADR-0089, ADR-0090): \
+             {collisions:#?}"
         );
         // The known collision is why GMAIL_CLIENT_SECRET is exempt.
         assert!(!SECRET_ENV_VARS.contains(&"GMAIL_CLIENT_SECRET"));
+    }
+
+    /// (d) Only the resolver, the settings writers and the `claude-cli` scrub
+    /// know how a `_COMMAND` companion is spelled: everything else reaches a
+    /// helper through [`secret_var`], so no call site can run one itself or
+    /// skip the timeout, the cap, or the cache (ADR-0090).
+    #[test]
+    fn only_the_resolver_writers_and_scrub_name_command_companions() {
+        const ALLOWED: [&str; 4] = [
+            "utils/secret_env.rs",
+            "utils/secret_env/command.rs",
+            "utils/settings.rs",
+            "claude/ai/claude_cli.rs",
+        ];
+        let mut strays = Vec::new();
+        for source in production_sources() {
+            let mentions =
+                source.code.contains("command_var_name(") || source.code.contains("COMMAND_SUFFIX");
+            if mentions && !ALLOWED.contains(&source.rel.as_str()) {
+                strays.push(source.rel); // omni-dev: coverage ignore-line reason="only runs if a stray file names the companion; strays.is_empty() below is this test's whole point"
+            }
+        }
+        assert!(
+            strays.is_empty(),
+            "read secrets through secret_var, not by naming their _COMMAND companion \
+             (ADR-0090): {strays:?}"
+        );
     }
 
     /// Self-check for the guards' source stripping: test modules go, the

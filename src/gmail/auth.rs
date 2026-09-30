@@ -1054,6 +1054,9 @@ pub(crate) async fn login_to(
     browser: &BrowserConfig,
     token_endpoint: &str,
 ) -> Result<GmailAuthStatus> {
+    // Refuse before the browser flow, not after: a token it then could not
+    // save would be lost (ADR-0090).
+    Settings::ensure_secrets_replaceable(settings_path, profile, &[GMAIL_REFRESH_TOKEN])?;
     let credentials =
         run_login_flow(client_id, client_secret, scope, browser, token_endpoint).await?;
     save_credentials_to(settings_path, profile, &credentials)?;
@@ -1724,6 +1727,41 @@ mod tests {
     /// retries the whole attempt (via [`run_with_port_retry`]) if it loses
     /// the ephemeral-port race. Asserts no settings file was written and
     /// returns the resulting error for the caller to inspect.
+    #[tokio::test]
+    async fn login_to_refuses_before_the_browser_flow_when_the_token_is_command_fetched() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let settings_path = temp_dir.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"env": {"GMAIL_REFRESH_TOKEN_COMMAND": "op read op://v/secret"}}"#,
+        )
+        .unwrap();
+        let browser = BrowserConfig {
+            launch: BrowserLaunch::Manual,
+            callback_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            callback_port: 0,
+        };
+        // Manual launch would wait for a callback that never comes, so a
+        // timeout means the refusal came too late.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            login_to(
+                &settings_path,
+                None,
+                "client-id",
+                &Secret::new("client-secret"),
+                GmailScope::ReadOnly,
+                &browser,
+                "http://127.0.0.1:1/token",
+            ),
+        )
+        .await
+        .expect("login must refuse before starting the browser flow");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("GMAIL_REFRESH_TOKEN_COMMAND"), "{err}");
+        assert!(!err.contains("op read"), "{err}");
+    }
+
     async fn run_login_to_expect_err(request_line: &'static [u8]) -> anyhow::Error {
         std::fs::create_dir_all("tmp").ok();
         let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();

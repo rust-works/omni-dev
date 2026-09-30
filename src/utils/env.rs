@@ -16,6 +16,10 @@
 //! settings.json fallback layer composes on top of it — see
 //! [`crate::utils::settings`].
 
+/// The `NAME`, `NAME_FILE` and `NAME_COMMAND` values of one secret, read from a
+/// single layer by [`EnvSource::var_triple`].
+pub type SecretTriple = (Option<String>, Option<String>, Option<String>);
+
 /// A read-only view of environment variables.
 ///
 /// Implemented by [`SystemEnv`] (the real process environment) in production
@@ -31,16 +35,17 @@ pub trait EnvSource {
         keys.iter().find_map(|k| self.var(k))
     }
 
-    /// Returns `key` and `file_key` **from the same layer**, for the secret
-    /// resolver's `NAME`/`NAME_FILE` pairs
+    /// Returns `key`, `file_key` and `command_key` **from the same layer**,
+    /// for the secret resolver's `NAME`/`NAME_FILE`/`NAME_COMMAND` triples
     /// ([`crate::utils::secret_env`]).
     ///
-    /// A single-layer source returns both lookups. A layered source
+    /// A single-layer source returns all three lookups. A layered source
     /// (settings.json's [`SettingsEnv`](crate::utils::settings::SettingsEnv))
-    /// overrides this to return the pair from the highest-precedence layer
-    /// that sets either, so a conflict is only ever detected within one layer.
-    fn var_pair(&self, key: &str, file_key: &str) -> (Option<String>, Option<String>) {
-        (self.var(key), self.var(file_key))
+    /// overrides this to return the triple from the highest-precedence layer
+    /// that sets any member, so a conflict is only ever detected within one
+    /// layer.
+    fn var_triple(&self, key: &str, file_key: &str, command_key: &str) -> SecretTriple {
+        (self.var(key), self.var(file_key), self.var(command_key))
     }
 }
 
@@ -64,8 +69,8 @@ impl<T: EnvSource + ?Sized> EnvSource for &T {
         (**self).var(key)
     }
 
-    fn var_pair(&self, key: &str, file_key: &str) -> (Option<String>, Option<String>) {
-        (**self).var_pair(key, file_key)
+    fn var_triple(&self, key: &str, file_key: &str, command_key: &str) -> SecretTriple {
+        (**self).var_triple(key, file_key, command_key)
     }
 }
 
@@ -165,15 +170,22 @@ mod tests {
     }
 
     #[test]
-    fn reference_forwards_var_pair_to_inner_source() {
-        let env = MapEnv::new().with("K", "v").with("K_FILE", "f");
-        fn read_pair(src: &impl EnvSource) -> (Option<String>, Option<String>) {
-            src.var_pair("K", "K_FILE")
+    fn reference_forwards_var_triple_to_inner_source() {
+        let env = MapEnv::new()
+            .with("K", "v")
+            .with("K_FILE", "f")
+            .with("K_COMMAND", "c");
+        fn read_triple(src: &impl EnvSource) -> SecretTriple {
+            src.var_triple("K", "K_FILE", "K_COMMAND")
         }
-        // &MapEnv's var_pair must also forward, not just var.
+        // &MapEnv's var_triple must also forward, not just var.
         assert_eq!(
-            read_pair(&&env),
-            (Some("v".to_string()), Some("f".to_string()))
+            read_triple(&&env),
+            (
+                Some("v".to_string()),
+                Some("f".to_string()),
+                Some("c".to_string())
+            )
         );
     }
 
