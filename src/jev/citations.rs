@@ -9,6 +9,7 @@
 //! project's own optimization notes call out.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::OnceLock;
 
 use regex::{Captures, Regex};
@@ -26,6 +27,18 @@ pub struct Citation {
     pub raw: String,
     /// Resolved web URL, populated by route's item lookup when available.
     pub url: Option<String>,
+}
+
+/// One occurrence of a citation, before target-level deduplication.
+///
+/// Route uses the byte range to read the wording around every mention,
+/// including a later explicit dependency after an earlier bare reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CitationMention {
+    /// The resolved citation at this occurrence.
+    pub citation: Citation,
+    /// Byte range of the raw reference within the input text.
+    pub range: Range<usize>,
 }
 
 fn citation_regex() -> &'static Regex {
@@ -145,6 +158,25 @@ pub(crate) fn first_citation(text: &str, default_project: &str) -> Option<(Strin
 pub fn find_citations(body: &str, default_project: &str, judged: &ItemRef) -> Vec<Citation> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
+    for mention in find_citation_mentions(body, default_project, judged) {
+        let citation = mention.citation;
+        if seen.insert((citation.item_ref.project.clone(), citation.item_ref.number)) {
+            out.push(citation);
+        }
+    }
+    out
+}
+
+/// Finds every citation occurrence, retaining repeated references and their
+/// byte ranges. Uses the same matching and boundary rules as
+/// [`find_citations`].
+#[must_use]
+pub fn find_citation_mentions(
+    body: &str,
+    default_project: &str,
+    judged: &ItemRef,
+) -> Vec<CitationMention> {
+    let mut out = Vec::new();
     for caps in citation_regex().captures_iter(body) {
         let Some(end) = number_end(&caps) else {
             continue; // a non-issue URL, matched only so it cannot be mis-read
@@ -158,16 +190,19 @@ pub fn find_citations(body: &str, default_project: &str, judged: &ItemRef) -> Ve
         if project == judged.project && number == judged.number {
             continue;
         }
-        if seen.insert((project.clone(), number)) {
-            out.push(Citation {
-                item_ref: ItemRef {
-                    provider: judged.provider,
-                    project,
-                    kind,
-                    number,
+        if let Some(matched) = caps.get(0) {
+            out.push(CitationMention {
+                range: matched.range(),
+                citation: Citation {
+                    item_ref: ItemRef {
+                        provider: judged.provider,
+                        project,
+                        kind,
+                        number,
+                    },
+                    raw: caps[0].to_string(),
+                    url: None,
                 },
-                raw: caps[0].to_string(),
-                url: None,
             });
         }
     }
@@ -251,6 +286,19 @@ mod tests {
         );
         assert_eq!(cites.len(), 1);
         assert_eq!(cites[0].item_ref.number, 1614);
+    }
+
+    #[test]
+    fn mentions_keep_repeated_references_and_byte_ranges() {
+        let body = "See #1614. Later: blocked on #1614.";
+        let mentions = find_citation_mentions(body, "rust-works/omni-dev", &judged(1779));
+        assert_eq!(mentions.len(), 2);
+        assert_eq!(&body[mentions[0].range.clone()], "#1614");
+        assert_eq!(&body[mentions[1].range.clone()], "#1614");
+        assert_eq!(
+            find_citations(body, "rust-works/omni-dev", &judged(1779)).len(),
+            1
+        );
     }
 
     #[test]

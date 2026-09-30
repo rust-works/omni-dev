@@ -1,0 +1,26 @@
+{
+  "succinctly-2640-current": {
+    "spike": "pending_settled_fork",
+    "relations": {},
+    "reading": "A named cachegrind measurement uses an explicit ~3% threshold to choose close versus fuse; the measurement remains pending."
+  },
+  "succinctly-1779-current": {
+    "spike": "judgment",
+    "relations": {},
+    "reading": "A live yq probe is requested, but the action for each outcome is not already fixed."
+  },
+  "succinctly-2511-current": {
+    "spike": "none",
+    "relations": {
+      "1351": "blocker"
+    },
+    "reading": "Explicitly blocked on node identity; substantial implementation remains after that prerequisite."
+  },
+  "succinctly-2705-current": {
+    "spike": "none",
+    "relations": {
+      "2709": "blocker"
+    },
+    "reading": "Explicitly blocked on #2709; triage states conditional implementation steps if it has not landed."
+  }
+}
