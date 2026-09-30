@@ -51,6 +51,7 @@ def main():
         counts = Counter()
         stages = {stage: Counter() for stage in STAGES}
         flips = Counter()
+        close_calls = Counter()
         matched = Counter()
         tokens = Counter()
         seconds = 0
@@ -66,6 +67,9 @@ def main():
                 counts[winner] += 1
                 for stage, selected in zip(STAGES, choice):
                     stages[stage][selected] += 1
+                    close_calls[stage] += (
+                        item["answer"]["answers"][f"stage_{stage}"]["confidence"] < 0.3
+                    )
                 if variant == "legacy":
                     matched["original_three_rung"] += winner == labels[number]
                 matched["collapsed_fable_to_opus"] += (
@@ -82,6 +86,7 @@ def main():
             "stage_counts": stages,
             "agreement_with_old_labels": matched,
             "repeat_flips": flips,
+            "close_calls_below_0_3": close_calls,
             "usage": tokens,
             "sum_request_seconds": round(seconds, 3),
         }
