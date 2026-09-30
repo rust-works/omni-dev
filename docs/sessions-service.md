@@ -566,7 +566,8 @@ on these events:
 | `PermissionRequest` | `{ "notification": "permission_prompt" }` → `waiting_for_permission` | Codex's dedicated approval event |
 | `PreToolUse` of `request_user_input` | `{ "notification": "agent_needs_input" }` → `waiting_for_input` | the clarifying-question UI is a tool call |
 | `Interrupt` | `stop` → `idle` | Esc/Ctrl-C mid-turn, or a declined approval in the TUI; `timeout: 3` |
-| `SubagentStart`, `SubagentStop`, `PreCompact`, `PostCompact` | `post_tool_use` → `working` | a heartbeat; subagents report the parent's `session_id` |
+| `SubagentStart` | `post_tool_use` → `working` | spawned by the parent's tool call, so always inside a turn; subagents report the parent's `session_id` |
+| `SubagentStop`, `PreCompact`, `PostCompact` | `transcript_discovered` → *unchanged* | each can fire on an idle session (`/compact` is `Stop · PreCompact · PostCompact`), and nothing afterwards would release a `working`; the thread lock keeps an idle session alive |
 | `SessionEnd` | the `end` op, with Codex's `reason` | `timeout: 3` (Codex caps it at 3 s) |
 
 **Position-stable install and uninstall.** Because Codex trusts a hook by its

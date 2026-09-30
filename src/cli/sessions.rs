@@ -435,8 +435,16 @@ fn session_event_for(
 ///   a wait for input until its `PostToolUse`;
 /// - `Interrupt` (Esc / Ctrl-C mid-turn, or a declined approval in the TUI) ends
 ///   the turn without a `Stop`, so it is one;
-/// - the compaction and subagent events carry the parent session's id and mean
-///   only that the session is busy — a working-state heartbeat;
+/// - `SubagentStart` carries the parent session's id and is caused by the
+///   parent's spawn tool call, so it can only occur inside a turn: `working`;
+/// - `SubagentStop`, `PreCompact` and `PostCompact` can fire while the session
+///   is idle — `/compact` is captured as `Stop · PreCompact · PostCompact`, and
+///   a subagent that is not joined can finish after the turn's `Stop` — and
+///   nothing after them would release a `working`, so, as for Claude (#1925),
+///   they are the state-preserving
+///   [`TranscriptDiscovered`](SessionEvent::TranscriptDiscovered) sighting.
+///   Liveness needs no heartbeat here: Codex's thread lock keeps an idle
+///   session alive (#1909);
 /// - a `SessionStart` with `source: "compact"` is not a new session, so, as for
 ///   Claude, it preserves the state rather than resetting it to `starting`
 ///   (#1946).
@@ -455,9 +463,8 @@ fn codex_session_event_for(
             SessionEvent::Notification(NotificationKind::AgentNeedsInput)
         }
         "PreToolUse" => SessionEvent::PreToolUse,
-        "PostToolUse" | "SubagentStart" | "SubagentStop" | "PreCompact" | "PostCompact" => {
-            SessionEvent::PostToolUse
-        }
+        "PostToolUse" | "SubagentStart" => SessionEvent::PostToolUse,
+        "SubagentStop" | "PreCompact" | "PostCompact" => SessionEvent::TranscriptDiscovered,
         "PermissionRequest" => SessionEvent::Notification(NotificationKind::PermissionPrompt),
         "Stop" | "Interrupt" => SessionEvent::Stop,
         _ => return None,
@@ -1733,8 +1740,14 @@ mod tests {
             "post_tool_use"
         );
         assert_eq!(codex_event("Interrupt", None), "stop");
-        for heartbeat in ["SubagentStart", "SubagentStop", "PreCompact", "PostCompact"] {
-            assert_eq!(codex_event(heartbeat, None), "post_tool_use", "{heartbeat}");
+        assert_eq!(codex_event("SubagentStart", None), "post_tool_use");
+        // Each of these can fire on an idle session, so none may turn it working.
+        for preserving in ["SubagentStop", "PreCompact", "PostCompact"] {
+            assert_eq!(
+                codex_event(preserving, None),
+                "transcript_discovered",
+                "{preserving}"
+            );
         }
         // Codex has no Notification event; an unknown one is ignored.
         assert!(codex_op(r#"{"session_id":"c1","hook_event_name":"Notification"}"#).is_none());
@@ -1812,6 +1825,25 @@ mod tests {
         for preserving in ["SubagentStop", "PreCompact", "PostCompact"] {
             let hook = json!({ "session_id": "s1", "hook_event_name": preserving });
             let (_, payload) = hook_op(&hook.to_string()).unwrap();
+            let event: SessionEvent = serde_json::from_value(payload["event"].clone()).unwrap();
+            assert_eq!(
+                SessionState::for_event(&event, Some(SessionState::Idle)),
+                SessionState::Idle,
+                "{preserving}"
+            );
+            assert_eq!(
+                SessionState::for_event(&event, Some(SessionState::WaitingForPermission)),
+                SessionState::WaitingForPermission,
+                "{preserving}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_codex_subagent_stop_or_compaction_leaves_an_idle_session_idle() {
+        for preserving in ["SubagentStop", "PreCompact", "PostCompact"] {
+            let hook = json!({ "session_id": "c1", "hook_event_name": preserving });
+            let (_, payload) = codex_op(&hook.to_string()).unwrap();
             let event: SessionEvent = serde_json::from_value(payload["event"].clone()).unwrap();
             assert_eq!(
                 SessionState::for_event(&event, Some(SessionState::Idle)),
