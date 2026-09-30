@@ -51,7 +51,7 @@ This skill performs the complete end-to-end release process for omni-dev, from v
    - `docs/RELEASE.md` - Release process still accurate?
    - `README.md` - Features and examples up to date?
    - `AGENTS.md` - AI guidance still relevant?
-   - `.Codex/skills/` - Skills reflect current workflows?
+   - `.agents/skills/` - Skills reflect current workflows?
 
    Update any docs that are outdated before proceeding.
 
