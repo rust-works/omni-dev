@@ -392,7 +392,9 @@ before #1927 may already have left beside it, so each event runs one sink.
 **un-customised** sink counts as stale: an `omni-dev sessions hook` with no
 arguments or only `--agent claude`. One with any other argument (a `--socket`, an
 `--agent codex`) is a deliberate choice, so install and uninstall leave it alone
-and print a note counting them; edit those by hand if they point at a moved binary.
+and print a note counting them; they keep running beside the canonical sink, so edit
+them by hand if they point at a moved binary. A sink behind a wrapper (`FOO=1 …`,
+`nice …`, `cd … &&`) is customised too.
 This is narrower than Codex, where every `sessions hook` entry is rewritten (below).
 
 The sink **never answers a `PermissionRequest`**. Claude Code reads that hook's

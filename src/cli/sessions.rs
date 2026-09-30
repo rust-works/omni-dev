@@ -1246,20 +1246,23 @@ impl ClaudeSync {
 /// `--socket`, an `--agent codex`) is a deliberate choice and is **not** stale:
 /// rewriting it to the canonical command would silently discard that choice.
 fn is_stale_claude_sink(command: &str) -> bool {
-    if !is_sessions_sink(command) {
-        return false;
-    }
-    let command = command.trim();
-    let Some(at) = command.find(" sessions hook") else {
+    // A launcher with whitespace in it is a wrapper (`FOO=1 …`, `nice -n 10 …`,
+    // `cd /x && …`), which is as customised as an extra argument.
+    let Some((launcher, rest)) = split_sink(command) else {
         return false;
     };
-    let args: Vec<&str> = command[at + " sessions hook".len()..]
-        .split_whitespace()
-        .collect();
-    matches!(
-        args.as_slice(),
-        [] | ["--agent", "claude"] | ["--agent=claude"]
-    )
+    let args: Vec<&str> = rest.split_whitespace().collect();
+    !launcher.contains(char::is_whitespace)
+        && matches!(
+            args.as_slice(),
+            [] | ["--agent", "claude"] | ["--agent=claude"]
+        )
+}
+
+/// Whether `command`, which is not `current`, is a sink install and uninstall
+/// leave alone: an `omni-dev sessions hook` that is not [`is_stale_claude_sink`].
+fn is_customised_sink(command: &str, current: &str) -> bool {
+    command != current && is_sessions_sink(command) && !is_stale_claude_sink(command)
 }
 
 /// Counts the `omni-dev sessions hook` entries in `settings` that are neither
@@ -1276,7 +1279,7 @@ fn count_customised_sinks(settings: &Value, current: &str) -> usize {
         .filter_map(|g| g.get("hooks").and_then(Value::as_array))
         .flatten()
         .filter_map(|h| h.get("command").and_then(Value::as_str))
-        .filter(|c| *c != current && is_sessions_sink(c) && !is_stale_claude_sink(c))
+        .filter(|c| is_customised_sink(c, current))
         .count()
 }
 
@@ -1299,13 +1302,19 @@ fn dedupe_command(settings: &mut Value, command: &str) -> usize {
         return 0;
     };
     let mut removed = 0;
-    let mut empty_events = Vec::new();
+    let mut emptied_events = Vec::new();
     for (event, groups) in hooks.iter_mut() {
         let Some(groups) = groups.as_array_mut() else {
             continue;
         };
-        let mut seen = false;
+        // Keyed by matcher: a copy under `Bash` does not cover a copy under `*`.
+        let mut seen: Vec<Option<String>> = Vec::new();
+        let mut dropped_here = 0;
         for group in groups.iter_mut() {
+            let matcher = group
+                .get("matcher")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
                 continue;
             };
@@ -1314,16 +1323,28 @@ fn dedupe_command(settings: &mut Value, command: &str) -> usize {
                 if !hook_has_command(h, command) {
                     return true;
                 }
-                !std::mem::replace(&mut seen, true)
+                if seen.contains(&matcher) {
+                    return false;
+                }
+                seen.push(matcher.clone());
+                true
             });
-            removed += before - inner.len();
+            let dropped = before - inner.len();
+            if dropped > 0 && inner.is_empty() {
+                *group = Value::Null; // emptied by us: pruned below
+            }
+            dropped_here += dropped;
         }
-        groups.retain(|g| !is_empty_group(g));
+        if dropped_here == 0 {
+            continue; // never touch an event we removed nothing from
+        }
+        removed += dropped_here;
+        groups.retain(|g| !g.is_null());
         if groups.is_empty() {
-            empty_events.push(event.clone());
+            emptied_events.push(event.clone());
         }
     }
-    for event in empty_events {
+    for event in emptied_events {
         hooks.remove(&event);
     }
     removed
@@ -1385,21 +1406,32 @@ fn codex_is_present(codex_home: &Path, path: Option<&std::ffi::OsStr>) -> bool {
 /// as Claude's, and a tagged one from another path is left by an upgrade that
 /// moved the binary.
 fn is_sessions_sink(command: &str) -> bool {
+    split_sink(command).is_some()
+}
+
+/// Splits a sink `command` into the text before `sessions hook` (the launcher
+/// path, plus anything a wrapper put in front of it) and the arguments after it,
+/// or `None` when it is not an `omni-dev sessions hook` at all. The one place the
+/// command is tokenised, so [`is_sessions_sink`] and [`is_stale_claude_sink`]
+/// cannot disagree about what a sink is.
+fn split_sink(command: &str) -> Option<(&str, &str)> {
     let command = command.trim();
-    let Some(at) = command.find(" sessions hook") else {
-        return false;
-    };
+    let at = command.find(" sessions hook")?;
     let rest = &command[at + " sessions hook".len()..];
-    (rest.is_empty() || rest.starts_with(char::is_whitespace))
-        && Path::new(command[..at].trim())
+    let launcher = command[..at].trim();
+    ((rest.is_empty() || rest.starts_with(char::is_whitespace))
+        && Path::new(launcher)
             .file_name()
-            .is_some_and(|name| name == "omni-dev")
+            .is_some_and(|name| name == "omni-dev"))
+    .then_some((launcher, rest))
 }
 
 /// Rewrites every stale sink entry (one `is_stale` matches, other than `command`
 /// itself) in `settings` to `command` **where it sits**, returning how many it
 /// rewrote. Codex passes [`is_sessions_sink`]; Claude the narrower
-/// [`is_stale_claude_sink`]. Left beside the
+/// [`is_stale_claude_sink`]. (Claude identifies a hook by content, so in-place
+/// matters there only for keeping a user's ordering; the trust argument below is
+/// Codex's.) Left beside the
 /// tagged entry, an untagged one would race it to be a session's first sighting
 /// and could fix the session's tag as `claude` for good; replacing it in place
 /// moves no other hook, so nothing else loses its Codex trust (ADR-0087). The
@@ -2627,6 +2659,103 @@ mod tests {
         let removed = remove_hooks(&mut settings, |c| c == NEW || is_stale_claude_sink(c));
         assert_eq!(removed, 2 * HOOK_EVENTS.len());
         assert!(settings["hooks"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_stale_claude_sink_rejects_wrapped_launchers() {
+        // Only a wrapper whose last word is a path to `omni-dev` is recognised as a
+        // sink at all; the rest (`nice -n 10 omni-dev …`) never match, so are
+        // never touched either.
+        for wrapped in [
+            "FOO=1 /x/omni-dev sessions hook",
+            "sudo -u me /usr/bin/omni-dev sessions hook",
+            "cd /repo && /x/omni-dev sessions hook",
+        ] {
+            assert!(is_sessions_sink(wrapped), "{wrapped}");
+            assert!(!is_stale_claude_sink(wrapped), "{wrapped}");
+            assert!(is_customised_sink(wrapped, NEW), "{wrapped}");
+        }
+        assert!(!is_sessions_sink("nice -n 10 omni-dev sessions hook"));
+        assert!(!is_customised_sink(NEW, NEW));
+        assert!(!is_customised_sink(OLD, NEW));
+    }
+
+    #[test]
+    fn dedupe_command_keys_on_the_matcher_and_leaves_untouched_events_alone() {
+        let mut settings = json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [{ "type": "command", "command": NEW }] },
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": NEW }] },
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": NEW }] }
+                ],
+                "Stop": [],
+                "Notification": [{ "hooks": [] }]
+            }
+        });
+        // Only the second `*` copy is redundant: `Bash` does not cover `*`.
+        assert_eq!(dedupe_command(&mut settings, NEW), 1);
+        assert_eq!(sinks_under(&settings, "PreToolUse"), [NEW, NEW]);
+        assert_eq!(settings["hooks"]["PreToolUse"][1]["matcher"], "*");
+        // Pre-existing empty scaffolding in events it removed nothing from stays.
+        assert_eq!(settings["hooks"]["Stop"], json!([]));
+        assert_eq!(settings["hooks"]["Notification"], json!([{ "hooks": [] }]));
+    }
+
+    #[test]
+    fn install_command_execute_rewrites_an_old_sink_and_a_rerun_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        let mut old = json!({});
+        merge_hooks(&mut old, OLD, HOOK_EVENTS);
+        merge_hooks(
+            &mut old,
+            "/x/omni-dev sessions hook --socket /s",
+            &HOOK_EVENTS[..1],
+        );
+        write_settings(&path, &old).unwrap();
+        let install = || {
+            InstallHooksCommand {
+                settings: Some(path.clone()),
+                pi_agent_dir: Some(tmp.path().join("pi-agent")),
+                codex_home: Some(tmp.path().join("codex-home")),
+            }
+            .execute()
+            .unwrap();
+        };
+
+        install();
+        let current = hook_command();
+        let settings = read_settings(&path).unwrap();
+        for HookSpec { event, .. } in HOOK_EVENTS {
+            let sinks = sinks_under(&settings, event);
+            assert!(sinks.contains(&current), "{event}: {sinks:?}");
+            assert!(!sinks.contains(&OLD.to_string()), "{event}: {sinks:?}");
+        }
+        // The customised sink survives beside the canonical one.
+        assert_eq!(count_customised_sinks(&settings, &current), 1);
+
+        let after_first = std::fs::read_to_string(&path).unwrap();
+        install();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
+
+        // Uninstalling from "a new path" also clears anything old left behind.
+        let mut stale = read_settings(&path).unwrap();
+        merge_hooks(&mut stale, OLD, HOOK_EVENTS);
+        write_settings(&path, &stale).unwrap();
+        UninstallHooksCommand {
+            settings: Some(path.clone()),
+            pi_agent_dir: Some(tmp.path().join("pi-agent")),
+            codex_home: Some(tmp.path().join("codex-home")),
+        }
+        .execute()
+        .unwrap();
+        let settings = read_settings(&path).unwrap();
+        assert_eq!(
+            sinks_under(&settings, HOOK_EVENTS[0].event),
+            ["/x/omni-dev sessions hook --socket /s"]
+        );
+        assert_eq!(count_customised_sinks(&settings, &current), 1);
     }
 
     #[test]
