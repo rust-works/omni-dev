@@ -84,6 +84,7 @@ async fn run_rename(
             return Ok(());
         }
         if report.old_name == report.new_name {
+            // Same predicate as `RenameOutcome::is_unchanged`.
             println!(
                 "Would not rename: already named {} ({})",
                 sanitize_for_terminal(&report.old_name),
@@ -101,6 +102,17 @@ async fn run_rename(
     }
 
     let outcome = rename::rename(client, file_id, new_name).await?;
+    if outcome.is_ignored() {
+        // Structured callers still get the record; either way the command
+        // fails, since the requested rename did not happen.
+        output_as(&outcome, output)?;
+        anyhow::bail!(
+            "Drive accepted the request but kept the name {} instead of {} ({})",
+            sanitize_for_terminal(&outcome.old_name),
+            sanitize_for_terminal(outcome.requested_name.as_deref().unwrap_or_default()),
+            sanitize_for_terminal(&outcome.file_id)
+        );
+    }
     print_outcome(&outcome, output)
 }
 
@@ -115,6 +127,7 @@ fn print_outcome(outcome: &RenameOutcome, output: &OutputFormat) -> Result<()> {
             sanitize_for_terminal(&outcome.new_name)
         );
     }
+    // `is_ignored` never reaches here: `run_rename` fails it first.
     if outcome.is_unchanged() {
         println!(
             "Already named: {} ({})",
@@ -283,5 +296,30 @@ mod tests {
         run_rename(&client, "f1", "Asked", false, &OutputFormat::Table)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_rename_fails_when_drive_ignores_the_name() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        for method in ["GET", "PATCH"] {
+            wiremock::Mock::given(wiremock::matchers::method(method))
+                .and(wiremock::matchers::path("/drive/v3/files/f1"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "id": "f1", "name": "Old",
+                    }),
+                ))
+                .mount(&server)
+                .await;
+        }
+
+        for output in [OutputFormat::Table, OutputFormat::Json] {
+            let err = run_rename(&client, "f1", "Asked", false, &output)
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("kept the name Old instead of Asked"), "{msg}");
+        }
     }
 }

@@ -40,15 +40,28 @@ impl RenameOutcome {
     pub fn is_unchanged(&self) -> bool {
         self.old_name == self.new_name
     }
+
+    /// Whether Drive answered 200 but kept the old name although a different
+    /// one was asked for — the rename did not happen.
+    #[must_use]
+    pub fn is_ignored(&self) -> bool {
+        self.is_unchanged() && self.requested_name.is_some()
+    }
 }
 
-/// Rejects a `new_name` that is empty or whitespace-only.
+/// Rejects a `new_name` that is empty, whitespace-only, or made only of
+/// invisible characters (control characters, zero-width spaces, BOM).
 ///
 /// Drive treats an empty `name` as "no change" and answers 200, so without
 /// this check a no-op is reported as a successful rename (#1918). Only
 /// blankness is rejected; the name that is sent is never trimmed.
 pub fn validate_new_name(new_name: &str) -> Result<()> {
-    if new_name.trim().is_empty() {
+    let invisible = |c: char| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}')
+    };
+    if new_name.chars().all(invisible) {
         bail!("The new name must not be empty or whitespace-only");
     }
     Ok(())
@@ -103,6 +116,8 @@ fn record_attempt(
     duration: Duration,
 ) {
     let (status, error) = match result {
+        Ok(outcome) if outcome.is_ignored() => ("ignored".to_string(), None),
+        Ok(outcome) if outcome.is_unchanged() => ("unchanged".to_string(), None),
         Ok(_) => ("renamed".to_string(), None),
         Err(err) => ("failed".to_string(), Some(err.to_string())),
     };
@@ -219,7 +234,19 @@ mod tests {
 
     #[test]
     fn validate_new_name_rejects_blank_names() {
-        for blank in ["", " ", "   ", "\t", "\n", " \t\n ", "\u{a0}", "\u{3000}"] {
+        for blank in [
+            "",
+            " ",
+            "   ",
+            "\t",
+            "\n",
+            " \t\n ",
+            "\u{a0}",
+            "\u{3000}",
+            "\u{200b}",
+            "\u{feff}",
+            " \u{200b}\u{2060} ",
+        ] {
             let err = validate_new_name(blank).unwrap_err();
             assert!(
                 err.to_string().contains("empty or whitespace-only"),
@@ -280,6 +307,7 @@ mod tests {
         assert_eq!(outcome.new_name, "Old Name");
         assert_eq!(outcome.requested_name.as_deref(), Some("New Name"));
         assert!(outcome.is_unchanged());
+        assert!(outcome.is_ignored());
     }
 
     #[tokio::test]
@@ -291,6 +319,7 @@ mod tests {
 
         let outcome = rename(&client, "f1", "Same").await.unwrap();
         assert!(outcome.is_unchanged());
+        assert!(!outcome.is_ignored());
         assert_eq!(outcome.requested_name, None);
         let json = serde_json::to_value(&outcome).unwrap();
         assert!(json.get("requested_name").is_none(), "{json}");
