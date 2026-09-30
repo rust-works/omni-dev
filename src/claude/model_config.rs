@@ -1304,6 +1304,7 @@ mod tests {
             "claude-opus-5",
             "claude-opus-4-8",
             "claude-opus-4-7",
+            "claude-sonnet-5-5",
             "claude-sonnet-5",
         ] {
             let spec = registry
@@ -1325,6 +1326,9 @@ mod tests {
         let sonnet5 = registry.get_model_spec("claude-sonnet-5").unwrap();
         assert_eq!(sonnet5.input_token_price, Some(3.0));
         assert_eq!(sonnet5.output_token_price, Some(15.0));
+        let sonnet55 = registry.get_model_spec("claude-sonnet-5-5").unwrap();
+        assert_eq!(sonnet55.input_token_price, Some(2.0));
+        assert_eq!(sonnet55.output_token_price, Some(10.0));
     }
 
     /// The 4.6 generation also exposes 1M context natively. These values were

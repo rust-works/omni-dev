@@ -1,0 +1,474 @@
+{
+  "model": "jev-1.13.0",
+  "e1_issue_count": 20,
+  "repeats": 2,
+  "e1": {
+    "baseline": {
+      "calls": 40,
+      "class_counts": {
+        "opus": 36,
+        "sonnet": 4
+      },
+      "stage_counts": {
+        "design": {
+          "opus": 36,
+          "none": 4
+        },
+        "implement": {
+          "sonnet": 22,
+          "opus": 18
+        },
+        "review": {
+          "opus": 31,
+          "sonnet": 9
+        }
+      },
+      "agreement_with_old_labels": {
+        "collapsed_fable_to_opus": 30
+      },
+      "repeat_flips": {
+        "class": 0,
+        "design": 0,
+        "implement": 2,
+        "review": 1
+      },
+      "usage": {
+        "input_tokens": 56578,
+        "output_tokens": 4111
+      },
+      "sum_request_seconds": 18.402
+    },
+    "versioned": {
+      "calls": 40,
+      "class_counts": {
+        "claude-opus-5-5": 36,
+        "claude-sonnet-5-5": 4
+      },
+      "stage_counts": {
+        "design": {
+          "claude-opus-5-5": 36,
+          "none": 4
+        },
+        "implement": {
+          "claude-sonnet-5-5": 32,
+          "claude-opus-5-5": 8
+        },
+        "review": {
+          "claude-sonnet-5-5": 14,
+          "claude-opus-5-5": 26
+        }
+      },
+      "agreement_with_old_labels": {
+        "collapsed_fable_to_opus": 30
+      },
+      "repeat_flips": {
+        "class": 0,
+        "design": 0,
+        "implement": 0,
+        "review": 0
+      },
+      "usage": {
+        "input_tokens": 58138,
+        "output_tokens": 6452
+      },
+      "sum_request_seconds": 20.975
+    },
+    "legacy": {
+      "calls": 40,
+      "class_counts": {
+        "opus": 16,
+        "sonnet": 8,
+        "fable": 16
+      },
+      "stage_counts": {
+        "design": {
+          "opus": 16,
+          "sonnet": 4,
+          "none": 4,
+          "fable": 16
+        },
+        "implement": {
+          "sonnet": 21,
+          "opus": 19
+        },
+        "review": {
+          "opus": 30,
+          "sonnet": 10
+        }
+      },
+      "agreement_with_old_labels": {
+        "original_three_rung": 32,
+        "collapsed_fable_to_opus": 34
+      },
+      "repeat_flips": {
+        "class": 0,
+        "design": 0,
+        "implement": 1,
+        "review": 0
+      },
+      "usage": {
+        "input_tokens": 62458,
+        "output_tokens": 5091
+      },
+      "sum_request_seconds": 21.618
+    },
+    "candidate": {
+      "calls": 40,
+      "class_counts": {
+        "sonnet": 18,
+        "opus": 22
+      },
+      "stage_counts": {
+        "design": {
+          "sonnet": 14,
+          "none": 4,
+          "opus": 22
+        },
+        "implement": {
+          "sonnet": 40
+        },
+        "review": {
+          "sonnet": 30,
+          "opus": 10
+        }
+      },
+      "agreement_with_old_labels": {
+        "collapsed_fable_to_opus": 36
+      },
+      "repeat_flips": {
+        "class": 0,
+        "design": 0,
+        "implement": 0,
+        "review": 0
+      },
+      "usage": {
+        "input_tokens": 58258,
+        "output_tokens": 4164
+      },
+      "sum_request_seconds": 19.222
+    }
+  },
+  "paired_differences_from_baseline": {
+    "versioned": {
+      "design": 0,
+      "implement": 10,
+      "review": 5,
+      "class": 0
+    },
+    "legacy": {
+      "design": 20,
+      "implement": 3,
+      "review": 1,
+      "class": 4
+    },
+    "candidate": {
+      "design": 14,
+      "implement": 18,
+      "review": 21,
+      "class": 14
+    }
+  },
+  "holdout": {
+    "1880": {
+      "baseline": [
+        [
+          "opus",
+          "sonnet",
+          "opus"
+        ],
+        [
+          "opus",
+          "sonnet",
+          "opus"
+        ]
+      ],
+      "versioned": [
+        [
+          "claude-opus-5-5",
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        [
+          "claude-opus-5-5",
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ]
+      ],
+      "legacy": [
+        [
+          "opus",
+          "sonnet",
+          "opus"
+        ],
+        [
+          "opus",
+          "sonnet",
+          "opus"
+        ]
+      ],
+      "candidate": [
+        [
+          "sonnet",
+          "sonnet",
+          "sonnet"
+        ],
+        [
+          "opus",
+          "sonnet",
+          "sonnet"
+        ]
+      ]
+    },
+    "1870": {
+      "baseline": [
+        [
+          "none",
+          "sonnet",
+          "opus"
+        ],
+        [
+          "none",
+          "sonnet",
+          "opus"
+        ]
+      ],
+      "versioned": [
+        [
+          "none",
+          "claude-sonnet-5-5",
+          "claude-sonnet-5-5"
+        ],
+        [
+          "none",
+          "claude-sonnet-5-5",
+          "claude-sonnet-5-5"
+        ]
+      ],
+      "legacy": [
+        [
+          "none",
+          "sonnet",
+          "opus"
+        ],
+        [
+          "none",
+          "sonnet",
+          "opus"
+        ]
+      ],
+      "candidate": [
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ],
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ]
+      ]
+    },
+    "1861": {
+      "baseline": [
+        [
+          "opus",
+          "opus",
+          "opus"
+        ],
+        [
+          "opus",
+          "opus",
+          "opus"
+        ]
+      ],
+      "versioned": [
+        [
+          "claude-opus-5-5",
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        [
+          "claude-opus-5-5",
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ]
+      ],
+      "legacy": [
+        [
+          "fable",
+          "opus",
+          "opus"
+        ],
+        [
+          "fable",
+          "opus",
+          "fable"
+        ]
+      ],
+      "candidate": [
+        [
+          "opus",
+          "sonnet",
+          "opus"
+        ],
+        [
+          "opus",
+          "sonnet",
+          "opus"
+        ]
+      ]
+    },
+    "1858": {
+      "baseline": [
+        [
+          "opus",
+          "sonnet",
+          "opus"
+        ],
+        [
+          "opus",
+          "sonnet",
+          "opus"
+        ]
+      ],
+      "versioned": [
+        [
+          "claude-opus-5-5",
+          "claude-sonnet-5-5",
+          "claude-sonnet-5-5"
+        ],
+        [
+          "claude-opus-5-5",
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ]
+      ],
+      "legacy": [
+        [
+          "opus",
+          "sonnet",
+          "opus"
+        ],
+        [
+          "opus",
+          "sonnet",
+          "opus"
+        ]
+      ],
+      "candidate": [
+        [
+          "opus",
+          "sonnet",
+          "sonnet"
+        ],
+        [
+          "opus",
+          "sonnet",
+          "sonnet"
+        ]
+      ]
+    },
+    "900001": {
+      "baseline": [
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ],
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ]
+      ],
+      "versioned": [
+        [
+          "none",
+          "claude-sonnet-5-5",
+          "claude-sonnet-5-5"
+        ],
+        [
+          "none",
+          "claude-sonnet-5-5",
+          "claude-sonnet-5-5"
+        ]
+      ],
+      "legacy": [
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ],
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ]
+      ],
+      "candidate": [
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ],
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ]
+      ]
+    },
+    "900002": {
+      "baseline": [
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ],
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ]
+      ],
+      "versioned": [
+        [
+          "none",
+          "claude-sonnet-5-5",
+          "claude-sonnet-5-5"
+        ],
+        [
+          "none",
+          "claude-sonnet-5-5",
+          "claude-sonnet-5-5"
+        ]
+      ],
+      "legacy": [
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ],
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ]
+      ],
+      "candidate": [
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ],
+        [
+          "none",
+          "sonnet",
+          "sonnet"
+        ]
+      ]
+    }
+  },
+  "limits": "Old hand labels are not downstream success or calibrated probabilities."
+}

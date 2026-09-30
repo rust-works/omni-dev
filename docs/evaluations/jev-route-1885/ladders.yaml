@@ -1,0 +1,47 @@
+# Frozen criteria for the #1885 rerun. Tier order is least to most capable.
+baseline:
+  - name: sonnet
+    description: >-
+      Reliable at executing a clear specification and following patterns that already exist in the
+      codebase. Tends to miss non-obvious interactions between parts and does not question the
+      specification.
+  - name: opus
+    description: >-
+      Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
+      ordering, once the overall direction is set. Can under-explore a genuinely open design space.
+versioned:
+  - name: claude-sonnet-5-5
+    description: >-
+      Reliable at executing a clear specification and following patterns that already exist in the
+      codebase. Tends to miss non-obvious interactions between parts and does not question the
+      specification.
+  - name: claude-opus-5-5
+    description: >-
+      Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
+      ordering, once the overall direction is set. Can under-explore a genuinely open design space.
+legacy:
+  - name: sonnet
+    description: >-
+      Reliable at executing a clear specification and following patterns that already exist in the
+      codebase. Tends to miss non-obvious interactions between parts and does not question the
+      specification.
+  - name: opus
+    description: >-
+      Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
+      ordering, once the overall direction is set. Can under-explore a genuinely open design space.
+  - name: fable
+    description: >-
+      Strongest at open-ended design and research: choosing between architectures, working in
+      unfamiliar territory with no precedent in the codebase, anticipating failure modes, and
+      security-critical judgement.
+candidate:
+  - name: sonnet
+    description: >-
+      Reliable at implementing and reviewing well-scoped work across several files, including
+      debugging and non-obvious interactions when the approach is clear. May need help with complex,
+      open-ended design requiring sustained judgement.
+  - name: opus
+    description: >-
+      Reliable at complex, open-ended design and research: weighing architectures and unfamiliar
+      approaches, anticipating failure modes, and making security-critical judgements. Carries subtle
+      multi-file implementation and review through with sustained judgement.
