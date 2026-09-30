@@ -1613,6 +1613,8 @@ that part is expected: see the footgun note above.
   original request and API notes.
 - [Issue #1779](https://github.com/rust-works/omni-dev/issues/1779): the
   experiments behind `route`, and a script that reproduces them.
+- [Code-informed triage roadmap](jev-triage-roadmap.md): planned follow-ups
+  for checking code facts before routing and previewing decision comments.
 - TypeSafe's own guidance, which [Best practices](#best-practices) draws on
   (as of `jev-1.13.0`, 2026-09-19):
   [Primitives](https://docs.typesafe.ai/primitives),
