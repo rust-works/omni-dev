@@ -1015,6 +1015,24 @@ mod tests {
 
     // ── resolve_cites_index / cites_judged_issue ───────────────────────
 
+    /// #2003: `route` skips code when finding citations, but `verify-decision`
+    /// does not — a reference deliberately written in backticks is still a
+    /// claim's source, and missing it would silently weaken the check. The
+    /// splitter may also wrap a `cites` string in backticks.
+    #[test]
+    fn a_citation_in_backticks_is_still_a_source() {
+        let citations = find_citations("settled by `#1614`", "rust-works/omni-dev", &judged(1));
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].raw, "#1614");
+        let issue = issue_doc(1614, "Title", "Body.", vec![], vec![]);
+        let fetched = BTreeMap::from([(("rust-works/omni-dev".to_string(), 1614), issue)]);
+        let sources = group_sources(&citations, "rust-works/omni-dev", &fetched);
+        assert_eq!(
+            resolve_cites_index("`#1614`", "rust-works/omni-dev", &sources),
+            Some(0)
+        );
+    }
+
     #[test]
     fn resolve_cites_index_matches_a_sources_keys() {
         let citations = find_citations("see #1614", "rust-works/omni-dev", &judged(1));
@@ -1121,6 +1139,19 @@ mod tests {
         let selected =
             select_comment(&doc, &CommentSelector::Latest, "rust-works/omni-dev").unwrap();
         assert_eq!(selected.id, Some(2));
+    }
+
+    /// #2003: a comment whose only reference is in code still counts as
+    /// citing something for `--comment latest`.
+    #[test]
+    fn select_comment_latest_counts_a_citation_in_code() {
+        let doc = doc_with_comments(vec![
+            comment(1, "alice", "settled by `#1614`"),
+            comment(2, "bob", "thanks!"),
+        ]);
+        let selected =
+            select_comment(&doc, &CommentSelector::Latest, "rust-works/omni-dev").unwrap();
+        assert_eq!(selected.id, Some(1));
     }
 
     #[test]

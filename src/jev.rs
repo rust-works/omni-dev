@@ -13,6 +13,7 @@
 //! - [`config`] — credential and base-URL resolution.
 //! - [`error`] — the [`error::JevError`] domain error type.
 //! - [`input`] — shared input-text truncation, used by `route` and `verify`.
+//! - [`markdown_code`] — masks fenced code and inline code spans, so scanners skip them.
 //! - [`protocol`] — the request/response wire types.
 //! - [`route`] — stage routing of issues to model classes (`ai jev route`).
 //! - [`verify`] — decision-comment verification (`ai jev verify-decision`).
@@ -22,6 +23,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod input;
+pub mod markdown_code;
 pub mod protocol;
 pub mod route;
 pub mod verify;
