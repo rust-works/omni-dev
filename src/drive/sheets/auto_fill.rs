@@ -296,6 +296,17 @@ pub enum AutoFillResult {
     AppliedReplyUnreadable {
         /// Same summary as [`Self::Changed`].
         summary: String,
+        /// Same as [`Self::Changed`] — all of it is plan-time data, so none
+        /// of it is lost with the reply.
+        destination: String,
+        /// Same as [`Self::Changed`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        requested_destination: Option<String>,
+        /// Same as [`Self::Changed`].
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        overwritten_cells: Vec<String>,
+        /// Same as [`Self::Changed`].
+        destination_is_upper_bound: bool,
         /// Why the reply could not be read.
         detail: String,
     },
@@ -666,7 +677,14 @@ async fn auto_fill_inner(
         // `RetryHint::Idempotent`: re-running the same fill is harmless, so the
         // reply is only needed to confirm the write (#2021).
         Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
-            AutoFillResult::AppliedReplyUnreadable { summary, detail }
+            AutoFillResult::AppliedReplyUnreadable {
+                summary,
+                destination: destination_a1,
+                requested_destination,
+                overwritten_cells,
+                destination_is_upper_bound: is_upper_bound,
+                detail,
+            }
         }
         Err(err) => AutoFillResult::Failed {
             detail: format!("{err:#}"),
@@ -990,6 +1008,12 @@ fn build_request(
 }
 
 fn record_attempt(outcome: &AutoFillOutcome, duration: Duration) {
+    request_log::record_drive_mutation(mutation_record(outcome, duration));
+}
+
+/// The request-log record for `outcome`, split from [`record_attempt`] so a
+/// test can read the fields it carries.
+fn mutation_record(outcome: &AutoFillOutcome, duration: Duration) -> DriveMutationOutcome {
     let error = match &outcome.result {
         AutoFillResult::Failed { detail }
         | AutoFillResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
@@ -1008,19 +1032,23 @@ fn record_attempt(outcome: &AutoFillOutcome, duration: Duration) {
                 overwritten_cells,
                 destination_is_upper_bound,
                 ..
+            }
+            | AutoFillResult::AppliedReplyUnreadable {
+                summary,
+                destination,
+                overwritten_cells,
+                destination_is_upper_bound,
+                ..
             } => (
                 Some(destination.clone()),
                 Some(summary.clone()),
                 overwritten_cells.clone(),
                 *destination_is_upper_bound,
             ),
-            AutoFillResult::AppliedReplyUnreadable { summary, .. } => {
-                (None, Some(summary.clone()), Vec::new(), false)
-            }
             _ => (None, None, Vec::new(), false),
         };
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: LOG_OPERATION,
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -1037,7 +1065,7 @@ fn record_attempt(outcome: &AutoFillOutcome, duration: Duration) {
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// Renders an outcome as human-readable text.
@@ -1146,13 +1174,29 @@ pub fn describe_lines(outcome: &AutoFillOutcome) -> Vec<String> {
         ),
         // Idempotent: filling the same source over the same destination again
         // yields the same cells.
-        AutoFillResult::AppliedReplyUnreadable { summary, detail } => {
-            vec![applied_reply_unreadable_line(
+        AutoFillResult::AppliedReplyUnreadable {
+            summary,
+            destination,
+            requested_destination,
+            overwritten_cells,
+            destination_is_upper_bound,
+            detail,
+        } => {
+            let mut lines = vec![applied_reply_unreadable_line(
                 summary,
                 &book,
                 RetryHint::Idempotent,
                 detail,
-            )]
+            )];
+            // The same detail lines `Changed` prints: all plan-time data.
+            lines.extend(change_detail_lines(
+                overwritten_cells,
+                *destination_is_upper_bound,
+                destination,
+                requested_destination.as_deref(),
+                false,
+            ));
+            lines
         }
         AutoFillResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -1170,10 +1214,32 @@ fn change_lines(
     requested_destination: Option<&str>,
     dry_run: bool,
 ) -> Vec<String> {
-    let mut lines = vec![
-        head.to_string(),
-        overwritten_line(overwritten_cells, destination_is_upper_bound, dry_run),
-    ];
+    let mut lines = vec![head.to_string()];
+    lines.extend(change_detail_lines(
+        overwritten_cells,
+        destination_is_upper_bound,
+        destination,
+        requested_destination,
+        dry_run,
+    ));
+    lines
+}
+
+/// The indented lines under a change's head line — split out so
+/// [`AutoFillResult::AppliedReplyUnreadable`] can print exactly what
+/// [`AutoFillResult::Changed`] does after its own head.
+fn change_detail_lines(
+    overwritten_cells: &[String],
+    destination_is_upper_bound: bool,
+    destination: &str,
+    requested_destination: Option<&str>,
+    dry_run: bool,
+) -> Vec<String> {
+    let mut lines = vec![overwritten_line(
+        overwritten_cells,
+        destination_is_upper_bound,
+        dry_run,
+    )];
     if let Some(requested) = requested_destination {
         lines.push(if dry_run {
             past_grid_extent_caveat_dry_run(destination, requested)
@@ -1738,6 +1804,10 @@ mod tests {
         assert_eq!(
             AutoFillResult::AppliedReplyUnreadable {
                 summary: String::new(),
+                destination: String::new(),
+                requested_destination: None,
+                overwritten_cells: Vec::new(),
+                destination_is_upper_bound: false,
                 detail: String::new(),
             }
             .log_status(),
@@ -1821,6 +1891,10 @@ mod tests {
             },
             AutoFillResult::AppliedReplyUnreadable {
                 summary: "auto-fill within 'Q1'!A1:A10".to_string(),
+                destination: "'Q1'!A1:A10".to_string(),
+                requested_destination: Some("'Q1'!A1:A20".to_string()),
+                overwritten_cells: vec!["A1".to_string()],
+                destination_is_upper_bound: true,
                 detail: "bad reply".to_string(),
             },
             AutoFillResult::Failed {
@@ -3004,7 +3078,7 @@ mod tests {
     }
 
     #[test]
-    fn describe_lines_renders_applied_reply_unreadable_as_an_idempotent_single_line() {
+    fn describe_lines_renders_applied_reply_unreadable_with_the_same_detail_lines_as_changed() {
         let outcome = AutoFillOutcome {
             spreadsheet_id: "sheet-1".to_string(),
             file_name: Some("Budget".to_string()),
@@ -3013,17 +3087,78 @@ mod tests {
             form: range_form(),
             result: AutoFillResult::AppliedReplyUnreadable {
                 summary: "auto-fill within 'Q1'!A1:A10".to_string(),
+                destination: "'Q1'!A1:A10".to_string(),
+                requested_destination: Some("'Q1'!A1:A20".to_string()),
+                overwritten_cells: vec!["A2".to_string()],
+                destination_is_upper_bound: true,
                 detail: "bad reply".to_string(),
             },
         };
+        let lines = describe_lines(&outcome);
         assert_eq!(
-            describe_lines(&outcome),
-            vec![
-                "Applied, but the reply could not be read: auto-fill within 'Q1'!A1:A10 in \
-                 'Budget' — check the spreadsheet to confirm (bad reply)"
-                    .to_string()
-            ]
+            lines[0],
+            "Applied, but the reply could not be read: auto-fill within 'Q1'!A1:A10 in \
+             'Budget' — check the spreadsheet to confirm (bad reply)"
         );
+        // Everything after the head is exactly what `Changed` prints.
+        let changed = describe_lines(&AutoFillOutcome {
+            result: AutoFillResult::Changed {
+                summary: "auto-fill within 'Q1'!A1:A10".to_string(),
+                destination: "'Q1'!A1:A10".to_string(),
+                requested_destination: Some("'Q1'!A1:A20".to_string()),
+                overwritten_cells: vec!["A2".to_string()],
+                destination_is_upper_bound: true,
+            },
+            ..outcome
+        });
+        assert!(lines.len() > 1, "{lines:?}");
+        assert_eq!(lines[1..], changed[1..]);
+        assert!(lines[1].contains("A2"), "{lines:?}");
+    }
+
+    /// An applied fill whose reply was unreadable still logs everything
+    /// `Changed` does: plan-time data is not lost with the reply.
+    #[test]
+    fn an_unreadable_reply_logs_the_same_fields_as_changed() {
+        let outcome = |result| AutoFillOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            sheet_id: Some(7),
+            form: range_form(),
+            result,
+        };
+        let changed = mutation_record(
+            &outcome(AutoFillResult::Changed {
+                summary: "auto-fill within 'Q1'!A1:A10".to_string(),
+                destination: "'Q1'!A1:A10".to_string(),
+                requested_destination: None,
+                overwritten_cells: vec!["A2".to_string()],
+                destination_is_upper_bound: true,
+            }),
+            Duration::from_millis(1),
+        );
+        let unreadable = mutation_record(
+            &outcome(AutoFillResult::AppliedReplyUnreadable {
+                summary: "auto-fill within 'Q1'!A1:A10".to_string(),
+                destination: "'Q1'!A1:A10".to_string(),
+                requested_destination: None,
+                overwritten_cells: vec!["A2".to_string()],
+                destination_is_upper_bound: true,
+                detail: "bad reply".to_string(),
+            }),
+            Duration::from_millis(1),
+        );
+        assert_eq!(unreadable.range.as_deref(), Some("'Q1'!A1:A10"));
+        assert_eq!(unreadable.range, changed.range);
+        assert_eq!(
+            unreadable.fields_changed.as_deref(),
+            Some("auto-fill within 'Q1'!A1:A10")
+        );
+        assert_eq!(unreadable.overwritten_cells, vec!["A2".to_string()]);
+        assert!(unreadable.overwritten_cells_upper_bound);
+        assert_eq!(unreadable.sheet_id, Some(7));
+        assert_eq!(unreadable.error.as_deref(), Some("bad reply"));
     }
 
     #[tokio::test]

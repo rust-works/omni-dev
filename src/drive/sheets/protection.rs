@@ -251,6 +251,11 @@ pub enum ProtectionResult {
     AppliedReplyUnreadable {
         /// Same summary as [`Self::WouldChange`].
         summary: String,
+        /// The protected range id resolved before the call — `Some` for
+        /// `update-protection`/`unprotect-range`, `None` for `protect-range`.
+        /// Never the server-assigned id of a new protection (that was in the
+        /// reply).
+        protected_range_id: Option<i64>,
         /// Why the reply could not be read.
         detail: String,
     },
@@ -578,7 +583,11 @@ async fn protection_inner(
         // NotIdempotent: a second `protect-range` would stack a second protection
         // over the same range.
         Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
-            ProtectionResult::AppliedReplyUnreadable { summary, detail }
+            ProtectionResult::AppliedReplyUnreadable {
+                summary,
+                protected_range_id: existing_id,
+                detail,
+            }
         }
         Err(err) => ProtectionResult::Failed {
             detail: format!("{err:#}"),
@@ -830,6 +839,16 @@ fn describe_effect(verb: &ProtectionVerb) -> String {
 }
 
 fn record_attempt(outcome: &ProtectionOutcome, opts: &ProtectionOptions, duration: Duration) {
+    request_log::record_drive_mutation(mutation_record(outcome, opts, duration));
+}
+
+/// The request-log record for one attempt. Split from [`record_attempt`] so
+/// the logged fields are unit-testable.
+fn mutation_record(
+    outcome: &ProtectionOutcome,
+    opts: &ProtectionOptions,
+    duration: Duration,
+) -> DriveMutationOutcome {
     let error = match &outcome.result {
         ProtectionResult::Failed { detail }
         | ProtectionResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
@@ -840,13 +859,17 @@ fn record_attempt(outcome: &ProtectionOutcome, opts: &ProtectionOptions, duratio
         _ => None,
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
-    // Editor changes are only real once the outcome is `Changed` — a
+    // Editor changes are only real once the outcome is `Changed` (or an
+    // applied change whose reply was unreadable) — a
     // `Blocked`/`Failed`/refused attempt granted or revoked nothing, so
     // logging the *requested* editors there (as opposed to what the verb
     // carries) would misrepresent the audit trail for a permission surface
     // where that record matters.
     let (protected_range_id, editors_added, editors_removed) = match &outcome.result {
         ProtectionResult::Changed {
+            protected_range_id, ..
+        }
+        | ProtectionResult::AppliedReplyUnreadable {
             protected_range_id, ..
         } => {
             let (added, removed) = match &opts.verb {
@@ -867,7 +890,7 @@ fn record_attempt(outcome: &ProtectionOutcome, opts: &ProtectionOptions, duratio
         _ => None,
     };
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: opts.verb.log_operation(),
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -883,7 +906,7 @@ fn record_attempt(outcome: &ProtectionOutcome, opts: &ProtectionOptions, duratio
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// Renders an outcome as human-readable text.
@@ -970,9 +993,14 @@ pub fn describe_lines(outcome: &ProtectionOutcome) -> Vec<String> {
             let id = protected_range_id.map_or_else(String::new, |id| format!(" (id {id})"));
             vec![format!("Applied: {summary}{id} in {book}")]
         }
-        ProtectionResult::AppliedReplyUnreadable { summary, detail } => {
+        ProtectionResult::AppliedReplyUnreadable {
+            summary,
+            protected_range_id,
+            detail,
+        } => {
+            let id = protected_range_id.map_or_else(String::new, |id| format!(" (id {id})"));
             let mut lines = vec![applied_reply_unreadable_line(
-                summary,
+                &format!("{summary}{id}"),
                 &book,
                 RetryHint::NotIdempotent,
                 detail,
@@ -1570,6 +1598,7 @@ mod tests {
         assert_eq!(
             ProtectionResult::AppliedReplyUnreadable {
                 summary: String::new(),
+                protected_range_id: None,
                 detail: String::new(),
             }
             .log_status(),
@@ -1950,6 +1979,7 @@ mod tests {
             Some("Budget"),
             ProtectionResult::AppliedReplyUnreadable {
                 summary: "protect (block edits)".to_string(),
+                protected_range_id: None,
                 detail: "bad reply".to_string(),
             },
         );
@@ -1970,10 +2000,69 @@ mod tests {
             Some("Budget"),
             ProtectionResult::AppliedReplyUnreadable {
                 summary: "remove protection".to_string(),
+                protected_range_id: Some(7),
                 detail: "bad reply".to_string(),
             },
         );
-        assert_eq!(describe_lines(&removed).len(), 1);
+        // Names the resolved id exactly as `Changed` does, and adds no hint.
+        assert_eq!(
+            describe_lines(&removed),
+            vec![
+                "Applied, but the reply could not be read: remove protection (id 7) in \
+                 'Budget' — do not retry; check the spreadsheet first (bad reply)"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// The editors an applied `update-protection` granted and revoked are
+    /// plan-time data, so an unreadable reply must still log them.
+    #[test]
+    fn mutation_record_logs_the_same_fields_for_an_unreadable_reply_as_for_changed() {
+        let verb = ProtectionVerb::UpdateProtection {
+            sheet: None,
+            range: None,
+            whole_sheet: false,
+            description: None,
+            warning_only: None,
+            add_editors: vec!["a@example.com".to_string()],
+            remove_editors: vec!["b@example.com".to_string()],
+        };
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: verb.clone(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let record = |result| {
+            let out = outcome_with(verb.clone(), Some("Budget"), result);
+            mutation_record(&out, &opts, Duration::ZERO)
+        };
+        let changed = record(ProtectionResult::Changed {
+            summary: "update protection".to_string(),
+            protected_range_id: Some(7),
+        });
+        let unreadable = record(ProtectionResult::AppliedReplyUnreadable {
+            summary: "update protection".to_string(),
+            protected_range_id: Some(7),
+            detail: "bad reply".to_string(),
+        });
+        assert_eq!(unreadable.protected_range_id, changed.protected_range_id);
+        assert_eq!(
+            unreadable.protection_editors_added,
+            vec!["a@example.com".to_string()]
+        );
+        assert_eq!(
+            unreadable.protection_editors_removed,
+            vec!["b@example.com".to_string()]
+        );
+        assert_eq!(unreadable.status, "applied-reply-unreadable");
+        assert_eq!(unreadable.error.as_deref(), Some("bad reply"));
+        assert_eq!(
+            unreadable.fields_changed.as_deref(),
+            Some("update protection")
+        );
     }
 
     #[test]

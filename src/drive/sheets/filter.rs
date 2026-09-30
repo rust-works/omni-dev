@@ -308,6 +308,13 @@ pub enum FilterResult {
     AppliedReplyUnreadable {
         /// Same summary as [`Self::WouldChange`].
         summary: String,
+        /// The filter view id resolved before the call — `Some` for
+        /// `update-filter-view`/`delete-filter-view`, `None` otherwise. Never
+        /// the server-assigned id of an added view (that was in the reply).
+        filter_view_id: Option<i64>,
+        /// Same as [`Self::Changed`]'s.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width_warning: Option<String>,
         /// Why the reply could not be read.
         detail: String,
     },
@@ -793,7 +800,12 @@ async fn filter_inner(
         // NotIdempotent: a second `add-filter-view` would add a second view, and a
         // second `sort-range` would re-sort already-moved rows.
         Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
-            FilterResult::AppliedReplyUnreadable { summary, detail }
+            FilterResult::AppliedReplyUnreadable {
+                summary,
+                filter_view_id: existing_id,
+                width_warning,
+                detail,
+            }
         }
         Err(err) => FilterResult::Failed {
             detail: format!("{err:#}"),
@@ -1301,6 +1313,16 @@ fn describe_filter_effect(prefix: &str, sort_by: &[String], hide_values: &[Strin
 }
 
 fn record_attempt(outcome: &FilterOutcome, opts: &FilterOptions, duration: Duration) {
+    request_log::record_drive_mutation(mutation_record(outcome, opts, duration));
+}
+
+/// The request-log record for one attempt. Split from [`record_attempt`] so
+/// the logged fields are unit-testable.
+fn mutation_record(
+    outcome: &FilterOutcome,
+    opts: &FilterOptions,
+    duration: Duration,
+) -> DriveMutationOutcome {
     let error = match &outcome.result {
         FilterResult::Failed { detail } | FilterResult::AppliedReplyUnreadable { detail, .. } => {
             Some(detail.clone())
@@ -1313,19 +1335,22 @@ fn record_attempt(outcome: &FilterOutcome, opts: &FilterOptions, duration: Durat
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
     let filter_view_id = match &outcome.result {
-        FilterResult::Changed { filter_view_id, .. } => *filter_view_id,
+        FilterResult::Changed { filter_view_id, .. }
+        | FilterResult::AppliedReplyUnreadable { filter_view_id, .. } => *filter_view_id,
         _ => None,
     };
-    let fields_changed = match &opts.verb {
-        FilterVerb::UpdateFilterView { .. } => match &outcome.result {
-            FilterResult::Changed { summary, .. }
-            | FilterResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
-            _ => None,
-        },
+    let fields_changed = match &outcome.result {
+        // An applied change always records what it was, whatever the verb.
+        FilterResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
+        FilterResult::Changed { summary, .. }
+            if matches!(opts.verb, FilterVerb::UpdateFilterView { .. }) =>
+        {
+            Some(summary.clone())
+        }
         _ => None,
     };
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: opts.verb.log_operation(),
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -1340,7 +1365,7 @@ fn record_attempt(outcome: &FilterOutcome, opts: &FilterOptions, duration: Durat
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// Renders an outcome as human-readable text.
@@ -1445,9 +1470,15 @@ pub fn describe_lines(outcome: &FilterOutcome) -> Vec<String> {
             )
         }
         FilterResult::Unchanged { detail } => vec![format!("Unchanged: {detail} in {book}")],
-        FilterResult::AppliedReplyUnreadable { summary, detail } => {
+        FilterResult::AppliedReplyUnreadable {
+            summary,
+            filter_view_id,
+            width_warning,
+            detail,
+        } => {
+            let id = filter_view_id.map_or_else(String::new, |id| format!(" (id {id})"));
             let mut lines = vec![applied_reply_unreadable_line(
-                summary,
+                &format!("{summary}{id}"),
                 &book,
                 RetryHint::NotIdempotent,
                 detail,
@@ -1459,6 +1490,13 @@ pub fn describe_lines(outcome: &FilterOutcome) -> Vec<String> {
                         .to_string(),
                 );
             }
+            // The plan-time caveats `Changed` prints around its summary: the
+            // summary is already in the line above, so keep only the rest.
+            lines.extend(
+                change_lines(verb, String::new(), width_warning.as_deref(), true)
+                    .into_iter()
+                    .filter(|line| !line.is_empty()),
+            );
             lines
         }
         FilterResult::Failed { detail } => vec![format!("Failed: {detail}")],
@@ -2335,6 +2373,8 @@ mod tests {
         assert_eq!(
             FilterResult::AppliedReplyUnreadable {
                 summary: String::new(),
+                filter_view_id: None,
+                width_warning: None,
                 detail: String::new(),
             }
             .log_status(),
@@ -3884,11 +3924,13 @@ mod tests {
             ledger_path,
         };
         let outcome = filter(&drive, &sheets, &opts, &rules).await;
-        assert!(
-            matches!(outcome.result, FilterResult::AppliedReplyUnreadable { .. }),
-            "{:?}",
-            outcome.result
-        );
+        match &outcome.result {
+            // The id resolved before the call is plan-time data, so it survives.
+            FilterResult::AppliedReplyUnreadable { filter_view_id, .. } => {
+                assert_eq!(*filter_view_id, Some(7));
+            }
+            other => panic!("expected AppliedReplyUnreadable, got {other:?}"),
+        }
         assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         assert!(
             describe(&outcome).starts_with("Applied, but the reply could not be read"),
@@ -4168,6 +4210,8 @@ mod tests {
             Some("Budget"),
             FilterResult::AppliedReplyUnreadable {
                 summary: "add filter view".to_string(),
+                filter_view_id: None,
+                width_warning: None,
                 detail: "bad reply".to_string(),
             },
         );
@@ -4188,10 +4232,77 @@ mod tests {
             Some("Budget"),
             FilterResult::AppliedReplyUnreadable {
                 summary: "update filter view 7".to_string(),
+                filter_view_id: Some(7),
+                width_warning: None,
                 detail: "bad reply".to_string(),
             },
         );
-        assert_eq!(describe_lines(&updated).len(), 1);
+        // Names the resolved id exactly as `Changed` does, and adds no hint.
+        assert_eq!(
+            describe_lines(&updated),
+            vec![
+                "Applied, but the reply could not be read: update filter view 7 (id 7) in \
+                 'Budget' — do not retry; check the spreadsheet first (bad reply)"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// Everything `Changed` carries that does not come from the reply — the
+    /// width warning and the reorder caveat — survives an unreadable reply.
+    #[test]
+    fn describe_lines_keeps_the_reorder_caveats_for_an_unreadable_reply() {
+        let out = outcome_with(
+            set_verb(vec!["0:asc".to_string()], Vec::new()),
+            Some("Budget"),
+            FilterResult::AppliedReplyUnreadable {
+                summary: "set basic filter (sort 0:asc)".to_string(),
+                filter_view_id: None,
+                width_warning: Some("selected columns 0..4 of 9".to_string()),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(
+            describe_lines(&out),
+            vec![
+                "Applied, but the reply could not be read: set basic filter (sort 0:asc) in \
+                 'Budget' — do not retry; check the spreadsheet first (bad reply)"
+                    .to_string(),
+                "Warning: selected columns 0..4 of 9".to_string(),
+                "  references outside the range may now observe values from a different row"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mutation_record_logs_the_same_fields_for_an_unreadable_reply_as_for_changed() {
+        let opts = unleased_opts(FilterVerb::DeleteFilterView { filter_view_id: 7 });
+        let record = |result| {
+            let mut out = outcome_with(opts.verb.clone(), Some("Budget"), result);
+            out.sheet_id = Some(3);
+            mutation_record(&out, &opts, Duration::ZERO)
+        };
+        let changed = record(FilterResult::Changed {
+            summary: "delete filter view".to_string(),
+            filter_view_id: Some(7),
+            width_warning: None,
+        });
+        let unreadable = record(FilterResult::AppliedReplyUnreadable {
+            summary: "delete filter view".to_string(),
+            filter_view_id: Some(7),
+            width_warning: None,
+            detail: "bad reply".to_string(),
+        });
+        assert_eq!(unreadable.sheet_id, Some(3));
+        assert_eq!(unreadable.filter_view_id, changed.filter_view_id);
+        assert_eq!(unreadable.status, "applied-reply-unreadable");
+        assert_eq!(unreadable.error.as_deref(), Some("bad reply"));
+        // Every verb records what was applied, not just update-filter-view.
+        assert_eq!(
+            unreadable.fields_changed.as_deref(),
+            Some("delete filter view")
+        );
     }
 
     #[test]

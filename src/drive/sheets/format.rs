@@ -358,6 +358,10 @@ pub enum FormatResult {
     AppliedReplyUnreadable {
         /// Same summary as [`Self::WouldChange`].
         summary: String,
+        /// Same as [`Self::Changed`] — read before the mutating call, so
+        /// not lost with the reply.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        discarded_cells: Vec<String>,
         /// Why the reply could not be read.
         detail: String,
     },
@@ -832,7 +836,11 @@ async fn format_inner(
         // `RetryHint::Idempotent` (see `describe_lines`): re-applying the same
         // formatting, merge or resize leaves the sheet as it is (#2021).
         Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
-            FormatResult::AppliedReplyUnreadable { summary, detail }
+            FormatResult::AppliedReplyUnreadable {
+                summary,
+                discarded_cells,
+                detail,
+            }
         }
         Err(err) => FormatResult::Failed {
             detail: format!("{err:#}"),
@@ -1300,6 +1308,16 @@ fn build_request(
 }
 
 fn record_attempt(outcome: &FormatOutcome, opts: &FormatOptions, duration: Duration) {
+    request_log::record_drive_mutation(mutation_record(outcome, opts, duration));
+}
+
+/// The request-log record for `outcome`, split from [`record_attempt`] so a
+/// test can read the fields it carries.
+fn mutation_record(
+    outcome: &FormatOutcome,
+    opts: &FormatOptions,
+    duration: Duration,
+) -> DriveMutationOutcome {
     let error = match &outcome.result {
         FormatResult::Failed { detail } | FormatResult::AppliedReplyUnreadable { detail, .. } => {
             Some(detail.clone())
@@ -1316,15 +1334,19 @@ fn record_attempt(outcome: &FormatOutcome, opts: &FormatOptions, duration: Durat
             summary,
             discarded_cells,
         }
+        | FormatResult::AppliedReplyUnreadable {
+            summary,
+            discarded_cells,
+            ..
+        }
         | FormatResult::WouldChange {
             summary,
             discarded_cells,
         } => (Some(summary.clone()), discarded_cells.clone()),
-        FormatResult::AppliedReplyUnreadable { summary, .. } => (Some(summary.clone()), Vec::new()),
         _ => (None, Vec::new()),
     };
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: opts.verb.log_operation(),
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -1338,7 +1360,7 @@ fn record_attempt(outcome: &FormatOutcome, opts: &FormatOptions, duration: Durat
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// Renders an outcome as human-readable text.
@@ -1412,7 +1434,9 @@ pub fn describe_lines(outcome: &FormatOutcome) -> Vec<String> {
             vec![format!("{} in {book}", past_tense_summary(verb, summary))]
         }
         // Idempotent: the same format / merge / unmerge / resize again is a no-op.
-        FormatResult::AppliedReplyUnreadable { summary, detail } => {
+        FormatResult::AppliedReplyUnreadable {
+            summary, detail, ..
+        } => {
             vec![applied_reply_unreadable_line(
                 summary,
                 &book,
@@ -2161,6 +2185,7 @@ mod tests {
             .log_status(),
             FormatResult::AppliedReplyUnreadable {
                 summary: "x".to_string(),
+                discarded_cells: Vec::new(),
                 detail: "x".to_string(),
             }
             .log_status(),
@@ -3267,6 +3292,7 @@ mod tests {
             verb: format_cells_opts(false).verb,
             result: FormatResult::AppliedReplyUnreadable {
                 summary: "set bold on 'Q1'!A1:B2".to_string(),
+                discarded_cells: Vec::new(),
                 detail: "bad reply".to_string(),
             },
         };
@@ -3278,6 +3304,42 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    /// An applied write whose reply was unreadable still logs everything
+    /// `Changed` does — the discarded cells were read before the write, so
+    /// they are not lost with the reply.
+    #[test]
+    fn an_unreadable_reply_logs_the_summary_and_discarded_cells_like_changed() {
+        let opts = format_cells_opts(false);
+        let record = |result| {
+            mutation_record(
+                &FormatOutcome {
+                    spreadsheet_id: "sheet-1".to_string(),
+                    file_name: Some("Budget".to_string()),
+                    resolved_folder_id: None,
+                    verb: opts.verb.clone(),
+                    result,
+                },
+                &opts,
+                Duration::from_millis(1),
+            )
+        };
+        let changed = record(FormatResult::Changed {
+            summary: "merge cells".to_string(),
+            discarded_cells: vec!["B1: gone".to_string()],
+        });
+        let unreadable = record(FormatResult::AppliedReplyUnreadable {
+            summary: "merge cells".to_string(),
+            discarded_cells: vec!["B1: gone".to_string()],
+            detail: "bad reply".to_string(),
+        });
+        assert_eq!(unreadable.fields_changed.as_deref(), Some("merge cells"));
+        assert_eq!(unreadable.fields_changed, changed.fields_changed);
+        assert_eq!(unreadable.discarded_cells, vec!["B1: gone".to_string()]);
+        assert_eq!(unreadable.discarded_cells, changed.discarded_cells);
+        assert_eq!(unreadable.error.as_deref(), Some("bad reply"));
+        assert_eq!(unreadable.status, "applied-reply-unreadable");
     }
 
     #[tokio::test]
@@ -3347,6 +3409,7 @@ mod tests {
             },
             FormatResult::AppliedReplyUnreadable {
                 summary: "set bold".to_string(),
+                discarded_cells: vec!["B1: gone".to_string()],
                 detail: "bad reply".to_string(),
             },
             FormatResult::Failed {

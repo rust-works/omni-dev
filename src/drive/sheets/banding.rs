@@ -249,6 +249,10 @@ pub enum BandingResult {
     AppliedReplyUnreadable {
         /// Same summary as [`Self::WouldChange`].
         summary: String,
+        /// The banded range id resolved before the call — `Some` for
+        /// `update-banding`/`delete-banding`, `None` for `add-banding`. Never
+        /// the server-assigned id of an added banding (that was in the reply).
+        banded_range_id: Option<i64>,
         /// Why the reply could not be read.
         detail: String,
     },
@@ -555,7 +559,11 @@ async fn banding_inner(
         }
         // NotIdempotent: a second `add-banding` would add a second banded range.
         Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
-            BandingResult::AppliedReplyUnreadable { summary, detail }
+            BandingResult::AppliedReplyUnreadable {
+                summary,
+                banded_range_id: existing_id,
+                detail,
+            }
         }
         Err(err) => BandingResult::Failed {
             detail: format!("{err:#}"),
@@ -899,6 +907,16 @@ fn describe_effect(verb: &BandingVerb) -> String {
 }
 
 fn record_attempt(outcome: &BandingOutcome, opts: &BandingOptions, duration: Duration) {
+    request_log::record_drive_mutation(mutation_record(outcome, opts, duration));
+}
+
+/// The request-log record for one attempt. Split from [`record_attempt`] so
+/// the logged fields are unit-testable.
+fn mutation_record(
+    outcome: &BandingOutcome,
+    opts: &BandingOptions,
+    duration: Duration,
+) -> DriveMutationOutcome {
     let error = match &outcome.result {
         BandingResult::Failed { detail } | BandingResult::AppliedReplyUnreadable { detail, .. } => {
             Some(detail.clone())
@@ -913,6 +931,9 @@ fn record_attempt(outcome: &BandingOutcome, opts: &BandingOptions, duration: Dur
     let banded_range_id = match &outcome.result {
         BandingResult::Changed {
             banded_range_id, ..
+        }
+        | BandingResult::AppliedReplyUnreadable {
+            banded_range_id, ..
         } => *banded_range_id,
         _ => None,
     };
@@ -921,7 +942,7 @@ fn record_attempt(outcome: &BandingOutcome, opts: &BandingOptions, duration: Dur
         _ => None,
     };
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: opts.verb.log_operation(),
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -936,7 +957,7 @@ fn record_attempt(outcome: &BandingOutcome, opts: &BandingOptions, duration: Dur
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// Renders an outcome as human-readable text.
@@ -1019,7 +1040,9 @@ pub fn describe_lines(outcome: &BandingOutcome) -> Vec<String> {
                 .map_or_else(String::new, |id| format!(" (id {id})"));
             vec![format!("Applied: {summary}{id} in {book}")]
         }
-        BandingResult::AppliedReplyUnreadable { summary, detail } => {
+        BandingResult::AppliedReplyUnreadable {
+            summary, detail, ..
+        } => {
             let mut lines = vec![applied_reply_unreadable_line(
                 summary,
                 &book,
@@ -3124,6 +3147,7 @@ mod tests {
             Some("Budget"),
             BandingResult::AppliedReplyUnreadable {
                 summary: "add row banding".to_string(),
+                banded_range_id: None,
                 detail: "bad reply".to_string(),
             },
         );
@@ -3144,10 +3168,52 @@ mod tests {
             Some("Budget"),
             BandingResult::AppliedReplyUnreadable {
                 summary: "delete banding id 7".to_string(),
+                banded_range_id: Some(7),
                 detail: "bad reply".to_string(),
             },
         );
-        assert_eq!(describe_lines(&deleted).len(), 1);
+        // The summary already names the id, exactly as `Changed` relies on.
+        assert_eq!(
+            describe_lines(&deleted),
+            vec![
+                "Applied, but the reply could not be read: delete banding id 7 in 'Budget' — \
+                 do not retry; check the spreadsheet first (bad reply)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn mutation_record_logs_the_same_fields_for_an_unreadable_reply_as_for_changed() {
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: delete_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let record = |result| {
+            let mut out = outcome_with(delete_verb(), Some("Budget"), result);
+            out.sheet_id = Some(3);
+            mutation_record(&out, &opts, Duration::ZERO)
+        };
+        let changed = record(BandingResult::Changed {
+            summary: "delete banding id 7".to_string(),
+            banded_range_id: Some(7),
+        });
+        let unreadable = record(BandingResult::AppliedReplyUnreadable {
+            summary: "delete banding id 7".to_string(),
+            banded_range_id: Some(7),
+            detail: "bad reply".to_string(),
+        });
+        assert_eq!(unreadable.sheet_id, Some(3));
+        assert_eq!(unreadable.banded_range_id, changed.banded_range_id);
+        assert_eq!(unreadable.status, "applied-reply-unreadable");
+        assert_eq!(unreadable.error.as_deref(), Some("bad reply"));
+        assert_eq!(
+            unreadable.fields_changed.as_deref(),
+            Some("delete banding id 7")
+        );
     }
 
     #[test]
@@ -3256,6 +3322,7 @@ mod tests {
         assert_eq!(
             BandingResult::AppliedReplyUnreadable {
                 summary: String::new(),
+                banded_range_id: None,
                 detail: String::new(),
             }
             .log_status(),

@@ -172,12 +172,22 @@ impl GoogleApiClient {
         response: Response,
         context: &'static str,
     ) -> Result<T> {
-        if !response.status().is_success() {
-            return Err(Self::response_to_error(self.api_name, response)
-                .await
-                .into());
-        }
+        let response = self.error_unless_success(response).await?;
         response.json().await.context(context)
+    }
+
+    /// Passes a 2xx `response` through and turns any other status into the
+    /// error [`Self::response_to_error`] builds — the one place both
+    /// `parse_response` and `parse_success_response` decide "the server
+    /// refused".
+    async fn error_unless_success(&self, response: Response) -> Result<Response> {
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            Err(Self::response_to_error(self.api_name, response)
+                .await
+                .into())
+        }
     }
 
     /// Like [`Self::parse_response`], but tells "the server refused" apart from
@@ -193,11 +203,7 @@ impl GoogleApiClient {
         response: Response,
         context: &'static str,
     ) -> Result<std::result::Result<T, String>> {
-        if !response.status().is_success() {
-            return Err(Self::response_to_error(self.api_name, response)
-                .await
-                .into());
-        }
+        let response = self.error_unless_success(response).await?;
         let bytes = match response.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => return Ok(Err(format!("{context}: {err}"))),
