@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::utils::env::{EnvSource, SystemEnv};
+use crate::utils::env::{EnvSource, SecretTriple, SystemEnv};
 use crate::utils::secret_env;
 
 /// Where a resolved environment value came from, for provenance reporting
@@ -478,9 +478,14 @@ impl EnvSource for SettingsEnv {
             .resolve_with(&SystemEnv, self.active_profile.as_deref(), key)
     }
 
-    fn var_pair(&self, key: &str, file_key: &str) -> (Option<String>, Option<String>) {
-        self.settings
-            .resolve_pair_with(&SystemEnv, self.active_profile.as_deref(), key, file_key)
+    fn var_triple(&self, key: &str, file_key: &str, command_key: &str) -> SecretTriple {
+        self.settings.resolve_triple_with(
+            &SystemEnv,
+            self.active_profile.as_deref(),
+            key,
+            file_key,
+            command_key,
+        )
     }
 }
 
@@ -499,9 +504,14 @@ impl EnvSource for SettingsEnvRef<'_> {
             .resolve_with(&SystemEnv, self.active_profile.as_deref(), key)
     }
 
-    fn var_pair(&self, key: &str, file_key: &str) -> (Option<String>, Option<String>) {
-        self.settings
-            .resolve_pair_with(&SystemEnv, self.active_profile.as_deref(), key, file_key)
+    fn var_triple(&self, key: &str, file_key: &str, command_key: &str) -> SecretTriple {
+        self.settings.resolve_triple_with(
+            &SystemEnv,
+            self.active_profile.as_deref(),
+            key,
+            file_key,
+            command_key,
+        )
     }
 }
 
@@ -543,6 +553,38 @@ static LOAD_WARN_DEDUP: LoadWarnDedup = LoadWarnDedup::new();
 /// Whether `key` is a registered secret, so it has a `_FILE` companion.
 fn is_secret_env_var(key: &str) -> bool {
     secret_env::SECRET_ENV_VARS.contains(&key)
+}
+
+/// Refuses to overwrite a registered secret that `env` fetches through its
+/// `<NAME>_COMMAND` companion (ADR-0090). Unlike a `_FILE` companion, which a
+/// login replaces (ADR-0089), the command names a store the user chose
+/// precisely to keep the secret out of settings.json; writing the new value
+/// there in plaintext would silently undo that. An empty value counts as
+/// unset, as everywhere else.
+fn refuse_secret_commands<'a>(
+    env: &serde_json::Map<String, serde_json::Value>,
+    keys: impl Iterator<Item = &'a str>,
+    profile: Option<&str>,
+) -> Result<()> {
+    for key in keys.filter(|key| is_secret_env_var(key)) {
+        let command_var = secret_env::command_var_name(key);
+        let set = env
+            .get(&command_var)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|v| !v.is_empty());
+        if set {
+            let map = match profile {
+                Some(name) => format!("profiles.{name}.env"),
+                None => "env".to_string(),
+            };
+            anyhow::bail!(
+                "{key} is fetched by {command_var} in the {map} map of settings.json, so a login \
+                 would replace it with a plaintext value there and nothing was saved; store the \
+                 new value in the store {command_var} reads, or remove {command_var} first"
+            );
+        }
+    }
+    Ok(())
 }
 
 impl Settings {
@@ -639,31 +681,36 @@ impl Settings {
             .map(|(value, _)| value)
     }
 
-    /// Resolves `key` and `file_key` **as a pair from one layer**, for the
-    /// secret resolver ([`crate::utils::secret_env`], ADR-0089): the raw
-    /// environment's pair if it sets either (even to an empty value, which
-    /// neutralises the lower layers exactly as [`Settings::resolve_with`]
-    /// does); otherwise the active profile's `env` pair, or the base `env`
-    /// pair when no profile is active. So `NAME_FILE` in the process env
-    /// overrides `NAME` in settings.json, while both in one layer is left for
-    /// the resolver to reject.
-    pub fn resolve_pair_with<E: EnvSource>(
+    /// Resolves `key`, `file_key` and `command_key` **as a triple from one
+    /// layer**, for the secret resolver ([`crate::utils::secret_env`],
+    /// ADR-0089, ADR-0090): the raw environment's triple if it sets any member
+    /// (even to an empty value, which neutralises the lower layers exactly as
+    /// [`Settings::resolve_with`] does); otherwise the active profile's `env`
+    /// triple, or the base `env` triple when no profile is active. So
+    /// `NAME_FILE` in the process env overrides `NAME` in settings.json, while
+    /// two members in one layer are left for the resolver to reject.
+    pub fn resolve_triple_with<E: EnvSource>(
         &self,
         raw: &E,
         active: Option<&str>,
         key: &str,
         file_key: &str,
-    ) -> (Option<String>, Option<String>) {
-        let raw_pair = (raw.var(key), raw.var(file_key));
-        if raw_pair.0.is_some() || raw_pair.1.is_some() {
-            return raw_pair;
+        command_key: &str,
+    ) -> SecretTriple {
+        let raw_triple = (raw.var(key), raw.var(file_key), raw.var(command_key));
+        if raw_triple.0.is_some() || raw_triple.1.is_some() || raw_triple.2.is_some() {
+            return raw_triple;
         }
         let layer = match active {
             Some(name) => self.profiles.get(name).map(|p| &p.env),
             None => Some(&self.env),
         };
-        layer.map_or((None, None), |env| {
-            (env.get(key).cloned(), env.get(file_key).cloned())
+        layer.map_or((None, None, None), |env| {
+            (
+                env.get(key).cloned(),
+                env.get(file_key).cloned(),
+                env.get(command_key).cloned(),
+            )
         })
     }
 
@@ -737,6 +784,7 @@ impl Settings {
         let mut settings_value = read_or_default_settings(path)?;
 
         let env = ensure_env_object(&mut settings_value, profile)?;
+        refuse_secret_commands(env, vars.iter().map(|(key, _)| *key), profile)?;
         for (key, value) in vars {
             env.insert(
                 (*key).to_string(),
@@ -751,6 +799,27 @@ impl Settings {
         }
 
         write_settings(path, &settings_value)
+    }
+
+    /// Fails when the `env` object targeted by `profile` fetches any of the
+    /// registered secrets in `keys` through a `<NAME>_COMMAND` — the check
+    /// [`Settings::upsert_env_vars_in`] applies before writing, exposed so an
+    /// interactive login can refuse *before* it spends a browser flow on a
+    /// token it would then be unable to save (ADR-0090). A missing file or
+    /// map passes.
+    pub fn ensure_secrets_replaceable(
+        path: &Path,
+        profile: Option<&str>,
+        keys: &[&str],
+    ) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut settings_value = read_or_default_settings(path)?;
+        match env_object_mut(&mut settings_value, profile) {
+            Some(env) => refuse_secret_commands(env, keys.iter().copied(), profile),
+            None => Ok(()),
+        }
     }
 
     /// Removes the given keys from the base `env` object of the settings file
@@ -782,9 +851,17 @@ impl Settings {
                     removed = true;
                 }
                 // Logging out must not leave a registered secret still
-                // resolvable through its `_FILE` companion (ADR-0089).
-                if is_secret_env_var(key) && env.remove(&secret_env::file_var_name(key)).is_some() {
-                    removed = true;
+                // resolvable through its `_FILE` or `_COMMAND` companion
+                // (ADR-0089, ADR-0090).
+                if is_secret_env_var(key) {
+                    for companion in [
+                        secret_env::file_var_name(key),
+                        secret_env::command_var_name(key),
+                    ] {
+                        if env.remove(&companion).is_some() {
+                            removed = true;
+                        }
+                    }
                 }
             }
         }
@@ -1526,6 +1603,81 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn upsert_of_a_secret_refuses_when_its_command_is_set_in_the_same_map() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let before = r#"{"env": {"DATADOG_API_KEY_COMMAND": "op read op://v/dd"},
+                "profiles": {"work": {"env": {"DATADOG_API_KEY_COMMAND": "/w"}}}}"#;
+        fs::write(&path, before).unwrap();
+
+        let err = Settings::upsert_env_vars_in(
+            &path,
+            None,
+            &[("DATADOG_SITE", "eu"), ("DATADOG_API_KEY", "s3cr3t-value")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("DATADOG_API_KEY_COMMAND"), "{err}");
+        assert!(err.contains("nothing was saved"), "{err}");
+        assert!(!err.contains("s3cr3t-value"), "the value leaked: {err}");
+        assert!(!err.contains("op read"), "the command leaked: {err}");
+        // Nothing was written, not even the non-secret key that came first.
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+        // The profile's map is judged on its own.
+        let err = Settings::upsert_env_vars_in(&path, Some("work"), &[("DATADOG_API_KEY", "v")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("profiles.work.env"), "{err}");
+    }
+
+    #[test]
+    fn upsert_ignores_an_empty_command_and_other_maps_commands() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"env": {"DATADOG_API_KEY_COMMAND": ""},
+                "profiles": {"work": {"env": {"DATADOG_APP_KEY_COMMAND": "/w"}}}}"#,
+        )
+        .unwrap();
+        Settings::upsert_env_vars_in(&path, None, &[("DATADOG_API_KEY", "v")]).unwrap();
+        assert_eq!(read_json(&path)["env"]["DATADOG_API_KEY"], "v");
+        // A command in another map, or for a non-secret key, never blocks.
+        Settings::upsert_env_vars_in(&path, None, &[("DATADOG_APP_KEY", "v")]).unwrap();
+        Settings::upsert_env_vars_in(&path, None, &[("DATADOG_SITE", "eu")]).unwrap();
+    }
+
+    #[test]
+    fn ensure_secrets_replaceable_is_the_same_check_without_writing() {
+        let (_tmp, path) = temp_settings_path();
+        // A missing file passes.
+        Settings::ensure_secrets_replaceable(&path, None, &["DATADOG_API_KEY"]).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"env": {"DATADOG_API_KEY_COMMAND": "/c"}}"#).unwrap();
+        assert!(Settings::ensure_secrets_replaceable(&path, None, &["DATADOG_API_KEY"]).is_err());
+        // Another key, another map, or an absent map passes.
+        Settings::ensure_secrets_replaceable(&path, None, &["DATADOG_APP_KEY"]).unwrap();
+        Settings::ensure_secrets_replaceable(&path, Some("work"), &["DATADOG_API_KEY"]).unwrap();
+    }
+
+    #[test]
+    fn remove_of_a_secret_also_removes_its_command_companion() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"env": {"DATADOG_API_KEY_COMMAND": "/c", "OTHER_COMMAND": "/keep"}}"#,
+        )
+        .unwrap();
+
+        assert!(Settings::remove_env_vars_in(&path, None, &["DATADOG_API_KEY"]).unwrap());
+        let val = read_json(&path);
+        assert!(val["env"].get("DATADOG_API_KEY_COMMAND").is_none());
+        assert_eq!(val["env"]["OTHER_COMMAND"], "/keep");
+    }
+
     fn settings_with_env(base: &[(&str, &str)], work: &[(&str, &str)]) -> Settings {
         let map = |pairs: &[(&str, &str)]| {
             pairs
@@ -1543,45 +1695,59 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pair_takes_the_process_env_pair_over_settings() {
+    fn resolve_triple_takes_the_process_env_triple_over_settings() {
         // `NAME_FILE` in the process env beats `NAME` in settings.json: the
         // layers never mix, so this is not a conflict.
         let settings = settings_with_env(&[("K", "from-settings")], &[]);
         let raw = MapEnv::new().with("K_FILE", "/run/k");
         assert_eq!(
-            settings.resolve_pair_with(&raw, None, "K", "K_FILE"),
-            (None, Some("/run/k".to_string()))
+            settings.resolve_triple_with(&raw, None, "K", "K_FILE", "K_COMMAND"),
+            (None, Some("/run/k".to_string()), None)
+        );
+        // So does `NAME_COMMAND`, over both settings members.
+        let settings = settings_with_env(&[("K", "v"), ("K_FILE", "/f")], &[]);
+        let raw = MapEnv::new().with("K_COMMAND", "/bin/op");
+        assert_eq!(
+            settings.resolve_triple_with(&raw, None, "K", "K_FILE", "K_COMMAND"),
+            (None, None, Some("/bin/op".to_string()))
         );
     }
 
     #[test]
-    fn resolve_pair_falls_back_to_one_settings_layer_as_a_pair() {
-        let settings = settings_with_env(&[("K", "v"), ("K_FILE", "/f")], &[("K_FILE", "/w")]);
+    fn resolve_triple_falls_back_to_one_settings_layer_as_a_triple() {
+        let settings = settings_with_env(
+            &[("K", "v"), ("K_FILE", "/f"), ("K_COMMAND", "/c")],
+            &[("K_FILE", "/w")],
+        );
         let raw = MapEnv::new();
-        // Both in the base layer come back together (the resolver rejects it).
+        // All three in the base layer come back together (the resolver rejects it).
         assert_eq!(
-            settings.resolve_pair_with(&raw, None, "K", "K_FILE"),
-            (Some("v".to_string()), Some("/f".to_string()))
+            settings.resolve_triple_with(&raw, None, "K", "K_FILE", "K_COMMAND"),
+            (
+                Some("v".to_string()),
+                Some("/f".to_string()),
+                Some("/c".to_string())
+            )
         );
         // A profile replaces the base layer entirely.
         assert_eq!(
-            settings.resolve_pair_with(&raw, Some("work"), "K", "K_FILE"),
-            (None, Some("/w".to_string()))
+            settings.resolve_triple_with(&raw, Some("work"), "K", "K_FILE", "K_COMMAND"),
+            (None, Some("/w".to_string()), None)
         );
         assert_eq!(
-            settings.resolve_pair_with(&raw, Some("nope"), "K", "K_FILE"),
-            (None, None)
+            settings.resolve_triple_with(&raw, Some("nope"), "K", "K_FILE", "K_COMMAND"),
+            (None, None, None)
         );
     }
 
     #[test]
-    fn resolve_pair_empty_process_env_value_neutralises_settings() {
+    fn resolve_triple_empty_process_env_value_neutralises_settings() {
         // Matches `resolve_with`: an exported `K=` shadows the settings layer.
         let settings = settings_with_env(&[("K", "from-settings")], &[]);
         let raw = MapEnv::new().with("K", "");
         assert_eq!(
-            settings.resolve_pair_with(&raw, None, "K", "K_FILE"),
-            (Some(String::new()), None)
+            settings.resolve_triple_with(&raw, None, "K", "K_FILE", "K_COMMAND"),
+            (Some(String::new()), None, None)
         );
     }
 
@@ -1603,8 +1769,9 @@ mod tests {
             fn var(&self, key: &str) -> Option<String> {
                 self.0.resolve_with(&self.1, None, key)
             }
-            fn var_pair(&self, key: &str, file_key: &str) -> (Option<String>, Option<String>) {
-                self.0.resolve_pair_with(&self.1, None, key, file_key)
+            fn var_triple(&self, key: &str, file_key: &str, command_key: &str) -> SecretTriple {
+                self.0
+                    .resolve_triple_with(&self.1, None, key, file_key, command_key)
             }
         }
 
@@ -1630,7 +1797,7 @@ mod tests {
             secret_var(&env, "DATADOG_API_KEY").unwrap_err(),
             SecretEnvError::Conflict { .. }
         ));
-        // secret_var only ever reads var_pair; var itself must still resolve
+        // secret_var only ever reads var_triple; var itself must still resolve
         // through the same settings/profile chain for other EnvSource callers.
         assert_eq!(env.var("DATADOG_API_KEY"), Some("v".to_string()));
     }
@@ -1638,7 +1805,7 @@ mod tests {
     #[test]
     fn settings_env_ref_var_falls_back_to_the_settings_layer() {
         // SettingsEnvRef::var is EnvSource's required method; secret_var and
-        // secret_var_is_set (its only production callers) read var_pair alone,
+        // secret_var_is_set (its only production callers) read var_triple alone,
         // so this exercises it directly against the same fallback chain
         // SettingsEnv::var uses.
         let settings = settings_with_env(

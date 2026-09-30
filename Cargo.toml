@@ -130,6 +130,10 @@ indicatif = "0.18"
 # mail-parser resolves MIME structure but does no HTML rendering itself.
 htmd = "0.5"
 
+# Splits a `<NAME>_COMMAND` secret-helper value into argv without a shell
+# (#2011, ADR-0090). Already in the tree via `cc`.
+shlex = "1.3"
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["fs", "hostname", "signal", "user"] }
 

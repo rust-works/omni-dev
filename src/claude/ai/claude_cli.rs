@@ -145,17 +145,19 @@ fn parse_keep_env(value: Option<&str>) -> Vec<String> {
 /// Returns whether `key` is a secret env var the tool-enabled scrub must
 /// remove, unless the user-supplied `keep` list names it:
 ///
-/// - a `<NAME>_FILE` companion (ADR-0089) of any secret `NAME` — even one in
-///   [`SECRET_ENV_KEEP`], since the nested `claude` never reads omni-dev's
-///   `_FILE` convention and the path only points it at the secret;
+/// - a `<NAME>_FILE` or `<NAME>_COMMAND` companion (ADR-0089, ADR-0090) of any
+///   secret `NAME` — even one in [`SECRET_ENV_KEEP`], since the nested
+///   `claude` never reads omni-dev's conventions and the path or command only
+///   points it at the secret. This is hygiene, not a boundary: the same
+///   command is still in `settings.json`, which the nested session can read;
 /// - otherwise, a name matching [`SECRET_ENV_SUFFIXES`] or
 ///   [`SECRET_ENV_EXACT`] that is not in [`SECRET_ENV_KEEP`].
 fn is_scrubbed_secret(key: &str, keep: &[String]) -> bool {
     if keep.iter().any(|k| k == key) {
         return false;
     }
-    if let Some(base) = key.strip_suffix(secret_env::FILE_SUFFIX) {
-        if is_secret_name(base) {
+    for suffix in [secret_env::FILE_SUFFIX, secret_env::COMMAND_SUFFIX] {
+        if key.strip_suffix(suffix).is_some_and(is_secret_name) {
             return true;
         }
     }
@@ -1388,6 +1390,34 @@ mod tests {
         assert!(!is_scrubbed_secret(
             "ANTHROPIC_API_KEY_FILE",
             &["ANTHROPIC_API_KEY_FILE".to_string()]
+        ));
+    }
+
+    #[test]
+    fn is_scrubbed_secret_removes_command_companions_of_secrets() {
+        for key in [
+            "DATADOG_API_KEY_COMMAND",
+            "DATADOG_APP_KEY_COMMAND",
+            "GH_TOKEN_COMMAND",
+            // The nested claude never runs our helpers, so even a kept
+            // name's companion goes.
+            "ANTHROPIC_API_KEY_COMMAND",
+            "ANTHROPIC_AUTH_TOKEN_COMMAND",
+        ] {
+            assert!(is_scrubbed_secret(key, &[]), "{key} should match");
+        }
+        // Names that merely end in `_COMMAND` are left alone.
+        for key in ["EDITOR_COMMAND", "GIT_SSH_COMMAND", "TOKENIZER_COMMAND"] {
+            assert!(!is_scrubbed_secret(key, &[]), "{key} should not match");
+        }
+        // The knobs are not secrets.
+        for key in [secret_env::COMMAND_TIMEOUT_VAR, secret_env::COMMAND_TTL_VAR] {
+            assert!(!is_scrubbed_secret(key, &[]), "{key} should not match");
+        }
+        // An explicit keep still wins.
+        assert!(!is_scrubbed_secret(
+            "ANTHROPIC_API_KEY_COMMAND",
+            &["ANTHROPIC_API_KEY_COMMAND".to_string()]
         ));
     }
 
