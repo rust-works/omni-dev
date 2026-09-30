@@ -47,7 +47,9 @@ use crate::drive::lease::check::{
     LeaseGateRefusal, LeasedWrite,
 };
 use crate::drive::lease::ledger::LeaseBackup;
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::types::{
     BatchUpdateRequestItem, DeleteDuplicatesRequest, Dimension, DimensionRange, GridRange,
@@ -135,6 +137,19 @@ pub enum DeleteDuplicatesResult {
     RefusedLeaseExpired,
     RefusedLeaseWrongFile,
     RefusedLeaseStale,
+    /// The API answered 2xx — the rows **were removed** — but its reply could
+    /// not be read (issue #2021). Distinct from [`Self::Failed`]. The
+    /// server's `duplicatesRemovedCount` was in that reply, so it is unknown.
+    AppliedReplyUnreadable {
+        /// What was applied, in the same terms as a `Removed` line.
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+        /// Where the lease that authorised this write backed the file up;
+        /// the recovery note names it exactly as for [`Self::Removed`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        backup: Option<Box<LeaseBackup>>,
+    },
     Failed {
         detail: String,
     },
@@ -173,6 +188,7 @@ impl DeleteDuplicatesResult {
             Self::RefusedLeaseExpired => "refused-lease-expired",
             Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
             Self::RefusedLeaseStale => "refused-lease-stale",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -368,7 +384,7 @@ async fn delete_duplicates_inner(
     )
     .await
     {
-        Ok(response) => DeleteDuplicatesResult::Removed {
+        Ok(BatchUpdateOutcome::Applied(response)) => DeleteDuplicatesResult::Removed {
             range: composed,
             comparison_columns: opts.comparison_columns.clone(),
             content_outside_range_untouched: true,
@@ -382,6 +398,20 @@ async fn delete_duplicates_inner(
                 .as_ref()
                 .map(|grant| Box::new(grant.backup.clone())),
         },
+        // Not idempotent (`RetryHint::NotIdempotent`): a re-run compares the
+        // already-deduplicated rows, so it can remove further rows.
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            DeleteDuplicatesResult::AppliedReplyUnreadable {
+                summary: format!(
+                    "remove duplicate rows from {composed} comparing {}",
+                    render_columns(&opts.comparison_columns)
+                ),
+                detail,
+                backup: lease_grant
+                    .as_ref()
+                    .map(|grant| Box::new(grant.backup.clone())),
+            }
+        }
         Err(err) => DeleteDuplicatesResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -448,10 +478,12 @@ fn record_attempt(outcome: &DeleteDuplicatesOutcome, duration: Duration) {
                 render_columns(comparison_columns)
             ),
         }),
+        DeleteDuplicatesResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
         _ => None,
     };
     let error = match &outcome.result {
         DeleteDuplicatesResult::RefusedInvalidRequest { detail }
+        | DeleteDuplicatesResult::AppliedReplyUnreadable { detail, .. }
         | DeleteDuplicatesResult::Failed { detail } => Some(detail.clone()),
         _ => None,
     };
@@ -548,6 +580,16 @@ pub fn describe_lines(outcome: &DeleteDuplicatesOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
+        DeleteDuplicatesResult::AppliedReplyUnreadable {
+            summary,
+            detail,
+            backup,
+        } => vec![
+            applied_reply_unreadable_line(summary, &book, RetryHint::NotIdempotent, detail),
+            "  the removed-row count was in the unreadable reply; check the spreadsheet"
+                .to_string(),
+            format!("  {}", recovery_note(backup.as_deref(), false)),
+        ],
         DeleteDuplicatesResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
@@ -862,6 +904,11 @@ mod tests {
             DeleteDuplicatesResult::RefusedLeaseExpired,
             DeleteDuplicatesResult::RefusedLeaseWrongFile,
             DeleteDuplicatesResult::RefusedLeaseStale,
+            DeleteDuplicatesResult::AppliedReplyUnreadable {
+                summary: "remove duplicate rows from 'Q1'!A2:C10 comparing all columns".into(),
+                detail: "bad reply".into(),
+                backup: None,
+            },
             DeleteDuplicatesResult::Failed {
                 detail: "boom".into(),
             },
@@ -885,8 +932,49 @@ mod tests {
             );
             statuses.insert(outcome.result.log_status());
         }
-        // 14 results, 13 statuses: the two `Removed`s share one.
-        assert_eq!(statuses.len(), 13);
+        // 15 results, 14 statuses: the two `Removed`s share one.
+        assert_eq!(statuses.len(), 14);
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable_with_a_count_hint_and_recovery_note() {
+        let outcome = DeleteDuplicatesOutcome {
+            spreadsheet_id: "sheet-1".into(),
+            file_name: Some("Budget".into()),
+            resolved_folder_id: None,
+            result: DeleteDuplicatesResult::AppliedReplyUnreadable {
+                summary: "remove duplicate rows from 'Q1'!A2:C10 comparing all columns".into(),
+                detail: "bad reply".into(),
+                backup: Some(Box::new(LeaseBackup::DriveCopy {
+                    file_id: "copy-9".into(),
+                })),
+            },
+        };
+        let lines = describe_lines(&outcome);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            "Applied, but the reply could not be read: remove duplicate rows from \
+             'Q1'!A2:C10 comparing all columns in 'Budget' — do not retry; check the \
+             spreadsheet first (bad reply)"
+        );
+        assert_eq!(
+            lines[1],
+            "  the removed-row count was in the unreadable reply; check the spreadsheet"
+        );
+        assert_eq!(
+            lines[2],
+            format!(
+                "  {}",
+                recovery_note(
+                    Some(&LeaseBackup::DriveCopy {
+                        file_id: "copy-9".into()
+                    }),
+                    false
+                )
+            )
+        );
+        assert!(lines[2].contains("Drive copy copy-9"), "{lines:?}");
     }
 
     #[test]
@@ -1353,6 +1441,37 @@ mod tests {
             matches!(outcome.result, DeleteDuplicatesResult::Failed { .. }),
             "{outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_duplicates_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_metadata(&server).await;
+        // 2xx, so the rows WERE removed — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = delete_duplicates(&drive, &sheets, &options(false), &[rule()]).await;
+        assert!(
+            matches!(
+                outcome.result,
+                DeleteDuplicatesResult::AppliedReplyUnreadable { .. }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        let lines = describe_lines(&outcome);
+        assert!(
+            lines[0].starts_with("Applied, but the reply could not be read"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("do not retry"), "{lines:?}");
     }
 
     // ── the Drive write lease (ADR-0080 §9) ─────────────────────────────

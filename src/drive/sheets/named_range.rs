@@ -68,7 +68,9 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::{SheetsApi, ValueRenderOption};
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi, ValueRenderOption,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
@@ -269,6 +271,17 @@ pub enum NamedRangeResult {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         referencing_formulas: Vec<String>,
     },
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: a
+    /// retry here would fail on the now-taken name or act on a range that has
+    /// already changed. The server-assigned id of an added named range was in
+    /// that reply, so it is unknown.
+    AppliedReplyUnreadable {
+        /// Same summary as [`Self::WouldChange`].
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -313,6 +326,7 @@ impl NamedRangeResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -609,13 +623,18 @@ async fn named_range_inner(
     )
     .await
     {
-        Ok(response) => {
+        Ok(BatchUpdateOutcome::Applied(response)) => {
             let named_range_id = added_named_range_id(&response).or(existing_id);
             NamedRangeResult::Changed {
                 summary,
                 named_range_id,
                 referencing_formulas,
             }
+        }
+        // NotIdempotent: a second run fails on the now-taken name or acts on an
+        // already-changed range.
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            NamedRangeResult::AppliedReplyUnreadable { summary, detail }
         }
         Err(err) => NamedRangeResult::Failed {
             detail: format!("{err:#}"),
@@ -940,7 +959,8 @@ fn target_descriptor(name: Option<&str>, id: Option<&str>) -> String {
 
 fn record_attempt(outcome: &NamedRangeOutcome, opts: &NamedRangeOptions, duration: Duration) {
     let error = match &outcome.result {
-        NamedRangeResult::Failed { detail } => Some(detail.clone()),
+        NamedRangeResult::Failed { detail }
+        | NamedRangeResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -956,6 +976,10 @@ fn record_attempt(outcome: &NamedRangeOutcome, opts: &NamedRangeOptions, duratio
         } => (named_range_id.clone(), referencing_formulas.clone()),
         _ => (None, Vec::new()),
     };
+    let fields_changed = match &outcome.result {
+        NamedRangeResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
+        _ => None,
+    };
 
     request_log::record_drive_mutation(DriveMutationOutcome {
         operation: opts.verb.log_operation(),
@@ -968,6 +992,7 @@ fn record_attempt(outcome: &NamedRangeOutcome, opts: &NamedRangeOptions, duratio
         decided_by_file_id: decided_by.file_id,
         named_range_id,
         referencing_formula_locations,
+        fields_changed,
         error,
         duration,
         ..Default::default()
@@ -1085,6 +1110,22 @@ pub fn describe_lines(outcome: &NamedRangeOutcome) -> Vec<String> {
                 .map_or_else(String::new, |id| format!(" (id {id})"));
             let mut lines = vec![format!("Applied: {summary}{id} in {book}")];
             lines.extend(referencing_formula_lines(referencing_formulas));
+            lines
+        }
+        NamedRangeResult::AppliedReplyUnreadable { summary, detail } => {
+            let mut lines = vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::NotIdempotent,
+                detail,
+            )];
+            if matches!(verb, NamedRangeVerb::AddNamedRange { .. }) {
+                lines.push(
+                    "  the new named range's id was in the unreadable reply; run \
+                     `list-named-ranges` to find it"
+                        .to_string(),
+                );
+            }
             lines
         }
         NamedRangeResult::Failed { detail } => vec![format!("Failed: {detail}")],
@@ -1545,6 +1586,59 @@ mod tests {
             }
             other => panic!("expected Changed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn add_named_range_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        // 2xx, so the named range WAS added — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: NamedRangeVerb::AddNamedRange {
+                name: "Foo".to_string(),
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = named_range(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                NamedRangeResult::AppliedReplyUnreadable { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        assert!(
+            describe(&outcome).starts_with("Applied, but the reply could not be read"),
+            "{}",
+            describe(&outcome)
+        );
     }
 
     #[tokio::test]
@@ -2412,6 +2506,39 @@ mod tests {
     }
 
     #[test]
+    fn describe_lines_renders_applied_reply_unreadable_with_an_id_hint_only_for_adds() {
+        let added = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            NamedRangeResult::AppliedReplyUnreadable {
+                summary: "add named range 'Foo'".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(
+            describe_lines(&added),
+            vec![
+                "Applied, but the reply could not be read: add named range 'Foo' in 'Budget' — \
+                 do not retry; check the spreadsheet first (bad reply)"
+                    .to_string(),
+                "  the new named range's id was in the unreadable reply; run \
+                 `list-named-ranges` to find it"
+                    .to_string(),
+            ]
+        );
+
+        let deleted = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            NamedRangeResult::AppliedReplyUnreadable {
+                summary: "delete named range 'Foo'".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(describe_lines(&deleted).len(), 1);
+    }
+
+    #[test]
     fn describe_lines_renders_failed() {
         let out = outcome_with(
             add_verb(),
@@ -3138,6 +3265,14 @@ mod tests {
             }
             .log_status(),
             "refused-duplicate-name"
+        );
+        assert_eq!(
+            NamedRangeResult::AppliedReplyUnreadable {
+                summary: String::new(),
+                detail: String::new(),
+            }
+            .log_status(),
+            "applied-reply-unreadable"
         );
         assert_eq!(
             NamedRangeResult::Failed {

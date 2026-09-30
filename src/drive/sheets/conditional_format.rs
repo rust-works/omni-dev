@@ -49,7 +49,9 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::date_value::{
     reject_blank, reject_blank_date, reject_empty, reject_invalid_date_between, reject_nan,
@@ -489,6 +491,16 @@ pub enum ConditionalFormatResult {
         /// Same summary as [`Self::WouldChange`].
         summary: String,
     },
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: the
+    /// rule change happened, and a retry could duplicate a rule or act on a
+    /// shifted index.
+    AppliedReplyUnreadable {
+        /// Same summary as [`Self::Changed`].
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -530,6 +542,7 @@ impl ConditionalFormatResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -857,7 +870,12 @@ async fn conditional_format_inner(
     )
     .await
     {
-        Ok(_response) => ConditionalFormatResult::Changed { summary },
+        Ok(BatchUpdateOutcome::Applied(_response)) => ConditionalFormatResult::Changed { summary },
+        // `RetryHint::NotIdempotent`: a second add duplicates the rule, and a
+        // second update/delete addresses rules by index (#2021).
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            ConditionalFormatResult::AppliedReplyUnreadable { summary, detail }
+        }
         Err(err) => ConditionalFormatResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -1006,7 +1024,8 @@ fn record_attempt(
     duration: Duration,
 ) {
     let error = match &outcome.result {
-        ConditionalFormatResult::Failed { detail } => Some(detail.clone()),
+        ConditionalFormatResult::Failed { detail }
+        | ConditionalFormatResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -1120,6 +1139,14 @@ pub fn describe_lines(outcome: &ConditionalFormatOutcome) -> Vec<String> {
             .collect(),
         ConditionalFormatResult::Changed { summary } => {
             vec![format!("Applied: {summary} in {book}")]
+        }
+        ConditionalFormatResult::AppliedReplyUnreadable { summary, detail } => {
+            vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::NotIdempotent,
+                detail,
+            )]
         }
         ConditionalFormatResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -2016,6 +2043,13 @@ mod tests {
                 "changed",
             ),
             (
+                ConditionalFormatResult::AppliedReplyUnreadable {
+                    summary: String::new(),
+                    detail: String::new(),
+                },
+                "applied-reply-unreadable",
+            ),
+            (
                 ConditionalFormatResult::Failed {
                     detail: String::new(),
                 },
@@ -2296,6 +2330,25 @@ mod tests {
     }
 
     #[test]
+    fn describe_lines_renders_applied_reply_unreadable_as_not_idempotent() {
+        let outcome = describe_outcome(
+            add_verb(),
+            ConditionalFormatResult::AppliedReplyUnreadable {
+                summary: "add conditional format (boolean rule)".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(
+            describe_lines(&outcome),
+            vec![
+                "Applied, but the reply could not be read: add conditional format (boolean \
+                 rule) in 'Budget' — do not retry; check the spreadsheet first (bad reply)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn describe_lines_renders_failed() {
         let outcome = describe_outcome(
             add_verb(),
@@ -2450,6 +2503,54 @@ mod tests {
             outcome.result,
             ConditionalFormatResult::Blocked { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn add_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // 2xx, so the rule WAS added — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = ConditionalFormatOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = conditional_format(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                ConditionalFormatResult::AppliedReplyUnreadable { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        assert!(
+            describe(&outcome).starts_with("Applied, but the reply could not be read"),
+            "{}",
+            describe(&outcome)
+        );
     }
 
     #[tokio::test]

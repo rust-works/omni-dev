@@ -64,7 +64,9 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
@@ -299,6 +301,16 @@ pub enum FilterResult {
         #[serde(skip_serializing_if = "Option::is_none")]
         width_warning: Option<String>,
     },
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: a
+    /// retry here could duplicate a filter view. The server-assigned id of an
+    /// added filter view was in that reply, so it is unknown.
+    AppliedReplyUnreadable {
+        /// Same summary as [`Self::WouldChange`].
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -341,6 +353,7 @@ impl FilterResult {
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Unchanged { .. } => "unchanged",
             Self::Changed { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -769,13 +782,18 @@ async fn filter_inner(
     )
     .await
     {
-        Ok(response) => {
+        Ok(BatchUpdateOutcome::Applied(response)) => {
             let filter_view_id = added_filter_view_id(&response).or(existing_id);
             FilterResult::Changed {
                 summary,
                 filter_view_id,
                 width_warning,
             }
+        }
+        // NotIdempotent: a second `add-filter-view` would add a second view, and a
+        // second `sort-range` would re-sort already-moved rows.
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            FilterResult::AppliedReplyUnreadable { summary, detail }
         }
         Err(err) => FilterResult::Failed {
             detail: format!("{err:#}"),
@@ -1284,7 +1302,9 @@ fn describe_filter_effect(prefix: &str, sort_by: &[String], hide_values: &[Strin
 
 fn record_attempt(outcome: &FilterOutcome, opts: &FilterOptions, duration: Duration) {
     let error = match &outcome.result {
-        FilterResult::Failed { detail } => Some(detail.clone()),
+        FilterResult::Failed { detail } | FilterResult::AppliedReplyUnreadable { detail, .. } => {
+            Some(detail.clone())
+        }
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -1298,7 +1318,8 @@ fn record_attempt(outcome: &FilterOutcome, opts: &FilterOptions, duration: Durat
     };
     let fields_changed = match &opts.verb {
         FilterVerb::UpdateFilterView { .. } => match &outcome.result {
-            FilterResult::Changed { summary, .. } => Some(summary.clone()),
+            FilterResult::Changed { summary, .. }
+            | FilterResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
             _ => None,
         },
         _ => None,
@@ -1424,6 +1445,22 @@ pub fn describe_lines(outcome: &FilterOutcome) -> Vec<String> {
             )
         }
         FilterResult::Unchanged { detail } => vec![format!("Unchanged: {detail} in {book}")],
+        FilterResult::AppliedReplyUnreadable { summary, detail } => {
+            let mut lines = vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::NotIdempotent,
+                detail,
+            )];
+            if matches!(verb, FilterVerb::AddFilterView { .. }) {
+                lines.push(
+                    "  the new filter view's id was in the unreadable reply; run \
+                     `list-filter-views` to find it"
+                        .to_string(),
+                );
+            }
+            lines
+        }
         FilterResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
@@ -2294,6 +2331,14 @@ mod tests {
         assert_eq!(
             FilterResult::RefusedFilterViewNotFound { filter_view_id: 1 }.log_status(),
             "refused-filter-view-not-found"
+        );
+        assert_eq!(
+            FilterResult::AppliedReplyUnreadable {
+                summary: String::new(),
+                detail: String::new(),
+            }
+            .log_status(),
+            "applied-reply-unreadable"
         );
         assert_eq!(
             FilterResult::Failed {
@@ -3807,6 +3852,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn update_filter_view_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook_with_view_seven().mount(&server).await;
+        // 2xx, so the change WAS applied — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = FilterOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: update_verb(),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = filter(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, FilterResult::AppliedReplyUnreadable { .. }),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        assert!(
+            describe(&outcome).starts_with("Applied, but the reply could not be read"),
+            "{}",
+            describe(&outcome)
+        );
+    }
+
     // ── the Drive write lease (ADR-0080 §9) ──────────────────────────────
 
     #[tokio::test]
@@ -4063,6 +4153,45 @@ mod tests {
             describe(&without_id),
             "Applied: set basic filter in 'Budget'"
         );
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable_with_an_id_hint_only_for_adds() {
+        let added = outcome_with(
+            FilterVerb::AddFilterView {
+                sheet: "Q1".to_string(),
+                range: "A1:D10".to_string(),
+                title: None,
+                sort_by: Vec::new(),
+                hide_values: Vec::new(),
+            },
+            Some("Budget"),
+            FilterResult::AppliedReplyUnreadable {
+                summary: "add filter view".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(
+            describe_lines(&added),
+            vec![
+                "Applied, but the reply could not be read: add filter view in 'Budget' — \
+                 do not retry; check the spreadsheet first (bad reply)"
+                    .to_string(),
+                "  the new filter view's id was in the unreadable reply; run \
+                 `list-filter-views` to find it"
+                    .to_string(),
+            ]
+        );
+
+        let updated = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            FilterResult::AppliedReplyUnreadable {
+                summary: "update filter view 7".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(describe_lines(&updated).len(), 1);
     }
 
     #[test]

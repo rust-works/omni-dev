@@ -711,6 +711,15 @@ merely which engine ran it:
   `stale-revision`: the *lease* was not stale, the mutation simply did not
   happen, and the error says why.
 
+- A Sheets `batchUpdate` that answers **2xx but whose reply cannot be
+  parsed** is still a mutation that happened (issue #2021): its outcome
+  record is `verdict: allowed` (with `version_after`, and the ledger is
+  refreshed), and its `drivemutation` record has `status:
+  applied-reply-unreadable`, `error` set to the parse detail, and
+  `fields_changed` set to the change summary — never `failed`. Only a
+  non-2xx response, or a transport failure before any status arrives,
+  records `failed`.
+
 An intent record with no matching outcome is itself the signal that
 something was interrupted mid-write — the whole point of writing the
 former durably before the latter can even be attempted.

@@ -40,7 +40,9 @@ use crate::drive::lease::check::{
     conclude_native_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
     LeasedWrite,
 };
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range::width_warning;
 use crate::drive::sheets::types::{BatchUpdateRequestItem, SortOrder, SortRangeRequest, SortSpec};
@@ -107,6 +109,14 @@ pub enum SortRangeResult {
     RefusedLeaseExpired,
     RefusedLeaseWrongFile,
     RefusedLeaseStale,
+    /// The API answered 2xx — the sort **was applied** — but its reply could
+    /// not be read (issue #2021). Distinct from [`Self::Failed`].
+    AppliedReplyUnreadable {
+        /// What was sorted, as recorded for `Changed`.
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     Failed {
         detail: String,
     },
@@ -145,6 +155,7 @@ impl SortRangeResult {
             Self::RefusedLeaseExpired => "refused-lease-expired",
             Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
             Self::RefusedLeaseStale => "refused-lease-stale",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -345,11 +356,18 @@ async fn sort_range_inner(
     )
     .await
     {
-        Ok(_) => SortRangeResult::Changed {
+        Ok(BatchUpdateOutcome::Applied(_)) => SortRangeResult::Changed {
             range: composed,
             sort_specs,
             width_warning,
         },
+        // Idempotent: re-sorting an already-sorted range is a no-op.
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            SortRangeResult::AppliedReplyUnreadable {
+                summary: sorted_summary(&composed, &sort_specs),
+                detail,
+            }
+        }
         Err(err) => SortRangeResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -414,13 +432,14 @@ fn record_attempt(outcome: &SortRangeOutcome, duration: Duration) {
     let fields_changed = match &outcome.result {
         SortRangeResult::Changed {
             range, sort_specs, ..
-        } => Some(format!("sorted {range} by {}", render_specs(sort_specs))),
+        } => Some(sorted_summary(range, sort_specs)),
+        SortRangeResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
         _ => None,
     };
     let error = match &outcome.result {
-        SortRangeResult::RefusedInvalidRequest { detail } | SortRangeResult::Failed { detail } => {
-            Some(detail.clone())
-        }
+        SortRangeResult::RefusedInvalidRequest { detail }
+        | SortRangeResult::Failed { detail }
+        | SortRangeResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     request_log::record_drive_mutation(DriveMutationOutcome {
@@ -517,8 +536,22 @@ pub fn describe_lines(outcome: &SortRangeOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
+        SortRangeResult::AppliedReplyUnreadable { summary, detail } => {
+            vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::Idempotent,
+                detail,
+            )]
+        }
         SortRangeResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
+}
+
+/// The one-line account of a sort, shared by the audit log and the
+/// unreadable-reply line.
+fn sorted_summary(range: &str, specs: &[SortSpec]) -> String {
+    format!("sorted {range} by {}", render_specs(specs))
 }
 
 fn render_specs(specs: &[SortSpec]) -> String {
@@ -1139,6 +1172,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sort_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_metadata(&server).await;
+        // 2xx, so the sort WAS applied — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = sort_range(&drive, &sheets, &options(false), &[rule()]).await;
+        assert!(
+            matches!(
+                outcome.result,
+                SortRangeResult::AppliedReplyUnreadable { .. }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        let lines = describe_lines(&outcome);
+        assert!(
+            lines[0].starts_with("Applied, but the reply could not be read"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable() {
+        let outcome = SortRangeOutcome {
+            spreadsheet_id: "sheet-1".into(),
+            file_name: Some("Budget".into()),
+            resolved_folder_id: None,
+            result: SortRangeResult::AppliedReplyUnreadable {
+                summary: "sorted Q1!A2:C10 by 2 desc".into(),
+                detail: "bad reply".into(),
+            },
+        };
+        assert_eq!(
+            describe_lines(&outcome),
+            vec![
+                "Applied, but the reply could not be read: sorted Q1!A2:C10 by 2 desc in \
+                 'Budget' — check the spreadsheet to confirm (bad reply)"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn a_batch_update_error_under_an_active_lease_records_the_failure() {
         // Unlike `a_batch_update_error_is_reported_as_failed` (no lease held
         // at all), this holds a real lease grant so the failure path also
@@ -1324,6 +1407,10 @@ mod tests {
             SortRangeResult::RefusedLeaseExpired,
             SortRangeResult::RefusedLeaseWrongFile,
             SortRangeResult::RefusedLeaseStale,
+            SortRangeResult::AppliedReplyUnreadable {
+                summary: "sorted Q1!A1:B3 by 0 asc".into(),
+                detail: "bad reply".into(),
+            },
             SortRangeResult::Failed {
                 detail: "boom".into(),
             },
@@ -1342,6 +1429,7 @@ mod tests {
                 | SortRangeResult::RefusedLeaseExpired
                 | SortRangeResult::RefusedLeaseWrongFile
                 | SortRangeResult::RefusedLeaseStale
+                | SortRangeResult::AppliedReplyUnreadable { .. }
                 | SortRangeResult::Failed { .. } => (),
             }
         }

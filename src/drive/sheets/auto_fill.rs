@@ -96,7 +96,9 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::{SheetsApi, ValueRenderOption};
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi, ValueRenderOption,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
@@ -288,6 +290,15 @@ pub enum AutoFillResult {
         /// Same as [`Self::WouldChange`].
         destination_is_upper_bound: bool,
     },
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: the
+    /// fill happened, so the sheet already holds it.
+    AppliedReplyUnreadable {
+        /// Same summary as [`Self::Changed`].
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -329,6 +340,7 @@ impl AutoFillResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -644,13 +656,18 @@ async fn auto_fill_inner(
     )
     .await
     {
-        Ok(_response) => AutoFillResult::Changed {
+        Ok(BatchUpdateOutcome::Applied(_response)) => AutoFillResult::Changed {
             summary,
             destination: destination_a1,
             requested_destination,
             overwritten_cells,
             destination_is_upper_bound: is_upper_bound,
         },
+        // `RetryHint::Idempotent`: re-running the same fill is harmless, so the
+        // reply is only needed to confirm the write (#2021).
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            AutoFillResult::AppliedReplyUnreadable { summary, detail }
+        }
         Err(err) => AutoFillResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -974,7 +991,8 @@ fn build_request(
 
 fn record_attempt(outcome: &AutoFillOutcome, duration: Duration) {
     let error = match &outcome.result {
-        AutoFillResult::Failed { detail } => Some(detail.clone()),
+        AutoFillResult::Failed { detail }
+        | AutoFillResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -996,6 +1014,9 @@ fn record_attempt(outcome: &AutoFillOutcome, duration: Duration) {
                 overwritten_cells.clone(),
                 *destination_is_upper_bound,
             ),
+            AutoFillResult::AppliedReplyUnreadable { summary, .. } => {
+                (None, Some(summary.clone()), Vec::new(), false)
+            }
             _ => (None, None, Vec::new(), false),
         };
 
@@ -1123,6 +1144,16 @@ pub fn describe_lines(outcome: &AutoFillOutcome) -> Vec<String> {
             requested_destination.as_deref(),
             false,
         ),
+        // Idempotent: filling the same source over the same destination again
+        // yields the same cells.
+        AutoFillResult::AppliedReplyUnreadable { summary, detail } => {
+            vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::Idempotent,
+                detail,
+            )]
+        }
         AutoFillResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
@@ -1705,6 +1736,14 @@ mod tests {
             "changed"
         );
         assert_eq!(
+            AutoFillResult::AppliedReplyUnreadable {
+                summary: String::new(),
+                detail: String::new(),
+            }
+            .log_status(),
+            "applied-reply-unreadable"
+        );
+        assert_eq!(
             AutoFillResult::Failed {
                 detail: String::new()
             }
@@ -1779,6 +1818,10 @@ mod tests {
                 requested_destination: None,
                 overwritten_cells: Vec::new(),
                 destination_is_upper_bound: true,
+            },
+            AutoFillResult::AppliedReplyUnreadable {
+                summary: "auto-fill within 'Q1'!A1:A10".to_string(),
+                detail: "bad reply".to_string(),
             },
             AutoFillResult::Failed {
                 detail: "boom".to_string(),
@@ -2905,6 +2948,82 @@ mod tests {
         };
         // The same string lands in the request log's `fields_changed`.
         assert!(!summary.contains("would"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn auto_fill_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A4:A10",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        // 2xx, so the fill WAS applied — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = AutoFillOptions {
+            lease_token,
+            ledger_path,
+            ..base_opts(source_and_destination_form(Dimension::Rows, 7), false)
+        };
+        let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                AutoFillResult::AppliedReplyUnreadable { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        assert!(
+            describe(&outcome).starts_with("Applied, but the reply could not be read"),
+            "{}",
+            describe(&outcome)
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable_as_an_idempotent_single_line() {
+        let outcome = AutoFillOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            sheet_id: Some(0),
+            form: range_form(),
+            result: AutoFillResult::AppliedReplyUnreadable {
+                summary: "auto-fill within 'Q1'!A1:A10".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        };
+        assert_eq!(
+            describe_lines(&outcome),
+            vec![
+                "Applied, but the reply could not be read: auto-fill within 'Q1'!A1:A10 in \
+                 'Budget' — check the spreadsheet to confirm (bad reply)"
+                    .to_string()
+            ]
+        );
     }
 
     #[tokio::test]

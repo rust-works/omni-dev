@@ -180,6 +180,31 @@ impl GoogleApiClient {
         response.json().await.context(context)
     }
 
+    /// Like [`Self::parse_response`], but tells "the server refused" apart from
+    /// "the server said 2xx, yet the body could not be read".
+    ///
+    /// The outer `Err` is a non-2xx (`response_to_error`'s message). On a 2xx the
+    /// inner `Result` is the body: `Err(detail)` means the request *succeeded*
+    /// but its reply failed to read or deserialise. For a mutating call that
+    /// distinction is load-bearing, because reporting an applied mutation as a
+    /// failure invites a retry that duplicates it (issue #2021).
+    pub(crate) async fn parse_success_response<T: serde::de::DeserializeOwned>(
+        &self,
+        response: Response,
+        context: &'static str,
+    ) -> Result<std::result::Result<T, String>> {
+        if !response.status().is_success() {
+            return Err(Self::response_to_error(self.api_name, response)
+                .await
+                .into());
+        }
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => return Ok(Err(format!("{context}: {err}"))),
+        };
+        Ok(serde_json::from_slice(&bytes).map_err(|err| format!("{context}: {err}")))
+    }
+
     /// Sends an authenticated GET and deserialises the JSON body into `T`.
     pub(crate) async fn get_parsed<T: serde::de::DeserializeOwned>(
         &self,

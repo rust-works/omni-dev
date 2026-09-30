@@ -47,7 +47,9 @@ use crate::drive::lease::check::{
     conclude_native_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
     LeasedWrite,
 };
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
@@ -249,6 +251,17 @@ pub enum DeveloperMetadataResult {
         /// The entries that were removed.
         entries: Vec<DeveloperMetadataEntry>,
     },
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: the
+    /// change is already in the spreadsheet, so check it before retrying.
+    AppliedReplyUnreadable {
+        /// What was applied, in the same wording the request log's
+        /// `fields_changed` carries for [`Self::Created`] / [`Self::Updated`]
+        /// / [`Self::Deleted`].
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -292,6 +305,7 @@ impl DeveloperMetadataResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Created { .. } | Self::Updated { .. } | Self::Deleted { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -775,7 +789,15 @@ async fn developer_metadata_inner(
     )
     .await
     {
-        Ok(_response) => changed_result,
+        Ok(BatchUpdateOutcome::Applied(_response)) => changed_result,
+        // NotIdempotent: conservative — a second run is normally harmless (`set`
+        // upserts, `delete` finds nothing), but the advice is to look first.
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            DeveloperMetadataResult::AppliedReplyUnreadable {
+                summary: changed_summary(&changed_result).unwrap_or_default(),
+                detail,
+            }
+        }
         Err(err) => DeveloperMetadataResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -851,7 +873,8 @@ fn record_attempt(
     duration: Duration,
 ) {
     let error = match &outcome.result {
-        DeveloperMetadataResult::Failed { detail } => Some(detail.clone()),
+        DeveloperMetadataResult::Failed { detail }
+        | DeveloperMetadataResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -860,6 +883,31 @@ fn record_attempt(
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
     let fields_changed = match &outcome.result {
+        DeveloperMetadataResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
+        other => changed_summary(other),
+    };
+
+    request_log::record_drive_mutation(DriveMutationOutcome {
+        operation: opts.verb.log_operation(),
+        file_id: outcome.spreadsheet_id.clone(),
+        file_name: outcome.file_name.clone().unwrap_or_default(),
+        status: outcome.result.log_status().to_string(),
+        resolved_folder_id: outcome.resolved_folder_id.clone(),
+        decided_by_folder_id: decided_by.folder_id,
+        decided_by_depth: decided_by.depth,
+        decided_by_file_id: decided_by.file_id,
+        fields_changed,
+        error,
+        duration,
+        ..Default::default()
+    });
+}
+
+/// A one-line summary of the change a `Created` / `Updated` / `Deleted`
+/// result records, for the request log and the unreadable-reply line. `None`
+/// for every other variant.
+fn changed_summary(result: &DeveloperMetadataResult) -> Option<String> {
+    match result {
         DeveloperMetadataResult::Created { key, value, .. } => {
             Some(format!("create key={key:?} value={value:?}"))
         }
@@ -877,22 +925,7 @@ fn record_attempt(
             plural(entries.len())
         )),
         _ => None,
-    };
-
-    request_log::record_drive_mutation(DriveMutationOutcome {
-        operation: opts.verb.log_operation(),
-        file_id: outcome.spreadsheet_id.clone(),
-        file_name: outcome.file_name.clone().unwrap_or_default(),
-        status: outcome.result.log_status().to_string(),
-        resolved_folder_id: outcome.resolved_folder_id.clone(),
-        decided_by_folder_id: decided_by.folder_id,
-        decided_by_depth: decided_by.depth,
-        decided_by_file_id: decided_by.file_id,
-        fields_changed,
-        error,
-        duration,
-        ..Default::default()
-    });
+    }
 }
 
 fn plural(n: usize) -> &'static str {
@@ -1050,6 +1083,16 @@ pub fn describe_lines(outcome: &DeveloperMetadataOutcome) -> Vec<String> {
             )];
             lines.extend(entries.iter().map(describe_entry));
             lines
+        }
+        // Neither verb learns anything from the reply (a created entry's id is
+        // not reported even on success), so there is no lost value to name.
+        DeveloperMetadataResult::AppliedReplyUnreadable { summary, detail } => {
+            vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::NotIdempotent,
+                detail,
+            )]
         }
         DeveloperMetadataResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -1465,6 +1508,40 @@ mod tests {
         }
         let text = describe(&outcome);
         assert!(text.contains("Created developer metadata"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn set_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets, rules) = setup(&server).await;
+        mount_search(serde_json::json!({"matchedDeveloperMetadata": []}))
+            .mount(&server)
+            .await;
+        // 2xx, so the entry WAS created — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = developer_metadata(&drive, &sheets, &set_opts(false), &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                DeveloperMetadataResult::AppliedReplyUnreadable { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        assert!(
+            describe(&outcome).starts_with("Applied, but the reply could not be read"),
+            "{}",
+            describe(&outcome)
+        );
     }
 
     #[tokio::test]
@@ -2277,6 +2354,51 @@ mod tests {
             location: "the whole spreadsheet".to_string(),
         };
         assert_eq!(would_create.log_status(), "would-change");
+    }
+
+    #[test]
+    fn log_status_names_every_result_variant_distinctly() {
+        let statuses = [
+            DeveloperMetadataResult::Created {
+                key: String::new(),
+                value: String::new(),
+                location: String::new(),
+            }
+            .log_status(),
+            DeveloperMetadataResult::AppliedReplyUnreadable {
+                summary: String::new(),
+                detail: String::new(),
+            }
+            .log_status(),
+            DeveloperMetadataResult::Failed {
+                detail: String::new(),
+            }
+            .log_status(),
+        ];
+        assert_eq!(statuses, ["changed", "applied-reply-unreadable", "failed"]);
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable() {
+        let outcome = DeveloperMetadataOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: set_opts(false).verb,
+            result: DeveloperMetadataResult::AppliedReplyUnreadable {
+                summary: "create key=\"owner\" value=\"team-a\"".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        };
+        assert_eq!(
+            describe_lines(&outcome),
+            vec![
+                "Applied, but the reply could not be read: create key=\"owner\" \
+                 value=\"team-a\" in 'Budget' — do not retry; check the spreadsheet first \
+                 (bad reply)"
+                    .to_string()
+            ]
+        );
     }
 
     // ── search()'s own location-error rendering ───────────────────────

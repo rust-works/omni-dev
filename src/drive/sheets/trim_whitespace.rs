@@ -53,7 +53,9 @@ use crate::drive::lease::check::{
     conclude_native_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
     LeasedWrite,
 };
-use crate::drive::sheets::api::{SheetsApi, ValueRenderOption};
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi, ValueRenderOption,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::types::{
     BatchUpdateRequestItem, GridRange, Sheet, Spreadsheet, TrimWhitespaceRequest,
@@ -134,6 +136,15 @@ pub enum TrimWhitespaceResult {
     RefusedLeaseExpired,
     RefusedLeaseWrongFile,
     RefusedLeaseStale,
+    /// The API answered 2xx — the trim **was applied** — but its reply could
+    /// not be read (issue #2021). Distinct from [`Self::Failed`]. The server's
+    /// `cellsChangedCount` was in that reply, so it is unknown.
+    AppliedReplyUnreadable {
+        /// What was applied, in the same terms as a `Changed` line.
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     Failed {
         detail: String,
     },
@@ -172,6 +183,7 @@ impl TrimWhitespaceResult {
             Self::RefusedLeaseExpired => "refused-lease-expired",
             Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
             Self::RefusedLeaseStale => "refused-lease-stale",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -376,7 +388,7 @@ async fn trim_whitespace_inner(
     )
     .await
     {
-        Ok(response) => TrimWhitespaceResult::Changed {
+        Ok(BatchUpdateOutcome::Applied(response)) => TrimWhitespaceResult::Changed {
             range: range_a1,
             cells_changed_count: response
                 .replies
@@ -385,6 +397,14 @@ async fn trim_whitespace_inner(
                 .and_then(|reply| reply.trim_whitespace)
                 .map(|trim| trim.cells_changed_count),
         },
+        // Idempotent (`RetryHint::Idempotent`): trimming an already-trimmed
+        // range changes nothing, so a re-run is safe.
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            TrimWhitespaceResult::AppliedReplyUnreadable {
+                summary: format!("trim whitespace in {range_a1}"),
+                detail,
+            }
+        }
         Err(err) => TrimWhitespaceResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -510,10 +530,12 @@ fn record_attempt(outcome: &TrimWhitespaceOutcome, duration: Duration) {
             Some(count) => format!("trimmed {count} cell(s) in {range}"),
             None => format!("trimmed {range}; the API reported no count"),
         }),
+        TrimWhitespaceResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
         _ => None,
     };
     let error = match &outcome.result {
         TrimWhitespaceResult::RefusedInvalidRequest { detail }
+        | TrimWhitespaceResult::AppliedReplyUnreadable { detail, .. }
         | TrimWhitespaceResult::Failed { detail } => Some(detail.clone()),
         _ => None,
     };
@@ -599,6 +621,10 @@ pub fn describe_lines(outcome: &TrimWhitespaceOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
+        TrimWhitespaceResult::AppliedReplyUnreadable { summary, detail } => vec![
+            applied_reply_unreadable_line(summary, &book, RetryHint::Idempotent, detail),
+            "  the cell count was in the unreadable reply; check the spreadsheet".to_string(),
+        ],
         TrimWhitespaceResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
@@ -945,6 +971,10 @@ mod tests {
             TrimWhitespaceResult::RefusedLeaseExpired,
             TrimWhitespaceResult::RefusedLeaseWrongFile,
             TrimWhitespaceResult::RefusedLeaseStale,
+            TrimWhitespaceResult::AppliedReplyUnreadable {
+                summary: "trim whitespace in Q1!A2:C10".into(),
+                detail: "bad reply".into(),
+            },
             TrimWhitespaceResult::Failed {
                 detail: "boom".into(),
             },
@@ -968,9 +998,30 @@ mod tests {
             );
             statuses.insert(outcome.result.log_status());
         }
-        // 15 results, 13 distinct statuses: the two `WouldChange`s share
+        // 16 results, 14 distinct statuses: the two `WouldChange`s share
         // one and the two `Changed`s share another.
-        assert_eq!(statuses.len(), 13);
+        assert_eq!(statuses.len(), 14);
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable_with_a_count_hint() {
+        let outcome = TrimWhitespaceOutcome {
+            spreadsheet_id: "sheet-1".into(),
+            file_name: Some("Budget".into()),
+            resolved_folder_id: None,
+            result: TrimWhitespaceResult::AppliedReplyUnreadable {
+                summary: "trim whitespace in Q1!A2:C10".into(),
+                detail: "bad reply".into(),
+            },
+        };
+        assert_eq!(
+            describe_lines(&outcome),
+            [
+                "Applied, but the reply could not be read: trim whitespace in Q1!A2:C10 in \
+                 'Budget' — check the spreadsheet to confirm (bad reply)",
+                "  the cell count was in the unreadable reply; check the spreadsheet",
+            ]
+        );
     }
 
     #[test]
@@ -1432,6 +1483,40 @@ mod tests {
         assert!(
             matches!(outcome.result, TrimWhitespaceResult::Failed { .. }),
             "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trim_whitespace_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_metadata(&server).await;
+        // 2xx, so the trim WAS applied — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = trim_whitespace(&drive, &sheets, &options(false), &[rule()]).await;
+        assert!(
+            matches!(
+                outcome.result,
+                TrimWhitespaceResult::AppliedReplyUnreadable { .. }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        let lines = describe_lines(&outcome);
+        assert!(
+            lines[0].starts_with("Applied, but the reply could not be read"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("check the spreadsheet to confirm"),
+            "{lines:?}"
         );
     }
 

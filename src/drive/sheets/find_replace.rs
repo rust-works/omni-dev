@@ -18,7 +18,9 @@ use crate::drive::lease::check::{
     conclude_native_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
     LeasedWrite,
 };
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::types::{
     BatchUpdateRequestItem, FindReplaceRequest, FindReplaceResponse, FindReplaceScope, GridRange,
@@ -130,6 +132,16 @@ pub enum FindReplaceResult {
     RefusedLeaseExpired,
     RefusedLeaseWrongFile,
     RefusedLeaseStale,
+    /// The API answered 2xx — the replacement **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: a
+    /// retry here could compound (`a` -> `aa`). The replacement counts were
+    /// in that reply, so they are unknown.
+    AppliedReplyUnreadable {
+        /// What was applied, in the same terms as a `Changed` line.
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     Failed {
         detail: String,
     },
@@ -168,6 +180,7 @@ impl FindReplaceResult {
             Self::RefusedLeaseExpired => "refused-lease-expired",
             Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
             Self::RefusedLeaseStale => "refused-lease-stale",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -328,7 +341,7 @@ async fn find_replace_inner(
         Ok(grant) => grant,
         Err(err) => return gated(err.into_result()),
     };
-    let response = match conclude_native_leased_write(
+    let outcome = match conclude_native_leased_write(
         leased,
         &lease_grant,
         &files_api,
@@ -341,10 +354,21 @@ async fn find_replace_inner(
     )
     .await
     {
-        Ok(response) => response,
+        Ok(outcome) => outcome,
         Err(err) => {
             return gated(FindReplaceResult::Failed {
                 detail: format!("{err:#}"),
+            })
+        }
+    };
+    // Not idempotent (`NotIdempotent`): a second run replaces again, so
+    // `a` -> `aa` compounds.
+    let response = match outcome {
+        BatchUpdateOutcome::Applied(response) => response,
+        BatchUpdateOutcome::AppliedReplyUnreadable { detail } => {
+            return gated(FindReplaceResult::AppliedReplyUnreadable {
+                summary: format!("find/replace on {}", target.describe()),
+                detail,
             })
         }
     };
@@ -472,12 +496,16 @@ fn record_attempt(outcome: &FindReplaceOutcome, _opts: &FindReplaceOptions, dura
                 target.describe()
             )),
         ),
+        FindReplaceResult::AppliedReplyUnreadable { summary, .. } => {
+            (None, None, Some(summary.clone()))
+        }
         FindReplaceResult::WouldChange { target, .. } => (None, None, Some(target.describe())), // omni-dev: coverage ignore-line reason="record_attempt is only called when !opts.dry_run, and WouldChange is only ever returned when opts.dry_run is true, so this arm can never run"
         _ => (None, None, None),
     };
     let error = match &outcome.result {
         FindReplaceResult::Failed { detail }
-        | FindReplaceResult::RefusedInvalidRequest { detail } => Some(detail.clone()),
+        | FindReplaceResult::RefusedInvalidRequest { detail }
+        | FindReplaceResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     request_log::record_drive_mutation(DriveMutationOutcome {
@@ -519,6 +547,10 @@ pub fn describe_lines(outcome: &FindReplaceOutcome) -> Vec<String> {
         FindReplaceResult::RefusedLeaseExpired => LeaseGateRefusal::Expired.describe_line(&outcome.spreadsheet_id, &book).into_iter().collect(),
         FindReplaceResult::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.describe_line(&outcome.spreadsheet_id, &book).into_iter().collect(),
         FindReplaceResult::RefusedLeaseStale => LeaseGateRefusal::Stale.describe_line(&outcome.spreadsheet_id, &book).into_iter().collect(),
+        FindReplaceResult::AppliedReplyUnreadable { summary, detail } => vec![
+            applied_reply_unreadable_line(summary, &book, RetryHint::NotIdempotent, detail),
+            "  the replacement counts were in the unreadable reply; check the spreadsheet".to_string(),
+        ],
         FindReplaceResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
@@ -1227,6 +1259,43 @@ mod tests {
         assert!(matches!(outcome.result, FindReplaceResult::Failed { .. }));
     }
 
+    #[tokio::test]
+    async fn find_replace_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // 2xx, so the replacement WAS applied — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
+        assert!(
+            matches!(
+                outcome.result,
+                FindReplaceResult::AppliedReplyUnreadable { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        let lines = describe_lines(&outcome);
+        assert!(
+            lines[0].starts_with("Applied, but the reply could not be read"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("do not retry"), "{lines:?}");
+    }
+
     // ── the Drive write lease (ADR-0080 §9) ─────────────────────────────
 
     #[tokio::test]
@@ -1447,6 +1516,10 @@ mod tests {
             FindReplaceResult::RefusedLeaseExpired,
             FindReplaceResult::RefusedLeaseWrongFile,
             FindReplaceResult::RefusedLeaseStale,
+            FindReplaceResult::AppliedReplyUnreadable {
+                summary: "find/replace on all sheets".to_string(),
+                detail: "bad reply".to_string(),
+            },
             FindReplaceResult::Failed {
                 detail: "boom".to_string(),
             },
@@ -1465,6 +1538,7 @@ mod tests {
                 | FindReplaceResult::RefusedLeaseExpired
                 | FindReplaceResult::RefusedLeaseWrongFile
                 | FindReplaceResult::RefusedLeaseStale
+                | FindReplaceResult::AppliedReplyUnreadable { .. }
                 | FindReplaceResult::Failed { .. } => (),
             }
         }
@@ -1481,9 +1555,18 @@ mod tests {
                 result,
             };
             let lines = describe_lines(&outcome);
+            // The unreadable-reply result adds one hint line for the counts.
+            let expected = if matches!(
+                outcome.result,
+                FindReplaceResult::AppliedReplyUnreadable { .. }
+            ) {
+                2
+            } else {
+                1
+            };
             assert_eq!(
                 lines.len(),
-                1,
+                expected,
                 "describe_lines emitted {} lines for {:?}: {lines:?}",
                 lines.len(), // omni-dev: coverage ignore-line reason="assert_eq!'s message args are only evaluated on failure, and this test always passes"
                 outcome.result
@@ -1529,6 +1612,35 @@ mod tests {
         assert_eq!(
             FindReplaceResult::RefusedLeaseStale.log_status(),
             "refused-lease-stale"
+        );
+        assert_eq!(
+            FindReplaceResult::AppliedReplyUnreadable {
+                summary: String::new(),
+                detail: String::new()
+            }
+            .log_status(),
+            "applied-reply-unreadable"
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable_with_a_counts_hint() {
+        let outcome = FindReplaceOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            result: FindReplaceResult::AppliedReplyUnreadable {
+                summary: "find/replace on sheet 'Q1'".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        };
+        assert_eq!(
+            describe_lines(&outcome),
+            [
+                "Applied, but the reply could not be read: find/replace on sheet 'Q1' in \
+                 'Budget' — do not retry; check the spreadsheet first (bad reply)",
+                "  the replacement counts were in the unreadable reply; check the spreadsheet",
+            ]
         );
     }
 

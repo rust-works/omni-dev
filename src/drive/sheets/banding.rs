@@ -46,7 +46,9 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::format::parse_hex_color;
 use crate::drive::sheets::grid_range;
@@ -240,6 +242,16 @@ pub enum BandingResult {
         /// `add-banding`, otherwise the one resolved against.
         banded_range_id: Option<i64>,
     },
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: a
+    /// retry here would duplicate the banded range. The server-assigned id of
+    /// an added banding was in that reply, so it is unknown.
+    AppliedReplyUnreadable {
+        /// Same summary as [`Self::WouldChange`].
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -281,6 +293,7 @@ impl BandingResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -533,12 +546,16 @@ async fn banding_inner(
     )
     .await
     {
-        Ok(response) => {
+        Ok(BatchUpdateOutcome::Applied(response)) => {
             let banded_range_id = added_banded_range_id(&response).or(existing_id);
             BandingResult::Changed {
                 summary,
                 banded_range_id,
             }
+        }
+        // NotIdempotent: a second `add-banding` would add a second banded range.
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            BandingResult::AppliedReplyUnreadable { summary, detail }
         }
         Err(err) => BandingResult::Failed {
             detail: format!("{err:#}"),
@@ -883,7 +900,9 @@ fn describe_effect(verb: &BandingVerb) -> String {
 
 fn record_attempt(outcome: &BandingOutcome, opts: &BandingOptions, duration: Duration) {
     let error = match &outcome.result {
-        BandingResult::Failed { detail } => Some(detail.clone()),
+        BandingResult::Failed { detail } | BandingResult::AppliedReplyUnreadable { detail, .. } => {
+            Some(detail.clone())
+        }
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -895,6 +914,10 @@ fn record_attempt(outcome: &BandingOutcome, opts: &BandingOptions, duration: Dur
         BandingResult::Changed {
             banded_range_id, ..
         } => *banded_range_id,
+        _ => None,
+    };
+    let fields_changed = match &outcome.result {
+        BandingResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
         _ => None,
     };
 
@@ -909,6 +932,7 @@ fn record_attempt(outcome: &BandingOutcome, opts: &BandingOptions, duration: Dur
         decided_by_file_id: decided_by.file_id,
         sheet_id: outcome.sheet_id,
         banded_range_id,
+        fields_changed,
         error,
         duration,
         ..Default::default()
@@ -994,6 +1018,22 @@ pub fn describe_lines(outcome: &BandingOutcome) -> Vec<String> {
                 .filter(|_| matches!(outcome.verb, BandingVerb::AddBanding { .. }))
                 .map_or_else(String::new, |id| format!(" (id {id})"));
             vec![format!("Applied: {summary}{id} in {book}")]
+        }
+        BandingResult::AppliedReplyUnreadable { summary, detail } => {
+            let mut lines = vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::NotIdempotent,
+                detail,
+            )];
+            if matches!(verb, BandingVerb::AddBanding { .. }) {
+                lines.push(
+                    "  the new banded range's id was in the unreadable reply; run \
+                     `list-bandings` to find it"
+                        .to_string(),
+                );
+            }
+            lines
         }
         BandingResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -1666,6 +1706,55 @@ mod tests {
             }
         );
         assert_eq!(outcome.sheet_id, Some(0));
+    }
+
+    #[tokio::test]
+    async fn add_banding_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        // 2xx, so the banding WAS added — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = BandingOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = banding(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, BandingResult::AppliedReplyUnreadable { .. }),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        assert!(
+            describe(&outcome).starts_with("Applied, but the reply could not be read"),
+            "{}",
+            describe(&outcome)
+        );
     }
 
     #[tokio::test]
@@ -3029,6 +3118,39 @@ mod tests {
     }
 
     #[test]
+    fn describe_lines_renders_applied_reply_unreadable_with_an_id_hint_only_for_adds() {
+        let added = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            BandingResult::AppliedReplyUnreadable {
+                summary: "add row banding".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(
+            describe_lines(&added),
+            vec![
+                "Applied, but the reply could not be read: add row banding in 'Budget' — \
+                 do not retry; check the spreadsheet first (bad reply)"
+                    .to_string(),
+                "  the new banded range's id was in the unreadable reply; run \
+                 `list-bandings` to find it"
+                    .to_string(),
+            ]
+        );
+
+        let deleted = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            BandingResult::AppliedReplyUnreadable {
+                summary: "delete banding id 7".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(describe_lines(&deleted).len(), 1);
+    }
+
+    #[test]
     fn describe_lines_renders_failed() {
         let out = outcome_with(
             add_verb(),
@@ -3130,6 +3252,14 @@ mod tests {
             }
             .log_status(),
             "changed"
+        );
+        assert_eq!(
+            BandingResult::AppliedReplyUnreadable {
+                summary: String::new(),
+                detail: String::new(),
+            }
+            .log_status(),
+            "applied-reply-unreadable"
         );
         assert_eq!(
             BandingResult::Failed {
