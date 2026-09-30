@@ -573,7 +573,12 @@ outcome reports the name Drive actually stored, not the string you asked
 for: if Drive normalised or ignored it, a `Note: requested … but Drive
 stored …` line goes to stderr and `-o json`/`yaml` output gains a
 `requested_name` field (omitted when the two match). Renaming a file to the
-name it already has prints `Already named: …` instead of `Renamed: a -> a`.
+name it already has prints `Already named: …` instead of `Renamed: a -> a`
+(`--dry-run` prints `Would not rename: already named …`). If Drive answers
+200 but keeps the old name although a different one was asked for, the
+command fails (`Drive accepted the request but kept the name …`) rather
+than reporting success; the request log records that attempt with status
+`ignored`, and a same-name rename with status `unchanged`.
 
 Renaming only ever touches a file's `name` field — it never changes
 `parents`, so it can never change who can see the file (Drive resolves
