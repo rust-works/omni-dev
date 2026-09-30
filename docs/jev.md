@@ -1460,8 +1460,10 @@ again, and a failed write is ignored, so at worst a run behaves as if there
 were no cache. Entries hold issue text, including text from private
 repositories. They are written readable by you alone (`0600` files in `0700`
 directories). Each run sweeps the whole cache directory, deleting entries older
-than the TTL (by file modification time, for every account) and any temp file
-a crashed write left behind. The sweep runs even with the TTL set to `0`, which
+than the TTL (by file modification time, for every account), any temp file
+a crashed write left behind, and the `<account>/<owner>/<repo>` directories
+that leaves empty. A directory that still holds anything, such as a fresh
+entry a concurrent run just wrote, is kept. The sweep runs even with the TTL set to `0`, which
 therefore clears everything a previous run cached. A lookup never deletes an
 entry itself, so two runs at once cannot delete each other's fresh copy.
 

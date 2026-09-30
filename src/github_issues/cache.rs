@@ -24,7 +24,8 @@
 //! effect at once. Entries hold issue text from possibly private
 //! repositories, so [`IssueCache::prune_expired`] sweeps expired ones (and
 //! the orphaned temp files of a crashed write) each run rather than leaving
-//! them on disk indefinitely. A lookup never deletes: the fetch that follows a
+//! them on disk indefinitely, along with the `<account>/<owner>/<repo>`
+//! directories that leaves empty. A lookup never deletes: the fetch that follows a
 //! miss overwrites the entry, and leaving removal to the sweep means a reader
 //! can never delete a fresh entry a concurrent writer just renamed into place.
 //!
@@ -260,6 +261,7 @@ impl IssueCache {
             };
             if expired {
                 remove_entry(&path);
+                remove_empty_parents(&path, root);
             }
         }
     }
@@ -367,10 +369,44 @@ fn is_safe_segment(segment: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// How many times a write starts over when the sweep removes its directory
+/// from under it. A second collision in a row means a sweep is running in a
+/// loop, not a race, and the write is given up as any other failed write is.
+const WRITE_ATTEMPTS: usize = 3;
+
 /// Writes one entry atomically: a `0600` temp file in the same `0700`
 /// directory, then a rename, so a concurrent reader sees either the old entry
 /// or the new one, never a partial file.
+///
+/// The sweep removes the directories it empties, and a directory is empty
+/// between its creation and the temp file landing in it, so the whole
+/// sequence starts over when a directory vanishes. Once the temp file exists
+/// its directory is non-empty and `remove_dir` refuses it, so the rename
+/// itself cannot lose that race.
 fn write_entry(path: &Path, doc: &IssueDoc) -> Result<()> {
+    retry_on_not_found(|| write_entry_once(path, doc))
+}
+
+/// Runs `write`, up to [`WRITE_ATTEMPTS`] times while it fails with `NotFound`.
+fn retry_on_not_found(mut write: impl FnMut() -> Result<()>) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        match write() {
+            Err(e) if attempt < WRITE_ATTEMPTS && is_not_found(&e) => attempt += 1,
+            result => return result,
+        }
+    }
+}
+
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn write_entry_once(path: &Path, doc: &IssueDoc) -> Result<()> {
     crate::daemon::paths::ensure_parent_dir_0700(path)?;
     let dir = path.parent().context("cache entry path has no parent")?;
     let entry = Entry {
@@ -401,6 +437,36 @@ fn remove_entry(path: &Path) {
             debug!("Failed to remove GitHub cache file {shown}: {e}");
         }
         _ => {}
+    }
+}
+
+/// Removes the directories `path`'s removal left empty, from its own directory
+/// up to but not including `root`.
+///
+/// `remove_dir` refuses a directory that still holds anything — a fresh
+/// sibling entry, a live write's temp file, a file that is not the cache's —
+/// so it is the emptiness check as well. The first directory it cannot remove
+/// ends the walk, since every ancestor of a non-empty directory is non-empty
+/// too. One that is already gone (another sweep got there first) does not.
+fn remove_empty_parents(path: &Path, root: &Path) {
+    for dir in path
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| *dir != root && dir.starts_with(root))
+    {
+        match std::fs::remove_dir(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::DirectoryNotEmpty {
+                    debug!(
+                        "Failed to remove GitHub cache directory {}: {e}",
+                        dir.display()
+                    );
+                }
+                return;
+            }
+        }
     }
 }
 
@@ -663,6 +729,136 @@ mod tests {
         assert!(off.dir.is_none());
         off.prune_expired();
         assert!(!path_b.exists());
+    }
+
+    /// The `<account>/<owner>/<repo>` directories under `root`, at any depth.
+    fn dirs_under(root: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for child in std::fs::read_dir(dir).unwrap().flatten() {
+                if child.file_type().unwrap().is_dir() {
+                    out.push(child.path());
+                    walk(&child.path(), out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out
+    }
+
+    #[test]
+    fn prune_removes_the_directories_an_expired_tree_leaves_empty() {
+        let base = tempfile::tempdir().unwrap();
+        let env = MapEnv::new();
+        let open = |account: &str| {
+            IssueCache::from_env_with(&env, Some(base.path().to_path_buf()), Some(account), false)
+        };
+        let (a, b) = (open("aaaa"), open("bbbb"));
+        for cache in [&a, &b] {
+            cache.store(&doc("o/r", 1, ItemKind::Issue));
+            cache.store(&doc("o/other", 1, ItemKind::Issue));
+        }
+        let entries = [("o/r", &a), ("o/other", &a), ("o/r", &b), ("o/other", &b)];
+        for (project, cache) in entries {
+            set_age(&cache.entry_path(project, 1).unwrap(), 3600);
+        }
+
+        a.prune_expired();
+        let root = a.root.clone().unwrap();
+        assert_eq!(dirs_under(&root), Vec::<PathBuf>::new());
+        assert!(root.is_dir(), "the cache root itself is never removed");
+    }
+
+    #[test]
+    fn prune_keeps_the_directories_a_fresh_sibling_or_bystander_still_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path());
+        for (project, number) in [("o/r", 1), ("o/r", 2), ("o/gone", 1), ("o/kept", 1)] {
+            cache.store(&doc(project, number, ItemKind::Issue));
+        }
+        let path = |project, n| cache.entry_path(project, n).unwrap();
+        set_age(&path("o/r", 1), 3600);
+        set_age(&path("o/gone", 1), 3600);
+        set_age(&path("o/kept", 1), 3600);
+        let bystander = path("o/kept", 1).with_file_name("notes.txt");
+        std::fs::write(&bystander, "not ours").unwrap();
+
+        cache.prune_expired();
+        assert!(path("o/r", 2).exists(), "the fresh sibling is untouched");
+        assert!(
+            bystander.exists(),
+            "a file that is not ours pins its directory"
+        );
+        assert!(!dir.path().join("o/gone").exists(), "emptied");
+        assert!(dir.path().join("o/r").is_dir());
+        assert!(dir.path().join("o/kept").is_dir());
+        assert!(dir.path().join("o").is_dir(), "still has children");
+    }
+
+    #[test]
+    fn prune_keeps_a_directory_holding_a_live_writes_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path());
+        cache.store(&doc("o/r", 1, ItemKind::Issue));
+        let live = dir
+            .path()
+            .join("o/r")
+            .join(format!(".entry-abc.{TEMP_EXT}"));
+        std::fs::write(&live, "issue text").unwrap();
+        set_age(&cache.entry_path("o/r", 1).unwrap(), 3600);
+
+        cache.prune_expired();
+        assert!(live.exists(), "the writer's directory survives its sweep");
+    }
+
+    #[test]
+    fn a_write_after_the_sweep_removed_its_directories_recreates_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path());
+        let item = doc("o/r", 1, ItemKind::Issue);
+        cache.store(&item);
+        set_age(&cache.entry_path("o/r", 1).unwrap(), 3600);
+        cache.prune_expired();
+        assert!(!dir.path().join("o").exists());
+
+        cache.store(&item);
+        assert!(cache.entry_path("o/r", 1).unwrap().exists());
+    }
+
+    #[test]
+    fn a_write_that_loses_its_directory_starts_over_a_bounded_number_of_times() {
+        let vanished = || -> Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                .context("Failed to create a temp file")
+        };
+
+        let mut calls = 0;
+        retry_on_not_found(|| {
+            calls += 1;
+            if calls < WRITE_ATTEMPTS {
+                vanished()
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, WRITE_ATTEMPTS, "the last attempt succeeds");
+
+        let mut calls = 0;
+        retry_on_not_found(|| {
+            calls += 1;
+            vanished()
+        })
+        .unwrap_err();
+        assert_eq!(calls, WRITE_ATTEMPTS, "then it gives up");
+
+        let mut calls = 0;
+        retry_on_not_found(|| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1, "any other failure is not retried");
     }
 
     #[test]
