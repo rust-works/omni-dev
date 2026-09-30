@@ -1024,6 +1024,9 @@ fn relation_at(state: &str, range: &std::ops::Range<usize>) -> MentionRelation {
         .rev()
         .collect();
     let nearby = nearby.to_ascii_lowercase();
+    let after = &state[range.end..];
+    let end = after.find(['.', '!', '?', '\n']).unwrap_or(after.len());
+    let following = after[..end].trim_start().to_ascii_lowercase();
     if nearby.contains("such as")
         || nearby.contains("for example")
         || nearby.contains("worked example")
@@ -1038,8 +1041,16 @@ fn relation_at(state: &str, range: &std::ops::Range<usize>) -> MentionRelation {
         || nearby.contains("unblocked")
         || nearby.contains("not a tracker")
         || nearby.contains("not split out of")
+        || following.starts_with("does not block")
+        || following.starts_with("no longer blocks")
     {
         return MentionRelation::Negated;
+    }
+    if following.starts_with("blocks ")
+        || following.starts_with("is required for ")
+        || following.starts_with("must land before ")
+    {
+        return MentionRelation::Blocker;
     }
     if nearby.contains("blocked on")
         || nearby.contains("depends on")
@@ -2145,8 +2156,19 @@ mod tests {
         assert_eq!(deps[0].state, ItemState::Open);
         assert_eq!(deps[0].could_be_cheaper.get("design"), Some(&0.75));
         assert_eq!(deps[0].relation, CitationRelation::Unspecified);
+        let json = serde_json::to_value(&deps[0]).unwrap();
+        assert_eq!(json["relation"], "unspecified");
+        assert_eq!(json["could_be_cheaper"]["design"], 0.75);
         assert_eq!(deps[1].item_ref, "#1349");
         assert!(deps[1].could_be_cheaper.is_empty());
+        assert_eq!(
+            serde_json::to_value(CitationRelation::Blocker).unwrap(),
+            "blocker"
+        );
+        assert_eq!(
+            serde_json::to_value(CitationRelation::Tracker).unwrap(),
+            "tracker"
+        );
     }
 
     fn relation_for(body: &str, target: u64) -> CitationRelation {
@@ -2184,6 +2206,7 @@ mod tests {
             "See #123 for context.",
             "Blocked on #123. Split out of #123.",
             "Blocked on #123. No longer blocked on #123.",
+            "#123 blocks this issue. #123 no longer blocks it.",
         ] {
             assert_eq!(
                 relation_for(body, 123),
@@ -2215,6 +2238,14 @@ mod tests {
         );
         assert_eq!(
             relation_for("Absorbed by #1753; neither suggested option remains.", 1753),
+            CitationRelation::Unspecified
+        );
+        assert_eq!(
+            relation_for("#1831 blocks this issue until its ADR lands.", 1831),
+            CitationRelation::Blocker
+        );
+        assert_eq!(
+            relation_for("See #1831. It blocks this issue.", 1831),
             CitationRelation::Unspecified
         );
     }
