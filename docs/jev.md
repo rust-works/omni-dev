@@ -1446,10 +1446,12 @@ few minutes instead of being queried again ([#1858](https://github.com/rust-work
   open dependency. A cached copy is served only if its state still matches
   GitHub's; a copy that was closed or reopened since is fetched again in full.
   For `--all-open` the fresh list of open issues already proves the state, so
-  the check costs nothing. Otherwise it is one small extra `gh api graphql`
-  call per run for the cached items, asking for their state and nothing else.
-  A cold cache, `--refresh` and an item fetched earlier in the same run need no
-  check.
+  the check costs nothing. Otherwise the cached items are checked with a small
+  extra `gh api graphql` call (25 items per call) asking for their state and
+  nothing else: one for the issues you named and one for the issues they cite.
+  A cold cache, `--refresh`, and an item already fetched or checked earlier in
+  the same run need no check. If the check itself fails, the cached copies are
+  fetched again in full instead of being trusted.
 - **What can be stale:** everything else `route` reads (titles, bodies,
   comments), and `verify-decision`'s cited sources, can be up to the TTL old.
 - **Bypassing it:** `--refresh` re-fetches everything for that run and caches

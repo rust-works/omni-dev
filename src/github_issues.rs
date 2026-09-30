@@ -746,23 +746,7 @@ fn parse_aliased_response<T>(
 /// Any other error (e.g. an SSO-gated org's `FORBIDDEN`) still fails it. Returns one entry per `refs`, in the same order.
 /// **Blocking** — callers must be on a blocking thread.
 pub fn fetch_items(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<IssueDoc>>> {
-    let mut by_key = HashMap::with_capacity(refs.len());
-    for chunk in refs.chunks(MAX_ISSUES_PER_QUERY) {
-        let Some((query, index)) = build_item_query(chunk) else {
-            // omni-dev: coverage ignore-line reason="chunks() never yields an empty chunk from a non-empty refs slice, and build_item_query returns None only for an empty slice"
-            continue;
-        };
-        let body = crate::pr_status::run_gh_graphql_with_partial_data(bin, &query)?;
-        by_key.extend(parse_item_response(&body, &index)?);
-    }
-    refs.iter()
-        .map(|item_ref| {
-            by_key
-                .get(&(item_ref.project.clone(), item_ref.number))
-                .cloned()
-                .ok_or_else(|| anyhow!("item {item_ref} missing from the parsed gh reply (bug)"))
-        })
-        .collect()
+    fetch_aliased(bin, refs, build_item_query, parse_item_response)
 }
 
 /// Fetches only the `state` of each reference (an issue or a pull request),
@@ -773,20 +757,30 @@ pub fn fetch_items(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<IssueDoc>>
 /// cheapest way to learn whether a cached item was closed or reopened since.
 /// **Blocking.**
 pub fn fetch_states(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<ItemState>>> {
+    fetch_aliased(bin, refs, build_state_query, parse_state_response)
+}
+
+/// One reply's parsed items, keyed by `(project, number)`.
+type Parsed<T> = HashMap<(String, u64), T>;
+
+/// Runs `refs` through `build` in chunks of [`MAX_ISSUES_PER_QUERY`], parses
+/// each reply with `parse`, and returns one entry per `refs`, in order.
+fn fetch_aliased<T: Clone>(
+    bin: &Path,
+    refs: &[ItemRef],
+    build: fn(&[ItemRef]) -> Option<(String, QueryIndex)>,
+    parse: fn(&Value, &QueryIndex) -> Result<Parsed<T>>,
+) -> Result<Vec<T>> {
     let mut by_key = HashMap::with_capacity(refs.len());
-    for chunk in refs.chunks(MAX_ISSUES_PER_QUERY) {
-        let Some((query, index)) = build_state_query(chunk) else {
-            // omni-dev: coverage ignore-line reason="chunks() never yields an empty chunk from a non-empty refs slice, and build_state_query returns None only for an empty slice"
-            continue;
-        };
+    for (query, index) in refs.chunks(MAX_ISSUES_PER_QUERY).filter_map(build) {
         let body = crate::pr_status::run_gh_graphql_with_partial_data(bin, &query)?;
-        by_key.extend(parse_state_response(&body, &index)?);
+        by_key.extend(parse(&body, &index)?);
     }
     refs.iter()
         .map(|item_ref| {
             by_key
                 .get(&(item_ref.project.clone(), item_ref.number))
-                .copied()
+                .cloned()
                 .ok_or_else(|| anyhow!("item {item_ref} missing from the parsed gh reply (bug)"))
         })
         .collect()
@@ -802,12 +796,7 @@ pub fn fetch_issues_cached(
     cache: &IssueCache,
     refs: &[ItemRef],
 ) -> Result<Vec<IssueDoc>> {
-    fetch_through_cache(
-        refs,
-        |item_ref| cache.lookup(item_ref, |doc| doc.kind == ItemKind::Issue),
-        |misses| fetch_issues(bin, misses),
-        |doc| cache.store(doc),
-    )
+    fetch_issues_through(bin, cache, refs, |_| true)
 }
 
 /// [`fetch_issues_cached`], but a cached issue is served only if its `state`
@@ -817,87 +806,31 @@ pub fn fetch_issues_cached(
 /// just what it says, so it is not trusted for the whole TTL like the text.
 /// `listed` is the state the caller already knows every ref has — `--all-open`
 /// lists its issues as open — which needs no request; with `None`, the cached
-/// refs are rechecked with one shallow [`fetch_states`] call (none when
-/// nothing is cached). **Blocking.**
+/// refs are rechecked with one shallow [`fetch_states`] call per chunk (none
+/// when nothing is cached). A failed recheck is not fatal: the cached copies
+/// are then treated as misses. **Blocking.**
 pub fn fetch_issues_cached_current(
     bin: &Path,
     cache: &IssueCache,
     refs: &[ItemRef],
     listed: Option<ItemState>,
 ) -> Result<Vec<IssueDoc>> {
-    let current = current_states(bin, cache, refs, listed)?;
+    let check = StateCheck::new(bin, cache, refs, listed, |doc| doc.kind == ItemKind::Issue);
+    fetch_issues_through(bin, cache, refs, |doc| check.accepts(cache, doc))
+}
+
+fn fetch_issues_through(
+    bin: &Path,
+    cache: &IssueCache,
+    refs: &[ItemRef],
+    accept: impl Fn(&IssueDoc) -> bool,
+) -> Result<Vec<IssueDoc>> {
     fetch_through_cache(
         refs,
-        |item_ref| {
-            cache.lookup(item_ref, |doc| {
-                doc.kind == ItemKind::Issue && state_is_current(&current, doc)
-            })
-        },
+        |item_ref| cache.lookup(item_ref, |doc| doc.kind == ItemKind::Issue && accept(doc)),
         |misses| fetch_issues(bin, misses),
         |doc| cache.store(doc),
     )
-}
-
-/// [`fetch_items_cached`] with the `state` check of
-/// [`fetch_issues_cached_current`]. **Blocking.**
-pub fn fetch_items_cached_current(
-    bin: &Path,
-    cache: &IssueCache,
-    refs: &[ItemRef],
-    listed: Option<ItemState>,
-) -> Result<Vec<Option<IssueDoc>>> {
-    let current = current_states(bin, cache, refs, listed)?;
-    fetch_through_cache(
-        refs,
-        |item_ref| {
-            cache
-                .lookup(item_ref, |doc| state_is_current(&current, doc))
-                .map(Some)
-        },
-        |misses| fetch_items(bin, misses),
-        |doc| {
-            if let Some(doc) = doc {
-                cache.store(doc);
-            }
-        },
-    )
-}
-
-/// The `(lowercased project, number)` key GitHub names are compared by.
-fn state_key(project: &str, number: u64) -> (String, u64) {
-    (project.to_ascii_lowercase(), number)
-}
-
-/// GitHub's current `state` for each of `refs` that `cache` could serve, from
-/// `listed` or one [`fetch_states`] call. `None` marks an item GitHub can't
-/// find; a ref with no cache entry, or one this run stored itself, is absent.
-fn current_states(
-    bin: &Path,
-    cache: &IssueCache,
-    refs: &[ItemRef],
-    listed: Option<ItemState>,
-) -> Result<HashMap<(String, u64), Option<ItemState>>> {
-    let cached: Vec<ItemRef> = cache.cached_refs(refs).into_iter().cloned().collect();
-    let states = match listed {
-        Some(state) => vec![Some(state); cached.len()],
-        None if cached.is_empty() => Vec::new(),
-        None => fetch_states(bin, &cached)?,
-    };
-    Ok(cached
-        .iter()
-        .zip(states)
-        .map(|(item_ref, state)| (state_key(&item_ref.project, item_ref.number), state))
-        .collect())
-}
-
-/// Whether `doc`'s cached `state` is the one GitHub reported. An item GitHub
-/// can't find is not current, so it is fetched in full. One absent from
-/// `current` needed no check: this run stored it, or it was written after the
-/// check, so either way it is as fresh as a fetch.
-fn state_is_current(current: &HashMap<(String, u64), Option<ItemState>>, doc: &IssueDoc) -> bool {
-    current
-        .get(&state_key(&doc.project, doc.number))
-        .is_none_or(|state| *state == Some(doc.state))
 }
 
 /// [`fetch_issues`], always from GitHub, writing the result through to `cache`.
@@ -923,9 +856,30 @@ pub fn fetch_items_cached(
     cache: &IssueCache,
     refs: &[ItemRef],
 ) -> Result<Vec<Option<IssueDoc>>> {
+    fetch_items_through(bin, cache, refs, |_| true)
+}
+
+/// [`fetch_items_cached`] with the `state` check of
+/// [`fetch_issues_cached_current`]. **Blocking.**
+pub fn fetch_items_cached_current(
+    bin: &Path,
+    cache: &IssueCache,
+    refs: &[ItemRef],
+    listed: Option<ItemState>,
+) -> Result<Vec<Option<IssueDoc>>> {
+    let check = StateCheck::new(bin, cache, refs, listed, |_| true);
+    fetch_items_through(bin, cache, refs, |doc| check.accepts(cache, doc))
+}
+
+fn fetch_items_through(
+    bin: &Path,
+    cache: &IssueCache,
+    refs: &[ItemRef],
+    accept: impl Fn(&IssueDoc) -> bool,
+) -> Result<Vec<Option<IssueDoc>>> {
     fetch_through_cache(
         refs,
-        |item_ref| cache.lookup(item_ref, |_| true).map(Some),
+        |item_ref| cache.lookup(item_ref, &accept).map(Some),
         |misses| fetch_items(bin, misses),
         |doc| {
             if let Some(doc) = doc {
@@ -933,6 +887,75 @@ pub fn fetch_items_cached(
             }
         },
     )
+}
+
+/// How a cached doc's `state` is validated for one call (#2041).
+enum StateCheck {
+    /// The caller knows every ref's state (`--all-open`'s listing).
+    Listed(ItemState),
+    /// GitHub's current `state` for each cached ref that was rechecked, keyed
+    /// by `(lowercased project, number)`; `None` marks an item GitHub can't
+    /// find, or a recheck that failed.
+    Rechecked(HashMap<(String, u64), Option<ItemState>>),
+}
+
+impl StateCheck {
+    /// Checks the refs `cache` could serve (and `kind` accepts) against
+    /// `listed`, or against one shallow [`fetch_states`] call for them. Refs
+    /// whose state this run already verified, and refs with no entry, need no
+    /// call.
+    fn new(
+        bin: &Path,
+        cache: &IssueCache,
+        refs: &[ItemRef],
+        listed: Option<ItemState>,
+        kind: impl Fn(&IssueDoc) -> bool,
+    ) -> Self {
+        if let Some(state) = listed {
+            return Self::Listed(state);
+        }
+        let cached: Vec<ItemRef> = cache
+            .unverified_refs(refs, kind)
+            .into_iter()
+            .cloned()
+            .collect();
+        let states = if cached.is_empty() {
+            Vec::new()
+        } else {
+            fetch_states(bin, &cached).unwrap_or_else(|e| {
+                warn!("Could not recheck cached GitHub state, refetching it: {e:#}");
+                vec![None; cached.len()]
+            })
+        };
+        cache.mark_state_verified(&cached);
+        Self::Rechecked(
+            cached
+                .iter()
+                .zip(states)
+                .map(|(item_ref, state)| {
+                    (
+                        (item_ref.project.to_ascii_lowercase(), item_ref.number),
+                        state,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether `doc`'s cached `state` is the one GitHub reported. A doc that
+    /// was not rechecked is trusted only if this run verified or fetched it
+    /// itself.
+    fn accepts(&self, cache: &IssueCache, doc: &IssueDoc) -> bool {
+        match self {
+            Self::Listed(state) => doc.state == *state,
+            Self::Rechecked(current) => {
+                match current.get(&(doc.project.to_ascii_lowercase(), doc.number)) {
+                    Some(state) => *state == Some(doc.state),
+                    None => cache.state_verified(&doc.project, doc.number),
+                }
+            }
+        }
+    }
 }
 
 /// The lookup / fetch-the-misses / store / restore-caller-order sequence
@@ -2159,6 +2182,57 @@ mod tests {
             retry_on_etxtbsy(|| fetch_items_cached_current(&bin, &cache, &refs, None)).unwrap();
         assert_eq!(docs[0].as_ref().unwrap().state, ItemState::Closed);
         assert_eq!(kinds(dir.path()), ["state", "full"]);
+    }
+
+    #[test]
+    fn a_failed_state_recheck_refetches_the_cached_issue_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_holding(cache_dir.path(), ItemState::Open);
+        let rate_limited = serde_json::json!({
+            "data": {"r0": null},
+            "errors": [{"type": "RATE_LIMITED", "message": "slow down"}]
+        })
+        .to_string();
+        let (bin, _shim) = state_gh(dir.path(), &rate_limited, &issue_reply("CLOSED"));
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        let docs =
+            retry_on_etxtbsy(|| fetch_issues_cached_current(&bin, &cache, &refs, None)).unwrap();
+        assert_eq!(
+            (docs[0].title.as_str(), docs[0].state),
+            ("fresh", ItemState::Closed)
+        );
+        assert_eq!(kinds(dir.path()), ["state", "full"]);
+    }
+
+    #[test]
+    fn a_state_already_verified_this_run_is_not_rechecked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = cache_holding(cache_dir.path(), ItemState::Open);
+        let (bin, _shim) = state_gh(dir.path(), &state_reply("OPEN"), &issue_reply("OPEN"));
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        // The same item as a routed issue, then as a citation.
+        retry_on_etxtbsy(|| fetch_issues_cached_current(&bin, &cache, &refs, None)).unwrap();
+        let items =
+            retry_on_etxtbsy(|| fetch_items_cached_current(&bin, &cache, &refs, None)).unwrap();
+        assert_eq!(items[0].as_ref().unwrap().title, "cached");
+        assert_eq!(kinds(dir.path()), ["state"]);
+    }
+
+    #[test]
+    fn a_cached_pull_request_is_not_rechecked_when_fetched_as_an_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        let mut pr = cached_doc("rust-works/omni-dev", 1);
+        pr.kind = ItemKind::ChangeRequest;
+        cache.store(&pr);
+        let later = IssueCache::new(cache_dir.path().to_path_buf(), DEFAULT_CACHE_TTL, false);
+        let (bin, _shim) = state_gh(dir.path(), &state_reply("OPEN"), &issue_reply("OPEN"));
+        let refs = [item_ref("rust-works/omni-dev", 1)];
+        retry_on_etxtbsy(|| fetch_issues_cached_current(&bin, &later, &refs, None)).unwrap();
+        assert_eq!(kinds(dir.path()), ["full"]);
     }
 
     /// Runs the shim once so its first `execve` (which can hit `ETXTBSY`, and

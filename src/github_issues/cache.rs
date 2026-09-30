@@ -125,6 +125,10 @@ pub struct IssueCache {
     /// judged issue that another judged issue cites) is not reported as a
     /// reuse of an earlier run's data.
     stored: Mutex<HashSet<(String, u64)>>,
+    /// Items whose cached `state` this run has checked against GitHub, so a
+    /// second call in the same run (a cited issue that was also routed) does
+    /// not check it again.
+    verified: Mutex<HashSet<(String, u64)>>,
 }
 
 impl IssueCache {
@@ -146,6 +150,7 @@ impl IssueCache {
             hits: AtomicUsize::new(0),
             oldest_hit_secs: AtomicU64::new(0),
             stored: Mutex::new(HashSet::new()),
+            verified: Mutex::new(HashSet::new()),
         }
     }
 
@@ -247,16 +252,42 @@ impl IssueCache {
         Some(doc)
     }
 
-    /// The `refs` [`lookup`](Self::lookup) could serve from disk, before any
-    /// `accept` check, except those this run stored itself (as fresh as a
-    /// fetch). For a caller that must validate something about those entries
-    /// (their `state`) against GitHub before trusting them; it counts no
-    /// reuse.
-    pub(super) fn cached_refs<'a>(&self, refs: &'a [ItemRef]) -> Vec<&'a ItemRef> {
+    /// The `refs` whose fresh entry `accept`s, and whose `state` this run has
+    /// neither verified against GitHub nor stored itself — the ones a caller
+    /// must check before trusting. Counts no reuse.
+    pub(super) fn unverified_refs<'a>(
+        &self,
+        refs: &'a [ItemRef],
+        accept: impl Fn(&IssueDoc) -> bool,
+    ) -> Vec<&'a ItemRef> {
         refs.iter()
-            .filter(|item_ref| !self.stored_this_run(&item_ref.project, item_ref.number))
-            .filter(|item_ref| self.read_fresh(item_ref).is_some())
+            .filter(|item_ref| !self.state_verified(&item_ref.project, item_ref.number))
+            .filter(|item_ref| {
+                self.read_fresh(item_ref)
+                    .is_some_and(|(doc, _)| accept(&doc))
+            })
             .collect()
+    }
+
+    /// Records that this run has checked `refs`' cached `state` against GitHub,
+    /// so a later call in the same run does not check them again.
+    pub(super) fn mark_state_verified(&self, refs: &[ItemRef]) {
+        if let Ok(mut verified) = self.verified.lock() {
+            verified.extend(
+                refs.iter()
+                    .map(|r| (r.project.to_ascii_lowercase(), r.number)),
+            );
+        }
+    }
+
+    /// Whether `project#number`'s `state` is as fresh as a fetch this run: it
+    /// stored the item itself, or checked its cached state.
+    pub(super) fn state_verified(&self, project: &str, number: u64) -> bool {
+        self.stored_this_run(project, number)
+            || self
+                .verified
+                .lock()
+                .is_ok_and(|v| v.contains(&(project.to_ascii_lowercase(), number)))
     }
 
     /// Deletes every expired entry, and every temp file a crashed write
