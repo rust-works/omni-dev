@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Build script that runs cargo build, fmt check, clippy, and tests.
+# Build script that runs cargo build, fmt check, marker lint, clippy, and tests.
 # Exits on first failure. Mirrors what CI checks so snapshot drift
 # (e.g. tests/snapshots/integration_test__help_all_output.snap) is
 # caught locally rather than only in CI. See
@@ -17,6 +17,11 @@ echo "🎨 Checking code formatting..."
 cargo fmt --check
 
 echo "✅ Code formatting check passed!"
+
+echo "🔎 Checking coverage markers..."
+cargo run --quiet --bin omni-dev -- coverage lint-markers
+
+echo "✅ Coverage marker check passed!"
 
 echo "🔍 Running clippy checks..."
 cargo clippy --all-targets --all-features -- -D warnings
