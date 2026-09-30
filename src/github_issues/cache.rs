@@ -24,10 +24,11 @@
 //! effect at once. Entries hold issue text from possibly private
 //! repositories, so [`IssueCache::prune_expired`] sweeps expired ones (and
 //! the orphaned temp files of a crashed write) each run rather than leaving
-//! them on disk indefinitely, along with the `<account>/<owner>/<repo>`
-//! directories that leaves empty. A lookup never deletes: the fetch that follows a
-//! miss overwrites the entry, and leaving removal to the sweep means a reader
-//! can never delete a fresh entry a concurrent writer just renamed into place.
+//! them on disk indefinitely, along with any empty
+//! `<account>/<owner>/<repo>` directory. A lookup never deletes: the fetch
+//! that follows a miss overwrites the entry, and leaving removal to the sweep
+//! means a reader can never delete a fresh entry a concurrent writer just
+//! renamed into place.
 //!
 //! A flat file rather than a daemon op was a deliberate choice: the usage
 //! pattern is *sequential* re-runs, which a shared file serves fully, while a
@@ -261,9 +262,9 @@ impl IssueCache {
             };
             if expired {
                 remove_entry(&path);
-                remove_empty_parents(&path, root);
             }
         }
+        remove_empty_dirs(root);
     }
 
     /// The age of an entry fetched at `fetched_at`, or `None` once it has
@@ -440,34 +441,48 @@ fn remove_entry(path: &Path) {
     }
 }
 
-/// Removes the directories `path`'s removal left empty, from its own directory
-/// up to but not including `root`.
+/// Removes every directory under `root` (never `root` itself) that holds
+/// nothing, deepest first, down to [`MAX_SWEEP_DEPTH`] levels. Directories
+/// that were already empty — an earlier release's, or a write that failed
+/// after making its directory — go too, not only those this sweep emptied.
 ///
 /// `remove_dir` refuses a directory that still holds anything — a fresh
-/// sibling entry, a live write's temp file, a file that is not the cache's —
-/// so it is the emptiness check as well. The first directory it cannot remove
-/// ends the walk, since every ancestor of a non-empty directory is non-empty
-/// too. One that is already gone (another sweep got there first) does not.
-fn remove_empty_parents(path: &Path, root: &Path) {
-    for dir in path
-        .ancestors()
-        .skip(1)
-        .take_while(|dir| *dir != root && dir.starts_with(root))
-    {
-        match std::fs::remove_dir(dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::DirectoryNotEmpty {
-                    debug!(
-                        "Failed to remove GitHub cache directory {}: {e}",
-                        dir.display()
-                    );
+/// entry, a live write's temp file, a file that is not the cache's — so it is
+/// the emptiness check as well, and a directory a writer has just filled keeps
+/// it. One a writer has just made but not yet filled can lose the race, which
+/// `write_entry` absorbs. Symlinks are not followed.
+fn remove_empty_dirs(root: &Path) {
+    fn walk(dir: &Path, depth: usize) {
+        let Ok(children) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for child in children.flatten() {
+            if depth < MAX_SWEEP_DEPTH && child.file_type().is_ok_and(|kind| kind.is_dir()) {
+                let path = child.path();
+                walk(&path, depth + 1);
+                match std::fs::remove_dir(&path) {
+                    Ok(()) => {}
+                    Err(e) if is_not_empty(&e) || e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        debug!(
+                            "Failed to remove GitHub cache directory {}: {e}",
+                            path.display()
+                        );
+                    }
                 }
-                return;
             }
         }
     }
+    walk(root, 1);
+}
+
+/// Whether `remove_dir` refused because the directory still holds something:
+/// `DirectoryNotEmpty`, or `AlreadyExists` where `rmdir` reports `EEXIST`.
+fn is_not_empty(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::AlreadyExists
+    )
 }
 
 /// How long ago `path` was last written, or `None` if that is unknown (the
@@ -796,6 +811,20 @@ mod tests {
     }
 
     #[test]
+    fn prune_removes_directories_that_were_already_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path());
+        cache.store(&doc("o/kept", 1, ItemKind::Issue));
+        std::fs::create_dir_all(dir.path().join("o/empty")).unwrap();
+        std::fs::create_dir_all(dir.path().join("x/y")).unwrap();
+
+        cache.prune_expired();
+        assert!(cache.entry_path("o/kept", 1).unwrap().exists());
+        assert!(!dir.path().join("o/empty").exists());
+        assert!(!dir.path().join("x").exists());
+    }
+
+    #[test]
     fn prune_keeps_a_directory_holding_a_live_writes_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache(dir.path());
@@ -823,6 +852,18 @@ mod tests {
 
         cache.store(&item);
         assert!(cache.entry_path("o/r", 1).unwrap().exists());
+    }
+
+    #[test]
+    fn the_error_a_vanished_directory_gives_a_write_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        let err = tempfile::Builder::new()
+            .tempfile_in(&gone)
+            .with_context(|| format!("Failed to create a temp file in {}", gone.display()))
+            .unwrap_err();
+        assert!(is_not_found(&err), "{err:?}");
+        assert!(!is_not_found(&anyhow::anyhow!("no io error at all")));
     }
 
     #[test]
