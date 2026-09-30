@@ -1292,8 +1292,8 @@ fn customised_note(count: usize) -> String {
 }
 
 /// Removes the second and later occurrences of exactly `command` under each
-/// event, pruning any group and event this empties, and returns how many it
-/// removed. Settings left by the pre-#1927 bug hold the old and new sink side by
+/// event, pruning any group this empties, and returns how many it removed. The
+/// first copy under each matcher is always kept, so an event never empties. Settings left by the pre-#1927 bug hold the old and new sink side by
 /// side; once [`replace_stale_sinks`] rewrites the old one they would be two
 /// identical entries, each spawning a sink per event. Claude identifies a hook by
 /// content rather than position, so removing one shifts nothing that matters.
@@ -1302,8 +1302,7 @@ fn dedupe_command(settings: &mut Value, command: &str) -> usize {
         return 0;
     };
     let mut removed = 0;
-    let mut emptied_events = Vec::new();
-    for (event, groups) in hooks.iter_mut() {
+    for groups in hooks.values_mut() {
         let Some(groups) = groups.as_array_mut() else {
             continue;
         };
@@ -1340,12 +1339,6 @@ fn dedupe_command(settings: &mut Value, command: &str) -> usize {
         }
         removed += dropped_here;
         groups.retain(|g| !g.is_null());
-        if groups.is_empty() {
-            emptied_events.push(event.clone());
-        }
-    }
-    for event in emptied_events {
-        hooks.remove(&event);
     }
     removed
 }
@@ -2759,11 +2752,36 @@ mod tests {
     }
 
     #[test]
+    fn install_command_execute_reports_and_removes_a_duplicate_sink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        // What the pre-#1927 bug left behind: the old and current sinks side by side.
+        let mut both = json!({});
+        merge_hooks(&mut both, OLD, HOOK_EVENTS);
+        merge_hooks(&mut both, &hook_command(), HOOK_EVENTS);
+        write_settings(&path, &both).unwrap();
+
+        InstallHooksCommand {
+            settings: Some(path.clone()),
+            pi_agent_dir: Some(tmp.path().join("pi-agent")),
+            codex_home: Some(tmp.path().join("codex-home")),
+        }
+        .execute()
+        .unwrap();
+
+        let settings = read_settings(&path).unwrap();
+        for HookSpec { event, .. } in HOOK_EVENTS {
+            assert_eq!(sinks_under(&settings, event), [hook_command()], "{event}");
+        }
+    }
+
+    #[test]
     fn dedupe_command_keeps_the_first_and_tolerates_odd_shapes() {
         let mut settings = json!({
             "hooks": {
                 "Stop": [
                     { "hooks": [{ "type": "command", "command": NEW }] },
+                    { "matcher": "Bash" },
                     { "hooks": [{ "type": "command", "command": "other" },
                                 { "type": "command", "command": NEW }] }
                 ],
@@ -2772,6 +2790,8 @@ mod tests {
         });
         assert_eq!(dedupe_command(&mut settings, NEW), 1);
         assert_eq!(sinks_under(&settings, "Stop"), [NEW, "other"]);
+        // A group with no `hooks` array is left as it was.
+        assert_eq!(settings["hooks"]["Stop"][1], json!({ "matcher": "Bash" }));
         assert_eq!(settings["hooks"]["Notification"], 5);
         assert_eq!(dedupe_command(&mut json!({}), NEW), 0);
     }
