@@ -1254,6 +1254,23 @@ mod tests {
     }
 
     #[test]
+    fn a_poisoned_verified_set_marks_nothing_and_never_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path());
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _held = cache.verified.lock().unwrap();
+                panic!("poison the verified set");
+            });
+            assert!(poisoner.join().is_err());
+        });
+        // Best-effort like the rest of the cache: the mark is skipped, so the
+        // item simply stays unverified and gets checked again.
+        cache.mark_state_verified(&[item_ref("o/r", 1)]);
+        assert!(!cache.state_verified("o/r", 1));
+    }
+
+    #[test]
     fn ages_format_in_seconds_then_minutes() {
         assert_eq!(format_age(0), "0s");
         assert_eq!(format_age(119), "119s");
