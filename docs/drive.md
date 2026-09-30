@@ -143,6 +143,11 @@ and `NAME_FILE` in the same place (both exported, or both in the same settings.j
 Unlike Gmail, there is no other meaning for `DRIVE_CLIENT_SECRET_FILE` to
 collide with.
 
+Both also accept a `_COMMAND` companion that fetches the secret on demand from
+a password manager or keychain; see [secret-commands.md](secret-commands.md).
+`drive auth login` refuses, before opening a browser, when the map it would write
+to holds one for the secret it would replace.
+
 ### Interactive setup
 
 ```bash

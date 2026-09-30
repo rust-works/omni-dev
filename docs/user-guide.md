@@ -640,6 +640,8 @@ regular file that is either yours and owner-only (`chmod 600`), or owned by root
 both `ATLASSIAN_API_TOKEN` and `ATLASSIAN_API_TOKEN_FILE` in the same place
 (both exported, or both in the same settings.json map) is an error. See [ADR-0089](adrs/adr-0089.md).
 
+`ATLASSIAN_API_TOKEN_COMMAND` fetches the token on demand from a password manager or keychain instead; see [secret-commands.md](secret-commands.md).
+
 To keep multiple Atlassian tenants (e.g. `work` and `personal`) on one machine
 and pick one per command, store each tenant's variables in a named **profile**
 and select it with `--profile <name>` (or `OMNI_DEV_PROFILE`). See

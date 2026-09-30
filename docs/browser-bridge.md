@@ -347,6 +347,8 @@ bridge runs.
   naming an absolute path to a file holding the token (the Docker/Kubernetes
   secrets convention) — an environment-variable alternative to the separate
   `--token-file` flag; see [ADR-0089](adrs/adr-0089.md).
+  `OMNI_BRIDGE_TOKEN_COMMAND` fetches it from a password manager or keychain
+  instead; see [secret-commands.md](secret-commands.md).
 - Control plane: every request must carry `Authorization: Bearer <token>`.
 - WebSocket plane: the browser presents the token via the WS subprotocol; the
   upgrade is rejected without it. An unauthenticated peer can never connect or
