@@ -461,6 +461,7 @@ issues:
   depends_on:
   - ref: "#1129"
     state: open
+    relation: blocker
     could_be_cheaper: {design: 0.75}
   reference_fetch_failures:
   - ref: "#404"
@@ -484,7 +485,13 @@ usage: {input_tokens: 1432, output_tokens: 61}
   same citation regex `verify-decision` uses, see below) that is still
   **open**; a closed citation is settled and is not reported. `ref` is the
   citation exactly as written (`"#1129"`, `"PR #1629"`, `"owner/repo#42"`),
-  not a reconstructed `owner/repo#N`. `could_be_cheaper.design` is the
+  not a reconstructed `owner/repo#N`. `relation` labels explicit citing
+  language as `blocker` or `tracker`; `unspecified` means the issue text
+  does not establish either. Repeated mentions are considered, but
+  contradictory, negated, quoted and code-block wording stays unspecified.
+  The label does not suppress a citation or change routing. It describes
+  the citing issue's wording, not an independently verified dependency.
+  `could_be_cheaper.design` is the
   probability, from one extra `noul` Jev call per open citation, that
   resolving it would leave **less design work** remaining than the text
   implies — as opposed to this issue's own remaining work being unaffected
@@ -492,7 +499,9 @@ usage: {input_tokens: 1432, output_tokens: 61}
   precondition). Only the `design` stage is asked for v1; `implement` is
   deferred pending the same kind of validation `design` got (see
   [#1812](https://github.com/rust-works/omni-dev/issues/1812)). There is no
-  suppression threshold: every open citation gets a score, unfiltered.
+  suppression threshold: every open citation stays visible, unfiltered. If
+  Jev omits a score, that citation remains with an empty
+  `could_be_cheaper` map and a warning is logged.
 - **`reference_fetch_failures`** lists citations GitHub could not fetch, so a
   stale or mistyped reference is visible rather than being indistinguishable
   from no citation. That includes a citation into a repository GitHub reports
@@ -555,7 +564,7 @@ styling.
 ```
 rust-works/omni-dev#1641 — Some issue title
   opus — design needs opus (0.52), implementation sonnet (0.83), review opus (0.41, close call — sonnet 0.59)
-  cites open #1129, which could leave less design work if resolved (0.75)
+  cites open #1129 (blocker), which could leave less design work if resolved (0.75)
   reference fetch failed: #404 (not found)
 
 model: jev-1.13.0, usage: 1432 input tokens, 61 output tokens
@@ -578,8 +587,8 @@ citation, in citation order, rather than one line joining every clause with
 ```
 rust-works/omni-dev#1845 — feat(drive): randomizeRange for drive sheets (#1830)
   opus — design needs opus (0.42), implementation sonnet (0.66), review opus (0.36)
-  cites open #1830, which could leave less design work if resolved (0.46)
-  cites open #1831, which could leave less design work if resolved (0.52)
+  cites open #1830 (tracker), which could leave less design work if resolved (0.46)
+  cites open #1831 (blocker), which could leave less design work if resolved (0.52)
 ```
 
 When any stage's chosen tier name is multi-model (a custom ladder's
@@ -1013,6 +1022,14 @@ validation cases and matched the author's own reading throughout, but there
 has been no **forward** validation: no case yet where an open citation
 actually resolved and `could_be_cheaper`'s prediction was checked against
 what really happened. Treat the score as informative, not calibrated.
+
+The [#1871 follow-up evaluation](evaluations/jev-route-1871/README.md)
+records 14 public-issue cases, 56 pinned Jev requests, and explicit relation
+readings. It supports conservative relation labels but leaves the proposed
+implementation-stage `could_be_cheaper` and bounded-spike questions
+unshipped: the implementation examples all hit the minimum tier, and an
+independent spike case landed close to a negative case. No threshold or
+rewording has been validated for those questions.
 
 ## verify-decision
 

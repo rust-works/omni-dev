@@ -20,13 +20,13 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::jev::citations::Citation;
+use crate::jev::citations::{find_citation_mentions, Citation};
 use crate::jev::client::JevClient;
 use crate::jev::error::is_auth_failure;
 use crate::jev::input::truncate_middle;
 use crate::jev::markdown_code::mask_code;
 use crate::jev::protocol::{Answer, Question, SystemOneRequest, Usage};
-use crate::provider::{IssueDoc, ItemState};
+use crate::provider::{IssueDoc, ItemRef, ItemState};
 
 pub use crate::jev::input::TRUNCATION_MARKER;
 
@@ -449,11 +449,26 @@ pub struct DependencyEntry {
     /// Always [`ItemState::Open`]: a closed citation is settled and is not
     /// reported here.
     pub state: ItemState,
+    /// The citing text's explicit relation to this open reference. An
+    /// unspecified relation does not imply that the citation is irrelevant.
+    pub relation: CitationRelation,
     /// The probability, per stage, that resolving this citation would leave
     /// less of that stage's work remaining than the text implies. Only
     /// `"design"` is populated for v1 — `"implement"` is deferred pending
     /// the same kind of live validation `design` got (see #1812).
     pub could_be_cheaper: BTreeMap<String, f64>,
+}
+
+/// What the issue's own wording establishes about an open citation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CitationRelation {
+    /// The cited work is explicitly named as a prerequisite.
+    Blocker,
+    /// The citation is explicitly named as a parent or tracking issue.
+    Tracker,
+    /// The text has no unambiguous relation phrase.
+    Unspecified,
 }
 
 /// The routing result for one issue.
@@ -646,6 +661,7 @@ pub async fn run_route_with_reference_fetch_failures(
         let citations = dependencies
             .get(&(doc.project.clone(), doc.number))
             .map_or(&[][..], Vec::as_slice);
+        let relations = citation_relations(&state, doc);
         let citation_failures = reference_fetch_failures
             .get(&(doc.project.clone(), doc.number))
             .cloned()
@@ -683,7 +699,12 @@ pub async fn run_route_with_reference_fetch_failures(
                 ) {
                     Ok(providers) => RouteOutcome::Routed {
                         providers,
-                        depends_on: dependency_entries(&item_ref, citations, &response.answers),
+                        depends_on: dependency_entries(
+                            &item_ref,
+                            citations,
+                            &relations,
+                            &response.answers,
+                        ),
                         reference_fetch_failures: citation_failures.clone(),
                     },
                     Err(err) => failed(
@@ -930,34 +951,148 @@ fn could_be_cheaper_question(citation: &str) -> Question {
     }
 }
 
+/// Labels only an explicit relation in the citing sentence. Every mention is
+/// considered, so a later "blocked on #N" is not lost behind an earlier bare
+/// "#N". Conflicting claims and quoted examples remain unspecified.
+fn citation_relations(state: &str, doc: &IssueDoc) -> BTreeMap<(String, u64), CitationRelation> {
+    let judged = ItemRef {
+        provider: doc.provider,
+        project: doc.project.clone(),
+        kind: doc.kind,
+        number: doc.number,
+    };
+    let mut evidence: BTreeMap<(String, u64), (bool, bool, bool)> = BTreeMap::new();
+    for mention in find_citation_mentions(state, &doc.project, &judged) {
+        let key = (
+            mention.citation.item_ref.project,
+            mention.citation.item_ref.number,
+        );
+        let entry = evidence.entry(key).or_default();
+        match relation_at(state, &mention.range) {
+            MentionRelation::Blocker => entry.0 = true,
+            MentionRelation::Tracker => entry.1 = true,
+            MentionRelation::Negated => entry.2 = true,
+            MentionRelation::None => {}
+        }
+    }
+    evidence
+        .into_iter()
+        .map(|(key, (blocker, tracker, negated))| {
+            let relation = match (blocker, tracker, negated) {
+                (true, false, false) => CitationRelation::Blocker,
+                (false, true, false) => CitationRelation::Tracker,
+                _ => CitationRelation::Unspecified,
+            };
+            (key, relation)
+        })
+        .collect()
+}
+
+enum MentionRelation {
+    Blocker,
+    Tracker,
+    Negated,
+    None,
+}
+
+fn relation_at(state: &str, range: &std::ops::Range<usize>) -> MentionRelation {
+    if !state[..range.start]
+        .matches("```")
+        .count()
+        .is_multiple_of(2)
+    {
+        return MentionRelation::None;
+    }
+    let before = &state[..range.start];
+    let boundary = before.rfind(['.', '!', '?', '\n']).map_or(0, |i| i + 1);
+    let sentence = &state[boundary..];
+    if sentence.trim_start().starts_with('>') {
+        return MentionRelation::None;
+    }
+    let prefix = &state[boundary..range.start];
+    if !prefix.matches('`').count().is_multiple_of(2)
+        || !prefix.matches('"').count().is_multiple_of(2)
+    {
+        return MentionRelation::None;
+    }
+    let nearby: String = prefix
+        .chars()
+        .rev()
+        .take(160)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let nearby = nearby.to_ascii_lowercase();
+    if nearby.contains("such as")
+        || nearby.contains("for example")
+        || nearby.contains("worked example")
+        || nearby.contains("e.g.")
+    {
+        return MentionRelation::None;
+    }
+    if nearby.contains("not blocked on")
+        || nearby.contains("no longer blocked on")
+        || nearby.contains("isn't blocked on")
+        || nearby.contains("not dependent on")
+        || nearby.contains("unblocked")
+        || nearby.contains("not a tracker")
+        || nearby.contains("not split out of")
+    {
+        return MentionRelation::Negated;
+    }
+    if nearby.contains("blocked on")
+        || nearby.contains("depends on")
+        || nearby.contains("requires")
+        || nearby.contains("prerequisite")
+    {
+        return MentionRelation::Blocker;
+    }
+    if nearby.contains("split out of")
+        || nearby.contains("split from")
+        || nearby.contains("parent tracker")
+        || nearby.contains("tracker checkbox")
+    {
+        return MentionRelation::Tracker;
+    }
+    MentionRelation::None
+}
+
 /// Builds `depends_on` from `citations` and the Jev response that answered
 /// one `could_be_cheaper` question per citation.
 ///
-/// A missing or malformed answer for one citation drops just that
-/// dependency — logged, not failed — since `could_be_cheaper` is additive on
-/// top of a routing result ([`stage_answers`]) that already succeeded.
+/// A missing or malformed answer leaves the citation visible with an empty
+/// score map. It is logged but does not fail the stage routing.
 fn dependency_entries(
     item_ref: &str,
     citations: &[Citation],
+    relations: &BTreeMap<(String, u64), CitationRelation>,
     answers: &BTreeMap<String, Answer>,
 ) -> Vec<DependencyEntry> {
     citations
         .iter()
         .enumerate()
-        .filter_map(|(i, citation)| {
-            if let Some(Answer::Noul { noul }) = answers.get(&could_be_cheaper_key(i)) {
-                return Some(DependencyEntry {
-                    item_ref: citation.raw.clone(),
-                    url: citation.url.clone(),
-                    state: ItemState::Open,
-                    could_be_cheaper: BTreeMap::from([("design".to_string(), *noul)]),
-                });
+        .map(|(i, citation)| {
+            let could_be_cheaper =
+                if let Some(Answer::Noul { noul }) = answers.get(&could_be_cheaper_key(i)) {
+                    BTreeMap::from([("design".to_string(), *noul)])
+                } else {
+                    warn!(
+                        "Issue {item_ref}: no could_be_cheaper answer for citation {:?}",
+                        citation.raw
+                    );
+                    BTreeMap::new()
+                };
+            DependencyEntry {
+                item_ref: citation.raw.clone(),
+                url: citation.url.clone(),
+                state: ItemState::Open,
+                relation: relations
+                    .get(&(citation.item_ref.project.clone(), citation.item_ref.number))
+                    .copied()
+                    .unwrap_or(CitationRelation::Unspecified),
+                could_be_cheaper,
             }
-            warn!(
-                "Issue {item_ref}: no could_be_cheaper answer for citation {:?}",
-                citation.raw
-            );
-            None
         })
         .collect()
 }
@@ -1284,11 +1419,16 @@ fn render_depends_on_lines(depends_on: &[DependencyEntry], style: TerminalStyle)
         .iter()
         .map(|dep| {
             let item_ref = hyperlink(&dep.item_ref, dep.url.as_deref(), style);
+            let relation = match dep.relation {
+                CitationRelation::Blocker => "blocker",
+                CitationRelation::Tracker => "tracker",
+                CitationRelation::Unspecified => "relation unspecified",
+            };
             match dep.could_be_cheaper.get("design") {
                 Some(prob) => format!(
-                    "  cites open {item_ref}, which could leave less design work if resolved ({prob:.2})"
+                    "  cites open {item_ref} ({relation}), which could leave less design work if resolved ({prob:.2})"
                 ),
-                None => format!("  cites open {item_ref}"),
+                None => format!("  cites open {item_ref} ({relation})"),
             }
         })
         .collect()
@@ -1999,11 +2139,123 @@ mod tests {
             "could_be_cheaper_0".to_string(),
             Answer::Noul { noul: 0.75 },
         )]);
-        let deps = dependency_entries("o/r#1", &citations, &answers);
-        assert_eq!(deps.len(), 1, "{deps:?}");
+        let deps = dependency_entries("o/r#1", &citations, &BTreeMap::new(), &answers);
+        assert_eq!(deps.len(), 2, "{deps:?}");
         assert_eq!(deps[0].item_ref, "#1129");
         assert_eq!(deps[0].state, ItemState::Open);
         assert_eq!(deps[0].could_be_cheaper.get("design"), Some(&0.75));
+        assert_eq!(deps[0].relation, CitationRelation::Unspecified);
+        assert_eq!(deps[1].item_ref, "#1349");
+        assert!(deps[1].could_be_cheaper.is_empty());
+    }
+
+    fn relation_for(body: &str, target: u64) -> CitationRelation {
+        let mut issue = doc(9999, ItemState::Open);
+        issue.body = body.to_string();
+        citation_relations(body, &issue)
+            .get(&(issue.project, target))
+            .copied()
+            .unwrap_or(CitationRelation::Unspecified)
+    }
+
+    #[test]
+    fn citation_relation_uses_later_explicit_mentions() {
+        assert_eq!(
+            relation_for(
+                "See #1351 for background. Blocked on node identity in #1351.",
+                1351
+            ),
+            CitationRelation::Blocker
+        );
+        assert_eq!(
+            relation_for("See #1830. Split out of #1830.", 1830),
+            CitationRelation::Tracker
+        );
+    }
+
+    #[test]
+    fn citation_relation_ignores_negation_quotes_and_conflicts() {
+        for body in [
+            "Not blocked on #123.",
+            "For example, \"blocked on #123\" is a blocker claim.",
+            "> Blocked on #123.",
+            "```\nBlocked on #123\n```",
+            "This is such as #123, a worked example.",
+            "See #123 for context.",
+            "Blocked on #123. Split out of #123.",
+            "Blocked on #123. No longer blocked on #123.",
+        ] {
+            assert_eq!(
+                relation_for(body, 123),
+                CitationRelation::Unspecified,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn citation_relation_real_issue_phrasing() {
+        assert_eq!(
+            relation_for(
+                "Split out of #1830. Blocker #1831 closed as ADR-0083.",
+                1830
+            ),
+            CitationRelation::Tracker
+        );
+        assert_eq!(
+            relation_for("## Triage — blocked on #1129's classifier change.", 1129),
+            CitationRelation::Blocker
+        );
+        assert_eq!(
+            relation_for(
+                "Blocked on real alias/node identity — the same work as #1351.",
+                1351
+            ),
+            CitationRelation::Blocker
+        );
+        assert_eq!(
+            relation_for("Absorbed by #1753; neither suggested option remains.", 1753),
+            CitationRelation::Unspecified
+        );
+    }
+
+    #[test]
+    fn citation_relations_match_frozen_public_issues() {
+        for (inputs, labels) in [
+            (
+                include_str!("../../docs/evaluations/jev-route-1871/inputs.json"),
+                include_str!("../../docs/evaluations/jev-route-1871/labels.json"),
+            ),
+            (
+                include_str!("../../docs/evaluations/jev-route-1871/holdout-inputs.json"),
+                include_str!("../../docs/evaluations/jev-route-1871/holdout-labels.json"),
+            ),
+        ] {
+            let cases: Vec<serde_json::Value> = serde_json::from_str(inputs).unwrap();
+            let labels: serde_json::Value = serde_json::from_str(labels).unwrap();
+            for case in cases {
+                let id = case["id"].as_str().unwrap();
+                let doc: IssueDoc = serde_json::from_value(case["doc"].clone()).unwrap();
+                let (state, _) = build_route_state(&doc, DEFAULT_MAX_INPUT_CHARS);
+                let relations = citation_relations(&state, &doc);
+                let Some(expected) = labels[id]["relations"].as_object() else {
+                    continue;
+                };
+                for (number, label) in expected {
+                    let actual = relations
+                        .get(&(doc.project.clone(), number.parse().unwrap()))
+                        .copied()
+                        .unwrap_or(CitationRelation::Unspecified);
+                    let want = match label.as_str().unwrap() {
+                        "blocker" => CitationRelation::Blocker,
+                        "tracker" => CitationRelation::Tracker,
+                        "unspecified" => CitationRelation::Unspecified,
+                        other => panic!("unknown relation label: {other}"),
+                    };
+                    assert_eq!(actual, want, "{id} -> #{number}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2639,7 +2891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_route_drops_a_dependency_with_no_could_be_cheaper_answer() {
+    async fn run_route_keeps_a_dependency_with_no_could_be_cheaper_answer() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(routed_json()))
@@ -2662,11 +2914,13 @@ mod tests {
         .unwrap();
 
         // routed_json() has no could_be_cheaper_0 answer; the issue still
-        // routes, just with no dependencies reported.
+        // routes and the citation remains visible without a score.
         let RouteOutcome::Routed { depends_on, .. } = &report.issues[0].outcome else {
             panic!("expected a routed issue: {:?}", report.issues[0]);
         };
-        assert!(depends_on.is_empty(), "{depends_on:?}");
+        assert_eq!(depends_on.len(), 1, "{depends_on:?}");
+        assert_eq!(depends_on[0].item_ref, "#1129");
+        assert!(depends_on[0].could_be_cheaper.is_empty());
     }
 
     #[test]
@@ -2756,6 +3010,7 @@ mod tests {
                         item_ref: "#1129".to_string(),
                         url: None,
                         state: ItemState::Open,
+                        relation: CitationRelation::Unspecified,
                         could_be_cheaper: BTreeMap::from([("design".to_string(), 0.75)]),
                     }],
                     reference_fetch_failures: vec![],
@@ -2774,7 +3029,7 @@ mod tests {
             "rust-works/omni-dev#1641 — Some issue title\n\
              \x20\x20opus — design needs opus (0.52), implementation sonnet (0.83), review \
              opus (0.41, close call)\n\
-             \x20\x20cites open #1129, which could leave less design work if resolved (0.75)\n\n\
+             \x20\x20cites open #1129 (relation unspecified), which could leave less design work if resolved (0.75)\n\n\
              model: jev-1.13.0, usage: 1432 input tokens, 61 output tokens\n"
         );
     }
@@ -2802,12 +3057,14 @@ mod tests {
                             item_ref: "#1830".to_string(),
                             url: None,
                             state: ItemState::Open,
+                            relation: CitationRelation::Unspecified,
                             could_be_cheaper: BTreeMap::from([("design".to_string(), 0.46)]),
                         },
                         DependencyEntry {
                             item_ref: "#1831".to_string(),
                             url: None,
                             state: ItemState::Open,
+                            relation: CitationRelation::Unspecified,
                             could_be_cheaper: BTreeMap::new(),
                         },
                     ],
@@ -2821,8 +3078,8 @@ mod tests {
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
         assert!(
             text.contains(
-                "  cites open #1830, which could leave less design work if resolved (0.46)\n  \
-                 cites open #1831\n"
+                "  cites open #1830 (relation unspecified), which could leave less design work if resolved (0.46)\n  \
+                 cites open #1831 (relation unspecified)\n"
             ),
             "{text}"
         );
@@ -2994,6 +3251,7 @@ mod tests {
                         item_ref: "#1129".to_string(),
                         url: None,
                         state: ItemState::Open,
+                        relation: CitationRelation::Unspecified,
                         could_be_cheaper: BTreeMap::new(),
                     }],
                     reference_fetch_failures: vec![],
@@ -3104,6 +3362,7 @@ mod tests {
                         item_ref: "#1830".to_string(),
                         url: None,
                         state: ItemState::Open,
+                        relation: CitationRelation::Unspecified,
                         could_be_cheaper: BTreeMap::from([("design".to_string(), 0.48)]),
                     }],
                     reference_fetch_failures: vec![],
@@ -3122,7 +3381,7 @@ mod tests {
                  \x20\x20design: needs no further work (0.94)\n\
                  \x20\x20implementation: {multi} (0.94)\n\
                  \x20\x20review: {multi} (0.70)\n\
-                 \x20\x20cites open #1830, which could leave less design work if resolved (0.48)\n\n\
+                 \x20\x20cites open #1830 (relation unspecified), which could leave less design work if resolved (0.48)\n\n\
                  model: jev-1.13.0, usage: 0 input tokens, 0 output tokens\n"
             )
         );
@@ -3464,6 +3723,7 @@ mod tests {
                     item_ref: "#42".to_string(),
                     url: Some("https://github.com/other/repo/pull/42".to_string()),
                     state: ItemState::Open,
+                    relation: CitationRelation::Unspecified,
                     could_be_cheaper: BTreeMap::new(),
                 }],
                 reference_fetch_failures: vec![],

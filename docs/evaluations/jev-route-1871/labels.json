@@ -1,0 +1,68 @@
+{
+  "omni-dev-1845-current": {
+    "spike": "completed",
+    "relations": {
+      "1830": "tracker"
+    },
+    "reading": "Current body and comments record the probe result; #1830 is the parent tracker."
+  },
+  "omni-dev-1871-current": {
+    "spike": "none",
+    "relations": {
+      "1845": "unspecified"
+    },
+    "reading": "The #1845 spike is a worked example, not this issue’s own pending fork."
+  },
+  "omni-dev-1880-current": {
+    "spike": "judgment",
+    "relations": {},
+    "reading": "Merge preview requires an operator-facing policy choice; no bounded experiment settles it."
+  },
+  "omni-dev-1858-current": {
+    "spike": "none",
+    "relations": {},
+    "reading": "Cache architecture tradeoff was decided in its plan; no specified empirical fork."
+  },
+  "succinctly-1356-current": {
+    "spike": "none",
+    "relations": {
+      "1129": "blocker"
+    },
+    "reading": "Triage explicitly says blocked on #1129’s classifier change."
+  },
+  "succinctly-1343-current": {
+    "spike": "none",
+    "relations": {
+      "2063": "unspecified"
+    },
+    "reading": "Triage mentions a related implementation caveat; no proven prerequisite."
+  },
+  "succinctly-1740-current": {
+    "spike": "none",
+    "relations": {
+      "1753": "unspecified"
+    },
+    "reading": "Triage says the work is absorbed by #1753, not merely a parent tracker."
+  },
+  "succinctly-1998-current": {
+    "spike": "none",
+    "relations": {
+      "1419": "unspecified"
+    },
+    "reading": "Parallel or sibling issue; closure is not a prerequisite."
+  },
+  "omni-dev-1845-pre-probe-reconstruction": {
+    "spike": "pending_settled_fork",
+    "relations": {
+      "1830": "unspecified"
+    },
+    "reading": "First plan comment specifies the live formatting probe and both gate outcomes. Reconstructed, not archived route input. The reconstructed text does not itself establish the tracker relation; leave the label unspecified."
+  },
+  "omni-dev-1843-pre-probe-reconstruction": {
+    "spike": "pending_settled_fork",
+    "relations": {
+      "1830": "unspecified"
+    },
+    "reading": "First plan comment specifies the formatting probe and both gate outcomes, but also records separate engineering work. Reconstructed. The reconstructed text does not itself establish the tracker relation; leave the label unspecified."
+  }
+}
