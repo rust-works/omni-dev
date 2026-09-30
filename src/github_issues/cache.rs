@@ -460,20 +460,24 @@ fn remove_empty_dirs(root: &Path) {
             if depth < MAX_SWEEP_DEPTH && child.file_type().is_ok_and(|kind| kind.is_dir()) {
                 let path = child.path();
                 walk(&path, depth + 1);
-                match std::fs::remove_dir(&path) {
-                    Ok(()) => {}
-                    Err(e) if is_not_empty(&e) || e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        debug!(
-                            "Failed to remove GitHub cache directory {}: {e}",
-                            path.display()
-                        );
-                    }
-                }
+                log_unexpected_remove_dir_failure(&path, std::fs::remove_dir(&path));
             }
         }
     }
     walk(root, 1);
+}
+
+/// Logs a `remove_dir` failure worth knowing about. Refusing a directory that
+/// still holds something, or one a concurrent sweep already removed, is the
+/// sweep working as designed and stays silent.
+fn log_unexpected_remove_dir_failure(path: &Path, result: std::io::Result<()>) {
+    match result {
+        Err(e) if !is_not_empty(&e) && e.kind() != std::io::ErrorKind::NotFound => {
+            let shown = path.display();
+            debug!("Failed to remove GitHub cache directory {shown}: {e}");
+        }
+        _ => {}
+    }
 }
 
 /// Whether `remove_dir` refused because the directory still holds something:
@@ -808,6 +812,28 @@ mod tests {
         assert!(dir.path().join("o/r").is_dir());
         assert!(dir.path().join("o/kept").is_dir());
         assert!(dir.path().join("o").is_dir(), "still has children");
+
+        let mut left = dirs_under(dir.path());
+        left.sort();
+        let expected = ["o", "o/kept", "o/r"].map(|d| dir.path().join(d));
+        assert_eq!(left, expected);
+    }
+
+    #[test]
+    fn only_a_refusal_for_a_reason_other_than_content_or_absence_is_worth_logging() {
+        use std::io::{Error, ErrorKind};
+        // The kinds `remove_dir` gives for a directory that is not empty
+        // (`ENOTEMPTY`, or `EEXIST` on platforms that report it so).
+        assert!(is_not_empty(&Error::from(ErrorKind::DirectoryNotEmpty)));
+        assert!(is_not_empty(&Error::from(ErrorKind::AlreadyExists)));
+        assert!(!is_not_empty(&Error::from(ErrorKind::PermissionDenied)));
+
+        // None of these may panic; the logged arm has no observable effect.
+        let path = Path::new("/cache/o/r");
+        log_unexpected_remove_dir_failure(path, Ok(()));
+        log_unexpected_remove_dir_failure(path, Err(Error::from(ErrorKind::NotFound)));
+        log_unexpected_remove_dir_failure(path, Err(Error::from(ErrorKind::DirectoryNotEmpty)));
+        log_unexpected_remove_dir_failure(path, Err(Error::from(ErrorKind::PermissionDenied)));
     }
 
     #[test]
