@@ -45,7 +45,9 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::{SheetsApi, ValueRenderOption};
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi, ValueRenderOption,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
@@ -350,6 +352,15 @@ pub enum FormatResult {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         discarded_cells: Vec<String>,
     },
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: the
+    /// formatting change happened, so the sheet already carries it.
+    AppliedReplyUnreadable {
+        /// Same summary as [`Self::WouldChange`].
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -390,6 +401,7 @@ impl FormatResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -813,10 +825,15 @@ async fn format_inner(
     )
     .await
     {
-        Ok(_response) => FormatResult::Changed {
+        Ok(BatchUpdateOutcome::Applied(_response)) => FormatResult::Changed {
             summary,
             discarded_cells,
         },
+        // `RetryHint::Idempotent` (see `describe_lines`): re-applying the same
+        // formatting, merge or resize leaves the sheet as it is (#2021).
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            FormatResult::AppliedReplyUnreadable { summary, detail }
+        }
         Err(err) => FormatResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -1284,7 +1301,9 @@ fn build_request(
 
 fn record_attempt(outcome: &FormatOutcome, opts: &FormatOptions, duration: Duration) {
     let error = match &outcome.result {
-        FormatResult::Failed { detail } => Some(detail.clone()),
+        FormatResult::Failed { detail } | FormatResult::AppliedReplyUnreadable { detail, .. } => {
+            Some(detail.clone())
+        }
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -1301,6 +1320,7 @@ fn record_attempt(outcome: &FormatOutcome, opts: &FormatOptions, duration: Durat
             summary,
             discarded_cells,
         } => (Some(summary.clone()), discarded_cells.clone()),
+        FormatResult::AppliedReplyUnreadable { summary, .. } => (Some(summary.clone()), Vec::new()),
         _ => (None, Vec::new()),
     };
 
@@ -1390,6 +1410,15 @@ pub fn describe_lines(outcome: &FormatOutcome) -> Vec<String> {
             .collect(),
         FormatResult::Changed { summary, .. } => {
             vec![format!("{} in {book}", past_tense_summary(verb, summary))]
+        }
+        // Idempotent: the same format / merge / unmerge / resize again is a no-op.
+        FormatResult::AppliedReplyUnreadable { summary, detail } => {
+            vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::Idempotent,
+                detail,
+            )]
         }
         FormatResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -2128,6 +2157,11 @@ mod tests {
             FormatResult::Changed {
                 summary: "x".to_string(),
                 discarded_cells: Vec::new(),
+            }
+            .log_status(),
+            FormatResult::AppliedReplyUnreadable {
+                summary: "x".to_string(),
+                detail: "x".to_string(),
             }
             .log_status(),
             FormatResult::Failed {
@@ -3187,6 +3221,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn format_cells_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // 2xx, so the change WAS applied — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+
+        let outcome = format(&drive, &sheets, &format_cells_opts(false), &rules).await;
+        assert!(
+            matches!(outcome.result, FormatResult::AppliedReplyUnreadable { .. }),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        assert!(
+            describe(&outcome).starts_with("Applied, but the reply could not be read"),
+            "{}",
+            describe(&outcome)
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable_as_an_idempotent_single_line() {
+        let outcome = FormatOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: format_cells_opts(false).verb,
+            result: FormatResult::AppliedReplyUnreadable {
+                summary: "set bold on 'Q1'!A1:B2".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        };
+        assert_eq!(
+            describe_lines(&outcome),
+            vec![
+                "Applied, but the reply could not be read: set bold on 'Q1'!A1:B2 in 'Budget' — \
+                 check the spreadsheet to confirm (bad reply)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn a_batch_update_failure_is_reported_as_failed() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
@@ -3251,6 +3345,10 @@ mod tests {
                 summary: "set bold".to_string(),
                 discarded_cells: Vec::new(),
             },
+            FormatResult::AppliedReplyUnreadable {
+                summary: "set bold".to_string(),
+                detail: "bad reply".to_string(),
+            },
             FormatResult::Failed {
                 detail: "boom".to_string(),
             },
@@ -3275,6 +3373,7 @@ mod tests {
                     | FormatResult::RefusedLeaseWrongFile
                     | FormatResult::RefusedLeaseStale
                     | FormatResult::Changed { .. }
+                    | FormatResult::AppliedReplyUnreadable { .. }
                     | FormatResult::Failed { .. } => {}
                 }
                 let outcome = FormatOutcome {

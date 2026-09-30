@@ -46,7 +46,9 @@ use crate::drive::lease::check::{
     conclude_native_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
     LeasedWrite,
 };
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range::width_warning;
 use crate::drive::sheets::types::{BatchUpdateRequestItem, RandomizeRangeRequest};
@@ -109,6 +111,14 @@ pub enum RandomizeRangeResult {
     RefusedLeaseExpired,
     RefusedLeaseWrongFile,
     RefusedLeaseStale,
+    /// The API answered 2xx — the shuffle **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`].
+    AppliedReplyUnreadable {
+        /// What was randomized, as recorded for `Changed`.
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     Failed {
         detail: String,
     },
@@ -147,6 +157,7 @@ impl RandomizeRangeResult {
             Self::RefusedLeaseExpired => "refused-lease-expired",
             Self::RefusedLeaseWrongFile => "refused-lease-wrong-file",
             Self::RefusedLeaseStale => "refused-lease-stale",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -321,10 +332,17 @@ async fn randomize_range_inner(
     )
     .await
     {
-        Ok(_) => RandomizeRangeResult::Changed {
+        Ok(BatchUpdateOutcome::Applied(_)) => RandomizeRangeResult::Changed {
             range: composed,
             width_warning,
         },
+        // Not idempotent: every run yields a different order.
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            RandomizeRangeResult::AppliedReplyUnreadable {
+                summary: format!("randomized {composed}"),
+                detail,
+            }
+        }
         Err(err) => RandomizeRangeResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -340,11 +358,13 @@ fn record_attempt(outcome: &RandomizeRangeOutcome, duration: Duration) {
     let decided_by = write_gate::decided_by_log_fields(decided_by);
     let fields_changed = match &outcome.result {
         RandomizeRangeResult::Changed { range, .. } => Some(format!("randomized {range}")),
+        RandomizeRangeResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
         _ => None,
     };
     let error = match &outcome.result {
         RandomizeRangeResult::RefusedInvalidRequest { detail }
-        | RandomizeRangeResult::Failed { detail } => Some(detail.clone()),
+        | RandomizeRangeResult::Failed { detail }
+        | RandomizeRangeResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     request_log::record_drive_mutation(DriveMutationOutcome {
@@ -441,6 +461,14 @@ pub fn describe_lines(outcome: &RandomizeRangeOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
+        RandomizeRangeResult::AppliedReplyUnreadable { summary, detail } => {
+            vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::NotIdempotent,
+                detail,
+            )]
+        }
         RandomizeRangeResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
@@ -946,6 +974,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn randomize_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_metadata(&server).await;
+        // 2xx, so the shuffle WAS applied — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = randomize_range(&drive, &sheets, &options(false), &[rule()]).await;
+        assert!(
+            matches!(
+                outcome.result,
+                RandomizeRangeResult::AppliedReplyUnreadable { .. }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        let lines = describe_lines(&outcome);
+        assert!(
+            lines[0].starts_with("Applied, but the reply could not be read"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable() {
+        let outcome = RandomizeRangeOutcome {
+            spreadsheet_id: "sheet-1".into(),
+            file_name: Some("Budget".into()),
+            resolved_folder_id: None,
+            result: RandomizeRangeResult::AppliedReplyUnreadable {
+                summary: "randomized Q1!A2:C10".into(),
+                detail: "bad reply".into(),
+            },
+        };
+        assert_eq!(
+            describe_lines(&outcome),
+            vec![
+                "Applied, but the reply could not be read: randomized Q1!A2:C10 in 'Budget' — \
+                 do not retry; check the spreadsheet first (bad reply)"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn a_batch_update_error_under_an_active_lease_records_the_failure() {
         // Unlike `a_batch_update_error_is_reported_as_failed` (no lease held
         // at all), this holds a real lease grant so the failure path also
@@ -1123,6 +1201,10 @@ mod tests {
             RandomizeRangeResult::RefusedLeaseExpired,
             RandomizeRangeResult::RefusedLeaseWrongFile,
             RandomizeRangeResult::RefusedLeaseStale,
+            RandomizeRangeResult::AppliedReplyUnreadable {
+                summary: "randomized Q1!A1:B3".into(),
+                detail: "bad reply".into(),
+            },
             RandomizeRangeResult::Failed {
                 detail: "boom".into(),
             },
@@ -1141,6 +1223,7 @@ mod tests {
                 | RandomizeRangeResult::RefusedLeaseExpired
                 | RandomizeRangeResult::RefusedLeaseWrongFile
                 | RandomizeRangeResult::RefusedLeaseStale
+                | RandomizeRangeResult::AppliedReplyUnreadable { .. }
                 | RandomizeRangeResult::Failed { .. } => (),
             }
         }

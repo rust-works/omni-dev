@@ -40,7 +40,9 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
@@ -241,6 +243,17 @@ pub enum ProtectionResult {
         /// `protect-range`, otherwise the one resolved against.
         protected_range_id: Option<i64>,
     },
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: a
+    /// retry here would stack a second protection over the same range. The
+    /// server-assigned id of a new protected range was in that reply, so it
+    /// is unknown.
+    AppliedReplyUnreadable {
+        /// Same summary as [`Self::WouldChange`].
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -283,6 +296,7 @@ impl ProtectionResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -554,12 +568,17 @@ async fn protection_inner(
     )
     .await
     {
-        Ok(response) => {
+        Ok(BatchUpdateOutcome::Applied(response)) => {
             let protected_range_id = added_protected_range_id(&response).or(existing_id);
             ProtectionResult::Changed {
                 summary,
                 protected_range_id,
             }
+        }
+        // NotIdempotent: a second `protect-range` would stack a second protection
+        // over the same range.
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            ProtectionResult::AppliedReplyUnreadable { summary, detail }
         }
         Err(err) => ProtectionResult::Failed {
             detail: format!("{err:#}"),
@@ -812,7 +831,8 @@ fn describe_effect(verb: &ProtectionVerb) -> String {
 
 fn record_attempt(outcome: &ProtectionOutcome, opts: &ProtectionOptions, duration: Duration) {
     let error = match &outcome.result {
-        ProtectionResult::Failed { detail } => Some(detail.clone()),
+        ProtectionResult::Failed { detail }
+        | ProtectionResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -842,6 +862,10 @@ fn record_attempt(outcome: &ProtectionOutcome, opts: &ProtectionOptions, duratio
         }
         _ => (None, Vec::new(), Vec::new()),
     };
+    let fields_changed = match &outcome.result {
+        ProtectionResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
+        _ => None,
+    };
 
     request_log::record_drive_mutation(DriveMutationOutcome {
         operation: opts.verb.log_operation(),
@@ -855,6 +879,7 @@ fn record_attempt(outcome: &ProtectionOutcome, opts: &ProtectionOptions, duratio
         protected_range_id,
         protection_editors_added: editors_added,
         protection_editors_removed: editors_removed,
+        fields_changed,
         error,
         duration,
         ..Default::default()
@@ -944,6 +969,22 @@ pub fn describe_lines(outcome: &ProtectionOutcome) -> Vec<String> {
         } => {
             let id = protected_range_id.map_or_else(String::new, |id| format!(" (id {id})"));
             vec![format!("Applied: {summary}{id} in {book}")]
+        }
+        ProtectionResult::AppliedReplyUnreadable { summary, detail } => {
+            let mut lines = vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::NotIdempotent,
+                detail,
+            )];
+            if matches!(verb, ProtectionVerb::ProtectRange { .. }) {
+                lines.push(
+                    "  the new protection's id was in the unreadable reply; run \
+                     `list-protections` to find it"
+                        .to_string(),
+                );
+            }
+            lines
         }
         ProtectionResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -1285,6 +1326,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protect_range_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([])).mount(&server).await;
+        // 2xx, so the protection WAS added — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = ProtectionOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: ProtectionVerb::ProtectRange {
+                sheet: Some("Q1".to_string()),
+                range: Some("A1:A5".to_string()),
+                whole_sheet: false,
+                description: Some("locked".to_string()),
+                warning_only: false,
+                editors: Vec::new(),
+            },
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = protection(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                ProtectionResult::AppliedReplyUnreadable { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        assert!(
+            describe(&outcome).starts_with("Applied, but the reply could not be read"),
+            "{}",
+            describe(&outcome)
+        );
+    }
+
+    #[tokio::test]
     async fn unprotect_range_refuses_when_no_protection_matches() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
@@ -1470,6 +1566,14 @@ mod tests {
             }
             .log_status(),
             "refused-ambiguous-protection"
+        );
+        assert_eq!(
+            ProtectionResult::AppliedReplyUnreadable {
+                summary: String::new(),
+                detail: String::new(),
+            }
+            .log_status(),
+            "applied-reply-unreadable"
         );
         assert_eq!(
             ProtectionResult::Failed {
@@ -1837,6 +1941,39 @@ mod tests {
             },
         );
         assert!(!describe(&without_id).contains("(id"));
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable_with_an_id_hint_only_for_protects() {
+        let protected = outcome_with(
+            protect_verb(),
+            Some("Budget"),
+            ProtectionResult::AppliedReplyUnreadable {
+                summary: "protect (block edits)".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(
+            describe_lines(&protected),
+            vec![
+                "Applied, but the reply could not be read: protect (block edits) in 'Budget' — \
+                 do not retry; check the spreadsheet first (bad reply)"
+                    .to_string(),
+                "  the new protection's id was in the unreadable reply; run \
+                 `list-protections` to find it"
+                    .to_string(),
+            ]
+        );
+
+        let removed = outcome_with(
+            unprotect_verb(),
+            Some("Budget"),
+            ProtectionResult::AppliedReplyUnreadable {
+                summary: "remove protection".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(describe_lines(&removed).len(), 1);
     }
 
     #[test]

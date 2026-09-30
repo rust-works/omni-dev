@@ -67,7 +67,9 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
@@ -451,6 +453,16 @@ pub enum PivotResult {
     RefusedLeaseStale,
     /// The mutation succeeded.
     Changed(PivotChange),
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: a
+    /// retry of `add-pivot-table` would be refused or stack a second change
+    /// on the first.
+    AppliedReplyUnreadable {
+        /// What was applied, e.g. "add a pivot table anchored at 'Q1'!A1".
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -495,6 +507,7 @@ impl PivotResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed(_) => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -850,7 +863,15 @@ async fn pivot_inner(
     )
     .await
     {
-        Ok(_response) => PivotResult::Changed(change),
+        Ok(BatchUpdateOutcome::Applied(_)) => PivotResult::Changed(change),
+        // Not idempotent: adding builds a new table and deleting clears one,
+        // so a blind second run is the wrong follow-up either way.
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            PivotResult::AppliedReplyUnreadable {
+                summary: pivot_action_summary(&opts.verb, &change),
+                detail,
+            }
+        }
         Err(err) => PivotResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -1099,7 +1120,13 @@ fn describe_anchor_currently(cell: Option<&CellSnapshot>) -> String {
 
 fn record_attempt(outcome: &PivotOutcome, opts: &PivotOptions, duration: Duration) {
     let error = match &outcome.result {
-        PivotResult::Failed { detail } => Some(detail.clone()),
+        PivotResult::Failed { detail } | PivotResult::AppliedReplyUnreadable { detail, .. } => {
+            Some(detail.clone())
+        }
+        _ => None,
+    };
+    let fields_changed = match &outcome.result {
+        PivotResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -1117,21 +1144,28 @@ fn record_attempt(outcome: &PivotOutcome, opts: &PivotOptions, duration: Duratio
         decided_by_folder_id: decided_by.folder_id,
         decided_by_depth: decided_by.depth,
         decided_by_file_id: decided_by.file_id,
+        fields_changed,
         error,
         duration,
         ..Default::default()
     });
 }
 
-/// Renders the change-specific lines of a `WouldChange`/`Changed` outcome
-/// — everything but the leading "Would "/"Applied: " the caller prepends,
-/// so both share this one builder.
-fn pivot_change_lines(verb: &PivotVerb, change: &PivotChange, book: &str) -> Vec<String> {
+/// What a pivot mutation does, e.g. "add a pivot table anchored at 'Q1'!A1" —
+/// the head shared by the change lines and the unreadable-reply line.
+fn pivot_action_summary(verb: &PivotVerb, change: &PivotChange) -> String {
     let action = match verb {
         PivotVerb::AddPivotTable { .. } => "add a pivot table",
         PivotVerb::DeletePivotTable { .. } => "delete the pivot table",
     };
-    let mut lines = vec![format!("{action} anchored at {} in {book}", change.anchor)];
+    format!("{action} anchored at {}", change.anchor)
+}
+
+/// Renders the change-specific lines of a `WouldChange`/`Changed` outcome
+/// — everything but the leading "Would "/"Applied: " the caller prepends,
+/// so both share this one builder.
+fn pivot_change_lines(verb: &PivotVerb, change: &PivotChange, book: &str) -> Vec<String> {
+    let mut lines = vec![format!("{} in {book}", pivot_action_summary(verb, change))];
     if let Some(source) = &change.source {
         lines.push(format!("  source: {source}"));
     }
@@ -1250,6 +1284,14 @@ pub fn describe_lines(outcome: &PivotOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
+        PivotResult::AppliedReplyUnreadable { summary, detail } => {
+            vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::NotIdempotent,
+                detail,
+            )]
+        }
         PivotResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
@@ -2870,6 +2912,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn add_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(None).mount(&server).await;
+        // 2xx, so the pivot table WAS created — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = pivot(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PivotResult::AppliedReplyUnreadable { .. }),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        let text = describe(&outcome);
+        assert!(
+            text.starts_with("Applied, but the reply could not be read"),
+            "{text}"
+        );
+    }
+
     // ── the Drive write lease (ADR-0080 §9) ─────────────────────────────
 
     #[tokio::test]
@@ -3248,6 +3338,26 @@ mod tests {
     }
 
     #[test]
+    fn describe_lines_renders_applied_reply_unreadable() {
+        let out = outcome_with(
+            delete_verb(),
+            Some("Budget"),
+            PivotResult::AppliedReplyUnreadable {
+                summary: "delete the pivot table anchored at 'Report'!A1".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(
+            describe_lines(&out),
+            vec![
+                "Applied, but the reply could not be read: delete the pivot table anchored at \
+                 'Report'!A1 in 'Budget' — do not retry; check the spreadsheet first (bad reply)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn log_status_covers_every_variant() {
         let decided_by = None;
         let change = PivotChange {
@@ -3292,6 +3402,10 @@ mod tests {
             PivotResult::RefusedLeaseWrongFile,
             PivotResult::RefusedLeaseStale,
             PivotResult::Changed(change),
+            PivotResult::AppliedReplyUnreadable {
+                summary: String::new(),
+                detail: String::new(),
+            },
             PivotResult::Failed {
                 detail: String::new(),
             },

@@ -42,7 +42,9 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::date_value::{
     reject_blank, reject_blank_date, reject_empty, reject_invalid_date_between, reject_nan,
@@ -314,6 +316,14 @@ pub enum ValidationResult {
         #[serde(skip_serializing_if = "Option::is_none")]
         clamped_to: Option<String>,
     },
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`].
+    AppliedReplyUnreadable {
+        /// Same summary as [`Self::Changed`].
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -354,6 +364,7 @@ impl ValidationResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -588,10 +599,15 @@ async fn validation_inner(
     )
     .await
     {
-        Ok(_response) => ValidationResult::Changed {
+        Ok(BatchUpdateOutcome::Applied(_)) => ValidationResult::Changed {
             summary,
             clamped_to,
         },
+        // Idempotent: setting or clearing the same rule again leaves the
+        // same end state.
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            ValidationResult::AppliedReplyUnreadable { summary, detail }
+        }
         Err(err) => ValidationResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -720,7 +736,12 @@ fn build_request(verb: &ValidationVerb, grid: GridRange) -> BatchUpdateRequestIt
 
 fn record_attempt(outcome: &ValidationOutcome, opts: &ValidationOptions, duration: Duration) {
     let error = match &outcome.result {
-        ValidationResult::Failed { detail } => Some(detail.clone()),
+        ValidationResult::Failed { detail }
+        | ValidationResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
+        _ => None,
+    };
+    let fields_changed = match &outcome.result {
+        ValidationResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -745,6 +766,7 @@ fn record_attempt(outcome: &ValidationOutcome, opts: &ValidationOptions, duratio
         decided_by_depth: decided_by.depth,
         decided_by_file_id: decided_by.file_id,
         validation_type,
+        fields_changed,
         error,
         duration,
         ..Default::default()
@@ -840,6 +862,14 @@ pub fn describe_lines(outcome: &ValidationOutcome) -> Vec<String> {
                 )
             }));
             lines
+        }
+        ValidationResult::AppliedReplyUnreadable { summary, detail } => {
+            vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::Idempotent,
+                detail,
+            )]
         }
         ValidationResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -2048,6 +2078,76 @@ mod tests {
         assert!(matches!(outcome.result, ValidationResult::Failed { .. }));
     }
 
+    #[tokio::test]
+    async fn set_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        // 2xx, so the rule WAS set — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: set_verb(Condition::Checkbox, false),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = validation(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                ValidationResult::AppliedReplyUnreadable { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        let text = describe(&outcome);
+        assert!(
+            text.starts_with("Applied, but the reply could not be read"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable() {
+        let outcome = ValidationOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: clear_verb(),
+            result: ValidationResult::AppliedReplyUnreadable {
+                summary: "clear data validation".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        };
+        assert_eq!(
+            describe_lines(&outcome),
+            vec![
+                "Applied, but the reply could not be read: clear data validation in 'Budget' — \
+                 check the spreadsheet to confirm (bad reply)"
+                    .to_string()
+            ]
+        );
+    }
+
     fn every_validation_result() -> Vec<ValidationResult> {
         let all = vec![
             ValidationResult::WouldChange {
@@ -2093,6 +2193,10 @@ mod tests {
                 summary: "set data validation".to_string(),
                 clamped_to: Some("'Q1'!Z1:Z1000".to_string()),
             },
+            ValidationResult::AppliedReplyUnreadable {
+                summary: "set data validation".to_string(),
+                detail: "bad reply".to_string(),
+            },
             ValidationResult::Failed {
                 detail: "boom".to_string(),
             },
@@ -2112,6 +2216,7 @@ mod tests {
                 | ValidationResult::RefusedLeaseWrongFile
                 | ValidationResult::RefusedLeaseStale
                 | ValidationResult::Changed { .. }
+                | ValidationResult::AppliedReplyUnreadable { .. }
                 | ValidationResult::Failed { .. } => {}
             }
         }
@@ -2161,10 +2266,11 @@ mod tests {
             .iter()
             .map(ValidationResult::log_status)
             .collect();
-        // 13 `ValidationResult` variants; `every_validation_result` lists 15
-        // entries so it can also exercise `RefusedSheetNotFound`'s and
-        // `Blocked`'s two shapes each, which share a `log_status`.
-        assert_eq!(statuses.len(), 13);
+        // 14 `ValidationResult` variants; `every_validation_result` lists 18
+        // entries so it can also exercise the two shapes each of
+        // `WouldChange`, `RefusedSheetNotFound`, `Blocked` and `Changed`,
+        // which share a `log_status`.
+        assert_eq!(statuses.len(), 14);
         assert!(statuses.iter().all(|s| !s.is_empty()));
     }
 

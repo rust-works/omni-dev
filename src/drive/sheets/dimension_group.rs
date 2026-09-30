@@ -64,7 +64,9 @@ use crate::drive::lease::check::{
     conclude_native_leased_write, gate_optional_leased_write, FromLeaseRefusal, LeaseGateRefusal,
     LeasedWrite,
 };
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
@@ -254,6 +256,15 @@ pub enum DimensionGroupResult {
         /// whose span matched more than one group.
         depth: Option<i64>,
     },
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: the
+    /// group change happened, and a retry could nest another level of depth.
+    AppliedReplyUnreadable {
+        /// Same summary as [`Self::Changed`].
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -296,6 +307,7 @@ impl DimensionGroupResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -522,7 +534,14 @@ async fn dimension_group_inner(
     )
     .await
     {
-        Ok(_response) => DimensionGroupResult::Changed { summary, depth },
+        Ok(BatchUpdateOutcome::Applied(_response)) => {
+            DimensionGroupResult::Changed { summary, depth }
+        }
+        // `RetryHint::NotIdempotent`: a second add nests the group one level
+        // deeper (#2021).
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            DimensionGroupResult::AppliedReplyUnreadable { summary, detail }
+        }
         Err(err) => DimensionGroupResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -738,7 +757,8 @@ fn record_attempt(
     duration: Duration,
 ) {
     let error = match &outcome.result {
-        DimensionGroupResult::Failed { detail } => Some(detail.clone()),
+        DimensionGroupResult::Failed { detail }
+        | DimensionGroupResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -749,7 +769,8 @@ fn record_attempt(
     let fields_changed = match (&opts.verb, &outcome.result) {
         (
             DimensionGroupVerb::UpdateDimensionGroup { collapsed, .. },
-            DimensionGroupResult::Changed { .. },
+            DimensionGroupResult::Changed { .. }
+            | DimensionGroupResult::AppliedReplyUnreadable { .. },
         ) => Some(format!("collapsed={collapsed}")),
         _ => None,
     };
@@ -856,6 +877,14 @@ pub fn describe_lines(outcome: &DimensionGroupOutcome) -> Vec<String> {
         DimensionGroupResult::Changed { summary, depth } => {
             let id = depth.map_or_else(String::new, |depth| format!(" (depth {depth})"));
             vec![format!("Applied: {summary}{id} in {book}")]
+        }
+        DimensionGroupResult::AppliedReplyUnreadable { summary, detail } => {
+            vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::NotIdempotent,
+                detail,
+            )]
         }
         DimensionGroupResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -969,6 +998,14 @@ mod tests {
             }
             .log_status(),
             "changed"
+        );
+        assert_eq!(
+            DimensionGroupResult::AppliedReplyUnreadable {
+                summary: String::new(),
+                detail: String::new(),
+            }
+            .log_status(),
+            "applied-reply-unreadable"
         );
         assert_eq!(
             DimensionGroupResult::Failed {
@@ -1489,6 +1526,55 @@ mod tests {
         );
         assert_eq!(outcome.sheet_id, Some(0));
         assert_eq!(outcome.dimension_range_label, Some("ROWS 5:9".to_string()));
+    }
+
+    #[tokio::test]
+    async fn add_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Q1", "index": 0,
+                "gridProperties": {"rowCount": 1000, "columnCount": 26}}},
+        ]))
+        .mount(&server)
+        .await;
+        // 2xx, so the group WAS added — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let mut opts = base_opts(add_verb(), false);
+        opts.lease_token = lease_token;
+        opts.ledger_path = ledger_path;
+        let outcome = dimension_group(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                DimensionGroupResult::AppliedReplyUnreadable { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        assert!(
+            describe(&outcome).starts_with("Applied, but the reply could not be read"),
+            "{}",
+            describe(&outcome)
+        );
     }
 
     #[tokio::test]
@@ -2227,6 +2313,26 @@ mod tests {
         );
         let text = describe(&without_depth);
         assert!(!text.contains("(depth"), "{text}");
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable_as_not_idempotent() {
+        let out = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            DimensionGroupResult::AppliedReplyUnreadable {
+                summary: "add a row group over ROWS 5:9".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(
+            describe_lines(&out),
+            vec![
+                "Applied, but the reply could not be read: add a row group over ROWS 5:9 in \
+                 'Budget' — do not retry; check the spreadsheet first (bad reply)"
+                    .to_string()
+            ]
+        );
     }
 
     #[test]

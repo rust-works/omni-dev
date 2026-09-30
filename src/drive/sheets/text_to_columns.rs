@@ -82,7 +82,9 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::{SheetsApi, ValueRenderOption};
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi, ValueRenderOption,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
@@ -315,6 +317,15 @@ pub enum TextToColumnsResult {
         /// Same as [`Self::WouldChange`].
         past_grid_extent: bool,
     },
+    /// The API answered 2xx — the split **was applied** — but its reply could
+    /// not be read (issue #2021). Distinct from [`Self::Failed`]: a retry
+    /// would split the already-split data again.
+    AppliedReplyUnreadable {
+        /// Same summary as [`Self::Changed`].
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -356,6 +367,7 @@ impl TextToColumnsResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -656,7 +668,7 @@ async fn text_to_columns_inner(
     )
     .await
     {
-        Ok(_response) => TextToColumnsResult::Changed {
+        Ok(BatchUpdateOutcome::Applied(_)) => TextToColumnsResult::Changed {
             summary,
             source: source_a1,
             spill: spill_a1,
@@ -664,6 +676,10 @@ async fn text_to_columns_inner(
             overwritten_cells,
             past_grid_extent,
         },
+        // Not idempotent: a second split acts on the already-split data.
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            TextToColumnsResult::AppliedReplyUnreadable { summary, detail }
+        }
         Err(err) => TextToColumnsResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -910,7 +926,8 @@ fn build_request(source: GridRange, delimiter: &Delimiter) -> BatchUpdateRequest
 
 fn record_attempt(outcome: &TextToColumnsOutcome, duration: Duration) {
     let error = match &outcome.result {
-        TextToColumnsResult::Failed { detail } => Some(detail.clone()),
+        TextToColumnsResult::Failed { detail }
+        | TextToColumnsResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -929,6 +946,9 @@ fn record_attempt(outcome: &TextToColumnsOutcome, duration: Duration) {
             Some(summary.clone()),
             overwritten_cells.clone(),
         ),
+        TextToColumnsResult::AppliedReplyUnreadable { summary, .. } => {
+            (None, Some(summary.clone()), Vec::new())
+        }
         _ => (None, None, Vec::new()),
     };
 
@@ -1048,6 +1068,14 @@ pub fn describe_lines(outcome: &TextToColumnsOutcome) -> Vec<String> {
             &outcome.delimiter,
             false,
         ),
+        TextToColumnsResult::AppliedReplyUnreadable { summary, detail } => {
+            vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::NotIdempotent,
+                detail,
+            )]
+        }
         TextToColumnsResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
@@ -1195,6 +1223,10 @@ mod tests {
             TextToColumnsResult::RefusedLeaseExpired,
             TextToColumnsResult::RefusedLeaseWrongFile,
             TextToColumnsResult::RefusedLeaseStale,
+            TextToColumnsResult::AppliedReplyUnreadable {
+                summary: String::new(),
+                detail: String::new(),
+            },
             TextToColumnsResult::Failed {
                 detail: String::new(),
             },
@@ -1551,6 +1583,10 @@ mod tests {
             TextToColumnsResult::RefusedLeaseExpired,
             TextToColumnsResult::RefusedLeaseWrongFile,
             TextToColumnsResult::RefusedLeaseStale,
+            TextToColumnsResult::AppliedReplyUnreadable {
+                summary: "split 'Q1'!A2:A4 on comma".to_string(),
+                detail: "bad reply".to_string(),
+            },
             TextToColumnsResult::Failed {
                 detail: "HTTP 500".to_string(),
             },
@@ -2368,6 +2404,66 @@ mod tests {
         )
         .await;
         assert!(matches!(outcome.result, TextToColumnsResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn text_to_columns_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (client, sheets) = client(&server).await;
+        mount_metadata(&server).await;
+        mount_values(
+            &server,
+            "'Q1'!A2:A4",
+            serde_json::json!({"values": [["a,b"]]}),
+        )
+        .await;
+        mount_values(&server, "'Q1'!B2:B4", serde_json::json!({"values": []})).await;
+        // 2xx, so the split WAS applied — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = text_to_columns(
+            &client,
+            &sheets,
+            &base_opts(false),
+            &[rule(DriveOperation::SheetsWrite, false)],
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome.result,
+                TextToColumnsResult::AppliedReplyUnreadable { .. }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        assert!(
+            describe(&outcome).starts_with("Applied, but the reply could not be read"),
+            "{}",
+            describe(&outcome)
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable() {
+        let mut outcome = would_change_outcome(Vec::new(), false);
+        outcome.result = TextToColumnsResult::AppliedReplyUnreadable {
+            summary: "split 'Q1'!A2:A4 on comma".to_string(),
+            detail: "bad reply".to_string(),
+        };
+        assert_eq!(
+            describe_lines(&outcome),
+            vec![
+                "Applied, but the reply could not be read: split 'Q1'!A2:A4 on comma in \
+                 'Budget' — do not retry; check the spreadsheet first (bad reply)"
+                    .to_string()
+            ]
+        );
     }
 
     #[tokio::test]

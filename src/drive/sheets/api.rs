@@ -18,6 +18,55 @@ use crate::drive::sheets::types::{
     UpdateValuesResponse, ValueRange,
 };
 
+/// What a 2xx `spreadsheets.batchUpdate` produced (issues #2021, #1929).
+///
+/// A non-2xx is not represented here: it is the `Err` of
+/// [`SheetsApi::batch_update`]. Making the two 2xx cases a type, rather than a
+/// downcastable marker on the error, means every engine must decide what to
+/// say about an applied-but-unreadable reply — and, because both are `Ok`,
+/// `conclude_native_leased_write` refreshes the lease ledger and audits
+/// `allowed` for both, as it must for a mutation that really happened.
+#[derive(Debug)]
+pub(in crate::drive) enum BatchUpdateOutcome {
+    /// 2xx and the reply parsed.
+    Applied(BatchUpdateResponse),
+    /// 2xx — the mutation **was applied** — but the body could not be read or
+    /// deserialised. `detail` carries the read/serde error.
+    AppliedReplyUnreadable {
+        /// Why the reply could not be read.
+        detail: String,
+    },
+}
+
+/// Whether running a verb's request a second time is safe, for the retry
+/// advice in [`applied_reply_unreadable_line`].
+///
+/// Defaults to [`Self::NotIdempotent`]: after a mutation, excess caution is
+/// the cheaper mistake, because what it prevents is a silent duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::drive) enum RetryHint {
+    /// A second run could create a duplicate, shift content or compound.
+    NotIdempotent,
+    /// A second run provably leaves the same end state.
+    Idempotent,
+}
+
+/// The one human-readable line every engine renders for an
+/// `AppliedReplyUnreadable` result (issue #2021). Shared so the 20 engines'
+/// wording cannot drift, the same reason `recovery_note` is.
+pub(in crate::drive) fn applied_reply_unreadable_line(
+    summary: &str,
+    book: &str,
+    hint: RetryHint,
+    detail: &str,
+) -> String {
+    let advice = match hint {
+        RetryHint::NotIdempotent => "do not retry; check the spreadsheet first",
+        RetryHint::Idempotent => "check the spreadsheet to confirm",
+    };
+    format!("Applied, but the reply could not be read: {summary} in {book} — {advice} ({detail})")
+}
+
 /// `fields` mask for `spreadsheets.get`.
 ///
 /// **Not optional.** An unmasked `spreadsheets.get` embeds every cell of
@@ -605,11 +654,18 @@ impl<'a> SheetsApi<'a> {
     /// JSON body, so the only requests expressible are the ones that type
     /// models. That is the type-level half of the guarantee its doc comment
     /// describes.
+    ///
+    /// `Err` means only that the server did **not** report success: a non-2xx,
+    /// or a send/transport failure before any status arrived. A 2xx whose body
+    /// cannot be read is [`BatchUpdateOutcome::AppliedReplyUnreadable`], returned as `Ok`
+    /// (issue #2021), because the mutation happened. A timeout or connection
+    /// reset before a status line stays `Err` too: the change may or may not
+    /// have been applied, and this method cannot claim it was.
     pub(in crate::drive) async fn batch_update(
         &self,
         spreadsheet_id: &str,
         requests: Vec<BatchUpdateRequestItem>,
-    ) -> Result<BatchUpdateResponse> {
+    ) -> Result<BatchUpdateOutcome> {
         let url = build_batch_update_url(self.client.base_url(), spreadsheet_id)?;
         let body = BatchUpdateRequest { requests };
         let response = self
@@ -617,11 +673,19 @@ impl<'a> SheetsApi<'a> {
             .transport()
             .post_json(url.as_str(), &body)
             .await?;
-        self.client
+        let reply = self
+            .client
             .transport()
-            .parse_response(response, "Failed to parse Sheets batchUpdate response")
+            .parse_success_response::<BatchUpdateResponse>(
+                response,
+                "Failed to parse Sheets batchUpdate response",
+            )
             .await
-            .map_err(|err| append_write_scope_hint(err, WriteCapability::EditContent))
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::EditContent))?;
+        Ok(match reply {
+            Ok(response) => BatchUpdateOutcome::Applied(response),
+            Err(detail) => BatchUpdateOutcome::AppliedReplyUnreadable { detail },
+        })
     }
 
     /// Copies one sheet from `spreadsheet_id` into `destination_spreadsheet_id`
@@ -1329,6 +1393,236 @@ mod tests {
             "/v4/spreadsheets/dest-or-source-id/sheets/12345:copyTo"
         );
         assert!(url.query().is_none(), "{url}");
+    }
+
+    // ── batchUpdate reply handling (issue #2021) ───────────────────────
+
+    /// A `SheetsApi` backed by `server`, with the OAuth token endpoint mounted.
+    async fn sheets_client_for(server: &wiremock::MockServer) -> SheetsClient {
+        use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+        use crate::drive::client::DriveClient;
+        use crate::drive::sheets::client::SHEETS_API_URL;
+        use crate::test_support::env::MapEnv;
+        use crate::utils::secret::Secret;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-token", "expires_in": 3600,
+                })),
+            )
+            .mount(server)
+            .await;
+        let credentials = DriveCredentials {
+            client_id: "client-1".to_string(),
+            client_secret: Secret::new("secret-1"),
+            refresh_token: Secret::new("refresh-1"),
+            scope: DriveGrantedScopes::READONLY,
+        };
+        let mut drive = DriveClient::new(&server.uri(), &credentials).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut drive,
+            &credentials,
+            &format!("{}/token", server.uri()),
+        );
+        let env = MapEnv::new().with(SHEETS_API_URL, &server.uri());
+        SheetsClient::from_drive_client_with(&env, &drive).unwrap()
+    }
+
+    /// Mounts a `batchUpdate` answering with `template`, expecting one call.
+    async fn mount_batch_update_reply(
+        server: &wiremock::MockServer,
+        template: wiremock::ResponseTemplate,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(template)
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    fn one_request() -> Vec<BatchUpdateRequestItem> {
+        vec![BatchUpdateRequestItem::DeleteEmbeddedObject(
+            crate::drive::sheets::types::DeleteEmbeddedObjectRequest { object_id: 1 },
+        )]
+    }
+
+    #[tokio::test]
+    async fn batch_update_parses_a_well_formed_2xx_reply_as_applied() {
+        let server = wiremock::MockServer::start().await;
+        let sheets = sheets_client_for(&server).await;
+        mount_batch_update_reply(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "spreadsheetId": "sheet-1",
+                "replies": [{"addChart": {"chart": {"chartId": 42}}}],
+            })),
+        )
+        .await;
+
+        let outcome = SheetsApi::new(&sheets)
+            .batch_update("sheet-1", one_request())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, BatchUpdateOutcome::Applied(_)),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_update_reports_a_2xx_with_a_non_json_body_as_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let sheets = sheets_client_for(&server).await;
+        mount_batch_update_reply(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_string("not json"),
+        )
+        .await;
+
+        let outcome = SheetsApi::new(&sheets)
+            .batch_update("sheet-1", one_request())
+            .await
+            .unwrap();
+        let BatchUpdateOutcome::AppliedReplyUnreadable { detail } = outcome else {
+            panic!("expected AppliedReplyUnreadable, got {outcome:?}"); // omni-dev: coverage ignore-line reason="the assertion arm only fires if the outcome type regresses, in which case the test has already failed"
+        };
+        assert!(
+            detail.contains("Failed to parse Sheets batchUpdate response"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_update_reports_a_2xx_with_a_mistyped_reply_as_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let sheets = sheets_client_for(&server).await;
+        // `chartId` is an integer on the wire; a string is a reply-shape gap
+        // of exactly the kind #1929 fixed one instance of.
+        mount_batch_update_reply(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "replies": [{"addChart": {"chart": {"chartId": "x"}}}],
+            })),
+        )
+        .await;
+
+        let outcome = SheetsApi::new(&sheets)
+            .batch_update("sheet-1", one_request())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, BatchUpdateOutcome::AppliedReplyUnreadable { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_update_reports_a_2xx_with_an_empty_body_as_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let sheets = sheets_client_for(&server).await;
+        mount_batch_update_reply(&server, wiremock::ResponseTemplate::new(200)).await;
+
+        let outcome = SheetsApi::new(&sheets)
+            .batch_update("sheet-1", one_request())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, BatchUpdateOutcome::AppliedReplyUnreadable { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_update_reports_a_non_2xx_as_an_error_not_applied() {
+        let server = wiremock::MockServer::start().await;
+        let sheets = sheets_client_for(&server).await;
+        mount_batch_update_reply(
+            &server,
+            wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 403,
+                    "message": "The caller does not have permission",
+                    "status": "PERMISSION_DENIED",
+                }
+            })),
+        )
+        .await;
+
+        let err = SheetsApi::new(&sheets)
+            .batch_update("sheet-1", one_request())
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("PERMISSION_DENIED"), "{message}");
+        assert!(message.contains("--write-full"), "{message}");
+    }
+
+    #[test]
+    fn applied_reply_unreadable_line_words_each_retry_hint() {
+        assert_eq!(
+            applied_reply_unreadable_line(
+                "add chart",
+                "'Budget'",
+                RetryHint::NotIdempotent,
+                "bad reply"
+            ),
+            "Applied, but the reply could not be read: add chart in 'Budget' — \
+             do not retry; check the spreadsheet first (bad reply)"
+        );
+        assert_eq!(
+            applied_reply_unreadable_line("sort A1:B2", "'Budget'", RetryHint::Idempotent, "x"),
+            "Applied, but the reply could not be read: sort A1:B2 in 'Budget' — \
+             check the spreadsheet to confirm (x)"
+        );
+    }
+
+    /// Every engine that calls `batch_update` must name [`BatchUpdateOutcome`].
+    ///
+    /// The compiler only forces this where the engine reads the reply: an
+    /// engine that matches `Ok(_)` compiles unchanged and would report an
+    /// applied-but-unreadable reply as a plain `Changed` with no signal. The
+    /// same grep-guard idiom keeps other cross-cutting rules honest.
+    #[test]
+    fn every_batch_update_caller_handles_an_unreadable_reply() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/drive");
+        let mut callers = Vec::new();
+        let mut dirs = vec![root.join("sheets"), root.join("lease")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                // Only production code: everything before the test module.
+                let production = source.split("#[cfg(test)]").next().unwrap();
+                if production.contains(".batch_update(") {
+                    callers.push((path, production.contains("AppliedReplyUnreadable")));
+                }
+            }
+        }
+        assert!(
+            callers.len() >= 21,
+            "expected 21 callers, found {callers:?}"
+        );
+        let unhandled: Vec<_> = callers
+            .iter()
+            .filter(|(_, handled)| !handled)
+            .map(|(path, _)| path.display().to_string())
+            .collect();
+        assert!(
+            unhandled.is_empty(),
+            "these batch_update callers never handle AppliedReplyUnreadable: {unhandled:?}"
+        );
     }
 
     // ── base URL handling ──────────────────────────────────────────────

@@ -93,7 +93,9 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::format::parse_hex_color;
 use crate::drive::sheets::grid_range;
@@ -483,6 +485,16 @@ pub enum EmbeddedObjectResult {
         #[serde(skip_serializing_if = "Option::is_none")]
         object: Option<Box<EmbeddedObjectSummary>>,
     },
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: a
+    /// retry here would duplicate the object. The server-assigned id of an
+    /// added chart or slicer was in that reply, so it is unknown.
+    AppliedReplyUnreadable {
+        /// Same summary as [`Self::WouldChange`].
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -526,6 +538,7 @@ impl EmbeddedObjectResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -722,12 +735,18 @@ async fn embedded_object_inner(
     )
     .await
     {
-        Ok(response) => {
+        Ok(BatchUpdateOutcome::Applied(response)) => {
             let object_id = added_object_id(&response).or(plan.existing_id);
             EmbeddedObjectResult::Changed {
                 summary: plan.summary,
                 object_id,
                 object: plan.before.map(Box::new),
+            }
+        }
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            EmbeddedObjectResult::AppliedReplyUnreadable {
+                summary: plan.summary,
+                detail,
             }
         }
         Err(err) => EmbeddedObjectResult::Failed {
@@ -2488,7 +2507,8 @@ fn record_attempt(
     duration: Duration,
 ) {
     let error = match &outcome.result {
-        EmbeddedObjectResult::Failed { detail } => Some(detail.clone()),
+        EmbeddedObjectResult::Failed { detail }
+        | EmbeddedObjectResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -2512,6 +2532,9 @@ fn record_attempt(
                 |object| format!("{summary} ({})", object_preview(object)),
             );
             (*object_id, Some(fields_changed))
+        }
+        EmbeddedObjectResult::AppliedReplyUnreadable { summary, .. } => {
+            (None, Some(summary.clone()))
         }
         _ => (None, None),
     };
@@ -2655,6 +2678,26 @@ pub fn describe_lines(outcome: &EmbeddedObjectOutcome) -> Vec<String> {
             let mut lines = vec![format!("Applied: {summary}{id} in {book}")];
             if let Some(object) = object {
                 lines.push(describe_object(object));
+            }
+            lines
+        }
+        EmbeddedObjectResult::AppliedReplyUnreadable { summary, detail } => {
+            // Not idempotent: a second `add-*` would add a second object.
+            let mut lines = vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::NotIdempotent,
+                detail,
+            )];
+            if matches!(
+                verb,
+                EmbeddedObjectVerb::AddChart { .. } | EmbeddedObjectVerb::AddSlicer { .. }
+            ) {
+                lines.push(
+                    "  the new object's id was in the unreadable reply; run `list-charts` / \
+                     `list-slicers` to find it"
+                        .to_string(),
+                );
             }
             lines
         }
@@ -3942,6 +3985,147 @@ mod tests {
             ),
             "{:?}",
             outcome.result
+        );
+    }
+
+    /// Mounts the gate reads and a workbook with one sheet, so an `add-chart`
+    /// reaches `batchUpdate`.
+    async fn mount_add_chart_reads(server: &wiremock::MockServer) {
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(server)
+        .await;
+        mount_folder("folder-1").mount(server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Sheet1", "index": 0}},
+        ]))
+        .mount(server)
+        .await;
+    }
+
+    #[tokio::test]
+    async fn add_chart_with_an_unreadable_reply_reports_applied_reply_unreadable_not_failed() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_add_chart_reads(&server).await;
+        // 2xx, so the chart WAS created — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_chart_verb(),
+            dry_run: false,
+            lease_token,
+            ledger_path,
+        };
+        let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                outcome.result,
+                EmbeddedObjectResult::AppliedReplyUnreadable { .. }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        let lines = describe_lines(&outcome);
+        assert!(
+            lines[0].starts_with("Applied, but the reply could not be read"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("do not retry"), "{lines:?}");
+        assert!(lines[1].contains("list-charts"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_reply_still_refreshes_the_lease_ledger() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        // `files.get` reports version "1" until the mutation lands and "2"
+        // after — the file moved because of our own write.
+        let written = Arc::new(AtomicBool::new(false));
+        let seen_by_get = Arc::clone(&written);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/drive/v3/files/sheet-1"))
+            .respond_with(move |_: &wiremock::Request| {
+                let version = if seen_by_get.load(Ordering::SeqCst) {
+                    "2"
+                } else {
+                    "1"
+                };
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "sheet-1", "name": "sheet-1",
+                    "mimeType": crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+                    "parents": ["folder-1"], "version": version,
+                }))
+            })
+            .mount(&server)
+            .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(serde_json::json!([
+            {"properties": {"sheetId": 0, "title": "Sheet1", "index": 0}},
+        ]))
+        .mount(&server)
+        .await;
+        let marks_written = Arc::clone(&written);
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                marks_written.store(true, Ordering::SeqCst);
+                wiremock::ResponseTemplate::new(200).set_body_string("not json")
+            })
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule("folder-1")];
+        let (lease_token, ledger_path) = leased_opts_for("sheet-1");
+        let token = lease_token.clone().unwrap();
+        let opts = EmbeddedObjectOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_chart_verb(),
+            dry_run: false,
+            lease_token,
+            ledger_path: ledger_path.clone(),
+        };
+
+        let first = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(
+                first.result,
+                EmbeddedObjectResult::AppliedReplyUnreadable { .. }
+            ),
+            "{:?}",
+            first.result
+        );
+        let ledger = crate::drive::lease::ledger::LeaseLedger::load(&ledger_path).unwrap();
+        assert_eq!(
+            ledger.get(&token).unwrap().version,
+            "2",
+            "an applied write must refresh the ledger even when its reply was unreadable"
+        );
+
+        // Regression: a stale ledger made the next write under the same lease
+        // `refused-lease-stale`.
+        let second = embedded_object(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            !matches!(second.result, EmbeddedObjectResult::RefusedLeaseStale),
+            "{:?}",
+            second.result
         );
     }
 
@@ -6368,6 +6552,35 @@ mod tests {
     }
 
     #[test]
+    fn describe_lines_renders_applied_reply_unreadable_with_an_id_hint_only_for_adds() {
+        let added = outcome_with(
+            add_chart_verb(),
+            Some("Budget"),
+            EmbeddedObjectResult::AppliedReplyUnreadable {
+                summary: "add column chart".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        let lines = describe_lines(&added);
+        assert_eq!(
+            lines[0],
+            "Applied, but the reply could not be read: add column chart in 'Budget' — \
+             do not retry; check the spreadsheet first (bad reply)"
+        );
+        assert_eq!(lines.len(), 2, "{lines:?}");
+
+        let deleted = outcome_with(
+            EmbeddedObjectVerb::DeleteChart { chart_id: 5 },
+            Some("Budget"),
+            EmbeddedObjectResult::AppliedReplyUnreadable {
+                summary: "delete chart 5".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(describe_lines(&deleted).len(), 1);
+    }
+
+    #[test]
     fn describe_lines_renders_failed() {
         let out = outcome_with(
             add_chart_verb(),
@@ -6417,6 +6630,10 @@ mod tests {
                 summary: String::new(),
                 object_id: None,
                 object: None,
+            },
+            EmbeddedObjectResult::AppliedReplyUnreadable {
+                summary: String::new(),
+                detail: String::new(),
             },
             EmbeddedObjectResult::Failed {
                 detail: String::new(),

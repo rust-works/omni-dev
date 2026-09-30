@@ -1655,6 +1655,32 @@ first sheet only**, because Drive's export API has no multi-sheet CSV format —
 No new login flag is needed. Reading works with the `drive.readonly` scope
 every account already has.
 
+#### Applied, but the reply could not be read
+
+Every mutating `drive sheets` verb that goes through `spreadsheets.batchUpdate`
+can report a third outcome besides `changed` and `failed` (issue #2021):
+
+```
+Applied, but the reply could not be read: add column chart in 'Budget' — do not retry; check the spreadsheet first (Failed to parse Sheets batchUpdate response: …)
+```
+
+It means Google answered **2xx**, so the change **was made**, but omni-dev could
+not parse the reply body. It is not a failure: retrying would repeat the change
+(a second chart, a second protected range, another split). Open the spreadsheet
+to confirm, and use the matching `list-*` verb to find any id the reply would
+have carried (an added chart's id, a new sheet's id, a replacement count). For
+verbs that are safe to repeat (the formatting verbs such as `format-cells`, the
+data-validation verbs, `sort-range`, `trim-whitespace` and `auto-fill`) the message says `check the spreadsheet to
+confirm` instead of `do not retry`.
+
+In JSON the result's `status` is `applied-reply-unreadable`, carrying `summary`
+and `detail`. The exit code is unchanged, as it is for `failed`. The
+`drivemutation` record has the same status, with `error` set to `detail` and
+`fields_changed` to `summary`. A lease held for the write is refreshed as after
+any successful write, so the next write under it is not refused as stale. A
+non-2xx response, or a transport failure before any status arrives, is still
+`failed`: in that case omni-dev cannot say whether the change was made.
+
 #### `drive sheets info`
 
 Shows the workbook title and the sheets (tabs) it contains, with each grid

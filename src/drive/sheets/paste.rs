@@ -95,7 +95,9 @@ use crate::drive::lease::check::{
     LeasedWrite,
 };
 use crate::drive::sheets::a1;
-use crate::drive::sheets::api::{SheetsApi, ValueRenderOption};
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi, ValueRenderOption,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::grid_range;
 use crate::drive::sheets::target_gate;
@@ -347,6 +349,17 @@ pub enum PasteResult {
     RefusedLeaseStale,
     /// The mutation succeeded.
     Changed(PasteChange),
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: the
+    /// paste happened, and a retry would paste (or, for `cut-paste`, move)
+    /// a second time.
+    AppliedReplyUnreadable {
+        /// What was pasted where — the head of [`Self::Changed`]'s text,
+        /// without the workbook name.
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -389,6 +402,7 @@ impl PasteResult {
             Self::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.log_status(),
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Changed(_) => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -799,13 +813,33 @@ async fn paste_inner(
     )
     .await
     {
-        Ok(_response) => PasteResult::Changed(change),
+        Ok(BatchUpdateOutcome::Applied(_response)) => PasteResult::Changed(change),
+        // `RetryHint::NotIdempotent`: a `cut-paste` moves cells (the source is
+        // already cleared) and a `paste-data`/`copy-paste` re-lands on top of
+        // whatever the caller has edited since (#2021).
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            PasteResult::AppliedReplyUnreadable {
+                summary: unreadable_summary(&opts.verb, &change),
+                detail,
+            }
+        }
         Err(err) => PasteResult::Failed {
             detail: format!("{err:#}"),
         },
     };
     drop(lease_grant);
     gated(result)
+}
+
+/// The `summary` of [`PasteResult::AppliedReplyUnreadable`]: the same
+/// verb, destination and written extent [`paste_change_lines`] leads with.
+fn unreadable_summary(verb: &PasteVerb, change: &PasteChange) -> String {
+    format!(
+        "{} into {} (writing {})",
+        verb.label(),
+        change.destination,
+        change.written_extent
+    )
 }
 
 /// Composes a `--source`/`--destination` A1 reference against an optional
@@ -1023,7 +1057,9 @@ fn sheet_exceeds_dimensions(
 
 fn record_attempt(outcome: &PasteOutcome, opts: &PasteOptions, duration: Duration) {
     let error = match &outcome.result {
-        PasteResult::Failed { detail } => Some(detail.clone()),
+        PasteResult::Failed { detail } | PasteResult::AppliedReplyUnreadable { detail, .. } => {
+            Some(detail.clone())
+        }
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -1206,6 +1242,14 @@ pub fn describe_lines(outcome: &PasteOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
+        PasteResult::AppliedReplyUnreadable { summary, detail } => {
+            vec![applied_reply_unreadable_line(
+                summary,
+                &book,
+                RetryHint::NotIdempotent,
+                detail,
+            )]
+        }
         PasteResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
@@ -3052,6 +3096,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cut_paste_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file(
+            "sheet-1",
+            crate::drive::types::GOOGLE_SHEET_MIME_TYPE,
+            &["folder-1"],
+        )
+        .mount(&server)
+        .await;
+        mount_folder("folder-1").mount(&server).await;
+        mount_workbook(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!D1:E2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!D1:E2", "values": []})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1/values/'Q1'!A1:B2",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"range": "'Q1'!A1:B2", "values": []})),
+            )
+            .mount(&server)
+            .await;
+        // 2xx, so the paste WAS applied — but the body is not the reply shape.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rules = vec![allow_rule(
+            "folder-1",
+            &[DriveOperation::SheetsWrite, DriveOperation::SheetsStructure],
+        )];
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: PasteVerb::CutPaste {
+                sheet: Some("Q1".to_string()),
+                source: "A1:B2".to_string(),
+                destination: "D1".to_string(),
+                paste_type: PasteType::Normal,
+            },
+            dry_run: false,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let outcome = paste(&drive, &sheets, &opts, &rules).await;
+        assert!(
+            matches!(outcome.result, PasteResult::AppliedReplyUnreadable { .. }),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        let lines = describe_lines(&outcome);
+        assert!(
+            lines[0].starts_with("Applied, but the reply could not be read"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("do not retry"), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable_as_not_idempotent() {
+        let outcome = PasteOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: every_paste_verb().remove(0),
+            result: PasteResult::AppliedReplyUnreadable {
+                summary: "cut-paste into 'Q1'!D1 (writing 'Q1'!D1:E2)".to_string(),
+                detail: "bad reply".to_string(),
+            },
+        };
+        assert_eq!(
+            describe_lines(&outcome),
+            vec![
+                "Applied, but the reply could not be read: cut-paste into 'Q1'!D1 (writing \
+                 'Q1'!D1:E2) in 'Budget' — do not retry; check the spreadsheet first (bad reply)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn copy_paste_real_run_succeeds_and_reports_changed() {
         let server = wiremock::MockServer::start().await;
         let (drive, sheets) = clients(&server).await;
@@ -3664,6 +3803,10 @@ mod tests {
             PasteResult::RefusedLeaseExpired,
             PasteResult::RefusedLeaseWrongFile,
             PasteResult::RefusedLeaseStale,
+            PasteResult::AppliedReplyUnreadable {
+                summary: "cut-paste into 'Q1'!D1 (writing 'Q1'!D1:E2)".to_string(),
+                detail: "bad reply".to_string(),
+            },
             PasteResult::Failed {
                 detail: "boom".to_string(),
             },

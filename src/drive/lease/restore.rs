@@ -60,7 +60,7 @@ use crate::drive::lease::check::{
     LeaseGateRefusal, LeasedWrite,
 };
 use crate::drive::lease::ledger::{LeaseBackup, LeaseLedger, LedgerLock};
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{BatchUpdateOutcome, SheetsApi};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::types::{
     BatchUpdateRequestItem, SheetPropertiesUpdate, UpdateSheetPropertiesRequest,
@@ -986,7 +986,17 @@ async fn rename_back_if_free(
         )
         .await;
     match rename {
-        Ok(_) => original_title.to_string(),
+        Ok(outcome) => {
+            if let BatchUpdateOutcome::AppliedReplyUnreadable { detail } = &outcome {
+                // The rename went through (2xx) — only its reply was unreadable
+                // (issue #2021) — so the sheet does carry the original title.
+                tracing::debug!(
+                    "drive lease restore: renamed the restored sheet back to \
+                     '{original_title}', but the reply could not be read: {detail}"
+                );
+            }
+            original_title.to_string()
+        }
         Err(err) => {
             tracing::debug!(
                 "drive lease restore: failed to rename the restored sheet back to \
@@ -2357,6 +2367,37 @@ mod tests {
         .await;
 
         assert_eq!(title, "Copy of Deleted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rename_back_treats_an_unreadable_2xx_reply_as_renamed() {
+        // Issue #2021: a 2xx means the rename happened, even when its reply
+        // cannot be parsed — reporting the copy title would be wrong.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let sheets = sheets_client_for(&server, &client);
+        mount_spreadsheet("sheet-1", &[(1, "Sheet1")])
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let title = rename_back_if_free(
+            &SheetsApi::new(&sheets),
+            "sheet-1",
+            999,
+            "Deleted",
+            "Copy of Deleted",
+        )
+        .await;
+
+        assert_eq!(title, "Deleted");
     }
 
     #[tokio::test(flavor = "multi_thread")]

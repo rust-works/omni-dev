@@ -82,7 +82,9 @@ use crate::drive::lease::check::{
     LeaseGateRefusal, LeasedWrite,
 };
 use crate::drive::lease::ledger::LeaseBackup;
-use crate::drive::sheets::api::SheetsApi;
+use crate::drive::sheets::api::{
+    applied_reply_unreadable_line, BatchUpdateOutcome, RetryHint, SheetsApi,
+};
 use crate::drive::sheets::client::SheetsClient;
 use crate::drive::sheets::format::{normalize_hex_for_display, parse_hex_color};
 use crate::drive::sheets::grid_range;
@@ -678,6 +680,22 @@ pub enum StructureResult {
         #[serde(skip_serializing_if = "Option::is_none")]
         backup: Option<Box<LeaseBackup>>,
     },
+    /// The API answered 2xx — the mutation **was applied** — but its reply
+    /// could not be read (issue #2021). Distinct from [`Self::Failed`]: no
+    /// structural verb is safe to re-run blind (a second `add-sheet` or
+    /// `delete-rows` compounds). The server-assigned id of an added or
+    /// duplicated sheet was in that reply, so it is unknown.
+    AppliedReplyUnreadable {
+        /// What was applied, e.g. `delete-rows 'Q2' (ROWS 5:7)`.
+        summary: String,
+        /// Why the reply could not be read.
+        detail: String,
+        /// The lease backup, exactly as [`Self::Changed`]'s own `backup`
+        /// field: a destructive verb's recovery note names it, since the
+        /// delete happened whether or not its reply was readable.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        backup: Option<Box<LeaseBackup>>,
+    },
     /// An API or validation error.
     Failed {
         /// A human-readable summary of what failed.
@@ -725,6 +743,7 @@ impl StructureResult {
             Self::RefusedLeaseStale => LeaseGateRefusal::Stale.log_status(),
             Self::Unchanged { .. } => "unchanged",
             Self::Changed { .. } => "changed",
+            Self::AppliedReplyUnreadable { .. } => "applied-reply-unreadable",
             Self::Failed { .. } => "failed",
         }
     }
@@ -1005,13 +1024,23 @@ async fn structure_inner(
     )
     .await
     {
-        Ok(response) => StructureResult::Changed {
+        Ok(BatchUpdateOutcome::Applied(response)) => StructureResult::Changed {
             sheet_id: added_sheet_id(&response).or_else(|| sheet.as_ref().and_then(|s| s.sheet_id)),
             sheet: sheet.map(Box::new),
             backup: lease_grant
                 .as_ref()
                 .map(|grant| Box::new(grant.backup.clone())),
         },
+        // Every structural verb is `RetryHint::NotIdempotent` (see `describe_lines`).
+        Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
+            StructureResult::AppliedReplyUnreadable {
+                summary: applied_summary(&opts.verb),
+                detail,
+                backup: lease_grant
+                    .as_ref()
+                    .map(|grant| Box::new(grant.backup.clone())),
+            }
+        }
         Err(err) => StructureResult::Failed {
             detail: format!("{err:#}"),
         },
@@ -1976,6 +2005,24 @@ fn added_sheet_id(response: &BatchUpdateResponse) -> Option<i64> {
         .and_then(|props| props.sheet_id)
 }
 
+/// What an [`StructureResult::AppliedReplyUnreadable`] says was applied,
+/// e.g. `delete-rows 'Q2' (ROWS 5:7)` or `rename-sheet 'Q2' to 'Q3'` — the
+/// verb the user typed plus the same sheet/span context the request log
+/// records, so they know which part of the spreadsheet to check.
+fn applied_summary(verb: &StructureVerb) -> String {
+    let mut summary = verb.label().to_string();
+    if let Some(title) = verb.sheet_title() {
+        summary.push_str(&format!(" '{title}'"));
+    }
+    if let Some(new_title) = verb.new_sheet_title() {
+        summary.push_str(&format!(" to '{new_title}'"));
+    }
+    if let Some(span) = dimension_range_label(verb).or_else(|| grid_range_label(verb)) {
+        summary.push_str(&format!(" ({span})"));
+    }
+    summary
+}
+
 /// The `dimension_range` context value the request log records, e.g.
 /// `"ROWS 5:7"` — the structural analogue of a cell verb's A1 `range`, for
 /// effects A1 cannot express. 1-based inclusive, matching the CLI's `--at`.
@@ -2044,7 +2091,8 @@ fn grid_range_label(verb: &StructureVerb) -> Option<String> {
 /// still leaves a trace. Same reasoning as `write.rs::record_attempt`.
 fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration: Duration) {
     let error = match &outcome.result {
-        StructureResult::Failed { detail } => Some(detail.clone()),
+        StructureResult::Failed { detail }
+        | StructureResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
     let decided_by = match &outcome.result {
@@ -2069,12 +2117,20 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
     // structural verbs (issues #1835/#1836) that can set more than one
     // field in a single request, so `sheet_title`/`dimension_range`/
     // `grid_range` alone can't name the effect.
+    //
+    // An applied-but-unreadable write keeps the verb's own field list when it
+    // has one (it names more than the summary does) and otherwise records
+    // the summary, so every applied write says what it applied.
     let fields_changed = match &opts.verb {
         StructureVerb::UpdateWorkbookProperties { .. } => {
             Some(workbook_properties_summary(&opts.verb))
         }
         _ => fields_changed_label(&opts.verb),
-    };
+    }
+    .or_else(|| match &outcome.result {
+        StructureResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
+        _ => None,
+    });
 
     request_log::record_drive_mutation(DriveMutationOutcome {
         operation: opts.verb.log_operation(),
@@ -2264,6 +2320,38 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
                 backup.as_deref(),
                 &book,
             )]
+        }
+        StructureResult::AppliedReplyUnreadable {
+            summary,
+            detail,
+            backup,
+        } => {
+            // Not idempotent, for every verb: a second add/duplicate/insert/
+            // delete compounds, and even a rename or reorder is only safe
+            // once the user has seen what the first one did.
+            let mut first =
+                applied_reply_unreadable_line(summary, &book, RetryHint::NotIdempotent, detail);
+            // The delete happened, so it owes the same recovery note
+            // `describe_changed` gives a readable one.
+            if matches!(verb.gate_operation(), DriveOperation::SheetsDelete) {
+                let recovery = recovery_note(
+                    backup.as_deref(),
+                    matches!(verb, StructureVerb::DeleteSheet { .. }),
+                );
+                first.push_str(&format!("; {recovery}"));
+            }
+            let mut lines = vec![first];
+            if matches!(
+                verb,
+                StructureVerb::AddSheet { .. } | StructureVerb::DuplicateSheet { .. }
+            ) {
+                lines.push(
+                    "  the new sheet's id was in the unreadable reply; check the spreadsheet's \
+                     tabs to find it"
+                        .to_string(),
+                );
+            }
+            lines
         }
         StructureResult::Unchanged { detail } => vec![format!("Unchanged: {detail} in {book}")],
         StructureResult::Failed { detail } => vec![format!("Failed: {detail}")],
@@ -6767,6 +6855,204 @@ mod tests {
             .is_none());
     }
 
+    // ── an applied write whose reply is unreadable (issue #2021) ────────
+
+    /// A 2xx `batchUpdate` whose body is not the reply shape — the
+    /// mutation was applied, only its reply was lost.
+    fn mount_unreadable_batch_update() -> wiremock::Mock {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v4/spreadsheets/sheet-1:batchUpdate",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+    }
+
+    #[tokio::test]
+    async fn add_sheet_with_an_unreadable_reply_reports_applied_reply_unreadable() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_unreadable_batch_update()
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = structure(
+            &drive,
+            &sheets,
+            &opts(add_sheet(), false),
+            &[allow_rule("parent-1")],
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &outcome.result,
+                StructureResult::AppliedReplyUnreadable { summary, .. } if summary == "add-sheet 'Q3'"
+            ),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
+        let lines = describe_lines(&outcome);
+        assert!(
+            lines[0].starts_with("Applied, but the reply could not be read: add-sheet 'Q3'"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("do not retry"), "{lines:?}");
+        assert!(
+            !lines[0].contains("cannot be undone"),
+            "an additive verb owes no recovery note: {lines:?}"
+        );
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[1].starts_with("  the new sheet's id was in the unreadable reply"),
+            "{lines:?}"
+        );
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["result"]["status"], "applied-reply-unreadable");
+    }
+
+    /// A delete whose reply was unreadable still deleted, so it owes the
+    /// same recovery note — naming the same lease backup — a readable one
+    /// gets from `describe_changed`.
+    #[tokio::test]
+    async fn a_delete_with_an_unreadable_reply_still_names_the_drive_copy_to_restore_from() {
+        let server = wiremock::MockServer::start().await;
+        let (drive, sheets) = clients(&server).await;
+        mount_file("sheet-1", GOOGLE_SHEET_MIME_TYPE, &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        mount_workbook().mount(&server).await;
+        mount_unreadable_batch_update()
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ledger_path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("lease-ledger.jsonl");
+        let token = seed_lease_with_backup(
+            &ledger_path,
+            "sheet-1",
+            "1",
+            LeaseBackup::DriveCopy {
+                file_id: "backup-copy-1".to_string(),
+            },
+        );
+        let mut o = opts(delete_sheet(), false);
+        o.lease_token = Some(token);
+        o.ledger_path = ledger_path;
+        let outcome = structure(&drive, &sheets, &o, &[delete_allow_rule("parent-1")]).await;
+
+        assert!(
+            matches!(
+                &outcome.result,
+                StructureResult::AppliedReplyUnreadable {
+                    backup: Some(backup),
+                    ..
+                } if **backup == LeaseBackup::DriveCopy { file_id: "backup-copy-1".to_string() }
+            ),
+            "{:?}",
+            outcome.result
+        );
+        let text = describe(&outcome);
+        assert!(
+            text.starts_with("Applied, but the reply could not be read: delete-sheet 'Q2'"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "; {}",
+                recovery_note(
+                    Some(&LeaseBackup::DriveCopy {
+                        file_id: "backup-copy-1".to_string(),
+                    }),
+                    true,
+                )
+            )),
+            "{text}"
+        );
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["result"]["backup"]["file_id"], "backup-copy-1");
+    }
+
+    fn unreadable_outcome(verb: StructureVerb, summary: &str) -> StructureOutcome {
+        StructureOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb,
+            result: StructureResult::AppliedReplyUnreadable {
+                summary: summary.to_string(),
+                detail: "bad reply".to_string(),
+                backup: None,
+            },
+        }
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable_for_an_additive_verb() {
+        let lines = describe_lines(&unreadable_outcome(
+            duplicate_sheet(),
+            "duplicate-sheet 'Q2'",
+        ));
+        assert_eq!(
+            lines,
+            vec![
+                "Applied, but the reply could not be read: duplicate-sheet 'Q2' in 'Budget' — \
+                 do not retry; check the spreadsheet first (bad reply)"
+                    .to_string(),
+                "  the new sheet's id was in the unreadable reply; check the spreadsheet's tabs \
+                 to find it"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            describe_lines(&unreadable_outcome(rename(), "rename-sheet 'Q2' to 'Q3'")),
+            vec![
+                "Applied, but the reply could not be read: rename-sheet 'Q2' to 'Q3' in \
+                 'Budget' — do not retry; check the spreadsheet first (bad reply)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable_for_a_destructive_verb() {
+        let lines = describe_lines(&unreadable_outcome(
+            delete_rows(),
+            "delete-rows 'Q2' (ROWS 5:7)",
+        ));
+        assert_eq!(
+            lines,
+            vec![format!(
+                "Applied, but the reply could not be read: delete-rows 'Q2' (ROWS 5:7) in \
+                 'Budget' — do not retry; check the spreadsheet first (bad reply); {}",
+                recovery_note(None, false)
+            )]
+        );
+    }
+
+    #[test]
+    fn applied_summary_names_the_verb_sheet_and_span() {
+        assert_eq!(applied_summary(&add_sheet()), "add-sheet 'Q3'");
+        assert_eq!(applied_summary(&rename()), "rename-sheet 'Q2' to 'Q3'");
+        assert_eq!(
+            applied_summary(&delete_rows()),
+            "delete-rows 'Q2' (ROWS 5:7)"
+        );
+        assert_eq!(
+            applied_summary(&update_workbook_properties()),
+            "update-workbook-properties"
+        );
+    }
+
     // ── move-rows / move-columns (issue #1834) ─────────────────────────
 
     /// The `batchUpdate` body the server actually received.
@@ -7969,6 +8255,13 @@ mod tests {
                     file_id: "backup-copy-1".to_string(),
                 })),
             },
+            StructureResult::AppliedReplyUnreadable {
+                summary: "delete-sheet 'Q2'".to_string(),
+                detail: "bad reply".to_string(),
+                backup: Some(Box::new(LeaseBackup::DriveCopy {
+                    file_id: "backup-copy-1".to_string(),
+                })),
+            },
             StructureResult::Failed {
                 detail: "boom".to_string(),
             },
@@ -7990,6 +8283,7 @@ mod tests {
                 | StructureResult::RefusedLeaseStale
                 | StructureResult::Unchanged { .. }
                 | StructureResult::Changed { .. }
+                | StructureResult::AppliedReplyUnreadable { .. }
                 | StructureResult::Failed { .. } => {}
             }
         }
@@ -7997,12 +8291,14 @@ mod tests {
     }
 
     /// No `describe_lines` line ever contains a newline, and the insert
-    /// preview is the only arm that emits a second line.
+    /// preview and an add/duplicate's unreadable reply are the only arms
+    /// that emit a second line.
     ///
     /// Both halves are load-bearing, and they are different claims. The
     /// second is presentation: `write.rs`/`create.rs` pin every arm to one
     /// line, and a structural insert earns its extra one because the shift is
-    /// the substance of the dry run (ADR-0075 §6).
+    /// the substance of the dry run (ADR-0075 §6); an unreadable reply to an
+    /// add/duplicate earns one because the new sheet's id is lost (#2021).
     ///
     /// The first is what makes `cli::drive::sheets::structure`'s sanitizing
     /// sound. Every line here interpolates untrusted text — a Drive-supplied
@@ -8053,9 +8349,17 @@ mod tests {
             // shift; every other verb, additive or destructive, stays one
             // line.
             let has_dimension_shift = verb.dimension().is_some();
+            // The other two-line arm: an unreadable reply to an add or
+            // duplicate adds the "find the new sheet's id" hint.
+            let adds_a_sheet = matches!(
+                verb,
+                StructureVerb::AddSheet { .. } | StructureVerb::DuplicateSheet { .. }
+            );
             for result in every_structure_result() {
-                let previews_an_insert =
-                    has_dimension_shift && matches!(result, StructureResult::WouldChange { .. });
+                let has_second_line = (has_dimension_shift
+                    && matches!(result, StructureResult::WouldChange { .. }))
+                    || (adds_a_sheet
+                        && matches!(result, StructureResult::AppliedReplyUnreadable { .. }));
                 let outcome = StructureOutcome {
                     spreadsheet_id: "sheet-1".to_string(),
                     file_name: Some("Budget".to_string()),
@@ -8066,7 +8370,7 @@ mod tests {
                 let lines = describe_lines(&outcome);
                 assert_eq!(
                     lines.len(),
-                    usize::from(previews_an_insert) + 1,
+                    usize::from(has_second_line) + 1,
                     "unexpected line count for {:?}/{:?}: {lines:?}",
                     outcome.verb,
                     outcome.result
@@ -8212,6 +8516,12 @@ mod tests {
             StructureResult::Changed {
                 sheet: None,
                 sheet_id: None,
+                backup: None,
+            }
+            .log_status(),
+            StructureResult::AppliedReplyUnreadable {
+                summary: "x".to_string(),
+                detail: "x".to_string(),
                 backup: None,
             }
             .log_status(),
