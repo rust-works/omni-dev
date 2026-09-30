@@ -801,17 +801,29 @@ impl Settings {
         write_settings(path, &settings_value)
     }
 
-    /// Fails when the `env` object targeted by `profile` fetches any of the
-    /// registered secrets in `keys` through a `<NAME>_COMMAND` — the check
-    /// [`Settings::upsert_env_vars_in`] applies before writing, exposed so an
-    /// interactive login can refuse *before* it spends a browser flow on a
-    /// token it would then be unable to save (ADR-0090). A missing file or
-    /// map passes.
+    /// Fails when any of the registered secrets in `keys` is fetched through
+    /// a `<NAME>_COMMAND`, either in the `env` object targeted by `profile`
+    /// (the check [`Settings::upsert_env_vars_in`] applies before writing) or
+    /// in the process environment `raw`, which outranks whatever a login would
+    /// write there and would silently shadow it. Exposed so an interactive
+    /// login can refuse *before* it spends a browser flow on a token it would
+    /// then be unable to use (ADR-0090). A missing file or map passes.
     pub fn ensure_secrets_replaceable(
         path: &Path,
         profile: Option<&str>,
         keys: &[&str],
+        raw: &impl EnvSource,
     ) -> Result<()> {
+        for key in keys.iter().copied().filter(|key| is_secret_env_var(key)) {
+            let command_var = secret_env::command_var_name(key);
+            if raw.var(&command_var).is_some_and(|v| !v.is_empty()) {
+                anyhow::bail!(
+                    "{key} is fetched by {command_var}, which is set in the environment and \
+                     would shadow anything a login saved, so nothing was saved; store the new \
+                     value in the store {command_var} reads, or unset {command_var} first"
+                );
+            }
+        }
         if !path.exists() {
             return Ok(());
         }
@@ -1652,14 +1664,31 @@ mod tests {
     #[test]
     fn ensure_secrets_replaceable_is_the_same_check_without_writing() {
         let (_tmp, path) = temp_settings_path();
+        let none = MapEnv::new();
         // A missing file passes.
-        Settings::ensure_secrets_replaceable(&path, None, &["DATADOG_API_KEY"]).unwrap();
+        Settings::ensure_secrets_replaceable(&path, None, &["DATADOG_API_KEY"], &none).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, r#"{"env": {"DATADOG_API_KEY_COMMAND": "/c"}}"#).unwrap();
-        assert!(Settings::ensure_secrets_replaceable(&path, None, &["DATADOG_API_KEY"]).is_err());
+        assert!(
+            Settings::ensure_secrets_replaceable(&path, None, &["DATADOG_API_KEY"], &none).is_err()
+        );
         // Another key, another map, or an absent map passes.
-        Settings::ensure_secrets_replaceable(&path, None, &["DATADOG_APP_KEY"]).unwrap();
-        Settings::ensure_secrets_replaceable(&path, Some("work"), &["DATADOG_API_KEY"]).unwrap();
+        Settings::ensure_secrets_replaceable(&path, None, &["DATADOG_APP_KEY"], &none).unwrap();
+        Settings::ensure_secrets_replaceable(&path, Some("work"), &["DATADOG_API_KEY"], &none)
+            .unwrap();
+
+        // A command exported in the process environment shadows whatever a
+        // login would write, so it is refused even when settings.json is clean.
+        let (_tmp2, clean) = temp_settings_path();
+        let exported = MapEnv::new().with("DATADOG_API_KEY_COMMAND", "op read op://v/dd");
+        let err =
+            Settings::ensure_secrets_replaceable(&clean, None, &["DATADOG_API_KEY"], &exported)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("set in the environment"), "{err}");
+        assert!(!err.contains("op read"), "{err}");
+        Settings::ensure_secrets_replaceable(&clean, None, &["DATADOG_APP_KEY"], &exported)
+            .unwrap();
     }
 
     #[test]

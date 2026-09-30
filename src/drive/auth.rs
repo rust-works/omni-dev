@@ -1154,6 +1154,7 @@ pub(crate) async fn login_to(
         settings_path,
         profile,
         &[DRIVE_CLIENT_SECRET, DRIVE_REFRESH_TOKEN],
+        &SystemEnv,
     )?;
     let credentials =
         run_login_flow(client_id, client_secret, scope, browser, token_endpoint).await?;
@@ -2004,12 +2005,6 @@ mod tests {
         }
     }
 
-    /// Shared body for the three `login_to_*` tests that drive a single
-    /// fixed callback request line through `login_to` and expect it to
-    /// error: reserves a port, spawns the connector, calls `login_to`, and
-    /// retries the whole attempt (via [`run_with_port_retry`]) if it loses
-    /// the ephemeral-port race. Asserts no settings file was written and
-    /// returns the resulting error for the caller to inspect.
     #[tokio::test]
     async fn login_to_refuses_before_the_browser_flow_when_the_token_is_command_fetched() {
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -2045,6 +2040,12 @@ mod tests {
         assert!(!err.contains("op read"), "{err}");
     }
 
+    /// Shared body for the three `login_to_*` tests that drive a single
+    /// fixed callback request line through `login_to` and expect it to
+    /// error: reserves a port, spawns the connector, calls `login_to`, and
+    /// retries the whole attempt (via [`run_with_port_retry`]) if it loses
+    /// the ephemeral-port race. Asserts no settings file was written and
+    /// returns the resulting error for the caller to inspect.
     async fn run_login_to_expect_err(request_line: &'static [u8]) -> anyhow::Error {
         std::fs::create_dir_all("tmp").ok();
         let temp_dir = tempfile::TempDir::new_in("tmp").unwrap();
