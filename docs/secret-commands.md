@@ -72,7 +72,8 @@ DATADOG_APP_KEY_COMMAND='/usr/bin/pass show omni-dev/datadog-app'
 - **No shell.** The value is split into arguments like a shell would split it
   (quotes and backslashes), then the program is run directly, so `;`, `|`,
   `$(…)` and `~` mean nothing. Write `sh -c '…'` yourself when you need a
-  pipeline. On Windows, quote a path that contains backslashes.
+  pipeline. The splitting follows POSIX rules, where a backslash escapes the next
+  character, so on Windows put a path in single quotes (`'C:\Program Files\…\op.exe' read …`).
 - **Absolute paths.** A bare program name is looked up on `PATH`. The daemon is
   started by launchd or systemd with a minimal `PATH`, so use an absolute path
   for anything the daemon reads (`SNOWFLAKE_TOKEN_COMMAND`, `OMNI_BRIDGE_TOKEN_COMMAND`).
@@ -82,10 +83,15 @@ DATADOG_APP_KEY_COMMAND='/usr/bin/pass show omni-dev/datadog-app'
   not shown on success; on failure the first 512 bytes are appended to the error.
 - **Failure.** A non-zero exit, no output, or output that is not UTF-8 is an
   error. Errors name the variable and the program, never the arguments or the
-  output.
+  output. A failing helper's own standard error is shown, so a helper that echoes
+  its arguments in an error message shows them.
 - **Environment.** The command inherits your environment minus every omni-dev
   secret and its `_FILE`/`_COMMAND` companion.
-- **Timeout.** 60 seconds, then the command and anything it started are killed.
+- **Timeout.** 60 seconds, then the command is killed, along with anything it
+  started when there is no terminal (the daemon, the MCP server, a pipe). With a
+  terminal attached the helper stays in your foreground process group, so one that
+  prompts on the terminal (`pass`, `gpg`'s curses pinentry) works; only the helper
+  itself is killed on a timeout.
   A biometric prompt needs a person, so raise it if you are slow to approve:
   `OMNI_DEV_SECRET_COMMAND_TIMEOUT_SECS=120`.
 - **Caching.** A successful result is reused for 300 seconds, by command, so one
@@ -112,7 +118,11 @@ command needs the secret; keep the file `0600`, as omni-dev writes it.
 `auth login` writes the new credential to settings.json as plaintext, which
 would replace your store. So when the map it would write to holds a
 `NAME_COMMAND` for a secret it would write, it **refuses**, before opening a
-browser or writing anything, and tells you which one. Store the new value in
+browser or writing anything, and tells you which one. A `NAME_COMMAND` exported
+in your environment is refused too, for `gmail auth login` and `drive auth login`,
+because it would shadow the saved value. `drive auth login` also writes the client
+secret, so a `DRIVE_CLIENT_SECRET_COMMAND` blocks it until you remove that line;
+a login that skips command-fetched secrets is a possible follow-up. Store the new value in
 your store (or remove the `_COMMAND` line) and run the command again. `auth
 logout` removes the `NAME`, `NAME_FILE` and `NAME_COMMAND` entries.
 

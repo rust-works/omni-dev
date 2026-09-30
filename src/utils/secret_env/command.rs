@@ -13,17 +13,23 @@
 //! - The child inherits the environment minus every registered secret and its
 //!   `_FILE`/`_COMMAND` companion, so a helper never receives sibling secrets.
 //! - A timeout (default 60 s: a biometric prompt needs a human) kills the
-//!   child's whole process group.
+//!   child. With no terminal attached (the daemon, the MCP server, a pipe) the
+//!   helper runs in its own process group and the whole group is killed. With
+//!   a terminal it stays in the foreground group, so a helper that prompts on
+//!   `/dev/tty` (`pass`, `gpg`'s curses pinentry) is not stopped by `SIGTTIN`,
+//!   and only the child itself is killed.
 //! - A non-zero exit, output that is empty after trimming one trailing
 //!   newline, or output that is not UTF-8 is an error.
 //! - A success is cached per command string for a TTL (default 300 s), with
 //!   concurrent callers sharing one run, so a burst of resolutions — `preflight`
 //!   then the client build — prompts the user once.
 //! - Errors and logs name the variable and the **program**, never the
-//!   arguments (they can embed a token) and never the output.
+//!   arguments (they can embed a token) and never standard output. A failing
+//!   helper's own standard error is appended, escaped and truncated, because it
+//!   is the only diagnostic; a helper that echoes its arguments there shows them.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -67,6 +73,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub(super) struct Limits {
     pub(super) timeout: Duration,
     pub(super) ttl: Duration,
+    /// Run the helper in its own process group, so a timeout can kill
+    /// everything it forked. Off when a terminal is attached: a background
+    /// group is stopped by `SIGTTIN` the moment it reads `/dev/tty`.
+    pub(super) own_group: bool,
 }
 
 impl Limits {
@@ -76,6 +86,7 @@ impl Limits {
         Self {
             timeout: Duration::from_secs(secs(env, TIMEOUT_VAR, DEFAULT_TIMEOUT_SECS, false)),
             ttl: Duration::from_secs(secs(env, TTL_VAR, DEFAULT_TTL_SECS, true)),
+            own_group: !std::io::stdin().is_terminal(),
         }
     }
 }
@@ -120,11 +131,9 @@ pub(super) fn resolve(
     let argv = split(command_var, command)?;
     blocking(|| {
         if limits.ttl.is_zero() {
-            run(command_var, &argv, limits.timeout)
+            run(command_var, &argv, limits)
         } else {
-            cached(command, limits.ttl, || {
-                run(command_var, &argv, limits.timeout)
-            })
+            cached(command, limits.ttl, || run(command_var, &argv, limits))
         }
     })
 }
@@ -165,7 +174,7 @@ fn cache() -> &'static Mutex<HashMap<String, Slot>> {
 }
 
 /// Returns the fresh cached result for `key`, or runs `fetch` and caches a
-/// success. The per-key slot stays locked while `fetch` runs, so concurrent
+/// success, forgetting results that have expired. The per-key slot stays locked while `fetch` runs, so concurrent
 /// callers wait for one run rather than each prompting. Failures are not
 /// cached.
 fn cached(
@@ -173,12 +182,20 @@ fn cached(
     ttl: Duration,
     fetch: impl FnOnce() -> Result<Secret, SecretEnvError>,
 ) -> Result<Secret, SecretEnvError> {
-    let slot = cache()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entry(key.to_string())
-        .or_default()
-        .clone();
+    let slot = {
+        let mut map = cache().lock().unwrap_or_else(PoisonError::into_inner);
+        // Drop expired results (and never-filled slots) so a secret that was
+        // rotated away is not kept in memory for the life of a long-lived
+        // process. A slot someone is filling right now is locked: keep it.
+        map.retain(|other, slot| {
+            other == key
+                || slot.try_lock().map_or(true, |held| {
+                    held.as_ref()
+                        .is_some_and(|(fetched, _)| fetched.elapsed() < ttl)
+                })
+        });
+        map.entry(key.to_string()).or_default().clone()
+    };
     let mut held = slot.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((fetched, secret)) = held.as_ref() {
         if fetched.elapsed() < ttl {
@@ -191,14 +208,16 @@ fn cached(
 }
 
 /// Builds the helper's [`Command`]: argv, null stdin, piped output, its own
-/// process group, and no registered secret in its environment.
-fn build(argv: &[String]) -> Command {
+/// process group when `own_group`, and no registered secret in its environment.
+fn build(argv: &[String], own_group: bool) -> Command {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // `SNOWFLAKE_PRIVATE_KEY_PATH` is the legacy alias of a registered secret
+    // (ADR-0089 point 7); it names the key's file, so it goes too.
     for name in SECRET_ENV_VARS
         .iter()
         .chain(&["SNOWFLAKE_PRIVATE_KEY_PATH"])
@@ -209,32 +228,40 @@ fn build(argv: &[String]) -> Command {
             .env_remove(command_var_name(name));
     }
     #[cfg(unix)]
-    {
+    if own_group {
         use std::os::unix::process::CommandExt;
         // A helper such as `op` or a wrapper script forks; the group lets a
         // timeout kill all of it.
         command.process_group(0);
     }
+    #[cfg(not(unix))]
+    let _ = own_group;
     command
 }
 
 /// Runs `argv` to completion within `timeout` and turns its output into a
 /// secret.
-fn run(command_var: &str, argv: &[String], timeout: Duration) -> Result<Secret, SecretEnvError> {
+fn run(command_var: &str, argv: &[String], limits: Limits) -> Result<Secret, SecretEnvError> {
+    let Limits {
+        timeout, own_group, ..
+    } = limits;
     let program = argv[0].clone();
     tracing::debug!(command_var, program = %program, "running a secret command");
-    let mut child = build(argv)
-        .spawn()
-        .map_err(|source| SecretEnvError::CommandSpawn {
-            command_var: command_var.to_string(),
-            program: program.clone(),
-            hint: if source.kind() == std::io::ErrorKind::NotFound {
-                "; give an absolute path if omni-dev runs as a daemon, whose PATH is minimal"
-            } else {
-                ""
-            },
-            source,
-        })?;
+    let mut child =
+        build(argv, own_group)
+            .spawn()
+            .map_err(|source| SecretEnvError::CommandSpawn {
+                command_var: command_var.to_string(),
+                program: program.clone(),
+                hint: if source.kind() == std::io::ErrorKind::NotFound
+                    && !std::path::Path::new(&program).is_absolute()
+                {
+                    "; give an absolute path if omni-dev runs as a daemon, whose PATH is minimal"
+                } else {
+                    ""
+                },
+                source,
+            })?;
     let stdout = capture(child.stdout.take(), STDOUT_CAP);
     let stderr = capture(child.stderr.take(), STDERR_CAP);
 
@@ -244,7 +271,7 @@ fn run(command_var: &str, argv: &[String], timeout: Duration) -> Result<Secret, 
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
             Ok(None) => {
-                kill_and_reap(&mut child);
+                kill_and_reap(&mut child, own_group);
                 return Err(SecretEnvError::CommandTimedOut {
                     command_var: command_var.to_string(),
                     program,
@@ -252,7 +279,7 @@ fn run(command_var: &str, argv: &[String], timeout: Duration) -> Result<Secret, 
                 });
             }
             Err(source) => {
-                kill_and_reap(&mut child);
+                kill_and_reap(&mut child, own_group);
                 return Err(SecretEnvError::CommandSpawn {
                     command_var: command_var.to_string(),
                     program,
@@ -294,26 +321,34 @@ fn run(command_var: &str, argv: &[String], timeout: Duration) -> Result<Secret, 
     Ok(Secret::new(text))
 }
 
-/// Kills the child's process group (Unix) or the child, then reaps it.
-fn kill_and_reap(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        // PIDs always fit in i32: Linux caps at ~2^22, macOS at 99999.
-        let group = nix::unistd::Pid::from_raw(child.id() as i32);
-        match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
-            // ESRCH: the group had already gone.
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-            Err(e) => {
-                tracing::debug!(error = %e, "killpg failed; killing the child directly");
-                let _ = child.kill();
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
+/// Kills the child's process group when it has one (Unix), else the child
+/// alone, then reaps it.
+fn kill_and_reap(child: &mut Child, own_group: bool) {
+    if !(own_group && kill_group(child)) {
         let _ = child.kill();
     }
     let _ = child.wait();
+}
+
+/// SIGKILLs the child's process group; whether it went (or was already gone).
+#[cfg(unix)]
+fn kill_group(child: &Child) -> bool {
+    // PIDs always fit in i32: Linux caps at ~2^22, macOS at 99999.
+    let group = nix::unistd::Pid::from_raw(child.id() as i32);
+    match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+        // ESRCH: the group had already gone.
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => true,
+        Err(e) => {
+            tracing::debug!(error = %e, "killpg failed; killing the child directly");
+            false
+        }
+    }
+}
+
+/// Windows has no process groups to signal.
+#[cfg(not(unix))]
+fn kill_group(_child: &Child) -> bool {
+    false
 }
 
 /// A pipe being drained on its own thread, so a chatty child can never fill
@@ -415,6 +450,7 @@ mod tests {
         Limits {
             timeout: Duration::from_secs(timeout_secs),
             ttl: Duration::ZERO,
+            own_group: true,
         }
     }
 
@@ -459,13 +495,22 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_program_names_it_and_hints_at_an_absolute_path() {
-        let err = resolve_now("/nonexistent/omni-dev-helper --flag").unwrap_err();
+    fn a_missing_bare_program_names_it_and_hints_at_an_absolute_path() {
+        let err = resolve_now("omni-dev-no-such-helper --flag").unwrap_err();
         assert!(matches!(err, SecretEnvError::CommandSpawn { .. }), "{err}");
         let text = err.to_string();
-        assert!(text.contains("/nonexistent/omni-dev-helper"), "{text}");
+        assert!(text.contains("omni-dev-no-such-helper"), "{text}");
         assert!(text.contains("absolute path"), "{text}");
         assert!(!text.contains("--flag"), "arguments leaked: {text}");
+    }
+
+    #[test]
+    fn a_missing_absolute_program_does_not_advise_what_it_already_did() {
+        let text = resolve_now("/nonexistent/omni-dev-helper")
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("/nonexistent/omni-dev-helper"), "{text}");
+        assert!(!text.contains("absolute path"), "{text}");
     }
 
     #[test]
@@ -566,6 +611,32 @@ mod tests {
     }
 
     #[test]
+    fn a_timeout_without_its_own_group_still_kills_the_child() {
+        // The terminal-attached mode: no process group, so only the child dies.
+        let limits = Limits {
+            own_group: false,
+            ..limits(1)
+        };
+        let started = Instant::now();
+        let err = resolve(VAR, "/bin/sleep 30", limits).unwrap_err();
+        assert!(
+            matches!(err, SecretEnvError::CommandTimedOut { .. }),
+            "{err}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_foreground_group_helper_still_returns_its_output() {
+        let limits = Limits {
+            own_group: false,
+            ..limits(30)
+        };
+        let got = resolve(VAR, &sh("printf tok"), limits).unwrap();
+        assert_eq!(got.expose_secret(), "tok");
+    }
+
+    #[test]
     fn a_signalled_command_reports_the_signal() {
         let err = resolve_now(&sh("kill -9 $$")).unwrap_err();
         assert!(err.to_string().contains("signal 9"), "{err}");
@@ -573,7 +644,7 @@ mod tests {
 
     #[test]
     fn the_child_environment_drops_every_secret_and_companion() {
-        let command = build(&["/bin/true".to_string()]);
+        let command = build(&["/bin/true".to_string()], true);
         let removed: Vec<String> = command
             .get_envs()
             .filter(|(_, value)| value.is_none())
@@ -633,6 +704,7 @@ mod tests {
         let limits = Limits {
             timeout: Duration::from_secs(30),
             ttl: Duration::from_secs(60),
+            own_group: true,
         };
         for _ in 0..3 {
             assert_eq!(
@@ -670,6 +742,18 @@ mod tests {
     }
 
     #[test]
+    fn expired_results_are_forgotten_when_another_command_is_cached() {
+        let ttl = Duration::from_millis(30);
+        let old = "sweep-test-old";
+        cached(old, ttl, || Ok(Secret::new("old"))).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        cached("sweep-test-new", ttl, || Ok(Secret::new("new"))).unwrap();
+        let held = cache().lock().unwrap();
+        assert!(!held.contains_key(old), "an expired result is still held");
+        assert!(held.contains_key("sweep-test-new"));
+    }
+
+    #[test]
     fn a_failure_is_not_cached() {
         let dir = tempfile::tempdir().unwrap();
         let flag = dir.path().join("ok");
@@ -677,6 +761,7 @@ mod tests {
         let limits = Limits {
             timeout: Duration::from_secs(30),
             ttl: Duration::from_secs(60),
+            own_group: true,
         };
         assert!(resolve(VAR, &command, limits).is_err());
         std::fs::write(&flag, "").unwrap();
@@ -698,6 +783,7 @@ mod tests {
         let limits = Limits {
             timeout: Duration::from_secs(30),
             ttl: Duration::from_secs(60),
+            own_group: true,
         };
         let handles: Vec<_> = (0..4)
             .map(|_| {
