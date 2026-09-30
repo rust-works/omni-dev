@@ -383,6 +383,18 @@ a hook event it doesn't know with a warning, not an error
 (`Unknown hook event "…" was ignored`). How older versions treat an unknown event
 hasn't been verified.
 
+Because the command holds an absolute path, it goes stale when the binary moves (a
+versioned install path, or a switch between cargo and Homebrew). Re-running
+`install-hooks` from the new location rewrites every old-path sink **in place**
+rather than adding a second one, and removes the duplicate that an install from
+before #1927 may already have left beside it, so each event runs one sink.
+`uninstall-hooks` from the new path likewise removes old-path sinks. Only an
+**un-customised** sink counts as stale: an `omni-dev sessions hook` with no
+arguments or only `--agent claude`. One with any other argument (a `--socket`, an
+`--agent codex`) is a deliberate choice, so install and uninstall leave it alone
+and print a note counting them; edit those by hand if they point at a moved binary.
+This is narrower than Codex, where every `sessions hook` entry is rewritten (below).
+
 The sink **never answers a `PermissionRequest`**. Claude Code reads that hook's
 stdout as a decision, and a `"behavior": "allow"` would approve the tool call on
 your behalf. The sink writes nothing to stdout and exits 0, so the prompt always
