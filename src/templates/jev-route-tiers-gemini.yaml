@@ -4,11 +4,10 @@
 # deep-think (Gemini 3 Deep Think).
 #
 # Tiers are listed from least to most capable; `route` ranks them by position.
-# The descriptions are the anthropic ladder's, rung for rung, byte-identical:
-# that text is the only text validated against jev-1.13.0 (#1779), and
-# rewording shifts every answer. Only the tier names differ. This ladder has
-# been compared in docs/evaluations/jev-effort-1888; downstream success
-# remains uncalibrated, so treat its answers as a starting point.
+# The descriptions match the anthropic ladder rung for rung. The first two
+# were re-evaluated in #1885 on Anthropic labels; this provider has no
+# independent model-class labels or measured downstream success. Its third
+# rung retains the retired Anthropic fable description (#1903).
 tiers:
   - name: flash
     models:
@@ -33,9 +32,9 @@ tiers:
               description: >-
                 The stage needs sustained reasoning about subtle behavior, multiple components, non-obvious failure modes or competing approaches.
     description: >-
-      Reliable at executing a clear specification and following patterns that already exist in the
-      codebase. Tends to miss non-obvious interactions between parts and does not question the
-      specification.
+      Reliable at implementing and reviewing well-scoped work across several files, including
+      debugging and non-obvious interactions when the approach is clear. May need help with complex,
+      open-ended design requiring sustained judgement.
   - name: pro
     models:
       - name: gemini-3.1-pro-preview
@@ -56,8 +55,9 @@ tiers:
               description: >-
                 The stage needs sustained reasoning about subtle behavior, multiple components, non-obvious failure modes or competing approaches.
     description: >-
-      Reliable at reasoning across many files, subtle library or platform semantics, concurrency and
-      ordering, once the overall direction is set. Can under-explore a genuinely open design space.
+      Reliable at complex, open-ended design and research: weighing architectures and unfamiliar
+      approaches, anticipating failure modes, and making security-critical judgements. Carries subtle
+      multi-file implementation and review through with sustained judgement.
   - name: deep-think
     models:
       - name: Gemini 3 Deep Think

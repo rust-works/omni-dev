@@ -1,7 +1,7 @@
 # AI Model Specifications
 # This file defines the capabilities and limits for all supported AI models
 # Used by omni-dev to configure API requests correctly
-# Last updated: September 2026
+# Last updated: October 2026
 
 # Schema version. Bumped when the YAML structure changes in a backwards-
 # incompatible way. User/project files declaring a different version receive
@@ -82,6 +82,18 @@ models:
     input_context: 1000000
     generation: 4.7
     tier: "flagship"
+    supports_structured_output: true
+
+  # Sonnet 5.5 (released 2026-09-28) is the current balanced route binding.
+  - provider: "claude"
+    model: "Claude Sonnet 5.5"
+    api_identifier: "claude-sonnet-5-5"
+    input_token_price: 2.0
+    output_token_price: 10.0
+    max_output_tokens: 128000
+    input_context: 1000000
+    generation: 5.5
+    tier: "balanced"
     supports_structured_output: true
 
   # Sonnet 5 has introductory pricing of $2.00/$10.00 per MTok through

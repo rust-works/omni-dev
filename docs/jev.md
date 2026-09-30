@@ -705,16 +705,17 @@ the issue, not a ladder, so its `could_be_cheaper` question is asked once
 per open citation, not once per ladder.
 
 The inherited #1779 evidence covered only the `anthropic` ladder (see
-[Evidence and its limits](#evidence-and-its-limits)). Because rewording a
-description shifts answers across the board, the `openai` and `gemini`
-ladders reuse the `anthropic` descriptions **rung for rung, byte for byte**,
-including the retired `fable` text for their own still-present third rung
-(`astra` / `deep-think`); a test pins that equality. The [#1888 comparison](evaluations/jev-effort-1888/README.md)
-now exercises all three, separately and together, including effort questions.
-It finds some single-versus-combined class differences. It does not provide
-independent model-class labels for OpenAI or Gemini, or downstream success
-measurements. Treat those answers as starting points and do not expect
-batching to produce identical judgements to separate runs.
+[Evidence and its limits](#evidence-and-its-limits)). The
+[#1885 re-evaluation](evaluations/jev-route-1885/README.md) revised its first
+two descriptions for Sonnet 5.5 and Opus 5.5. The `openai` and `gemini`
+ladders reuse them **rung for rung, byte for byte**, including the retired
+`fable` text for their own still-present third rung (`astra` /
+`deep-think`); a test pins that equality. The [#1888 comparison](evaluations/jev-effort-1888/README.md)
+exercised the old descriptions across all three ladders, separately and
+together, including effort questions. It found some single-versus-combined
+class differences. There are no independent model-class labels for OpenAI
+or Gemini, or measured downstream success. Treat their revised answers as
+starting points.
 
 **`anthropic`'s `fable` rung** ([#1903](https://github.com/rust-works/omni-dev/issues/1903)):
 commented out, not deleted, in `src/templates/jev-route-tiers-anthropic.yaml`.
@@ -740,9 +741,9 @@ the concrete versions for which effort advice is given. The binding and effort
 vocabulary live entirely in `src/templates/jev-route-tiers-<provider>.yaml`;
 updating a model does not require a provider-specific routing branch.
 
-Capabilities checked on 2026-09-23:
+Anthropic capabilities checked on 2026-10-01; other providers on 2026-09-23:
 
-- Anthropic `sonnet` → `claude-sonnet-5` and `opus` → `claude-opus-5-5`:
+- Anthropic `sonnet` → `claude-sonnet-5-5` and `opus` → `claude-opus-5-5`:
   `low`, `medium`, `high`, `xhigh`, `max`.
   [Official effort documentation](https://platform.claude.com/docs/en/build-with-claude/effort).
 - OpenAI `terra` → `gpt-5.6-terra` and `sol` → `gpt-5.6-sol`: `none`, `low`,
@@ -762,13 +763,20 @@ Native `none` (OpenAI: no explicit reasoning) is a valid effort setting. It
 is distinct from `not_needed` (no remaining stage work), and from the
 existing design-class answer `none`.
 
-The class descriptions remain the original #1779 wording. #1885 tracks
-reassessing those descriptions as model capabilities change; the binding
-above does not itself validate that a version matches its rung. Custom
-bindings can select different models for different stages. For example, an
-`opus` rung can bind one model for design and another model for
-implementation and review, but that substitution requires its own
-evaluation.
+The stage question instructions remain the original #1779 wording. The first
+two class descriptions are [#1885-evaluated wording](evaluations/jev-route-1885/README.md),
+not the original #1779 text. Against 20 frozen problem-only issues, it agreed
+with old labels collapsed to two rungs on 18/20 in each of two repetitions,
+versus 15/20 for the former descriptions; those labels are one person's
+judgement, not task outcomes. A custom ladder with `claude-sonnet-5-5` and
+`claude-opus-5-5` as criterion keys kept the same overall class on those
+issues but changed 10/40 implementation and 5/40 review choices, so names
+are consequential even with the same descriptions. The old three-rung
+`fable` tier won design on eight issues per repeat but never implement or
+review in that set; the proposed `fable`→Opus 5.5 implement/review mapping
+therefore had no direct selections to validate. With `fable` retired,
+`opus` binds Opus 5.5 for all three stages. Custom bindings that split a
+rung by stage need their own outcome evaluation.
 
 ### Reading effort advice
 
@@ -788,7 +796,7 @@ implement:
   probabilities: {sonnet: 0.2, opus: 0.8}
   effort_by_model:
     sonnet:
-      - model: claude-sonnet-5
+      - model: claude-sonnet-5-5
         control: output_config.effort
         status: recommended
         level: high
@@ -830,7 +838,7 @@ model beneath each ladder's class summary (illustrative values):
 
 ```text
     Model / effort               Design       Implement    Review
-    sonnet [claude-sonnet-5]      high (0.62)  high (0.68)  high (0.60)
+    sonnet [claude-sonnet-5-5]    high (0.62)  high (0.68)  high (0.60)
     opus [claude-opus-5-5]        high (0.66)  medium [1]   high (0.71)
     [1] opus [claude-opus-5-5], implement: medium (0.20, close call — high 0.45)
 ```
@@ -943,8 +951,8 @@ name (`anthropic`/`openai`/`gemini`) is reserved and cannot be redefined. A
 on the assumption that it is a typo'd `--ladders` entry rather than an
 intentionally unused definition.
 
-The `anthropic` descriptions and the three stage questions are the exact text
-the evidence was gathered with. Every question ends with the same bar:
+The `anthropic` descriptions are the #1885-evaluated text; the three stage
+question instructions retain their #1779 wording. Every question ends with the same bar:
 *"Choose the least capable class likely to complete this stage correctly with
 no rework, about 9 times in 10. Judge the work that remains given the text, not
 the size of the text."* Rewording shifts answers across the board: an earlier

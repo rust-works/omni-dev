@@ -1604,18 +1604,35 @@ mod tests {
     /// rungs.
     #[test]
     fn anthropic_tiers_are_sonnet_opus_in_order() {
-        assert_eq!(tier_names(&default_tiers()), ["sonnet", "opus"]);
+        let tiers = default_tiers();
+        assert_eq!(tier_names(&tiers), ["sonnet", "opus"]);
+        assert_eq!(
+            tiers.as_slice()[0].models.as_ref().unwrap()[0].name,
+            "claude-sonnet-5-5"
+        );
+        assert_eq!(
+            tiers.as_slice()[1].models.as_ref().unwrap()[0].name,
+            "claude-opus-5-5"
+        );
     }
 
     #[test]
-    fn anthropic_tier_descriptions_are_the_tested_text() {
+    fn anthropic_tier_descriptions_are_the_reevaluated_text() {
         let tiers = default_tiers();
+        let sonnet = &tiers.as_slice()[0];
         let opus = &tiers.as_slice()[1];
         assert_eq!(
+            sonnet.description,
+            "Reliable at implementing and reviewing well-scoped work across several files, \
+             including debugging and non-obvious interactions when the approach is clear. May \
+             need help with complex, open-ended design requiring sustained judgement."
+        );
+        assert_eq!(
             opus.description,
-            "Reliable at reasoning across many files, subtle library or platform semantics, \
-             concurrency and ordering, once the overall direction is set. Can under-explore a \
-             genuinely open design space."
+            "Reliable at complex, open-ended design and research: weighing architectures and \
+             unfamiliar approaches, anticipating failure modes, and making security-critical \
+             judgements. Carries subtle multi-file implementation and review through with \
+             sustained judgement."
         );
     }
 
@@ -1773,11 +1790,25 @@ mod tests {
         criteria.keys().cloned().collect()
     }
 
-    /// Pins the tested wording: changing it shifts every answer, so an edit
-    /// to the template must also be a deliberate edit here.
+    /// Pins the #1779 stage instructions and the #1885 re-evaluated criteria.
+    /// Changing either shifts answers and requires a deliberate evaluation.
     #[test]
     fn stage_questions_are_the_tested_wording() {
         let questions = build_route_questions(&anthropic()).unwrap();
+        let tiers = default_tiers();
+        for stage in ["stage_design", "stage_implement", "stage_review"] {
+            let Question::Choice { criteria, .. } = &questions[&format!("anthropic.{stage}")]
+            else {
+                panic!("{stage} is not a choice");
+            };
+            for tier in tiers.as_slice() {
+                assert_eq!(
+                    criteria[&tier.name], tier.description,
+                    "{stage}: {}",
+                    tier.name
+                );
+            }
+        }
         assert_eq!(
             instructions(&questions, "anthropic.stage_design"),
             format!(
