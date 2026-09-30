@@ -9,15 +9,22 @@
 //! This is deliberately a small subset of CommonMark, not a parser:
 //!
 //! - **Fenced blocks** are recognised only when *closed*. CommonMark runs an
-//!   unclosed fence to the end of the document, but `route` scans one long
-//!   state built from an issue's body and every comment, so an unclosed fence
-//!   in one body would hide every later citation. Leaving it as text falls
-//!   back to the pre-#2003 behaviour, which is the safe direction.
+//!   unclosed fence to the end of the document, but an unclosed fence would
+//!   then hide every citation after it. Leaving it as text falls back to the
+//!   pre-#2003 behaviour, which is the safe direction. A fence may be indented
+//!   (a list item's) or quoted (`> `), which is why indentation is not
+//!   limited: an indented *code block* is not recognised either way, and a
+//!   fence-looking line inside one only matters if a matching closer follows.
 //! - **Inline spans** must open and close within one paragraph, so a stray
 //!   backtick cannot pair with one paragraphs later and mask what lies
-//!   between.
+//!   between. A fenced block ends the paragraph it interrupts, and a
+//!   backslash-escaped backtick cannot open a span.
 //! - **Indented code blocks** are not recognised: without a full parser they
 //!   cannot be told apart from list continuation.
+//!
+//! Callers with several bodies (an issue and its comments) must mask each one
+//! on its own, so an unclosed fence or a stray backtick in one cannot pair
+//! with markup in another.
 
 use std::ops::Range;
 
@@ -27,10 +34,6 @@ use std::ops::Range;
 /// glue the tokens around it together (`PR`, a span, `#5`) nor make a number
 /// before it run into a word character (`#12` then a span).
 const MASK_CHAR: char = '\u{FFFC}';
-
-/// The most leading spaces a fence line may carry before it is an indented
-/// code block instead.
-const MAX_FENCE_INDENT: usize = 3;
 
 /// The shortest run of fence characters that opens or closes a fence.
 const MIN_FENCE_LEN: usize = 3;
@@ -71,16 +74,18 @@ struct Fence {
     len: usize,
 }
 
-/// Reads `line` as a fence line: up to [`MAX_FENCE_INDENT`] spaces, then a
-/// run of at least [`MIN_FENCE_LEN`] identical backticks or tildes. Returns
-/// the fence and what follows the run.
+/// Reads `line` as a fence line: any indentation and blockquote markers
+/// (`> `), then a run of at least [`MIN_FENCE_LEN`] identical backticks or
+/// tildes. Returns the fence and what follows the run.
 fn parse_fence_line(line: &str) -> Option<(Fence, &str)> {
-    let trimmed = line.trim_end_matches(['\n', '\r']);
-    let indent = trimmed.len() - trimmed.trim_start_matches(' ').len();
-    if indent > MAX_FENCE_INDENT {
-        return None;
+    let mut rest = line.trim_end_matches(['\n', '\r']);
+    loop {
+        rest = rest.trim_start_matches([' ', '\t']);
+        match rest.strip_prefix('>') {
+            Some(after) => rest = after,
+            None => break,
+        }
     }
-    let rest = &trimmed[indent..];
     let marker = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
     let len = rest.chars().take_while(|&c| c == marker).count();
     (len >= MIN_FENCE_LEN).then(|| {
@@ -132,60 +137,109 @@ fn fenced_ranges(text: &str) -> Vec<Range<usize>> {
     ranges
 }
 
+/// The byte range of every paragraph in `text`: a maximal run of lines that
+/// are neither blank nor (already masked) fenced code, so a fenced block ends
+/// the paragraph it interrupts.
+fn paragraphs(text: &str) -> Vec<Range<usize>> {
+    let mut paragraphs = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let separator = trimmed.is_empty() || trimmed.starts_with(MASK_CHAR);
+        match (separator, start) {
+            (false, None) => start = Some(offset),
+            (true, Some(s)) => {
+                paragraphs.push(s..offset);
+                start = None;
+            }
+            _ => {}
+        }
+        offset += line.len();
+    }
+    if let Some(s) = start {
+        paragraphs.push(s..text.len());
+    }
+    paragraphs
+}
+
+/// A maximal run of backticks.
+struct Run {
+    range: Range<usize>,
+    /// Whether a backslash escapes the run's first backtick. That backtick
+    /// is then literal text, so the run cannot open a span from it — but
+    /// inside a span a backslash is literal, so the run still closes one at
+    /// its full length.
+    escaped: bool,
+}
+
+impl Run {
+    /// The length of the run when it is an opener.
+    fn opening_len(&self) -> usize {
+        self.range.len() - usize::from(self.escaped)
+    }
+}
+
 /// The byte ranges of every inline code span: a run of backticks closed by
 /// the next run of the same length, within one paragraph. An unmatched run is
 /// literal.
 fn inline_ranges(text: &str) -> Vec<Range<usize>> {
-    let runs = backtick_runs(text);
     let mut ranges = Vec::new();
-    let mut k = 0;
-    while k < runs.len() {
-        let opener = &runs[k];
-        let closer = runs[k + 1..]
-            .iter()
-            .take_while(|run| !has_blank_line(&text[opener.end..run.start]))
-            .position(|run| run.len() == opener.len());
-        match closer {
-            Some(offset) => {
-                let closer = &runs[k + 1 + offset];
-                ranges.push(opener.start..closer.end);
-                k += offset + 2;
+    for paragraph in paragraphs(text) {
+        let runs = backtick_runs(text, paragraph);
+        let mut k = 0;
+        while k < runs.len() {
+            let opener = &runs[k];
+            let closer = (opener.opening_len() > 0)
+                .then(|| {
+                    runs[k + 1..]
+                        .iter()
+                        .position(|run| run.range.len() == opener.opening_len())
+                })
+                .flatten();
+            match closer {
+                Some(offset) => {
+                    let start = opener.range.end - opener.opening_len();
+                    ranges.push(start..runs[k + 1 + offset].range.end);
+                    k += offset + 2;
+                }
+                None => k += 1,
             }
-            None => k += 1,
         }
     }
     ranges
 }
 
-/// The byte range of every maximal run of backticks in `text`.
-fn backtick_runs(text: &str) -> Vec<Range<usize>> {
+/// Every maximal run of backticks within `paragraph`.
+fn backtick_runs(text: &str, paragraph: Range<usize>) -> Vec<Run> {
     let mut runs = Vec::new();
     let mut start: Option<usize> = None;
-    for (i, c) in text.char_indices() {
+    let mut push = |start: usize, end: usize| {
+        let backslashes = text[..start]
+            .chars()
+            .rev()
+            .take_while(|&c| c == '\\')
+            .count();
+        runs.push(Run {
+            range: start..end,
+            escaped: backslashes % 2 == 1,
+        });
+    };
+    for (i, c) in text[paragraph.clone()].char_indices() {
+        let i = paragraph.start + i;
         match (c == '`', start) {
             (true, None) => start = Some(i),
             (false, Some(s)) => {
-                runs.push(s..i);
+                push(s, i);
                 start = None;
             }
             _ => {}
         }
     }
     if let Some(s) = start {
-        runs.push(s..text.len());
+        push(s, paragraph.end);
     }
     runs
-}
-
-/// Whether `segment` contains a blank line, which ends a paragraph. The
-/// first and last pieces are the partial lines either side of the segment,
-/// so only the ones between them can be blank.
-fn has_blank_line(segment: &str) -> bool {
-    let pieces: Vec<&str> = segment.split('\n').collect();
-    pieces.len() > 2
-        && pieces[1..pieces.len() - 1]
-            .iter()
-            .any(|p| p.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -267,12 +321,63 @@ mod tests {
         );
     }
 
+    /// A fence nested in a list item is indented past three spaces.
     #[test]
-    fn a_line_indented_four_spaces_is_not_a_fence() {
-        // Were the first line a fence, the longer run would close it. As it
-        // is not, the two runs differ in length and pair as nothing.
-        let text = "    ```\no/r#1\n````\n#2";
+    fn a_fence_nested_in_a_list_item_is_masked() {
+        assert_eq!(
+            visible("1. step\n\n       ~~~\n       o/r#1\n       ~~~\n\n#2"),
+            "1. step\n\n__________\n____________\n__________\n\n#2"
+        );
+    }
+
+    #[test]
+    fn a_blockquoted_fence_is_masked() {
+        assert_eq!(
+            visible("> ~~~\n> o/r#1\n> ~~~\n#2"),
+            "_____\n_______\n_____\n#2"
+        );
+    }
+
+    /// A fenced block ends the paragraph it interrupts, so backticks either
+    /// side of it cannot pair across it and hide the text between.
+    #[test]
+    fn a_span_does_not_pair_across_a_fenced_block() {
+        assert_eq!(
+            visible("a ` b\n```\ncode\n```\nreal #1 ` d"),
+            "a ` b\n___\n____\n___\nreal #1 ` d"
+        );
+    }
+
+    /// An escaped backtick is literal text, not a span delimiter.
+    #[test]
+    fn an_escaped_backtick_does_not_open_a_span() {
+        let text = "use \\`#5\\` literally, see #6";
         assert_eq!(mask_code(text), text);
+    }
+
+    #[test]
+    fn an_escaped_backtick_does_not_stop_a_later_span() {
+        assert_eq!(visible("a \\` b `c` d"), "a \\` b ___ d");
+    }
+
+    /// Inside a span a backslash is literal, so `\`` still closes it.
+    #[test]
+    fn a_backslash_before_a_closing_backtick_still_closes_the_span() {
+        assert_eq!(visible("`a\\` #1"), "____ #1");
+    }
+
+    /// Masking one body at a time is the caller's job: an unclosed fence in
+    /// one pairs with a fence in the next when they are masked together.
+    #[test]
+    fn bodies_masked_together_can_pair_a_stray_fence_with_a_later_block() {
+        assert_ne!(
+            mask_code("```\nstray\n\n```\nquoted o/r#9\n```"),
+            format!(
+                "{}{}",
+                mask_code("```\nstray\n"),
+                mask_code("\n```\nquoted o/r#9\n```")
+            )
+        );
     }
 
     #[test]

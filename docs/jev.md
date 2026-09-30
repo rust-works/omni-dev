@@ -643,13 +643,15 @@ the cited issue's content, only its open/closed state, so it costs a `gh`
 lookup, not extra tokens in the routing call itself.
 
 The scan **skips code**: a reference inside a fenced code block (` ``` ` or
-`~~~`) or an inline code span is a quoted example, such as an error message
-containing `owner/repo#123`, not a dependency, so it triggers no lookup and
-never appears in `reference_fetch_failures`. Only a *closed* fence counts as
-code (an unclosed one is scanned like prose, so it cannot hide every citation
-after it in the issue's long combined text), a span must open and close within
-one paragraph, and an indented code block is not recognised. `verify-decision`
-does not skip code; see [What the splitter and Jev see](#what-the-splitter-and-jev-see).
+`~~~`, including one nested in a list item or a `> ` quote) or an inline code
+span is a quoted example, such as an error message containing `owner/repo#123`,
+not a dependency, so it triggers no lookup and never appears in
+`reference_fetch_failures`. The title, the body and each comment are read
+separately, so markup in one cannot affect another. Only a *closed* fence
+counts as code (an unclosed one is scanned like prose, so it cannot hide the
+citations after it), a span must open and close within one paragraph, a
+backslash-escaped backtick does not open one, and an indented code block is not
+recognised. `verify-decision` does not skip code; see [What the splitter and Jev see](#what-the-splitter-and-jev-see).
 
 ### Closed issues
 
