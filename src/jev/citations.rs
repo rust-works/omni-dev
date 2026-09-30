@@ -13,7 +13,6 @@ use std::sync::OnceLock;
 
 use regex::{Captures, Regex};
 
-use crate::jev::markdown_code::mask_code;
 use crate::provider::{ItemKind, ItemRef};
 
 /// A reference to another issue or pull request found in a comment's text.
@@ -140,7 +139,8 @@ pub(crate) fn first_citation(text: &str, default_project: &str) -> Option<(Strin
 /// citation against its source, so a reference deliberately written in
 /// backticks (`` `#1614` ``) must still be checked, and a missed source
 /// weakens a verifier where an extra one only costs a lookup. `route` skips
-/// code through [`find_citations_outside_code`] instead (#2003).
+/// code instead, by masking it before it calls this (#2003; see
+/// `route::build_route_citation_text`).
 #[must_use]
 pub fn find_citations(body: &str, default_project: &str, judged: &ItemRef) -> Vec<Citation> {
     let mut seen = BTreeSet::new();
@@ -174,27 +174,11 @@ pub fn find_citations(body: &str, default_project: &str, judged: &ItemRef) -> Ve
     out
 }
 
-/// Finds every issue/pull-request reference in `body` that is not inside a
-/// fenced code block or an inline code span (#2003).
-///
-/// Otherwise identical to [`find_citations`]. `route`'s `depends_on` uses
-/// this: a quoted error message or example such as `owner/repo#123` is not a
-/// dependency, and treating it as one costs a pointless `gh` lookup and adds
-/// noise to `reference_fetch_failures`. See [`mask_code`] for exactly what
-/// counts as code.
-#[must_use]
-pub fn find_citations_outside_code(
-    body: &str,
-    default_project: &str,
-    judged: &ItemRef,
-) -> Vec<Citation> {
-    find_citations(&mask_code(body), default_project, judged)
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::jev::markdown_code::mask_code;
     use crate::provider::GitProvider;
 
     fn judged(number: u64) -> ItemRef {
@@ -339,65 +323,35 @@ error: could not find owner/repo#123
 Inline `o/r#1` and ``o/r#2`` examples, then PR #1629.
 ";
 
-    /// `route` ignores a quoted example: neither the fenced block nor the
-    /// inline spans yield a citation, and the ones outside code still do.
+    /// `verify-decision` scans code, so a reference deliberately written in
+    /// backticks is still checked against its source (#2003). `route` skips
+    /// code by masking it first.
     #[test]
-    fn outside_code_skips_fences_and_inline_spans() {
-        let cites = find_citations_outside_code(CODE_BODY, "rust-works/omni-dev", &judged(1779));
-        let numbers: Vec<u64> = cites.iter().map(|c| c.item_ref.number).collect();
-        assert_eq!(numbers, [1614, 1629]);
-        assert_eq!(cites[0].raw, "#1614");
-        assert_eq!(cites[1].raw, "PR #1629");
-    }
-
-    /// `verify-decision` keeps scanning code, so a reference deliberately
-    /// written in backticks is still checked against its source.
-    #[test]
-    fn find_citations_still_reads_code() {
+    fn find_citations_reads_code() {
         let cites = find_citations(CODE_BODY, "rust-works/omni-dev", &judged(1779));
         let numbers: Vec<u64> = cites.iter().map(|c| c.item_ref.number).collect();
         assert_eq!(numbers, [1614, 123, 1, 2, 1629]);
     }
 
     #[test]
-    fn a_backticked_reference_is_found_by_find_citations_but_not_outside_code() {
-        let body = "settled by `#1614`";
-        let judged = judged(1779);
-        assert_eq!(
-            find_citations(body, "rust-works/omni-dev", &judged).len(),
-            1
-        );
-        assert!(find_citations_outside_code(body, "rust-works/omni-dev", &judged).is_empty());
-    }
-
-    #[test]
-    fn outside_code_matches_find_citations_when_there_is_no_code() {
-        let body = "See #1614, other/repo#5, and https://github.com/rust-works/omni-dev/pull/1629.";
-        let judged = judged(1779);
-        assert_eq!(
-            find_citations_outside_code(body, "rust-works/omni-dev", &judged),
-            find_citations(body, "rust-works/omni-dev", &judged)
-        );
-    }
-
-    /// A citation ending right where a span begins is still a citation: the
-    /// mask character is not a word character.
-    #[test]
-    fn outside_code_keeps_a_citation_that_abuts_a_span() {
-        let cites =
-            find_citations_outside_code("fixed by #1614`x`", "rust-works/omni-dev", &judged(1779));
+    fn a_backticked_reference_is_a_citation() {
+        let cites = find_citations("settled by `#1614`", "rust-works/omni-dev", &judged(1779));
         assert_eq!(cites.len(), 1);
         assert_eq!(cites[0].raw, "#1614");
     }
 
-    /// An unclosed fence must not hide the citations after it.
+    /// What `route` does: mask, then find. The quoted examples go, the real
+    /// references stay, and a citation abutting a span is still found.
     #[test]
-    fn outside_code_ignores_an_unclosed_fence() {
-        let cites = find_citations_outside_code(
-            "```\nunclosed\n\nlater #1614",
-            "rust-works/omni-dev",
-            &judged(1779),
+    fn masked_text_keeps_only_the_citations_outside_code() {
+        let masked = mask_code(CODE_BODY);
+        let cites = find_citations(&masked, "rust-works/omni-dev", &judged(1779));
+        let raws: Vec<&str> = cites.iter().map(|c| c.raw.as_str()).collect();
+        assert_eq!(raws, ["#1614", "PR #1629"]);
+        let abutting = mask_code("fixed by #1614`x`");
+        assert_eq!(
+            find_citations(&abutting, "rust-works/omni-dev", &judged(1779))[0].raw,
+            "#1614"
         );
-        assert_eq!(cites.len(), 1);
     }
 }

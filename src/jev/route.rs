@@ -24,6 +24,7 @@ use crate::jev::citations::Citation;
 use crate::jev::client::JevClient;
 use crate::jev::error::is_auth_failure;
 use crate::jev::input::truncate_middle;
+use crate::jev::markdown_code::mask_code;
 use crate::jev::protocol::{Answer, Question, SystemOneRequest, Usage};
 use crate::provider::{IssueDoc, ItemState};
 
@@ -355,14 +356,43 @@ fn build_route_questions_for_mode(
 /// tokens and inflate small issues.
 #[must_use]
 pub fn build_route_state(doc: &IssueDoc, max_chars: usize) -> (String, bool) {
-    let mut text = format!("# #{} {}\n\n{}\n", doc.number, doc.title, doc.body.trim());
+    assemble_route_state(doc, max_chars, str::to_string)
+}
+
+/// The text `route` scans for `depends_on` citations (#2003): exactly
+/// [`build_route_state`]'s text with the code in the title, body and each
+/// comment masked by [`mask_code`].
+///
+/// Each part is masked on its own, so an unclosed fence or a stray backtick
+/// in one comment cannot pair with markup in another and hide the citations
+/// between them. Masking replaces characters one for one, so the truncation
+/// lands in the same place and the scan sees the same text Jev does, minus
+/// its code. Not sent to Jev.
+#[must_use]
+pub fn build_route_citation_text(doc: &IssueDoc, max_chars: usize) -> String {
+    assemble_route_state(doc, max_chars, mask_code).0
+}
+
+/// Lays out [`build_route_state`]'s text, passing the title, body and each
+/// comment body through `prose` first.
+fn assemble_route_state(
+    doc: &IssueDoc,
+    max_chars: usize,
+    prose: impl Fn(&str) -> String,
+) -> (String, bool) {
+    let mut text = format!(
+        "# #{} {}\n\n{}\n",
+        doc.number,
+        prose(&doc.title),
+        prose(doc.body.trim())
+    );
     if !doc.comments.is_empty() {
         text.push_str("\n\n---\n\n## Comments on this issue\n");
         for comment in &doc.comments {
             text.push_str(&format!(
                 "\n\n**Comment by {}:**\n\n{}\n",
                 comment.author,
-                comment.body.trim()
+                prose(comment.body.trim())
             ));
         }
     }
@@ -1734,6 +1764,61 @@ mod tests {
         assert_eq!(tail.chars().count(), 10);
         assert!(full.starts_with(head));
         assert!(full.ends_with(tail));
+    }
+
+    fn comment(author: &str, body: &str) -> Comment {
+        Comment {
+            author: author.to_string(),
+            body: body.to_string(),
+            id: None,
+        }
+    }
+
+    /// #2003: the citation text is the state with its code masked, character
+    /// for character, so the cut lands in the same place.
+    #[test]
+    fn citation_text_is_the_state_with_code_masked() {
+        let mut d = doc(7, ItemState::Open);
+        d.title = "Fix `o/r#1`".to_string();
+        d.body = "See #5.\n\n```\nerror: o/r#2\n```".to_string();
+        d.comments = vec![comment("alice", "inline `o/r#3` and #6")];
+        let (state, _) = build_route_state(&d, 1000);
+        let text = build_route_citation_text(&d, 1000);
+        assert_eq!(text.chars().count(), state.chars().count());
+        assert!(text.contains("See #5."), "{text}");
+        assert!(text.contains("and #6"), "{text}");
+        assert!(text.contains("**Comment by alice:**"), "{text}");
+        for masked in ["o/r#1", "o/r#2", "o/r#3"] {
+            assert!(!text.contains(masked), "{masked} survived in {text}");
+        }
+    }
+
+    #[test]
+    fn citation_text_is_truncated_where_the_state_is() {
+        let mut d = doc(7, ItemState::Open);
+        d.body = format!("start #1 {} `o/r#9` end #2", "x".repeat(500));
+        let (state, truncated) = build_route_state(&d, 100);
+        let text = build_route_citation_text(&d, 100);
+        assert!(truncated);
+        assert_eq!(text.chars().count(), state.chars().count());
+        assert!(text.contains(TRUNCATION_MARKER), "{text}");
+    }
+
+    /// #2003: markup is masked per part, so an unclosed fence in one comment
+    /// neither hides the citations after it nor turns a later quoted example
+    /// into a citation.
+    #[test]
+    fn citation_text_masks_each_comment_on_its_own() {
+        let mut d = doc(7, ItemState::Open);
+        d.comments = vec![
+            comment("alice", "```\nstray fence, never closed\nreal #11"),
+            comment("bob", "real #12"),
+            comment("carol", "```\nerror: o/r#9\n```"),
+        ];
+        let text = build_route_citation_text(&d, 10_000);
+        assert!(text.contains("real #11"), "{text}");
+        assert!(text.contains("real #12"), "{text}");
+        assert!(!text.contains("o/r#9"), "{text}");
     }
 
     /// The latest comment is where a decision lands, so a cut must not lose it.

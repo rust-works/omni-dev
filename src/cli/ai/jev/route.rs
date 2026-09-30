@@ -11,11 +11,11 @@ use crate::github_issues::{
     fetch_issues_cached_current, fetch_items_cached_current, list_open_issue_numbers,
     needs_default_project, parse_issue_arg, resolve_current_project, CacheUsage, IssueCache,
 };
-use crate::jev::citations::{find_citations_outside_code, Citation};
+use crate::jev::citations::{find_citations, Citation};
 use crate::jev::client::JevClient;
 use crate::jev::config::JevConfig;
 use crate::jev::route::{
-    build_route_state, is_ignored_closed, render_route_text, render_route_text_styled,
+    build_route_citation_text, is_ignored_closed, render_route_text, render_route_text_styled,
     run_route_with_reference_fetch_failures, Ladder, OpenDependencies, Provider,
     ReferenceFetchFailure, ReferenceFetchFailures, RouteOptions, RouteReport, TerminalStyle, Tiers,
     DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
@@ -486,8 +486,8 @@ fn find_open_dependencies(
             kind: doc.kind,
             number: doc.number,
         };
-        let (state, _truncated) = build_route_state(doc, max_input_chars);
-        let citations = find_citations_outside_code(&state, &doc.project, &judged);
+        let text = build_route_citation_text(doc, max_input_chars);
+        let citations = find_citations(&text, &doc.project, &judged);
         for citation in &citations {
             let key = (citation.item_ref.project.clone(), citation.item_ref.number);
             if seen.insert(key) {
