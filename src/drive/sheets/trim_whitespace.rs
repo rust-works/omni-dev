@@ -140,6 +140,7 @@ pub enum TrimWhitespaceResult {
     /// not be read (issue #2021). Distinct from [`Self::Failed`]. The server's
     /// `cellsChangedCount` was in that reply, so it is unknown.
     AppliedReplyUnreadable {
+        range: String,
         /// What was applied, in the same terms as a `Changed` line.
         summary: String,
         /// Why the reply could not be read.
@@ -402,6 +403,7 @@ async fn trim_whitespace_inner(
         Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
             TrimWhitespaceResult::AppliedReplyUnreadable {
                 summary: format!("trim whitespace in {range_a1}"),
+                range: range_a1,
                 detail,
             }
         }
@@ -516,13 +518,10 @@ async fn read_non_blank(
     ))
 }
 
-fn record_attempt(outcome: &TrimWhitespaceOutcome, duration: Duration) {
-    let decided_by = match &outcome.result {
-        TrimWhitespaceResult::Blocked { decided_by } => decided_by.as_ref(),
-        _ => None,
-    };
-    let decided_by = write_gate::decided_by_log_fields(decided_by);
-    let fields_changed = match &outcome.result {
+/// The `fields_changed` summary a result logs. An unreadable-reply result
+/// always logs its summary, though not the count that was in the reply.
+fn logged_fields_changed(result: &TrimWhitespaceResult) -> Option<String> {
+    match result {
         TrimWhitespaceResult::Changed {
             range,
             cells_changed_count,
@@ -532,7 +531,16 @@ fn record_attempt(outcome: &TrimWhitespaceOutcome, duration: Duration) {
         }),
         TrimWhitespaceResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
         _ => None,
+    }
+}
+
+fn record_attempt(outcome: &TrimWhitespaceOutcome, duration: Duration) {
+    let decided_by = match &outcome.result {
+        TrimWhitespaceResult::Blocked { decided_by } => decided_by.as_ref(),
+        _ => None,
     };
+    let decided_by = write_gate::decided_by_log_fields(decided_by);
+    let fields_changed = logged_fields_changed(&outcome.result);
     let error = match &outcome.result {
         TrimWhitespaceResult::RefusedInvalidRequest { detail }
         | TrimWhitespaceResult::AppliedReplyUnreadable { detail, .. }
@@ -621,7 +629,9 @@ pub fn describe_lines(outcome: &TrimWhitespaceOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
-        TrimWhitespaceResult::AppliedReplyUnreadable { summary, detail } => vec![
+        TrimWhitespaceResult::AppliedReplyUnreadable {
+            summary, detail, ..
+        } => vec![
             applied_reply_unreadable_line(summary, &book, RetryHint::Idempotent, detail),
             "  the cell count was in the unreadable reply; check the spreadsheet".to_string(),
         ],
@@ -972,6 +982,7 @@ mod tests {
             TrimWhitespaceResult::RefusedLeaseWrongFile,
             TrimWhitespaceResult::RefusedLeaseStale,
             TrimWhitespaceResult::AppliedReplyUnreadable {
+                range: "Q1!A2:C10".into(),
                 summary: "trim whitespace in Q1!A2:C10".into(),
                 detail: "bad reply".into(),
             },
@@ -1010,6 +1021,7 @@ mod tests {
             file_name: Some("Budget".into()),
             resolved_folder_id: None,
             result: TrimWhitespaceResult::AppliedReplyUnreadable {
+                range: "Q1!A2:C10".into(),
                 summary: "trim whitespace in Q1!A2:C10".into(),
                 detail: "bad reply".into(),
             },
@@ -1022,6 +1034,22 @@ mod tests {
                 "  the cell count was in the unreadable reply; check the spreadsheet",
             ]
         );
+    }
+
+    #[test]
+    fn an_unreadable_reply_logs_its_summary_and_serializes_its_range() {
+        let result = TrimWhitespaceResult::AppliedReplyUnreadable {
+            range: "Q1!A2:C10".into(),
+            summary: "trim whitespace in Q1!A2:C10".into(),
+            detail: "bad reply".into(),
+        };
+        assert_eq!(
+            logged_fields_changed(&result).as_deref(),
+            Some("trim whitespace in Q1!A2:C10")
+        );
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["status"], "applied-reply-unreadable");
+        assert_eq!(json["range"], "Q1!A2:C10");
     }
 
     #[test]

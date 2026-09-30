@@ -1603,10 +1603,21 @@ mod tests {
                     continue;
                 }
                 let source = std::fs::read_to_string(&path).unwrap();
-                // Only production code: everything before the test module.
-                let production = source.split("#[cfg(test)]").next().unwrap();
+                // Only production code: everything before the `#[cfg(test)]`
+                // that gates the trailing `mod tests`, so an earlier
+                // cfg-gated item cannot hide the code after it.
+                let production = source.rfind("\nmod tests").map_or(source.as_str(), |at| {
+                    source[..at]
+                        .rfind("#[cfg(test)]")
+                        .map_or(&source[..at], |cfg| &source[..cfg])
+                });
                 if production.contains(".batch_update(") {
-                    callers.push((path, production.contains("AppliedReplyUnreadable")));
+                    // The qualified path, not the bare identifier: an import or
+                    // a comment naming the variant must not satisfy the guard.
+                    callers.push((
+                        path,
+                        production.contains("BatchUpdateOutcome::AppliedReplyUnreadable"),
+                    ));
                 }
             }
         }

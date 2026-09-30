@@ -137,6 +137,7 @@ pub enum FindReplaceResult {
     /// retry here could compound (`a` -> `aa`). The replacement counts were
     /// in that reply, so they are unknown.
     AppliedReplyUnreadable {
+        target: FindReplaceTarget,
         /// What was applied, in the same terms as a `Changed` line.
         summary: String,
         /// Why the reply could not be read.
@@ -368,6 +369,7 @@ async fn find_replace_inner(
         BatchUpdateOutcome::AppliedReplyUnreadable { detail } => {
             return gated(FindReplaceResult::AppliedReplyUnreadable {
                 summary: format!("find/replace on {}", target.describe()),
+                target,
                 detail,
             })
         }
@@ -465,13 +467,12 @@ fn preview_summary(opts: &FindReplaceOptions) -> String {
     )
 }
 
-fn record_attempt(outcome: &FindReplaceOutcome, _opts: &FindReplaceOptions, duration: Duration) {
-    let decided_by = match &outcome.result {
-        FindReplaceResult::Blocked { decided_by } => decided_by.as_ref(),
-        _ => None,
-    };
-    let decided_by = write_gate::decided_by_log_fields(decided_by);
-    let (occurrences_changed, updated_cells, fields_changed) = match &outcome.result {
+/// The `(occurrences_changed, updated_cells, fields_changed)` a result logs.
+///
+/// An unreadable-reply result logs no counts (they were in the reply) but
+/// always logs its summary as `fields_changed`.
+fn logged_counts(result: &FindReplaceResult) -> (Option<i64>, Option<i64>, Option<String>) {
+    match result {
         FindReplaceResult::Changed {
             target,
             counts: Some(counts),
@@ -501,7 +502,16 @@ fn record_attempt(outcome: &FindReplaceOutcome, _opts: &FindReplaceOptions, dura
         }
         FindReplaceResult::WouldChange { target, .. } => (None, None, Some(target.describe())), // omni-dev: coverage ignore-line reason="record_attempt is only called when !opts.dry_run, and WouldChange is only ever returned when opts.dry_run is true, so this arm can never run"
         _ => (None, None, None),
+    }
+}
+
+fn record_attempt(outcome: &FindReplaceOutcome, _opts: &FindReplaceOptions, duration: Duration) {
+    let decided_by = match &outcome.result {
+        FindReplaceResult::Blocked { decided_by } => decided_by.as_ref(),
+        _ => None,
     };
+    let decided_by = write_gate::decided_by_log_fields(decided_by);
+    let (occurrences_changed, updated_cells, fields_changed) = logged_counts(&outcome.result);
     let error = match &outcome.result {
         FindReplaceResult::Failed { detail }
         | FindReplaceResult::RefusedInvalidRequest { detail }
@@ -547,7 +557,9 @@ pub fn describe_lines(outcome: &FindReplaceOutcome) -> Vec<String> {
         FindReplaceResult::RefusedLeaseExpired => LeaseGateRefusal::Expired.describe_line(&outcome.spreadsheet_id, &book).into_iter().collect(),
         FindReplaceResult::RefusedLeaseWrongFile => LeaseGateRefusal::WrongFile.describe_line(&outcome.spreadsheet_id, &book).into_iter().collect(),
         FindReplaceResult::RefusedLeaseStale => LeaseGateRefusal::Stale.describe_line(&outcome.spreadsheet_id, &book).into_iter().collect(),
-        FindReplaceResult::AppliedReplyUnreadable { summary, detail } => vec![
+        FindReplaceResult::AppliedReplyUnreadable {
+            summary, detail, ..
+        } => vec![
             applied_reply_unreadable_line(summary, &book, RetryHint::NotIdempotent, detail),
             "  the replacement counts were in the unreadable reply; check the spreadsheet".to_string(),
         ],
@@ -1517,6 +1529,7 @@ mod tests {
             FindReplaceResult::RefusedLeaseWrongFile,
             FindReplaceResult::RefusedLeaseStale,
             FindReplaceResult::AppliedReplyUnreadable {
+                target: FindReplaceTarget::AllSheets,
                 summary: "find/replace on all sheets".to_string(),
                 detail: "bad reply".to_string(),
             },
@@ -1615,6 +1628,7 @@ mod tests {
         );
         assert_eq!(
             FindReplaceResult::AppliedReplyUnreadable {
+                target: FindReplaceTarget::AllSheets,
                 summary: String::new(),
                 detail: String::new()
             }
@@ -1630,6 +1644,10 @@ mod tests {
             file_name: Some("Budget".to_string()),
             resolved_folder_id: None,
             result: FindReplaceResult::AppliedReplyUnreadable {
+                target: FindReplaceTarget::Sheet {
+                    sheet: "Q1".to_string(),
+                    sheet_id: 0,
+                },
                 summary: "find/replace on sheet 'Q1'".to_string(),
                 detail: "bad reply".to_string(),
             },
@@ -1642,6 +1660,35 @@ mod tests {
                 "  the replacement counts were in the unreadable reply; check the spreadsheet",
             ]
         );
+    }
+
+    #[test]
+    fn an_unreadable_reply_logs_its_summary_and_no_reply_derived_counts() {
+        let result = FindReplaceResult::AppliedReplyUnreadable {
+            target: FindReplaceTarget::AllSheets,
+            summary: "find/replace on all sheets".to_string(),
+            detail: "bad reply".to_string(),
+        };
+        assert_eq!(
+            logged_counts(&result),
+            (None, None, Some("find/replace on all sheets".to_string()))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_reply_serializes_its_target_and_status() {
+        let result = FindReplaceResult::AppliedReplyUnreadable {
+            target: FindReplaceTarget::Range {
+                range: "A1:B2".to_string(),
+                sheet_id: 7,
+            },
+            summary: "find/replace on range A1:B2".to_string(),
+            detail: "bad reply".to_string(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["status"], "applied-reply-unreadable");
+        assert_eq!(json["target"]["sheet_id"], 7);
+        assert_eq!(json["target"]["range"], "A1:B2");
     }
 
     #[test]

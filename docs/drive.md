@@ -1674,7 +1674,11 @@ data-validation verbs, `sort-range`, `trim-whitespace` and `auto-fill`) the mess
 confirm` instead of `do not retry`.
 
 In JSON the result's `status` is `applied-reply-unreadable`, carrying `summary`
-and `detail`. The exit code is unchanged, as it is for `failed`. The
+and `detail` plus everything the verb's `changed` result knows before the
+request is sent (the range, any cells it overwrote or discarded, warnings and
+the lease backup); only what the lost reply held, such as a new object's id or
+a replacement count, is missing. The exit code is unchanged, as it is for
+`failed`. The
 `drivemutation` record has the same status, with `error` set to `detail` and
 `fields_changed` to `summary`. A lease held for the write is refreshed as after
 any successful write, so the next write under it is not refused as stale. A

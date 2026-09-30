@@ -1023,6 +1023,16 @@ fn record_attempt(
     opts: &ConditionalFormatOptions,
     duration: Duration,
 ) {
+    request_log::record_drive_mutation(mutation_record(outcome, opts, duration));
+}
+
+/// The request-log record for `outcome`, split from [`record_attempt`] so a
+/// test can read the fields it carries.
+fn mutation_record(
+    outcome: &ConditionalFormatOutcome,
+    opts: &ConditionalFormatOptions,
+    duration: Duration,
+) -> DriveMutationOutcome {
     let error = match &outcome.result {
         ConditionalFormatResult::Failed { detail }
         | ConditionalFormatResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
@@ -1033,8 +1043,13 @@ fn record_attempt(
         _ => None,
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
+    // The write happened, so name what it was even though the reply is gone.
+    let fields_changed = match &outcome.result {
+        ConditionalFormatResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
+        _ => None,
+    };
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: opts.verb.log_operation(),
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -1043,10 +1058,11 @@ fn record_attempt(
         decided_by_folder_id: decided_by.folder_id,
         decided_by_depth: decided_by.depth,
         decided_by_file_id: decided_by.file_id,
+        fields_changed,
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// Renders an outcome as human-readable text.
@@ -2327,6 +2343,34 @@ mod tests {
             assert_eq!(lines.len(), 1, "{result:?} -> {lines:?}");
             assert!(lines[0].starts_with("Refused:"), "{result:?} -> {lines:?}");
         }
+    }
+
+    #[test]
+    fn an_unreadable_reply_logs_the_summary_as_fields_changed() {
+        let opts = ConditionalFormatOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: add_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let record = mutation_record(
+            &describe_outcome(
+                add_verb(),
+                ConditionalFormatResult::AppliedReplyUnreadable {
+                    summary: "add conditional format (boolean rule)".to_string(),
+                    detail: "bad reply".to_string(),
+                },
+            ),
+            &opts,
+            Duration::from_millis(1),
+        );
+        assert_eq!(
+            record.fields_changed.as_deref(),
+            Some("add conditional format (boolean rule)")
+        );
+        assert_eq!(record.error.as_deref(), Some("bad reply"));
+        assert_eq!(record.status, "applied-reply-unreadable");
     }
 
     #[test]

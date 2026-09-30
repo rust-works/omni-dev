@@ -279,6 +279,14 @@ pub enum NamedRangeResult {
     AppliedReplyUnreadable {
         /// Same summary as [`Self::WouldChange`].
         summary: String,
+        /// The named range id resolved before the call — `Some` for
+        /// `update-named-range`/`delete-named-range`, `None` for
+        /// `add-named-range`. Never the server-assigned id of an added range
+        /// (that was in the reply).
+        named_range_id: Option<String>,
+        /// Same as [`Self::Changed`]'s.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        referencing_formulas: Vec<String>,
         /// Why the reply could not be read.
         detail: String,
     },
@@ -634,7 +642,12 @@ async fn named_range_inner(
         // NotIdempotent: a second run fails on the now-taken name or acts on an
         // already-changed range.
         Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
-            NamedRangeResult::AppliedReplyUnreadable { summary, detail }
+            NamedRangeResult::AppliedReplyUnreadable {
+                summary,
+                named_range_id: existing_id,
+                referencing_formulas,
+                detail,
+            }
         }
         Err(err) => NamedRangeResult::Failed {
             detail: format!("{err:#}"),
@@ -958,6 +971,16 @@ fn target_descriptor(name: Option<&str>, id: Option<&str>) -> String {
 }
 
 fn record_attempt(outcome: &NamedRangeOutcome, opts: &NamedRangeOptions, duration: Duration) {
+    request_log::record_drive_mutation(mutation_record(outcome, opts, duration));
+}
+
+/// The request-log record for one attempt. Split from [`record_attempt`] so
+/// the logged fields are unit-testable.
+fn mutation_record(
+    outcome: &NamedRangeOutcome,
+    opts: &NamedRangeOptions,
+    duration: Duration,
+) -> DriveMutationOutcome {
     let error = match &outcome.result {
         NamedRangeResult::Failed { detail }
         | NamedRangeResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
@@ -973,6 +996,11 @@ fn record_attempt(outcome: &NamedRangeOutcome, opts: &NamedRangeOptions, duratio
             named_range_id,
             referencing_formulas,
             ..
+        }
+        | NamedRangeResult::AppliedReplyUnreadable {
+            named_range_id,
+            referencing_formulas,
+            ..
         } => (named_range_id.clone(), referencing_formulas.clone()),
         _ => (None, Vec::new()),
     };
@@ -981,7 +1009,7 @@ fn record_attempt(outcome: &NamedRangeOutcome, opts: &NamedRangeOptions, duratio
         _ => None,
     };
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: opts.verb.log_operation(),
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -996,7 +1024,7 @@ fn record_attempt(outcome: &NamedRangeOutcome, opts: &NamedRangeOptions, duratio
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// Renders an outcome as human-readable text.
@@ -1112,9 +1140,17 @@ pub fn describe_lines(outcome: &NamedRangeOutcome) -> Vec<String> {
             lines.extend(referencing_formula_lines(referencing_formulas));
             lines
         }
-        NamedRangeResult::AppliedReplyUnreadable { summary, detail } => {
+        NamedRangeResult::AppliedReplyUnreadable {
+            summary,
+            named_range_id,
+            referencing_formulas,
+            detail,
+        } => {
+            let id = named_range_id
+                .as_deref()
+                .map_or_else(String::new, |id| format!(" (id {id})"));
             let mut lines = vec![applied_reply_unreadable_line(
-                summary,
+                &format!("{summary}{id}"),
                 &book,
                 RetryHint::NotIdempotent,
                 detail,
@@ -1126,6 +1162,8 @@ pub fn describe_lines(outcome: &NamedRangeOutcome) -> Vec<String> {
                         .to_string(),
                 );
             }
+            // The preview `Changed` prints, read before the delete took effect.
+            lines.extend(referencing_formula_lines(referencing_formulas));
             lines
         }
         NamedRangeResult::Failed { detail } => vec![format!("Failed: {detail}")],
@@ -2512,6 +2550,8 @@ mod tests {
             Some("Budget"),
             NamedRangeResult::AppliedReplyUnreadable {
                 summary: "add named range 'Foo'".to_string(),
+                named_range_id: None,
+                referencing_formulas: Vec::new(),
                 detail: "bad reply".to_string(),
             },
         );
@@ -2532,10 +2572,67 @@ mod tests {
             Some("Budget"),
             NamedRangeResult::AppliedReplyUnreadable {
                 summary: "delete named range 'Foo'".to_string(),
+                named_range_id: Some("id-7".to_string()),
+                referencing_formulas: vec!["'Q1'!A1".to_string()],
                 detail: "bad reply".to_string(),
             },
         );
-        assert_eq!(describe_lines(&deleted).len(), 1);
+        // The resolved id and the pre-delete formula preview print exactly as
+        // `Changed` prints them; there is no add-only hint line.
+        assert_eq!(
+            describe_lines(&deleted),
+            vec![
+                "Applied, but the reply could not be read: delete named range 'Foo' (id id-7) \
+                 in 'Budget' — do not retry; check the spreadsheet first (bad reply)"
+                    .to_string(),
+                "1 cell formula(s) reference this name and will start evaluating to #REF! \
+                 once it's removed (conditional formatting, data validation and chart \
+                 references are not scanned): 'Q1'!A1"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mutation_record_logs_the_same_fields_for_an_unreadable_reply_as_for_changed() {
+        let opts = NamedRangeOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: delete_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let record = |result| {
+            let out = outcome_with(delete_verb(), Some("Budget"), result);
+            mutation_record(&out, &opts, Duration::ZERO)
+        };
+        let changed = record(NamedRangeResult::Changed {
+            summary: "delete named range 'Foo'".to_string(),
+            named_range_id: Some("id-7".to_string()),
+            referencing_formulas: vec!["'Q1'!A1".to_string()],
+        });
+        let unreadable = record(NamedRangeResult::AppliedReplyUnreadable {
+            summary: "delete named range 'Foo'".to_string(),
+            named_range_id: Some("id-7".to_string()),
+            referencing_formulas: vec!["'Q1'!A1".to_string()],
+            detail: "bad reply".to_string(),
+        });
+        assert_eq!(unreadable.named_range_id.as_deref(), Some("id-7"));
+        assert_eq!(unreadable.named_range_id, changed.named_range_id);
+        assert_eq!(
+            unreadable.referencing_formula_locations,
+            changed.referencing_formula_locations
+        );
+        assert_eq!(
+            unreadable.referencing_formula_locations,
+            vec!["'Q1'!A1".to_string()]
+        );
+        assert_eq!(unreadable.status, "applied-reply-unreadable");
+        assert_eq!(unreadable.error.as_deref(), Some("bad reply"));
+        assert_eq!(
+            unreadable.fields_changed.as_deref(),
+            Some("delete named range 'Foo'")
+        );
     }
 
     #[test]
@@ -3269,6 +3366,8 @@ mod tests {
         assert_eq!(
             NamedRangeResult::AppliedReplyUnreadable {
                 summary: String::new(),
+                named_range_id: None,
+                referencing_formulas: Vec::new(),
                 detail: String::new(),
             }
             .log_status(),

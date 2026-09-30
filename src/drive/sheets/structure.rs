@@ -690,6 +690,16 @@ pub enum StructureResult {
         summary: String,
         /// Why the reply could not be read.
         detail: String,
+        /// The sheet acted on, as it stood *before* the change — plan-time
+        /// data, so it survives the lost reply exactly as [`Self::Changed`]
+        /// carries it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sheet: Option<Box<SheetSnapshot>>,
+        /// The target sheet's id, from the pre-resolved snapshot. `None` for
+        /// `add-sheet`/`duplicate-sheet`, whose id [`Self::Changed`] reads
+        /// from the reply — the one thing lost here.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sheet_id: Option<i64>,
         /// The lease backup, exactly as [`Self::Changed`]'s own `backup`
         /// field: a destructive verb's recovery note names it, since the
         /// delete happened whether or not its reply was readable.
@@ -1036,6 +1046,15 @@ async fn structure_inner(
             StructureResult::AppliedReplyUnreadable {
                 summary: applied_summary(&opts.verb),
                 detail,
+                // `Changed`'s fallback minus the reply: for an add/duplicate
+                // the id `Changed` reports is the *new* sheet's, which only
+                // the lost reply knew, so the source's id must not stand in.
+                sheet_id: if adds_a_sheet(&opts.verb) {
+                    None
+                } else {
+                    sheet.as_ref().and_then(|s| s.sheet_id)
+                },
+                sheet: sheet.map(Box::new),
                 backup: lease_grant
                     .as_ref()
                     .map(|grant| Box::new(grant.backup.clone())),
@@ -2005,6 +2024,15 @@ fn added_sheet_id(response: &BatchUpdateResponse) -> Option<i64> {
         .and_then(|props| props.sheet_id)
 }
 
+/// Whether this verb creates a sheet whose id the server assigns in the
+/// reply (`addSheet`/`duplicateSheet`, the two [`added_sheet_id`] reads).
+const fn adds_a_sheet(verb: &StructureVerb) -> bool {
+    matches!(
+        verb,
+        StructureVerb::AddSheet { .. } | StructureVerb::DuplicateSheet { .. }
+    )
+}
+
 /// What an [`StructureResult::AppliedReplyUnreadable`] says was applied,
 /// e.g. `delete-rows 'Q2' (ROWS 5:7)` or `rename-sheet 'Q2' to 'Q3'` — the
 /// verb the user typed plus the same sheet/span context the request log
@@ -2090,6 +2118,16 @@ fn grid_range_label(verb: &StructureVerb) -> Option<String> {
 /// bypass it — and so a `Blocked` outcome, which makes zero Sheets calls,
 /// still leaves a trace. Same reasoning as `write.rs::record_attempt`.
 fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration: Duration) {
+    request_log::record_drive_mutation(mutation_record(outcome, opts, duration));
+}
+
+/// The record [`record_attempt`] emits, split out so a test can pin what an
+/// outcome logs without reading the log file back.
+fn mutation_record(
+    outcome: &StructureOutcome,
+    opts: &StructureOptions,
+    duration: Duration,
+) -> DriveMutationOutcome {
     let error = match &outcome.result {
         StructureResult::Failed { detail }
         | StructureResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
@@ -2101,7 +2139,8 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
     let sheet_id = match &outcome.result {
-        StructureResult::Changed { sheet_id, .. } => *sheet_id,
+        StructureResult::Changed { sheet_id, .. }
+        | StructureResult::AppliedReplyUnreadable { sheet_id, .. } => *sheet_id,
         StructureResult::WouldChange { sheet, .. } => sheet.as_ref().and_then(|s| s.sheet_id),
         _ => None,
     };
@@ -2132,7 +2171,7 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
         _ => None,
     });
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: opts.verb.log_operation(),
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -2151,7 +2190,7 @@ fn record_attempt(outcome: &StructureOutcome, opts: &StructureOptions, duration:
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// The `fields_changed` context value the request log records for an
@@ -2324,13 +2363,18 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
         StructureResult::AppliedReplyUnreadable {
             summary,
             detail,
+            sheet: _,
+            sheet_id,
             backup,
         } => {
             // Not idempotent, for every verb: a second add/duplicate/insert/
             // delete compounds, and even a rename or reorder is only safe
             // once the user has seen what the first one did.
+            // The ` (sheetId N)` suffix `describe_changed` gives, when known.
+            let summary =
+                sheet_id.map_or_else(|| summary.clone(), |id| format!("{summary} (sheetId {id})"));
             let mut first =
-                applied_reply_unreadable_line(summary, &book, RetryHint::NotIdempotent, detail);
+                applied_reply_unreadable_line(&summary, &book, RetryHint::NotIdempotent, detail);
             // The delete happened, so it owes the same recovery note
             // `describe_changed` gives a readable one.
             if matches!(verb.gate_operation(), DriveOperation::SheetsDelete) {
@@ -2341,10 +2385,7 @@ pub fn describe_lines(outcome: &StructureOutcome) -> Vec<String> {
                 first.push_str(&format!("; {recovery}"));
             }
             let mut lines = vec![first];
-            if matches!(
-                verb,
-                StructureVerb::AddSheet { .. } | StructureVerb::DuplicateSheet { .. }
-            ) {
+            if adds_a_sheet(verb) {
                 lines.push(
                     "  the new sheet's id was in the unreadable reply; check the spreadsheet's \
                      tabs to find it"
@@ -6880,22 +6921,29 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let outcome = structure(
-            &drive,
-            &sheets,
-            &opts(add_sheet(), false),
-            &[allow_rule("parent-1")],
-        )
-        .await;
+        let o = opts(add_sheet(), false);
+        let outcome = structure(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
 
+        // The new sheet's id was only in the lost reply, so none is claimed.
         assert!(
             matches!(
                 &outcome.result,
-                StructureResult::AppliedReplyUnreadable { summary, .. } if summary == "add-sheet 'Q3'"
+                StructureResult::AppliedReplyUnreadable {
+                    summary,
+                    sheet: None,
+                    sheet_id: None,
+                    backup: Some(_),
+                    ..
+                } if summary == "add-sheet 'Q3'"
             ),
             "{:?}",
             outcome.result
         );
+        let record = mutation_record(&outcome, &o, Duration::ZERO);
+        assert_eq!(record.status, "applied-reply-unreadable");
+        assert_eq!(record.sheet_id, None);
+        assert_eq!(record.fields_changed.as_deref(), Some("add-sheet 'Q3'"));
+        assert!(record.error.is_some());
         assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         let lines = describe_lines(&outcome);
         assert!(
@@ -6914,6 +6962,8 @@ mod tests {
         );
         let json = serde_json::to_value(&outcome).unwrap();
         assert_eq!(json["result"]["status"], "applied-reply-unreadable");
+        assert!(json["result"].get("sheet_id").is_none(), "{json}");
+        assert!(json["result"].get("sheet").is_none(), "{json}");
     }
 
     /// A delete whose reply was unreadable still deleted, so it owes the
@@ -6978,8 +7028,57 @@ mod tests {
             )),
             "{text}"
         );
+        // The target sheet's id and snapshot are plan-time data, not the
+        // reply's, so they survive exactly as `Changed` would carry them.
+        assert!(
+            text.contains("delete-sheet 'Q2' (sheetId 118293) in 'sheet-1'"),
+            "{text}"
+        );
         let json = serde_json::to_value(&outcome).unwrap();
         assert_eq!(json["result"]["backup"]["file_id"], "backup-copy-1");
+        assert_eq!(json["result"]["sheet_id"], 118_293);
+        assert_eq!(json["result"]["sheet"]["title"], "Q2");
+        let record = mutation_record(&outcome, &o, Duration::ZERO);
+        assert_eq!(record.sheet_id, Some(118_293));
+        assert_eq!(record.fields_changed.as_deref(), Some("delete-sheet 'Q2'"));
+        assert!(record.error.is_some());
+    }
+
+    /// `update-sheet-properties` logs its own field list, which names more
+    /// than the summary; `fields_changed` is still never `None`.
+    #[test]
+    fn an_unreadable_reply_logs_the_verbs_own_field_list_when_it_has_one() {
+        let verb = StructureVerb::UpdateSheetProperties {
+            sheet: "Q2".to_string(),
+            freeze_rows: Some(2),
+            freeze_columns: None,
+            tab_color: None,
+            clear_tab_color: false,
+            right_to_left: None,
+            hide_gridlines: None,
+        };
+        let outcome =
+            unreadable_outcome_with_id(verb.clone(), "update-sheet-properties 'Q2'", 118_293);
+        let record = mutation_record(&outcome, &opts(verb, false), Duration::ZERO);
+        assert_eq!(record.fields_changed.as_deref(), Some("frozenRowCount=2"));
+        assert_eq!(record.sheet_id, Some(118_293));
+    }
+
+    #[test]
+    fn describe_lines_names_the_known_sheet_id_of_an_unreadable_reply() {
+        assert_eq!(
+            describe_lines(&unreadable_outcome_with_id(
+                rename(),
+                "rename-sheet 'Q2' to 'Q3'",
+                7
+            )),
+            vec![
+                "Applied, but the reply could not be read: rename-sheet 'Q2' to 'Q3' \
+                 (sheetId 7) in 'Budget' — do not retry; check the spreadsheet first \
+                 (bad reply)"
+                    .to_string()
+            ]
+        );
     }
 
     fn unreadable_outcome(verb: StructureVerb, summary: &str) -> StructureOutcome {
@@ -6991,9 +7090,35 @@ mod tests {
             result: StructureResult::AppliedReplyUnreadable {
                 summary: summary.to_string(),
                 detail: "bad reply".to_string(),
+                sheet: None,
+                sheet_id: None,
                 backup: None,
             },
         }
+    }
+
+    /// [`unreadable_outcome`] for a verb whose target sheet resolved to
+    /// `sheet_id`, as the engine builds it.
+    fn unreadable_outcome_with_id(
+        verb: StructureVerb,
+        summary: &str,
+        sheet_id: i64,
+    ) -> StructureOutcome {
+        let mut outcome = unreadable_outcome(verb, summary);
+        if let StructureResult::AppliedReplyUnreadable {
+            sheet: s,
+            sheet_id: id,
+            ..
+        } = &mut outcome.result
+        {
+            *s = Some(Box::new(SheetSnapshot {
+                sheet_id: Some(sheet_id),
+                title: "Q2".to_string(),
+                ..Default::default()
+            }));
+            *id = Some(sheet_id);
+        }
+        outcome
     }
 
     #[test]
@@ -8258,6 +8383,14 @@ mod tests {
             StructureResult::AppliedReplyUnreadable {
                 summary: "delete-sheet 'Q2'".to_string(),
                 detail: "bad reply".to_string(),
+                sheet: Some(Box::new(SheetSnapshot {
+                    sheet_id: Some(7),
+                    title: "Q2".to_string(),
+                    row_count: Some(500),
+                    column_count: Some(26),
+                    ..Default::default()
+                })),
+                sheet_id: Some(7),
                 backup: Some(Box::new(LeaseBackup::DriveCopy {
                     file_id: "backup-copy-1".to_string(),
                 })),
@@ -8522,6 +8655,8 @@ mod tests {
             StructureResult::AppliedReplyUnreadable {
                 summary: "x".to_string(),
                 detail: "x".to_string(),
+                sheet: None,
+                sheet_id: None,
                 backup: None,
             }
             .log_status(),

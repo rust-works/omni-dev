@@ -259,6 +259,11 @@ pub enum DeveloperMetadataResult {
         /// `fields_changed` carries for [`Self::Created`] / [`Self::Updated`]
         /// / [`Self::Deleted`].
         summary: String,
+        /// The [`Self::Created`] / [`Self::Updated`] / [`Self::Deleted`] result
+        /// that would have been reported had the reply been readable. All of
+        /// it is plan-time data (the entries were read before the call), so
+        /// nothing an applied change carries is lost.
+        applied: Box<Self>,
         /// Why the reply could not be read.
         detail: String,
     },
@@ -795,6 +800,7 @@ async fn developer_metadata_inner(
         Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
             DeveloperMetadataResult::AppliedReplyUnreadable {
                 summary: changed_summary(&changed_result).unwrap_or_default(),
+                applied: Box::new(changed_result),
                 detail,
             }
         }
@@ -872,6 +878,16 @@ fn record_attempt(
     opts: &DeveloperMetadataOptions,
     duration: Duration,
 ) {
+    request_log::record_drive_mutation(mutation_record(outcome, opts, duration));
+}
+
+/// The request-log record for one attempt. Split from [`record_attempt`] so
+/// the logged fields are unit-testable.
+fn mutation_record(
+    outcome: &DeveloperMetadataOutcome,
+    opts: &DeveloperMetadataOptions,
+    duration: Duration,
+) -> DriveMutationOutcome {
     let error = match &outcome.result {
         DeveloperMetadataResult::Failed { detail }
         | DeveloperMetadataResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
@@ -887,7 +903,7 @@ fn record_attempt(
         other => changed_summary(other),
     };
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: opts.verb.log_operation(),
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -900,7 +916,7 @@ fn record_attempt(
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// A one-line summary of the change a `Created` / `Updated` / `Deleted`
@@ -1085,14 +1101,41 @@ pub fn describe_lines(outcome: &DeveloperMetadataOutcome) -> Vec<String> {
             lines
         }
         // Neither verb learns anything from the reply (a created entry's id is
-        // not reported even on success), so there is no lost value to name.
-        DeveloperMetadataResult::AppliedReplyUnreadable { summary, detail } => {
-            vec![applied_reply_unreadable_line(
-                summary,
+        // not reported even on success), so there is no lost value to name;
+        // what `Created`/`Updated`/`Deleted` print beyond their header is
+        // plan-time data and follows the shared line.
+        DeveloperMetadataResult::AppliedReplyUnreadable {
+            summary,
+            applied,
+            detail,
+        } => {
+            let (location, entry_lines): (String, Vec<String>) = match &**applied {
+                DeveloperMetadataResult::Created { location, .. } => {
+                    (format!(" at {location}"), Vec::new())
+                }
+                DeveloperMetadataResult::Updated {
+                    new_value,
+                    previous,
+                } => (
+                    String::new(),
+                    previous
+                        .iter()
+                        .map(|entry| describe_updated_entry(entry, new_value))
+                        .collect(),
+                ),
+                DeveloperMetadataResult::Deleted { entries } => {
+                    (String::new(), entries.iter().map(describe_entry).collect())
+                }
+                _ => (String::new(), Vec::new()),
+            };
+            let mut lines = vec![applied_reply_unreadable_line(
+                &format!("{summary}{location}"),
                 &book,
                 RetryHint::NotIdempotent,
                 detail,
-            )]
+            )];
+            lines.extend(entry_lines);
+            lines
         }
         DeveloperMetadataResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -2356,20 +2399,49 @@ mod tests {
         assert_eq!(would_create.log_status(), "would-change");
     }
 
+    fn created(location: &str) -> DeveloperMetadataResult {
+        DeveloperMetadataResult::Created {
+            key: "owner".to_string(),
+            value: "team-a".to_string(),
+            location: location.to_string(),
+        }
+    }
+
+    fn entry_42() -> DeveloperMetadataEntry {
+        DeveloperMetadataEntry {
+            metadata_id: 42,
+            key: "owner".to_string(),
+            value: "team-b".to_string(),
+            location: "the whole spreadsheet".to_string(),
+        }
+    }
+
+    fn updated() -> DeveloperMetadataResult {
+        DeveloperMetadataResult::Updated {
+            new_value: "team-a".to_string(),
+            previous: vec![entry_42()],
+        }
+    }
+
+    fn deleted() -> DeveloperMetadataResult {
+        DeveloperMetadataResult::Deleted {
+            entries: vec![entry_42()],
+        }
+    }
+
+    fn unreadable(applied: DeveloperMetadataResult) -> DeveloperMetadataResult {
+        DeveloperMetadataResult::AppliedReplyUnreadable {
+            summary: changed_summary(&applied).unwrap(),
+            applied: Box::new(applied),
+            detail: "bad reply".to_string(),
+        }
+    }
+
     #[test]
     fn log_status_names_every_result_variant_distinctly() {
         let statuses = [
-            DeveloperMetadataResult::Created {
-                key: String::new(),
-                value: String::new(),
-                location: String::new(),
-            }
-            .log_status(),
-            DeveloperMetadataResult::AppliedReplyUnreadable {
-                summary: String::new(),
-                detail: String::new(),
-            }
-            .log_status(),
+            created("").log_status(),
+            unreadable(created("")).log_status(),
             DeveloperMetadataResult::Failed {
                 detail: String::new(),
             }
@@ -2378,27 +2450,73 @@ mod tests {
         assert_eq!(statuses, ["changed", "applied-reply-unreadable", "failed"]);
     }
 
-    #[test]
-    fn describe_lines_renders_applied_reply_unreadable() {
-        let outcome = DeveloperMetadataOutcome {
+    fn describe_of(verb: DeveloperMetadataVerb, result: DeveloperMetadataResult) -> Vec<String> {
+        describe_lines(&DeveloperMetadataOutcome {
             spreadsheet_id: "sheet-1".to_string(),
             file_name: Some("Budget".to_string()),
             resolved_folder_id: None,
-            verb: set_opts(false).verb,
-            result: DeveloperMetadataResult::AppliedReplyUnreadable {
-                summary: "create key=\"owner\" value=\"team-a\"".to_string(),
-                detail: "bad reply".to_string(),
-            },
-        };
+            verb,
+            result,
+        })
+    }
+
+    /// Everything `Created`/`Updated`/`Deleted` print that is not derived
+    /// from the reply — the location, and the entries with their ids — must
+    /// survive an unreadable reply.
+    #[test]
+    fn describe_lines_keeps_the_plan_time_detail_for_an_unreadable_reply() {
         assert_eq!(
-            describe_lines(&outcome),
+            describe_of(set_opts(false).verb, unreadable(created("sheet 'Q1'"))),
             vec![
                 "Applied, but the reply could not be read: create key=\"owner\" \
-                 value=\"team-a\" in 'Budget' — do not retry; check the spreadsheet first \
-                 (bad reply)"
+                 value=\"team-a\" at sheet 'Q1' in 'Budget' — do not retry; check the \
+                 spreadsheet first (bad reply)"
                     .to_string()
             ]
         );
+        assert_eq!(
+            describe_of(set_opts(false).verb, unreadable(updated())),
+            vec![
+                "Applied, but the reply could not be read: update 1 entry to \
+                 value=\"team-a\" in 'Budget' — do not retry; check the spreadsheet first \
+                 (bad reply)"
+                    .to_string(),
+                "  id 42: \"owner\"=\"team-a\" at the whole spreadsheet".to_string(),
+            ]
+        );
+        assert_eq!(
+            describe_of(delete_opts(false).verb, unreadable(deleted())),
+            vec![
+                "Applied, but the reply could not be read: delete 1 entry in 'Budget' — \
+                 do not retry; check the spreadsheet first (bad reply)"
+                    .to_string(),
+                "  id 42: \"owner\"=\"team-b\" at the whole spreadsheet".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mutation_record_logs_the_same_fields_for_an_unreadable_reply_as_for_changed() {
+        let opts = set_opts(false);
+        let record = |result| {
+            let out = DeveloperMetadataOutcome {
+                spreadsheet_id: "sheet-1".to_string(),
+                file_name: Some("Budget".to_string()),
+                resolved_folder_id: None,
+                verb: opts.verb.clone(),
+                result,
+            };
+            mutation_record(&out, &opts, Duration::ZERO)
+        };
+        let changed = record(updated());
+        let unreadable = record(unreadable(updated()));
+        assert_eq!(unreadable.fields_changed, changed.fields_changed);
+        assert_eq!(
+            unreadable.fields_changed.as_deref(),
+            Some("update 1 entry to value=\"team-a\"")
+        );
+        assert_eq!(unreadable.status, "applied-reply-unreadable");
+        assert_eq!(unreadable.error.as_deref(), Some("bad reply"));
     }
 
     // ── search()'s own location-error rendering ───────────────────────

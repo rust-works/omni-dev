@@ -116,6 +116,12 @@ pub enum SortRangeResult {
         summary: String,
         /// Why the reply could not be read.
         detail: String,
+        /// Same as [`Self::Changed`].
+        range: String,
+        /// Same as [`Self::Changed`].
+        sort_specs: Vec<SortSpec>,
+        /// Same as [`Self::Changed`].
+        width_warning: Option<String>,
     },
     Failed {
         detail: String,
@@ -366,6 +372,9 @@ async fn sort_range_inner(
             SortRangeResult::AppliedReplyUnreadable {
                 summary: sorted_summary(&composed, &sort_specs),
                 detail,
+                range: composed,
+                sort_specs,
+                width_warning,
             }
         }
         Err(err) => SortRangeResult::Failed {
@@ -424,6 +433,12 @@ fn reject_duplicate_sort_columns(specs: &[SortSpec]) -> Result<(), String> {
 }
 
 fn record_attempt(outcome: &SortRangeOutcome, duration: Duration) {
+    request_log::record_drive_mutation(mutation_outcome(outcome, duration));
+}
+
+/// The `drivemutation` record for one attempt. Split out from
+/// [`record_attempt`] so the logged fields are unit-testable.
+fn mutation_outcome(outcome: &SortRangeOutcome, duration: Duration) -> DriveMutationOutcome {
     let decided_by = match &outcome.result {
         SortRangeResult::Blocked { decided_by, .. } => decided_by.as_ref(),
         _ => None,
@@ -442,7 +457,7 @@ fn record_attempt(outcome: &SortRangeOutcome, duration: Duration) {
         | SortRangeResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: LOG_OPERATION,
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -455,7 +470,7 @@ fn record_attempt(outcome: &SortRangeOutcome, duration: Duration) {
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 pub fn describe_lines(outcome: &SortRangeOutcome) -> Vec<String> {
@@ -536,13 +551,28 @@ pub fn describe_lines(outcome: &SortRangeOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
-        SortRangeResult::AppliedReplyUnreadable { summary, detail } => {
-            vec![applied_reply_unreadable_line(
-                summary,
-                &book,
-                RetryHint::Idempotent,
-                detail,
-            )]
+        SortRangeResult::AppliedReplyUnreadable {
+            summary,
+            detail,
+            width_warning,
+            ..
+        } => {
+            let mut lines = grid_range::reorder_caveat_lines(
+                "sorting",
+                applied_reply_unreadable_line(summary, &book, RetryHint::Idempotent, detail),
+                None,
+                true,
+                None,
+            );
+            // The width warning is plan-time data, so it survives the
+            // unreadable reply; it follows the shared line here.
+            lines.splice(
+                1..1,
+                width_warning
+                    .iter()
+                    .map(|warning| format!("Warning: {warning}")),
+            );
+            lines
         }
         SortRangeResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -1210,15 +1240,48 @@ mod tests {
             result: SortRangeResult::AppliedReplyUnreadable {
                 summary: "sorted Q1!A2:C10 by 2 desc".into(),
                 detail: "bad reply".into(),
+                range: "Q1!A2:C10".into(),
+                sort_specs: vec![SortSpec {
+                    dimension_index: 2,
+                    sort_order: SortOrder::Descending,
+                }],
+                width_warning: Some("narrow".to_string()),
             },
         };
+        // The plan-time width warning and reference caveat survive, exactly
+        // as `Changed` renders them.
         assert_eq!(
             describe_lines(&outcome),
             vec![
                 "Applied, but the reply could not be read: sorted Q1!A2:C10 by 2 desc in \
-                 'Budget' — check the spreadsheet to confirm (bad reply)"
+                 'Budget' — check the spreadsheet to confirm (bad reply)",
+                "Warning: narrow",
+                "  references outside the range may now observe values from a different row"
             ]
         );
+    }
+
+    #[test]
+    fn the_unreadable_reply_is_logged_with_its_summary_and_detail() {
+        let outcome = SortRangeOutcome {
+            spreadsheet_id: "sheet-1".into(),
+            file_name: Some("Budget".into()),
+            resolved_folder_id: None,
+            result: SortRangeResult::AppliedReplyUnreadable {
+                summary: "sorted Q1!A2:C10 by 2 desc".into(),
+                detail: "bad reply".into(),
+                range: "Q1!A2:C10".into(),
+                sort_specs: vec![],
+                width_warning: None,
+            },
+        };
+        let logged = mutation_outcome(&outcome, Duration::ZERO);
+        assert_eq!(logged.status, "applied-reply-unreadable");
+        assert_eq!(
+            logged.fields_changed.as_deref(),
+            Some("sorted Q1!A2:C10 by 2 desc")
+        );
+        assert_eq!(logged.error.as_deref(), Some("bad reply"));
     }
 
     #[tokio::test]
@@ -1410,6 +1473,12 @@ mod tests {
             SortRangeResult::AppliedReplyUnreadable {
                 summary: "sorted Q1!A1:B3 by 0 asc".into(),
                 detail: "bad reply".into(),
+                range: "Q1!A1:B3".into(),
+                sort_specs: vec![SortSpec {
+                    dimension_index: 0,
+                    sort_order: SortOrder::Ascending,
+                }],
+                width_warning: Some("narrow".to_string()),
             },
             SortRangeResult::Failed {
                 detail: "boom".into(),

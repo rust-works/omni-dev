@@ -141,6 +141,10 @@ pub enum DeleteDuplicatesResult {
     /// not be read (issue #2021). Distinct from [`Self::Failed`]. The
     /// server's `duplicatesRemovedCount` was in that reply, so it is unknown.
     AppliedReplyUnreadable {
+        range: String,
+        comparison_columns: Vec<i64>,
+        /// The API leaves content outside the selected rectangle in place.
+        content_outside_range_untouched: bool,
         /// What was applied, in the same terms as a `Removed` line.
         summary: String,
         /// Why the reply could not be read.
@@ -406,6 +410,9 @@ async fn delete_duplicates_inner(
                     "remove duplicate rows from {composed} comparing {}",
                     render_columns(&opts.comparison_columns)
                 ),
+                range: composed,
+                comparison_columns: opts.comparison_columns.clone(),
+                content_outside_range_untouched: true,
                 detail,
                 backup: lease_grant
                     .as_ref()
@@ -456,13 +463,10 @@ fn columns_within_range(columns: &[i64], grid: &GridRange) -> Result<(), String>
     })
 }
 
-fn record_attempt(outcome: &DeleteDuplicatesOutcome, duration: Duration) {
-    let decided_by = match &outcome.result {
-        DeleteDuplicatesResult::Blocked { decided_by } => decided_by.as_ref(),
-        _ => None,
-    };
-    let decided_by = write_gate::decided_by_log_fields(decided_by);
-    let fields_changed = match &outcome.result {
+/// The `fields_changed` summary a result logs. An unreadable-reply result
+/// always logs its summary, though not the count that was in the reply.
+fn logged_fields_changed(result: &DeleteDuplicatesResult) -> Option<String> {
+    match result {
         DeleteDuplicatesResult::Removed {
             range,
             comparison_columns,
@@ -480,7 +484,16 @@ fn record_attempt(outcome: &DeleteDuplicatesOutcome, duration: Duration) {
         }),
         DeleteDuplicatesResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
         _ => None,
+    }
+}
+
+fn record_attempt(outcome: &DeleteDuplicatesOutcome, duration: Duration) {
+    let decided_by = match &outcome.result {
+        DeleteDuplicatesResult::Blocked { decided_by } => decided_by.as_ref(),
+        _ => None,
     };
+    let decided_by = write_gate::decided_by_log_fields(decided_by);
+    let fields_changed = logged_fields_changed(&outcome.result);
     let error = match &outcome.result {
         DeleteDuplicatesResult::RefusedInvalidRequest { detail }
         | DeleteDuplicatesResult::AppliedReplyUnreadable { detail, .. }
@@ -584,10 +597,13 @@ pub fn describe_lines(outcome: &DeleteDuplicatesOutcome) -> Vec<String> {
             summary,
             detail,
             backup,
+            ..
         } => vec![
             applied_reply_unreadable_line(summary, &book, RetryHint::NotIdempotent, detail),
             "  the removed-row count was in the unreadable reply; check the spreadsheet"
                 .to_string(),
+            format!("Warning: {RANGE_ONLY_CAVEAT}"),
+            format!("  {EQUALITY_RULE}"),
             format!("  {}", recovery_note(backup.as_deref(), false)),
         ],
         DeleteDuplicatesResult::Failed { detail } => vec![format!("Failed: {detail}")],
@@ -904,11 +920,7 @@ mod tests {
             DeleteDuplicatesResult::RefusedLeaseExpired,
             DeleteDuplicatesResult::RefusedLeaseWrongFile,
             DeleteDuplicatesResult::RefusedLeaseStale,
-            DeleteDuplicatesResult::AppliedReplyUnreadable {
-                summary: "remove duplicate rows from 'Q1'!A2:C10 comparing all columns".into(),
-                detail: "bad reply".into(),
-                backup: None,
-            },
+            unreadable_result(None),
             DeleteDuplicatesResult::Failed {
                 detail: "boom".into(),
             },
@@ -936,45 +948,59 @@ mod tests {
         assert_eq!(statuses.len(), 14);
     }
 
+    fn unreadable_result(backup: Option<Box<LeaseBackup>>) -> DeleteDuplicatesResult {
+        DeleteDuplicatesResult::AppliedReplyUnreadable {
+            range: "'Q1'!A2:C10".into(),
+            comparison_columns: Vec::new(),
+            content_outside_range_untouched: true,
+            summary: "remove duplicate rows from 'Q1'!A2:C10 comparing every column in the range"
+                .into(),
+            detail: "bad reply".into(),
+            backup,
+        }
+    }
+
     #[test]
-    fn describe_lines_renders_applied_reply_unreadable_with_a_count_hint_and_recovery_note() {
+    fn describe_lines_renders_applied_reply_unreadable_with_everything_removed_carries() {
+        let backup = LeaseBackup::DriveCopy {
+            file_id: "copy-9".into(),
+        };
         let outcome = DeleteDuplicatesOutcome {
             spreadsheet_id: "sheet-1".into(),
             file_name: Some("Budget".into()),
             resolved_folder_id: None,
-            result: DeleteDuplicatesResult::AppliedReplyUnreadable {
-                summary: "remove duplicate rows from 'Q1'!A2:C10 comparing all columns".into(),
-                detail: "bad reply".into(),
-                backup: Some(Box::new(LeaseBackup::DriveCopy {
-                    file_id: "copy-9".into(),
-                })),
-            },
+            result: unreadable_result(Some(Box::new(backup.clone()))),
         };
         let lines = describe_lines(&outcome);
-        assert_eq!(lines.len(), 3, "{lines:?}");
         assert_eq!(
-            lines[0],
-            "Applied, but the reply could not be read: remove duplicate rows from \
-             'Q1'!A2:C10 comparing all columns in 'Budget' — do not retry; check the \
-             spreadsheet first (bad reply)"
+            lines,
+            [
+                "Applied, but the reply could not be read: remove duplicate rows from \
+                 'Q1'!A2:C10 comparing every column in the range in 'Budget' — do not \
+                 retry; check the spreadsheet first (bad reply)"
+                    .to_string(),
+                "  the removed-row count was in the unreadable reply; check the spreadsheet"
+                    .to_string(),
+                format!("Warning: {RANGE_ONLY_CAVEAT}"),
+                format!("  {EQUALITY_RULE}"),
+                format!("  {}", recovery_note(Some(&backup), false)),
+            ]
         );
+        assert!(lines[4].contains("Drive copy copy-9"), "{lines:?}");
+    }
+
+    #[test]
+    fn an_unreadable_reply_logs_its_summary_and_serializes_its_plan_time_data() {
+        let result = unreadable_result(None);
         assert_eq!(
-            lines[1],
-            "  the removed-row count was in the unreadable reply; check the spreadsheet"
+            logged_fields_changed(&result).as_deref(),
+            Some("remove duplicate rows from 'Q1'!A2:C10 comparing every column in the range")
         );
-        assert_eq!(
-            lines[2],
-            format!(
-                "  {}",
-                recovery_note(
-                    Some(&LeaseBackup::DriveCopy {
-                        file_id: "copy-9".into()
-                    }),
-                    false
-                )
-            )
-        );
-        assert!(lines[2].contains("Drive copy copy-9"), "{lines:?}");
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["status"], "applied-reply-unreadable");
+        assert_eq!(json["range"], "'Q1'!A2:C10");
+        assert_eq!(json["content_outside_range_untouched"], true);
+        assert!(json.get("backup").is_none(), "{json}");
     }
 
     #[test]

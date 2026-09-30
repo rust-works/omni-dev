@@ -323,6 +323,9 @@ pub enum ValidationResult {
         summary: String,
         /// Why the reply could not be read.
         detail: String,
+        /// Same as [`Self::Changed`] — plan-time, not from the reply.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        clamped_to: Option<String>,
     },
     /// An API or validation error.
     Failed {
@@ -606,7 +609,11 @@ async fn validation_inner(
         // Idempotent: setting or clearing the same rule again leaves the
         // same end state.
         Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
-            ValidationResult::AppliedReplyUnreadable { summary, detail }
+            ValidationResult::AppliedReplyUnreadable {
+                summary,
+                detail,
+                clamped_to,
+            }
         }
         Err(err) => ValidationResult::Failed {
             detail: format!("{err:#}"),
@@ -735,6 +742,16 @@ fn build_request(verb: &ValidationVerb, grid: GridRange) -> BatchUpdateRequestIt
 }
 
 fn record_attempt(outcome: &ValidationOutcome, opts: &ValidationOptions, duration: Duration) {
+    request_log::record_drive_mutation(mutation_outcome(outcome, opts, duration));
+}
+
+/// The `drivemutation` record for one attempt. Split out from
+/// [`record_attempt`] so the logged fields are unit-testable.
+fn mutation_outcome(
+    outcome: &ValidationOutcome,
+    opts: &ValidationOptions,
+    duration: Duration,
+) -> DriveMutationOutcome {
     let error = match &outcome.result {
         ValidationResult::Failed { detail }
         | ValidationResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
@@ -756,7 +773,7 @@ fn record_attempt(outcome: &ValidationOutcome, opts: &ValidationOptions, duratio
         ValidationVerb::ClearDataValidation { .. } => Some("cleared".to_string()),
     };
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: opts.verb.log_operation(),
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -770,7 +787,17 @@ fn record_attempt(outcome: &ValidationOutcome, opts: &ValidationOptions, duratio
         error,
         duration,
         ..Default::default()
-    });
+    }
+}
+
+/// The past-tense note that Sheets clamped a range running past the grid,
+/// shared by `Changed` and `AppliedReplyUnreadable` (the clamp is plan-time
+/// data, not read from the reply).
+fn clamped_applied_line(applied: &str) -> String {
+    format!(
+        "  the range ran past the sheet's current grid; Sheets clamped it, so this applied to \
+         {applied} only"
+    )
 }
 
 /// Renders an outcome as human-readable text.
@@ -855,21 +882,22 @@ pub fn describe_lines(outcome: &ValidationOutcome) -> Vec<String> {
             clamped_to,
         } => {
             let mut lines = vec![format!("Applied: {summary} in {book}")];
-            lines.extend(clamped_to.as_ref().map(|applied| {
-                format!(
-                    "  the range ran past the sheet's current grid; Sheets clamped it, so this \
-                     applied to {applied} only"
-                )
-            }));
+            lines.extend(clamped_to.as_deref().map(clamped_applied_line));
             lines
         }
-        ValidationResult::AppliedReplyUnreadable { summary, detail } => {
-            vec![applied_reply_unreadable_line(
+        ValidationResult::AppliedReplyUnreadable {
+            summary,
+            detail,
+            clamped_to,
+        } => {
+            let mut lines = vec![applied_reply_unreadable_line(
                 summary,
                 &book,
                 RetryHint::Idempotent,
                 detail,
-            )]
+            )];
+            lines.extend(clamped_to.as_deref().map(clamped_applied_line));
+            lines
         }
         ValidationResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -2136,16 +2164,55 @@ mod tests {
             result: ValidationResult::AppliedReplyUnreadable {
                 summary: "clear data validation".to_string(),
                 detail: "bad reply".to_string(),
+                clamped_to: Some("'Q1'!Z1:Z1000".to_string()),
             },
         };
+        // The plan-time clamp note survives, worded exactly as `Changed`
+        // words it.
         assert_eq!(
             describe_lines(&outcome),
             vec![
                 "Applied, but the reply could not be read: clear data validation in 'Budget' — \
                  check the spreadsheet to confirm (bad reply)"
-                    .to_string()
+                    .to_string(),
+                "  the range ran past the sheet's current grid; Sheets clamped it, so this \
+                 applied to 'Q1'!Z1:Z1000 only"
+                    .to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn the_unreadable_reply_logs_everything_changed_logs() {
+        let outcome = ValidationOutcome {
+            spreadsheet_id: "sheet-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            verb: set_verb(Condition::Checkbox, false),
+            result: ValidationResult::AppliedReplyUnreadable {
+                summary: "set data validation".to_string(),
+                detail: "bad reply".to_string(),
+                clamped_to: None,
+            },
+        };
+        let opts = ValidationOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: set_verb(Condition::Checkbox, false),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let logged = mutation_outcome(&outcome, &opts, Duration::ZERO);
+        assert_eq!(logged.status, "applied-reply-unreadable");
+        assert_eq!(
+            logged.validation_type.as_deref(),
+            Some(Condition::Checkbox.condition_type_str())
+        );
+        assert_eq!(
+            logged.fields_changed.as_deref(),
+            Some("set data validation")
+        );
+        assert_eq!(logged.error.as_deref(), Some("bad reply"));
     }
 
     fn every_validation_result() -> Vec<ValidationResult> {
@@ -2196,6 +2263,12 @@ mod tests {
             ValidationResult::AppliedReplyUnreadable {
                 summary: "set data validation".to_string(),
                 detail: "bad reply".to_string(),
+                clamped_to: None,
+            },
+            ValidationResult::AppliedReplyUnreadable {
+                summary: "set data validation".to_string(),
+                detail: "bad reply".to_string(),
+                clamped_to: Some("'Q1'!Z1:Z1000".to_string()),
             },
             ValidationResult::Failed {
                 detail: "boom".to_string(),
@@ -2244,6 +2317,9 @@ mod tests {
                     } | ValidationResult::Changed {
                         clamped_to: Some(_),
                         ..
+                    } | ValidationResult::AppliedReplyUnreadable {
+                        clamped_to: Some(_),
+                        ..
                     }
                 );
                 assert_eq!(
@@ -2266,9 +2342,10 @@ mod tests {
             .iter()
             .map(ValidationResult::log_status)
             .collect();
-        // 14 `ValidationResult` variants; `every_validation_result` lists 18
+        // 14 `ValidationResult` variants; `every_validation_result` lists 19
         // entries so it can also exercise the two shapes each of
-        // `WouldChange`, `RefusedSheetNotFound`, `Blocked` and `Changed`,
+        // `WouldChange`, `RefusedSheetNotFound`, `Blocked`, `Changed` and
+        // `AppliedReplyUnreadable`,
         // which share a `log_status`.
         assert_eq!(statuses.len(), 14);
         assert!(statuses.iter().all(|s| !s.is_empty()));

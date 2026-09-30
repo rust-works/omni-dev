@@ -462,6 +462,11 @@ pub enum PivotResult {
         summary: String,
         /// Why the reply could not be read.
         detail: String,
+        /// The plan-time substance, exactly as [`Self::Changed`] carries it
+        /// (anchor, source, config, what the anchor held) — none of it came
+        /// from the reply.
+        #[serde(flatten)]
+        change: PivotChange,
     },
     /// An API or validation error.
     Failed {
@@ -870,6 +875,7 @@ async fn pivot_inner(
             PivotResult::AppliedReplyUnreadable {
                 summary: pivot_action_summary(&opts.verb, &change),
                 detail,
+                change,
             }
         }
         Err(err) => PivotResult::Failed {
@@ -1119,6 +1125,16 @@ fn describe_anchor_currently(cell: Option<&CellSnapshot>) -> String {
 }
 
 fn record_attempt(outcome: &PivotOutcome, opts: &PivotOptions, duration: Duration) {
+    request_log::record_drive_mutation(mutation_outcome(outcome, opts, duration));
+}
+
+/// The `drivemutation` record for one attempt. Split out from
+/// [`record_attempt`] so the logged fields are unit-testable.
+fn mutation_outcome(
+    outcome: &PivotOutcome,
+    opts: &PivotOptions,
+    duration: Duration,
+) -> DriveMutationOutcome {
     let error = match &outcome.result {
         PivotResult::Failed { detail } | PivotResult::AppliedReplyUnreadable { detail, .. } => {
             Some(detail.clone())
@@ -1135,7 +1151,7 @@ fn record_attempt(outcome: &PivotOutcome, opts: &PivotOptions, duration: Duratio
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: opts.verb.log_operation(),
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -1148,7 +1164,7 @@ fn record_attempt(outcome: &PivotOutcome, opts: &PivotOptions, duration: Duratio
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// What a pivot mutation does, e.g. "add a pivot table anchored at 'Q1'!A1" —
@@ -1284,13 +1300,17 @@ pub fn describe_lines(outcome: &PivotOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
-        PivotResult::AppliedReplyUnreadable { summary, detail } => {
-            vec![applied_reply_unreadable_line(
-                summary,
-                &book,
-                RetryHint::NotIdempotent,
-                detail,
-            )]
+        PivotResult::AppliedReplyUnreadable {
+            summary,
+            detail,
+            change,
+        } => {
+            // Everything after the head line is plan-time data, so it is
+            // printed exactly as `Changed` prints it.
+            let mut lines = pivot_change_lines(verb, change, &book);
+            lines[0] =
+                applied_reply_unreadable_line(summary, &book, RetryHint::NotIdempotent, detail);
+            lines
         }
         PivotResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -3337,24 +3357,65 @@ mod tests {
         assert_eq!(describe(&failed), "Failed: boom");
     }
 
+    fn unreadable_add_change() -> PivotChange {
+        PivotChange {
+            anchor: "'Report'!A1".to_string(),
+            source: Some("'Data'!A1:D20".to_string()),
+            config: Some("rows: col 0; values: SUM col 3".to_string()),
+            anchor_currently: "empty".to_string(),
+        }
+    }
+
     #[test]
-    fn describe_lines_renders_applied_reply_unreadable() {
+    fn describe_lines_renders_applied_reply_unreadable_with_the_plan_time_lines() {
+        let change = unreadable_add_change();
+        let out = outcome_with(
+            add_verb(),
+            Some("Budget"),
+            PivotResult::AppliedReplyUnreadable {
+                summary: "add a pivot table anchored at 'Report'!A1".to_string(),
+                detail: "bad reply".to_string(),
+                change: change.clone(),
+            },
+        );
+        let lines = describe_lines(&out);
+        assert_eq!(
+            lines[0],
+            "Applied, but the reply could not be read: add a pivot table anchored at \
+             'Report'!A1 in 'Budget' — do not retry; check the spreadsheet first (bad reply)"
+        );
+        // Everything after the head is what `Changed` prints, unchanged.
+        let changed = outcome_with(add_verb(), Some("Budget"), PivotResult::Changed(change));
+        assert_eq!(lines[1..], describe_lines(&changed)[1..]);
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(lines[1], "  source: 'Data'!A1:D20");
+    }
+
+    #[test]
+    fn the_unreadable_reply_is_logged_with_its_summary_and_detail() {
         let out = outcome_with(
             delete_verb(),
             Some("Budget"),
             PivotResult::AppliedReplyUnreadable {
                 summary: "delete the pivot table anchored at 'Report'!A1".to_string(),
                 detail: "bad reply".to_string(),
+                change: unreadable_add_change(),
             },
         );
+        let opts = PivotOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: delete_verb(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        };
+        let logged = mutation_outcome(&out, &opts, Duration::ZERO);
+        assert_eq!(logged.status, "applied-reply-unreadable");
         assert_eq!(
-            describe_lines(&out),
-            vec![
-                "Applied, but the reply could not be read: delete the pivot table anchored at \
-                 'Report'!A1 in 'Budget' — do not retry; check the spreadsheet first (bad reply)"
-                    .to_string()
-            ]
+            logged.fields_changed.as_deref(),
+            Some("delete the pivot table anchored at 'Report'!A1")
         );
+        assert_eq!(logged.error.as_deref(), Some("bad reply"));
     }
 
     #[test]
@@ -3401,10 +3462,11 @@ mod tests {
             PivotResult::RefusedLeaseExpired,
             PivotResult::RefusedLeaseWrongFile,
             PivotResult::RefusedLeaseStale,
-            PivotResult::Changed(change),
+            PivotResult::Changed(change.clone()),
             PivotResult::AppliedReplyUnreadable {
                 summary: String::new(),
                 detail: String::new(),
+                change,
             },
             PivotResult::Failed {
                 detail: String::new(),

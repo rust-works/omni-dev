@@ -262,6 +262,9 @@ pub enum DimensionGroupResult {
     AppliedReplyUnreadable {
         /// Same summary as [`Self::Changed`].
         summary: String,
+        /// Same as [`Self::Changed`] — resolved from the pre-read workbook,
+        /// not from the reply, so it survives the unreadable reply.
+        depth: Option<i64>,
         /// Why the reply could not be read.
         detail: String,
     },
@@ -540,7 +543,11 @@ async fn dimension_group_inner(
         // `RetryHint::NotIdempotent`: a second add nests the group one level
         // deeper (#2021).
         Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
-            DimensionGroupResult::AppliedReplyUnreadable { summary, detail }
+            DimensionGroupResult::AppliedReplyUnreadable {
+                summary,
+                depth,
+                detail,
+            }
         }
         Err(err) => DimensionGroupResult::Failed {
             detail: format!("{err:#}"),
@@ -756,6 +763,16 @@ fn record_attempt(
     opts: &DimensionGroupOptions,
     duration: Duration,
 ) {
+    request_log::record_drive_mutation(mutation_record(outcome, opts, duration));
+}
+
+/// The request-log record for `outcome`, split from [`record_attempt`] so a
+/// test can read the fields it carries.
+fn mutation_record(
+    outcome: &DimensionGroupOutcome,
+    opts: &DimensionGroupOptions,
+    duration: Duration,
+) -> DriveMutationOutcome {
     let error = match &outcome.result {
         DimensionGroupResult::Failed { detail }
         | DimensionGroupResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
@@ -767,15 +784,16 @@ fn record_attempt(
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
     let fields_changed = match (&opts.verb, &outcome.result) {
+        // An unreadable reply names the write for every verb: it happened.
+        (_, DimensionGroupResult::AppliedReplyUnreadable { summary, .. }) => Some(summary.clone()),
         (
             DimensionGroupVerb::UpdateDimensionGroup { collapsed, .. },
-            DimensionGroupResult::Changed { .. }
-            | DimensionGroupResult::AppliedReplyUnreadable { .. },
+            DimensionGroupResult::Changed { .. },
         ) => Some(format!("collapsed={collapsed}")),
         _ => None,
     };
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: opts.verb.log_operation(),
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -790,7 +808,7 @@ fn record_attempt(
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// Renders an outcome as human-readable text.
@@ -878,9 +896,15 @@ pub fn describe_lines(outcome: &DimensionGroupOutcome) -> Vec<String> {
             let id = depth.map_or_else(String::new, |depth| format!(" (depth {depth})"));
             vec![format!("Applied: {summary}{id} in {book}")]
         }
-        DimensionGroupResult::AppliedReplyUnreadable { summary, detail } => {
+        DimensionGroupResult::AppliedReplyUnreadable {
+            summary,
+            depth,
+            detail,
+        } => {
+            // The depth is named exactly as `Changed` names it.
+            let id = depth.map_or_else(String::new, |depth| format!(" (depth {depth})"));
             vec![applied_reply_unreadable_line(
-                summary,
+                &format!("{summary}{id}"),
                 &book,
                 RetryHint::NotIdempotent,
                 detail,
@@ -1002,6 +1026,7 @@ mod tests {
         assert_eq!(
             DimensionGroupResult::AppliedReplyUnreadable {
                 summary: String::new(),
+                depth: None,
                 detail: String::new(),
             }
             .log_status(),
@@ -2322,6 +2347,7 @@ mod tests {
             Some("Budget"),
             DimensionGroupResult::AppliedReplyUnreadable {
                 summary: "add a row group over ROWS 5:9".to_string(),
+                depth: None,
                 detail: "bad reply".to_string(),
             },
         );
@@ -2333,6 +2359,51 @@ mod tests {
                     .to_string()
             ]
         );
+
+        // A resolved depth is named the way `Changed` names it.
+        let with_depth = outcome_with(
+            update_verb(),
+            Some("Budget"),
+            DimensionGroupResult::AppliedReplyUnreadable {
+                summary: "set collapsed=true on the group over ROWS 5:9".to_string(),
+                depth: Some(1),
+                detail: "bad reply".to_string(),
+            },
+        );
+        assert_eq!(
+            describe_lines(&with_depth),
+            vec![
+                "Applied, but the reply could not be read: set collapsed=true on the group \
+                 over ROWS 5:9 (depth 1) in 'Budget' — do not retry; check the spreadsheet \
+                 first (bad reply)"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// An applied write whose reply was unreadable logs the summary for
+    /// every verb, plus the sheet and span `Changed` logs.
+    #[test]
+    fn an_unreadable_reply_logs_the_summary_sheet_and_span_for_every_verb() {
+        for verb in [add_verb(), update_verb()] {
+            let opts = base_opts(verb.clone(), false);
+            let mut outcome = outcome_with(
+                verb,
+                Some("Budget"),
+                DimensionGroupResult::AppliedReplyUnreadable {
+                    summary: "the summary".to_string(),
+                    depth: Some(1),
+                    detail: "bad reply".to_string(),
+                },
+            );
+            outcome.sheet_id = Some(3);
+            outcome.dimension_range_label = Some("ROWS 5:9".to_string());
+            let record = mutation_record(&outcome, &opts, Duration::from_millis(1));
+            assert_eq!(record.fields_changed.as_deref(), Some("the summary"));
+            assert_eq!(record.sheet_id, Some(3));
+            assert_eq!(record.dimension_range.as_deref(), Some("ROWS 5:9"));
+            assert_eq!(record.error.as_deref(), Some("bad reply"));
+        }
     }
 
     #[test]

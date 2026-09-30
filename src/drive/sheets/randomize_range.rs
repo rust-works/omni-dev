@@ -118,6 +118,10 @@ pub enum RandomizeRangeResult {
         summary: String,
         /// Why the reply could not be read.
         detail: String,
+        /// Same as [`Self::Changed`].
+        range: String,
+        /// Same as [`Self::Changed`].
+        width_warning: Option<String>,
     },
     Failed {
         detail: String,
@@ -341,6 +345,8 @@ async fn randomize_range_inner(
             RandomizeRangeResult::AppliedReplyUnreadable {
                 summary: format!("randomized {composed}"),
                 detail,
+                range: composed,
+                width_warning,
             }
         }
         Err(err) => RandomizeRangeResult::Failed {
@@ -351,6 +357,12 @@ async fn randomize_range_inner(
 }
 
 fn record_attempt(outcome: &RandomizeRangeOutcome, duration: Duration) {
+    request_log::record_drive_mutation(mutation_outcome(outcome, duration));
+}
+
+/// The `drivemutation` record for one attempt. Split out from
+/// [`record_attempt`] so the logged fields are unit-testable.
+fn mutation_outcome(outcome: &RandomizeRangeOutcome, duration: Duration) -> DriveMutationOutcome {
     let decided_by = match &outcome.result {
         RandomizeRangeResult::Blocked { decided_by, .. } => decided_by.as_ref(),
         _ => None,
@@ -367,7 +379,7 @@ fn record_attempt(outcome: &RandomizeRangeOutcome, duration: Duration) {
         | RandomizeRangeResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
         _ => None,
     };
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: LOG_OPERATION,
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -380,7 +392,7 @@ fn record_attempt(outcome: &RandomizeRangeOutcome, duration: Duration) {
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// The line stating that the resulting row order can never be known ahead
@@ -461,13 +473,28 @@ pub fn describe_lines(outcome: &RandomizeRangeOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
-        RandomizeRangeResult::AppliedReplyUnreadable { summary, detail } => {
-            vec![applied_reply_unreadable_line(
-                summary,
-                &book,
-                RetryHint::NotIdempotent,
-                detail,
-            )]
+        RandomizeRangeResult::AppliedReplyUnreadable {
+            summary,
+            detail,
+            width_warning,
+            ..
+        } => {
+            let mut lines = grid_range::reorder_caveat_lines(
+                "randomizing",
+                applied_reply_unreadable_line(summary, &book, RetryHint::NotIdempotent, detail),
+                None,
+                true,
+                Some(ORDER_CAVEAT),
+            );
+            // The width warning is plan-time data, so it survives the
+            // unreadable reply; it follows the shared line here.
+            lines.splice(
+                1..1,
+                width_warning
+                    .iter()
+                    .map(|warning| format!("Warning: {warning}")),
+            );
+            lines
         }
         RandomizeRangeResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -1012,15 +1039,46 @@ mod tests {
             result: RandomizeRangeResult::AppliedReplyUnreadable {
                 summary: "randomized Q1!A2:C10".into(),
                 detail: "bad reply".into(),
+                range: "Q1!A2:C10".into(),
+                width_warning: Some("narrow".into()),
             },
         };
+        // The plan-time width warning and the order/reference caveats
+        // survive, exactly as `Changed` renders them.
         assert_eq!(
             describe_lines(&outcome),
             vec![
                 "Applied, but the reply could not be read: randomized Q1!A2:C10 in 'Budget' — \
                  do not retry; check the spreadsheet first (bad reply)"
+                    .to_string(),
+                "Warning: narrow".to_string(),
+                format!("  {ORDER_CAVEAT}"),
+                "  references outside the range may now observe values from a different row"
+                    .to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn the_unreadable_reply_is_logged_with_its_summary_and_detail() {
+        let outcome = RandomizeRangeOutcome {
+            spreadsheet_id: "sheet-1".into(),
+            file_name: Some("Budget".into()),
+            resolved_folder_id: None,
+            result: RandomizeRangeResult::AppliedReplyUnreadable {
+                summary: "randomized Q1!A2:C10".into(),
+                detail: "bad reply".into(),
+                range: "Q1!A2:C10".into(),
+                width_warning: None,
+            },
+        };
+        let logged = mutation_outcome(&outcome, Duration::ZERO);
+        assert_eq!(logged.status, "applied-reply-unreadable");
+        assert_eq!(
+            logged.fields_changed.as_deref(),
+            Some("randomized Q1!A2:C10")
+        );
+        assert_eq!(logged.error.as_deref(), Some("bad reply"));
     }
 
     #[tokio::test]
@@ -1204,6 +1262,8 @@ mod tests {
             RandomizeRangeResult::AppliedReplyUnreadable {
                 summary: "randomized Q1!A1:B3".into(),
                 detail: "bad reply".into(),
+                range: "Q1!A1:B3".into(),
+                width_warning: Some("narrow".into()),
             },
             RandomizeRangeResult::Failed {
                 detail: "boom".into(),

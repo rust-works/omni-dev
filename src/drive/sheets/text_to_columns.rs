@@ -325,6 +325,20 @@ pub enum TextToColumnsResult {
         summary: String,
         /// Why the reply could not be read.
         detail: String,
+        /// Same as [`Self::Changed`] — plan-time, not from the reply.
+        source: String,
+        /// Same as [`Self::Changed`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spill: Option<String>,
+        /// Same as [`Self::Changed`].
+        width_upper_bound: usize,
+        /// Same as [`Self::Changed`] — the cells that were read before the
+        /// mutation, so the audit of what the split overwrote survives an
+        /// unreadable reply.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        overwritten_cells: Vec<String>,
+        /// Same as [`Self::Changed`].
+        past_grid_extent: bool,
     },
     /// An API or validation error.
     Failed {
@@ -678,7 +692,15 @@ async fn text_to_columns_inner(
         },
         // Not idempotent: a second split acts on the already-split data.
         Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
-            TextToColumnsResult::AppliedReplyUnreadable { summary, detail }
+            TextToColumnsResult::AppliedReplyUnreadable {
+                summary,
+                detail,
+                source: source_a1,
+                spill: spill_a1,
+                width_upper_bound,
+                overwritten_cells,
+                past_grid_extent,
+            }
         }
         Err(err) => TextToColumnsResult::Failed {
             detail: format!("{err:#}"),
@@ -925,6 +947,12 @@ fn build_request(source: GridRange, delimiter: &Delimiter) -> BatchUpdateRequest
 }
 
 fn record_attempt(outcome: &TextToColumnsOutcome, duration: Duration) {
+    request_log::record_drive_mutation(mutation_outcome(outcome, duration));
+}
+
+/// The `drivemutation` record for one attempt. Split out from
+/// [`record_attempt`] so the logged fields are unit-testable.
+fn mutation_outcome(outcome: &TextToColumnsOutcome, duration: Duration) -> DriveMutationOutcome {
     let error = match &outcome.result {
         TextToColumnsResult::Failed { detail }
         | TextToColumnsResult::AppliedReplyUnreadable { detail, .. } => Some(detail.clone()),
@@ -936,7 +964,15 @@ fn record_attempt(outcome: &TextToColumnsOutcome, duration: Duration) {
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
     let (range, fields_changed, overwritten_cells) = match &outcome.result {
+        // The unreadable reply logs everything `Changed` does: the mutation
+        // was applied, so what it overwrote must stay auditable.
         TextToColumnsResult::Changed {
+            summary,
+            source,
+            overwritten_cells,
+            ..
+        }
+        | TextToColumnsResult::AppliedReplyUnreadable {
             summary,
             source,
             overwritten_cells,
@@ -946,13 +982,10 @@ fn record_attempt(outcome: &TextToColumnsOutcome, duration: Duration) {
             Some(summary.clone()),
             overwritten_cells.clone(),
         ),
-        TextToColumnsResult::AppliedReplyUnreadable { summary, .. } => {
-            (None, Some(summary.clone()), Vec::new())
-        }
         _ => (None, None, Vec::new()),
     };
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: LOG_OPERATION,
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -975,7 +1008,7 @@ fn record_attempt(outcome: &TextToColumnsOutcome, duration: Duration) {
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// Renders an outcome as human-readable text.
@@ -1068,14 +1101,19 @@ pub fn describe_lines(outcome: &TextToColumnsOutcome) -> Vec<String> {
             &outcome.delimiter,
             false,
         ),
-        TextToColumnsResult::AppliedReplyUnreadable { summary, detail } => {
-            vec![applied_reply_unreadable_line(
-                summary,
-                &book,
-                RetryHint::NotIdempotent,
-                detail,
-            )]
-        }
+        TextToColumnsResult::AppliedReplyUnreadable {
+            summary,
+            detail,
+            overwritten_cells,
+            past_grid_extent,
+            ..
+        } => change_lines(
+            &applied_reply_unreadable_line(summary, &book, RetryHint::NotIdempotent, detail),
+            overwritten_cells,
+            *past_grid_extent,
+            &outcome.delimiter,
+            false,
+        ),
         TextToColumnsResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
 }
@@ -1226,6 +1264,11 @@ mod tests {
             TextToColumnsResult::AppliedReplyUnreadable {
                 summary: String::new(),
                 detail: String::new(),
+                source: String::new(),
+                spill: None,
+                width_upper_bound: 0,
+                overwritten_cells: Vec::new(),
+                past_grid_extent: false,
             },
             TextToColumnsResult::Failed {
                 detail: String::new(),
@@ -1586,6 +1629,11 @@ mod tests {
             TextToColumnsResult::AppliedReplyUnreadable {
                 summary: "split 'Q1'!A2:A4 on comma".to_string(),
                 detail: "bad reply".to_string(),
+                source: "'Q1'!A2:A4".to_string(),
+                spill: Some("'Q1'!B2:B4".to_string()),
+                width_upper_bound: 2,
+                overwritten_cells: Vec::new(),
+                past_grid_extent: false,
             },
             TextToColumnsResult::Failed {
                 detail: "HTTP 500".to_string(),
@@ -2449,21 +2497,67 @@ mod tests {
         );
     }
 
-    #[test]
-    fn describe_lines_renders_applied_reply_unreadable() {
+    fn unreadable_outcome(
+        overwritten_cells: Vec<String>,
+        past_grid_extent: bool,
+    ) -> TextToColumnsOutcome {
         let mut outcome = would_change_outcome(Vec::new(), false);
         outcome.result = TextToColumnsResult::AppliedReplyUnreadable {
             summary: "split 'Q1'!A2:A4 on comma".to_string(),
             detail: "bad reply".to_string(),
+            source: "'Q1'!A2:A4".to_string(),
+            spill: Some("'Q1'!B2:B4".to_string()),
+            width_upper_bound: 2,
+            overwritten_cells,
+            past_grid_extent,
         };
+        outcome
+    }
+
+    #[test]
+    fn describe_lines_renders_applied_reply_unreadable_with_the_plan_time_lines() {
+        let outcome = unreadable_outcome(vec!["B2".to_string()], true);
+        let lines = describe_lines(&outcome);
         assert_eq!(
-            describe_lines(&outcome),
-            vec![
-                "Applied, but the reply could not be read: split 'Q1'!A2:A4 on comma in \
-                 'Budget' — do not retry; check the spreadsheet first (bad reply)"
-                    .to_string()
+            lines[0],
+            "Applied, but the reply could not be read: split 'Q1'!A2:A4 on comma in \
+             'Budget' — do not retry; check the spreadsheet first (bad reply)"
+        );
+        assert_eq!(
+            lines[1..],
+            [
+                "  up to 1 non-blank cell(s) were overwritten: B2".to_string(),
+                PAST_GRID_EXTENT_CAVEAT.to_string(),
+                UNPREVIEWABLE_SPLIT_CAVEAT.to_string(),
             ]
         );
+        // Everything after the head is what `Changed` prints, unchanged.
+        let mut changed = outcome;
+        changed.result = TextToColumnsResult::Changed {
+            summary: "split 'Q1'!A2:A4 on comma".to_string(),
+            source: "'Q1'!A2:A4".to_string(),
+            spill: Some("'Q1'!B2:B4".to_string()),
+            width_upper_bound: 2,
+            overwritten_cells: vec!["B2".to_string()],
+            past_grid_extent: true,
+        };
+        assert_eq!(lines[1..], describe_lines(&changed)[1..]);
+    }
+
+    #[test]
+    fn the_unreadable_reply_logs_everything_changed_logs() {
+        let outcome = unreadable_outcome(vec!["B2".to_string(), "B3".to_string()], false);
+        let logged = mutation_outcome(&outcome, Duration::ZERO);
+        assert_eq!(logged.status, "applied-reply-unreadable");
+        assert_eq!(logged.sheet_id, Some(0));
+        assert_eq!(logged.range.as_deref(), Some("'Q1'!A2:A4"));
+        assert_eq!(
+            logged.fields_changed.as_deref(),
+            Some("split 'Q1'!A2:A4 on comma")
+        );
+        assert_eq!(logged.overwritten_cells, vec!["B2", "B3"]);
+        assert!(logged.overwritten_cells_upper_bound);
+        assert_eq!(logged.error.as_deref(), Some("bad reply"));
     }
 
     #[tokio::test]

@@ -357,6 +357,11 @@ pub enum PasteResult {
         /// What was pasted where — the head of [`Self::Changed`]'s text,
         /// without the workbook name.
         summary: String,
+        /// Same as [`Self::Changed`] — all of it (extent, overwritten and
+        /// cleared cells, grid-edge caveat) is plan-time data, so none of it
+        /// is lost with the reply.
+        #[serde(flatten)]
+        change: PasteChange,
         /// Why the reply could not be read.
         detail: String,
     },
@@ -820,6 +825,7 @@ async fn paste_inner(
         Ok(BatchUpdateOutcome::AppliedReplyUnreadable { detail }) => {
             PasteResult::AppliedReplyUnreadable {
                 summary: unreadable_summary(&opts.verb, &change),
+                change,
                 detail,
             }
         }
@@ -1056,6 +1062,16 @@ fn sheet_exceeds_dimensions(
 }
 
 fn record_attempt(outcome: &PasteOutcome, opts: &PasteOptions, duration: Duration) {
+    request_log::record_drive_mutation(mutation_record(outcome, opts, duration));
+}
+
+/// The request-log record for `outcome`, split from [`record_attempt`] so a
+/// test can read the fields it carries.
+fn mutation_record(
+    outcome: &PasteOutcome,
+    opts: &PasteOptions,
+    duration: Duration,
+) -> DriveMutationOutcome {
     let error = match &outcome.result {
         PasteResult::Failed { detail } | PasteResult::AppliedReplyUnreadable { detail, .. } => {
             Some(detail.clone())
@@ -1067,8 +1083,13 @@ fn record_attempt(outcome: &PasteOutcome, opts: &PasteOptions, duration: Duratio
         _ => None,
     };
     let decided_by = write_gate::decided_by_log_fields(decided_by);
+    // The write happened, so name what it was even though the reply is gone.
+    let fields_changed = match &outcome.result {
+        PasteResult::AppliedReplyUnreadable { summary, .. } => Some(summary.clone()),
+        _ => None,
+    };
 
-    request_log::record_drive_mutation(DriveMutationOutcome {
+    DriveMutationOutcome {
         operation: opts.verb.log_operation(),
         file_id: outcome.spreadsheet_id.clone(),
         file_name: outcome.file_name.clone().unwrap_or_default(),
@@ -1077,10 +1098,11 @@ fn record_attempt(outcome: &PasteOutcome, opts: &PasteOptions, duration: Duratio
         decided_by_folder_id: decided_by.folder_id,
         decided_by_depth: decided_by.depth,
         decided_by_file_id: decided_by.file_id,
+        fields_changed,
         error,
         duration,
         ..Default::default()
-    });
+    }
 }
 
 /// Renders the change-specific lines of a `WouldChange`/`Changed` outcome
@@ -1242,13 +1264,17 @@ pub fn describe_lines(outcome: &PasteOutcome) -> Vec<String> {
             .describe_line(&outcome.spreadsheet_id, &book)
             .into_iter()
             .collect(),
-        PasteResult::AppliedReplyUnreadable { summary, detail } => {
-            vec![applied_reply_unreadable_line(
-                summary,
-                &book,
-                RetryHint::NotIdempotent,
-                detail,
-            )]
+        PasteResult::AppliedReplyUnreadable {
+            summary,
+            change,
+            detail,
+        } => {
+            // The head line is replaced by the shared one; every line after
+            // it is exactly what `Changed` prints.
+            let mut lines = paste_change_lines(verb, change, &book, true);
+            lines[0] =
+                applied_reply_unreadable_line(summary, &book, RetryHint::NotIdempotent, detail);
+            lines
         }
         PasteResult::Failed { detail } => vec![format!("Failed: {detail}")],
     }
@@ -3169,25 +3195,77 @@ mod tests {
     }
 
     #[test]
-    fn describe_lines_renders_applied_reply_unreadable_as_not_idempotent() {
-        let outcome = PasteOutcome {
+    fn describe_lines_renders_applied_reply_unreadable_with_the_same_detail_lines_as_changed() {
+        let outcome = |result| PasteOutcome {
             spreadsheet_id: "sheet-1".to_string(),
             file_name: Some("Budget".to_string()),
             resolved_folder_id: None,
             verb: every_paste_verb().remove(0),
-            result: PasteResult::AppliedReplyUnreadable {
-                summary: "cut-paste into 'Q1'!D1 (writing 'Q1'!D1:E2)".to_string(),
-                detail: "bad reply".to_string(),
-            },
+            result,
         };
+        let unreadable = describe_lines(&outcome(PasteResult::AppliedReplyUnreadable {
+            summary: "cut-paste into 'Q1'!D1 (writing 'Q1'!D1:E2)".to_string(),
+            change: change_for_unreadable(),
+            detail: "bad reply".to_string(),
+        }));
+        let changed = describe_lines(&outcome(PasteResult::Changed(change_for_unreadable())));
         assert_eq!(
-            describe_lines(&outcome),
-            vec![
-                "Applied, but the reply could not be read: cut-paste into 'Q1'!D1 (writing \
-                 'Q1'!D1:E2) in 'Budget' — do not retry; check the spreadsheet first (bad reply)"
-                    .to_string()
-            ]
+            unreadable[0],
+            "Applied, but the reply could not be read: cut-paste into 'Q1'!D1 (writing \
+             'Q1'!D1:E2) in 'Budget' — do not retry; check the spreadsheet first (bad reply)"
         );
+        // Overwritten, cleared and grid-edge lines all survive.
+        assert!(unreadable.len() > 3, "{unreadable:?}");
+        assert_eq!(unreadable[1..], changed[1..]);
+    }
+
+    /// An applied paste whose reply was unreadable serialises the same
+    /// plan-time fields `Changed` does, flattened beside the tag.
+    #[test]
+    fn an_unreadable_reply_serialises_the_change_fields_beside_the_status() {
+        let value = serde_json::to_value(PasteResult::AppliedReplyUnreadable {
+            summary: "s".to_string(),
+            change: change_for_unreadable(),
+            detail: "bad reply".to_string(),
+        })
+        .unwrap();
+        assert_eq!(value["status"], "applied-reply-unreadable");
+        assert_eq!(value["destination"], "'Q1'!D1");
+        assert_eq!(value["overwritten"], serde_json::json!(["D1"]));
+        assert_eq!(value["cleared"], serde_json::json!(["A1"]));
+        assert_eq!(value["detail"], "bad reply");
+    }
+
+    #[test]
+    fn an_unreadable_reply_logs_the_summary_as_fields_changed() {
+        let verb = every_paste_verb().remove(0);
+        let opts = PasteOptions {
+            spreadsheet_id: "sheet-1".to_string(),
+            verb: verb.clone(),
+            dry_run: false,
+            lease_token: None,
+            ledger_path: PathBuf::new(),
+        };
+        let record = mutation_record(
+            &PasteOutcome {
+                spreadsheet_id: "sheet-1".to_string(),
+                file_name: Some("Budget".to_string()),
+                resolved_folder_id: None,
+                verb,
+                result: PasteResult::AppliedReplyUnreadable {
+                    summary: "cut-paste into 'Q1'!D1 (writing 'Q1'!D1:E2)".to_string(),
+                    change: change_for_unreadable(),
+                    detail: "bad reply".to_string(),
+                },
+            },
+            &opts,
+            Duration::from_millis(1),
+        );
+        assert_eq!(
+            record.fields_changed.as_deref(),
+            Some("cut-paste into 'Q1'!D1 (writing 'Q1'!D1:E2)")
+        );
+        assert_eq!(record.error.as_deref(), Some("bad reply"));
     }
 
     #[tokio::test]
@@ -3770,6 +3848,17 @@ mod tests {
 
     // ── `describe_lines` over every result variant, every verb ──
 
+    fn change_for_unreadable() -> PasteChange {
+        PasteChange {
+            destination: "'Q1'!D1".to_string(),
+            source: Some("'Q1'!A1:B2".to_string()),
+            written_extent: "'Q1'!D1:E2".to_string(),
+            overwritten: Some(vec!["D1".to_string()]),
+            cleared: Some(vec!["A1".to_string()]),
+            grid_edge_caveat: Some("runs past the sheet's allocated rows".to_string()),
+        }
+    }
+
     fn every_paste_result() -> Vec<PasteResult> {
         let change = PasteChange {
             destination: "'Q1'!D1".to_string(),
@@ -3805,6 +3894,7 @@ mod tests {
             PasteResult::RefusedLeaseStale,
             PasteResult::AppliedReplyUnreadable {
                 summary: "cut-paste into 'Q1'!D1 (writing 'Q1'!D1:E2)".to_string(),
+                change: change_for_unreadable(),
                 detail: "bad reply".to_string(),
             },
             PasteResult::Failed {
