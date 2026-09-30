@@ -1590,35 +1590,36 @@ mod tests {
     #[test]
     fn every_batch_update_caller_handles_an_unreadable_reply() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/drive");
-        let mut callers = Vec::new();
+        let mut files = Vec::new();
         let mut dirs = vec![root.join("sheets"), root.join("lease")];
         while let Some(dir) = dirs.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     dirs.push(path);
-                    continue;
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
                 }
-                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                    continue;
-                }
-                let source = std::fs::read_to_string(&path).unwrap();
-                // Only production code: everything before the `#[cfg(test)]`
-                // that gates the trailing `mod tests`, so an earlier
-                // cfg-gated item cannot hide the code after it.
-                let production = source.rfind("\nmod tests").map_or(source.as_str(), |at| {
-                    source[..at]
-                        .rfind("#[cfg(test)]")
-                        .map_or(&source[..at], |cfg| &source[..cfg])
-                });
-                if production.contains(".batch_update(") {
-                    // The qualified path, not the bare identifier: an import or
-                    // a comment naming the variant must not satisfy the guard.
-                    callers.push((
-                        path,
-                        production.contains("BatchUpdateOutcome::AppliedReplyUnreadable"),
-                    ));
-                }
+            }
+        }
+        let mut callers = Vec::new();
+        for path in files {
+            let source = std::fs::read_to_string(&path).unwrap();
+            // Only production code: everything before the `#[cfg(test)]`
+            // that gates the trailing `mod tests`, so an earlier
+            // cfg-gated item cannot hide the code after it.
+            let production = source.rfind("\nmod tests").map_or(source.as_str(), |at| {
+                source[..at]
+                    .rfind("#[cfg(test)]")
+                    .map_or(&source[..at], |cfg| &source[..cfg])
+            });
+            if production.contains(".batch_update(") {
+                // The qualified path, not the bare identifier: an import or
+                // a comment naming the variant must not satisfy the guard.
+                callers.push((
+                    path,
+                    production.contains("BatchUpdateOutcome::AppliedReplyUnreadable"),
+                ));
             }
         }
         assert!(

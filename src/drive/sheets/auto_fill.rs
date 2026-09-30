@@ -3061,15 +3061,12 @@ mod tests {
             ..base_opts(source_and_destination_form(Dimension::Rows, 7), false)
         };
         let outcome = auto_fill(&drive, &sheets, &opts, &rules).await;
-        assert!(
-            matches!(
-                outcome.result,
-                AutoFillResult::AppliedReplyUnreadable { .. }
-            ),
+        assert_eq!(
+            outcome.result.log_status(),
+            "applied-reply-unreadable",
             "{:?}",
             outcome.result
         );
-        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         assert!(
             describe(&outcome).starts_with("Applied, but the reply could not be read"),
             "{}",

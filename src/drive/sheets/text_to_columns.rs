@@ -2482,14 +2482,11 @@ mod tests {
             &[rule(DriveOperation::SheetsWrite, false)],
         )
         .await;
-        assert!(
-            matches!(
-                outcome.result,
-                TextToColumnsResult::AppliedReplyUnreadable { .. }
-            ),
+        assert_eq!(
+            outcome.result.log_status(),
+            "applied-reply-unreadable",
             "{outcome:?}"
         );
-        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         assert!(
             describe(&outcome).starts_with("Applied, but the reply could not be read"),
             "{}",

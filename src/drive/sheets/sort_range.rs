@@ -1216,14 +1216,11 @@ mod tests {
             .mount(&server)
             .await;
         let outcome = sort_range(&drive, &sheets, &options(false), &[rule()]).await;
-        assert!(
-            matches!(
-                outcome.result,
-                SortRangeResult::AppliedReplyUnreadable { .. }
-            ),
+        assert_eq!(
+            outcome.result.log_status(),
+            "applied-reply-unreadable",
             "{outcome:?}"
         );
-        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         let lines = describe_lines(&outcome);
         assert!(
             lines[0].starts_with("Applied, but the reply could not be read"),

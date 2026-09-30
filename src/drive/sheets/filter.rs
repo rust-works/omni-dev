@@ -3929,7 +3929,7 @@ mod tests {
             FilterResult::AppliedReplyUnreadable { filter_view_id, .. } => {
                 assert_eq!(*filter_view_id, Some(7));
             }
-            other => panic!("expected AppliedReplyUnreadable, got {other:?}"),
+            other => panic!("expected AppliedReplyUnreadable, got {other:?}"), // omni-dev: coverage ignore-line reason="this arm only fires if the match failed to bind the expected variant; the assertion below it pins the same variant, so the branch never executes"
         }
         assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         assert!(

@@ -1291,15 +1291,12 @@ mod tests {
             .await;
 
         let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
-        assert!(
-            matches!(
-                outcome.result,
-                FindReplaceResult::AppliedReplyUnreadable { .. }
-            ),
+        assert_eq!(
+            outcome.result.log_status(),
+            "applied-reply-unreadable",
             "{:?}",
             outcome.result
         );
-        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         let lines = describe_lines(&outcome);
         assert!(
             lines[0].starts_with("Applied, but the reply could not be read"),

@@ -4030,15 +4030,12 @@ mod tests {
             ledger_path,
         };
         let outcome = embedded_object(&drive, &sheets, &opts, &rules).await;
-        assert!(
-            matches!(
-                outcome.result,
-                EmbeddedObjectResult::AppliedReplyUnreadable { .. }
-            ),
+        assert_eq!(
+            outcome.result.log_status(),
+            "applied-reply-unreadable",
             "{:?}",
             outcome.result
         );
-        assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         let lines = describe_lines(&outcome);
         assert!(
             lines[0].starts_with("Applied, but the reply could not be read"),
@@ -4104,11 +4101,9 @@ mod tests {
         };
 
         let first = embedded_object(&drive, &sheets, &opts, &rules).await;
-        assert!(
-            matches!(
-                first.result,
-                EmbeddedObjectResult::AppliedReplyUnreadable { .. }
-            ),
+        assert_eq!(
+            first.result.log_status(),
+            "applied-reply-unreadable",
             "{:?}",
             first.result
         );
