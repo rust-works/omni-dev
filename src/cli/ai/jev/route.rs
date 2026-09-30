@@ -11,7 +11,7 @@ use crate::github_issues::{
     fetch_issues_cached_current, fetch_items_cached_current, list_open_issue_numbers,
     needs_default_project, parse_issue_arg, resolve_current_project, CacheUsage, IssueCache,
 };
-use crate::jev::citations::{find_citations, Citation};
+use crate::jev::citations::{find_citations_outside_code, Citation};
 use crate::jev::client::JevClient;
 use crate::jev::config::JevConfig;
 use crate::jev::route::{
@@ -487,7 +487,7 @@ fn find_open_dependencies(
             number: doc.number,
         };
         let (state, _truncated) = build_route_state(doc, max_input_chars);
-        let citations = find_citations(&state, &doc.project, &judged);
+        let citations = find_citations_outside_code(&state, &doc.project, &judged);
         for citation in &citations {
             let key = (citation.item_ref.project.clone(), citation.item_ref.number);
             if seen.insert(key) {
@@ -1587,7 +1587,7 @@ mod tests {
         let citing = serde_json::json!({
             "__typename": "Issue",
             "title": "t",
-            "body": "```\nError: gh api graphql failed: see owner/repo#123\n```",
+            "body": "Error: gh api graphql failed: see owner/repo#123",
             "state": "OPEN", "url": "u",
             "comments": {"totalCount": 0, "nodes": []},
             "closedByPullRequestsReferences": {"nodes": []}
@@ -1626,5 +1626,51 @@ mod tests {
                 error: "not found".to_string(),
             }])
         );
+    }
+
+    /// #2003: the same quoted example inside a fenced code block or an inline
+    /// span is not a citation at all, so it neither triggers a lookup (the
+    /// shim would answer it with `NOT_FOUND`) nor lands in
+    /// `reference_fetch_failures`.
+    #[test]
+    fn fetch_docs_ignores_a_citation_quoted_in_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let _shim = shim_lock();
+        let citing = serde_json::json!({
+            "__typename": "Issue",
+            "title": "t",
+            "body": "```\nError: gh api graphql failed: see owner/repo#123\n```\nand `o/r#1` inline",
+            "state": "OPEN", "url": "u",
+            "comments": {"totalCount": 0, "nodes": []},
+            "closedByPullRequestsReferences": {"nodes": []}
+        });
+        let bin = dir.path().join("fake-gh");
+        write_exec_script(
+            &bin,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n\
+                 repo) echo rust-works/omni-dev ;;\n\
+                 *) case \"$4\" in\n\
+                    *'number:123'*) cat <<'JSON'\n{{\"data\": {{\"r0\": null}}, \"errors\": [{{\"type\": \"NOT_FOUND\", \"path\": [\"r0\"], \"message\": \"Could not resolve to a Repository with the name 'owner/repo'.\"}}]}}\nJSON\nexit 1 ;;\n\
+                    *) cat <<'JSON'\n{{\"data\": {{\"r0\": {{\"i0\": {citing}}}}}}}\nJSON\n;;\n\
+                    esac ;;\n\
+                 esac\n",
+            ),
+        );
+        let (docs, dependencies, failures) = retry_on_etxtbsy(|| {
+            fetch_docs(
+                &bin,
+                &IssueCache::disabled(),
+                dir.path(),
+                &["#1".to_string()],
+                false,
+                DEFAULT_MAX_INPUT_CHARS,
+                false,
+            )
+        })
+        .unwrap();
+        let key = (docs[0].project.clone(), docs[0].number);
+        assert!(dependencies.is_empty(), "{dependencies:?}");
+        assert!(!failures.contains_key(&key), "{failures:?}");
     }
 }

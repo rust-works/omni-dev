@@ -642,6 +642,15 @@ as a comment (see below) rather than relying on the reference.
 the cited issue's content, only its open/closed state, so it costs a `gh`
 lookup, not extra tokens in the routing call itself.
 
+The scan **skips code**: a reference inside a fenced code block (` ``` ` or
+`~~~`) or an inline code span is a quoted example, such as an error message
+containing `owner/repo#123`, not a dependency, so it triggers no lookup and
+never appears in `reference_fetch_failures`. Only a *closed* fence counts as
+code (an unclosed one is scanned like prose, so it cannot hide every citation
+after it in the issue's long combined text), a span must open and close within
+one paragraph, and an indented code block is not recognised. `verify-decision`
+does not skip code; see [What the splitter and Jev see](#what-the-splitter-and-jev-see).
+
 ### Closed issues
 
 `route` refuses a closed issue unless `--allow-closed` is given, because its
@@ -1081,7 +1090,10 @@ GitHub issue/pull URL). A number that runs straight into a letter, digit,
 `_` or `-` is **not** a citation, so a hex colour (`#1f77b4`) or a heading
 anchor (`#1-overview`) is left alone, and any other `http(s)://` link is
 skipped whole, so a path or fragment inside it (`docs/jev.md#4-state-input`)
-is never read as one. The backend is asked to split the comment into
+is never read as one. Unlike `route`, `verify-decision` scans **code too**: a
+reference deliberately written in backticks (`` `#1614` ``) is still the source
+of the claim it supports, and missing it would silently weaken the check,
+whereas an extra source only costs a lookup. The backend is asked to split the comment into
 statements that each name one item exactly as the comment names it,
 keeping the original wording's certainty ("was decided" and "was
 considered" are different facts) and adding nothing the comment does not
