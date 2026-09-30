@@ -122,7 +122,11 @@ fn builtins_offer_only_their_native_levels_and_keep_original_stage_questions() {
             .iter()
             .flat_map(|t| t.models.iter().flatten())
         {
-            assert_eq!(model.verified.as_deref(), Some("2026-09-23"));
+            // 2026-10-01 is the Claude 5.5 re-evaluation (#1885); the rest are unchanged.
+            assert!(matches!(
+                model.verified.as_deref(),
+                Some("2026-09-23" | "2026-10-01")
+            ));
             assert!(!model.sources.is_empty());
         }
     }
@@ -880,6 +884,6 @@ fn text_keeps_each_providers_effort_table_below_its_class_summary() {
     let anthropic = text.find("  anthropic:").unwrap();
     assert!(openai < text.find("terra [gpt-5.6-terra]").unwrap());
     assert!(text.find("astra [gpt-6-astra]").unwrap() < anthropic);
-    assert!(anthropic < text.find("sonnet [claude-sonnet-5]").unwrap());
+    assert!(anthropic < text.find("sonnet [claude-sonnet-5-5]").unwrap());
     assert_eq!(text.matches("Model / effort").count(), 2);
 }
