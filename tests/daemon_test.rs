@@ -6,10 +6,42 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::process::Command;
+use std::path::Path;
+use std::process::{Child, Command};
 use std::time::Duration;
 
 use omni_dev::daemon::client::DaemonClient;
+
+/// Spawns `omni-dev daemon run` on `socket`, with its request log in `log`.
+///
+/// The daemon's `github` service tallies the request log at startup and again
+/// in `shutdown()` — which the process awaits before it can exit — and does so
+/// by parsing the **whole** file. Left to default, that file is the
+/// developer's real `log.jsonl`, which grows without bound (4.1 GB on the
+/// machine that surfaced #1653) and took 50-75s per pass. That, not host
+/// load, is what failed these tests past every fixed deadline (#1632, #1653);
+/// CI never saw it because a fresh runner has no log. Pointing the daemon at a
+/// file of the test's own makes the run independent of the machine's history,
+/// so route every spawn through here rather than building the command by hand.
+fn spawn_daemon(socket: &Path, log: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .arg("daemon")
+        .arg("run")
+        .arg("--socket")
+        .arg(socket)
+        // Bind the bridge's TCP planes to random free ports so the test never
+        // collides with a real daemon (or another test) on the default 9998/9999.
+        .arg("--bridge-control-port")
+        .arg("0")
+        .arg("--bridge-ws-port")
+        .arg("0")
+        // Stay headless even when the binary is built with `--features menu-bar`,
+        // so this test never tries to open a macOS tray in a headless run.
+        .arg("--no-menu")
+        .env("OMNI_DEV_LOG_FILE", log)
+        .spawn()
+        .expect("failed to spawn `omni-dev daemon run`")
+}
 
 /// Polls `f` until it returns `true` or the deadline passes.
 ///
@@ -26,6 +58,12 @@ use omni_dev::daemon::client::DaemonClient;
 /// shutdown is graceful, not that it is fast; no requirement anywhere binds
 /// it to a deadline, so the bound exists purely to stop a hung daemon
 /// hanging the suite forever.
+///
+/// It is **not** a knob for slow hosts. The slowness #1653 chased was the
+/// daemon scanning the real request log (see [`spawn_daemon`]), which no
+/// ceiling can absorb because the log only grows; with the log isolated a
+/// daemon exits in a few seconds even on a busy machine. If these tests time
+/// out again, look for what the daemon is doing before raising this.
 async fn wait_for<F>(mut f: F) -> bool
 where
     F: FnMut() -> bool,
@@ -49,20 +87,7 @@ async fn daemon_run_status_stop_roundtrip() {
 
     // Bind the bridge's TCP planes to random free ports so the test never
     // collides with a real daemon (or another test) on the default 9998/9999.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_omni-dev"))
-        .arg("daemon")
-        .arg("run")
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--bridge-control-port")
-        .arg("0")
-        .arg("--bridge-ws-port")
-        .arg("0")
-        // Stay headless even when the binary is built with `--features menu-bar`,
-        // so this test never tries to open a macOS tray in a headless run.
-        .arg("--no-menu")
-        .spawn()
-        .expect("failed to spawn `omni-dev daemon run`");
+    let mut child = spawn_daemon(&socket, &dir.path().join("log.jsonl"));
 
     let client = DaemonClient::new(&socket);
 
@@ -74,6 +99,9 @@ async fn daemon_run_status_stop_roundtrip() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    if !ready {
+        let _ = child.kill();
     }
     assert!(ready, "daemon did not become ready");
 
@@ -112,18 +140,7 @@ async fn daemon_run_shuts_down_gracefully_on_sighup() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("d.sock");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_omni-dev"))
-        .arg("daemon")
-        .arg("run")
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--bridge-control-port")
-        .arg("0")
-        .arg("--bridge-ws-port")
-        .arg("0")
-        .arg("--no-menu")
-        .spawn()
-        .expect("failed to spawn `omni-dev daemon run`");
+    let mut child = spawn_daemon(&socket, &dir.path().join("log.jsonl"));
 
     let client = DaemonClient::new(&socket);
     let ready = {
@@ -203,6 +220,9 @@ async fn daemon_start_detaches_into_its_own_session() {
         // with a systemd user manager would install a real unit under the
         // developer's `~/.config` and socket-activate the daemon instead (#1174).
         .env("OMNI_DEV_DAEMON_DISABLE_SYSTEMD", "1")
+        // The detached daemon inherits this; see `spawn_daemon` for why it
+        // must not read the developer's real request log.
+        .env("OMNI_DEV_LOG_FILE", dir.path().join("log.jsonl"))
         .status()
         .expect("failed to run `omni-dev daemon start`");
     assert!(launcher.success(), "daemon start failed: {launcher:?}");
