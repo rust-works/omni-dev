@@ -6,19 +6,27 @@
 //! run used to pay a fresh `gh api graphql` round trip for identical data;
 //! this cache lets a run within [`DEFAULT_TTL`] of the last fetch reuse it.
 //!
-//! One JSON file per item, keyed by `(project, number)`, under the user cache
-//! directory: `<cache_dir>/omni-dev/github-issues/<owner>/<repo>/<number>.json`.
-//! Both [`super::fetch_issues`] and [`super::fetch_items`] build the same
-//! [`IssueDoc`] for an issue, so they share entries; a caller that only
-//! accepts issues filters on [`IssueDoc::kind`] at lookup.
+//! One JSON file per item, keyed by `(project, number)` and namespaced by the
+//! `gh` login that fetched it, under the user cache directory:
+//! `<cache_dir>/omni-dev/github-issues/<account>/<owner>/<repo>/<number>.json`.
+//! `<account>` is a digest of the token `gh` is using (see `account_scope`),
+//! so a different host or a switched `gh` account never reads another's
+//! entries, and no login can be served issue text it could not fetch itself.
+//! The project is lowercased in the path, since GitHub names are
+//! case-insensitive. Both [`super::fetch_issues`] and [`super::fetch_items`]
+//! build the same [`IssueDoc`] for an issue, so they share entries; a caller
+//! that only accepts issues filters on [`IssueDoc::kind`] at lookup.
 //!
 //! The cache is best-effort throughout: a missing, unreadable, corrupt,
-//! old-schema or expired entry is a miss (and is deleted), and a failed write
-//! is logged and ignored, so the worst case is exactly the uncached
-//! behaviour. Not-found results are never cached, so fixing a typo or
-//! granting `gh` access takes effect at once. Entries hold issue text from
-//! possibly private repositories, so [`IssueCache::prune_expired`] sweeps
-//! expired ones each run rather than leaving them on disk indefinitely.
+//! old-schema or expired entry is a miss, and a failed write is logged and
+//! ignored, so the worst case is exactly the uncached behaviour. Not-found
+//! results are never cached, so fixing a typo or granting `gh` access takes
+//! effect at once. Entries hold issue text from possibly private
+//! repositories, so [`IssueCache::prune_expired`] sweeps expired ones (and
+//! the orphaned temp files of a crashed write) each run rather than leaving
+//! them on disk indefinitely. A lookup never deletes: the fetch that follows a
+//! miss overwrites the entry, and leaving removal to the sweep means a reader
+//! can never delete a fresh entry a concurrent writer just renamed into place.
 //!
 //! A flat file rather than a daemon op was a deliberate choice: the usage
 //! pattern is *sequential* re-runs, which a shared file serves fully, while a
@@ -26,6 +34,7 @@
 //! the one extra it offers — deduplicating concurrent in-flight fetches.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -33,6 +42,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::provider::{IssueDoc, ItemRef};
@@ -58,6 +68,17 @@ const SCHEMA: u32 = 1;
 /// The cache's directory under the user cache directory.
 const CACHE_SUBDIR: [&str; 2] = ["omni-dev", "github-issues"];
 
+/// Entries deeper than `<account>/<owner>/<repo>/<file>` are never written, so
+/// the sweep does not descend further.
+const MAX_SWEEP_DEPTH: usize = 4;
+
+/// Extension of an in-flight write's temp file, which is renamed to `.json`.
+const TEMP_EXT: &str = "partial";
+
+/// How long a temp file may sit before the sweep treats it as orphaned by a
+/// crash. Far longer than any write takes, so a live one is never removed.
+const TEMP_GRACE: Duration = Duration::from_secs(3600);
+
 /// One cached item, as stored on disk.
 #[derive(Serialize, Deserialize)]
 struct Entry {
@@ -67,13 +88,17 @@ struct Entry {
     doc: IssueDoc,
 }
 
-/// An [`Entry`]'s header alone, for [`IssueCache::prune_expired`], which
-/// needs only the age and must not reject an entry just because a newer
-/// build's [`IssueDoc`] no longer parses it.
-#[derive(Deserialize)]
-struct EntryHeader {
-    schema: u32,
-    fetched_at: u64,
+/// How much of a run's GitHub input came from the cache.
+///
+/// Reported as `github_cache` in `route` and `verify-decision`'s JSON and YAML
+/// output, and omitted when nothing was reused, so an uncached run serialises
+/// as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CacheUsage {
+    /// How many items were served from the cache.
+    pub items_reused: usize,
+    /// The age in seconds of the oldest of them.
+    pub oldest_age_secs: u64,
 }
 
 /// The GitHub fetch cache shared by `route` and `verify-decision`.
@@ -83,6 +108,10 @@ struct EntryHeader {
 /// silent.
 #[derive(Debug)]
 pub struct IssueCache {
+    /// Everything this cache has ever written, across accounts, for the
+    /// sweep. `None` only when there is no cache directory at all.
+    root: Option<PathBuf>,
+    /// Where this run reads and writes (`root` plus the account digest);
     /// `None` when the cache is disabled.
     dir: Option<PathBuf>,
     ttl: Duration,
@@ -102,8 +131,14 @@ impl IssueCache {
     /// while still writing the fresh copies back.
     #[must_use]
     pub fn new(dir: PathBuf, ttl: Duration, refresh: bool) -> Self {
+        let active = (!ttl.is_zero()).then(|| dir.clone());
+        Self::build(Some(dir), active, ttl, refresh)
+    }
+
+    fn build(root: Option<PathBuf>, dir: Option<PathBuf>, ttl: Duration, refresh: bool) -> Self {
         Self {
-            dir: (!ttl.is_zero()).then_some(dir),
+            root,
+            dir,
             ttl,
             refresh,
             hits: AtomicUsize::new(0),
@@ -115,24 +150,43 @@ impl IssueCache {
     /// A cache that never reads or writes anything.
     #[must_use]
     pub fn disabled() -> Self {
-        Self::new(PathBuf::new(), Duration::ZERO, false)
+        Self::build(None, None, Duration::ZERO, false)
     }
 
     /// The cache configured from `env` (in production, the `SettingsEnv` the
     /// command already loaded), rooted under `base` (`dirs::cache_dir()`).
-    /// With no base directory the cache is disabled.
+    ///
+    /// `account` is the `account_scope` digest of the `gh` login the fetches will
+    /// run as. Without one (`gh` could not say who it is) the cache is
+    /// disabled, since an entry it wrote could later be served to another
+    /// login. With no base directory the cache is disabled too. A zero TTL
+    /// disables reads and writes but keeps the root, so the sweep still
+    /// clears what an earlier run cached.
     #[must_use]
-    pub fn from_env_with(env: &impl EnvSource, base: Option<PathBuf>, refresh: bool) -> Self {
+    pub fn from_env_with(
+        env: &impl EnvSource,
+        base: Option<PathBuf>,
+        account: Option<&str>,
+        refresh: bool,
+    ) -> Self {
         let Some(base) = base else {
             debug!("No user cache directory; the GitHub fetch cache is disabled");
             return Self::disabled();
         };
-        let dir = CACHE_SUBDIR.iter().fold(base, |dir, part| dir.join(part));
-        Self::new(dir, ttl_from_env(env), refresh)
+        let root = CACHE_SUBDIR.iter().fold(base, |dir, part| dir.join(part));
+        let ttl = ttl_from_env(env);
+        let dir = account
+            .filter(|account| is_safe_segment(account))
+            .filter(|_| !ttl.is_zero())
+            .map(|account| root.join(account));
+        if dir.is_none() && !ttl.is_zero() {
+            debug!("No usable gh login; the GitHub fetch cache is disabled");
+        }
+        Self::build(Some(root), dir, ttl, refresh)
     }
 
     /// Returns the cached doc for `item_ref` if it is fresh and `accept`s it,
-    /// counting the reuse.
+    /// counting the reuse. Never deletes: see the module docs.
     pub(super) fn lookup(
         &self,
         item_ref: &ItemRef,
@@ -146,34 +200,27 @@ impl IssueCache {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => {
-                debug!("Ignoring GitHub cache entry {}: {e}", path.display());
+                let shown = path.display();
+                debug!("Ignoring GitHub cache entry {shown}: {e}");
                 return None;
             }
         };
-        // A corrupt or old-layout entry is deleted, and the fetch this miss
-        // triggers rewrites it, so it heals itself; debug, not warn.
+        // A corrupt or old-layout entry is a miss; the fetch it triggers
+        // rewrites it, so it heals itself (debug, not warn).
         let entry = match serde_json::from_slice::<Entry>(&bytes) {
             Ok(entry) if entry.schema == SCHEMA => entry,
-            Ok(_) => {
-                remove_entry(&path);
-                return None;
-            }
+            Ok(_) => return None,
             Err(e) => {
-                debug!(
-                    "Ignoring unreadable GitHub cache entry {}: {e}",
-                    path.display() // omni-dev: coverage ignore-line reason="this continuation of a multi-line debug! call reports 0 hits under llvm-cov regardless of test count — verified locally: a_corrupt_or_old_schema_entry_is_a_miss hits this exact arm (the surrounding debug!( and remove_entry(&path) lines both measure as hit), yet this trailing argument expression never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
-                );
-                remove_entry(&path);
+                let shown = path.display();
+                debug!("Ignoring unreadable GitHub cache entry {shown}: {e}");
                 return None;
             }
         };
-        let Some(age) = self.fresh_age(entry.fetched_at) else {
-            remove_entry(&path);
-            return None;
-        };
+        let age = self.fresh_age(entry.fetched_at)?;
         // A mismatched key or a rejected kind is a miss but still a valid
         // entry (a cached pull request serves `fetch_items`), so it is kept.
-        if entry.doc.project != item_ref.project
+        // GitHub names are case-insensitive, and so is the entry's path.
+        if !entry.doc.project.eq_ignore_ascii_case(&item_ref.project)
             || entry.doc.number != item_ref.number
             || !accept(&entry.doc)
         {
@@ -183,24 +230,35 @@ impl IssueCache {
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.oldest_hit_secs.fetch_max(age, Ordering::Relaxed);
         }
-        Some(entry.doc)
+        // The caller's spelling, so the doc is what an uncached fetch of this
+        // ref would have returned.
+        let mut doc = entry.doc;
+        doc.project.clone_from(&item_ref.project);
+        Some(doc)
     }
 
-    /// Deletes every expired, old-schema or unreadable entry. Best-effort,
-    /// like everything else here; **blocking**, so run it on the same
-    /// blocking thread as the fetch.
+    /// Deletes every expired entry, and every temp file a crashed write
+    /// orphaned. Best-effort, like everything else here; **blocking**, so run
+    /// it on the same blocking thread as the fetch.
+    ///
+    /// Age is the file's mtime, which a write sets to when it stored the entry,
+    /// so the sweep never reads or parses an entry. It covers every account's
+    /// entries, and with a zero TTL it removes them all.
     pub fn prune_expired(&self) {
-        let Some(dir) = &self.dir else {
+        let Some(root) = &self.root else {
             return;
         };
-        for path in entry_files(dir) {
-            let fresh = std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<EntryHeader>(&bytes).ok())
-                .filter(|header| header.schema == SCHEMA)
-                .and_then(|header| self.fresh_age(header.fetched_at))
-                .is_some();
-            if !fresh {
+        for (path, is_temp) in sweep_files(root) {
+            // An unknown age (a vanished file, or an mtime in the future after
+            // the clock moved) is not trusted, as in `fresh_age`; but only an
+            // entry is removed on it, since a temp file may be live.
+            let age = file_age(&path);
+            let expired = if is_temp {
+                age.is_some_and(|age| age >= TEMP_GRACE)
+            } else {
+                age.is_none_or(|age| age.as_secs() >= self.ttl.as_secs())
+            };
+            if expired {
                 remove_entry(&path);
             }
         }
@@ -218,7 +276,7 @@ impl IssueCache {
     fn stored_this_run(&self, project: &str, number: u64) -> bool {
         self.stored
             .lock()
-            .is_ok_and(|stored| stored.contains(&(project.to_string(), number)))
+            .is_ok_and(|stored| stored.contains(&(project.to_ascii_lowercase(), number)))
     }
 
     /// Writes `doc` to the cache. Best-effort: a failure is logged at debug
@@ -230,11 +288,26 @@ impl IssueCache {
         match write_entry(&path, doc) {
             Ok(()) => {
                 if let Ok(mut stored) = self.stored.lock() {
-                    stored.insert((doc.project.clone(), doc.number));
+                    stored.insert((doc.project.to_ascii_lowercase(), doc.number));
                 }
             }
-            Err(e) => debug!("Failed to cache {}#{}: {e:#}", doc.project, doc.number),
+            Err(e) => {
+                let (project, number) = (&doc.project, doc.number);
+                debug!("Failed to cache {project}#{number}: {e:#}");
+            }
         }
+    }
+
+    /// What this run reused, for the machine-readable output, or `None` when
+    /// it reused nothing. The stderr [`reuse_note`](Self::reuse_note) is the
+    /// human's copy of the same facts; a script reading only stdout needs this.
+    #[must_use]
+    pub fn usage(&self) -> Option<CacheUsage> {
+        let items_reused = self.hits.load(Ordering::Relaxed);
+        (items_reused > 0).then(|| CacheUsage {
+            items_reused,
+            oldest_age_secs: self.oldest_hit_secs.load(Ordering::Relaxed),
+        })
     }
 
     /// A one-line note for stderr when this run reused cached items, naming
@@ -252,10 +325,12 @@ impl IssueCache {
         ))
     }
 
-    /// The entry file for `project#number`, or `None` when the cache is
-    /// disabled or `project` isn't a pair of path-safe segments.
+    /// The entry file for `project#number` (lowercased, as GitHub names are
+    /// case-insensitive), or `None` when the cache is disabled or `project`
+    /// isn't a pair of path-safe segments.
     fn entry_path(&self, project: &str, number: u64) -> Option<PathBuf> {
         let dir = self.dir.as_ref()?;
+        let project = project.to_ascii_lowercase();
         let (owner, repo) = project.split_once('/')?;
         if !is_safe_segment(owner) || !is_safe_segment(repo) {
             return None;
@@ -273,10 +348,8 @@ fn ttl_from_env(env: &impl EnvSource) -> Duration {
     match raw.trim().parse::<u64>() {
         Ok(secs) => Duration::from_secs(secs),
         Err(e) => {
-            warn!(
-                "Ignoring {GITHUB_CACHE_TTL_ENV}={raw:?} ({e}); using {}s",
-                DEFAULT_TTL.as_secs() // omni-dev: coverage ignore-line reason="this continuation of a multi-line warn! call reports 0 hits under llvm-cov regardless of test count — verified locally: env_ttl_defaults_parses_and_ignores_garbage hits this exact arm (the surrounding warn!( line and the DEFAULT_TTL return right after both measure as hit), yet this trailing argument expression never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
-            );
+            let default = DEFAULT_TTL.as_secs();
+            warn!("Ignoring {GITHUB_CACHE_TTL_ENV}={raw:?} ({e}); using {default}s");
             DEFAULT_TTL
         }
     }
@@ -306,8 +379,12 @@ fn write_entry(path: &Path, doc: &IssueDoc) -> Result<()> {
         doc: doc.clone(),
     };
     // `NamedTempFile` is created `0600` on Unix with a random name, so two
-    // processes caching the same item never share a temp file.
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+    // processes caching the same item never share a temp file. Its name is
+    // recognisable (`TEMP_EXT`) so the sweep can remove one a crash orphaned.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".entry-")
+        .suffix(&format!(".{TEMP_EXT}"))
+        .tempfile_in(dir)
         .with_context(|| format!("Failed to create a temp file in {}", dir.display()))?;
     serde_json::to_writer(&mut tmp, &entry).context("Failed to serialise cache entry")?;
     tmp.persist(path)
@@ -315,38 +392,68 @@ fn write_entry(path: &Path, doc: &IssueDoc) -> Result<()> {
     Ok(())
 }
 
-/// Deletes one entry, best-effort: a failure only means the entry is tried
-/// again on the next read or prune.
+/// Deletes one file, best-effort: a failure only means it is tried again on
+/// the next sweep.
 fn remove_entry(path: &Path) {
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            debug!(
-                "Failed to remove GitHub cache entry {}: {e}",
-                path.display() // omni-dev: coverage ignore-line reason="this continuation of a multi-line debug! call reports 0 hits under llvm-cov regardless of test count — verified locally: remove_entry_logs_and_ignores_a_non_not_found_failure hits this exact arm (the enclosing if e.kind() != NotFound check and the debug!( line both measure as hit), yet this trailing argument expression never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
-            );
-        } // omni-dev: coverage ignore-line reason="this closing brace reports 0 hits under llvm-cov regardless of test count — verified locally: remove_entry_logs_and_ignores_a_non_not_found_failure hits the if e.kind() != NotFound check and the debug!(...) call above (both measure as hit), yet this specific brace, closing that check, never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            let shown = path.display();
+            debug!("Failed to remove GitHub cache file {shown}: {e}");
+        }
+        _ => {}
     }
 }
 
-/// Every `<owner>/<repo>/<number>.json` file under `dir`. Temp files from an
-/// in-flight write (`.tmp*`, no `.json` extension) are skipped.
-fn entry_files(dir: &Path) -> Vec<PathBuf> {
-    let subdirs = |dir: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .collect()
-    };
-    subdirs(dir)
-        .iter()
-        .filter(|owner| owner.is_dir())
-        .flat_map(|owner| subdirs(owner))
-        .filter(|repo| repo.is_dir())
-        .flat_map(|repo| subdirs(&repo))
-        .filter(|file| file.extension().is_some_and(|ext| ext == "json"))
-        .collect()
+/// How long ago `path` was last written, or `None` if that is unknown (the
+/// file is gone, or its mtime is in the future).
+fn file_age(path: &Path) -> Option<Duration> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    SystemTime::now().duration_since(modified).ok()
+}
+
+/// Every regular file the cache could have written under `root` — an entry
+/// (`*.json`, `false`) or an in-flight write's temp file (`true`) — down to
+/// [`MAX_SWEEP_DEPTH`] levels. Anything else is left alone, and symlinks are
+/// never followed.
+fn sweep_files(root: &Path) -> Vec<(PathBuf, bool)> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, bool)>) {
+        let Ok(children) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for child in children.flatten() {
+            let path = child.path();
+            let Ok(kind) = child.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if depth < MAX_SWEEP_DEPTH {
+                    walk(&path, depth + 1, out);
+                }
+            } else if kind.is_file() {
+                match path.extension().and_then(|ext| ext.to_str()) {
+                    Some("json") => out.push((path, false)),
+                    Some(TEMP_EXT) => out.push((path, true)),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, 1, &mut out);
+    out
+}
+
+/// The cache namespace for one `gh` login: a digest of `token`, which `gh
+/// auth token` prints for the account and host `gh` is currently using, so a
+/// switched account or another host lands in a different directory. Only the
+/// digest is kept; the token itself is never stored or logged.
+#[must_use]
+pub fn account_scope(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    digest[..8].iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
 }
 
 fn now_secs() -> u64 {
@@ -456,39 +563,106 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_entry_is_a_miss_and_is_deleted() {
+    fn an_expired_entry_is_a_miss_and_is_left_for_the_sweep() {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache(dir.path());
         cache.store(&doc("o/r", 7, ItemKind::Issue));
         backdate(dir.path(), "o/r", 7, 300);
         assert!(cache.lookup(&item_ref("o/r", 7), |_| true).is_none());
         assert!(cache.reuse_note().is_none());
-        assert!(!cache.entry_path("o/r", 7).unwrap().exists());
+        // A lookup must not delete: it could be racing a writer's rename.
+        assert!(cache.entry_path("o/r", 7).unwrap().exists());
+    }
+
+    /// Sets `path`'s mtime to `secs_ago` seconds in the past (negative: the
+    /// future), which is what the sweep reads.
+    fn set_age(path: &Path, secs_ago: i64) {
+        let now = SystemTime::now();
+        let by = Duration::from_secs(secs_ago.unsigned_abs());
+        let at = if secs_ago >= 0 { now - by } else { now + by };
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
     }
 
     #[test]
-    fn prune_removes_expired_old_and_corrupt_entries_only() {
+    fn prune_removes_entries_older_than_the_ttl_only() {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache(dir.path());
-        for number in 1..=4 {
+        for number in 1..=3 {
             cache.store(&doc("o/r", number, ItemKind::Issue));
         }
-        backdate(dir.path(), "o/r", 2, 3600);
         let path = |n| cache.entry_path("o/r", n).unwrap();
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path(3)).unwrap()).unwrap();
-        value["schema"] = serde_json::json!(SCHEMA + 1);
-        std::fs::write(path(3), value.to_string()).unwrap();
-        std::fs::write(path(4), "{not json").unwrap();
-        let temp = dir.path().join("o/r/.tmpXYZ");
-        std::fs::write(&temp, "in flight").unwrap();
+        set_age(&path(2), 3600);
+        set_age(&path(3), -3600);
+        let bystander = dir.path().join("o/r/notes.txt");
+        std::fs::write(&bystander, "not ours").unwrap();
+        set_age(&bystander, 86_400);
 
         cache.prune_expired();
         assert!(path(1).exists());
-        assert!(!path(2).exists());
-        assert!(!path(3).exists());
-        assert!(!path(4).exists());
-        assert!(temp.exists(), "an in-flight temp file is never pruned");
+        assert!(!path(2).exists(), "expired");
+        assert!(!path(3).exists(), "an mtime in the future is not trusted");
+        assert!(bystander.exists(), "only the cache's own files are swept");
+    }
+
+    #[test]
+    fn prune_removes_a_crashed_writes_temp_file_but_not_a_live_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path());
+        cache.store(&doc("o/r", 1, ItemKind::Issue));
+        let repo_dir = dir.path().join("o/r");
+        let orphan = repo_dir.join(format!(".entry-abc.{TEMP_EXT}"));
+        let live = repo_dir.join(format!(".entry-def.{TEMP_EXT}"));
+        std::fs::write(&orphan, "issue text").unwrap();
+        std::fs::write(&live, "issue text").unwrap();
+        set_age(&orphan, i64::try_from(TEMP_GRACE.as_secs()).unwrap() + 60);
+
+        cache.prune_expired();
+        assert!(!orphan.exists(), "an orphaned temp file holds issue text");
+        assert!(live.exists(), "an in-flight write is never pruned");
+    }
+
+    #[test]
+    fn a_write_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        cache(dir.path()).store(&doc("o/r", 1, ItemKind::Issue));
+        let names: Vec<_> = std::fs::read_dir(dir.path().join("o/r"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["1.json"]);
+    }
+
+    #[test]
+    fn prune_sweeps_every_accounts_entries_and_a_zero_ttl_sweeps_them_all() {
+        let base = tempfile::tempdir().unwrap();
+        let env = MapEnv::new();
+        let open = |env: &MapEnv, account: &str| {
+            IssueCache::from_env_with(env, Some(base.path().to_path_buf()), Some(account), false)
+        };
+        let (a, b) = (open(&env, "aaaa"), open(&env, "bbbb"));
+        a.store(&doc("o/r", 1, ItemKind::Issue));
+        b.store(&doc("o/r", 1, ItemKind::Issue));
+        let (path_a, path_b) = (
+            a.entry_path("o/r", 1).unwrap(),
+            b.entry_path("o/r", 1).unwrap(),
+        );
+        set_age(&path_a, 3600);
+
+        b.prune_expired();
+        assert!(!path_a.exists(), "another account's expired entry");
+        assert!(path_b.exists());
+
+        // TTL 0 turns reads and writes off but must still clear the root:
+        // what an earlier run cached is private text nothing else will delete.
+        let off = open(&MapEnv::new().with(GITHUB_CACHE_TTL_ENV, "0"), "bbbb");
+        assert!(off.dir.is_none());
+        off.prune_expired();
+        assert!(!path_b.exists());
     }
 
     #[test]
@@ -648,7 +822,8 @@ mod tests {
     #[test]
     fn env_ttl_defaults_parses_and_ignores_garbage() {
         let base = Some(PathBuf::from("/cache"));
-        let ttl = |env: &MapEnv| IssueCache::from_env_with(env, base.clone(), false).ttl;
+        let ttl =
+            |env: &MapEnv| IssueCache::from_env_with(env, base.clone(), Some("acct"), false).ttl;
         assert_eq!(ttl(&MapEnv::new()), DEFAULT_TTL);
         assert_eq!(
             ttl(&MapEnv::new().with(GITHUB_CACHE_TTL_ENV, "60")),
@@ -665,21 +840,103 @@ mod tests {
         let off = IssueCache::from_env_with(
             &MapEnv::new().with(GITHUB_CACHE_TTL_ENV, "0"),
             Some(PathBuf::from("/cache")),
+            Some("acct"),
             false,
         );
         assert!(off.dir.is_none());
-        assert!(IssueCache::from_env_with(&MapEnv::new(), None, false)
-            .dir
-            .is_none());
+        assert!(
+            IssueCache::from_env_with(&MapEnv::new(), None, Some("acct"), false)
+                .dir
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_usable_gh_login_disables_the_cache_but_keeps_the_root_to_sweep() {
+        let base = Some(PathBuf::from("/cache"));
+        for account in [None, Some(""), Some(".."), Some("a/b")] {
+            let cache = IssueCache::from_env_with(&MapEnv::new(), base.clone(), account, false);
+            assert!(cache.dir.is_none(), "{account:?}");
+            assert!(cache.root.is_some(), "{account:?}");
+        }
     }
 
     #[test]
     fn the_cache_lives_under_omni_dev_github_issues() {
-        let cache = IssueCache::from_env_with(&MapEnv::new(), Some(PathBuf::from("/c")), false);
+        let cache = IssueCache::from_env_with(
+            &MapEnv::new(),
+            Some(PathBuf::from("/c")),
+            Some("0123abcd"),
+            false,
+        );
         assert_eq!(
             cache.entry_path("o/r", 7).unwrap(),
-            Path::new("/c/omni-dev/github-issues/o/r/7.json")
+            Path::new("/c/omni-dev/github-issues/0123abcd/o/r/7.json")
         );
+    }
+
+    #[test]
+    fn a_different_gh_login_never_reads_an_entry_it_could_not_have_fetched() {
+        let base = tempfile::tempdir().unwrap();
+        let open = |account: &str| {
+            IssueCache::from_env_with(
+                &MapEnv::new(),
+                Some(base.path().to_path_buf()),
+                Some(account),
+                false,
+            )
+        };
+        open(&account_scope("token-a")).store(&doc("o/r", 7, ItemKind::Issue));
+        let item = item_ref("o/r", 7);
+        assert!(open(&account_scope("token-a"))
+            .lookup(&item, |_| true)
+            .is_some());
+        assert!(open(&account_scope("token-b"))
+            .lookup(&item, |_| true)
+            .is_none());
+    }
+
+    #[test]
+    fn the_account_scope_is_a_stable_path_safe_digest_that_hides_the_token() {
+        let scope = account_scope("gho_secret");
+        assert_eq!(scope, account_scope("gho_secret"));
+        assert_ne!(scope, account_scope("gho_other"));
+        assert_eq!(scope.len(), 16);
+        assert!(
+            is_safe_segment(&scope) && !scope.contains("secret"),
+            "{scope}"
+        );
+    }
+
+    #[test]
+    fn owner_and_repo_case_share_one_entry_and_the_callers_spelling_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path());
+        cache.store(&doc("Rust-Works/Omni-Dev", 1, ItemKind::Issue));
+        for spelling in [
+            "Rust-Works/Omni-Dev",
+            "rust-works/omni-dev",
+            "RUST-WORKS/omni-dev",
+        ] {
+            let served = cache.lookup(&item_ref(spelling, 1), |_| true).unwrap();
+            assert_eq!(served.project, spelling);
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn usage_reports_the_count_and_oldest_age_for_machine_readable_output() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(cache(dir.path()).usage(), None);
+        cache(dir.path()).store(&doc("o/r", 1, ItemKind::Issue));
+        cache(dir.path()).store(&doc("o/r", 2, ItemKind::Issue));
+        backdate(dir.path(), "o/r", 2, 150);
+        let cache = cache(dir.path());
+        assert!(cache.lookup(&item_ref("o/r", 1), |_| true).is_some());
+        assert!(cache.lookup(&item_ref("o/r", 2), |_| true).is_some());
+        let usage = cache.usage().unwrap();
+        assert_eq!(usage.items_reused, 2);
+        assert!((150..=152).contains(&usage.oldest_age_secs), "{usage:?}");
     }
 
     #[test]

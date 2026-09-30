@@ -15,7 +15,7 @@ use crate::jev::verify::{
 };
 use crate::provider::{Comment, IssueDoc};
 
-use super::common::{format_output, JevFormat};
+use super::common::{format_output_with_cache, JevFormat};
 
 /// Checks a decision comment against the issues or pull requests it cites.
 #[derive(Parser)]
@@ -107,14 +107,15 @@ impl VerifyDecisionCommand {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let issue_arg = self.issue;
 
-        let cache = std::sync::Arc::new(IssueCache::from_env_with(
-            &env,
+        let cache = crate::github_issues::open_cache_blocking(
+            env,
             dirs::cache_dir(),
+            bin.clone(),
             self.refresh,
-        ));
+        )
+        .await?;
         let fetch_cache = std::sync::Arc::clone(&cache);
         let fetched = tokio::task::spawn_blocking(move || {
-            fetch_cache.prune_expired();
             fetch_input(&bin, &fetch_cache, &cwd, &issue_arg, &selector)
         })
         .await
@@ -133,7 +134,10 @@ impl VerifyDecisionCommand {
             max_input_chars: self.max_input_chars,
         };
         let report = run_verify(&jev, &ai, &issue, &comment, &citations, &sources, &opts).await?;
-        print!("{}", format_output(&report, self.output)?);
+        print!(
+            "{}",
+            format_output_with_cache(&report, cache.usage(), self.output)?
+        );
         Ok(())
         // omni-dev: coverage end
     }

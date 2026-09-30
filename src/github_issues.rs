@@ -18,13 +18,14 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::provider::{Comment, GitProvider, IssueDoc, ItemKind, ItemRef, ItemState};
+use crate::utils::env::EnvSource;
 
 mod cache;
 
-pub use cache::{IssueCache, DEFAULT_TTL as DEFAULT_CACHE_TTL, GITHUB_CACHE_TTL_ENV};
+pub use cache::{CacheUsage, IssueCache, DEFAULT_TTL as DEFAULT_CACHE_TTL, GITHUB_CACHE_TTL_ENV};
 
 /// Most issues resolved by one `gh api graphql` call. Each issue carries up
 /// to [`MAX_COMMENTS`] comment bodies, so an unbounded `--all-open` query on a
@@ -712,27 +713,12 @@ pub fn fetch_issues_cached(
     cache: &IssueCache,
     refs: &[ItemRef],
 ) -> Result<Vec<IssueDoc>> {
-    let mut found: Vec<Option<IssueDoc>> = refs
-        .iter()
-        .map(|item_ref| cache.lookup(item_ref, |doc| doc.kind == ItemKind::Issue))
-        .collect();
-    let misses = missing_refs(refs, &found);
-    if !misses.is_empty() {
-        let mut fetched = fetch_issues(bin, &misses)?.into_iter();
-        for slot in found.iter_mut().filter(|slot| slot.is_none()) {
-            let doc = fetched
-                .next()
-                .context("fetch_issues returned fewer issues than asked for (bug)")?;
-            cache.store(&doc);
-            *slot = Some(doc);
-        }
-    }
-    refs.iter()
-        .zip(found)
-        .map(|(item_ref, doc)| {
-            doc.ok_or_else(|| anyhow!("issue {item_ref} missing after the fetch (bug)"))
-        })
-        .collect()
+    fetch_through_cache(
+        refs,
+        |item_ref| cache.lookup(item_ref, |doc| doc.kind == ItemKind::Issue),
+        |misses| fetch_issues(bin, misses),
+        |doc| cache.store(doc),
+    )
 }
 
 /// [`fetch_issues`], always from GitHub, writing the result through to `cache`.
@@ -758,24 +744,116 @@ pub fn fetch_items_cached(
     cache: &IssueCache,
     refs: &[ItemRef],
 ) -> Result<Vec<Option<IssueDoc>>> {
-    let mut found: Vec<Option<Option<IssueDoc>>> = refs
-        .iter()
-        .map(|item_ref| cache.lookup(item_ref, |_| true).map(Some))
-        .collect();
-    let misses = missing_refs(refs, &found);
-    if !misses.is_empty() {
-        let mut fetched = fetch_items(bin, &misses)?.into_iter();
-        for slot in found.iter_mut().filter(|slot| slot.is_none()) {
-            let doc = fetched
-                .next()
-                .context("fetch_items returned fewer items than asked for (bug)")?;
-            if let Some(doc) = &doc {
+    fetch_through_cache(
+        refs,
+        |item_ref| cache.lookup(item_ref, |_| true).map(Some),
+        |misses| fetch_items(bin, misses),
+        |doc| {
+            if let Some(doc) = doc {
                 cache.store(doc);
             }
-            *slot = Some(doc);
+        },
+    )
+}
+
+/// The lookup / fetch-the-misses / store / restore-caller-order sequence
+/// shared by [`fetch_issues_cached`] and [`fetch_items_cached`], which differ
+/// only in the slot type (`IssueDoc` or `Option<IssueDoc>`).
+///
+/// `lookup` serves one ref from the cache, `fetch` fetches exactly the refs
+/// that missed (in order), and `store` caches each fetched slot.
+fn fetch_through_cache<T>(
+    refs: &[ItemRef],
+    lookup: impl Fn(&ItemRef) -> Option<T>,
+    fetch: impl FnOnce(&[ItemRef]) -> Result<Vec<T>>,
+    store: impl Fn(&T),
+) -> Result<Vec<T>> {
+    let mut found: Vec<Option<T>> = refs.iter().map(lookup).collect();
+    let misses = missing_refs(refs, &found);
+    if !misses.is_empty() {
+        let mut fetched = fetch(&misses)?.into_iter();
+        for slot in found.iter_mut().filter(|slot| slot.is_none()) {
+            let item = fetched
+                .next()
+                .context("the fetch returned fewer items than asked for (bug)")?;
+            store(&item);
+            *slot = Some(item);
         }
-    } // omni-dev: coverage ignore-line reason="this closing brace reports 0 hits under llvm-cov regardless of test count — verified locally: fetch_items_cached_shares_entries_with_fetch_issues_cached and fetch_items_cached_does_not_cache_a_not_found_item both complete the block above (the for loop's own closing brace on the line before, and the following Ok(...) line, both measure as hit), yet this specific brace, closing the misses.is_empty() check, never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
-    Ok(found.into_iter().map(Option::flatten).collect())
+    }
+    refs.iter()
+        .zip(found)
+        .map(|(item_ref, item)| {
+            item.ok_or_else(|| anyhow!("item {item_ref} missing after the fetch (bug)"))
+        })
+        .collect()
+}
+
+/// The `account_scope` digest of the `gh` login the fetches
+/// will run as.
+///
+/// `None` if `gh` can't say (not installed, not logged in), in which case the
+/// cache stays off: an entry could later be served to a different login.
+/// **Blocking.**
+#[must_use]
+pub fn auth_scope(bin: &Path) -> Option<String> {
+    match checked_auth_scope(bin) {
+        Ok(scope) => Some(scope),
+        Err(e) => {
+            debug!("No usable gh login for the GitHub fetch cache: {e:#}");
+            None
+        }
+    }
+}
+
+/// [`auth_scope`] with the reason it failed. Asks `gh auth token`, which
+/// honours `GH_HOST`, `GH_TOKEN` and the active `gh auth switch` account
+/// exactly as `gh api` does, and reads local config only (no network). The
+/// token is digested at once and never logged.
+fn checked_auth_scope(bin: &Path) -> Result<String> {
+    let output = crate::github_metrics::run_gh(bin, ["auth", "token"], "auth token", None)
+        .with_context(|| format!("Failed to run {} auth token", bin.display()))?;
+    if !output.status.success() {
+        bail!("gh auth token failed (is `gh` logged in?)");
+    }
+    let token = String::from_utf8_lossy(&output.stdout);
+    let token = token.trim();
+    if token.is_empty() {
+        bail!("gh auth token printed no token");
+    }
+    Ok(cache::account_scope(token))
+}
+
+/// The cache `route` and `verify-decision` fetch through.
+///
+/// Configured from `env`, rooted under `base` (`dirs::cache_dir()`),
+/// namespaced to the `gh` login (see [`auth_scope`]), and swept of expired
+/// entries. **Blocking.**
+#[must_use]
+pub fn open_cache(
+    env: &impl EnvSource,
+    base: Option<std::path::PathBuf>,
+    bin: &Path,
+    refresh: bool,
+) -> IssueCache {
+    let cache = IssueCache::from_env_with(env, base, auth_scope(bin).as_deref(), refresh);
+    cache.prune_expired();
+    cache
+}
+
+/// [`open_cache`] on a blocking thread, shared by the two commands that
+/// fetch through the cache.
+pub async fn open_cache_blocking<E>(
+    env: E,
+    base: Option<std::path::PathBuf>,
+    bin: std::path::PathBuf,
+    refresh: bool,
+) -> Result<std::sync::Arc<IssueCache>>
+where
+    E: EnvSource + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || std::sync::Arc::new(open_cache(&env, base, &bin, refresh)))
+        .await
+        .context("GitHub cache setup task panicked")
 }
 
 /// The refs whose `found` slot is still empty, in order.
@@ -1612,6 +1690,122 @@ mod tests {
             2,
             "the refreshed copy is reused later"
         );
+    }
+
+    fn cached_doc(project: &str, number: u64) -> IssueDoc {
+        IssueDoc {
+            provider: GitProvider::GitHub,
+            project: project.to_string(),
+            number,
+            kind: ItemKind::Issue,
+            title: "t".to_string(),
+            state: ItemState::Open,
+            body: "b".to_string(),
+            comments: Vec::new(),
+            closed_by: Vec::new(),
+            url: "u".to_string(),
+        }
+    }
+
+    /// Runs the shim once so its first `execve` (which can hit `ETXTBSY`, and
+    /// which `auth_scope` would swallow into `None`) is behind us.
+    fn warm(bin: &Path) {
+        let _ = retry_on_etxtbsy(|| checked_auth_scope(bin).or_else(|_| Ok(String::new())));
+    }
+
+    #[test]
+    fn auth_scope_digests_the_token_gh_reports_and_never_returns_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(dir.path(), "gho_secret_token", 0);
+        let scope = retry_on_etxtbsy(|| checked_auth_scope(&bin)).unwrap();
+        assert_eq!(scope, cache::account_scope("gho_secret_token"));
+        assert!(!scope.contains("secret"), "{scope}");
+        assert_eq!(auth_scope(&bin), Some(scope));
+    }
+
+    #[test]
+    fn auth_scope_is_none_when_gh_cannot_say_who_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(auth_scope(Path::new("/no/such/gh/xyzzy")).is_none());
+        let (failing, _shim) = fake_gh(dir.path(), "not logged in", 1);
+        warm(&failing);
+        assert!(auth_scope(&failing).is_none());
+    }
+
+    #[test]
+    fn auth_scope_is_none_when_gh_prints_no_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (silent, _shim) = fake_gh(dir.path(), "", 0);
+        warm(&silent);
+        assert!(auth_scope(&silent).is_none());
+    }
+
+    #[test]
+    fn open_cache_is_namespaced_to_the_login_and_sweeps_expired_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let env = crate::test_support::env::MapEnv::new();
+        let (bin, _shim) = fake_gh(dir.path(), "token-a", 0);
+        warm(&bin);
+        let open = || open_cache(&env, Some(base.path().to_path_buf()), &bin, false);
+
+        open().store(&cached_doc("o/r", 1));
+        let entry = base
+            .path()
+            .join("omni-dev/github-issues")
+            .join(cache::account_scope("token-a"))
+            .join("o/r/1.json");
+        assert!(entry.exists(), "{entry:?}");
+
+        // A later run, past the TTL, sweeps it on open.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&entry)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let _later = open();
+        assert!(!entry.exists());
+    }
+
+    #[test]
+    fn open_cache_is_off_without_a_gh_login() {
+        let base = tempfile::tempdir().unwrap();
+        let env = crate::test_support::env::MapEnv::new();
+        let cache = open_cache(
+            &env,
+            Some(base.path().to_path_buf()),
+            Path::new("/no/such/gh/xyzzy"),
+            false,
+        );
+        cache.store(&cached_doc("o/r", 1));
+        assert_eq!(std::fs::read_dir(base.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn open_cache_blocking_opens_the_same_cache_from_async() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh(dir.path(), "token-a", 0);
+        warm(&bin);
+        let cache = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(open_cache_blocking(
+                crate::test_support::env::MapEnv::new(),
+                Some(base.path().to_path_buf()),
+                bin,
+                false,
+            ))
+            .unwrap();
+        cache.store(&cached_doc("o/r", 1));
+        assert!(base
+            .path()
+            .join("omni-dev/github-issues")
+            .join(cache::account_scope("token-a"))
+            .join("o/r/1.json")
+            .exists());
     }
 
     #[test]

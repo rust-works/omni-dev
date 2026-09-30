@@ -1416,10 +1416,18 @@ flags or prompts, so each item they fetch is cached on disk and reused for a
 few minutes instead of being queried again ([#1858](https://github.com/rust-works/omni-dev/issues/1858)).
 
 - **What is cached:** each fetched issue or pull request, as one JSON file at
-  `<cache dir>/omni-dev/github-issues/<owner>/<repo>/<number>.json`. The cache
-  dir is `~/Library/Caches` on macOS and `$XDG_CACHE_HOME` (or `~/.cache`) on
-  Linux. `route` and `verify-decision` share entries, so a cited issue
-  that `route` fetched is reused by `verify-decision`, and the other way round.
+  `<cache dir>/omni-dev/github-issues/<account>/<owner>/<repo>/<number>.json`.
+  The cache dir is `~/Library/Caches` on macOS and `$XDG_CACHE_HOME` (or
+  `~/.cache`) on Linux. `route` and `verify-decision` share entries, so a cited
+  issue that `route` fetched is reused by `verify-decision`, and the other way
+  round. Owner and repository names are lowercased in the path, since GitHub
+  treats them case-insensitively.
+- **Per `gh` login:** `<account>` is a short digest of the token `gh auth
+  token` reports, so switching `gh` accounts (or `GH_HOST`, or `GH_TOKEN`)
+  starts from an empty cache and never reads issue text the current login
+  could not fetch itself. If `gh` can't say who it is (not installed, not
+  logged in) the cache is off for that run. Only the digest is stored; the
+  token is never written or logged.
 - **What is always fetched fresh:**
   - `verify-decision`'s own issue. Its comments are what gets checked, and a
     cached copy would silently miss a decision comment posted since. The fresh
@@ -1439,15 +1447,23 @@ few minutes instead of being queried again ([#1858](https://github.com/rust-work
   the fresh copies. Use it after closing, reopening or commenting on an issue
   you're about to route.
 - **Knowing when it was used:** when a run reuses anything, it says so on
-  stderr, and stdout is unchanged:
+  stderr:
   `note: reused 2 cached GitHub items, up to 3m old; pass --refresh to re-fetch`.
+  The JSON and YAML output also gain a top-level `github_cache` object, so a
+  script that reads only stdout can tell too:
+  `"github_cache": {"items_reused": 2, "oldest_age_secs": 180}`. It is absent
+  when nothing was reused, so an uncached run prints exactly what it always
+  did. The `text` format of `route` has only the stderr note.
 
 The cache is best-effort. An unreadable, corrupt or expired entry is fetched
 again, and a failed write is ignored, so at worst a run behaves as if there
 were no cache. Entries hold issue text, including text from private
 repositories. They are written readable by you alone (`0600` files in `0700`
-directories), and each run deletes the expired ones. Setting the TTL to `0`
-stops the sweep too, so remove the directory to clear what is left.
+directories). Each run sweeps the whole cache directory, deleting entries older
+than the TTL (by file modification time, for every account) and any temp file
+a crashed write left behind. The sweep runs even with the TTL set to `0`, which
+therefore clears everything a previous run cached. A lookup never deletes an
+entry itself, so two runs at once cannot delete each other's fresh copy.
 
 ## Retries and timeouts
 

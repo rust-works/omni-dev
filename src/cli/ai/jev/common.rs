@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::Serialize;
 
+use crate::github_issues::CacheUsage;
 use crate::jev::protocol::{Answer, SystemOneResponse, Usage};
 
 /// Output format selector for `ai jev` subcommands.
@@ -146,6 +147,37 @@ pub(super) fn format_output<T: Serialize>(value: &T, format: JevFormat) -> Resul
     }
 }
 
+/// A report with `github_cache` flattened beside its own fields.
+///
+/// Tells a script that read stdout only that some of the GitHub input was
+/// reused from the cache (#1858). The stderr note carries the same for a human.
+#[derive(Serialize)]
+struct WithGithubCache<'a, T> {
+    #[serde(flatten)]
+    report: &'a T,
+    github_cache: CacheUsage,
+}
+
+/// [`format_output`] for a report whose GitHub input may have come from the
+/// cache: `cache_use` is added as `github_cache`, and omitted when `None`, so
+/// a run that reused nothing prints exactly what it did before the cache.
+pub(super) fn format_output_with_cache<T: Serialize>(
+    value: &T,
+    cache_use: Option<CacheUsage>,
+    format: JevFormat,
+) -> Result<String> {
+    match cache_use {
+        Some(github_cache) => format_output(
+            &WithGithubCache {
+                report: value,
+                github_cache,
+            },
+            format,
+        ),
+        None => format_output(value, format),
+    }
+}
+
 /// Test-only helpers shared by every leaf's test module.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -178,6 +210,32 @@ mod tests {
                 output_tokens: 2,
             },
         }
+    }
+
+    #[test]
+    fn github_cache_usage_is_flattened_beside_the_report_and_only_when_present() {
+        let response = sample_response();
+        let usage = CacheUsage {
+            items_reused: 3,
+            oldest_age_secs: 150,
+        };
+
+        let plain = format_output_with_cache(&response, None, JevFormat::Json).unwrap();
+        assert_eq!(plain, format_output(&response, JevFormat::Json).unwrap());
+        assert!(!plain.contains("github_cache"), "{plain}");
+
+        let json = format_output_with_cache(&response, Some(usage), JevFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["model"], "jev-1.13.0", "the report's own fields stay");
+        assert_eq!(
+            value["github_cache"],
+            serde_json::json!({"items_reused": 3, "oldest_age_secs": 150})
+        );
+
+        let yaml = format_output_with_cache(&response, Some(usage), JevFormat::Yaml).unwrap();
+        assert!(yaml.contains("github_cache:"), "{yaml}");
+        assert!(yaml.contains("items_reused: 3"), "{yaml}");
+        assert!(yaml.contains("model: jev-1.13.0"), "{yaml}");
     }
 
     #[test]
