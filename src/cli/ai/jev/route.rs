@@ -9,7 +9,7 @@ use clap::Parser;
 
 use crate::github_issues::{
     fetch_issues_cached, fetch_items_cached, list_open_issue_numbers, needs_default_project,
-    parse_issue_arg, resolve_current_project, IssueCache,
+    parse_issue_arg, resolve_current_project, CacheUsage, IssueCache,
 };
 use crate::jev::citations::{find_citations, Citation};
 use crate::jev::client::JevClient;
@@ -23,7 +23,7 @@ use crate::jev::route::{
 use crate::provider::{GitProvider, IssueDoc, ItemKind, ItemRef, ItemState};
 use crate::utils::env::{EnvSource, SystemEnv};
 
-use super::common::{format_output, JevFormat};
+use super::common::{format_output_with_cache, JevFormat};
 
 /// Output format for `route`.
 ///
@@ -171,14 +171,15 @@ impl RouteCommand {
             self.max_input_chars,
             self.ignore_closed,
         );
-        let cache = std::sync::Arc::new(IssueCache::from_env_with(
-            &env,
+        let cache = crate::github_issues::open_cache_blocking(
+            env,
             dirs::cache_dir(),
+            bin.clone(),
             self.refresh,
-        ));
+        )
+        .await?;
         let fetch_cache = std::sync::Arc::clone(&cache);
         let fetched = tokio::task::spawn_blocking(move || {
-            fetch_cache.prune_expired();
             fetch_docs(
                 &bin,
                 &fetch_cache,
@@ -214,6 +215,7 @@ impl RouteCommand {
                 self.max_input_chars,
                 &ladders,
                 terminal_style(),
+                cache.usage(),
             )?
         );
         failure_summary(&report).map_or(Ok(()), |msg| bail!(msg))
@@ -236,14 +238,18 @@ impl RouteCommand {
 /// [`RouteCommand::execute`] so the format dispatch is unit-testable without
 /// a Jev client or a `gh` binary — `execute` itself stays an untested thin
 /// shell, per the project's `run_*` convention (STYLE-0025).
+///
+/// `cache_use` becomes `github_cache` in JSON and YAML; the text format is for
+/// people, who get the same fact from the stderr note.
 fn render_output(
     report: &RouteReport,
     output: RouteFormat,
     max_input_chars: usize,
+    cache_use: Option<CacheUsage>,
 ) -> Result<String> {
     Ok(match output {
-        RouteFormat::Json => format_output(report, JevFormat::Json)?,
-        RouteFormat::Yaml => format_output(report, JevFormat::Yaml)?,
+        RouteFormat::Json => format_output_with_cache(report, cache_use, JevFormat::Json)?,
+        RouteFormat::Yaml => format_output_with_cache(report, cache_use, JevFormat::Yaml)?,
         RouteFormat::Text => render_route_text(report, max_input_chars),
     })
 }
@@ -254,6 +260,7 @@ fn render_output_with_style(
     max_input_chars: usize,
     ladders: &[Ladder],
     style: TerminalStyle,
+    cache_use: Option<CacheUsage>,
 ) -> Result<String> {
     if output == RouteFormat::Text {
         Ok(render_route_text_styled(
@@ -263,7 +270,7 @@ fn render_output_with_style(
             style,
         ))
     } else {
-        render_output(report, output, max_input_chars)
+        render_output(report, output, max_input_chars, cache_use)
     }
 }
 
@@ -900,17 +907,32 @@ mod tests {
             usage: Usage::default(),
         };
 
-        let json = render_output(&report, RouteFormat::Json, DEFAULT_MAX_INPUT_CHARS).unwrap();
+        let json =
+            render_output(&report, RouteFormat::Json, DEFAULT_MAX_INPUT_CHARS, None).unwrap();
         assert!(json.contains("\"model\": \"jev-1.13.0\""), "{json}");
         assert!(json.contains("\"reference_fetch_failures\""), "{json}");
         assert!(json.contains("\"ref\": \"#404\""), "{json}");
 
-        let yaml = render_output(&report, RouteFormat::Yaml, DEFAULT_MAX_INPUT_CHARS).unwrap();
+        let yaml =
+            render_output(&report, RouteFormat::Yaml, DEFAULT_MAX_INPUT_CHARS, None).unwrap();
         assert!(yaml.contains("model: jev-1.13.0"), "{yaml}");
         assert!(yaml.contains("reference_fetch_failures:"), "{yaml}");
         assert!(yaml.contains("ref: '#404'"), "{yaml}");
 
-        let text = render_output(&report, RouteFormat::Text, DEFAULT_MAX_INPUT_CHARS).unwrap();
+        let usage = Some(CacheUsage {
+            items_reused: 2,
+            oldest_age_secs: 90,
+        });
+        let cached =
+            render_output(&report, RouteFormat::Json, DEFAULT_MAX_INPUT_CHARS, usage).unwrap();
+        assert!(cached.contains("\"github_cache\""), "{cached}");
+        assert!(!json.contains("github_cache"), "{json}");
+        let cached_text =
+            render_output(&report, RouteFormat::Text, DEFAULT_MAX_INPUT_CHARS, usage).unwrap();
+        assert!(!cached_text.contains("github_cache"), "{cached_text}");
+
+        let text =
+            render_output(&report, RouteFormat::Text, DEFAULT_MAX_INPUT_CHARS, None).unwrap();
         assert!(text.starts_with("o/r#1 — t\n"), "{text}");
         assert!(
             text.contains("reference fetch failed: #404 (not found)"),
@@ -923,9 +945,16 @@ mod tests {
         };
         for format in [RouteFormat::Json, RouteFormat::Yaml] {
             assert_eq!(
-                render_output_with_style(&report, format, DEFAULT_MAX_INPUT_CHARS, &[], style)
-                    .unwrap(),
-                render_output(&report, format, DEFAULT_MAX_INPUT_CHARS).unwrap()
+                render_output_with_style(
+                    &report,
+                    format,
+                    DEFAULT_MAX_INPUT_CHARS,
+                    &[],
+                    style,
+                    None
+                )
+                .unwrap(),
+                render_output(&report, format, DEFAULT_MAX_INPUT_CHARS, None).unwrap()
             );
         }
 
@@ -935,6 +964,7 @@ mod tests {
             DEFAULT_MAX_INPUT_CHARS,
             &[],
             style,
+            None,
         )
         .unwrap();
         assert_eq!(
