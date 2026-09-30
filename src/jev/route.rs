@@ -2269,20 +2269,21 @@ mod tests {
                 let doc: IssueDoc = serde_json::from_value(case["doc"].clone()).unwrap();
                 let (state, _) = build_route_state(&doc, DEFAULT_MAX_INPUT_CHARS);
                 let relations = citation_relations(&state, &doc);
-                let Some(expected) = labels[id]["relations"].as_object() else {
-                    continue;
-                };
-                for (number, label) in expected {
+                // A case with no labelled relations contributes nothing.
+                for (number, label) in labels[id]["relations"].as_object().into_iter().flatten() {
                     let actual = relations
                         .get(&(doc.project.clone(), number.parse().unwrap()))
                         .copied()
                         .unwrap_or(CitationRelation::Unspecified);
-                    let want = match label.as_str().unwrap() {
-                        "blocker" => CitationRelation::Blocker,
-                        "tracker" => CitationRelation::Tracker,
-                        "unspecified" => CitationRelation::Unspecified,
-                        other => panic!("unknown relation label: {other}"),
-                    };
+                    let want = [
+                        ("blocker", CitationRelation::Blocker),
+                        ("tracker", CitationRelation::Tracker),
+                        ("unspecified", CitationRelation::Unspecified),
+                    ]
+                    .into_iter()
+                    .find(|(name, _)| Some(*name) == label.as_str())
+                    .expect("a known relation label")
+                    .1;
                     assert_eq!(actual, want, "{id} -> #{number}");
                 }
             }
@@ -3115,6 +3116,33 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("; "), "{text}");
+    }
+
+    #[test]
+    fn render_depends_on_lines_labels_each_citation_relation() {
+        let entry = |item_ref: &str, relation| DependencyEntry {
+            item_ref: item_ref.to_string(),
+            url: None,
+            state: ItemState::Open,
+            relation,
+            could_be_cheaper: BTreeMap::new(),
+        };
+        let lines = render_depends_on_lines(
+            &[
+                entry("#1", CitationRelation::Blocker),
+                entry("#2", CitationRelation::Tracker),
+                entry("#3", CitationRelation::Unspecified),
+            ],
+            TerminalStyle::default(),
+        );
+        assert_eq!(
+            lines,
+            [
+                "  cites open #1 (blocker)",
+                "  cites open #2 (tracker)",
+                "  cites open #3 (relation unspecified)",
+            ]
+        );
     }
 
     #[test]
