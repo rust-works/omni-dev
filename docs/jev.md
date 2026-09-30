@@ -78,6 +78,8 @@ Docker/Kubernetes secrets convention. The file must be a regular file that is ei
 trailing newline, and setting both `NAME` and `NAME_FILE` in the same place (both exported, or both in the same settings.json map)
 is an error. See [ADR-0089](adrs/adr-0089.md).
 
+Both also accept a `<NAME>_COMMAND` companion that fetches the key on demand from a password manager or keychain; see [secret-commands.md](secret-commands.md).
+
 Each variable is looked up in the process environment first, then in the
 `settings.json` `env` map, so an exported shell or CI variable always wins:
 

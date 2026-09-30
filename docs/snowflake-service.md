@@ -289,6 +289,8 @@ alias still outranks `SNOWFLAKE_PRIVATE_KEY_FILE` and now gets the same
 checks (absolute path; yours and owner-only, or root-owned and not writable by others) — previously it accepted
 a relative path or a looser file mode.
 
+Both also accept a `<NAME>_COMMAND` companion that fetches the secret on demand from a password manager or keychain (`SNOWFLAKE_TOKEN_COMMAND`, `SNOWFLAKE_PRIVATE_KEY_COMMAND`); the daemon reads it once at start-up, and its minimal `PATH` means the program should be an absolute path. See [secret-commands.md](secret-commands.md).
+
 ### External-browser SSO (default)
 
 The client's external-browser flow auto-opens a browser and binds an ephemeral

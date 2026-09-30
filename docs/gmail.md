@@ -106,6 +106,11 @@ import` — and an installed-app OAuth client secret isn't confidential per
 Google in the first place, so `gmail auth import` already covers the
 file-based case.
 
+`GMAIL_REFRESH_TOKEN_COMMAND` fetches the token on demand from a password
+manager or keychain; see [secret-commands.md](secret-commands.md).
+`gmail auth login` refuses, before opening a browser, when the map it would
+write to holds one.
+
 ### Interactive setup
 
 If you downloaded the OAuth client's `client_secret.json` from the Cloud

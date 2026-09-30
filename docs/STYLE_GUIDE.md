@@ -1600,9 +1600,12 @@ let api_key = env.var(DATADOG_API_KEY).ok_or(DatadogError::CredentialsNotFound)?
 
 The resolver gives every secret a `<NAME>_FILE` companion with one set of rules
 (absolute path, yours and owner-only or root's and read-only to others, one trailing newline
-trimmed, both-set is an error per layer) — see
-[ADR-0089](adrs/adr-0089.md). Document `<NAME>_FILE` next to the variable in
-its operator guide. A secret-shaped name that genuinely must not accept `_FILE`
+trimmed, two-set is an error per layer) — see
+[ADR-0089](adrs/adr-0089.md) — and a `<NAME>_COMMAND` companion that runs a
+helper program and reads its output ([ADR-0090](adrs/adr-0090.md),
+[secret-commands.md](secret-commands.md)). Only the resolver, the settings
+writers and the `claude-cli` scrub may spell either companion. Document
+`<NAME>_FILE` and `<NAME>_COMMAND` next to the variable in its operator guide. A secret-shaped name that genuinely must not accept `_FILE`
 goes in `EXEMPT_SECRET_ENV_VARS` with its reason. Test the call site's `_FILE`
 path with `MapEnv` and `test_support::env::secret_file` (STYLE-0028).
 

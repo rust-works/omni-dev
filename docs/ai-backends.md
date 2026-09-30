@@ -121,6 +121,8 @@ to a file holding the secret, instead of the value itself — the
 Docker/Kubernetes secrets convention. The file must be a regular file that is either yours and owner-only (`chmod 600`), or owned by root and not writable by others (the shape Kubernetes and Docker secrets take); setting both `NAME` and
 `NAME_FILE` in the same place (both exported, or both in the same settings.json map) is an error. See [ADR-0089](adrs/adr-0089.md).
 
+`<NAME>_COMMAND` is also accepted, fetching the secret from a password manager or keychain instead; see [docs/secret-commands.md](secret-commands.md).
+
 **Model.** Resolved from the precedence chain above. The registry default is
 `claude-sonnet-4-6`. Override per-invocation with `--model`:
 
@@ -315,7 +317,8 @@ export ANTHROPIC_BEDROCK_BASE_URL="https://bedrock-runtime.<region>.amazonaws.co
 
 `ANTHROPIC_AUTH_TOKEN` also accepts an `ANTHROPIC_AUTH_TOKEN_FILE` companion
 naming an absolute path to a file holding the token — see the note under
-[Claude API](#claude-api-default) and [ADR-0089](adrs/adr-0089.md).
+[Claude API](#claude-api-default) and [ADR-0089](adrs/adr-0089.md) — and an
+`ANTHROPIC_AUTH_TOKEN_COMMAND` companion; see [secret-commands.md](secret-commands.md).
 
 **Model.** Resolved through the standard chain (registry default
 `claude-sonnet-4-6`). Bedrock identifiers are URL-encoded automatically when
@@ -544,6 +547,12 @@ listing one in `OMNI_DEV_CLAUDE_CLI_KEEP_ENV` exempts it. Note that the nested `
 a key supplied only as `ANTHROPIC_API_KEY_FILE` does not authenticate the
 `claude-cli` backend; `claude` uses its own login or a plain
 `ANTHROPIC_API_KEY`.
+
+The same scrub removes `<NAME>_COMMAND` companions (see
+[ADR-0090](adrs/adr-0090.md) and [secret-commands.md](secret-commands.md)). That
+is hygiene, not a boundary: the command is still in `settings.json`, which the
+nested session can read, so it only defends against an agent that has to be
+prompted for the secret when the store prompts on every use.
 
 A `WARN` log is emitted on every invocation while this is active. Grep for
 it with `RUST_LOG=omni_dev=warn`:
