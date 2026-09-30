@@ -1931,6 +1931,19 @@ mod tests {
                 calls = calls.display()
             ),
         );
+        // Production code under test degrades a failed state recheck to a
+        // refetch (#2041), which swallows an `ETXTBSY` from the first exec of
+        // a freshly written shim and drops the expected `state` call. Exec it
+        // once here, where `retry_on_etxtbsy` can see the error, then reset
+        // the log.
+        retry_on_etxtbsy(|| {
+            std::process::Command::new(&path)
+                .output()
+                .map(drop)
+                .map_err(Into::into)
+        })
+        .unwrap();
+        std::fs::remove_file(&calls).unwrap();
         (path, guard)
     }
 
