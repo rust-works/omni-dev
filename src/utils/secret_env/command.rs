@@ -278,6 +278,7 @@ fn run(command_var: &str, argv: &[String], limits: Limits) -> Result<Secret, Sec
                     secs: timeout.as_secs(),
                 });
             }
+            // omni-dev: coverage ignore reason="try_wait on a live, owned child fails only if waitpid itself errors (ECHILD/EINTR from outside the process); no in-process test can provoke it, and the arm only reaps and reports"
             Err(source) => {
                 kill_and_reap(&mut child, own_group);
                 return Err(SecretEnvError::CommandSpawn {
@@ -286,7 +287,7 @@ fn run(command_var: &str, argv: &[String], limits: Limits) -> Result<Secret, Sec
                     hint: "",
                     source,
                 });
-            }
+            } // omni-dev: coverage end
         }
     };
     let stdout = stdout.finish();
@@ -335,7 +336,17 @@ fn kill_and_reap(child: &mut Child, own_group: bool) {
 fn kill_group(child: &Child) -> bool {
     // PIDs always fit in i32: Linux caps at ~2^22, macOS at 99999.
     let group = nix::unistd::Pid::from_raw(child.id() as i32);
-    match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+    group_kill_succeeded(nix::sys::signal::killpg(
+        group,
+        nix::sys::signal::Signal::SIGKILL,
+    ))
+}
+
+/// Whether a `killpg` result means the group is gone; an error is logged and
+/// sends the caller to killing the child directly.
+#[cfg(unix)]
+fn group_kill_succeeded(result: nix::Result<()>) -> bool {
+    match result {
         // ESRCH: the group had already gone.
         Ok(()) | Err(nix::errno::Errno::ESRCH) => true,
         Err(e) => {
@@ -444,6 +455,27 @@ mod tests {
     /// A `/bin/sh -c <script>` command line, with `script` quoted.
     fn sh(script: &str) -> String {
         format!("/bin/sh -c {}", shlex::try_quote(script).unwrap())
+    }
+
+    #[test]
+    fn a_failed_killpg_falls_back_to_killing_the_child_directly() {
+        use nix::errno::Errno;
+        assert!(group_kill_succeeded(Ok(())));
+        assert!(group_kill_succeeded(Err(Errno::ESRCH)));
+        assert!(!group_kill_succeeded(Err(Errno::EPERM)));
+    }
+
+    #[test]
+    fn capture_without_a_pipe_finishes_empty() {
+        let none = capture::<std::io::Empty>(None, 16);
+        assert!(none.finish().is_empty());
+    }
+
+    #[test]
+    fn a_status_with_neither_code_nor_signal_is_described_plainly() {
+        use std::os::unix::process::ExitStatusExt;
+        // A stopped (not exited, not signalled) wait status: 0x7f.
+        assert_eq!(describe(ExitStatus::from_raw(0x7f)), "no exit code");
     }
 
     fn limits(timeout_secs: u64) -> Limits {

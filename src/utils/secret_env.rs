@@ -1188,19 +1188,27 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_command_knobs_are_read_through_the_env_source() {
         // A 1s timeout from the MapEnv, not the process environment.
         let env = MapEnv::new()
             .with(COMMAND_VAR, "/bin/sleep 5")
             .with(COMMAND_TIMEOUT_VAR, "1")
             .with(COMMAND_TTL_VAR, "0");
-        if cfg!(unix) {
-            let err = resolve(&env).unwrap_err();
-            assert!(
-                matches!(err, SecretEnvError::CommandTimedOut { .. }),
-                "{err}"
-            );
-        }
+        let err = resolve(&env).unwrap_err();
+        assert!(
+            matches!(err, SecretEnvError::CommandTimedOut { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn join_names_handles_every_arity() {
+        let names = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(join_names(&[]), "");
+        assert_eq!(join_names(&names(&["A"])), "A");
+        assert_eq!(join_names(&names(&["A", "B"])), "A and B");
+        assert_eq!(join_names(&names(&["A", "B", "C"])), "A, B and C");
     }
 
     #[test]
