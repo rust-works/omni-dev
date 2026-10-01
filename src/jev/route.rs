@@ -671,6 +671,13 @@ pub async fn run_route_with_reference_fetch_failures(
     let (docs, ignored_closed) = drop_closed(docs, opts)?;
     validate_options(&docs, ladders, opts)?;
     let questions = build_route_questions_for_mode(ladders, opts.effort_advice)?;
+    // A custom ladder can hold any number of tiers, so check its questions
+    // against the caps of the model that will be asked, naming the question.
+    for (key, question) in &questions {
+        question
+            .validate_for_model(&opts.model)
+            .with_context(|| format!("route question {key:?}"))?;
+    }
 
     let mut models = BTreeSet::new();
     let mut usage = Usage::default();
@@ -2917,6 +2924,30 @@ mod tests {
         .await
         .unwrap_err();
         assert!(format!("{err:#}").contains("Failed to route issue rust-works/omni-dev#3"));
+    }
+
+    #[tokio::test]
+    async fn run_route_rejects_a_ladder_over_the_choice_cap_before_any_request() {
+        let yaml: String = std::iter::once("tiers:\n".to_string())
+            .chain((0..256).map(|i| format!("  - {{name: t{i}, description: d{i}}}\n")))
+            .collect();
+        let ladder = Ladder::named("big".to_string(), Tiers::parse(&yaml).unwrap());
+        let client = JevClient::new("http://127.0.0.1:1", "key").unwrap();
+        let err = run_route(
+            &client,
+            &[doc(3, ItemState::Open)],
+            &[ladder],
+            &opts(),
+            &OpenDependencies::new(),
+        )
+        .await
+        .unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("route question \"big.stage_"), "{chain}");
+        assert!(
+            chain.contains("at most 255 options on jev-latest"),
+            "{chain}"
+        );
     }
 
     #[tokio::test]

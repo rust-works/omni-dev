@@ -118,16 +118,20 @@ impl QuestionLimits {
     /// The limits for `model`: the single table to extend when a model
     /// documents different caps.
     ///
-    /// `jev-latest` is enforced with the `jev-1.13` caps because that is what
-    /// it resolves to today; re-check it when the alias moves. `jev-1.13` and
-    /// `jev-1.13.<patch>` match, but `jev-1.130` does not. Any other model gets
-    /// [`Self::UNLIMITED`].
+    /// `jev-1.13` and `jev-1.13.<digits>` match, but `jev-1.130` and
+    /// `jev-1.13.x` do not. `jev-latest` is enforced with the `jev-1.13` caps
+    /// because that is what the alias resolves to today. That is a bet: if
+    /// TypeSafe repoints the alias at a model with higher caps, the check goes
+    /// stale for default users until this table is updated, and pinning
+    /// `--jev-model` to a version without an entry here is the way round it.
+    /// Any other model gets [`Self::UNLIMITED`], so a cap that is not known is
+    /// never enforced.
     #[must_use]
     pub fn for_model(model: &str) -> Self {
         let is_1_13 = model == "jev-1.13"
-            || model
-                .strip_prefix("jev-1.13.")
-                .is_some_and(|patch| !patch.is_empty());
+            || model.strip_prefix("jev-1.13.").is_some_and(|patch| {
+                !patch.is_empty() && patch.bytes().all(|b| b.is_ascii_digit())
+            });
         if model == DEFAULT_MODEL || is_1_13 {
             Self::JEV_1_13
         } else {
@@ -160,29 +164,22 @@ impl Question {
     pub fn validate_for_model(&self, model: &str) -> Result<(), JevError> {
         self.check_minimums()?;
         let limits = QuestionLimits::for_model(model);
-        match self {
-            Self::Choice { criteria, .. }
-                if limits
-                    .max_choice_options
-                    .is_some_and(|max| criteria.len() > max) =>
-            {
-                Err(JevError::InvalidQuestionSpec(format!(
-                    "a choice question accepts at most {} options on {model}, got {}",
-                    limits.max_choice_options.unwrap_or_default(),
-                    criteria.len()
-                )))
+        let (kind, unit, count, max) = match self {
+            Self::Choice { criteria, .. } => (
+                "choice",
+                "options",
+                criteria.len(),
+                limits.max_choice_options,
+            ),
+            Self::Score { criteria, .. } => {
+                ("score", "levels", criteria.len(), limits.max_score_levels)
             }
-            Self::Score { criteria, .. }
-                if limits
-                    .max_score_levels
-                    .is_some_and(|max| criteria.len() > max) =>
-            {
-                Err(JevError::InvalidQuestionSpec(format!(
-                    "a score question accepts at most {} levels on {model}, got {}",
-                    limits.max_score_levels.unwrap_or_default(),
-                    criteria.len()
-                )))
-            }
+            Self::Noul { .. } => return Ok(()),
+        };
+        match max {
+            Some(max) if count > max => Err(JevError::InvalidQuestionSpec(format!(
+                "a {kind} question accepts at most {max} {unit} on {model}, got {count}"
+            ))),
             _ => Ok(()),
         }
     }
@@ -523,7 +520,14 @@ mod tests {
 
     #[test]
     fn validate_for_model_leaves_unknown_models_uncapped() {
-        for model in ["jev-2.0", "jev-1.130", "jev-1.13.", "jev-1.14.0", ""] {
+        for model in [
+            "jev-2.0",
+            "jev-1.130",
+            "jev-1.13.",
+            "jev-1.13.x",
+            "jev-1.14.0",
+            "",
+        ] {
             choice_with(300).validate_for_model(model).unwrap();
             score_with(20).validate_for_model(model).unwrap();
         }
