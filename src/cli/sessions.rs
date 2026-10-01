@@ -392,16 +392,15 @@ impl HookPayload {
             model: self.model.clone(),
             pid,
         };
-        match serde_json::to_value(request) {
-            Ok(payload) => Some(("observe", payload)),
-            Err(_) => {
-                tracing::debug!(
-                    ?agent,
-                    outcome = "serialization_failed",
-                    "session_hook_skipped"
-                );
-                None
-            }
+        if let Ok(payload) = serde_json::to_value(request) {
+            Some(("observe", payload))
+        } else {
+            tracing::debug!(
+                ?agent,
+                outcome = "serialization_failed",
+                "session_hook_skipped"
+            );
+            None
         }
     }
 }
@@ -1786,7 +1785,7 @@ mod tests {
             socket: Some(dir.path().join("missing.sock")),
             agent: HookAgent::Claude,
         };
-        let (_, logs) = crate::test_support::capture_future_at(tracing::Level::DEBUG, async {
+        let ((), logs) = crate::test_support::capture_future_at(tracing::Level::DEBUG, async {
             for input in ["not json HOOK_CONTENT_SECRET", "{}",
                 r#"{"session_id":"test"}"#,
                 r#"{"session_id":"test","hook_event_name":"future-event"}"#,

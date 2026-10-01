@@ -222,12 +222,9 @@ impl StreamTracker {
         // line here is a JSON object, so skipping to the first `{` recovers
         // it without needing to understand escape-sequence structure at all.
         let json = line.find('{').map_or(line, |start| &line[start..]);
-        let parsed: StreamLine = match serde_json::from_str(json) {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                self.diagnostics.parse_failures = self.diagnostics.parse_failures.saturating_add(1);
-                return None;
-            }
+        let Ok(parsed) = serde_json::from_str::<StreamLine>(json) else {
+            self.diagnostics.parse_failures = self.diagnostics.parse_failures.saturating_add(1);
+            return None;
         };
         self.absorb_identity(direction, &parsed);
         self.apply(direction, &parsed);
