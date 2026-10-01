@@ -314,10 +314,7 @@ mod tests {
             ..sample_state()
         };
         save(&state, &path).unwrap();
-        match load(&path) {
-            LoadOutcome::Present(loaded) => assert_eq!(loaded, state),
-            _ => panic!("expected Present"),
-        }
+        assert!(matches!(load(&path), LoadOutcome::Present(loaded) if loaded == state));
     }
 
     #[test]
@@ -329,14 +326,13 @@ mod tests {
             r#"{"history_id":"1000","email_address":"user@example.com","last_sync":"2026-01-01T00:00:00Z","pending_fetch":["m1","m2"]}"#,
         )
         .unwrap();
-        match load(&path) {
-            LoadOutcome::Present(loaded) => {
-                assert_eq!(loaded.pending_fetch, [legacy("m1"), legacy("m2")]);
-                // A legacy id has no `next_retry_at`, so it is retried at once.
-                assert!(loaded.pending_fetch[0].is_due(at("2026-01-01T00:00:00Z")));
-            }
-            _ => panic!("expected Present"),
-        }
+        assert!(matches!(
+            load(&path),
+            LoadOutcome::Present(loaded)
+                if loaded.pending_fetch == [legacy("m1"), legacy("m2")]
+                    // A legacy id has no `next_retry_at`, so it is retried at once.
+                    && loaded.pending_fetch[0].is_due(at("2026-01-01T00:00:00Z"))
+        ));
     }
 
     #[test]

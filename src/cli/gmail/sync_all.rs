@@ -210,6 +210,7 @@ type ClientFor = Arc<dyn Fn(&str) -> Result<GmailClient> + Send + Sync>;
 
 impl SyncAllCommand {
     pub(crate) async fn execute(self) -> Result<()> {
+        // omni-dev: coverage ignore reason="SyncAllCommand::execute is the process-bound wiring shell: it loads the real ~/.omni-dev settings and builds clients against the real Gmail host; run_sync_all, load_gmail_sync_config and validate_accounts are its tested seams"
         let (context_dir, _source) =
             discovery::resolve_context_dir_with_source(self.context_dir.as_deref());
         let config = load_gmail_sync_config(&context_dir)?;
@@ -242,6 +243,7 @@ impl SyncAllCommand {
             client_for,
         )
         .await
+        // omni-dev: coverage end
     }
 }
 
@@ -1081,6 +1083,22 @@ accounts:
     }
 
     // ── SyncAllReportOutput::write_jsonl ──────────────────────────────────
+
+    #[test]
+    fn print_account_line_reports_deferred_ids_even_when_quiet() {
+        let report = SyncReport {
+            deferred: vec![DeferredFetch {
+                id: "m1".to_string(),
+                failures: 3,
+                next_retry_at: None,
+                last_error: Some("rate limited".to_string()),
+            }],
+            ..SyncReport::default()
+        };
+        // Prints to stdout; this pins that the deferred-warning branch runs
+        // for a clean outcome under `--quiet` without panicking.
+        print_account_line("acct-a", &Ok(report), true);
+    }
 
     #[test]
     fn add_summary_folds_deferred_into_the_combined_total() {
