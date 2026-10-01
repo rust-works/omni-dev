@@ -449,7 +449,7 @@ does not reinterpret it. `--limit 0` fetches every match up to a 10,000
 hard cap, auto-paginating underneath.
 
 By default `search` returns only `id`/`threadId` per hit — `messages.list`
-itself never returns more than that, and it bounds the listing cost. Pass
+itself never returns more than that, avoiding per-hit read costs. Pass
 `--enrich` to add From/Subject/Date/snippet, at the cost of one extra
 `messages.get` request **per hit**. `--concurrency` (default 4) bounds how
 many of those hydration requests run at once; see
