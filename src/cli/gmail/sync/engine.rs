@@ -141,13 +141,23 @@ impl RetrySchedule {
     /// untouched (nothing was attempted, so nothing changed), and `carried`
     /// — pending ids a scoped listing never looked at — are kept as they are.
     /// Anything that succeeded, vanished or was deleted is simply absent.
-    fn next_pending(&self, report: &SyncReport, carried: Vec<PendingFetch>) -> Vec<PendingFetch> {
+    ///
+    /// `failed_at` is when the run finished, not when it started: a long run
+    /// under rate limiting can take far longer than the first backoff step,
+    /// and anchoring to the start would leave a late failure's delay already
+    /// elapsed.
+    fn next_pending(
+        &self,
+        report: &SyncReport,
+        carried: Vec<PendingFetch>,
+        failed_at: DateTime<Utc>,
+    ) -> Vec<PendingFetch> {
         let failed = report.errors.iter().map(|error| {
             PendingFetch::failed(
                 self.entries.get(&error.id),
                 &error.id,
                 &error.reason,
-                self.now,
+                failed_at,
             )
         });
         let deferred = report
@@ -304,7 +314,7 @@ pub(crate) async fn run_sync_with_progress(
         // No dedup needed: both fetch paths already fetch each id once, an id
         // is never both failed and deferred, and `carried` only holds ids
         // this run's listing never named.
-        let pending_fetch = schedule.next_pending(&report, carried);
+        let pending_fetch = schedule.next_pending(&report, carried, Utc::now());
         state::save(
             &ArchiveState {
                 history_id,
@@ -711,7 +721,12 @@ async fn run_incremental(
     if let Some(tx) = progress {
         let _ = tx.send(SyncProgressEvent::ListingPage {
             pages: 1,
-            ids_discovered: to_fetch.len(),
+            // Deferred ids are in `to_fetch` only so the fetch phase can report
+            // them; counting them would leave the fetch bar short of its total.
+            ids_discovered: to_fetch
+                .iter()
+                .filter(|id| schedule.deferral(id).is_none())
+                .count(),
         });
         let _ = tx.send(SyncProgressEvent::ListingDone);
     }
@@ -3691,6 +3706,91 @@ not-really-a-pdf\r\n\
             .actions
             .iter()
             .any(|a| matches!(a, SyncAction::WouldFetch { .. })));
+    }
+
+    #[tokio::test]
+    async fn run_sync_progress_does_not_count_a_deferred_id_as_discovered() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_entries(
+            &output_dir,
+            vec![backed_off("m1", 3, chrono::Duration::hours(1))],
+        );
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(
+            &server,
+            serde_json::json!({
+                "history": [{
+                    "id": "150",
+                    "messagesAdded": [{"message": {"id": "m2", "threadId": "t2", "labelIds": ["INBOX"]}}]
+                }],
+                "historyId": "200"
+            }),
+        )
+        .await;
+        mount_get_never_called(&server, "m1").await;
+        mount_raw_get(&server, "m2", "New").await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_sync_with_progress(&client, &opts(output_dir), Some(&tx))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        let discovered: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                SyncProgressEvent::ListingPage { ids_discovered, .. } => Some(*ids_discovered),
+                _ => None,
+            })
+            .collect();
+        let queued = events
+            .iter()
+            .filter(|e| matches!(e, SyncProgressEvent::FetchQueued))
+            .count();
+        assert_eq!(discovered, [1], "only the new message is to be fetched");
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn run_sync_stamps_a_failure_with_the_time_the_run_finished() {
+        // The backoff must run from when the failure was recorded, not from
+        // when the run began, or a long run would eat its own delay.
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_entries(
+            &output_dir,
+            vec![backed_off("m1", 1, chrono::Duration::hours(-1))],
+        );
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(500)
+                    .set_body_string("boom")
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        let started = Utc::now();
+        run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        let entry = &load_present(&output_dir).pending_fetch[0];
+        assert!(
+            entry.next_retry_at.unwrap()
+                >= started + chrono::Duration::milliseconds(300) + state::backoff_delay(2),
+            "next_retry_at must be anchored after the slow fetch, not at run start"
+        );
     }
 
     #[test]
