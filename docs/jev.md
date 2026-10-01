@@ -490,10 +490,30 @@ usage: {input_tokens: 1432, output_tokens: 61}
   class without help from design. Design `none` ranks below every tier and
   review is never a source, so those two values are the only ones. Each
   ladder has its own `class_from`.
-- **`close_calls`** lists the stages whose confidence is below `--close-call`
-  (default `0.3`, a working heuristic that has not been validated). Jev is
-  noisy on close calls: identical inputs changed the design answer in 2 of 19
-  cases, so treat a flagged stage as a judgement call, not an answer.
+- **`close_calls`** lists model-class stages whose confidence is below
+  `--close-call` (default `0.3`) **or** whose top-two tier probability gap is
+  below `--close-call-margin` (default `0.2`). Both are configurable working
+  heuristics, not calibrated confidence guarantees. Both comparisons are strict:
+  equality does not trigger that rule, but the other rule can still flag the
+  stage. For example, implement probabilities `0.55/0.45` with confidence `0.32`
+  are flagged by their `0.10` gap despite confidence exceeding `0.3`.
+  `--close-call-margin 0` disables margin flagging, including ties, restoring
+  confidence-only behavior. JSON, YAML, and both text layouts use the same list.
+  Jev is noisy on close calls: identical inputs changed the design answer in
+  2 of 19 cases, so treat a flagged stage as a judgement call, not an answer.
+
+  The margin uses the two highest finite probabilities in `[0, 1]` for options
+  offered to that stage and ladder, including design `none`. Unknown options,
+  implement/review `none`, and invalid probabilities are ignored. Partial maps
+  with at least two usable entries still supply a margin; fewer entries retain
+  confidence-only flagging. Values are not normalized or filled in, even when
+  their sum is not one. Confidence is never substituted for a missing probability,
+  and the chosen tier need not have the highest probability. Comparisons use
+  unrounded values. Override the margin threshold with:
+
+  ```sh
+  omni-dev ai jev route 'rust-works/succinctly#3017' --close-call-margin 0.1
+  ```
 - **`depends_on`** lists every issue or pull request the text cites (via the
   same citation regex `verify-decision` uses, see below) that is still
   **open**; a closed citation is settled and is not reported. `ref` is the
@@ -586,7 +606,10 @@ model: jev-1.13.0, usage: 1432 input tokens, 61 output tokens
 For a close call, text output adds the highest-probability alternative from
 `probabilities` after the chosen answer's confidence. It uses a stable
 alphabetical tie break and leaves the alternative out if none is available.
-Confidence and the alternative's probability are separate Jev values.
+Confidence and the alternative's probability are separate Jev values. The
+margin rule compares the top two usable probabilities, which need not include
+the chosen answer; the displayed alternative remains the strongest nonchosen
+option, rather than the margin itself.
 
 Routing against several `--ladders` adds one indented line per ladder,
 labelled `<ladder>: <class> (from <stage>) — ...` (a single ladder, the common
@@ -888,8 +911,10 @@ model beneath each ladder's class summary (illustrative values):
 Every rung is shown in ladder order; long/multi-model names keep the expanded
 class layout. A dash means the model has no binding for that stage. Close-call
 evidence and unavailable-control explanations appear in numbered notes below
-the table to keep columns compact. Effort close calls use `--close-call`,
-independently of class close calls, and show the strongest alternative
+the table to keep columns compact. Effort close calls use only the confidence
+threshold `--close-call`;
+`--close-call-margin` applies only to model-class stages. Effort flags remain
+independent of class close calls, and show the strongest alternative
 (alphabetical tie break). Confidence and option probability are distinct Jev
 values. JSON and YAML retain the complete structured evidence.
 

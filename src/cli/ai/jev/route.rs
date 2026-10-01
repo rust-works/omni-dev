@@ -18,7 +18,7 @@ use crate::jev::route::{
     build_route_citation_text_with_drafts, is_ignored_closed, render_route_text,
     render_route_text_styled, run_route_with_reference_fetch_failures, Ladder, OpenDependencies,
     Provider, ReferenceFetchFailure, ReferenceFetchFailures, RouteOptions, RouteReport,
-    TerminalStyle, Tiers, DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
+    TerminalStyle, Tiers, DEFAULT_CLOSE_CALL, DEFAULT_CLOSE_CALL_MARGIN, DEFAULT_MAX_INPUT_CHARS,
 };
 use crate::provider::{GitProvider, IssueDoc, ItemKind, ItemRef, ItemState};
 use crate::utils::env::{EnvSource, SystemEnv};
@@ -53,8 +53,10 @@ stages. Add --effort-advice for per-model effort recommendations.\n\nMakes one J
 comments (never the issues or pull requests it references) and picks, for each stage, the \
 least capable class likely to do it correctly with no rework. The issue's class is the \
 higher of its design and implement choices (class_from names which one supplied it; a tie \
-goes to implement), and a stage whose confidence is below --close-call is listed under \
-close_calls.\n\nThe classes come from a named model ladder: \
+goes to implement), and a stage whose confidence is below --close-call or whose top-two \
+model-class probability gap is below --close-call-margin is listed under close_calls. \
+Both comparisons are strict; --close-call-margin 0 disables margin flagging. Effort \
+advice uses only the confidence threshold.\n\nThe classes come from a named model ladder: \
 built-in ladders are anthropic (sonnet/opus, the default), openai (terra/sol/astra) \
 and gemini (flash/pro/deep-think). --ladders NAMES routes against several ladders at once, \
 still in one Jev call per issue, and the output nests stages, class, class_from and \
@@ -122,6 +124,12 @@ pub struct RouteCommand {
     #[arg(long, value_name = "CONFIDENCE", default_value_t = DEFAULT_CLOSE_CALL)]
     pub close_call: f64,
 
+    /// Top-two model-class probability gap below which a stage is a close call (strictly less;
+    /// 0 disables margin flagging). Effort advice uses only --close-call.
+    #[arg(long, value_name = "MARGIN", default_value_t = DEFAULT_CLOSE_CALL_MARGIN,
+        value_parser = parse_close_call_margin)]
+    pub close_call_margin: f64,
+
     /// Longest issue text, in characters, sent to Jev; longer text is cut with a marker.
     #[arg(long, value_name = "CHARS", default_value_t = DEFAULT_MAX_INPUT_CHARS)]
     pub max_input_chars: usize,
@@ -150,6 +158,16 @@ pub struct RouteCommand {
     /// `-C/--repo`: the repository that `#N` and `--all-open` resolve against.
     #[command(flatten)]
     pub repo: crate::cli::repo_arg::RepoArg,
+}
+
+fn parse_close_call_margin(value: &str) -> std::result::Result<f64, String> {
+    let margin: f64 = value
+        .parse()
+        .map_err(|_| "margin must be a number".to_string())?;
+    if !(0.0..=1.0).contains(&margin) {
+        return Err("margin must be finite and between 0 and 1".to_string());
+    }
+    Ok(margin)
 }
 
 impl RouteCommand {
@@ -255,6 +273,7 @@ impl RouteCommand {
             draft_comments: vec![],
             model,
             close_call: self.close_call,
+            close_call_margin: self.close_call_margin,
             effort_advice: self.effort_advice,
             max_input_chars: self.max_input_chars,
             allow_closed: self.allow_closed,
@@ -801,6 +820,7 @@ mod tests {
         assert!(!default.ignore_closed);
         assert_eq!(default.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
         assert!((default.close_call - DEFAULT_CLOSE_CALL).abs() < f64::EPSILON);
+        assert_eq!(default.close_call_margin, DEFAULT_CLOSE_CALL_MARGIN);
 
         let enabled = parse(&[
             "#1",
@@ -810,6 +830,8 @@ mod tests {
             "1234",
             "--close-call",
             "0.42",
+            "--close-call-margin",
+            "0.15",
         ])
         .unwrap()
         .route_options("override-model".into());
@@ -818,6 +840,25 @@ mod tests {
         assert!(enabled.allow_closed);
         assert_eq!(enabled.max_input_chars, 1234);
         assert!((enabled.close_call - 0.42).abs() < f64::EPSILON);
+        assert_eq!(enabled.close_call_margin, 0.15);
+    }
+
+    #[test]
+    fn route_validates_and_forwards_close_call_margin() {
+        for margin in ["0", "0.15", "1"] {
+            for effort in [false, true] {
+                let mut args = vec!["#1", "--close-call-margin", margin];
+                if effort {
+                    args.push("--effort-advice");
+                }
+                let options = parse(&args).unwrap().route_options("model".into());
+                assert_eq!(options.close_call_margin, margin.parse::<f64>().unwrap());
+            }
+        }
+        for margin in ["-0.1", "1.1", "NaN", "inf", "-inf", "invalid"] {
+            let arg = format!("--close-call-margin={margin}");
+            assert!(parse(&["#1", &arg]).is_err(), "{margin}");
+        }
     }
 
     #[test]

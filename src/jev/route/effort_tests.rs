@@ -1,12 +1,20 @@
 use super::*;
-use crate::jev::route::{build_route_questions, Provider, ProviderRoute, Tiers};
+use crate::jev::route::{
+    build_route_questions, Provider, ProviderRoute, Tiers, DEFAULT_CLOSE_CALL_MARGIN,
+};
 
 fn provider_routes(
     answers: &BTreeMap<String, Answer>,
     ladders: &[Ladder],
     close_call: f64,
 ) -> anyhow::Result<BTreeMap<String, ProviderRoute>> {
-    super::super::provider_routes(answers, ladders, close_call, true)
+    super::super::provider_routes(
+        answers,
+        ladders,
+        close_call,
+        DEFAULT_CLOSE_CALL_MARGIN,
+        true,
+    )
 }
 
 const CUSTOM: &str = r"
@@ -487,6 +495,7 @@ async fn all_ladders_and_efforts_share_one_request_and_fail_only_the_bad_issue()
         draft_comments: vec![],
         model: "jev-test".into(),
         close_call: 0.3,
+        close_call_margin: DEFAULT_CLOSE_CALL_MARGIN,
         effort_advice: true,
         max_input_chars: 60000,
         allow_closed: false,
@@ -607,6 +616,7 @@ async fn class_only_route_omits_effort_questions_and_output_for_builtin_and_cust
             draft_comments: vec![],
             model: "jev-test".into(),
             close_call: 0.3,
+            close_call_margin: DEFAULT_CLOSE_CALL_MARGIN,
             effort_advice: false,
             max_input_chars: 60000,
             allow_closed: false,
@@ -888,4 +898,55 @@ fn text_keeps_each_providers_effort_table_below_its_class_summary() {
     assert!(text.find("astra [gpt-6-astra]").unwrap() < anthropic);
     assert!(anthropic < text.find("sonnet [claude-sonnet-5-5]").unwrap());
     assert_eq!(text.matches("Model / effort").count(), 2);
+}
+
+#[test]
+fn class_margin_does_not_change_effort_close_calls() {
+    let ladder = custom();
+    let mut answers = response(std::slice::from_ref(&ladder));
+    for (key, confidence) in [
+        ("custom.stage_implement", 0.32),
+        ("custom.stage_implement.effort_0_0", 0.32),
+    ] {
+        let Answer::Choice {
+            confidence: c,
+            probabilities,
+            ..
+        } = answers.get_mut(key).unwrap()
+        else {
+            panic!()
+        };
+        *c = confidence;
+        for (option, probability) in probabilities {
+            *probability = match option.as_str() {
+                "quick" | "small,alternative" => 0.55,
+                "thorough" | "large" => 0.45,
+                _ => 0.0,
+            };
+        }
+    }
+    for effort_confidence in [0.32, 0.2] {
+        let Answer::Choice { confidence, .. } = answers
+            .get_mut("custom.stage_implement.effort_0_0")
+            .unwrap()
+        else {
+            panic!()
+        };
+        *confidence = effort_confidence;
+        let baseline =
+            super::super::provider_routes(&answers, std::slice::from_ref(&ladder), 0.3, 0.0, true)
+                .unwrap();
+        let margin =
+            super::super::provider_routes(&answers, std::slice::from_ref(&ladder), 0.3, 0.2, true)
+                .unwrap();
+        assert!(baseline["custom"].close_calls.is_empty());
+        assert_eq!(margin["custom"].close_calls, [Stage::Implement]);
+        let before = &baseline["custom"].stages.implement.effort_by_model;
+        let after = &margin["custom"].stages.implement.effort_by_model;
+        assert_eq!(before, after);
+        assert_eq!(
+            after["small,alternative"][0].close_call,
+            effort_confidence < 0.3
+        );
+    }
 }

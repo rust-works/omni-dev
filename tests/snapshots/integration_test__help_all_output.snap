@@ -358,6 +358,7 @@ Options:
       --ladder-definition <NAME=FILE>  Registers a custom ladder as NAME=FILE. Tiers contain name, description, and optional model-specific effort profiles (see docs/jev.md). Repeatable
       --effort-advice                  Ask for per-model effort advice in text, JSON, or YAML output
       --close-call <CONFIDENCE>        Confidence below which a model-class or effort answer is reported as a close call [default: 0.3]
+      --close-call-margin <MARGIN>     Top-two model-class probability gap below which a stage is a close call (strictly less; 0 disables margin flagging). Effort advice uses only --close-call [default: 0.2]
       --max-input-chars <CHARS>        Longest issue text, in characters, sent to Jev; longer text is cut with a marker [default: 60000]
       --allow-closed                   Routes closed issues instead of refusing them
       --ignore-closed                  Skips closed issues instead of refusing them, listing them under `ignored_closed`
