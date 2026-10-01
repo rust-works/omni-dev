@@ -909,11 +909,15 @@ mod tests {
         assert!(
             matches!(creds.auth, AtlassianAuth::Bearer { token } if token.expose_secret() == "file-pat")
         );
-        let env = MapEnv::new().with("ATLASSIAN_PAT_COMMAND", "/usr/bin/printf helper-pat");
-        let creds = load_credentials_from(&env, Some("https://self.example")).unwrap();
-        assert!(
-            matches!(creds.auth, AtlassianAuth::Bearer { token } if token.expose_secret() == "helper-pat")
-        );
+        // The printf helper is Unix-specific; the file-source case above is portable.
+        #[cfg(unix)]
+        {
+            let env = MapEnv::new().with("ATLASSIAN_PAT_COMMAND", "/usr/bin/printf helper-pat");
+            let creds = load_credentials_from(&env, Some("https://self.example")).unwrap();
+            assert!(
+                matches!(creds.auth, AtlassianAuth::Bearer { token } if token.expose_secret() == "helper-pat")
+            );
+        }
     }
 
     #[test]
