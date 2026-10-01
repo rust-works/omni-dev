@@ -19,9 +19,9 @@ const SNIPPET_TRUNCATE_AT: usize = 60;
 ///
 /// **Ids-only by default.** `messages.list` only returns `{id, threadId}`
 /// per hit — enriching a result with From/Subject/Date/snippet costs one
-/// extra `messages.get` request per hit, and Gmail's quota is 250
-/// units/user/second with `messages.get` at 5 units, so an unbounded
-/// enrichment pass can burn the entire per-second budget in one command.
+/// extra 20-unit `messages.get` request per hit, so an unbounded enrichment
+/// pass can consume substantial quota. The current per-user per-project
+/// quota is 6,000 units/minute.
 /// Ids-only is therefore the cheap path you get by accident; `--enrich`
 /// opts into the expensive, more useful table.
 #[derive(Parser)]
@@ -38,16 +38,15 @@ pub struct SearchCommand {
 
     /// Enrich each hit with From/Subject/Date/snippet via one extra
     /// `messages.get` request per hit. Without this flag, `search` returns
-    /// only `id`/`threadId` — the cheap, quota-safe default. Combined with
+    /// only `id`/`threadId` — the cheaper default. Combined with
     /// `--limit 0` this can issue thousands of requests; use deliberately.
     #[arg(long)]
     pub enrich: bool,
 
     /// Bounds concurrent `messages.get` calls when `--enrich` is set (has
     /// no effect otherwise). Modelled on `confluence download`'s
-    /// `--concurrency`. Clamped to 1..=50 — Gmail's quota is 250
-    /// units/user/second and `messages.get` costs 5 units, so a higher
-    /// value could burst past it.
+    /// `--concurrency`. Clamped to 1..=5, based on a 100-units/second pacing
+    /// budget and 20 units per get. Bounds fan-out, not request rate.
     #[arg(long, default_value_t = DEFAULT_ENRICH_CONCURRENCY)]
     pub concurrency: usize,
 

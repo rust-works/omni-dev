@@ -93,7 +93,7 @@ pub(crate) fn manifest_path(output_dir: &Path) -> PathBuf {
 /// during [`fetch_and_archive_messages`]'s fetch fan-out.
 ///
 /// Bounds how much re-fetch work a crash mid-backfill can cost to about one
-/// interval's worth (~4s at the documented 50 msg/s quota ceiling for `200`
+/// interval's worth (~40s at the five-get/second pacing budget for `200`
 /// messages), while keeping the number of full-manifest rewrites
 /// proportional to `total / interval` rather than `total` (#1467).
 const MANIFEST_CHECKPOINT_INTERVAL: usize = 200;
@@ -4097,6 +4097,57 @@ not-really-a-pdf\r\n\
             ids.len(),
             "every id should still be present and not soft-deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn both_sync_fetch_paths_charge_twenty_units_per_get() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        for id in ["m1", "m2"] {
+            mount_raw_get(&server, id, "Hello").await;
+        }
+        // These are the streaming full-sync and batched incremental paths.
+        for streaming in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = opts(dir.path().to_path_buf());
+            let mut manifest = Manifest::default();
+            let mut report = SyncReport::default();
+            let limiter = TokenBucket::new(100, 0);
+            let ids = vec!["m1".to_string(), "m2".to_string()];
+            if streaming {
+                let (tx, rx) = mpsc::unbounded_channel();
+                for id in &ids {
+                    tx.send(id.clone()).unwrap();
+                }
+                drop(tx);
+                fetch_and_archive_messages_streaming(
+                    &client,
+                    &mut manifest,
+                    rx,
+                    &limiter,
+                    &options,
+                    &mut report,
+                    None,
+                )
+                .await
+                .unwrap();
+            } else {
+                fetch_and_archive_messages(
+                    &client,
+                    &mut manifest,
+                    &ids,
+                    &limiter,
+                    &options,
+                    &mut report,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            assert!(report.errors.is_empty());
+            assert_eq!(manifest.ids_not_deleted().count(), 2);
+            assert_eq!(limiter.available().await as u32, 60);
+        }
     }
 
     // ── manifest checkpointing during the fetch loop (#1467) ─────────────

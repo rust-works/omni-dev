@@ -243,11 +243,8 @@ impl<'a> DraftsApi<'a> {
     /// `Subject` also match that thread (see [`crate::gmail::compose`]).
     ///
     /// Requires `gmail.modify` (or `gmail.compose`); a `gmail.readonly`
-    /// token gets a 403 back from Google. Gmail doesn't document this call's
-    /// quota cost separately; assume the insert cost
-    /// ([`MESSAGES_INSERT_COST_UNITS`]) until someone verifies it.
-    ///
-    /// [`MESSAGES_INSERT_COST_UNITS`]: crate::gmail::messages_api::MESSAGES_INSERT_COST_UNITS
+    /// token gets a 403 back from Google. `drafts.create` costs 10 quota units,
+    /// per <https://developers.google.com/workspace/gmail/api/reference/quota>.
     pub async fn create(&self, raw: &[u8], thread_id: Option<&str>) -> Result<Draft> {
         ensure_within_message_limit(raw.len(), "create a draft of")?;
         let url = build_draft_create_url(self.client.base_url())?;

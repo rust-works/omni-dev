@@ -449,7 +449,7 @@ does not reinterpret it. `--limit 0` fetches every match up to a 10,000
 hard cap, auto-paginating underneath.
 
 By default `search` returns only `id`/`threadId` per hit — `messages.list`
-itself never returns more than that, and it's the quota-safe choice. Pass
+itself never returns more than that, and it bounds the listing cost. Pass
 `--enrich` to add From/Subject/Date/snippet, at the cost of one extra
 `messages.get` request **per hit**. `--concurrency` (default 4) bounds how
 many of those hydration requests run at once; see
@@ -578,7 +578,7 @@ and `0` fetches every draft up to the 10,000 hard cap, auto-paginating
 underneath.
 
 `drafts.list` returns only ids, so each row costs one extra `messages.get`
-(5 quota units). That is the same cost as `gmail search --enrich`, and
+(20 quota units). That is the same cost as `gmail search --enrich`, and
 these calls run at the same fixed concurrency (4); see
 [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour).
 `draft list` has no `--concurrency` flag. Saving a draft replaces its
@@ -904,12 +904,12 @@ Maintains a durable, greppable local archive of a mailbox — full-fidelity
 `.eml` files plus a JSONL manifest — incrementally updated on each run.
 Unlike every other Gmail command, `sync` is a genuinely long-running bulk
 operation: **a first sync of a several-thousand-message mailbox takes
-minutes, not seconds**. A 50k-message mailbox is roughly 15-20 minutes at
-Gmail's theoretical 50 msg/s quota ceiling, but real-world throughput
-depends on message sizes and network too — a measured run against a
-5,824-message mailbox sustained 36.4 msg/s, which extrapolates to roughly
-23 minutes for 50k. Either figure is bounded by Gmail's per-second quota
-(see
+minutes, not seconds**. With the current pacing budget, get-only throughput
+is at most roughly five messages/second: 50k messages take about 2 hours
+47 minutes before listing costs, network delays, or retries. Older measurements
+using the previous quota baseline do not predict current throughput. Sync's
+configured concurrency defaults to 20 but is clamped to five by the shared
+cap; the token bucket paces requests independently (see
 [Rate limits](#rate-limits-and-retry-behaviour) below). A re-run against an
 already-synced mailbox with no new mail is fast — typically a single
 `history.list` call.
@@ -1473,25 +1473,26 @@ as poor a fit here as it is for `sync`/`extract-attachments`.
 
 ## Rate limits and retry behaviour
 
-Gmail enforces a **per-user quota of 250 units/second**; `messages.get` and
-`messages.list` each cost 5 units, `messages.batchModify` costs 50 units
-for up to 1000 ids. Gmail doesn't document a separate cost for
-`drafts.create`, so assume the `messages.insert` cost (25 units) until it's
-verified. `draft create` makes one such call and one `users.getProfile`
-(1 unit), plus one `messages.get` with `--reply-to` and one
-`users.settings.sendAs.list` (1 unit) with `--reply-all` or `--from`.
-`draft update` makes one `drafts.update` (assume the same 25 units) plus two
-`drafts.get` calls, or one with `--raw`, and one `users.settings.sendAs.list`
-with `--from`. `gmail search`'s ids-only default costs a flat
-5 units regardless of `--limit` (auto-pagination is still one `messages.list` call
-per page). `--enrich` adds one `messages.get` (5 units) **per hit**, so
-`--enrich --limit 50` can cost up to 255 units — nearly the entire
-per-second budget in one command — and `--limit 0 --enrich` against a large
-mailbox can cost tens of thousands of units, spread across as many seconds
-as `--concurrency` allows. `--concurrency` (default 4) bounds how many of
-those `messages.get` calls are in flight at once; it does not itself pace
-requests against the per-second budget, so a large `--limit --enrich`
-combination should be sized deliberately, not left at defaults.
+[Google's current quota reference](https://developers.google.com/workspace/gmail/api/reference/quota)
+lists **6,000 units/minute per user per project**. Sync and insert use a
+**100-unit/second continuous pacing budget** derived from that minute quota.
+Some projects using the API between November 2025 and April 2026 retain their
+previous quotas; the client uses the current documented baseline.
+
+`messages.get` costs **20 units**, `messages.list` costs **5**, `history.list`
+costs **2**, and `messages.insert` costs **25**. `messages.batchModify` costs
+50 units for up to 1000 ids. `drafts.create` costs 10 units; `draft create`
+also makes one `users.getProfile` (1 unit), plus one `messages.get` with
+`--reply-to` and one `users.settings.sendAs.list` (1 unit) with `--reply-all`
+or `--from`. `draft update` makes one `drafts.update` (15 units) plus two
+`drafts.get` calls (20 units each), or one with `--raw`, and one
+`users.settings.sendAs.list` with `--from`.
+
+`gmail search`'s ids-only default costs 5 units **per page**. `--enrich` adds
+one 20-unit `messages.get` **per hit**, so 50 enriched hits on one page cost
+1,005 units. `--limit 0 --enrich` against a large mailbox can consume substantial
+quota. `--concurrency` (default 4, clamped to 1 through 5) bounds in-flight gets;
+it does not pace request rate. Size large enrichment requests deliberately.
 
 Gmail signals quota exhaustion as **HTTP 403** with `reason:
 rateLimitExceeded` / `userRateLimitExceeded`, not HTTP 429 — the Gmail
@@ -1499,11 +1500,15 @@ client's requests retry both `429` and this specific 403 shape through the
 shared retry driver (`retry_if`/`retry_429`, `src/utils/http.rs`), with the
 same `Retry-After`-then-exponential-backoff schedule; any other 403 (e.g.
 `insufficientPermissions`) is never retried. `gmail sync` additionally
-paces its own `messages.get` requests against the 250-units/second budget
-with a proactive token-bucket limiter, rather than relying on this reactive
+paces its own `messages.get` requests against the 100-units/second budget
+with a proactive token-bucket limiter, in addition to reactive
 retry — see [Sync](#sync) above. `search --enrich`/`thread`/`draft list` still rely on
 `--concurrency` (or `draft list`'s fixed bound of 4) alone (a concurrency bound, not a rate limiter) plus this
 retry driver as their only quota protection.
+
+Sync and insert buckets start with one second's budget and refill continuously;
+they do not enforce an exact minute window or coordinate quota across processes.
+Retries can also consume additional quota.
 
 The list endpoints (`search`, `draft list`, `thread`'s underlying calls) auto-paginate
 when `--limit 0` is passed, capped at **10,000 records** per invocation.

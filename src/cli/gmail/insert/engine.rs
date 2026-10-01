@@ -44,8 +44,8 @@ use super::report::{InsertAction, InsertError, InsertReport, SkipReason};
 
 /// Default `--concurrency`. Deliberately far below `sync`'s default of 20:
 /// `messages.insert` costs [`MESSAGES_INSERT_COST_UNITS`] (25) against a
-/// 250-units/second bucket, so the limiter admits roughly 10 requests/second
-/// regardless of how wide the fan-out is — a wider `buffer_unordered` window
+/// 100-units/second bucket, so the limiter admits at most roughly 4 inserts/second
+/// before probe costs, regardless of fan-out — a wider `buffer_unordered` window
 /// buys no extra throughput here, and only widens the set of inserts that
 /// are in flight (and thus un-ledgered) if the process crashes mid-run.
 pub(crate) const DEFAULT_INSERT_CONCURRENCY: usize = 4;

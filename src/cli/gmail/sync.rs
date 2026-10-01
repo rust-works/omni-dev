@@ -31,10 +31,9 @@ use engine::SyncOptions;
 use progress::{SyncProgressBars, SyncProgressEvent};
 use report::{DeferredFetch, SyncAction, SyncError, SyncReport, SyncSummary};
 
-/// Default `--concurrency`: an in-flight-request cap layered under the
-/// token-bucket rate limiter (which is the actual quota-compliance
-/// mechanism — see `engine.rs`), so it can be generous without risking a
-/// quota burst.
+/// Default requested `--concurrency`, retained for configuration compatibility.
+/// The engine clamps it to [`crate::gmail::messages_api::MAX_CONCURRENCY`]
+/// (currently five) and separately paces requests with its token bucket.
 ///
 /// `pub(crate)` — also `sync-all`'s fallback when neither its own
 /// `--concurrency` flag nor `gmail-sync.yaml`'s `concurrency` is set

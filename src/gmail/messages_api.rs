@@ -34,29 +34,29 @@ pub const HARD_CAP: usize = 10_000;
 /// parameter, regardless of what the caller (CLI `--concurrency` or the MCP
 /// `concurrency` param) requests.
 ///
-/// Gmail's quota is 250 units/user/second and `messages.get` costs 5 units,
-/// so more than 50 requests in flight at once already assumes every one
-/// completes within a second — the flag exists to bound the fan-out against
-/// that quota, so it shouldn't itself accept a value that can blow past it.
-pub const MAX_CONCURRENCY: usize = 50;
+/// Bounds fan-out to one second's read budget (100 units / 20 units per get).
+/// This limits in-flight work, not sustained request rate: fast calls can
+/// still consume quota faster than the pacing budget.
+pub const MAX_CONCURRENCY: usize =
+    (GMAIL_QUOTA_UNITS_PER_SECOND / MESSAGES_GET_COST_UNITS) as usize;
 
-/// Gmail's documented quota ceiling, in quota units per user per second.
+/// Continuous pacing budget, in quota units per user per project per second.
 ///
-/// The load-bearing constraint behind [`MAX_CONCURRENCY`] above and behind
-/// `gmail sync`'s proactive token-bucket limiter
-/// (`src/cli/gmail/sync/engine.rs`) — the single biggest determinant of
-/// whether a bulk sync is pleasant or infuriating (#1467).
-pub const GMAIL_QUOTA_UNITS_PER_SECOND: u32 = 250;
+/// Derived from Google's documented 6,000 units/minute quota, not a separate
+/// server-enforced per-second limit. Used by sync and insert's token buckets
+/// and by [`MAX_CONCURRENCY`]. Some existing projects retain older quotas;
+/// this client uses the current documented baseline.
+/// See <https://developers.google.com/workspace/gmail/api/reference/quota>.
+pub const GMAIL_QUOTA_UNITS_PER_SECOND: u32 = 100;
 
 /// Quota-unit cost of one `messages.get` call, regardless of `format`.
-pub const MESSAGES_GET_COST_UNITS: u32 = 5;
+pub const MESSAGES_GET_COST_UNITS: u32 = 20;
 
 /// Quota-unit cost of one `messages.list` page request.
 pub const MESSAGES_LIST_COST_UNITS: u32 = 5;
 
-/// Quota-unit cost of one `messages.insert` call — 5× a read, since insert
-/// bypasses Gmail's spam/classification pipeline a normally-delivered
-/// message goes through (`gmail insert`, #1655).
+/// Quota-unit cost of one `messages.insert` call, per Google's quota reference.
+/// Insert bypasses Gmail's spam/classification pipeline (`gmail insert`, #1655).
 pub const MESSAGES_INSERT_COST_UNITS: u32 = 25;
 
 /// Refuses to insert content larger than this before ever building the
@@ -73,7 +73,7 @@ pub const DEFAULT_ENRICH_CONCURRENCY: usize = 4;
 ///
 /// Shared between the CLI (`gmail search`'s `--limit` default) and the MCP
 /// `gmail_search` tool (its `limit` param default when omitted), so an
-/// unset limit means the same "quota-safe 50" thing in both surfaces rather
+/// unset limit means the same 50-result bound in both surfaces rather
 /// than silently falling back to `0` (fetch-to-[`HARD_CAP`]) in one of them.
 pub const DEFAULT_SEARCH_LIMIT: usize = 50;
 
@@ -349,14 +349,10 @@ impl<'a> MessagesApi<'a> {
     ///
     /// Gmail's list endpoint only returns `{id, threadId}` per hit — a
     /// `search`-shaped CLI/MCP surface needs more than bare ids to be
-    /// useful, so this costs one extra request per result. Gmail's quota is
-    /// **250 units/user/second** and `messages.get` costs **5 units**, so
-    /// this is a genuinely expensive operation — callers are expected to
-    /// treat it as opt-in (the CLI's `--enrich` flag) rather than a default,
-    /// and `concurrency` bounds the fan-out (modelled on
-    /// `src/cli/atlassian/confluence/download.rs`'s
-    /// `Semaphore::new(params.concurrency)` list-then-hydrate shape) so a
-    /// large `limit` can't burst past the quota in an uncontrolled way.
+    /// useful, so this costs one extra 20-unit request per result. Callers
+    /// should treat it as opt-in (the CLI's `--enrich` flag). `concurrency`
+    /// bounds fan-out to five calls; it does not pace sustained request rate
+    /// against the 100-unit/second budget derived from the minute quota.
     /// Order is preserved (`buffered`, not `buffer_unordered`) so results
     /// match `search_all`'s ordering. A hydration failure on any one id
     /// aborts the whole call with that error, once every already-in-flight
@@ -588,8 +584,8 @@ pub(crate) fn effective_cap(limit: usize) -> usize {
 
 /// Clamps a requested hydration `concurrency` into `1..=MAX_CONCURRENCY`:
 /// `0` (which would otherwise stall the stream forever) is raised to `1`,
-/// and anything past [`MAX_CONCURRENCY`] is capped rather than allowed to
-/// burst past Gmail's per-second quota.
+/// and anything past [`MAX_CONCURRENCY`] is capped to bound fan-out.
+/// This does not enforce a sustained request rate.
 fn effective_concurrency(concurrency: usize) -> usize {
     concurrency.clamp(1, MAX_CONCURRENCY)
 }
@@ -600,7 +596,7 @@ fn effective_concurrency(concurrency: usize) -> usize {
 ///
 /// The list-then-hydrate fan-out shared by [`MessagesApi::search_summaries`]
 /// and `DraftsApi::list_summaries` (#1921), so both bound their
-/// `messages.get` calls against Gmail's per-second quota the same way. Order
+/// `messages.get` fan-out the same way. Order
 /// is preserved (`buffered`, not `buffer_unordered`). A failure on any one
 /// item aborts the whole call with that error, once every already-in-flight
 /// fetch in its concurrency batch completes — it is never silently dropped
@@ -1657,6 +1653,49 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Insufficient Permission"));
         assert!(msg.contains("insufficientPermissions"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gmail_read_budget_paces_the_sixth_get() {
+        let bucket = TokenBucket::new(GMAIL_QUOTA_UNITS_PER_SECOND, GMAIL_QUOTA_UNITS_PER_SECOND);
+        let start = tokio::time::Instant::now();
+        for _ in 0..5 {
+            bucket.acquire(MESSAGES_GET_COST_UNITS).await;
+        }
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+        bucket.acquire(MESSAGES_GET_COST_UNITS).await;
+        assert_eq!(start.elapsed(), std::time::Duration::from_millis(200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hydration_caps_in_flight_gets_and_preserves_order() {
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let ids: Vec<usize> = (0..12).collect();
+        let results = hydrate_in_order(ids.clone(), 50, |id| {
+            let active = &active;
+            let peak = &peak;
+            async move {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                // Finish later items first to exercise ordered collection.
+                tokio::time::sleep(std::time::Duration::from_millis((12 - id) as u64)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(id)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), 5);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(results, ids);
+    }
+
+    #[test]
+    fn effective_concurrency_accepts_the_current_budget_boundary() {
+        assert_eq!(effective_concurrency(5), 5);
+        assert_eq!(effective_concurrency(6), 5);
+        assert_eq!(effective_concurrency(DEFAULT_ENRICH_CONCURRENCY), 4);
     }
 
     // ── effective_cap ─────────────────────────────────────────────────
