@@ -132,3 +132,8 @@ Named Drive and Gmail accounts (`drive.accounts.<name>`, `gmail.accounts.<name>`
 accept `client_secret_file` and `refresh_token_file` but not a `_command` field.
 Reading the OS keychain directly, without a command, is also not built; see
 [ADR-0090](adrs/adr-0090.md).
+
+Atlassian Server/Data Center PATs use `ATLASSIAN_PAT_COMMAND` (or
+`ATLASSIAN_PAT_FILE`) instead of `ATLASSIAN_API_TOKEN_COMMAND`. Configure only one
+authentication mode. `atlassian_auth_status` counts these sources without running
+them. See [PAT authentication](user-guide.md#serverdata-center-personal-access-tokens).

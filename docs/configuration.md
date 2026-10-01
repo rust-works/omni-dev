@@ -1177,3 +1177,13 @@ Complete example configurations for different project types:
 - 🔧 [Troubleshooting](troubleshooting.md) - Common issues
 - 📝 [Examples](examples.md) - Real-world examples  
 - 💬 [GitHub Discussions](https://github.com/rust-works/omni-dev/discussions) - Community support
+
+## Atlassian authentication
+
+Cloud credentials use `ATLASSIAN_INSTANCE_URL`, `ATLASSIAN_EMAIL`, and
+`ATLASSIAN_API_TOKEN` (Basic). Self-hosted Jira/Confluence PAT credentials use
+`ATLASSIAN_INSTANCE_URL` and `ATLASSIAN_PAT` (Bearer), without email.
+Configure one token mode only. Both token keys accept `_FILE` and `_COMMAND`.
+Process sources override the selected settings profile; a selected profile does
+not inherit the base `env`. See [Atlassian PAT setup and compatibility](user-guide.md#serverdata-center-personal-access-tokens)
+for login, verification, mode switching, context-path examples and limitations.

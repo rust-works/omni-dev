@@ -627,7 +627,8 @@ omni-dev atlassian auth logout
 ```
 
 `auth logout` removes the `ATLASSIAN_INSTANCE_URL`, `ATLASSIAN_EMAIL`, and
-`ATLASSIAN_API_TOKEN` keys from the active profile's `env` map (the base `env`
+`ATLASSIAN_API_TOKEN`, and `ATLASSIAN_PAT` keys (including token `_FILE` and
+`_COMMAND` companions) from the active profile's `env` map (the base `env`
 map when no profile is selected), leaving all other settings intact.
 
 Credentials are stored in `~/.omni-dev/settings.json`. You can also use
@@ -649,6 +650,73 @@ both `ATLASSIAN_API_TOKEN` and `ATLASSIAN_API_TOKEN_FILE` in the same place
 (both exported, or both in the same settings.json map) is an error. See [ADR-0089](adrs/adr-0089.md).
 
 `ATLASSIAN_API_TOKEN_COMMAND` fetches the token on demand from a password manager or keychain instead; see [secret-commands.md](secret-commands.md).
+
+
+#### Server/Data Center Personal Access Tokens
+
+For Jira 8.14+ or Confluence 7.9+, configure an explicit Bearer PAT:
+
+```bash
+omni-dev atlassian auth login --auth-mode bearer
+# Prompts for instance URL and PAT; no email required.
+omni-dev atlassian auth status --service jira
+# For a Confluence installation:
+omni-dev atlassian auth status --service confluence
+```
+
+Alternatively, export credentials for one invocation/session:
+
+```bash
+export ATLASSIAN_INSTANCE_URL=https://jira.example.com/jira
+export ATLASSIAN_PAT=your-personal-access-token
+```
+
+A profile keeps a self-hosted tenant separate from Cloud credentials:
+
+```json
+{
+  "profiles": {
+    "self-hosted": {
+      "env": {
+        "ATLASSIAN_INSTANCE_URL": "https://jira.example.com/jira",
+        "ATLASSIAN_PAT_FILE": "/run/secrets/atlassian-pat"
+      }
+    }
+  }
+}
+```
+
+Run `omni-dev --profile self-hosted atlassian auth status` to select it.
+Include any
+self-hosted context path, for example `https://jira.example.com/jira` or
+`https://docs.example.com/confluence`. Both tokens accept `_FILE` and `_COMMAND`
+companions through the [secret resolver](secret-commands.md); configure only one
+source for each secret in a layer.
+
+`ATLASSIAN_API_TOKEN` always means Basic authentication and still requires
+`ATLASSIAN_EMAIL`. If both API-token and PAT sources are configured, loading
+fails with a conflict; it never switches modes after an authentication failure.
+An email alone does not prevent PAT authentication. Empty or blank tokens fail.
+Cloud OAuth 2.0 3LO is not supported by this PAT flow.
+
+Login replaces the other mode's stored keys and companions in the selected
+profile (or base `env`); a helper for the selected token refuses replacement
+before any write. Unset exported token sources before login, since they override
+settings. Profiles remain isolated from base credentials. Logout removes both
+token modes and their companions in that map; exported credentials remain set.
+
+PAT support covers shared authentication and service-specific current-user
+verification. Most Jira/Confluence operations still use Cloud endpoints, account
+IDs and payloads, so PAT setup does **not** imply full Server/Data Center command
+compatibility. Jira verification uses `/rest/api/2/myself`; Confluence uses
+`/rest/api/user/current` relative to your base/context path, without adding
+`/wiki`. An anonymous Confluence response is rejected even when HTTP is 200.
+
+The `atlassian_auth_status` MCP tool only inspects configuration presence. Its
+`has_pat`, `auth_mode`, and `configuration_state` fields distinguish a PAT-only
+configuration from missing, incomplete or conflicting configuration. It does
+not read secret files, run helpers, or authenticate remotely. `has_token` retains
+its existing meaning of API-token presence.
 
 To keep multiple Atlassian tenants (e.g. `work` and `personal`) on one machine
 and pick one per command, store each tenant's variables in a named **profile**

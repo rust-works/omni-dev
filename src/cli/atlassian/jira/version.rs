@@ -827,8 +827,10 @@ mod tests {
     fn mock_credentials(instance_url: &str) -> AtlassianCredentials {
         AtlassianCredentials {
             instance_url: instance_url.to_string(),
-            email: "test@example.com".to_string(),
-            api_token: "test-token".into(),
+            auth: crate::atlassian::auth::AtlassianAuth::Basic {
+                email: "test@example.com".to_string(),
+                api_token: "test-token".into(),
+            },
         }
     }
 

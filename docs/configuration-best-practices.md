@@ -142,6 +142,11 @@ omni-dev --profile work atlassian jira read PROJ-1   # global --profile flag
 OMNI_DEV_PROFILE=work omni-dev datadog monitor list  # OMNI_DEV_PROFILE env var
 ```
 
+For a self-hosted Atlassian profile, replace `ATLASSIAN_EMAIL` and
+`ATLASSIAN_API_TOKEN` with `ATLASSIAN_PAT`, and use the self-hosted URL including
+its context path. Do not configure both token modes; see
+[PAT setup](user-guide.md#serverdata-center-personal-access-tokens).
+
 ### Populating a profile
 
 The `auth login` flows write to the profile that is active when they run:

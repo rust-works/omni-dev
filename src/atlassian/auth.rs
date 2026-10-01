@@ -1,6 +1,6 @@
 //! Atlassian credential management.
 //!
-//! Loads and saves Atlassian Cloud API credentials from/to the
+//! Loads and saves Atlassian Basic and Bearer credentials from/to the
 //! `~/.omni-dev/settings.json` file — the active profile's `env` map when a
 //! profile is selected, the base `env` map otherwise (issue #1116).
 
@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::atlassian::error::AtlassianError;
-use crate::utils::env::SystemEnv;
+use crate::utils::env::{EnvSource, SystemEnv};
 use crate::utils::secret::Secret;
 use crate::utils::secret_env::{secret_var, secret_var_is_set};
 use crate::utils::settings::{active_profile_from, Settings};
@@ -30,17 +30,75 @@ pub const ATLASSIAN_API_TOKEN: &str = "ATLASSIAN_API_TOKEN";
 /// (e.g. via [`load_credentials_with_instance`]) still wins over it.
 pub const ATLASSIAN_INSTANCE_OVERRIDE_ENV: &str = "OMNI_DEV_ATLASSIAN_INSTANCE";
 
-/// Atlassian Cloud credentials.
+/// Environment variable / settings key for a Server/Data Center PAT.
+pub const ATLASSIAN_PAT: &str = "ATLASSIAN_PAT";
+
+/// Authentication credentials; secret values are redacted in Debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AtlassianAuth {
+    /// Cloud Basic authentication.
+    Basic {
+        /// Account email.
+        email: String,
+        /// Cloud API token.
+        api_token: Secret,
+    },
+    /// Server/Data Center Personal Access Token authentication.
+    Bearer {
+        /// Personal Access Token.
+        token: Secret,
+    },
+}
+
+/// Non-secret authentication mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// Email and API token.
+    #[default]
+    Basic,
+    /// Personal Access Token without email.
+    Bearer,
+}
+
+impl AtlassianAuth {
+    /// Returns the authentication mode without exposing credentials.
+    #[must_use]
+    pub const fn mode(&self) -> AuthMode {
+        match self {
+            Self::Basic { .. } => AuthMode::Basic,
+            Self::Bearer { .. } => AuthMode::Bearer,
+        }
+    }
+
+    /// Validates required fields without printing their contents.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let token = match self {
+            Self::Basic { email, api_token } => {
+                if email.trim().is_empty() {
+                    anyhow::bail!("ATLASSIAN_EMAIL is required for Basic authentication");
+                }
+                api_token.expose_secret()
+            }
+            Self::Bearer { token } => token.expose_secret(),
+        };
+        if token.trim().is_empty() {
+            anyhow::bail!("Atlassian token must not be blank");
+        }
+        if token.chars().any(char::is_control) {
+            anyhow::bail!("Atlassian token contains invalid control characters");
+        }
+        Ok(())
+    }
+}
+
+/// Atlassian credentials for one instance.
 #[derive(Debug, Clone)]
 pub struct AtlassianCredentials {
-    /// Instance base URL (e.g., `"https://myorg.atlassian.net"`).
+    /// Base URL, including any self-hosted context path.
     pub instance_url: String,
-
-    /// User email address.
-    pub email: String,
-
-    /// API token (secret; redacted in `Debug` output).
-    pub api_token: Secret,
+    /// Selected authentication credentials.
+    pub auth: AtlassianAuth,
 }
 
 /// Loads Atlassian credentials from environment variables or settings.json.
@@ -63,33 +121,65 @@ pub fn load_credentials() -> Result<AtlassianCredentials> {
 /// trailing-slash normalization) and the `ATLASSIAN_INSTANCE_URL` env /
 /// settings lookup is skipped — so a caller-supplied instance (e.g.
 /// `jira create --instance`) works even when no instance is configured in the
-/// environment. `ATLASSIAN_EMAIL` and `ATLASSIAN_API_TOKEN` are still required.
+/// environment. Authentication requires either email/API token or a PAT.
 /// When `None`, behaves exactly like [`load_credentials`].
 pub fn load_credentials_with_instance(
     instance_override: Option<&str>,
 ) -> Result<AtlassianCredentials> {
     let settings = Settings::load_or_warn_default();
 
-    let instance_url = match instance_override {
-        Some(url) => url.to_string(),
-        None => settings
-            .get_env_var(ATLASSIAN_INSTANCE_URL)
-            .ok_or(AtlassianError::CredentialsNotFound)?,
+    load_credentials_from(&settings.env_source(), instance_override)
+}
+
+/// Resolves credentials through an injected layered environment source.
+pub(crate) fn load_credentials_from(
+    env: &impl EnvSource,
+    instance_override: Option<&str>,
+) -> Result<AtlassianCredentials> {
+    let scope = scope_status_from(env);
+    if scope.configuration_state == ConfigurationState::Conflict {
+        anyhow::bail!(
+            "ATLASSIAN_PAT and ATLASSIAN_API_TOKEN conflict; configure only one token source"
+        );
+    }
+    let instance_url = instance_override
+        .map(str::to_owned)
+        .or(scope.instance_url)
+        .filter(|v| !v.trim().is_empty())
+        .ok_or(AtlassianError::CredentialsNotFound)?;
+    let auth = if scope.has_pat {
+        AtlassianAuth::Bearer {
+            token: secret_var(env, ATLASSIAN_PAT)?.ok_or(AtlassianError::CredentialsNotFound)?,
+        }
+    } else {
+        AtlassianAuth::Basic {
+            email: env
+                .var(ATLASSIAN_EMAIL)
+                .filter(|v| !v.trim().is_empty())
+                .ok_or(AtlassianError::CredentialsNotFound)?,
+            api_token: secret_var(env, ATLASSIAN_API_TOKEN)?
+                .ok_or(AtlassianError::CredentialsNotFound)?,
+        }
     };
-    let email = settings
-        .get_env_var(ATLASSIAN_EMAIL)
-        .ok_or(AtlassianError::CredentialsNotFound)?;
-    let api_token = secret_var(&settings.env_source(), ATLASSIAN_API_TOKEN)?
-        .ok_or(AtlassianError::CredentialsNotFound)?;
-
-    // Normalize: strip trailing slash from instance URL
-    let instance_url = instance_url.trim_end_matches('/').to_string();
-
+    auth.validate()?;
     Ok(AtlassianCredentials {
-        instance_url,
-        email,
-        api_token,
+        instance_url: instance_url.trim_end_matches('/').to_string(),
+        auth,
     })
+}
+
+/// Configuration presence, without resolving or authenticating secrets.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationState {
+    /// No authentication keys are present.
+    Missing,
+    /// Required configuration is absent.
+    Incomplete,
+    /// Required configuration is present; not remotely validated.
+    Configured,
+    /// Both authentication token sources are configured.
+    Conflict,
 }
 
 /// Summary of a single Atlassian credential scope.
@@ -105,6 +195,13 @@ pub struct AtlassianScopeStatus {
     pub has_email: bool,
     /// Whether [`ATLASSIAN_API_TOKEN`] is present. Token value is never exposed.
     pub has_token: bool,
+    /// Whether a PAT source is present, without resolving it.
+    pub has_pat: bool,
+    /// Unambiguous selected authentication mode, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<AuthMode>,
+    /// Presence classification; never a claim of authentication success.
+    pub configuration_state: ConfigurationState,
     /// Value of [`ATLASSIAN_INSTANCE_URL`] when set. The URL is considered
     /// non-secret; returning it helps the assistant surface which instance
     /// a scope targets without exposing credentials.
@@ -130,19 +227,49 @@ pub struct AuthStatus {
 pub fn status() -> AuthStatus {
     let settings = Settings::load_or_warn_default();
 
-    let instance_url = settings
-        .get_env_var(ATLASSIAN_INSTANCE_URL)
-        .map(|v| v.trim_end_matches('/').to_string());
-    let has_email = settings.get_env_var(ATLASSIAN_EMAIL).is_some();
-    let has_token = secret_var_is_set(&settings.env_source(), ATLASSIAN_API_TOKEN);
+    status_from(&settings.env_source())
+}
 
+/// Reports presence through an injected source, without resolving secrets.
+pub(crate) fn status_from(env: &impl EnvSource) -> AuthStatus {
     AuthStatus {
-        scopes: vec![AtlassianScopeStatus {
-            name: "default".to_string(),
-            has_email,
-            has_token,
-            instance_url,
-        }],
+        scopes: vec![scope_status_from(env)],
+    }
+}
+
+/// Classifies credential presence without reading files or executing helpers.
+fn scope_status_from(env: &impl EnvSource) -> AtlassianScopeStatus {
+    let instance_url = env
+        .var(ATLASSIAN_INSTANCE_URL)
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.trim_end_matches('/').to_string());
+    let has_email = env
+        .var(ATLASSIAN_EMAIL)
+        .is_some_and(|v| !v.trim().is_empty());
+    let has_token = secret_var_is_set(env, ATLASSIAN_API_TOKEN);
+    let has_pat = secret_var_is_set(env, ATLASSIAN_PAT);
+    let auth_mode = match (has_token, has_pat) {
+        (true, false) => Some(AuthMode::Basic),
+        (false, true) => Some(AuthMode::Bearer),
+        _ => None,
+    };
+    let configuration_state = if has_token && has_pat {
+        ConfigurationState::Conflict
+    } else if (has_pat || (has_token && has_email)) && instance_url.is_some() {
+        ConfigurationState::Configured
+    } else if !has_email && !has_token && !has_pat && instance_url.is_none() {
+        ConfigurationState::Missing
+    } else {
+        ConfigurationState::Incomplete
+    };
+    AtlassianScopeStatus {
+        name: "default".to_string(),
+        has_email,
+        has_token,
+        has_pat,
+        auth_mode,
+        configuration_state,
+        instance_url,
     }
 }
 
@@ -169,15 +296,25 @@ pub(crate) fn save_credentials_to(
     profile: Option<&str>,
     credentials: &AtlassianCredentials,
 ) -> Result<()> {
-    Settings::upsert_env_vars_in(
-        settings_path,
-        profile,
-        &[
-            (ATLASSIAN_INSTANCE_URL, credentials.instance_url.as_str()),
-            (ATLASSIAN_EMAIL, credentials.email.as_str()),
-            (ATLASSIAN_API_TOKEN, credentials.api_token.expose_secret()),
-        ],
-    )
+    credentials.auth.validate()?;
+    if credentials.instance_url.trim().is_empty() {
+        anyhow::bail!("Instance URL is required");
+    }
+    let mut vars = vec![(ATLASSIAN_INSTANCE_URL, credentials.instance_url.as_str())];
+    let remove = match &credentials.auth {
+        AtlassianAuth::Basic { email, api_token } => {
+            vars.extend([
+                (ATLASSIAN_EMAIL, email.as_str()),
+                (ATLASSIAN_API_TOKEN, api_token.expose_secret()),
+            ]);
+            vec![ATLASSIAN_PAT]
+        }
+        AtlassianAuth::Bearer { token } => {
+            vars.push((ATLASSIAN_PAT, token.expose_secret()));
+            vec![ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN]
+        }
+    };
+    Settings::replace_env_vars_in(settings_path, profile, &vars, &remove)
 }
 
 /// Removes Atlassian credential keys from `~/.omni-dev/settings.json` — from
@@ -207,7 +344,12 @@ pub(crate) fn remove_credentials_at(
     Settings::remove_env_vars_in(
         settings_path,
         profile,
-        &[ATLASSIAN_INSTANCE_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN],
+        &[
+            ATLASSIAN_INSTANCE_URL,
+            ATLASSIAN_EMAIL,
+            ATLASSIAN_API_TOKEN,
+            ATLASSIAN_PAT,
+        ],
     )
 }
 
@@ -221,7 +363,7 @@ pub(crate) fn remove_credentials_at(
 pub(crate) mod test_util {
     use super::{
         ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_OVERRIDE_ENV,
-        ATLASSIAN_INSTANCE_URL,
+        ATLASSIAN_INSTANCE_URL, ATLASSIAN_PAT,
     };
     use crate::utils::settings::PROFILE_ENV_VAR;
 
@@ -258,6 +400,7 @@ pub(crate) mod test_util {
                 ATLASSIAN_INSTANCE_OVERRIDE_ENV,
                 ATLASSIAN_EMAIL,
                 ATLASSIAN_API_TOKEN,
+                ATLASSIAN_PAT,
             ];
             let snapshot = keys
                 .into_iter()
@@ -286,6 +429,7 @@ pub(crate) mod test_util {
             std::env::remove_var(ATLASSIAN_INSTANCE_OVERRIDE_ENV);
             std::env::remove_var(ATLASSIAN_EMAIL);
             std::env::remove_var(ATLASSIAN_API_TOKEN);
+            std::env::remove_var(ATLASSIAN_PAT);
             dir
         }
 
@@ -302,6 +446,7 @@ pub(crate) mod test_util {
             std::env::set_var(ATLASSIAN_INSTANCE_URL, instance_url);
             std::env::set_var(ATLASSIAN_EMAIL, "test@example.com");
             std::env::set_var(ATLASSIAN_API_TOKEN, "test-token");
+            std::env::remove_var(ATLASSIAN_PAT);
             dir
         }
     }
@@ -378,13 +523,14 @@ mod tests {
     fn credentials_struct_clone_and_debug() {
         let creds = AtlassianCredentials {
             instance_url: "https://org.atlassian.net".to_string(),
-            email: "user@test.com".to_string(),
-            api_token: "super-sekret-api-token-value".into(),
+            auth: crate::atlassian::auth::AtlassianAuth::Basic {
+                email: "user@test.com".to_string(),
+                api_token: "super-sekret-api-token-value".into(),
+            },
         };
         let cloned = creds.clone();
         assert_eq!(cloned.instance_url, creds.instance_url);
-        assert_eq!(cloned.email, creds.email);
-        assert_eq!(cloned.api_token, creds.api_token);
+        assert_eq!(cloned.auth, creds.auth);
         // Debug must never print the token value (#1131).
         let debug = format!("{creds:?}");
         assert!(debug.contains("AtlassianCredentials"));
@@ -407,6 +553,7 @@ mod tests {
         std::env::remove_var(ATLASSIAN_INSTANCE_URL);
         std::env::remove_var(ATLASSIAN_EMAIL);
         std::env::remove_var(ATLASSIAN_API_TOKEN);
+        std::env::remove_var(ATLASSIAN_PAT);
         dir
     }
 
@@ -482,8 +629,10 @@ mod tests {
 
         let creds = AtlassianCredentials {
             instance_url: "https://wrapper.atlassian.net".to_string(),
-            email: "wrapper@example.com".to_string(),
-            api_token: "wrapper-token".into(),
+            auth: crate::atlassian::auth::AtlassianAuth::Basic {
+                email: "wrapper@example.com".to_string(),
+                api_token: "wrapper-token".into(),
+            },
         };
         save_credentials(&creds).unwrap();
 
@@ -503,8 +652,10 @@ mod tests {
 
         let creds = AtlassianCredentials {
             instance_url: "https://wrapper.atlassian.net".to_string(),
-            email: "wrapper@example.com".to_string(),
-            api_token: "wrapper-token".into(),
+            auth: crate::atlassian::auth::AtlassianAuth::Basic {
+                email: "wrapper@example.com".to_string(),
+                api_token: "wrapper-token".into(),
+            },
         };
         save_credentials(&creds).unwrap();
 
@@ -536,8 +687,10 @@ mod tests {
 
             let creds = AtlassianCredentials {
                 instance_url: "https://save.atlassian.net".to_string(),
-                email: "save@example.com".to_string(),
-                api_token: "save-token".into(),
+                auth: crate::atlassian::auth::AtlassianAuth::Basic {
+                    email: "save@example.com".to_string(),
+                    api_token: "save-token".into(),
+                },
             };
             save_credentials_to(&settings_path, None, &creds).unwrap();
 
@@ -577,8 +730,10 @@ mod tests {
 
             let creds = AtlassianCredentials {
                 instance_url: "https://org.atlassian.net".to_string(),
-                email: "user@test.com".to_string(),
-                api_token: "token".into(),
+                auth: crate::atlassian::auth::AtlassianAuth::Basic {
+                    email: "user@test.com".to_string(),
+                    api_token: "token".into(),
+                },
             };
             save_credentials_to(&settings_path, None, &creds).unwrap();
 
@@ -609,8 +764,10 @@ mod tests {
 
         let creds = AtlassianCredentials {
             instance_url: "https://work.atlassian.net".to_string(),
-            email: "work@example.com".to_string(),
-            api_token: "work-token".into(),
+            auth: crate::atlassian::auth::AtlassianAuth::Basic {
+                email: "work@example.com".to_string(),
+                api_token: "work-token".into(),
+            },
         };
         save_credentials_to(&settings_path, Some("work"), &creds).unwrap();
 
@@ -641,8 +798,12 @@ mod tests {
         let creds =
             load_credentials_with_instance(Some("https://override.atlassian.net/")).unwrap();
         assert_eq!(creds.instance_url, "https://override.atlassian.net");
-        assert_eq!(creds.email, "person@example.com");
-        assert_eq!(creds.api_token.expose_secret(), "token");
+        assert!(
+            matches!(&creds.auth, AtlassianAuth::Basic { email, .. } if email == "person@example.com")
+        );
+        assert!(
+            matches!(&creds.auth, AtlassianAuth::Basic { api_token, .. } if api_token.expose_secret() == "token")
+        );
     }
 
     #[test]
@@ -678,6 +839,210 @@ mod tests {
         );
         let creds = load_credentials().unwrap();
         assert_eq!(creds.instance_url, "https://flag.atlassian.net");
-        assert_eq!(creds.email, "person@example.com");
+        assert!(
+            matches!(&creds.auth, AtlassianAuth::Basic { email, .. } if email == "person@example.com")
+        );
+    }
+    use crate::test_support::env::{secret_file, MapEnv};
+
+    fn pat_env() -> MapEnv {
+        MapEnv::new()
+            .with(ATLASSIAN_INSTANCE_URL, "https://self.example/jira/")
+            .with(ATLASSIAN_PAT, "private-pat")
+    }
+
+    #[test]
+    fn pat_loads_without_email_and_is_redacted() {
+        let creds = load_credentials_from(&pat_env(), None).unwrap();
+        assert_eq!(creds.instance_url, "https://self.example/jira");
+        assert_eq!(creds.auth.mode(), AuthMode::Bearer);
+        assert!(!format!("{creds:?}").contains("private-pat"));
+        let scope = scope_status_from(&pat_env().with(ATLASSIAN_EMAIL, "leftover@example.com"));
+        assert_eq!(scope.configuration_state, ConfigurationState::Configured);
+        assert_eq!(scope.auth_mode, Some(AuthMode::Bearer));
+        let yaml = serde_yaml::to_string(&scope).unwrap();
+        assert!(yaml.contains("has_pat: true"));
+        assert!(!yaml.contains("private-pat"));
+        assert!(!yaml.contains("leftover@example.com"));
+    }
+
+    #[test]
+    fn token_conflict_precedes_secret_resolution() {
+        let env = MapEnv::new()
+            .with(ATLASSIAN_INSTANCE_URL, "https://self.example")
+            .with("ATLASSIAN_PAT_COMMAND", "/does/not/exist")
+            .with("ATLASSIAN_API_TOKEN_FILE", "/does/not/exist");
+        let scope = scope_status_from(&env);
+        assert_eq!(scope.configuration_state, ConfigurationState::Conflict);
+        assert_eq!(scope.auth_mode, None);
+        let err = load_credentials_from(&env, None).unwrap_err().to_string();
+        assert!(err.contains("conflict"));
+        assert!(!err.contains("/does/not/exist"));
+    }
+
+    #[test]
+    fn presence_status_does_not_resolve_sources() {
+        for key in ["ATLASSIAN_PAT_FILE", "ATLASSIAN_PAT_COMMAND"] {
+            let env = MapEnv::new()
+                .with(ATLASSIAN_INSTANCE_URL, "https://self.example")
+                .with(key, "/does/not/exist");
+            assert_eq!(
+                scope_status_from(&env).configuration_state,
+                ConfigurationState::Configured
+            );
+        }
+        assert_eq!(
+            scope_status_from(&MapEnv::new()).configuration_state,
+            ConfigurationState::Missing
+        );
+        assert_eq!(
+            scope_status_from(&MapEnv::new().with(ATLASSIAN_PAT, "pat")).configuration_state,
+            ConfigurationState::Incomplete
+        );
+    }
+
+    #[test]
+    fn pat_file_and_helper_use_secret_resolver() {
+        let (_dir, path) = secret_file("file-pat\n");
+        let env = MapEnv::new().with("ATLASSIAN_PAT_FILE", &path);
+        let creds = load_credentials_from(&env, Some("https://self.example/confluence/")).unwrap();
+        assert!(
+            matches!(creds.auth, AtlassianAuth::Bearer { token } if token.expose_secret() == "file-pat")
+        );
+        let env = MapEnv::new().with("ATLASSIAN_PAT_COMMAND", "/usr/bin/printf helper-pat");
+        let creds = load_credentials_from(&env, Some("https://self.example")).unwrap();
+        assert!(
+            matches!(creds.auth, AtlassianAuth::Bearer { token } if token.expose_secret() == "helper-pat")
+        );
+    }
+
+    #[test]
+    fn invalid_and_missing_credentials_do_not_fall_back() {
+        for token in [" ", "pat\r\nInjected: yes"] {
+            let env = MapEnv::new().with(ATLASSIAN_PAT, token);
+            let err = load_credentials_from(&env, Some("https://self.example")).unwrap_err();
+            if !token.trim().is_empty() {
+                assert!(!err.to_string().contains(token));
+            }
+        }
+        let env = MapEnv::new().with(ATLASSIAN_API_TOKEN, "cloud-token");
+        assert!(load_credentials_from(&env, Some("https://self.example")).is_err());
+        assert!(load_credentials_from(&MapEnv::new(), Some("https://self.example")).is_err());
+        assert!(load_credentials_from(&pat_env(), Some(" ")).is_err());
+        let env = MapEnv::new()
+            .with(ATLASSIAN_PAT, "pat")
+            .with("ATLASSIAN_PAT_FILE", "/missing");
+        assert!(load_credentials_from(&env, Some("https://self.example")).is_err());
+    }
+
+    struct Layered<'a> {
+        settings: &'a Settings,
+        raw: MapEnv,
+        profile: Option<&'a str>,
+    }
+    impl EnvSource for Layered<'_> {
+        fn var(&self, key: &str) -> Option<String> {
+            self.settings.resolve_with(&self.raw, self.profile, key)
+        }
+        fn var_triple(
+            &self,
+            key: &str,
+            file: &str,
+            command: &str,
+        ) -> crate::utils::env::SecretTriple {
+            self.settings
+                .resolve_triple_with(&self.raw, self.profile, key, file, command)
+        }
+    }
+
+    #[test]
+    fn pat_profiles_are_isolated_and_process_source_wins() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "env": {"ATLASSIAN_EMAIL": "base@example.com", "ATLASSIAN_API_TOKEN": "base-token"},
+            "profiles": {"work": {"env": {"ATLASSIAN_PAT": "profile-pat"}}}
+        }))
+        .unwrap();
+        let source = Layered {
+            settings: &settings,
+            raw: MapEnv::new(),
+            profile: Some("work"),
+        };
+        let creds = load_credentials_from(&source, Some("https://self.example")).unwrap();
+        assert!(
+            matches!(creds.auth, AtlassianAuth::Bearer { token } if token.expose_secret() == "profile-pat")
+        );
+        let source = Layered {
+            raw: MapEnv::new().with(ATLASSIAN_PAT, "process-pat"),
+            ..source
+        };
+        let creds = load_credentials_from(&source, Some("https://self.example")).unwrap();
+        assert!(
+            matches!(creds.auth, AtlassianAuth::Bearer { token } if token.expose_secret() == "process-pat")
+        );
+    }
+
+    #[test]
+    fn mode_switch_and_logout_remove_obsolete_sources_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = serde_json::json!({"unknown": true, "env": {"KEEP": "base"}, "profiles": {
+            "work": {"env": {"KEEP": "work", "ATLASSIAN_EMAIL": "old@example.com",
+                "ATLASSIAN_API_TOKEN_FILE": "/old-file", "ATLASSIAN_API_TOKEN_COMMAND": "old-helper"}},
+            "other": {"env": {"ATLASSIAN_PAT": "other-pat"}}
+        }});
+        fs::write(&path, initial.to_string()).unwrap();
+        let creds = AtlassianCredentials {
+            instance_url: "https://self.example".into(),
+            auth: AtlassianAuth::Bearer {
+                token: "new-pat".into(),
+            },
+        };
+        save_credentials_to(&path, Some("work"), &creds).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let env = &saved["profiles"]["work"]["env"];
+        assert_eq!(env[ATLASSIAN_PAT], "new-pat");
+        for key in [
+            ATLASSIAN_EMAIL,
+            ATLASSIAN_API_TOKEN,
+            "ATLASSIAN_API_TOKEN_FILE",
+            "ATLASSIAN_API_TOKEN_COMMAND",
+        ] {
+            assert!(env.get(key).is_none());
+        }
+        assert_eq!(saved["env"], initial["env"]);
+        assert_eq!(saved["profiles"]["other"], initial["profiles"]["other"]);
+        assert_eq!(saved["unknown"], true);
+        let creds = AtlassianCredentials {
+            instance_url: "https://cloud.example".into(),
+            auth: AtlassianAuth::Basic {
+                email: "me@example.com".into(),
+                api_token: "cloud-token".into(),
+            },
+        };
+        save_credentials_to(&path, Some("work"), &creds).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved["profiles"]["work"]["env"]
+            .get(ATLASSIAN_PAT)
+            .is_none());
+        assert!(remove_credentials_at(&path, Some("work")).unwrap());
+        assert!(!remove_credentials_at(&path, Some("work")).unwrap());
+    }
+
+    #[test]
+    fn selected_helper_refusal_leaves_file_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = r#"{"env":{"ATLASSIAN_PAT_COMMAND":"helper","ATLASSIAN_API_TOKEN":"old"}}"#;
+        fs::write(&path, initial).unwrap();
+        let creds = AtlassianCredentials {
+            instance_url: "https://self.example".into(),
+            auth: AtlassianAuth::Bearer {
+                token: "new-pat".into(),
+            },
+        };
+        assert!(save_credentials_to(&path, None, &creds).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), initial);
     }
 }

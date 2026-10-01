@@ -5,12 +5,12 @@ use std::io::{self, Write};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::auth::{self, AtlassianCredentials};
-use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::auth::{self, AtlassianAuth, AtlassianCredentials, AuthMode};
+use crate::atlassian::client::{AtlassianClient, AuthService};
 use crate::utils::env::SystemEnv;
 use crate::utils::settings::{active_profile_from, profile_suffix, Settings};
 
-/// Manages Atlassian Cloud credentials.
+/// Manages Atlassian credentials.
 #[derive(Parser)]
 pub struct AuthCommand {
     /// The auth subcommand to execute.
@@ -21,9 +21,9 @@ pub struct AuthCommand {
 /// Auth subcommands.
 #[derive(Subcommand)]
 pub enum AuthSubcommands {
-    /// Configures Atlassian Cloud credentials interactively.
+    /// Configures Atlassian credentials interactively.
     Login(LoginCommand),
-    /// Removes Atlassian Cloud credentials from settings.json.
+    /// Removes Atlassian credentials from settings.json.
     Logout(LogoutCommand),
     /// Shows the current authentication status (mirrors the `atlassian_auth_status` MCP tool).
     Status(StatusCommand),
@@ -40,18 +40,32 @@ impl AuthCommand {
     }
 }
 
-/// Configures Atlassian Cloud credentials.
+/// Configures Atlassian credentials.
 #[derive(Parser)]
-pub struct LoginCommand;
+pub struct LoginCommand {
+    /// Authentication: basic for Cloud, bearer for Server/Data Center PATs.
+    #[arg(long, value_enum, default_value = "basic")]
+    pub auth_mode: AuthMode,
+}
 
 impl LoginCommand {
     /// Prompts the user for credentials and saves them.
     pub fn execute(self) -> Result<()> {
-        println!("Configure Atlassian Cloud credentials\n");
+        println!("Configure Atlassian credentials\n");
         let instance_url = prompt("Instance URL (e.g., https://myorg.atlassian.net): ")?;
-        let email = prompt("Email: ")?;
-        let api_token = prompt("API token: ")?;
-        run_login(&instance_url, &email, &api_token)
+        let credentials = match self.auth_mode {
+            AuthMode::Basic => AtlassianAuth::Basic {
+                email: prompt("Email: ")?,
+                api_token: prompt("API token: ")?.into(),
+            },
+            AuthMode::Bearer => AtlassianAuth::Bearer {
+                token: prompt("Personal Access Token: ")?.into(),
+            },
+        };
+        let path = Settings::get_settings_path()?;
+        let profile = active_profile_from(&SystemEnv);
+        check_login_sources(&path, profile.as_deref(), &credentials, &SystemEnv)?;
+        save_login_to(&path, profile.as_deref(), &instance_url, credentials)
     }
 }
 
@@ -61,6 +75,7 @@ impl LoginCommand {
 ///
 /// Extracted from [`LoginCommand::execute`] so the input-validation branches
 /// are reachable from tests without mocking stdin.
+#[cfg(test)]
 fn run_login(instance_url: &str, email: &str, api_token: &str) -> Result<()> {
     run_login_to(
         &Settings::get_settings_path()?,
@@ -74,6 +89,7 @@ fn run_login(instance_url: &str, email: &str, api_token: &str) -> Result<()> {
 /// [`run_login`], persisting to an explicit settings-file path and profile so
 /// tests inject both instead of mutating `HOME` / `OMNI_DEV_PROFILE`
 /// (issue #1030).
+#[cfg(test)]
 fn run_login_to(
     settings_path: &std::path::Path,
     profile: Option<&str>,
@@ -91,25 +107,64 @@ fn run_login_to(
         anyhow::bail!("API token is required");
     }
 
+    save_login_to(
+        settings_path,
+        profile,
+        instance_url,
+        AtlassianAuth::Basic {
+            email: email.to_string(),
+            api_token: api_token.into(),
+        },
+    )
+}
+
+/// Refuses process sources that would shadow or conflict with the saved mode.
+fn check_login_sources(
+    path: &std::path::Path,
+    profile: Option<&str>,
+    auth: &AtlassianAuth,
+    raw: &impl crate::utils::env::EnvSource,
+) -> Result<()> {
+    let (selected, opposite) = match auth {
+        AtlassianAuth::Basic { .. } => (auth::ATLASSIAN_API_TOKEN, auth::ATLASSIAN_PAT),
+        AtlassianAuth::Bearer { .. } => (auth::ATLASSIAN_PAT, auth::ATLASSIAN_API_TOKEN),
+    };
+    Settings::ensure_secrets_replaceable(path, profile, &[selected], raw)?;
+    for key in [selected, opposite] {
+        if crate::utils::secret_env::secret_var_is_set(raw, key) {
+            anyhow::bail!(
+                "{key} has a process environment source; unset it before saving credentials"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn save_login_to(
+    settings_path: &std::path::Path,
+    profile: Option<&str>,
+    instance_url: &str,
+    auth: AtlassianAuth,
+) -> Result<()> {
     let credentials = AtlassianCredentials {
         instance_url: instance_url.to_string(),
-        email: email.to_string(),
-        api_token: api_token.into(),
+        auth,
     };
-
     auth::save_credentials_to(settings_path, profile, &credentials)?;
     println!(
         "\nCredentials saved to ~/.omni-dev/settings.json{}",
         profile_suffix(profile)
     );
     println!("  Instance: {instance_url}");
-    println!("  Email: {email}");
+    println!("  Authentication: {:?}", credentials.auth.mode());
+    if let AtlassianAuth::Basic { email, .. } = &credentials.auth {
+        println!("  Email: {email}");
+    }
     println!("\nRun `omni-dev atlassian auth status` to verify.");
-
     Ok(())
 }
 
-/// Removes Atlassian Cloud credentials.
+/// Removes Atlassian credentials.
 #[derive(Parser)]
 pub struct LogoutCommand;
 
@@ -146,6 +201,9 @@ pub struct StatusCommand {
     /// `--instance` override for the tenant being checked.
     #[command(flatten)]
     pub instance: super::InstanceArg,
+    /// Service whose current-user endpoint verifies the credentials.
+    #[arg(long, value_enum, default_value = "jira")]
+    pub service: AuthService,
 }
 
 impl StatusCommand {
@@ -154,21 +212,34 @@ impl StatusCommand {
         self.instance.apply();
         let credentials = auth::load_credentials()?;
         let client = AtlassianClient::from_credentials(&credentials)?;
-        run_auth_status(&client, &credentials.instance_url).await
+        println!("Authentication: {:?}", credentials.auth.mode());
+        run_auth_status(&client, &credentials.instance_url, self.service).await
     }
 }
 
 /// Verifies authentication and displays the current user.
-async fn run_auth_status(client: &AtlassianClient, instance_url: &str) -> Result<()> {
+async fn run_auth_status(
+    client: &AtlassianClient,
+    instance_url: &str,
+    service: AuthService,
+) -> Result<()> {
     println!("Checking authentication to {instance_url}...");
 
-    let user = client.get_myself().await?;
+    let user = client.auth_identity(service).await?;
 
     println!("Authenticated as: {}", user.display_name);
     if let Some(ref email) = user.email_address {
         println!("Email: {email}");
     }
-    println!("Account ID: {}", user.account_id);
+    if let Some(id) = user.account_id {
+        println!("Account ID: {id}");
+    }
+    if let Some(name) = user.username {
+        println!("Username: {name}");
+    }
+    if let Some(key) = user.key {
+        println!("User key: {key}");
+    }
     println!("Instance: {instance_url}");
 
     Ok(())
@@ -195,7 +266,9 @@ mod tests {
     #[test]
     fn auth_command_login_dispatch() {
         let cmd = AuthCommand {
-            command: AuthSubcommands::Login(LoginCommand),
+            command: AuthSubcommands::Login(LoginCommand {
+                auth_mode: AuthMode::Basic,
+            }),
         };
         assert!(matches!(cmd.command, AuthSubcommands::Login(_)));
     }
@@ -213,6 +286,7 @@ mod tests {
         let cmd = AuthCommand {
             command: AuthSubcommands::Status(StatusCommand {
                 instance: crate::cli::atlassian::InstanceArg::default(),
+                service: AuthService::Jira,
             }),
         };
         assert!(matches!(cmd.command, AuthSubcommands::Status(_)));
@@ -425,7 +499,9 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        assert!(run_auth_status(&client, &server.uri()).await.is_ok());
+        assert!(run_auth_status(&client, &server.uri(), AuthService::Jira)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -443,7 +519,9 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        assert!(run_auth_status(&client, &server.uri()).await.is_ok());
+        assert!(run_auth_status(&client, &server.uri(), AuthService::Jira)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -456,7 +534,88 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let err = run_auth_status(&client, &server.uri()).await.unwrap_err();
+        let err = run_auth_status(&client, &server.uri(), AuthService::Jira)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("401"));
+    }
+    #[test]
+    fn auth_flags_parse_defaults_and_explicit_modes() {
+        let cmd = AuthCommand::try_parse_from(["auth", "login"]).unwrap();
+        assert!(matches!(
+            cmd.command,
+            AuthSubcommands::Login(LoginCommand {
+                auth_mode: AuthMode::Basic
+            })
+        ));
+        let cmd = AuthCommand::try_parse_from(["auth", "login", "--auth-mode", "bearer"]).unwrap();
+        assert!(matches!(
+            cmd.command,
+            AuthSubcommands::Login(LoginCommand {
+                auth_mode: AuthMode::Bearer
+            })
+        ));
+        let cmd =
+            AuthCommand::try_parse_from(["auth", "status", "--service", "confluence"]).unwrap();
+        assert!(matches!(
+            cmd.command,
+            AuthSubcommands::Status(StatusCommand {
+                service: AuthService::Confluence,
+                ..
+            })
+        ));
+        assert!(AuthCommand::try_parse_from(["auth", "login", "--auth-mode", "oauth"]).is_err());
+    }
+
+    #[test]
+    fn bearer_login_persists_without_email_and_rejects_blank() {
+        let (_dir, path) = temp_settings();
+        save_login_to(
+            &path,
+            None,
+            "https://self.example",
+            AtlassianAuth::Bearer {
+                token: "pat".into(),
+            },
+        )
+        .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["env"][auth::ATLASSIAN_PAT], "pat");
+        assert!(saved["env"].get(auth::ATLASSIAN_EMAIL).is_none());
+        assert!(save_login_to(
+            &path,
+            None,
+            "https://self.example",
+            AtlassianAuth::Bearer { token: " ".into() }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn login_refuses_process_sources_and_selected_helper() {
+        use crate::test_support::env::MapEnv;
+        let (_dir, path) = temp_settings();
+        let credentials = AtlassianAuth::Bearer {
+            token: "pat".into(),
+        };
+        for key in [
+            auth::ATLASSIAN_PAT,
+            "ATLASSIAN_PAT_FILE",
+            "ATLASSIAN_PAT_COMMAND",
+            auth::ATLASSIAN_API_TOKEN,
+            "ATLASSIAN_API_TOKEN_FILE",
+            "ATLASSIAN_API_TOKEN_COMMAND",
+        ] {
+            assert!(check_login_sources(
+                &path,
+                None,
+                &credentials,
+                &MapEnv::new().with(key, "source")
+            )
+            .is_err());
+            assert!(!path.exists());
+        }
+        assert!(check_login_sources(&path, None, &credentials, &MapEnv::new()).is_ok());
     }
 }

@@ -44,10 +44,10 @@ impl OmniDevServer {
     /// Boolean presence flags only — never returns secret values.
     #[tool(
         description = "Report which Atlassian credential scopes have credentials configured. \
-                       Returns boolean presence flags only — NEVER includes the email, API \
-                       token, or any other secret. The instance URL (non-secret) is returned \
+                       Returns credential presence flags, auth_mode (basic or bearer), and configuration_state only — NEVER includes the email, API \
+                       token, PAT, or any other secret. The instance URL (non-secret) is returned \
                        verbatim. Checks local configuration only; it does NOT call the Atlassian \
-                       API to validate the credentials (unlike `omni-dev atlassian auth status`, \
+                       API, read secret files, or run credential helpers to validate the credentials (unlike `omni-dev atlassian auth status`, \
                        which signs in and prints the authenticated user). Takes no arguments. \
                        Read-only. Output is YAML."
     )]
@@ -56,10 +56,17 @@ impl OmniDevServer {
         Parameters(_params): Parameters<AtlassianAuthStatusParams>,
     ) -> Result<CallToolResult, McpError> {
         let status = crate::atlassian::auth::status();
-        let yaml = serde_yaml::to_string(&status)
-            .map_err(|e| tool_error(anyhow::anyhow!("failed to serialize auth status: {e}")))?;
-        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+        auth_status_result(&status)
     }
+}
+
+/// Formats the presence-only credential report shared with the handler.
+fn auth_status_result(
+    status: &crate::atlassian::auth::AuthStatus,
+) -> Result<CallToolResult, McpError> {
+    let yaml = serde_yaml::to_string(status)
+        .map_err(|e| tool_error(anyhow::anyhow!("Failed to serialize auth status: {e}")))?;
+    Ok(CallToolResult::success(vec![Content::text(yaml)]))
 }
 
 #[cfg(test)]
@@ -75,5 +82,28 @@ mod tests {
     #[test]
     fn atlassian_auth_status_params_accepts_empty_object() {
         let _p: AtlassianAuthStatusParams = serde_json::from_str("{}").unwrap();
+    }
+    #[test]
+    fn auth_status_formats_pat_and_conflict_without_resolving_secrets() {
+        use crate::atlassian::auth::{
+            status_from, ATLASSIAN_API_TOKEN, ATLASSIAN_INSTANCE_URL, ATLASSIAN_PAT,
+        };
+        use crate::test_support::env::MapEnv;
+        let env = MapEnv::new()
+            .with(ATLASSIAN_INSTANCE_URL, "https://self.example")
+            .with(ATLASSIAN_PAT, "never-return-pat");
+        for (env, expected) in [
+            (env.clone(), "configured"),
+            (
+                env.with(ATLASSIAN_API_TOKEN, "never-return-api-token"),
+                "conflict",
+            ),
+        ] {
+            let result = auth_status_result(&status_from(&env)).unwrap();
+            let text = serde_json::to_string(&result).unwrap();
+            assert!(text.contains("has_pat: true"));
+            assert!(text.contains(expected));
+            assert!(!text.contains("never-return"));
+        }
     }
 }

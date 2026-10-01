@@ -781,10 +781,30 @@ impl Settings {
         profile: Option<&str>,
         vars: &[(&str, &str)],
     ) -> Result<()> {
+        Self::replace_env_vars_in(path, profile, vars, &[])
+    }
+
+    /// Replaces keys and removes obsolete credentials in one settings write.
+    ///
+    /// Preserves unrelated settings, rejects selected secret helpers before any
+    /// mutation, and removes obsolete secrets' file and command companions.
+    pub(crate) fn replace_env_vars_in(
+        path: &Path,
+        profile: Option<&str>,
+        vars: &[(&str, &str)],
+        remove: &[&str],
+    ) -> Result<()> {
         let mut settings_value = read_or_default_settings(path)?;
 
         let env = ensure_env_object(&mut settings_value, profile)?;
         refuse_secret_commands(env, vars.iter().map(|(key, _)| *key), profile)?;
+        for key in remove {
+            env.remove(*key);
+            if is_secret_env_var(key) {
+                env.remove(&secret_env::file_var_name(key));
+                env.remove(&secret_env::command_var_name(key));
+            }
+        }
         for (key, value) in vars {
             env.insert(
                 (*key).to_string(),
