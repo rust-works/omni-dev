@@ -5,7 +5,7 @@
 //! Implements issue [#732] — code-generates the ADF allowed-children atoms
 //! table from `@atlaskit/adf-schema` so the source of truth lives in upstream
 //! data, not in hand transcription. The hand-maintained `CONTENT_ENTRIES`
-//! table in `src/atlassian/adf_schema/mod.rs` keeps the per-term quantifier
+//! table in `src/atlassian/adf_schema.rs` keeps the per-term quantifier
 //! information that the upstream JSON schema does not expose in a parseable
 //! shape; the integration tests assert the two views agree modulo a small,
 //! documented leniency allowlist.
@@ -273,7 +273,9 @@ const GENERATED_HEADER: &str = "\
 //! 2. Update `assets/adf-schema/provenance.json` with the new version and
 //!    tarball/JSON SHA-256s.
 //! 3. Run `cargo run --bin adf-schema-codegen`.
-//! 4. Commit `full.json`, `provenance.json`, and this file together.
+//! 4. Update the runtime provenance constants in `src/atlassian/adf_schema.rs`
+//!    and review content, attribute, and mark rules against the new schema.
+//! 5. Commit `full.json`, `provenance.json`, this file, and runtime changes together.
 //!
 //! See issue #732 (ADR-0023 follow-up) for the rationale.
 ";
@@ -287,11 +289,11 @@ const ENTRIES_DOC: &str = "
 /// (`+`, `*`, `?`, `{n}`, `{m,n}`, sequence order) is *not* preserved here —
 /// the upstream JSON schema's `anyOf`-of-`$ref` shape does not encode it in
 /// a parseable way. See [`super::CONTENT_ENTRIES`] in
-/// `src/atlassian/adf_schema/mod.rs` for the runtime model that layers
+/// `src/atlassian/adf_schema.rs` for the runtime model that layers
 /// quantifier arity on top of these atoms.
 ///
 /// The unit test `generated_upstream_atoms_match_local_snapshot` in
-/// `src/atlassian/adf_schema/mod.rs` asserts that the flattened atoms from
+/// `src/atlassian/adf_schema.rs` asserts that the flattened atoms from
 /// [`super::CONTENT_ENTRIES`] agree with `UPSTREAM_ENTRIES` modulo a small
 /// allowlist of documented leniency deviations.
 ";

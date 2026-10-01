@@ -25,14 +25,21 @@ Source artefacts for the code-generated ADF schema table (issue #732).
    cargo run --bin adf-schema-codegen
    ```
    This rewrites `src/atlassian/adf_schema/generated.rs`.
-5. Run the consistency test:
+5. Update `SCHEMA_VERSION` (`<npm-version>-<refresh-date>`) and
+   `UPSTREAM_TARBALL_SHA256` in `src/atlassian/adf_schema.rs` to match the
+   new provenance. Review the full JSON diff, not just parent/child atoms;
+   attribute and mark constraints can change without content-model drift.
+   Update `CONTENT_ENTRIES` only if the content rules have changed.
+6. Run the consistency test:
    ```
+   cargo test --lib atlassian::adf_schema
    cargo test --test adf_schema_test
    ```
    Drift between the upstream snapshot and the hand-maintained
    `CONTENT_ENTRIES` is reported, modulo the documented leniency allowlist in
    the test.
-6. Commit `full.json`, `provenance.json`, and `generated.rs` together.
+7. Commit `full.json`, `provenance.json`, `generated.rs`, and the runtime
+   provenance constants together.
 
 The generator is also CI-checkable: `cargo run --bin adf-schema-codegen --
 --check` exits non-zero if the committed `generated.rs` is out of date with

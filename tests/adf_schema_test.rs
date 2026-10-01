@@ -293,3 +293,30 @@ fn heading_level_out_of_range_flagged_via_public_api() {
         .collect();
     assert_eq!(invalid.len(), 1, "got: {violations:?}");
 }
+
+#[test]
+fn status_hex_color_validates_and_round_trips_via_public_api() {
+    let value = serde_json::json!({
+        "version": 1,
+        "type": "doc",
+        "content": [{"type": "paragraph", "content": [{
+            "type": "status",
+            "attrs": {"text": "Ready", "color": "#aB12Cd", "localId": "status-1"}
+        }]}]
+    });
+    let doc = AdfDocument::from_json_str(&value.to_string()).unwrap();
+    assert_eq!(validate_document(&doc), vec![]);
+    assert_eq!(serde_json::to_value(&doc).unwrap(), value);
+}
+
+#[test]
+fn status_hex_color_survives_jfm_round_trip() {
+    use omni_dev::atlassian::convert::{adf_to_markdown, markdown_to_adf};
+
+    let input = ":status[Ready]{color=#aB12Cd}\n";
+    let doc = markdown_to_adf(input).unwrap();
+    assert_eq!(validate_document(&doc), vec![]);
+    let rendered = adf_to_markdown(&doc).unwrap();
+    assert_eq!(rendered, input);
+    assert_eq!(markdown_to_adf(&rendered).unwrap(), doc);
+}

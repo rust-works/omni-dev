@@ -67,6 +67,8 @@ pub enum AttrPresence {
 pub enum AttrType {
     /// One of a finite list of string values, case-sensitive.
     Enum(&'static [&'static str]),
+    /// A named status color or exactly six ASCII hex digits prefixed with `#`.
+    StatusColor,
     /// An integer (no fractional part) in `[lo, hi]` inclusive.
     IntRange(i64, i64),
     /// A number in `[lo, hi]` inclusive (accepts integers).
@@ -491,11 +493,7 @@ const ATTR_ENTRIES: &[AttrEntry] = &[
         AttrSchema {
             fields: &[
                 ("text", AttrType::String, AttrPresence::Required),
-                (
-                    "color",
-                    AttrType::Enum(ENUM_STATUS_COLOR),
-                    AttrPresence::Required,
-                ),
+                ("color", AttrType::StatusColor, AttrPresence::Required),
                 ("localId", AttrType::String, AttrPresence::Optional),
                 ("style", AttrType::String, AttrPresence::Optional),
             ],
@@ -665,6 +663,20 @@ pub fn check_value(ty: &AttrType, value: &Value) -> Option<AttrProblem> {
             }),
             None => Some(AttrProblem::WrongType { expected: "string" }),
         },
+        AttrType::StatusColor => match value.as_str() {
+            Some(s)
+                if ENUM_STATUS_COLOR.contains(&s)
+                    || (s.len() == 7
+                        && s.starts_with('#')
+                        && s.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)) =>
+            {
+                None
+            }
+            Some(_) => Some(AttrProblem::BadFormat {
+                reason: "expected a named status color or #RRGGBB",
+            }),
+            None => Some(AttrProblem::WrongType { expected: "string" }),
+        },
         AttrType::IntRange(lo, hi) => match value.as_i64() {
             Some(n) if n >= *lo && n <= *hi => None,
             Some(n) => Some(AttrProblem::OutOfRange {
@@ -731,6 +743,49 @@ mod tests {
         let mut out = Vec::new();
         validate_attrs(node_type, None, &[], &mut out);
         out
+    }
+
+    #[test]
+    fn status_color_accepts_names_and_six_digit_hex() {
+        for color in ENUM_STATUS_COLOR
+            .iter()
+            .copied()
+            .chain(["#000000", "#ffffff", "#aB12Cd"])
+        {
+            assert!(run("status", json!({"text": "Ready", "color": color})).is_empty());
+        }
+    }
+
+    #[test]
+    fn status_color_rejects_malformed_strings_and_wrong_types() {
+        for color in [
+            "orange",
+            "Blue",
+            "#fff",
+            "#12345678",
+            "123456",
+            "#12GG34",
+            " #123456",
+            "#123456\n",
+            "#é1234",
+            "",
+        ] {
+            let violations = run("status", json!({"text": "Ready", "color": color}));
+            assert!(
+                matches!(violations.as_slice(), [AdfSchemaViolation::InvalidAttr {
+                attr_name, problem: AttrProblem::BadFormat { .. }, ..
+            }] if attr_name == "color"),
+                "color={color:?}: {violations:?}"
+            );
+        }
+        for color in [json!(42), json!(true), json!({}), json!([])] {
+            let violations = run("status", json!({"text": "Ready", "color": color}));
+            assert!(
+                matches!(violations.as_slice(), [AdfSchemaViolation::InvalidAttr {
+                attr_name, problem: AttrProblem::WrongType { expected: "string" }, ..
+            }] if attr_name == "color")
+            );
+        }
     }
 
     #[test]

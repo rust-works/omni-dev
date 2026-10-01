@@ -1,6 +1,6 @@
 //! `adf-schema-drift` — fetch the latest `@atlaskit/adf-schema` upstream and
 //! diff it against the locally-encoded snapshot in
-//! `src/atlassian/adf_schema/mod.rs`.
+//! `src/atlassian/adf_schema.rs`.
 //!
 //! Used by `.github/workflows/adf-schema-drift.yml` on a weekly schedule.
 //! Writes `drift-report.md` and/or `drift-report.json` to `--output-dir` and
