@@ -222,9 +222,13 @@ impl StreamTracker {
     /// TTL and reappears the moment it next does anything.
     #[must_use]
     pub fn keepalive(&self) -> Option<ObserveRequest> {
+        // Exhaustive on purpose: a state added later must choose whether it is
+        // busy enough to pin a session, rather than silently being pinned.
         match self.state() {
-            SessionState::Idle => None,
-            busy => self.request(busy),
+            busy @ (SessionState::Working
+            | SessionState::WaitingForInput
+            | SessionState::WaitingForPermission) => self.request(busy),
+            SessionState::Idle | SessionState::Starting | SessionState::Ended => None,
         }
     }
 

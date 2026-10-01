@@ -76,8 +76,9 @@ pub mod watcher;
 /// now the fallback for a session with no pid (older hooks, the transcript
 /// watcher, pi.dev), one the watcher has not yet confirmed, or whose pid it
 /// can't confirm (an unprompted spare process, one another `session_id`
-/// has since taken over, or one the stream wrapper reports — #1454). A still-alive idle session bound by this TTL
-/// re-appears the moment it next does anything. See ADR-0052.
+/// has since taken over, or one the stream wrapper reports — #1454). A
+/// still-alive idle session bound by this TTL re-appears the moment it next
+/// does anything. See ADR-0052.
 const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(300);
 
 /// How long an **ended** session lingers before it is reaped, so `sessions list`
@@ -487,7 +488,8 @@ pub struct SessionEntry {
     /// attached to a VS Code/SDK-driven `claude`, whose extension keeps a
     /// process per chat rather than per visible tab, so a live pid says nothing
     /// about whether anyone can still see the chat. Its busy states are kept
-    /// fresh by the wrapper's own keep-alive instead. Sticky: once set it stays.
+    /// fresh by the wrapper's own keep-alive instead. Sticky across hooks, but
+    /// reset when a different process takes the session over ([`track_pid`]).
     #[serde(skip)]
     pub(crate) streamed: bool,
     /// The processes the session was taken over from, oldest first and capped
@@ -1024,6 +1026,10 @@ fn track_pid(entry: &mut SessionEntry, pid: Option<u32>) {
             entry.replaced_pids.pop_front();
         }
         entry.replaced_pids.push_back(owner);
+        // A different process now owns the session, and whether *it* is wrapped
+        // is learned from its own next stream report (a terminal `--resume` of
+        // a chat the extension once ran is not).
+        entry.streamed = false;
     }
     entry.pid_start = None;
 }
@@ -1394,6 +1400,18 @@ mod tests {
             100,
         ));
         assert!(reg.pid_liveness_candidates()[0].streamed);
+
+        // A different process taking the session over (a terminal `--resume` of
+        // a chat the extension once ran) is not known to be wrapped.
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_from(
+            "resumed",
+            SessionEvent::StreamState(SessionState::Idle),
+            100,
+        ));
+        assert!(reg.pid_liveness_candidates()[0].streamed);
+        reg.observe(observe_from("resumed", SessionEvent::SessionStart, 200));
+        assert!(!reg.pid_liveness_candidates()[0].streamed);
 
         // Another agent's `StreamState` (Codex's wrapper, pi's extension) is not
         // a Claude chat the extension is pinning.
