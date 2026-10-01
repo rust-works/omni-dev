@@ -123,7 +123,10 @@ impl DriftReport {
 
         out.push_str("## Content-model drift\n\n");
         if !self.has_content_drift() {
-            out.push_str("No content-model changes — version bump only.\n\n");
+            out.push_str(
+                "No content-model changes detected (parent/child atoms only). \
+                 Attribute and mark constraints are not compared.\n\n",
+            );
         } else {
             if !self.added_parents.is_empty() {
                 out.push_str("### New parents (upstream only)\n\n");
@@ -893,6 +896,8 @@ mod tests {
         let md = report.render_markdown();
         assert!(md.contains("No content-model changes"));
         assert!(!md.contains("Per-parent diffs"));
+        assert!(!md.contains("version bump only"));
+        assert!(md.contains("Attribute and mark constraints are not compared"));
         assert!(md.contains("assets/adf-schema/README.md"));
         assert!(md.contains("vendored JSON and provenance"));
         assert!(md.contains("adf-schema-codegen"));
