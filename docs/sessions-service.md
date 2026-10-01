@@ -1012,14 +1012,16 @@ identify parse failure, unknown control shapes, missing permission IDs, and
 permission-cap drops. Known unrelated control requests are ignored normally.
 The summary also counts drops from the independent diagnostic queue.
 
-When unset or empty, no file, writer, or diagnostic counters are created.
+When unset or empty, no file, writer thread, tee-counter allocation, or
+diagnostic formatting is created. The pure tracker still counts protocol drift.
 When enabled, a separate thread appends records through a bounded nonblocking
 queue; byte pumps only update counters. New files use `0600`; symlinks and
 nonregular targets are refused, and existing file permissions are left intact.
 Open/write failures silently disable writing without preventing Claude from
 launching. Shutdown waits at most 200 ms for diagnostics; a killed process,
 stuck disk, or full queue can lose records. Files append across processes and
-include session/PID metadata where known; there is no automatic rotation.
+include timestamps, wrapper PID, and session/child PID metadata where known;
+there is no automatic rotation.
 
 Conversation messages, tool inputs/results, raw stdio/hook payloads, and daemon
 error text are never written to this wrapper file. Paths and identifiers are

@@ -345,16 +345,6 @@ async fn handle_connection(
     }
 }
 
-/// Drives a push subscription over `framed` until the client goes away or the
-/// daemon shuts down. Sends an initial snapshot, then re-samples the stream on
-/// each change notification and on a periodic [`stream_tick`], pushing **only**
-/// snapshots that differ from the last one sent — so identical frames are never
-/// duplicated (the acceptance criterion). Mirrors the browser bridge's
-/// `start_stream` coalescing shape, but on the control socket.
-///
-/// The subscription owns the connection for its lifetime: any further inbound
-/// line is treated as an explicit cancel and ends the stream, matching the
-/// one-op-per-connection the companion uses (a dedicated subscribe socket).
 /// Reasons a subscription ends; no incoming line content is retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamEnd {
@@ -373,6 +363,16 @@ fn inbound_end(line: Option<Result<String, LinesCodecError>>) -> StreamEnd {
     }
 }
 
+/// Drives a push subscription over `framed` until the client goes away or the
+/// daemon shuts down. Sends an initial snapshot, then re-samples the stream on
+/// each change notification and on a periodic [`stream_tick`], pushing **only**
+/// snapshots that differ from the last one sent — so identical frames are never
+/// duplicated (the acceptance criterion). Mirrors the browser bridge's
+/// `start_stream` coalescing shape, but on the control socket.
+///
+/// The subscription owns the connection for its lifetime: any further inbound
+/// line is treated as an explicit cancel and ends the stream, matching the
+/// one-op-per-connection the companion uses (a dedicated subscribe socket).
 async fn run_stream(
     framed: &mut Framed<UnixStream, LinesCodec>,
     mut stream: Box<dyn ServiceStream>,
