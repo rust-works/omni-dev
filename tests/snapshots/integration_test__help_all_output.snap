@@ -353,6 +353,7 @@ Arguments:
 
 Options:
       --all-open                       Routes every open issue in the current repository
+      --draft-comment <FILE>           Append a local UTF-8 comment for preview without posting it. Repeatable; one issue only
       --ladders <NAMES>                Ladder names to route against (comma-separated, repeatable): a built-in provider name or one registered via --ladder-definition [default: anthropic]
       --ladder-definition <NAME=FILE>  Registers a custom ladder as NAME=FILE. Tiers contain name, description, and optional model-specific effort profiles (see docs/jev.md). Repeatable
       --effort-advice                  Ask for per-model effort advice in text, JSON, or YAML output

@@ -631,6 +631,33 @@ single-model ladder into the block form too. Single-word tiers (every
 built-in ladder) keep the compact class summary. With `--effort-advice`, a
 per-model effort table follows that summary.
 
+### Preview a draft comment
+
+Use repeatable `--draft-comment FILE` to check how a proposed comment changes
+routing before posting it:
+
+```console
+omni-dev ai jev route 3017 --draft-comment triage.md
+omni-dev ai jev route 3017 --draft-comment decision.md --draft-comment scope.md
+```
+
+Drafts apply to exactly one `ISSUE` argument; combining them with `--all-open`
+or multiple issue arguments is an error. Files must contain nonempty UTF-8
+text (whitespace alone is empty). Relative paths resolve from the invocation's
+working directory, including when `-C/--repo` selects another repository.
+Each file is read once before external work; read errors name the path.
+
+Drafts follow fetched comments in command-line order, as `Comment by draft`
+blocks with outer whitespace trimmed. The combined text uses the same
+`--max-input-chars` cap and keep-the-end truncation policy. Draft citations
+follow the same dependency rules, including ignoring references inside code.
+JSON/YAML issue entries record the supplied paths in `draft_comments`; text
+output labels them as a preview. The field is omitted when no drafts are used,
+including on ordinary failed reports; preview failures retain their paths.
+
+Routing still calls Jev and may fetch citation states. Drafts are never posted
+to GitHub or stored in the issue cache.
+
 ### What Jev sees
 
 Only the issue's title, body and **human** comments, oldest first. Bot
@@ -976,6 +1003,9 @@ advisory instruction moved answers even on inputs it was not aimed at. Re-run
 the evaluation before trusting different wording or descriptions.
 
 ### Decision comments
+
+Before posting a decision, run `omni-dev ai jev route ISSUE --draft-comment decision.md`
+to inspect its effect on routing. Iterate on the file, then post it when ready.
 
 Jev reacts to decisions stated **in the issue itself**. It cannot infer that a
 referenced issue settled a question, even with that issue and its closing pull

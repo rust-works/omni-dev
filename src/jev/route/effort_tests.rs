@@ -484,6 +484,7 @@ async fn all_ladders_and_efforts_share_one_request_and_fail_only_the_bad_issue()
         url: "https://github.com/owner/repo/issues/1".into(),
     };
     let options = RouteOptions {
+        draft_comments: vec![],
         model: "jev-test".into(),
         close_call: 0.3,
         effort_advice: true,
@@ -603,6 +604,7 @@ async fn class_only_route_omits_effort_questions_and_output_for_builtin_and_cust
         &[doc],
         &ladders,
         &RouteOptions {
+            draft_comments: vec![],
             model: "jev-test".into(),
             close_call: 0.3,
             effort_advice: false,

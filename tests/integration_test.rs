@@ -2266,3 +2266,39 @@ scopes:
     );
     Ok(())
 }
+
+#[test]
+fn binary_route_draft_errors_precede_external_work() {
+    let dir = TempDir::new().unwrap();
+    let draft = dir.path().join("draft.md");
+    let invoke = |issues: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+            .current_dir(dir.path())
+            .args(["ai", "jev", "route"])
+            .args(issues)
+            .args(["--draft-comment", "draft.md"])
+            .output()
+            .unwrap()
+    };
+    for issues in [&["#1", "#2"][..], &["#1", "1"][..]] {
+        let output = invoke(issues);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("exactly one ISSUE"));
+    }
+    let output = invoke(&["--all-open"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--all-open"));
+    for contents in [None, Some(&b" \n\t"[..]), Some(&[0xff][..])] {
+        if let Some(bytes) = contents {
+            fs::write(&draft, bytes).unwrap();
+        }
+        let output = invoke(&["#1"]);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("draft.md"), "{stderr}");
+        assert!(
+            stderr.contains("empty") || stderr.contains("Failed to read draft"),
+            "{stderr}"
+        );
+    }
+}

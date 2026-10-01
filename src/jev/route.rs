@@ -356,7 +356,7 @@ fn build_route_questions_for_mode(
 /// tokens and inflate small issues.
 #[must_use]
 pub fn build_route_state(doc: &IssueDoc, max_chars: usize) -> (String, bool) {
-    assemble_route_state(doc, max_chars, str::to_string)
+    build_route_state_with_drafts(doc, max_chars, &[])
 }
 
 /// The text `route` scans for `depends_on` citations (#2003): exactly
@@ -370,7 +370,27 @@ pub fn build_route_state(doc: &IssueDoc, max_chars: usize) -> (String, bool) {
 /// its code. Not sent to Jev.
 #[must_use]
 pub fn build_route_citation_text(doc: &IssueDoc, max_chars: usize) -> String {
-    assemble_route_state(doc, max_chars, mask_code).0
+    build_route_citation_text_with_drafts(doc, max_chars, &[])
+}
+
+/// Builds routing input with local drafts appended after fetched comments.
+#[must_use]
+pub fn build_route_state_with_drafts(
+    doc: &IssueDoc,
+    max_chars: usize,
+    drafts: &[String],
+) -> (String, bool) {
+    assemble_route_state(doc, max_chars, drafts, str::to_string)
+}
+
+/// Builds the same retained input with code masked separately in each draft.
+#[must_use]
+pub fn build_route_citation_text_with_drafts(
+    doc: &IssueDoc,
+    max_chars: usize,
+    drafts: &[String],
+) -> String {
+    assemble_route_state(doc, max_chars, drafts, mask_code).0
 }
 
 /// Lays out [`build_route_state`]'s text, passing the title, body and each
@@ -378,6 +398,7 @@ pub fn build_route_citation_text(doc: &IssueDoc, max_chars: usize) -> String {
 fn assemble_route_state(
     doc: &IssueDoc,
     max_chars: usize,
+    drafts: &[String],
     prose: impl Fn(&str) -> String,
 ) -> (String, bool) {
     let mut text = format!(
@@ -386,7 +407,7 @@ fn assemble_route_state(
         prose(&doc.title),
         prose(doc.body.trim())
     );
-    if !doc.comments.is_empty() {
+    if !doc.comments.is_empty() || !drafts.is_empty() {
         text.push_str("\n\n---\n\n## Comments on this issue\n");
         for comment in &doc.comments {
             text.push_str(&format!(
@@ -395,6 +416,12 @@ fn assemble_route_state(
                 prose(comment.body.trim())
             ));
         }
+    }
+    for draft in drafts {
+        text.push_str(&format!(
+            "\n\n**Comment by draft:**\n\n{}\n",
+            prose(draft.trim())
+        ));
     }
     truncate_middle(&text, max_chars)
 }
@@ -474,6 +501,9 @@ pub enum CitationRelation {
 /// The routing result for one issue.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IssueRoute {
+    /// Local draft source paths, as supplied to the CLI, for preview provenance.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub draft_comments: Vec<std::path::PathBuf>,
     /// The issue, as `owner/repo#N`.
     #[serde(rename = "ref")]
     pub item_ref: String,
@@ -602,6 +632,8 @@ pub struct IgnoredIssue {
 /// Knobs for [`run_route`].
 #[derive(Debug, Clone)]
 pub struct RouteOptions {
+    /// Local comments appended after fetched comments, in supplied order.
+    pub draft_comments: Vec<String>,
     /// The Jev model to request.
     pub model: String,
     /// Confidence below which a stage is a close call.
@@ -668,6 +700,9 @@ pub async fn run_route_with_reference_fetch_failures(
     dependencies: &OpenDependencies,
     reference_fetch_failures: &ReferenceFetchFailures,
 ) -> Result<RouteReport> {
+    if !opts.draft_comments.is_empty() && docs.len() != 1 {
+        bail!("draft comments apply to exactly one issue; cannot preview a batch");
+    }
     let (docs, ignored_closed) = drop_closed(docs, opts)?;
     validate_options(&docs, ladders, opts)?;
     let questions = build_route_questions_for_mode(ladders, opts.effort_advice)?;
@@ -684,7 +719,8 @@ pub async fn run_route_with_reference_fetch_failures(
     let mut issues = Vec::with_capacity(docs.len());
     for doc in docs {
         let item_ref = item_ref(doc);
-        let (state, truncated) = build_route_state(doc, opts.max_input_chars);
+        let (state, truncated) =
+            build_route_state_with_drafts(doc, opts.max_input_chars, &opts.draft_comments);
         if truncated {
             warn!(
                 "Issue {item_ref} is longer than {} characters; its input was truncated",
@@ -749,6 +785,7 @@ pub async fn run_route_with_reference_fetch_failures(
             }
         };
         issues.push(IssueRoute {
+            draft_comments: vec![],
             item_ref,
             url: doc.url.clone(),
             title: doc.title.clone(),
@@ -1247,6 +1284,12 @@ fn render_issue_block(
         format!("{item_ref} — {}", issue.title)
     };
     let mut lines = vec![header];
+    if !issue.draft_comments.is_empty() {
+        lines.push(format!(
+            "  draft comments (preview): {:?}",
+            issue.draft_comments
+        ));
+    }
     match &issue.outcome {
         RouteOutcome::Routed {
             providers,
@@ -1615,6 +1658,7 @@ mod tests {
 
     fn opts() -> RouteOptions {
         RouteOptions {
+            draft_comments: vec![],
             model: "jev-latest".to_string(),
             close_call: DEFAULT_CLOSE_CALL,
             effort_advice: false,
@@ -2080,6 +2124,161 @@ mod tests {
         let (state, truncated) = build_route_state(&d, full.chars().count());
         assert_eq!(state, full);
         assert!(!truncated);
+    }
+
+    #[test]
+    fn drafts_follow_fetched_comments_and_default_input_is_identical() {
+        let mut d = doc(7, ItemState::Open);
+        for (author, body) in [("alice", "first"), ("bob", "second")] {
+            d.comments.push(Comment {
+                author: author.into(),
+                body: body.into(),
+                id: None,
+            });
+        }
+        let drafts = ["  third\n\n  indented\n".into(), "fourth".into()];
+        let (state, truncated) = build_route_state_with_drafts(&d, 1000, &drafts);
+        assert!(!truncated);
+        assert!(state.ends_with(
+            "**Comment by draft:**\n\nthird\n\n  indented\n\n\n**Comment by draft:**\n\nfourth\n"
+        ));
+        assert!(state.find("first").unwrap() < state.find("second").unwrap());
+        assert!(state.find("second").unwrap() < state.find("third").unwrap());
+        assert_eq!(
+            build_route_state_with_drafts(&d, 1000, &[]),
+            build_route_state(&d, 1000)
+        );
+        assert_eq!(
+            build_route_citation_text_with_drafts(&d, 1000, &[]),
+            build_route_citation_text(&d, 1000)
+        );
+        d.comments.clear();
+        let (state, _) = build_route_state_with_drafts(&d, 1000, &drafts);
+        assert!(state.contains("## Comments on this issue"));
+    }
+
+    #[test]
+    fn draft_truncation_and_code_masking_remain_aligned() {
+        let d = doc(7, ItemState::Open);
+        let drafts = [
+            format!("`#99` {}\n```\n#88\n```", "é".repeat(200)),
+            "See #2 at the tail".into(),
+        ];
+        let (full, _) = build_route_state_with_drafts(&d, usize::MAX, &drafts);
+        let masked = build_route_citation_text_with_drafts(&d, usize::MAX, &drafts);
+        assert_eq!(full.chars().count(), masked.chars().count());
+        assert!(!masked.contains("#99"));
+        assert!(!masked.contains("#88"));
+        assert!(masked.contains("#2"));
+        let (cut, truncated) = build_route_state_with_drafts(&d, 120, &drafts);
+        let masked_cut = build_route_citation_text_with_drafts(&d, 120, &drafts);
+        assert!(truncated);
+        assert!(cut.ends_with("See #2 at the tail\n"));
+        assert_eq!(cut.chars().count(), masked_cut.chars().count());
+        let marker = crate::jev::input::TRUNCATION_MARKER;
+        let before = cut.split_once(marker).unwrap().0.chars().count();
+        let masked_before = masked_cut.split_once(marker).unwrap().0.chars().count();
+        assert_eq!(before, masked_before);
+        assert!(cut.find(marker).unwrap() < cut.find("See #2").unwrap());
+        let isolated =
+            build_route_citation_text_with_drafts(&d, 1000, &["`start".into(), "#2 end`".into()]);
+        assert!(isolated.contains("#2"));
+    }
+
+    #[tokio::test]
+    async fn drafts_reach_requests_and_batch_guard_precedes_closed_filtering() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(routed_json()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = JevClient::new(&server.uri(), "key").unwrap();
+        let mut options = opts();
+        options.draft_comments = vec!["Blocked on #1129".into()];
+        let dependencies = OpenDependencies::from([(
+            ("rust-works/omni-dev".into(), 7),
+            vec![citation("#1129", 1129)],
+        )]);
+        run_route(
+            &client,
+            &[doc(7, ItemState::Open)],
+            &anthropic(),
+            &options,
+            &dependencies,
+        )
+        .await
+        .unwrap();
+        options.ignore_closed = true;
+        let err = run_route(
+            &client,
+            &[doc(7, ItemState::Open), doc(8, ItemState::Closed)],
+            &anthropic(),
+            &options,
+            &dependencies,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("exactly one issue"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        assert!(body["state"]
+            .as_str()
+            .unwrap()
+            .ends_with("**Comment by draft:**\n\nBlocked on #1129\n"));
+        assert!(body["questions"].get("could_be_cheaper_0").is_some());
+        let expected = build_route_questions_for_mode(&anthropic(), false).unwrap();
+        for (key, question) in expected {
+            assert_eq!(
+                body["questions"][key],
+                serde_json::to_value(question).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn preview_provenance_is_visible_in_all_formats_including_failures() {
+        let mut issue = IssueRoute {
+            draft_comments: vec!["triage draft.md".into(), "scope.md".into()],
+            item_ref: "o/r#1".into(),
+            url: "u".into(),
+            title: "t".into(),
+            state: ItemState::Open,
+            truncated: false,
+            outcome: RouteOutcome::Failed {
+                error: "failure".into(),
+                reference_fetch_failures: vec![],
+            },
+        };
+        for outcome in [
+            issue.outcome.clone(),
+            RouteOutcome::Routed {
+                providers: BTreeMap::new(),
+                depends_on: vec![],
+                reference_fetch_failures: vec![],
+            },
+        ] {
+            issue.outcome = outcome;
+            let json = serde_json::to_value(&issue).unwrap();
+            assert_eq!(
+                json["draft_comments"],
+                serde_json::json!(["triage draft.md", "scope.md"])
+            );
+            let yaml: serde_yaml::Value =
+                serde_yaml::from_str(&serde_yaml::to_string(&issue).unwrap()).unwrap();
+            assert_eq!(yaml["draft_comments"][0].as_str(), Some("triage draft.md"));
+            let text = render_issue_block(&issue, 1000, &[], TerminalStyle::default());
+            assert!(text.contains("draft comments (preview): [\"triage draft.md\", \"scope.md\"]"));
+        }
+        issue.draft_comments.clear();
+        assert!(serde_json::to_value(&issue)
+            .unwrap()
+            .get("draft_comments")
+            .is_none());
+        assert!(
+            !render_issue_block(&issue, 1000, &[], TerminalStyle::default()).contains("preview")
+        );
     }
 
     // ── class and close calls ────────────────────────────────────────
@@ -3090,6 +3289,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -3129,6 +3329,7 @@ mod tests {
     #[test]
     fn a_failed_issue_serialises_only_its_error() {
         let route = IssueRoute {
+            draft_comments: vec![],
             item_ref: "o/r#1".to_string(),
             url: "u".to_string(),
             title: "t".to_string(),
@@ -3152,6 +3353,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "rust-works/omni-dev#1641".to_string(),
                 url: "u".to_string(),
                 title: "Some issue title".to_string(),
@@ -3203,6 +3405,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "rust-works/omni-dev#1845".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -3289,6 +3492,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -3322,6 +3526,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -3344,6 +3549,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -3400,6 +3606,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -3434,6 +3641,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -3470,6 +3678,7 @@ mod tests {
     #[test]
     fn render_route_text_notes_a_truncated_issue_and_omits_the_note_otherwise() {
         let issue = |truncated: bool| IssueRoute {
+            draft_comments: vec![],
             item_ref: "o/r#1".to_string(),
             url: "u".to_string(),
             title: "t".to_string(),
@@ -3509,6 +3718,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -3544,6 +3754,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "rust-works/omni-dev#1832".to_string(),
                 url: "u".to_string(),
                 title: "feat(drive): banded ranges for drive sheets (#1830)".to_string(),
@@ -3598,6 +3809,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -3648,6 +3860,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -3702,6 +3915,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -3739,6 +3953,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -3775,6 +3990,7 @@ mod tests {
     #[test]
     fn render_route_text_separates_multiple_issues_with_a_blank_line_in_request_order() {
         let issue = |item_ref: &str| IssueRoute {
+            draft_comments: vec![],
             item_ref: item_ref.to_string(),
             url: "u".to_string(),
             title: "t".to_string(),
@@ -3924,6 +4140,7 @@ mod tests {
     #[test]
     fn styled_report_colors_classes_stages_and_failure_and_links_refs() {
         let issue = IssueRoute {
+            draft_comments: vec![],
             item_ref: "o/r#1".to_string(),
             url: "https://github.com/o/r/issues/1".to_string(),
             title: "t".to_string(),
@@ -3950,6 +4167,7 @@ mod tests {
             truncated: false,
         };
         let failed = IssueRoute {
+            draft_comments: vec![],
             item_ref: "o/r#2".to_string(),
             url: "https://github.com/o/r/issues/2".to_string(),
             title: "failed".to_string(),
@@ -4019,6 +4237,7 @@ mod tests {
         let report = RouteReport {
             model: "jev".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "https://github.com/o/r/issues/1".to_string(),
                 title: "t".to_string(),
@@ -4067,6 +4286,7 @@ mod tests {
         RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
