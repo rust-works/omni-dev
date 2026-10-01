@@ -67,10 +67,11 @@ impl AskCommand {
 ///
 /// `serde_yaml` accepts JSON (YAML is a superset), so this covers both JSON
 /// and YAML question files without branching on file extension. Each spec
-/// is then checked with [`Question::validate`] — the same minimums the
-/// single-question subcommands enforce — so a degenerate spec fails locally,
+/// is then checked with [`Question::validate_for_model`] — the same minimums
+/// and, for a model whose caps are known, the same caps the single-question
+/// subcommands enforce — so a degenerate or oversized spec fails locally,
 /// naming the offending question, before any paid request is sent.
-fn read_questions(path: &Path) -> Result<BTreeMap<String, Question>> {
+fn read_questions(path: &Path, model: &str) -> Result<BTreeMap<String, Question>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read questions file {}", path.display()))?;
     let questions: BTreeMap<String, Question> = serde_yaml::from_str(&content)
@@ -80,7 +81,7 @@ fn read_questions(path: &Path) -> Result<BTreeMap<String, Question>> {
     }
     for (name, question) in &questions {
         question
-            .validate()
+            .validate_for_model(model)
             .with_context(|| format!("question {name:?} in {}", path.display()))?;
     }
     Ok(questions)
@@ -95,7 +96,7 @@ async fn run_ask(
     questions_path: &Path,
     format: JevFormat,
 ) -> Result<String> {
-    let questions = read_questions(questions_path)?;
+    let questions = read_questions(questions_path, model)?;
     let raw_state = resolve_state(state)?;
     let state_value = build_state_value(&raw_state, state_json)?;
 
@@ -129,7 +130,7 @@ mod tests {
         let file = write_temp(
             "department:\n  type: choice\n  instructions: Route this\n  criteria:\n    billing: Payments\n    technical: Bugs\n",
         );
-        let questions = read_questions(file.path()).unwrap();
+        let questions = read_questions(file.path(), "jev-latest").unwrap();
         assert_eq!(questions.len(), 1);
         assert!(matches!(questions["department"], Question::Choice { .. }));
     }
@@ -137,7 +138,7 @@ mod tests {
     #[test]
     fn read_questions_parses_json_file() {
         let file = write_temp(r#"{"refund": {"type": "noul", "instructions": "Urgent?"}}"#);
-        let questions = read_questions(file.path()).unwrap();
+        let questions = read_questions(file.path(), "jev-latest").unwrap();
         assert_eq!(questions.len(), 1);
         assert!(matches!(questions["refund"], Question::Noul { .. }));
     }
@@ -145,7 +146,7 @@ mod tests {
     #[test]
     fn read_questions_rejects_empty_map() {
         let file = write_temp("{}\n");
-        let err = read_questions(file.path()).unwrap_err();
+        let err = read_questions(file.path(), "jev-latest").unwrap_err();
         assert!(err.to_string().contains("defines no questions"));
     }
 
@@ -154,7 +155,7 @@ mod tests {
         let file = write_temp(
             "department:\n  type: choice\n  instructions: Route this\n  criteria:\n    billing: Payments\n",
         );
-        let err = read_questions(file.path()).unwrap_err();
+        let err = read_questions(file.path(), "jev-latest").unwrap_err();
         let chain = format!("{err:#}");
         assert!(chain.contains("question \"department\""), "{chain}");
         assert!(chain.contains("at least 2 options, got 1"), "{chain}");
@@ -164,22 +165,68 @@ mod tests {
     fn read_questions_rejects_a_score_with_one_level() {
         let file =
             write_temp("urgency:\n  type: score\n  instructions: How urgent\n  criteria: [Low]\n");
-        let err = read_questions(file.path()).unwrap_err();
+        let err = read_questions(file.path(), "jev-latest").unwrap_err();
         let chain = format!("{err:#}");
         assert!(chain.contains("question \"urgency\""), "{chain}");
         assert!(chain.contains("at least 2 levels, got 1"), "{chain}");
     }
 
     #[test]
+    fn read_questions_rejects_an_oversized_spec_naming_the_question() {
+        let options = (0..256)
+            .map(|i| format!("    o{i}: d\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let file = write_temp(&format!(
+            "department:\n  type: choice\n  instructions: Route this\n  criteria:\n{options}"
+        ));
+        let err = read_questions(file.path(), "jev-1.13.0").unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("question \"department\""), "{chain}");
+        assert!(
+            chain.contains("at most 255 options on jev-1.13.0, got 256"),
+            "{chain}"
+        );
+
+        let levels = (0..11)
+            .map(|i| format!("l{i}, "))
+            .collect::<Vec<_>>()
+            .concat();
+        let file = write_temp(&format!(
+            "urgency:\n  type: score\n  instructions: How urgent\n  criteria: [{levels}end]\n"
+        ));
+        let err = read_questions(file.path(), "jev-latest").unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("question \"urgency\""), "{chain}");
+        assert!(
+            chain.contains("at most 10 levels on jev-latest, got 12"),
+            "{chain}"
+        );
+    }
+
+    #[test]
+    fn read_questions_accepts_an_oversized_spec_for_an_unknown_model() {
+        let levels = (0..11)
+            .map(|i| format!("l{i}, "))
+            .collect::<Vec<_>>()
+            .concat();
+        let file = write_temp(&format!(
+            "urgency:\n  type: score\n  instructions: How urgent\n  criteria: [{levels}end]\n"
+        ));
+        assert_eq!(read_questions(file.path(), "jev-2.0.0").unwrap().len(), 1);
+    }
+
+    #[test]
     fn read_questions_missing_file_errors() {
-        let err = read_questions(Path::new("/nonexistent/questions.yaml")).unwrap_err();
+        let err =
+            read_questions(Path::new("/nonexistent/questions.yaml"), "jev-latest").unwrap_err();
         assert!(err.to_string().contains("Failed to read questions file"));
     }
 
     #[test]
     fn read_questions_invalid_yaml_errors() {
         let file = write_temp("not: [a, valid, question, map");
-        let err = read_questions(file.path()).unwrap_err();
+        let err = read_questions(file.path(), "jev-latest").unwrap_err();
         assert!(err.to_string().contains("Failed to parse questions file"));
     }
 

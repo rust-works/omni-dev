@@ -27,7 +27,7 @@ pub struct ScoreCommand {
     #[arg(long)]
     pub instructions: String,
 
-    /// A scale level, low to high. Repeatable; at least two are required.
+    /// A scale level, low to high. Repeatable; at least two are required (10 at most on `jev-1.13`).
     /// Order is significant and preserved.
     #[arg(long = "level", value_name = "DESC")]
     pub level: Vec<String>,
@@ -69,7 +69,7 @@ impl ScoreCommand {
 
 /// Builds and sends the score request, returning the formatted output.
 ///
-/// The `--level` minimum-count validation ([`Question::validate`]) happens
+/// The `--level` count validation ([`Question::validate_for_model`]) happens
 /// here, before stdin is read, rather than in `execute`, so it is testable
 /// without an env or a network call (STYLE-0025).
 #[allow(clippy::too_many_arguments)]
@@ -86,7 +86,7 @@ async fn run_score(
         instructions: instructions.to_string(),
         criteria: levels,
     };
-    question.validate()?;
+    question.validate_for_model(model)?;
 
     let raw_state = resolve_state(state)?;
     let state_value = build_state_value(&raw_state, state_json)?;
@@ -123,6 +123,62 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("at least 2 levels"));
+    }
+
+    #[tokio::test]
+    async fn run_score_rejects_more_than_10_levels_before_any_request() {
+        let err = run_score(
+            &dead_client(),
+            "jev-latest",
+            Some("state".to_string()),
+            false,
+            "How urgent",
+            (0..11).map(|i| format!("l{i}")).collect(),
+            JevFormat::Json,
+        )
+        .await
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("at most 10 levels on jev-latest, got 11"));
+    }
+
+    #[tokio::test]
+    async fn run_score_sends_more_than_10_levels_to_an_unknown_model() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/systemone"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "jev-2.0.0",
+                    "answers": {
+                        "answer": {
+                            "type": "score",
+                            "score": 1.0,
+                            "confidence": 0.5,
+                            "legend": {"0": "l0"},
+                            "probabilities": {"0": 1.0}
+                        }
+                    },
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = JevClient::new(&server.uri(), "my-key").unwrap();
+        run_score(
+            &client,
+            "jev-2.0.0",
+            Some("state".to_string()),
+            false,
+            "How urgent",
+            (0..11).map(|i| format!("l{i}")).collect(),
+            JevFormat::Json,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
