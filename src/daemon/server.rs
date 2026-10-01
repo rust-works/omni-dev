@@ -946,6 +946,41 @@ mod tests {
             .unwrap();
     }
 
+    /// A pushed delta that cannot be written ends the stream as a write failure.
+    /// The server end shuts down its own write half after the initial snapshot,
+    /// so the next push fails while the read side is still open — dropping the
+    /// client instead would race the failing write against the EOF it also causes.
+    #[tokio::test]
+    async fn run_stream_ends_when_a_pushed_delta_cannot_be_written() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let server = server.into_std().unwrap();
+        let hangup = server.try_clone().unwrap();
+        let server = UnixStream::from_std(server).unwrap();
+        let (tx, rx) = watch::channel(0u64);
+        let snap = Arc::new(StdMutex::new(json!({ "n": 0 })));
+        let fake = FakeStream {
+            rx,
+            snap: Arc::clone(&snap),
+        };
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(async move {
+            let mut framed = Framed::new(server, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
+            run_stream(&mut framed, Box::new(fake), &shutdown, "fake", "subscribe").await
+        });
+
+        let mut reader = BufReader::new(&mut client);
+        read_reply(&mut reader).await;
+        hangup.shutdown(std::net::Shutdown::Write).unwrap();
+        *snap.lock().unwrap() = json!({ "n": 1 });
+        tx.send(1).unwrap();
+
+        let end = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("run_stream should end when a push cannot be written")
+            .unwrap();
+        assert_eq!(end, StreamEnd::WriteFailure);
+    }
+
     /// `run_stream` returns immediately when even the initial snapshot cannot be
     /// sent (the client is already gone) rather than entering the select loop.
     #[tokio::test]

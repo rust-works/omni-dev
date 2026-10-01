@@ -50,26 +50,14 @@ impl Diagnostics {
                 if let Ok(mut file) = file {
                     // Refuse devices/FIFOs, and never follow a symlink log target.
                     if file.metadata().is_ok_and(|m| m.is_file()) {
-                        for record in receiver {
-                            // Serialize the entire record before the append:
-                            // multiple wrappers may share this file. Token-sized
-                            // writes from to_writer could interleave their JSON.
-                            let Ok(mut line) = serde_json::to_vec(&record) else {
-                                break;
-                            };
-                            line.push(b'\n');
-                            if file.write_all(&line).is_err() {
-                                break;
-                            }
-                        }
-                        let _ = file.flush();
+                        drain(&receiver, &mut file);
                     }
                 }
                 worker_counts.stopped.store(true, Ordering::Relaxed);
                 let _ = done_tx.send(());
             });
         if worker.is_err() {
-            return (Self::default(), None);
+            return (Self::default(), None); // omni-dev: coverage ignore-line reason="Builder::spawn fails only when the OS refuses a new thread (resource exhaustion), which a test cannot provoke; the fail-open return is what keeps the wrapper forwarding"
         }
         (
             Self {
@@ -94,25 +82,23 @@ impl Diagnostics {
 
     /// Only call with allowlisted metadata; never stream lines or daemon errors.
     pub fn record(&self, record: impl FnOnce() -> Value) {
-        if !self.enabled() {
+        let Some(sender) = self.sender.as_ref().filter(|_| self.enabled()) else {
             return;
+        };
+        let mut record = record();
+        if let Some(fields) = record.as_object_mut() {
+            fields.insert("wrapper_pid".into(), json!(std::process::id()));
+            fields.insert(
+                "timestamp_ms".into(),
+                json!(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()),
+            );
         }
-        if let Some(sender) = &self.sender {
-            let mut record = record();
-            if let Some(fields) = record.as_object_mut() {
-                fields.insert("wrapper_pid".into(), json!(std::process::id()));
-                fields.insert(
-                    "timestamp_ms".into(),
-                    json!(std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis()),
-                );
-            }
-            if sender.try_send(record).is_err() {
-                if let Some(counts) = &self.counts {
-                    increment(&counts.diagnostic_drops);
-                }
+        if sender.try_send(record).is_err() {
+            if let Some(counts) = &self.counts {
+                increment(&counts.diagnostic_drops);
             }
         }
     }
@@ -127,6 +113,22 @@ impl Diagnostics {
                 "diagnostic_drops":c.map(|c| load(&c.diagnostic_drops))})
         });
     }
+}
+
+/// Appends each record to `out` as one line until the channel closes or a write
+/// fails; a failed write abandons the log rather than the wrapper's forwarding.
+fn drain(receiver: &mpsc::Receiver<Value>, out: &mut impl Write) {
+    for record in receiver {
+        // Serialize the entire record before the append: multiple wrappers may
+        // share this file, and token-sized writes from `to_writer` could
+        // interleave their JSON. `Value`'s `Display` cannot fail.
+        let mut line = record.to_string().into_bytes();
+        line.push(b'\n');
+        if out.write_all(&line).is_err() {
+            break;
+        }
+    }
+    let _ = out.flush();
 }
 
 pub(super) fn increment(counter: &AtomicU64) {
@@ -208,6 +210,35 @@ mod tests {
             assert!(value["wrapper_pid"].is_number());
             assert!(value["timestamp_ms"].is_number());
         }
+    }
+
+    #[test]
+    fn drain_abandons_the_log_when_a_write_fails() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        sender.send(json!({"event":"first"})).unwrap();
+        sender.send(json!({"event":"second"})).unwrap();
+        drop(sender);
+        // The first failed write ends the drain; it must neither panic nor
+        // keep retrying the remaining records.
+        drain(
+            &receiver,
+            &mut crate::test_support::failing_io::FailingWriter,
+        );
+        assert_eq!(receiver.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn drain_writes_one_complete_line_per_record() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        sender.send(json!({"event":"first"})).unwrap();
+        sender.send(json!({"event":"second","n":2})).unwrap();
+        drop(sender);
+        let mut out = Vec::new();
+        drain(&receiver, &mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"event\":\"first\"}\n{\"event\":\"second\",\"n\":2}\n"
+        );
     }
 
     #[tokio::test]

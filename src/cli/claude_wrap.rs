@@ -151,6 +151,7 @@ fn exec_replace(program: &str, args: &[String]) -> anyhow::Error {
 
 /// Wraps `program`, joining it to this process's own stdin and stdout.
 async fn wrap(program: &str, args: &[String], socket: Option<PathBuf>) -> Result<i32> {
+    // omni-dev: coverage ignore reason="process-bound wiring shell: it joins this process's own stdin/stdout and reads the real OMNI_DEV_CLAUDE_WRAP_LOG, which a test must not take over (see the note on run/wrap in the tests module); wrap_io_diagnostics beneath it is covered directly"
     wrap_io_diagnostics(
         program,
         args,
@@ -160,6 +161,7 @@ async fn wrap(program: &str, args: &[String], socket: Option<PathBuf>) -> Result
         std::env::var_os("OMNI_DEV_CLAUDE_WRAP_LOG").map(PathBuf::from),
     )
     .await
+    // omni-dev: coverage end
 }
 
 /// Spawns the child with piped stdio, pumps `input` and `output` through it
@@ -705,9 +707,11 @@ async fn observe_diagnostics(
     diagnostics: Diagnostics,
 ) {
     let Ok(socket) = server::resolve_socket(socket) else {
+        // omni-dev: coverage ignore reason="resolve_socket fails only when the platform has no data directory to put the default socket in (no resolvable home), which a test cannot reproduce on macOS or Linux; the fail-open return is what keeps the wrapper forwarding"
         diagnostics
             .record(|| json!({"event":"observer_stopped", "outcome":"socket_resolution_failed"}));
         return;
+        // omni-dev: coverage end
     };
     let mut tracker = StreamTracker::new();
     let mut last_model: Option<String> = None;
@@ -760,9 +764,11 @@ async fn observe_diagnostics(
             if let Ok(payload) = serde_json::to_value(request) {
                 report_diagnostics(&socket, "observe", payload, &diagnostics).await;
             } else {
+                // omni-dev: coverage ignore reason="to_value on an ObserveRequest fails only for a non-UTF-8 cwd, and the tracker takes cwd from a JSON string, so it is always UTF-8; the arm exists so a future non-string field cannot silently drop the report"
                 diagnostics.record(
                     || json!({"event":"report", "op":"observe", "outcome":"serialization_failed"}),
                 );
+                // omni-dev: coverage end
             }
         }
     }
@@ -959,6 +965,22 @@ mod tests {
         assert!(text.contains("daemon_rejected"));
         assert!(text.contains("transport_failed"));
         assert!(!text.contains("DAEMON_CONTENT_SECRET"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn diagnostic_report_gives_up_on_a_wedged_daemon() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("d.sock");
+        // Bound but never accepted: the connect lands in the backlog and the
+        // request in the socket buffer, so only the report timeout can end the
+        // exchange. With the clock paused, that two-second wait costs no wall time.
+        let _wedged = UnixListener::bind(&socket).unwrap();
+        let path = dir.path().join("log");
+        let (diagnostics, done) = Diagnostics::open(Some(&path));
+        report_diagnostics(&socket, "observe", json!({}), &diagnostics).await;
+        drop(diagnostics);
+        done.unwrap().await.unwrap();
+        assert!(std::fs::read_to_string(path).unwrap().contains("timeout"));
     }
 
     /// An [`AsyncWrite`] that appends into a shared buffer, so a test can assert

@@ -245,6 +245,7 @@ pub(crate) fn spawn(registry: Arc<SessionsRegistry>, token: CancellationToken) -
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::sessions::{Agent, ObserveRequest, SessionEvent, SessionState};
 
     fn candidate(
         session_id: &str,
@@ -485,6 +486,49 @@ mod tests {
         };
         plan(&candidates, &mut confirmed, probe);
         assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    /// Registers `session_id` as a prompted session owned by `pid`.
+    fn observe_owned_by(registry: &SessionsRegistry, session_id: &str, pid: u32) {
+        registry.observe(ObserveRequest {
+            agent_id: None,
+            session_id: session_id.to_string(),
+            cwd: None,
+            transcript_path: None,
+            event: SessionEvent::UserPromptSubmit,
+            repo: None,
+            model: None,
+            agent: Agent::Claude,
+            pid: Some(pid),
+        });
+    }
+
+    #[test]
+    fn an_end_action_ends_the_session_and_logs_why() {
+        let registry = SessionsRegistry::new();
+        observe_owned_by(&registry, "s1", 100);
+        let logs = crate::test_support::capture_at(tracing::Level::DEBUG, || {
+            Action::End {
+                session_id: "s1".to_string(),
+            }
+            .apply(&registry, Utc::now());
+        });
+        assert!(logs.contains("session_process_ended"), "{logs}");
+        assert!(logs.contains("pid_liveness"), "{logs}");
+        assert_eq!(registry.list()[0].state, SessionState::Ended);
+    }
+
+    #[test]
+    fn a_confirm_action_captures_the_pid_identity_token() {
+        let registry = SessionsRegistry::new();
+        observe_owned_by(&registry, "s1", 100);
+        Action::Confirm {
+            session_id: "s1".to_string(),
+            pid_start: "tok".to_string(),
+        }
+        .apply(&registry, Utc::now());
+        let candidates = registry.pid_liveness_candidates();
+        assert_eq!(candidates[0].pid_start.as_deref(), Some("tok"));
     }
 
     #[test]
