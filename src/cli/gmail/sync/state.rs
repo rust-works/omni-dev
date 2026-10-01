@@ -115,7 +115,9 @@ impl From<PendingFetchRepr> for PendingFetch {
                 last_error,
             } => Self {
                 id,
-                failures,
+                // An entry that exists has failed at least once, whatever a
+                // hand-edited or partial object says.
+                failures: failures.max(1),
                 first_failed_at,
                 next_retry_at,
                 last_error,
@@ -349,7 +351,7 @@ mod tests {
         match load(&path) {
             LoadOutcome::Present(loaded) => {
                 assert_eq!(loaded.pending_fetch[0].id, "m1");
-                assert_eq!(loaded.pending_fetch[0].failures, 0);
+                assert_eq!(loaded.pending_fetch[0].failures, 1);
                 assert!(loaded.pending_fetch[0].is_due(at("2026-01-01T00:00:00Z")));
             }
             _ => panic!("expected Present"),
