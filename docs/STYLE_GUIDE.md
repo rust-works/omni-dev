@@ -377,18 +377,15 @@ local overrides and the global fallback.
 The commit guidelines must themselves follow **Conventional Commits** and remain consistent
 with the scope definitions in `.omni-dev/scopes.yaml`:
 
-1. **Scope list** — the `` - `name` - description `` bullets in the `## Scopes` section of
-   `commit-guidelines.md` must match the scopes defined in `scopes.yaml` name-for-name and
-   description-for-description. When a scope is added, removed, or renamed in `scopes.yaml`,
-   update `commit-guidelines.md` to match. Prose in the same section is not part of the list
-   — the note recording the ecosystem default scopes that `merge_ecosystem_scopes` adds
-   (`cargo`, `core`, `lib`, `test` for a Rust project) belongs there, outside the bullets.
+1. **Single source of truth** — `scopes.yaml` is the sole maintained inventory of this
+   repository's project scope names and descriptions. Do not duplicate that inventory in
+   `commit-guidelines.md`: the checker injects the resolved valid scope set automatically.
+   Keep scope policy in the guidelines, including the ecosystem-default note
+   (`cargo`, `core`, `lib`, `test` for a Rust project), multi-scope rules, and file-ownership
+   exceptions.
 2. **Examples** — every `<scope>` used in the `## Examples` section must be a scope that
    exists in `scopes.yaml`. Do not use scopes from other projects or hypothetical scopes.
-3. **Single source of truth** — `scopes.yaml` is the canonical definition. The scope list in
-   `commit-guidelines.md` exists only so the AI prompt has inline context; it must never
-   diverge from the YAML file.
-4. **Tree coverage** — every tracked file under `src/`, `editors/` and `.github/` must be
+3. **Tree coverage** — every tracked file under `src/`, `editors/` and `.github/` must be
    matched by some scope's `file_patterns` (or listed in the `allow:` list for files that
    legitimately belong to no subsystem). When a new subsystem or module facade lands,
    `scopes.yaml` must gain a pattern for it in the same change. Coverage is checked against
@@ -398,9 +395,12 @@ with the scope definitions in `.omni-dev/scopes.yaml`:
    one — so keep it small and prefer a scope or a `file_patterns` entry; growing it is at
    least a visible diff in review, unlike a catch-all that absorbs new subsystems silently.
 
-Clauses 1–3 are enforced by
-[`tests/commit_guidelines_scopes_test.rs`](../tests/commit_guidelines_scopes_test.rs); clause
-4 is enforced by `omni-dev config scopes lint --root src --root editors --root .github`,
+The inventory and example contracts are enforced by
+[`tests/commit_guidelines_scopes_test.rs`](../tests/commit_guidelines_scopes_test.rs), which
+also checks that the guidelines' example subjects remain parseable. Prompt unit tests in
+[`src/claude/prompts.rs`](../src/claude/prompts.rs) cover injection with custom guidelines
+and compatibility with downstream Markdown scope lists when the resolved set is empty.
+Clause 3 is enforced by `omni-dev config scopes lint --root src --root editors --root .github`,
 exercised end-to-end by the `binary_config_scopes_lint_*` tests in
 [`tests/integration_test.rs`](../tests/integration_test.rs). Together they make a divergence
 fail the build rather than silently degrading the prompt.

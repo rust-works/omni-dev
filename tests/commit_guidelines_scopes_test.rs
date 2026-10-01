@@ -1,14 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! Enforces STYLE-0007's scope-list contract between the two `.omni-dev/` files.
+//! Enforces the scope/example contracts in STYLE-0007.
 //!
-//! `scopes.yaml` is the single source of truth for commit scopes; the `## Scopes`
-//! list in `commit-guidelines.md` exists only so the AI prompt has inline context.
-//! Both files are injected into the same commit-check prompt — `commit-guidelines.md`
-//! verbatim, `scopes.yaml` via `load_project_scopes` — so a divergence hands the AI
-//! judge two documents that contradict each other. That list had drifted by nine
-//! entries before anything caught it (#1421); these tests are what makes the rule
-//! self-enforcing rather than aspirational.
+//! `scopes.yaml` is the single maintained inventory of project scopes. The checker
+//! injects the resolved scopes directly, so the guidelines need no Markdown copy.
+//! These tests verify that the prompt carries the complete inventory and that the
+//! guidelines' examples use declared scopes.
 //!
 //! The same file is also the source of truth for the commit *syntax* the code has to
 //! parse, so `example_subjects_are_parseable_by_parse_subject` closes the second half
@@ -75,59 +72,6 @@ fn section<'a>(markdown: &'a str, heading: &str) -> &'a str {
         .find("\n## ")
         .map_or(markdown.len(), |offset| start + offset);
     &markdown[start..end]
-}
-
-/// Parses `- \`name\` - description` bullets into name → description.
-///
-/// Prose paragraphs in the same section are ignored, which is what lets the
-/// ecosystem-defaults note sit below the list without breaking parity.
-fn markdown_scopes(body: &str) -> BTreeMap<String, String> {
-    let bullet = Regex::new(r"^- `([a-z0-9-]+)` - (.+)$").unwrap();
-    body.lines()
-        .filter_map(|line| bullet.captures(line.trim_end()))
-        .map(|caps| (caps[1].to_string(), caps[2].trim().to_string()))
-        .collect()
-}
-
-/// STYLE-0007 clauses 1 and 3: the markdown list must match the YAML exactly.
-///
-/// Compared as maps rather than sequences, so `commit-guidelines.md` may stay
-/// alphabetical while `scopes.yaml` keeps its curated definition order.
-#[test]
-fn scope_list_matches_scopes_yaml() {
-    let yaml = yaml_scopes();
-    let guidelines = commit_guidelines();
-    let markdown = markdown_scopes(section(&guidelines, "Scopes"));
-
-    let mut problems = Vec::new();
-    for (name, description) in &yaml {
-        match markdown.get(name) {
-            None => problems.push(format!(
-                "missing from commit-guidelines.md: `{name}` - {description}"
-            )),
-            Some(listed) if listed != description => problems.push(format!(
-                "description differs for `{name}`:\n\
-                 \x20   scopes.yaml:          {description}\n\
-                 \x20   commit-guidelines.md: {listed}"
-            )),
-            Some(_) => {}
-        }
-    }
-    for name in markdown.keys() {
-        if !yaml.contains_key(name) {
-            problems.push(format!(
-                "listed in commit-guidelines.md but not defined in scopes.yaml: `{name}`"
-            ));
-        }
-    }
-
-    assert!(
-        problems.is_empty(),
-        "the `## Scopes` list in .omni-dev/commit-guidelines.md has drifted from \
-         .omni-dev/scopes.yaml (STYLE-0007):\n  {}\n\n\
-         scopes.yaml is the single source of truth — update the markdown list to match it.",
-        problems.join("\n  ")
-    );
 }
 
 /// STYLE-0007 clause 2: every scope used in `## Examples` must exist in the YAML.
@@ -237,14 +181,38 @@ fn section_stops_at_the_next_heading_but_not_subheadings() {
     assert_eq!(section(markdown, "Two"), "\nother\n");
 }
 
+/// The repository keeps its inventory in YAML and receives it through the prompt.
 #[test]
-fn markdown_scopes_ignores_prose() {
-    let body = "\n- `cli` - Command-line interface and argument parsing\n\
-                \nIn addition to the scopes above, `cargo` is also accepted.\n";
-    let parsed = markdown_scopes(body);
-    assert_eq!(parsed.len(), 1);
-    assert_eq!(
-        parsed.get("cli").map(String::as_str),
-        Some("Command-line interface and argument parsing")
+fn check_prompt_injects_repository_scopes_without_a_markdown_inventory() {
+    let guidelines = commit_guidelines();
+    let scope_section = section(&guidelines, "Scopes");
+    let inventory_bullet = Regex::new(r"(?m)^\s*- `[a-z0-9-]+` [-:] ").unwrap();
+    assert!(
+        !inventory_bullet.is_match(scope_section),
+        "keep the project scope inventory in scopes.yaml, not commit-guidelines.md"
     );
+
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scopes = omni_dev::claude::context::load_project_scopes(&omni_dev_dir(), &repo_root);
+    assert!(!scopes.is_empty());
+    for name in ["cargo", "core", "lib", "test"] {
+        assert!(scopes.iter().any(|scope| scope.name == name));
+    }
+    let prompt = omni_dev::claude::prompts::generate_check_system_prompt_with_scopes(
+        Some(&guidelines),
+        &scopes,
+    );
+    assert!(prompt.contains(&guidelines));
+    let header = "=== VALID SCOPES FOR THIS PROJECT ===";
+    assert_eq!(prompt.matches(header).count(), 1);
+    let inventory = prompt.split_once(header).unwrap().1;
+    let inventory = inventory.split_once("\n## Scope Checking Rules").unwrap().0;
+    for scope in &scopes {
+        let entry = format!("- `{}`: {}", scope.name, scope.description);
+        assert_eq!(
+            inventory.lines().filter(|line| *line == entry).count(),
+            1,
+            "scope entry must occur exactly once: {entry}"
+        );
+    }
 }

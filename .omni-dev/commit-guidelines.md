@@ -51,37 +51,11 @@ Required. Must be one of:
 
 ## Scopes
 
-Required. Use scopes defined in `.omni-dev/scopes.yaml`:
+Required. The project-specific scopes are defined in `.omni-dev/scopes.yaml`.
+The checker supplies the resolved valid scope set automatically; see the
+`VALID SCOPES FOR THIS PROJECT` section of the check prompt for the full list.
 
-- `atlassian` - Atlassian JIRA/Confluence integration and API client
-- `browser` - Browser bridge: drive authenticated requests through a browser tab
-- `changelog` - CHANGELOG.md entries
-- `ci` - CI/CD pipelines and GitHub Actions workflows
-- `claude` - Claude AI client implementation and integration
-- `cli` - Command-line interface and argument parsing
-- `coverage` - Coverage report parsing, diffing and rendering
-- `daemon` - Daemon supervisor: control socket, lifecycle, service registry, menu-bar tray
-- `data` - Data structures and serialization
-- `datadog` - Datadog monitoring integration and REST API client
-- `docs` - Documentation and planning
-- `drive` - Google Drive integration: typed API client, OAuth2 auth, and CLI/MCP surfaces
-- `git` - Git operations and repository analysis
-- `gmail` - Gmail integration: typed API client, OAuth2 auth, and CLI/MCP surfaces
-- `jev` - TypeSafe Jev System One API client and CLI surface
-- `mcp` - MCP server implementation and tool handlers
-- `release` - Release process, versioning, and publishing
-- `request-log` - Local append-only invocation + HTTP request log and its reader
-- `resources` - Embedded reference content registry shared by CLI and MCP
-- `scopes` - Commit scope definitions and configuration
-- `sessions` - Claude Code sessions tracker: cross-window live session state on the daemon
-- `snowflake` - Snowflake query service: authenticate-once SSO sessions on the daemon
-- `transcript` - Transcript fetching and formatting: source retrieval and subtitle conversion
-- `vscode` - VS Code companion extension for the worktrees service
-- `website` - Project promo site sources under website/
-- `workflows` - GitHub Actions workflow files
-- `worktrees` - Worktrees registry: cross-window repo/worktree tracking and window management on the daemon
-
-In addition to the scopes above, this project is a Rust crate, so the
+In addition to the YAML-defined scopes, this project is a Rust crate, so the
 ecosystem default scopes `cargo`, `core`, `lib` and `test` are also
 accepted.
 

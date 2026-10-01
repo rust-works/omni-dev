@@ -135,6 +135,17 @@ spec-by-example lives at
 [`src/templates/default-commit-guidelines.md`](../src/templates/default-commit-guidelines.md);
 the default is used when no project, XDG, or home copy exists.
 
+The commit checker separately injects the resolved scope names and descriptions in a
+`VALID SCOPES FOR THIS PROJECT` block. Keep project scope inventories in `scopes.yaml`
+and use the guidelines' optional `## Scopes` section for policy rather than maintaining
+another copy. Markdown scope lists remain supported: existing downstream guidelines
+are still passed through verbatim.
+
+A missing project-local `scopes.yaml` does not imply an empty scope set: configuration
+fallback and ecosystem detection can still supply scopes. When the resolved set is
+empty, the checker omits the injected block and skips deterministic scope-membership
+validation; any scope rules stated in the guidelines still reach the AI reviewer.
+
 A minimally useful file declares severity levels and a list of accepted types:
 
 ```markdown

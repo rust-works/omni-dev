@@ -1776,6 +1776,52 @@ mod tests {
         assert!(prompt.contains("`cli`: CLI module"));
     }
 
+    #[test]
+    fn check_system_prompt_custom_guidelines_with_complete_scope_inventory() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let scopes = vec![
+            ScopeDefinition {
+                name: "cli".to_string(),
+                description: "CLI module".to_string(),
+                examples: Vec::new(),
+                file_patterns: Vec::new(),
+            },
+            ScopeDefinition {
+                name: "git".to_string(),
+                description: "Git operations".to_string(),
+                examples: Vec::new(),
+                file_patterns: Vec::new(),
+            },
+        ];
+        let guidelines = "## Scopes\n\nUse the supplied valid scope inventory.";
+        let prompt = generate_check_system_prompt_with_scopes(Some(guidelines), &scopes);
+        assert!(prompt.contains(guidelines));
+        let header = "=== VALID SCOPES FOR THIS PROJECT ===";
+        assert_eq!(prompt.matches(header).count(), 1);
+        let inventory = prompt
+            .split_once(header)
+            .context("missing scope inventory")?
+            .1;
+        let inventory = inventory
+            .split_once("\n## Scope Checking Rules")
+            .context("missing scope checking rules")?
+            .0;
+        for scope in &scopes {
+            let entry = format!("- `{}`: {}", scope.name, scope.description);
+            assert_eq!(inventory.lines().filter(|line| *line == entry).count(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn check_system_prompt_preserves_downstream_scope_list_when_resolved_scopes_are_empty() {
+        let guidelines = "## Scopes\n\nRequired. Use these scopes:\n- `api` - API handlers\n";
+        let prompt = generate_check_system_prompt_with_scopes(Some(guidelines), &[]);
+        assert!(prompt.contains(guidelines));
+        assert!(!prompt.contains("=== VALID SCOPES FOR THIS PROJECT ==="));
+        assert!(!prompt.contains("## Scope Checking Rules"));
+    }
+
     // ── staged commit prompts ─────────────────────────────────────
 
     #[test]

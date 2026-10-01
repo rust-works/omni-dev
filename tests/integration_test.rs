@@ -319,7 +319,7 @@ fn binary_config_models_show_succeeds() {
 // asserts a clean run instead — inverted rather than deleted, so a future
 // regression is still caught here.
 //
-// This is the guard #1469 asked for (STYLE-0007 clause 4): every tracked
+// This is the guard #1469 asked for (STYLE-0007 tree-coverage clause): every tracked
 // file under `src/`, `editors/` and `.github/` is matched by some project
 // scope's `file_patterns` or by the `allow:` list in scopes.yaml. It runs
 // the lint with project scopes only (the default), because the ecosystem
