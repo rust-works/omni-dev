@@ -125,23 +125,19 @@ impl UsageCommand {
     /// Renders `report` per `self.output`.
     fn output_report(&self, report: &ScopeUsageReport) -> Result<()> {
         match self.output {
-            OutputFormat::Text => {
-                print!("{}", format_text_report(report));
-                Ok(())
-            }
+            OutputFormat::Text => print!("{}", format_text_report(report)),
             OutputFormat::Json => {
                 let json = serde_json::to_string_pretty(report)
                     .context("Failed to serialize report to JSON")?;
                 println!("{json}");
-                Ok(())
             }
             OutputFormat::Yaml => {
                 let yaml =
                     crate::data::to_yaml(report).context("Failed to serialize report to YAML")?;
                 println!("{yaml}");
-                Ok(())
             }
         }
+        Ok(())
     }
 }
 

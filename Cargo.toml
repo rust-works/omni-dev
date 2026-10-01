@@ -270,6 +270,8 @@ unused_async            = "allow"  # some async fns are async for API consistenc
 items_after_statements  = "allow"  # sometimes clearer to declare near use
 struct_field_names      = "allow"  # naming convention matches domain
 struct_excessive_bools  = "allow"  # config structs use bool flags
+# New in Clippy 1.99; older toolchains warn "unknown lint" (a warning, never an error).
+assert_is_empty         = "allow"  # suggested `assert_eq!(x, [] as [T; 0])` needs the element type spelled out
 
 # ── Pedantic: numeric casts ─────────────────────────────────────────
 cast_precision_loss      = "allow"  # token/char counts within safe ranges
