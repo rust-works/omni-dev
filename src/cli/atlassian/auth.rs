@@ -56,10 +56,10 @@ impl LoginCommand {
         let credentials = match self.auth_mode {
             AuthMode::Basic => AtlassianAuth::Basic {
                 email: prompt("Email: ")?,
-                api_token: prompt("API token: ")?.into(),
+                api_token: prompt_line("API token: ")?.into(),
             },
             AuthMode::Bearer => AtlassianAuth::Bearer {
-                token: prompt("Personal Access Token: ")?.into(),
+                token: prompt_line("Personal Access Token: ")?.into(),
             },
         };
         let path = Settings::get_settings_path()?;
@@ -67,55 +67,6 @@ impl LoginCommand {
         check_login_sources(&path, profile.as_deref(), &credentials, &SystemEnv)?;
         save_login_to(&path, profile.as_deref(), &instance_url, credentials)
     }
-}
-
-/// Validates credentials and persists them to `~/.omni-dev/settings.json`,
-/// targeting the active profile's `env` map when a profile is selected
-/// (issue #1116).
-///
-/// Extracted from [`LoginCommand::execute`] so the input-validation branches
-/// are reachable from tests without mocking stdin.
-#[cfg(test)]
-fn run_login(instance_url: &str, email: &str, api_token: &str) -> Result<()> {
-    run_login_to(
-        &Settings::get_settings_path()?,
-        active_profile_from(&SystemEnv).as_deref(),
-        instance_url,
-        email,
-        api_token,
-    )
-}
-
-/// [`run_login`], persisting to an explicit settings-file path and profile so
-/// tests inject both instead of mutating `HOME` / `OMNI_DEV_PROFILE`
-/// (issue #1030).
-#[cfg(test)]
-fn run_login_to(
-    settings_path: &std::path::Path,
-    profile: Option<&str>,
-    instance_url: &str,
-    email: &str,
-    api_token: &str,
-) -> Result<()> {
-    if instance_url.is_empty() {
-        anyhow::bail!("Instance URL is required");
-    }
-    if email.is_empty() {
-        anyhow::bail!("Email is required");
-    }
-    if api_token.is_empty() {
-        anyhow::bail!("API token is required");
-    }
-
-    save_login_to(
-        settings_path,
-        profile,
-        instance_url,
-        AtlassianAuth::Basic {
-            email: email.to_string(),
-            api_token: api_token.into(),
-        },
-    )
 }
 
 /// Refuses process sources that would shadow or conflict with the saved mode.
@@ -140,6 +91,7 @@ fn check_login_sources(
     Ok(())
 }
 
+/// Validates and saves credentials through the same path used by interactive login.
 fn save_login_to(
     settings_path: &std::path::Path,
     profile: Option<&str>,
@@ -247,15 +199,30 @@ async fn run_auth_status(
 
 /// Prompts the user for input on a single line.
 fn prompt(message: &str) -> Result<String> {
+    Ok(prompt_line(message)?.trim().to_string())
+}
+
+/// Prompts for a line, preserving credential bytes except its line terminator.
+fn prompt_line(message: &str) -> Result<String> {
     print!("{message}");
     io::stdout().flush().context("Failed to flush stdout")?;
 
+    read_prompt_input(&mut io::stdin().lock())
+}
+
+/// Reads one input line; the injected reader allows the secret boundary to be tested.
+fn read_prompt_input(reader: &mut impl io::BufRead) -> Result<String> {
     let mut input = String::new();
-    io::stdin()
+    reader
         .read_line(&mut input)
         .context("Failed to read user input")?;
-
-    Ok(input.trim().to_string())
+    if input.ends_with('\n') {
+        input.pop();
+        if input.ends_with('\r') {
+            input.pop();
+        }
+    }
+    Ok(input)
 }
 
 #[cfg(test)]
@@ -292,6 +259,28 @@ mod tests {
         assert!(matches!(cmd.command, AuthSubcommands::Status(_)));
     }
 
+    fn basic_auth(email: &str, token: &str) -> AtlassianAuth {
+        AtlassianAuth::Basic {
+            email: email.to_string(),
+            api_token: token.into(),
+        }
+    }
+
+    #[test]
+    fn secret_prompt_preserves_bytes_and_only_removes_line_terminator() {
+        for (input, expected) in [
+            (" token \n", " token "),
+            (" token \r\n", " token "),
+            ("token\r", "token\r"),
+            ("token", "token"),
+        ] {
+            assert_eq!(
+                read_prompt_input(&mut io::Cursor::new(input)).unwrap(),
+                expected
+            );
+        }
+    }
+
     // ── run_login ──────────────────────────────────────────────────
 
     fn temp_settings() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -303,32 +292,46 @@ mod tests {
 
     #[test]
     fn run_login_rejects_empty_instance_url() {
-        let err = run_login("", "me@test.com", "tok").unwrap_err();
+        let (_dir, path) = temp_settings();
+        let err = save_login_to(&path, None, "", basic_auth("me@test.com", "tok")).unwrap_err();
         assert!(err.to_string().contains("Instance URL"));
     }
 
     #[test]
     fn run_login_rejects_empty_email() {
-        let err = run_login("https://org.atlassian.net", "", "tok").unwrap_err();
-        assert!(err.to_string().contains("Email"));
+        let (_dir, path) = temp_settings();
+        let err = save_login_to(
+            &path,
+            None,
+            "https://org.atlassian.net",
+            basic_auth("", "tok"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ATLASSIAN_EMAIL"));
     }
 
     #[test]
     fn run_login_rejects_empty_api_token() {
-        let err = run_login("https://org.atlassian.net", "me@test.com", "").unwrap_err();
-        assert!(err.to_string().contains("API token"));
+        let (_dir, path) = temp_settings();
+        let err = save_login_to(
+            &path,
+            None,
+            "https://org.atlassian.net",
+            basic_auth("me@test.com", ""),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("token"));
     }
 
     #[test]
     fn run_login_to_persists_credentials() {
         let (_dir, settings_path) = temp_settings();
 
-        run_login_to(
+        save_login_to(
             &settings_path,
             None,
             "https://org.atlassian.net",
-            "me@test.com",
-            "tok-1",
+            basic_auth("me@test.com", "tok-1"),
         )
         .unwrap();
 
@@ -346,12 +349,11 @@ mod tests {
     fn run_login_to_with_profile_persists_under_profile() {
         let (_dir, settings_path) = temp_settings();
 
-        run_login_to(
+        save_login_to(
             &settings_path,
             Some("work"),
             "https://work.atlassian.net",
-            "me@work.com",
-            "tok-w",
+            basic_auth("me@work.com", "tok-w"),
         )
         .unwrap();
 
