@@ -131,10 +131,19 @@ fn drain(receiver: &mpsc::Receiver<Value>, out: &mut impl Write) {
     let _ = out.flush();
 }
 
+/// Saturating increment. A `compare_exchange` loop rather than `fetch_update`
+/// (deprecated on Rust 1.99+) or its `try_update` replacement (newer than the
+/// MSRV).
 pub(super) fn increment(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-        Some(n.saturating_add(1))
-    });
+    let mut current = counter.load(Ordering::Relaxed);
+    while let Err(actual) = counter.compare_exchange_weak(
+        current,
+        current.saturating_add(1),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        current = actual;
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +168,33 @@ mod tests {
                 .load(Ordering::Relaxed),
             99
         );
+    }
+
+    #[test]
+    fn increment_saturates_instead_of_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        increment(&counter);
+        increment(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn increment_loses_no_updates_under_contention() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let counter = Arc::clone(&counter);
+                std::thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        increment(&counter);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 8_000);
     }
 
     #[tokio::test]
