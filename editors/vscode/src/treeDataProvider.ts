@@ -323,8 +323,8 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
       sessionTooltipLine(sessions),
     );
     item.contextValue = worktreeContextValue(node.wt, this.windowKey, !!node.repo.github);
-    // A colored file decoration carries the row's Claude session cue (#1406) or,
-    // failing that, its PR CI-check state (#1324). Rows with either get a
+    // A file decoration carries the PR-check badge (#1324) and combined
+    // check/session colour (#1406). Rows with either state get a
     // custom-scheme `resourceUri` keyed by both, which the
     // `WorktreeDecorationProvider` paints (and which re-decorates on its own when
     // the state — and so the URI — changes). Rows with neither get none.

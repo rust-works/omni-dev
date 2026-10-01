@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Worktree session cues use the description and row colour** ([#1455](https://github.com/rust-works/omni-dev/issues/1455)): session counts no longer repeat in a file-decoration badge. The row description and tooltip retain the complete session breakdown; session state still contributes to the row colour with the existing waiting > working > idle priority. A single decoration provider displays only the PR-check badge, with the unchanged combined check/session colour.
+
 ## [0.10.0] - 2026-09-29
 
 ### Added
