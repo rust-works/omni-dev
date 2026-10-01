@@ -37,8 +37,10 @@ use super::format::{output_as, write_scalar_jsonl, JsonlSerialize, OutputFormat}
 use super::helpers;
 use super::sync::engine::{self, SyncOptions};
 use super::sync::progress::{SyncProgressBars, SyncProgressEvent};
-use super::sync::report::{SyncAction, SyncError, SyncReport, SyncSummary};
-use super::sync::{format_summary_line, should_show_progress, DEFAULT_SYNC_CONCURRENCY};
+use super::sync::report::{DeferredFetch, SyncAction, SyncError, SyncReport, SyncSummary};
+use super::sync::{
+    deferred_warning_lines, format_summary_line, should_show_progress, DEFAULT_SYNC_CONCURRENCY,
+};
 
 /// `.omni-dev/gmail-sync.yaml`'s top level.
 #[derive(Debug, Default, Deserialize)]
@@ -147,6 +149,11 @@ pub struct SyncAllCommand {
     #[arg(long)]
     pub full: bool,
 
+    /// Retries every account's pending failed fetches now, ignoring their
+    /// retry backoff, same as `gmail sync --retry-pending` (#1790).
+    #[arg(long)]
+    pub retry_pending: bool,
+
     /// Reports the planned actions for every account without writing any
     /// files.
     #[arg(long)]
@@ -175,6 +182,7 @@ struct AccountSyncOutcome {
     account_error: Option<String>,
     actions: Vec<SyncAction>,
     errors: Vec<SyncError>,
+    deferred: Vec<DeferredFetch>,
     summary: SyncSummary,
 }
 
@@ -226,6 +234,7 @@ impl SyncAllCommand {
             &config,
             &project_root,
             self.full,
+            self.retry_pending,
             self.dry_run,
             self.quiet,
             &self.output,
@@ -240,11 +249,12 @@ impl SyncAllCommand {
 /// tests can inject a [`ClientFor`] over wiremock-backed clients instead of
 /// going through real credential resolution — mirrors
 /// `sync.rs::run_sync_command`'s split from `SyncCommand::execute`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)] // mirrors the four independent CLI flags
 async fn run_sync_all(
     config: &GmailSyncAllConfig,
     project_root: &Path,
     full: bool,
+    retry_pending: bool,
     dry_run: bool,
     quiet: bool,
     output: &OutputFormat,
@@ -275,6 +285,7 @@ async fn run_sync_all(
             query: entry.query.clone(),
             exclude_labels: entry.exclude_labels.clone(),
             full,
+            retry_pending,
             concurrency: DEFAULT_SYNC_CONCURRENCY,
             dry_run,
             extract_attachments: entry.extract_attachments.unwrap_or(false),
@@ -356,6 +367,7 @@ async fn run_sync_all(
                     account_error: None,
                     actions: report.actions,
                     errors: report.errors,
+                    deferred: report.deferred,
                     summary,
                 });
             }
@@ -367,6 +379,7 @@ async fn run_sync_all(
                     account_error: Some(format!("{err:#}")),
                     actions: Vec::new(),
                     errors: Vec::new(),
+                    deferred: Vec::new(),
                     summary: SyncSummary {
                         errors: 1,
                         ..SyncSummary::default()
@@ -437,6 +450,12 @@ fn print_account_line(account: &str, outcome: &Result<SyncReport>, quiet: bool) 
             for error in &report.errors {
                 println!("{account}: error: {} failed: {}", error.id, error.reason);
             }
+            // A warning, never an error: deferred ids don't fail the run, and
+            // like errors they print under `--quiet` since nothing else says
+            // the archive is missing messages.
+            for line in deferred_warning_lines(&report.deferred) {
+                println!("{account}: {line}");
+            }
             if !quiet {
                 println!("{account}: {}", format_summary_line(&report.summary()));
             }
@@ -458,6 +477,7 @@ fn add_summary(total: &mut SyncSummary, summary: &SyncSummary) {
     total.would_delete += summary.would_delete;
     total.would_undelete += summary.would_undelete;
     total.errors += summary.errors;
+    total.deferred += summary.deferred;
 }
 
 #[cfg(test)]
@@ -732,6 +752,7 @@ accounts:
             project_root,
             false,
             false,
+            false,
             true,
             &OutputFormat::Table,
             20,
@@ -803,6 +824,7 @@ accounts:
         let err = run_sync_all(
             &config,
             project_root,
+            false,
             false,
             false,
             true,
@@ -877,6 +899,7 @@ accounts:
             project_root,
             false,
             false,
+            false,
             true,
             &OutputFormat::Table,
             20,
@@ -928,6 +951,7 @@ accounts:
         run_sync_all(
             &config,
             project_root,
+            false,
             false,
             false,
             true,
@@ -987,6 +1011,7 @@ accounts:
             project_root,
             false,
             false,
+            false,
             true,
             &OutputFormat::Json,
             20,
@@ -1021,6 +1046,7 @@ accounts:
             query: None,
             exclude_labels: Vec::new(),
             full: false,
+            retry_pending: false,
             concurrency: DEFAULT_SYNC_CONCURRENCY,
             dry_run: false,
             extract_attachments: false,
@@ -1057,6 +1083,22 @@ accounts:
     // ── SyncAllReportOutput::write_jsonl ──────────────────────────────────
 
     #[test]
+    fn add_summary_folds_deferred_into_the_combined_total() {
+        let mut total = SyncSummary {
+            deferred: 2,
+            ..SyncSummary::default()
+        };
+        add_summary(
+            &mut total,
+            &SyncSummary {
+                deferred: 3,
+                ..SyncSummary::default()
+            },
+        );
+        assert_eq!(total.deferred, 5);
+    }
+
+    #[test]
     fn sync_all_report_output_write_jsonl_emits_exactly_one_line() {
         let output = SyncAllReportOutput {
             accounts: vec![AccountSyncOutcome {
@@ -1064,6 +1106,7 @@ accounts:
                 account_error: None,
                 actions: Vec::new(),
                 errors: Vec::new(),
+                deferred: Vec::new(),
                 summary: SyncSummary::default(),
             }],
             combined_summary: SyncSummary::default(),

@@ -935,7 +935,8 @@ would just be a second, redundant dump.
 ```
 <output-dir>/
   state.json                  # watermark (historyId) + account identity +
-                                #   pending_fetch (ids that failed last run)
+                                #   pending_fetch (ids that failed, with their retry
+                                #   backoff — see Sync below)
   manifest.jsonl               # one record per message: id, thread_id, label_ids,
                                 #   internal_date, subject, from, to, rfc822_msgid,
                                 #   in_reply_to, references, attachment_count,
@@ -987,6 +988,37 @@ not an error. It's recorded as a `Vanished` action instead and never added
 to `pending_fetch`, since Gmail's `history.list` and `messages.get` aren't
 perfectly consistent and retrying that particular id can never succeed;
 see the Troubleshooting section below.
+
+**Retry backoff for failing ids (#1790):** an id that keeps failing is not
+retried on every run. After its *n*th consecutive failure it is deferred for
+`5 min * 2^(n-1)`, capped at 24 hours (5, 10, 20, 40 minutes, … up to once a
+day), and `state.json` records its failure count, first-failure time, next
+retry time and last error beside it. The watermark is independent of this
+and still advances on every run, so a bad id never delays new mail. This
+spares a rate-limited account from re-spending quota it doesn't have, and
+caps a permanently failing id (a decode error, a message too large to
+download inside the read timeout) at about one request a day. Backoff also
+applies to `--full` and to a reconciliation after an expired watermark, so
+the most expensive pass doesn't retry known-bad ids either.
+
+A deferred id costs no request and is **not** an error: it is reported as a
+warning (and in the `deferred` array of `-o json`/`yaml` output, plus a
+`deferred` count in the summary), and does not change `sync`'s or
+`sync-all`'s exit code. Only an id that was actually attempted and failed
+again is an error.
+
+```
+Warning: 2 message(s) deferred by retry backoff after repeated failures; pass --retry-pending to retry them now
+  18f3a…: 4 consecutive failure(s), next retry 2026-10-01T04:40:00Z; last error: Gmail API request failed: HTTP 403 …
+```
+
+After fixing the cause (raising the read timeout, waiting out a quota
+reset), pass **`--retry-pending`** — `gmail sync --retry-pending`, or
+`gmail sync-all --retry-pending` for every account — to attempt every
+pending id now. A forced retry that fails again still counts as a further
+failure and restarts the delay from that moment. `state.json` written by an
+earlier version (a plain list of ids) still loads, with every id due
+immediately.
 
 **`--query` and incremental sync (a known limitation):** `--query` scopes a
 backfill/`--full`/reconciliation pass, but `history.list` has no query
@@ -1106,6 +1138,7 @@ label mutation CLI-only above).
 $ omni-dev gmail sync-all
 $ omni-dev gmail sync-all --concurrency 10
 $ omni-dev gmail sync-all --full --dry-run
+$ omni-dev gmail sync-all --retry-pending   # retry ids deferred by backoff now
 $ omni-dev gmail sync-all -o json
 ```
 

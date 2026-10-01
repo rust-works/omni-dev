@@ -22,12 +22,12 @@
 //! [`fetch_and_archive_messages_streaming`]'s [`MANIFEST_CHECKPOINT_INTERVAL`]
 //! (#1467).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::stream::{self, FuturesUnordered, StreamExt as _};
 use tokio::sync::{mpsc, Semaphore};
 
@@ -48,9 +48,9 @@ use crate::utils::rate_limit::TokenBucket;
 
 use super::manifest::{Manifest, ManifestRecord};
 use super::progress::SyncProgressEvent;
-use super::report::{SyncAction, SyncError, SyncReport};
+use super::report::{DeferredFetch, SyncAction, SyncError, SyncReport};
 use super::shard::{attachments_dir, shard_path};
-use super::state::{self, ArchiveState, LoadOutcome};
+use super::state::{self, ArchiveState, LoadOutcome, PendingFetch};
 
 /// Options for one `gmail sync` invocation.
 pub(crate) struct SyncOptions {
@@ -64,6 +64,9 @@ pub(crate) struct SyncOptions {
     /// `full_sync_query`'s doc comment.
     pub(crate) exclude_labels: Vec<String>,
     pub(crate) full: bool,
+    /// Attempts every pending id this run, bypassing its retry backoff
+    /// (#1790). A retry that fails again still counts as a further failure.
+    pub(crate) retry_pending: bool,
     pub(crate) concurrency: usize,
     pub(crate) dry_run: bool,
     pub(crate) extract_attachments: bool,
@@ -94,6 +97,66 @@ pub(crate) fn manifest_path(output_dir: &Path) -> PathBuf {
 /// messages), while keeping the number of full-manifest rewrites
 /// proportional to `total / interval` rather than `total` (#1467).
 const MANIFEST_CHECKPOINT_INTERVAL: usize = 200;
+
+/// Which of the previous run's pending ids this run may fetch (#1790).
+///
+/// Built once per run from `state.json`'s `pending_fetch` and consulted by
+/// both fetch fan-outs, so backoff applies to the incremental retry *and* to
+/// the full-listing passes (`--full`, a 404-triggered reconciliation): the
+/// latter is the most expensive pass there is and must not spend a request
+/// per known-bad id. `--retry-pending` is the override for both.
+struct RetrySchedule {
+    entries: HashMap<String, PendingFetch>,
+    now: DateTime<Utc>,
+    bypass: bool,
+}
+
+impl RetrySchedule {
+    fn new(pending: &[PendingFetch], now: DateTime<Utc>, bypass: bool) -> Self {
+        Self {
+            entries: pending
+                .iter()
+                .map(|entry| (entry.id.clone(), entry.clone()))
+                .collect(),
+            now,
+            bypass,
+        }
+    }
+
+    /// The report line for `id` if its backoff forbids fetching it now.
+    fn deferral(&self, id: &str) -> Option<DeferredFetch> {
+        self.entries
+            .get(id)
+            .filter(|entry| !self.bypass && !entry.is_due(self.now))
+            .map(|entry| DeferredFetch {
+                id: entry.id.clone(),
+                failures: entry.failures,
+                next_retry_at: entry.next_retry_at,
+                last_error: entry.last_error.clone(),
+            })
+    }
+
+    /// `pending_fetch` for the state this run writes: each id that failed
+    /// continues its failure streak, each deferred id is carried over
+    /// untouched (nothing was attempted, so nothing changed), and `carried`
+    /// — pending ids a scoped listing never looked at — are kept as they are.
+    /// Anything that succeeded, vanished or was deleted is simply absent.
+    fn next_pending(&self, report: &SyncReport, carried: Vec<PendingFetch>) -> Vec<PendingFetch> {
+        let failed = report.errors.iter().map(|error| {
+            PendingFetch::failed(
+                self.entries.get(&error.id),
+                &error.id,
+                &error.reason,
+                self.now,
+            )
+        });
+        let deferred = report
+            .deferred
+            .iter()
+            .filter_map(|deferred| self.entries.get(&deferred.id).cloned());
+        failed.chain(deferred).chain(carried).collect()
+    }
+}
 
 /// Runs one sync: resolves identity, decides backfill vs. incremental (with
 /// 404 fallback), fetches whatever's missing, and returns a report. Never
@@ -134,6 +197,11 @@ pub(crate) async fn run_sync_with_progress(
     let mut manifest = Manifest::load(&manifest_path(&opts.output_dir))?;
     let mut report = SyncReport::default();
     let limiter = TokenBucket::new(GMAIL_QUOTA_UNITS_PER_SECOND, GMAIL_QUOTA_UNITS_PER_SECOND);
+    let previous_pending: &[PendingFetch] = match &loaded {
+        LoadOutcome::Present(state) => &state.pending_fetch,
+        LoadOutcome::Absent | LoadOutcome::Corrupt(_) => &[],
+    };
+    let schedule = RetrySchedule::new(previous_pending, Utc::now(), opts.retry_pending);
 
     let (history_id, carried) = match loaded {
         LoadOutcome::Present(state) if !opts.full => {
@@ -144,6 +212,7 @@ pub(crate) async fn run_sync_with_progress(
                 &state,
                 opts,
                 &limiter,
+                &schedule,
                 &mut report,
                 progress,
             )
@@ -161,6 +230,7 @@ pub(crate) async fn run_sync_with_progress(
                         &profile,
                         opts,
                         &limiter,
+                        &schedule,
                         &mut report,
                         progress,
                     )
@@ -181,6 +251,7 @@ pub(crate) async fn run_sync_with_progress(
                 &profile,
                 opts,
                 &limiter,
+                &schedule,
                 &mut report,
                 progress,
             )
@@ -193,6 +264,7 @@ pub(crate) async fn run_sync_with_progress(
             &profile,
             opts,
             &limiter,
+            &schedule,
             &mut report,
             progress,
         )
@@ -208,6 +280,7 @@ pub(crate) async fn run_sync_with_progress(
                 &profile,
                 opts,
                 &limiter,
+                &schedule,
                 &mut report,
                 progress,
             )
@@ -228,15 +301,10 @@ pub(crate) async fn run_sync_with_progress(
         // window used to be the only way back to a failed id, which meant a
         // chronically rate-limited account could never advance its watermark
         // and was pushed into a full-mailbox reconciliation (#1784).
-        // No dedup needed: both fetch paths already fetch each id once, and
-        // `carried` only holds ids this run's listing never named, so never
-        // an id that could also have failed here.
-        let pending_fetch = report
-            .errors
-            .iter()
-            .map(|e| e.id.clone())
-            .chain(carried)
-            .collect();
+        // No dedup needed: both fetch paths already fetch each id once, an id
+        // is never both failed and deferred, and `carried` only holds ids
+        // this run's listing never named.
+        let pending_fetch = schedule.next_pending(&report, carried);
         state::save(
             &ArchiveState {
                 history_id,
@@ -267,12 +335,14 @@ pub(crate) async fn run_sync_with_progress(
 /// join — previously undelete ran before the (then-sequential) fetch phase
 /// and stale-deletion ran after, so this can change the *order* actions
 /// appear in a [`SyncReport`], never which actions occur.
+#[allow(clippy::too_many_arguments)] // the retry schedule is the eighth input
 async fn run_full_sync(
     client: &GmailClient,
     manifest: &mut Manifest,
     profile: &Profile,
     opts: &SyncOptions,
     limiter: &TokenBucket,
+    schedule: &RetrySchedule,
     report: &mut SyncReport,
     progress: Option<&mpsc::UnboundedSender<SyncProgressEvent>>,
 ) -> Result<FullListing> {
@@ -295,7 +365,7 @@ async fn run_full_sync(
         },
     );
     let fetching = fetch_and_archive_messages_streaming(
-        client, manifest, ids_rx, limiter, opts, report, progress,
+        client, manifest, ids_rx, limiter, opts, schedule, report, progress,
     );
 
     let (listing_result, fetch_result) = tokio::join!(listing, fetching);
@@ -394,11 +464,11 @@ impl FullListing {
     /// is never carried. An unlisted one is dropped after an unscoped
     /// listing, where absence means the message is gone, but carried after a
     /// scoped one, which never looked for it.
-    fn carry_forward(self, previous: &[String]) -> (String, Vec<String>) {
+    fn carry_forward(self, previous: &[PendingFetch]) -> (String, Vec<PendingFetch>) {
         let carried = if self.scoped {
             previous
                 .iter()
-                .filter(|id| !self.listed_ids.contains(*id))
+                .filter(|entry| !self.listed_ids.contains(&entry.id))
                 .cloned()
                 .collect()
         } else {
@@ -545,12 +615,14 @@ fn full_sync_query(opts: &SyncOptions, report: &mut SyncReport) -> (Option<Strin
 /// is decided from the labels the fetch itself returns, since the
 /// `messagesAdded` event that carried its labels was consumed by an earlier
 /// run.
+#[allow(clippy::too_many_arguments)] // the retry schedule is the eighth input
 async fn run_incremental(
     client: &GmailClient,
     manifest: &mut Manifest,
     previous: &ArchiveState,
     opts: &SyncOptions,
     limiter: &TokenBucket,
+    schedule: &RetrySchedule,
     report: &mut SyncReport,
     progress: Option<&mpsc::UnboundedSender<SyncProgressEvent>>,
 ) -> Result<String> {
@@ -568,10 +640,15 @@ async fn run_incremental(
     let mut seen = HashSet::new();
     let mut to_fetch = Vec::new();
     let mut pending_retried = Vec::new();
-    for id in &previous.pending_fetch {
+    for entry in &previous.pending_fetch {
+        let id = &entry.id;
         if !deleted_ids.contains(id) && seen.insert(id.clone()) {
             to_fetch.push(id.clone());
-            pending_retried.push(id.clone());
+            // A deferred id stays in `to_fetch` so the fetch phase reports it
+            // (after its already-archived check), but is not "retried".
+            if schedule.deferral(id).is_none() {
+                pending_retried.push(id.clone());
+            }
         }
     }
     if !pending_retried.is_empty() {
@@ -639,8 +716,10 @@ async fn run_incremental(
         let _ = tx.send(SyncProgressEvent::ListingDone);
     }
 
-    fetch_and_archive_messages(client, manifest, &to_fetch, limiter, opts, report, progress)
-        .await?;
+    fetch_and_archive_messages(
+        client, manifest, &to_fetch, limiter, opts, schedule, report, progress,
+    )
+    .await?;
 
     for id in labels_touched.iter().chain(
         pending_retried
@@ -734,12 +813,14 @@ fn reconcile_label_exclusion(
 /// Also returns every id seen on `ids_rx` (regardless of whether it needed
 /// fetching) — [`run_full_sync`] needs that complete set, once listing
 /// finishes, for its undelete/stale-deletion passes.
+#[allow(clippy::too_many_arguments)] // the retry schedule is the eighth input
 async fn fetch_and_archive_messages_streaming(
     client: &GmailClient,
     manifest: &mut Manifest,
     mut ids_rx: mpsc::UnboundedReceiver<String>,
     limiter: &TokenBucket,
     opts: &SyncOptions,
+    schedule: &RetrySchedule,
     report: &mut SyncReport,
     progress: Option<&mpsc::UnboundedSender<SyncProgressEvent>>,
 ) -> Result<HashSet<String>> {
@@ -770,6 +851,10 @@ async fn fetch_and_archive_messages_streaming(
                             .get(&id)
                             .is_some_and(|record| output_dir.join(&record.path).exists());
                         if already_archived {
+                            continue;
+                        }
+                        if let Some(deferral) = schedule.deferral(&id) {
+                            report.deferred.push(deferral);
                             continue;
                         }
                         if opts.dry_run {
@@ -868,12 +953,14 @@ async fn fetch_and_archive_messages_streaming(
 ///
 /// Used by [`run_incremental`] only — [`run_full_sync`]'s pipelined listing
 /// uses [`fetch_and_archive_messages_streaming`] instead (#1502).
+#[allow(clippy::too_many_arguments)] // the retry schedule is the eighth input
 async fn fetch_and_archive_messages(
     client: &GmailClient,
     manifest: &mut Manifest,
     ids: &[String],
     limiter: &TokenBucket,
     opts: &SyncOptions,
+    schedule: &RetrySchedule,
     report: &mut SyncReport,
     progress: Option<&mpsc::UnboundedSender<SyncProgressEvent>>,
 ) -> Result<()> {
@@ -892,8 +979,12 @@ async fn fetch_and_archive_messages(
         let already_archived = manifest
             .get(id)
             .is_some_and(|record| output_dir.join(&record.path).exists());
-        if !already_archived {
-            to_fetch.push(id.clone());
+        if already_archived {
+            continue;
+        }
+        match schedule.deferral(id) {
+            Some(deferral) => report.deferred.push(deferral),
+            None => to_fetch.push(id.clone()),
         }
     }
     if to_fetch.is_empty() {
@@ -1191,6 +1282,26 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A schedule with no pending ids, so nothing is ever deferred.
+    fn no_schedule() -> RetrySchedule {
+        RetrySchedule::new(&[], Utc::now(), false)
+    }
+
+    /// What a bare id string in a #1788-era `state.json` loads as: due now.
+    fn legacy_pending(id: &str) -> PendingFetch {
+        PendingFetch {
+            id: id.to_string(),
+            failures: 1,
+            first_failed_at: None,
+            next_retry_at: None,
+            last_error: None,
+        }
+    }
+
+    fn pending_ids(state: &ArchiveState) -> Vec<&str> {
+        state.pending_fetch.iter().map(|p| p.id.as_str()).collect()
+    }
     use base64::Engine as _;
     use chrono::DateTime;
     use std::sync::atomic::Ordering;
@@ -1296,6 +1407,7 @@ mod tests {
             query: None,
             exclude_labels: Vec::new(),
             full: false,
+            retry_pending: false,
             concurrency: 4,
             dry_run: false,
             extract_attachments: false,
@@ -2770,7 +2882,7 @@ not-really-a-pdf\r\n\
         match state::load(&state_path(&output_dir)) {
             LoadOutcome::Present(s) => {
                 assert_eq!(s.history_id, "999");
-                assert_eq!(s.pending_fetch, ["m2"]);
+                assert_eq!(pending_ids(&s), ["m2"]);
             }
             _ => panic!("expected state.json to be written"),
         }
@@ -2819,7 +2931,7 @@ not-really-a-pdf\r\n\
         match state::load(&state_path(&output_dir)) {
             LoadOutcome::Present(s) => {
                 assert_eq!(s.history_id, "200", "watermark must advance");
-                assert_eq!(s.pending_fetch, ["m1"], "the failure is carried forward");
+                assert_eq!(pending_ids(&s), ["m1"], "the failure is carried forward");
             }
             _ => panic!("expected state.json to be written"),
         }
@@ -2959,7 +3071,7 @@ not-really-a-pdf\r\n\
             LoadOutcome::Present(s) => {
                 assert_eq!(s.history_id, "300", "watermark must advance");
                 assert_eq!(
-                    s.pending_fetch,
+                    pending_ids(&s),
                     ["m1"],
                     "a non-notFound 404 is retried next run"
                 );
@@ -2978,7 +3090,7 @@ not-really-a-pdf\r\n\
                 email_address: "user@example.com".to_string(),
                 last_sync: Utc::now(),
                 query: None,
-                pending_fetch: pending.iter().map(|id| (*id).to_string()).collect(),
+                pending_fetch: pending.iter().map(|id| legacy_pending(id)).collect(),
             },
             &state_path(output_dir),
         )
@@ -3060,7 +3172,7 @@ not-really-a-pdf\r\n\
         assert_eq!(report.errors.len(), 1);
         let s = load_present(&output_dir);
         assert_eq!(s.history_id, "200");
-        assert_eq!(s.pending_fetch, ["m1"]);
+        assert_eq!(pending_ids(&s), ["m1"]);
     }
 
     #[tokio::test]
@@ -3223,13 +3335,14 @@ not-really-a-pdf\r\n\
 
         let opts = SyncOptions {
             full: true,
+            retry_pending: false,
             ..opts(output_dir.clone())
         };
         run_sync(&client, &opts).await.unwrap();
 
         let s = load_present(&output_dir);
         assert_eq!(s.history_id, "999");
-        assert_eq!(s.pending_fetch, ["m2"]);
+        assert_eq!(pending_ids(&s), ["m2"]);
     }
 
     #[tokio::test]
@@ -3250,6 +3363,7 @@ not-really-a-pdf\r\n\
 
         let opts = SyncOptions {
             full: true,
+            retry_pending: false,
             query: Some("from:boss@example.com".to_string()),
             ..opts(output_dir.clone())
         };
@@ -3258,7 +3372,341 @@ not-really-a-pdf\r\n\
         assert!(report.errors.is_empty());
         let s = load_present(&output_dir);
         assert_eq!(s.history_id, "999");
-        assert_eq!(s.pending_fetch, ["outside"]);
+        assert_eq!(pending_ids(&s), ["outside"]);
+    }
+
+    // ── pending_fetch retry backoff (#1790) ─────────────────────────────
+
+    /// A pending entry that has failed `failures` times and may next be
+    /// retried `retry_in` from now (negative = already due).
+    fn backed_off(id: &str, failures: u32, retry_in: chrono::Duration) -> PendingFetch {
+        PendingFetch {
+            id: id.to_string(),
+            failures,
+            first_failed_at: Some(Utc::now() - chrono::Duration::days(1)),
+            next_retry_at: Some(Utc::now() + retry_in),
+            last_error: Some("rate limited".to_string()),
+        }
+    }
+
+    fn save_state_with_entries(output_dir: &Path, entries: Vec<PendingFetch>) {
+        std::fs::create_dir_all(output_dir).unwrap();
+        state::save(
+            &ArchiveState {
+                history_id: "100".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: Utc::now(),
+                query: None,
+                pending_fetch: entries,
+            },
+            &state_path(output_dir),
+        )
+        .unwrap();
+    }
+
+    async fn mount_failing_get(server: &wiremock::MockServer, id: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/gmail/v1/users/me/messages/{id}"
+            )))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn run_sync_defers_a_pending_id_whose_backoff_has_not_elapsed() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        let entry = backed_off("m1", 3, chrono::Duration::hours(1));
+        save_state_with_entries(&output_dir, vec![entry.clone()]);
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+        mount_get_never_called(&server, "m1").await;
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.errors.is_empty(), "a deferred id is not an error");
+        assert_eq!(report.deferred.len(), 1);
+        assert_eq!(report.deferred[0].id, "m1");
+        assert_eq!(report.deferred[0].failures, 3);
+        assert_eq!(report.deferred[0].next_retry_at, entry.next_retry_at);
+        assert!(!report.actions.iter().any(|a| matches!(
+            a,
+            SyncAction::Note { message } if message.contains("retrying")
+        )));
+        let s = load_present(&output_dir);
+        assert_eq!(s.history_id, "200", "the watermark still advances");
+        assert_eq!(s.pending_fetch, [entry], "a deferred entry is untouched");
+    }
+
+    #[tokio::test]
+    async fn run_sync_retries_a_pending_id_whose_backoff_has_elapsed() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_entries(
+            &output_dir,
+            vec![backed_off("m1", 3, chrono::Duration::hours(-1))],
+        );
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+        mount_raw_get(&server, "m1", "Retried").await;
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert!(report.deferred.is_empty());
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Fetched { id, .. } if id == "m1")));
+        assert!(load_present(&output_dir).pending_fetch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_sync_extends_the_backoff_when_a_due_retry_fails_again() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        let previous = backed_off("m1", 2, chrono::Duration::hours(-1));
+        save_state_with_entries(&output_dir, vec![previous.clone()]);
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+        mount_failing_get(&server, "m1").await;
+
+        let before = Utc::now();
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert_eq!(report.errors.len(), 1);
+        let s = load_present(&output_dir);
+        assert_eq!(s.pending_fetch.len(), 1);
+        let entry = &s.pending_fetch[0];
+        assert_eq!(entry.id, "m1");
+        assert_eq!(entry.failures, 3);
+        assert_eq!(entry.first_failed_at, previous.first_failed_at);
+        assert!(entry.next_retry_at.unwrap() >= before + state::backoff_delay(3));
+        assert!(entry.last_error.as_deref().unwrap().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn run_sync_retry_pending_bypasses_the_backoff() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_entries(
+            &output_dir,
+            vec![backed_off("m1", 5, chrono::Duration::hours(20))],
+        );
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+        mount_raw_get(&server, "m1", "Forced").await;
+
+        let opts = SyncOptions {
+            retry_pending: true,
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.deferred.is_empty());
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Fetched { id, .. } if id == "m1")));
+        assert!(load_present(&output_dir).pending_fetch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_sync_retry_pending_that_fails_again_still_counts_the_failure() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_entries(
+            &output_dir,
+            vec![backed_off("m1", 2, chrono::Duration::hours(20))],
+        );
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+        mount_failing_get(&server, "m1").await;
+
+        let before = Utc::now();
+        let opts = SyncOptions {
+            retry_pending: true,
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert_eq!(report.errors.len(), 1);
+        let entry = &load_present(&output_dir).pending_fetch[0];
+        assert_eq!(entry.failures, 3);
+        // The delay restarts from now, rather than keeping the old 20h.
+        assert!(entry.next_retry_at.unwrap() < before + chrono::Duration::hours(1));
+    }
+
+    #[tokio::test]
+    async fn run_sync_full_defers_a_backed_off_id_but_fetches_the_rest() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        let entry = backed_off("m1", 4, chrono::Duration::hours(2));
+        save_state_with_entries(&output_dir, vec![entry.clone()]);
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_message_list(&server, &["m1", "m2"]).await;
+        mount_get_never_called(&server, "m1").await;
+        mount_raw_get(&server, "m2", "Fresh").await;
+
+        let opts = SyncOptions {
+            full: true,
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.errors.is_empty());
+        assert_eq!(report.deferred.len(), 1);
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Fetched { id, .. } if id == "m2")));
+        assert_eq!(load_present(&output_dir).pending_fetch, [entry]);
+    }
+
+    #[tokio::test]
+    async fn run_sync_full_retry_pending_fetches_a_backed_off_id() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_entries(
+            &output_dir,
+            vec![backed_off("m1", 4, chrono::Duration::hours(2))],
+        );
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_message_list(&server, &["m1"]).await;
+        mount_raw_get(&server, "m1", "Forced").await;
+
+        let opts = SyncOptions {
+            full: true,
+            retry_pending: true,
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert!(report.deferred.is_empty());
+        assert!(load_present(&output_dir).pending_fetch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_sync_full_with_query_keeps_the_backoff_of_an_unlisted_pending_id() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        let entry = backed_off("outside", 6, chrono::Duration::hours(3));
+        save_state_with_entries(&output_dir, vec![entry.clone()]);
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_message_list(&server, &[]).await;
+
+        let opts = SyncOptions {
+            full: true,
+            query: Some("from:boss@example.com".to_string()),
+            ..opts(output_dir.clone())
+        };
+        run_sync(&client, &opts).await.unwrap();
+
+        assert_eq!(load_present(&output_dir).pending_fetch, [entry]);
+    }
+
+    #[tokio::test]
+    async fn run_sync_drops_a_backed_off_id_that_was_archived_by_other_means() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_entries(
+            &output_dir,
+            vec![backed_off("m1", 3, chrono::Duration::hours(1))],
+        );
+        let mut manifest = Manifest::default();
+        let path = shard_path(&output_dir, "m1", None);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "From: a@example.com\r\n\r\nm1 body").unwrap();
+        manifest.upsert(ManifestRecord {
+            id: "m1".to_string(),
+            thread_id: Some("t1".to_string()),
+            label_ids: vec!["INBOX".to_string()],
+            internal_date: None,
+            subject: None,
+            from: None,
+            to: None,
+            rfc822_msgid: None,
+            in_reply_to: None,
+            references: None,
+            attachment_count: 0,
+            attachment_filenames: Vec::new(),
+            path: path.strip_prefix(&output_dir).unwrap().to_path_buf(),
+            size: std::fs::metadata(&path).unwrap().len(),
+            history_id: Some("50".to_string()),
+            deleted_at: None,
+            excluded_labels: Vec::new(),
+        });
+        manifest.save(&manifest_path(&output_dir)).unwrap();
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+        mount_get_never_called(&server, "m1").await;
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.deferred.is_empty(), "archived, so nothing to defer");
+        assert!(load_present(&output_dir).pending_fetch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_sync_dry_run_reports_a_deferred_id_without_planning_a_fetch() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        save_state_with_entries(
+            &output_dir,
+            vec![backed_off("m1", 3, chrono::Duration::hours(1))],
+        );
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_history(&server, serde_json::json!({"historyId": "200"})).await;
+
+        let opts = SyncOptions {
+            dry_run: true,
+            ..opts(output_dir.clone())
+        };
+        let report = run_sync(&client, &opts).await.unwrap();
+
+        assert_eq!(report.deferred.len(), 1);
+        assert!(!report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::WouldFetch { .. })));
+    }
+
+    #[test]
+    fn retry_schedule_defers_only_not_yet_due_ids_and_honours_bypass() {
+        let now = Utc::now();
+        let pending = vec![
+            backed_off("later", 2, chrono::Duration::hours(1)),
+            backed_off("due", 2, chrono::Duration::hours(-1)),
+        ];
+        let schedule = RetrySchedule::new(&pending, now, false);
+        assert!(schedule.deferral("later").is_some());
+        assert!(schedule.deferral("due").is_none());
+        assert!(schedule.deferral("unknown").is_none());
+
+        let bypassed = RetrySchedule::new(&pending, now, true);
+        assert!(bypassed.deferral("later").is_none());
     }
 
     #[tokio::test]
@@ -3356,6 +3804,7 @@ not-really-a-pdf\r\n\
                 query: None,
                 exclude_labels: Vec::new(),
                 full: false,
+                retry_pending: false,
                 concurrency: 4,
                 dry_run: true,
                 extract_attachments: false,
@@ -3548,6 +3997,7 @@ not-really-a-pdf\r\n\
             query: None,
             exclude_labels: Vec::new(),
             full: false,
+            retry_pending: false,
             concurrency: 20,
             dry_run: false,
             extract_attachments: false,
@@ -3560,6 +4010,7 @@ not-really-a-pdf\r\n\
             &ids,
             &limiter,
             &opts,
+            &no_schedule(),
             &mut report,
             None,
         )
@@ -3638,6 +4089,7 @@ not-really-a-pdf\r\n\
             query: None,
             exclude_labels: Vec::new(),
             full: false,
+            retry_pending: false,
             concurrency: 20,
             dry_run: false,
             extract_attachments: false,
@@ -3660,10 +4112,11 @@ not-really-a-pdf\r\n\
             }
         };
 
+        let schedule = no_schedule();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             tokio::select! {
                 _ = fetch_and_archive_messages(
-                    &client, &mut manifest, &ids, &limiter, &opts, &mut report, None,
+                    &client, &mut manifest, &ids, &limiter, &opts, &schedule, &mut report, None,
                 ) => {
                     panic!(
                         "fetch_and_archive_messages returned before the slow ids' delay could \
@@ -3714,6 +4167,7 @@ not-really-a-pdf\r\n\
             query: None,
             exclude_labels: Vec::new(),
             full: false,
+            retry_pending: false,
             concurrency: 20,
             dry_run: false,
             extract_attachments: false,
@@ -3732,6 +4186,7 @@ not-really-a-pdf\r\n\
             ids_rx,
             &limiter,
             &opts,
+            &no_schedule(),
             &mut report,
             None,
         )
@@ -3794,6 +4249,7 @@ not-really-a-pdf\r\n\
             ids_rx,
             &limiter,
             &opts,
+            &no_schedule(),
             &mut report,
             Some(&progress_tx),
         )
@@ -4010,6 +4466,7 @@ not-really-a-pdf\r\n\
                 query: None,
                 exclude_labels: Vec::new(),
                 full: false,
+                retry_pending: false,
                 concurrency: 4,
                 dry_run: true,
                 extract_attachments: false,
@@ -4126,6 +4583,7 @@ not-really-a-pdf\r\n\
             query: None,
             exclude_labels: Vec::new(),
             full: false,
+            retry_pending: false,
             // A generous *local* concurrency: only the shared pool should
             // be the thing capping in-flight requests to 1 here.
             concurrency: 20,
@@ -4160,10 +4618,11 @@ not-really-a-pdf\r\n\
             );
         };
 
+        let schedule = no_schedule();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
                 _ = fetch_and_archive_messages(
-                    &client, &mut manifest, &ids, &limiter, &opts, &mut report, None,
+                    &client, &mut manifest, &ids, &limiter, &opts, &schedule, &mut report, None,
                 ) => {
                     panic!(
                         "fetch_and_archive_messages returned before the slow ids' 3600s delay \
@@ -4201,6 +4660,7 @@ not-really-a-pdf\r\n\
             query: None,
             exclude_labels: Vec::new(),
             full: false,
+            retry_pending: false,
             concurrency: 4,
             dry_run: false,
             extract_attachments: false,
@@ -4217,6 +4677,7 @@ not-really-a-pdf\r\n\
             ids_rx,
             &limiter,
             &opts,
+            &no_schedule(),
             &mut report,
             None,
         )
@@ -4247,6 +4708,7 @@ not-really-a-pdf\r\n\
             query: None,
             exclude_labels: Vec::new(),
             full: false,
+            retry_pending: false,
             concurrency: 4,
             dry_run: false,
             extract_attachments: false,
@@ -4259,6 +4721,7 @@ not-really-a-pdf\r\n\
             &["id1".to_string()],
             &limiter,
             &opts,
+            &no_schedule(),
             &mut report,
             None,
         )

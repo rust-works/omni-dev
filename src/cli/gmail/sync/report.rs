@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::cli::gmail::format::{write_scalar_jsonl, JsonlSerialize};
@@ -18,6 +19,9 @@ use crate::cli::gmail::format::{write_scalar_jsonl, JsonlSerialize};
 pub(crate) struct SyncReport {
     pub(crate) actions: Vec<SyncAction>,
     pub(crate) errors: Vec<SyncError>,
+    /// Pending ids skipped this run because their retry backoff has not yet
+    /// elapsed (#1790). Not errors: nothing was attempted.
+    pub(crate) deferred: Vec<DeferredFetch>,
 }
 
 impl JsonlSerialize for SyncReport {
@@ -82,6 +86,18 @@ pub(crate) struct SyncError {
     pub(crate) reason: String,
 }
 
+/// A message whose fetch was skipped this run because an earlier failure put
+/// it on retry backoff (#1790). Costs no quota and does not fail the run;
+/// `--retry-pending` attempts it anyway.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DeferredFetch {
+    pub(crate) id: String,
+    /// Consecutive failed attempts so far.
+    pub(crate) failures: u32,
+    pub(crate) next_retry_at: Option<DateTime<Utc>>,
+    pub(crate) last_error: Option<String>,
+}
+
 /// Aggregate counts derived from `actions`/`errors` — see [`SyncReport::summary`].
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct SyncSummary {
@@ -95,6 +111,7 @@ pub(crate) struct SyncSummary {
     pub(crate) would_delete: usize,
     pub(crate) would_undelete: usize,
     pub(crate) errors: usize,
+    pub(crate) deferred: usize,
 }
 
 impl SyncReport {
@@ -105,6 +122,7 @@ impl SyncReport {
     pub(crate) fn summary(&self) -> SyncSummary {
         let mut summary = SyncSummary {
             errors: self.errors.len(),
+            deferred: self.deferred.len(),
             ..SyncSummary::default()
         };
         for action in &self.actions {
@@ -177,6 +195,12 @@ mod tests {
                 id: "m9".to_string(),
                 reason: "boom".to_string(),
             }],
+            deferred: vec![DeferredFetch {
+                id: "m11".to_string(),
+                failures: 2,
+                next_retry_at: None,
+                last_error: None,
+            }],
         };
 
         assert_eq!(
@@ -192,6 +216,7 @@ mod tests {
                 would_delete: 1,
                 would_undelete: 1,
                 errors: 1,
+                deferred: 1,
             }
         );
     }

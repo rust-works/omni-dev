@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use chrono::SecondsFormat;
 use clap::Parser;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -28,7 +29,7 @@ use crate::gmail::client::GmailClient;
 
 use engine::SyncOptions;
 use progress::{SyncProgressBars, SyncProgressEvent};
-use report::{SyncAction, SyncError, SyncReport, SyncSummary};
+use report::{DeferredFetch, SyncAction, SyncError, SyncReport, SyncSummary};
 
 /// Default `--concurrency`: an in-flight-request cap layered under the
 /// token-bucket rate limiter (which is the actual quota-compliance
@@ -78,6 +79,13 @@ pub struct SyncCommand {
     #[arg(long)]
     pub full: bool,
 
+    /// Retries every message still pending from an earlier failed fetch now,
+    /// ignoring the retry backoff that would otherwise defer it (#1790). Use
+    /// after fixing whatever made the fetches fail. A retry that fails again
+    /// still counts toward — and restarts — that message's backoff.
+    #[arg(long)]
+    pub retry_pending: bool,
+
     /// Bounds concurrent message fetches. Clamped to
     /// `1..=gmail::messages_api::MAX_CONCURRENCY`.
     #[arg(long, default_value_t = DEFAULT_SYNC_CONCURRENCY)]
@@ -122,6 +130,7 @@ impl SyncCommand {
                 query: self.query,
                 exclude_labels: self.exclude_label,
                 full: self.full,
+                retry_pending: self.retry_pending,
                 concurrency: self.concurrency,
                 dry_run: self.dry_run,
                 extract_attachments: self.extract_attachments,
@@ -180,6 +189,7 @@ async fn run_sync_command(
     let output_view = SyncReportOutput {
         actions: &report.actions,
         errors: &report.errors,
+        deferred: &report.deferred,
         summary: report.summary(),
     };
     if !output_as(&output_view, output)? {
@@ -238,6 +248,7 @@ pub(crate) fn should_show_progress(
 struct SyncReportOutput<'a> {
     actions: &'a [SyncAction],
     errors: &'a [SyncError],
+    deferred: &'a [DeferredFetch],
     summary: SyncSummary,
 }
 
@@ -265,7 +276,7 @@ fn render_report_text(
     out: &mut dyn Write,
     show_action_detail: bool,
 ) -> Result<()> {
-    if report.actions.is_empty() && report.errors.is_empty() {
+    if report.actions.is_empty() && report.errors.is_empty() && report.deferred.is_empty() {
         writeln!(out, "Nothing to do.").context("Failed to write sync report")?;
         return Ok(());
     }
@@ -311,9 +322,55 @@ fn render_report_text(
         writeln!(out, "Error: {} failed: {}", error.id, error.reason)
             .context("Failed to write sync report")?;
     }
+    for line in deferred_warning_lines(&report.deferred) {
+        writeln!(out, "{line}").context("Failed to write sync report")?;
+    }
     writeln!(out, "{}", format_summary_line(&report.summary()))
         .context("Failed to write sync report")?;
     Ok(())
+}
+
+/// Most deferred ids listed individually in a warning; the rest are counted.
+/// A sustained rate limit can defer thousands, and `-o json` carries them all.
+const DEFERRED_LINES_SHOWN: usize = 10;
+
+/// The warning for ids skipped by retry backoff (#1790): a header line, up to
+/// [`DEFERRED_LINES_SHOWN`] indented per-id lines, and an overflow count.
+/// Empty when nothing was deferred. A warning, not an error — it never
+/// contributes to the exit code.
+///
+/// `pub(crate)` so `sync-all` can print the same text under its own
+/// `<account>:` prefix.
+pub(crate) fn deferred_warning_lines(deferred: &[DeferredFetch]) -> Vec<String> {
+    if deferred.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Warning: {} message(s) deferred by retry backoff after repeated failures; \
+         pass --retry-pending to retry them now",
+        deferred.len()
+    )];
+    for entry in deferred.iter().take(DEFERRED_LINES_SHOWN) {
+        let next = entry.next_retry_at.map_or_else(
+            || "unscheduled".to_string(),
+            |at| at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        );
+        let reason = entry
+            .last_error
+            .as_ref()
+            .map_or_else(String::new, |reason| format!("; last error: {reason}"));
+        lines.push(format!(
+            "  {}: {} consecutive failure(s), next retry {next}{reason}",
+            entry.id, entry.failures
+        ));
+    }
+    if deferred.len() > DEFERRED_LINES_SHOWN {
+        lines.push(format!(
+            "  ... and {} more",
+            deferred.len() - DEFERRED_LINES_SHOWN
+        ));
+    }
+    lines
 }
 
 /// Formats `summary` as a trailing comma-separated line, e.g.
@@ -338,6 +395,7 @@ pub(crate) fn format_summary_line(summary: &SyncSummary) -> String {
     push(summary.undeleted, "undeleted");
     push(summary.would_delete, "would delete");
     push(summary.would_undelete, "would undelete");
+    push(summary.deferred, "deferred");
     parts.push(format!("{} errors", summary.errors));
     parts.join(", ")
 }
@@ -450,6 +508,7 @@ mod tests {
                 id: "m3".to_string(),
                 reason: "boom".to_string(),
             }],
+            ..SyncReport::default()
         };
         let mut buf = Vec::new();
         render_report_text(&report, &mut buf, true).unwrap();
@@ -470,6 +529,7 @@ mod tests {
                 removed: vec!["UNREAD".to_string()],
             }],
             errors: vec![],
+            ..SyncReport::default()
         };
         let mut buf = Vec::new();
         render_report_text(&report, &mut buf, true).unwrap();
@@ -485,6 +545,7 @@ mod tests {
                 id: "spam1".to_string(),
             }],
             errors: vec![],
+            ..SyncReport::default()
         };
         let mut buf = Vec::new();
         render_report_text(&report, &mut buf, true).unwrap();
@@ -508,6 +569,7 @@ mod tests {
                 },
             ],
             errors: vec![],
+            ..SyncReport::default()
         };
         let mut buf = Vec::new();
         render_report_text(&report, &mut buf, true).unwrap();
@@ -537,6 +599,7 @@ mod tests {
                 id: "m3".to_string(),
                 reason: "boom".to_string(),
             }],
+            ..SyncReport::default()
         };
         let mut buf = Vec::new();
         render_report_text(&report, &mut buf, false).unwrap();
@@ -574,10 +637,12 @@ mod tests {
                 bytes: 1,
             }],
             errors: vec![],
+            ..SyncReport::default()
         };
         let output_view = SyncReportOutput {
             actions: &report.actions,
             errors: &report.errors,
+            deferred: &report.deferred,
             summary: report.summary(),
         };
         let yaml = serde_yaml::to_string(&output_view).unwrap();
@@ -617,6 +682,7 @@ mod tests {
                 query: None,
                 exclude_labels: Vec::new(),
                 full: false,
+                retry_pending: false,
                 concurrency: 4,
                 dry_run: true,
                 extract_attachments: false,
@@ -629,6 +695,128 @@ mod tests {
         .unwrap();
 
         assert!(!output_dir.exists());
+    }
+
+    fn deferred(id: &str, failures: u32) -> DeferredFetch {
+        DeferredFetch {
+            id: id.to_string(),
+            failures,
+            next_retry_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-01-01T00:40:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            last_error: Some("rate limited".to_string()),
+        }
+    }
+
+    #[test]
+    fn deferred_warning_lines_is_empty_when_nothing_was_deferred() {
+        assert!(deferred_warning_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn deferred_warning_lines_names_each_id_and_the_override() {
+        let lines = deferred_warning_lines(&[deferred("m1", 4)]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("Warning: 1 message(s) deferred"));
+        assert!(lines[0].contains("--retry-pending"));
+        assert_eq!(
+            lines[1],
+            "  m1: 4 consecutive failure(s), next retry 2026-01-01T00:40:00Z; \
+             last error: rate limited"
+        );
+    }
+
+    #[test]
+    fn deferred_warning_lines_caps_the_per_id_lines_and_counts_the_rest() {
+        let many: Vec<DeferredFetch> = (0..13).map(|n| deferred(&format!("m{n}"), 2)).collect();
+        let lines = deferred_warning_lines(&many);
+        // Header, ten ids, overflow line.
+        assert_eq!(lines.len(), 12);
+        assert!(lines[0].contains("13 message(s)"));
+        assert_eq!(lines[11], "  ... and 3 more");
+    }
+
+    #[test]
+    fn render_report_text_shows_deferred_warnings_even_without_action_detail() {
+        let report = SyncReport {
+            deferred: vec![deferred("m1", 3)],
+            ..SyncReport::default()
+        };
+        let mut buf = Vec::new();
+        render_report_text(&report, &mut buf, false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(!text.contains("Nothing to do"));
+        assert!(text.contains("Warning: 1 message(s) deferred"));
+        assert!(text.contains("m1: 3 consecutive failure(s)"));
+        assert!(text.contains("1 deferred, 0 errors"));
+    }
+
+    #[tokio::test]
+    async fn run_sync_command_exits_zero_when_the_only_problem_is_a_deferred_id() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/profile"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "emailAddress": "user@example.com", "messagesTotal": 1, "threadsTotal": 1, "historyId": "1"
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/history"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"historyId": "2"})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/gmail/v1/users/me/messages/m1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        state::save(
+            &state::ArchiveState {
+                history_id: "1".to_string(),
+                email_address: "user@example.com".to_string(),
+                last_sync: chrono::Utc::now(),
+                query: None,
+                pending_fetch: vec![state::PendingFetch::failed(
+                    None,
+                    "m1",
+                    "rate limited",
+                    chrono::Utc::now(),
+                )],
+            },
+            &output_dir.join("state.json"),
+        )
+        .unwrap();
+
+        run_sync_command(
+            &client,
+            SyncOptions {
+                output_dir,
+                query: None,
+                exclude_labels: Vec::new(),
+                full: false,
+                retry_pending: false,
+                concurrency: 4,
+                dry_run: false,
+                extract_attachments: false,
+                shared_pool: None,
+            },
+            true,
+            &OutputFormat::Table,
+        )
+        .await
+        .expect("a deferred id is a warning, not a failure");
     }
 
     #[tokio::test]
@@ -665,6 +853,7 @@ mod tests {
                 query: None,
                 exclude_labels: Vec::new(),
                 full: false,
+                retry_pending: false,
                 concurrency: 4,
                 dry_run: false,
                 extract_attachments: false,
@@ -704,6 +893,7 @@ mod tests {
             query: None,
             exclude_label: Vec::new(),
             full: false,
+            retry_pending: false,
             concurrency: DEFAULT_SYNC_CONCURRENCY,
             dry_run: false,
             extract_attachments: false,
@@ -796,6 +986,7 @@ Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
                 query: None,
                 exclude_labels: Vec::new(),
                 full: false,
+                retry_pending: false,
                 concurrency: 4,
                 dry_run: false,
                 extract_attachments: true,
@@ -826,6 +1017,7 @@ Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
                 query: None,
                 exclude_labels: Vec::new(),
                 full: false,
+                retry_pending: false,
                 concurrency: 4,
                 dry_run: false,
                 extract_attachments: false,
