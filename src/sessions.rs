@@ -75,8 +75,8 @@ pub mod watcher;
 /// lock, so `reap_sessions` never needs to know about pids at all. This TTL is
 /// now the fallback for a session with no pid (older hooks, the transcript
 /// watcher, pi.dev), one the watcher has not yet confirmed, or whose pid it
-/// can't confirm (an unprompted spare process, or one another `session_id`
-/// has since taken over). A still-alive idle session bound by this TTL
+/// can't confirm (an unprompted spare process, one another `session_id`
+/// has since taken over, or one the stream wrapper reports — #1454). A still-alive idle session bound by this TTL
 /// re-appears the moment it next does anything. See ADR-0052.
 const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(300);
 
@@ -481,6 +481,15 @@ pub struct SessionEntry {
     /// pid is alive.
     #[serde(skip)]
     pub(crate) prompted: bool,
+    /// Whether a Claude `claude-wrap` stream observer has reported this session
+    /// (an authoritative [`SessionEvent::StreamState`]). Excludes it from the
+    /// pid-liveness TTL exemption (#1454): the stream wrapper is only ever
+    /// attached to a VS Code/SDK-driven `claude`, whose extension keeps a
+    /// process per chat rather than per visible tab, so a live pid says nothing
+    /// about whether anyone can still see the chat. Its busy states are kept
+    /// fresh by the wrapper's own keep-alive instead. Sticky: once set it stays.
+    #[serde(skip)]
+    pub(crate) streamed: bool,
     /// The processes the session was taken over from, oldest first and capped
     /// at [`MAX_REPLACED_PIDS`] — the old processes of in-place resumes. An
     /// `end` from one of them is ignored (#1948).
@@ -550,6 +559,9 @@ pub(crate) struct PidCandidate {
     /// [`SessionEntry::pid_start`]).
     pub(crate) pid_start: Option<String>,
     pub(crate) prompted: bool,
+    /// Whether the session is reported by the stream wrapper — see
+    /// [`SessionEntry::streamed`]. Such a session is never exempted from the TTL.
+    pub(crate) streamed: bool,
     /// When this session was last seen, used to pick the *currently active*
     /// session_id among several sharing a pid — not `started_at`, which would
     /// wrongly keep favouring a `/clear`-abandoned session forever over one a
@@ -711,6 +723,7 @@ impl SessionsRegistry {
                 Some(entry) => {
                     track_pid(entry, req.pid);
                     entry.prompted |= req.event == SessionEvent::UserPromptSubmit;
+                    entry.streamed |= is_claude_stream_report(&req);
                     let next = subagent_state(entry, req.event, agent_id);
                     let state_changed = next != entry.state;
                     entry.state = next;
@@ -734,6 +747,7 @@ impl SessionsRegistry {
                         SessionState::for_event(&req.event, None)
                     };
                     let prompted = req.event == SessionEvent::UserPromptSubmit;
+                    let streamed = is_claude_stream_report(&req);
                     let session_id = req.session_id.clone();
                     let mut entry = SessionEntry {
                         subagent_base: None,
@@ -752,6 +766,7 @@ impl SessionsRegistry {
                         pid: req.pid,
                         pid_start: None,
                         prompted,
+                        streamed,
                         replaced_pids: VecDeque::new(),
                     };
                     entry.state = subagent_state(&mut entry, req.event, agent_id);
@@ -826,6 +841,7 @@ impl SessionsRegistry {
                     pid: e.pid?,
                     pid_start: e.pid_start.clone(),
                     prompted: e.prompted,
+                    streamed: e.streamed,
                     last_seen: e.last_seen,
                 })
             })
@@ -1086,6 +1102,14 @@ fn match_depth(cwd: &Path, folders: &[PathBuf]) -> Option<usize> {
         .max()
 }
 
+/// Whether `req` is a Claude session's authoritative stream-wrapper report —
+/// the signal [`SessionEntry::streamed`] latches on. Codex's wrapper also emits
+/// `StreamState`, but it polls an app-server it owns and re-asserts every poll,
+/// and pi's extension carries no pid, so neither is affected.
+fn is_claude_stream_report(req: &ObserveRequest) -> bool {
+    req.agent == Agent::Claude && matches!(req.event, SessionEvent::StreamState(_))
+}
+
 /// Removes sessions last seen longer than their TTL ago (a shorter
 /// [`ended_ttl`](SessionsRegistry::ended_ttl) for `ended` sessions), returning
 /// how many were dropped. Pure CPU; the caller holds the sessions lock but never
@@ -1341,6 +1365,46 @@ mod tests {
         assert_eq!(candidates[0].pid, 100);
         assert!(candidates[0].prompted);
         assert_eq!(candidates[0].pid_start, None);
+    }
+
+    #[test]
+    fn only_a_claude_stream_report_marks_a_session_streamed() {
+        // Hooks alone never mark it, even for a prompted session.
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_from("hooked", SessionEvent::UserPromptSubmit, 100));
+        let candidates = reg.pid_liveness_candidates();
+        assert!(candidates[0].prompted);
+        assert!(!candidates[0].streamed);
+
+        // A Claude stream report does, whether it created the entry or arrived
+        // later, and it is sticky across the hooks that follow.
+        reg.observe(observe_from(
+            "hooked",
+            SessionEvent::StreamState(SessionState::Idle),
+            100,
+        ));
+        reg.observe(observe_from("hooked", SessionEvent::Stop, 100));
+        let candidates = reg.pid_liveness_candidates();
+        assert!(candidates[0].prompted && candidates[0].streamed);
+
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_from(
+            "wrapped",
+            SessionEvent::StreamState(SessionState::Working),
+            100,
+        ));
+        assert!(reg.pid_liveness_candidates()[0].streamed);
+
+        // Another agent's `StreamState` (Codex's wrapper, pi's extension) is not
+        // a Claude chat the extension is pinning.
+        for agent in [Agent::Codex, Agent::Pi] {
+            let reg = SessionsRegistry::new();
+            reg.observe(ObserveRequest {
+                agent,
+                ..observe_from("other", SessionEvent::StreamState(SessionState::Idle), 100)
+            });
+            assert!(!reg.pid_liveness_candidates()[0].streamed, "{agent:?}");
+        }
     }
 
     #[test]
@@ -1654,6 +1718,7 @@ mod tests {
                     pid: None,
                     pid_start: None,
                     prompted: false,
+                    streamed: false,
                     replaced_pids: VecDeque::new(),
                     agent: Agent::Claude,
                     session_id: id.to_string(),
@@ -1900,6 +1965,7 @@ mod tests {
                         pid: None,
                         pid_start: None,
                         prompted: false,
+                        streamed: false,
                         replaced_pids: VecDeque::new(),
                         agent: Agent::Claude,
                         session_id: id.clone(),

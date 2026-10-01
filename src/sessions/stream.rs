@@ -207,15 +207,25 @@ impl StreamTracker {
         self.emit_if_changed()
     }
 
-    /// Re-reports the current state, so a session that has been silent for a
-    /// while does not age out of the registry on its TTL.
+    /// Re-reports the current state while the session is *busy*, so one that
+    /// has been silent for a while — a long turn, an unanswered permission
+    /// prompt — does not age out of the registry on its TTL.
     ///
-    /// The wrapper lives exactly as long as the `claude` process does, so this
-    /// is real liveness rather than the activity-based approximation the hook and
-    /// transcript feeds are limited to.
+    /// An **idle** session is deliberately not re-reported (#1454). The wrapper
+    /// lives exactly as long as the `claude` process does, but the Claude VS
+    /// Code extension keeps a process per chat in a window, not per visible
+    /// tab: a never-prompted spare, or a conversation the user finished hours
+    /// ago, stays alive indefinitely. Process lifetime is therefore not tab
+    /// visibility, and re-reporting idle would pin every such process in the
+    /// registry forever. The transition to idle is still reported once by
+    /// [`Self::observe_line`]; after that the session ages out on the registry's
+    /// TTL and reappears the moment it next does anything.
     #[must_use]
     pub fn keepalive(&self) -> Option<ObserveRequest> {
-        self.request(self.state())
+        match self.state() {
+            SessionState::Idle => None,
+            busy => self.request(busy),
+        }
     }
 
     /// Records the identity fields carried on a line: `session_id`/`cwd` are
@@ -400,6 +410,12 @@ mod tests {
         tracker
     }
 
+    /// What the tracker would report for its present state, whether or not
+    /// [`StreamTracker::keepalive`] would send it (it does not for an idle one).
+    fn current(tracker: &StreamTracker) -> Option<ObserveRequest> {
+        tracker.request(tracker.state())
+    }
+
     fn state_of(request: &ObserveRequest) -> SessionState {
         match request.event {
             SessionEvent::StreamState(state) => state,
@@ -517,7 +533,7 @@ mod tests {
             )
             .is_none());
         assert_eq!(
-            tracker.keepalive().unwrap().model.as_deref(),
+            current(&tracker).unwrap().model.as_deref(),
             Some("claude-opus-5")
         );
     }
@@ -534,7 +550,7 @@ mod tests {
             )
             .is_none());
         assert_eq!(
-            tracker.keepalive().unwrap().model.as_deref(),
+            current(&tracker).unwrap().model.as_deref(),
             Some("claude-opus-5")
         );
     }
@@ -596,7 +612,7 @@ mod tests {
             )
             .is_none());
         assert_eq!(
-            state_of(&tracker.keepalive().unwrap()),
+            state_of(&current(&tracker).unwrap()),
             SessionState::WaitingForPermission
         );
     }
@@ -610,7 +626,7 @@ mod tests {
             );
             assert!(tracker.observe_line(Direction::FromClaude, &line).is_none());
         }
-        assert_eq!(state_of(&tracker.keepalive().unwrap()), SessionState::Idle);
+        assert_eq!(state_of(&current(&tracker).unwrap()), SessionState::Idle);
     }
 
     #[test]
@@ -692,7 +708,7 @@ mod tests {
                 r#"{"type":"control_request","request":{"subtype":"can_use_tool"}}"#,
             )
             .is_none());
-        assert_eq!(state_of(&tracker.keepalive().unwrap()), SessionState::Idle);
+        assert_eq!(state_of(&current(&tracker).unwrap()), SessionState::Idle);
         // Likewise an answer that names no request clears nothing.
         tracker.observe_line(
             Direction::FromClaude,
@@ -702,7 +718,7 @@ mod tests {
             .observe_line(Direction::ToClaude, r#"{"type":"control_response"}"#)
             .is_none());
         assert_eq!(
-            state_of(&tracker.keepalive().unwrap()),
+            state_of(&current(&tracker).unwrap()),
             SessionState::WaitingForPermission
         );
     }
@@ -728,7 +744,7 @@ mod tests {
         ] {
             assert!(tracker.observe_line(Direction::FromClaude, line).is_none());
         }
-        assert_eq!(state_of(&tracker.keepalive().unwrap()), SessionState::Idle);
+        assert_eq!(state_of(&current(&tracker).unwrap()), SessionState::Idle);
     }
 
     #[test]
@@ -755,5 +771,40 @@ mod tests {
         assert_eq!(state_of(&first), SessionState::Working);
         assert_eq!(state_of(&second), SessionState::Working);
         assert_eq!(first.session_id, "sess-1");
+    }
+
+    #[test]
+    fn keepalive_does_not_re_report_an_idle_session() {
+        // #1454: the extension keeps a process per chat, not per visible tab, so
+        // a finished or never-prompted chat must be left to age out.
+        let mut tracker = tracker_after_init();
+        assert!(tracker.keepalive().is_none(), "unprompted spare");
+        tracker.observe_line(Direction::FromClaude, r#"{"type":"assistant"}"#);
+        assert!(tracker.keepalive().is_some(), "mid-turn");
+        tracker.observe_line(Direction::FromClaude, r#"{"type":"result"}"#);
+        assert!(tracker.keepalive().is_none(), "finished chat");
+    }
+
+    #[test]
+    fn keepalive_re_reports_every_waiting_state() {
+        let mut tracker = tracker_after_init();
+        tracker.observe_line(
+            Direction::FromClaude,
+            r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool"}}"#,
+        );
+        assert_eq!(
+            state_of(&tracker.keepalive().unwrap()),
+            SessionState::WaitingForPermission
+        );
+        // Answering it returns to the turn that was running, which is busy.
+        tracker.observe_line(Direction::FromClaude, r#"{"type":"assistant"}"#);
+        tracker.observe_line(
+            Direction::ToClaude,
+            r#"{"type":"control_response","response":{"request_id":"r1"}}"#,
+        );
+        assert_eq!(
+            state_of(&tracker.keepalive().unwrap()),
+            SessionState::Working
+        );
     }
 }

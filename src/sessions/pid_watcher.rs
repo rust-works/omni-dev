@@ -30,7 +30,10 @@
 //!   and it is the most recently *active* (by `last_seen`, not creation order)
 //!   `session_id` among every candidate sharing that pid:** refresh
 //!   `last_seen`, keeping the ordinary [`reap_sessions`](super::reap_sessions)
-//!   TTL from ever seeing it go stale.
+//!   TTL from ever seeing it go stale. A session the `claude-wrap` stream
+//!   observer has reported is never refreshed this way (#1454): its VS Code
+//!   extension keeps a process per chat rather than per visible tab, so a live
+//!   pid does not mean anyone can still see the chat.
 //!
 //! **Why a pid must be independently confirmed alive before its death is ever
 //! trusted.** #1948's docs allow for a hook command wrapped in a shell, whose
@@ -190,7 +193,7 @@ fn plan(
                         confirmed.insert(c.pid);
                         let is_most_recently_seen =
                             most_recently_seen.get(&c.pid) == Some(&c.last_seen);
-                        if c.prompted && is_most_recently_seen {
+                        if c.prompted && !c.streamed && is_most_recently_seen {
                             if let Some(token) = start_token {
                                 actions.push(Action::Confirm {
                                     session_id: c.session_id.clone(),
@@ -253,6 +256,7 @@ mod tests {
             pid,
             pid_start: pid_start.map(str::to_string),
             prompted,
+            streamed: false,
             last_seen: Utc::now(),
         }
     }
@@ -324,6 +328,35 @@ mod tests {
         assert!(actions.is_empty());
         // Still tracked as independently confirmed, so a later death is caught.
         assert!(confirmed.contains(&100));
+    }
+
+    #[test]
+    fn a_streamed_session_is_tracked_but_never_confirmed() {
+        // #1454: a `claude-wrap`-observed session is a VS Code chat, and the
+        // extension keeps a process per chat rather than per visible tab, so a
+        // live pid is no reason to hold a finished (but prompted) one past the
+        // TTL. Its death is still caught.
+        let mut streamed = candidate("s1", 100, Some("tok"), true);
+        streamed.streamed = true;
+        let alive = HashMap::from([(
+            100,
+            PidStatus::Alive {
+                start_token: Some("tok".to_string()),
+            },
+        )]);
+        let mut confirmed = HashSet::new();
+        let actions = plan(&[streamed.clone()], &mut confirmed, probe_of(&alive));
+        assert!(actions.is_empty());
+        assert!(confirmed.contains(&100));
+
+        let gone = HashMap::from([(100, PidStatus::Gone)]);
+        let actions = plan(&[streamed], &mut confirmed, probe_of(&gone));
+        assert_eq!(
+            actions,
+            vec![Action::End {
+                session_id: "s1".to_string()
+            }]
+        );
     }
 
     #[test]

@@ -46,12 +46,13 @@ const SERVICE: &str = "sessions";
 /// Short, and on a task that no byte ever waits behind.
 const REPORT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How often the current state is re-reported while the child lives.
+/// How often a *busy* state is re-reported while the child lives.
 ///
-/// Comfortably inside the registry's 300s session TTL, so a session that sits
-/// idle at the prompt for an hour never ages out. This is the wrapper's bonus
-/// over the hook and transcript feeds: liveness bounded by the real process
-/// lifetime rather than by observed activity.
+/// Comfortably inside the registry's 300s session TTL, so a long silent turn or
+/// an unanswered permission prompt never ages out. An idle session is not
+/// re-reported (#1454, see [`StreamTracker::keepalive`]): the Claude VS Code
+/// extension keeps a process per chat rather than per visible tab, so
+/// process lifetime is not a sign anyone can still see the chat.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How many teed lines may be in flight before further ones are dropped.
@@ -590,8 +591,8 @@ fn tee_chunk(
 }
 
 /// Consumes teed lines, tracks the session state, and reports every change to
-/// the daemon — plus a keep-alive while nothing changes, and an `end` once the
-/// stream is over.
+/// the daemon — plus a keep-alive while a busy state is unchanged, and an `end`
+/// once the stream is over.
 /// `every` is the keep-alive cadence, injected so tests can drive it without
 /// waiting out the real [`KEEPALIVE_INTERVAL`]. `child_pid` is the wrapped
 /// `claude`, sent on every report — the same pid its hooks send — so the `end`
@@ -934,9 +935,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_keepalive_re_reports_a_silent_session() {
-        // The wrapper's TTL-liveness guarantee: a session that says nothing more
-        // must keep being reported, or the registry ages it out at 5 minutes.
+    async fn the_keepalive_re_reports_a_silent_working_session() {
+        // A turn that goes quiet (a long tool call, an unanswered prompt) must
+        // keep being reported, or the registry ages it out at 5 minutes.
+        let (_dir, socket, seen) = fake_daemon();
+        let (tee, lines) = mpsc::channel(4);
+        let (title_tx, _title_rx) = watch::channel(None);
+        let observer = tokio::spawn(observe(
+            lines,
+            Some(socket),
+            Duration::from_millis(20),
+            title_tx,
+            Some(4242),
+        ));
+        for line in [
+            r#"{"type":"system","subtype":"init","session_id":"ka-1"}"#,
+            r#"{"type":"assistant","session_id":"ka-1"}"#,
+        ] {
+            tee.send((Direction::FromClaude, line.to_string()))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        drop(tee);
+        observer.await.unwrap();
+
+        let envelopes = seen.lock().await.clone();
+        let observes: Vec<_> = envelopes.iter().filter(|e| e["op"] == "observe").collect();
+        // One for init, one for the state change, then repeats of that state.
+        assert!(observes.len() > 2, "expected keep-alives, got {observes:?}");
+        for envelope in &observes[1..] {
+            assert_eq!(envelope["payload"]["session_id"], "ka-1");
+            assert_eq!(envelope["payload"]["event"]["stream_state"], "working");
+            // The wrapped child's pid, so a resume can tell it apart (#1948).
+            assert_eq!(envelope["payload"]["pid"], 4242);
+        }
+        let end = envelopes.last().unwrap();
+        assert_eq!(end["op"], "end");
+        assert_eq!(end["payload"]["pid"], 4242);
+    }
+
+    #[tokio::test]
+    async fn the_keepalive_leaves_an_idle_session_to_age_out() {
+        // #1454: the extension keeps a process per chat, not per visible tab, so
+        // an idle one is reported once and then not pinned.
         let (_dir, socket, seen) = fake_daemon();
         let (tee, lines) = mpsc::channel(4);
         let (title_tx, _title_rx) = watch::channel(None);
@@ -949,7 +991,7 @@ mod tests {
         ));
         tee.send((
             Direction::FromClaude,
-            r#"{"type":"system","subtype":"init","session_id":"ka-1"}"#.to_string(),
+            r#"{"type":"system","subtype":"init","session_id":"ka-2"}"#.to_string(),
         ))
         .await
         .unwrap();
@@ -958,18 +1000,12 @@ mod tests {
         observer.await.unwrap();
 
         let envelopes = seen.lock().await.clone();
-        let observes: Vec<_> = envelopes.iter().filter(|e| e["op"] == "observe").collect();
-        // One for the state change, then repeats carrying the same state.
-        assert!(observes.len() > 1, "expected keep-alives, got {observes:?}");
-        for envelope in &observes {
-            assert_eq!(envelope["payload"]["session_id"], "ka-1");
-            assert_eq!(envelope["payload"]["event"]["stream_state"], "idle");
-            // The wrapped child's pid, so a resume can tell it apart (#1948).
-            assert_eq!(envelope["payload"]["pid"], 4242);
-        }
-        let end = envelopes.last().unwrap();
-        assert_eq!(end["op"], "end");
-        assert_eq!(end["payload"]["pid"], 4242);
+        let ops: Vec<_> = envelopes
+            .iter()
+            .map(|e| e["op"].as_str().unwrap())
+            .collect();
+        assert_eq!(ops, ["observe", "end"], "got {envelopes:?}");
+        assert_eq!(envelopes[0]["payload"]["event"]["stream_state"], "idle");
     }
 
     #[tokio::test]
