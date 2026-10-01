@@ -392,6 +392,25 @@ mod tests {
 
     use super::test_git::{init_repo, init_repo_with_commit, worktree_add};
 
+    #[test]
+    fn seed_path_defaults_to_base_and_joins_relative_paths() {
+        let base = Path::new("/base");
+        assert_eq!(seed_path(base, None), PathBuf::from("/base"));
+        assert_eq!(
+            seed_path(base, Some(Path::new("sub"))),
+            PathBuf::from("/base/sub")
+        );
+        assert_eq!(
+            seed_path(base, Some(Path::new("../sib"))),
+            PathBuf::from("/base/../sib")
+        );
+        // An absolute path wins over the base, as with `git -C`.
+        assert_eq!(
+            seed_path(base, Some(Path::new("/abs"))),
+            PathBuf::from("/abs")
+        );
+    }
+
     fn tempdir() -> TempDir {
         std::fs::create_dir_all("tmp").ok();
         TempDir::new_in("tmp").unwrap()

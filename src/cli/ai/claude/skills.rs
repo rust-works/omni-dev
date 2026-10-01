@@ -622,7 +622,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::common::test_git::init_repo;
+    use super::common::test_git::{init_repo, init_repo_with_commit, worktree_add};
     use common::OutputFormat;
 
     fn tempdir() -> TempDir {
@@ -764,5 +764,62 @@ mod tests {
             .execute()
             .unwrap_err();
         assert!(format!("{err:?}").contains("git rev-parse"), "{err:?}");
+    }
+
+    /// A relative `--source` and `--target` both resolve against `-C`.
+    #[test]
+    fn sync_resolves_relative_source_against_repo() {
+        let parent = tempdir();
+        for name in ["src", "tgt"] {
+            let d = parent.path().join(name);
+            fs::create_dir_all(&d).unwrap();
+            init_repo(&d);
+        }
+        seed_skill(&parent.path().join("src"), "alpha");
+
+        parse(&[
+            "sync",
+            "-C",
+            parent.path().to_str().unwrap(),
+            "--source",
+            "src",
+            "--target",
+            "tgt",
+        ])
+        .execute()
+        .unwrap();
+        assert!(parent.path().join("tgt/.claude/skills/alpha").exists());
+    }
+
+    /// `--worktrees` enumerates the worktrees of the `-C` repository.
+    #[test]
+    fn clean_with_worktrees_covers_the_repo_flag_worktrees() {
+        let src = tempdir();
+        let main = tempdir();
+        let wt_parent = tempdir();
+        let linked = wt_parent.path().join("linked");
+        init_repo(src.path());
+        init_repo_with_commit(main.path());
+        worktree_add(main.path(), &linked);
+        seed_skill(src.path(), "alpha");
+        parse(&[
+            "sync",
+            "--source",
+            src.path().to_str().unwrap(),
+            "--target",
+            linked.to_str().unwrap(),
+        ])
+        .execute()
+        .unwrap();
+        let link = linked.join(".claude/skills/alpha");
+        assert!(link.symlink_metadata().is_ok());
+
+        parse(&["clean", "--worktrees", "-C", main.path().to_str().unwrap()])
+            .execute()
+            .unwrap();
+        assert!(
+            link.symlink_metadata().is_err(),
+            "linked worktree not cleaned"
+        );
     }
 }

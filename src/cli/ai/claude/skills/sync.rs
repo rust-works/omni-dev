@@ -47,10 +47,10 @@ impl SyncCommand {
         let source_seed = seed_path(&base, self.source.as_deref());
         let source_root = resolve_toplevel(&source_seed)?;
 
-        let target_seed = match self.target.as_deref() {
-            Some(t) => base.join(t),
-            None => source_root.clone(),
-        };
+        let target_seed = self
+            .target
+            .as_deref()
+            .map_or_else(|| source_root.clone(), |t| seed_path(&base, Some(t)));
         let target_root = resolve_toplevel(&target_seed)?;
 
         let mut targets = vec![target_root.clone()];
