@@ -58,7 +58,8 @@ pub struct TwiddleCommand {
     #[arg(long)]
     pub no_coherence: bool,
 
-    /// Skips AI processing and only outputs repository YAML.
+    /// Skips AI processing and amends commits to a deterministic suggestion
+    /// (detected type and scope, corrected against scopes.yaml).
     #[arg(long)]
     pub no_ai: bool,
 
@@ -1046,27 +1047,28 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Executes the twiddle command without AI, creating amendments with original messages.
+    /// Executes the twiddle command without AI, amending each commit to a
+    /// deterministic suggestion (#1566).
+    ///
+    /// Commits whose suggestion equals their current message are left out, so
+    /// already-conformant commits are never rewritten.
     async fn execute_no_ai(&self, repo_root: &std::path::Path) -> Result<()> {
-        use crate::data::amendments::{Amendment, AmendmentFile};
+        use crate::data::amendments::AmendmentFile;
 
-        println!("📋 Generating amendments YAML without AI processing...");
+        println!("📋 Generating deterministic amendments without AI processing...");
 
         // Generate repository view to get all commits
         let repo_view = self.generate_repository_view(repo_root)?;
+        let scope_defs = self.load_check_scopes(repo_root);
 
-        // Create amendments with original commit messages (no AI improvements)
-        let amendments: Vec<Amendment> = repo_view
-            .commits
-            .iter()
-            .map(|commit| Amendment {
-                commit: commit.hash.clone(),
-                message: commit.original_message.clone(),
-                summary: String::new(),
-            })
-            .collect();
+        let amendment_file = AmendmentFile {
+            amendments: deterministic_amendments(&repo_view, &scope_defs),
+        };
 
-        let amendment_file = AmendmentFile { amendments };
+        if amendment_file.amendments.is_empty() {
+            println!("✨ No changes needed: every commit message already conforms.");
+            return Ok(());
+        }
 
         // Handle different output modes
         if let Some(save_path) = &self.save_only {
@@ -2369,49 +2371,87 @@ mod execute_tests {
         );
     }
 
-    /// Test 3 — `--no-ai` save-only path: drives `execute()` with
-    /// `--no-ai` (which short-circuits before preflight), exercising the
-    /// `summary: String::new()` initialiser at line 1031 in
-    /// `execute_no_ai`.
+    /// Builds a `--no-ai`, save-only command over `HEAD`.
+    fn make_no_ai_cmd(save_path: &std::path::Path) -> TwiddleCommand {
+        TwiddleCommand {
+            no_ai: true,
+            ..make_cmd("HEAD", save_path.to_path_buf())
+        }
+    }
+
+    /// Rewrites `HEAD`'s message in place and returns the new commit hash.
+    fn set_head_message(repo_root: &std::path::Path, message: &str) -> String {
+        let repo = Repository::open(repo_root).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        head.amend(Some("HEAD"), None, None, None, Some(message), None)
+            .unwrap()
+            .to_string()
+    }
+
+    /// Test 3 — `--no-ai` suggests a deterministic message instead of
+    /// re-saving the original (#1566): a non-conventional subject gains the
+    /// detected type, the scope from `scopes.yaml`, and keeps its body.
     #[tokio::test]
-    async fn execute_no_ai_save_only_covers_line_1031() {
-        let (temp_dir, hash) = init_test_repo_with_commit();
+    async fn execute_no_ai_save_only_suggests_type_and_scope() {
+        let (temp_dir, _) = init_test_repo_with_commit();
+        let hash = set_head_message(temp_dir.path(), "add widget\n\nWhy it matters.\n");
+        let context_dir = temp_dir.path().join(".omni-dev");
+        std::fs::create_dir_all(&context_dir).unwrap();
+        std::fs::write(
+            context_dir.join("scopes.yaml"),
+            "scopes:\n  - name: widgets\n    description: Widgets\n    examples: []\n    file_patterns:\n      - f0.txt\n",
+        )
+        .unwrap();
 
         let save_path = temp_dir.path().join("amendments.yaml");
-        let cmd = TwiddleCommand {
-            commit_range: Some("HEAD".to_string()),
-            auto_apply: false,
-            allow_pushed: false,
-            save_only: Some(save_path.to_string_lossy().into_owned()),
-            use_context: false,
-            context_dir: None,
-            work_context: None,
-            branch_context: None,
-            no_context: true,
-            concurrency: 1,
-            batch_size: None,
-            no_coherence: true,
-            no_ai: true,
-            fresh: false,
-            refine: false,
-            check: false,
-            quiet: true,
-            ai: crate::cli::ai_backend_args::AiBackendArgs::default(),
-        };
-
-        cmd.execute(Some(temp_dir.path())).await.unwrap();
+        make_no_ai_cmd(&save_path)
+            .execute(Some(temp_dir.path()))
+            .await
+            .unwrap();
 
         let saved = AmendmentFile::load_from_file(&save_path).unwrap();
         assert_eq!(saved.amendments.len(), 1);
         let amendment = &saved.amendments[0];
         assert_eq!(amendment.commit, hash);
-        assert!(
-            amendment.message.contains("feat: original commit 0"),
-            "message: {}",
-            amendment.message
+        assert_eq!(
+            amendment.message,
+            "chore(widgets): add widget\n\nWhy it matters.\n"
         );
-        // The whole point of line 1031: `summary: String::new()`.
         assert_eq!(amendment.summary, "");
+    }
+
+    /// Test 4 — `--no-ai` leaves a conformant commit alone: nothing is
+    /// saved and nothing is rewritten.
+    #[tokio::test]
+    async fn execute_no_ai_skips_conforming_commits() {
+        let (temp_dir, _) = init_test_repo_with_commit();
+        let save_path = temp_dir.path().join("amendments.yaml");
+
+        make_no_ai_cmd(&save_path)
+            .execute(Some(temp_dir.path()))
+            .await
+            .unwrap();
+
+        assert!(
+            !save_path.exists(),
+            "an all-conforming range must not produce an amendments file"
+        );
+    }
+
+    /// Test 5 — `deterministic_amendments` keeps only the commits whose
+    /// suggestion differs from their current message.
+    #[test]
+    fn deterministic_amendments_filters_unchanged_commits() {
+        let (temp_dir, hashes) = init_test_repo_with_n_commits(2);
+        let changed = set_head_message(temp_dir.path(), "tidy things");
+        let cmd = make_cmd("HEAD~1..HEAD", temp_dir.path().join("unused.yaml"));
+        let repo_view = cmd.generate_repository_view(temp_dir.path()).unwrap();
+
+        let amendments = deterministic_amendments(&repo_view, &[]);
+
+        assert_eq!(amendments.len(), 1, "hashes: {hashes:?}");
+        assert_eq!(amendments[0].commit, changed);
+        assert_eq!(amendments[0].message, "chore: tidy things");
     }
 }
 
@@ -2573,6 +2613,30 @@ fn resolve_duplicate_amendments(
     amendments.amendments = kept;
 
     Ok(())
+}
+
+/// Builds the `--no-ai` amendments: one per commit whose deterministic
+/// suggestion differs from its current message.
+fn deterministic_amendments(
+    repo_view: &RepositoryView,
+    scope_defs: &[crate::data::context::ScopeDefinition],
+) -> Vec<crate::data::amendments::Amendment> {
+    repo_view
+        .commits
+        .iter()
+        .filter_map(|commit| {
+            let message = commit
+                .analysis
+                .suggest_message(&commit.original_message, scope_defs);
+            (message.trim_end() != commit.original_message.trim_end()).then(|| {
+                crate::data::amendments::Amendment {
+                    commit: commit.hash.clone(),
+                    message,
+                    summary: String::new(),
+                }
+            })
+        })
+        .collect()
 }
 
 /// Refine scopes in generated amendment messages using the same deterministic

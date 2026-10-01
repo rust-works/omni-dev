@@ -351,6 +351,47 @@ impl CommitAnalysis {
         }
     }
 
+    /// Builds a deterministic replacement for `original_message` without AI.
+    ///
+    /// Unlike [`Self::proposed_message`], which is generated before scope
+    /// definitions are applied (and covers only the first line), this resolves
+    /// the scope from `scope_defs` first, corrects the scope of an
+    /// already-conventional subject the way the AI path does, and keeps the
+    /// original body verbatim. A commit that already conforms comes back
+    /// unchanged.
+    #[must_use]
+    pub fn suggest_message(
+        &self,
+        original_message: &str,
+        scope_defs: &[ScopeDefinition],
+    ) -> String {
+        let files: Vec<&str> = self
+            .file_changes
+            .file_list
+            .iter()
+            .map(|f| f.file.as_str())
+            .collect();
+        let scope =
+            resolve_scope(&files, scope_defs).unwrap_or_else(|| self.detected_scope.clone());
+
+        let (first_line, body) = original_message
+            .split_once('\n')
+            .map_or((original_message, None), |(f, r)| (f, Some(r)));
+
+        let subject = Self::generate_proposed_message_from(
+            first_line,
+            &self.detected_type,
+            &scope,
+            &self.file_changes,
+        );
+        let subject = refine_message_scope(&subject, &files, scope_defs);
+
+        match body {
+            Some(body) => format!("{subject}\n{body}"),
+            None => subject,
+        }
+    }
+
     /// Generates a proposed conventional commit message.
     fn generate_proposed_message(
         commit: &Commit,
@@ -1190,6 +1231,86 @@ mod tests {
             examples: vec![],
             file_patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
         }
+    }
+
+    fn make_analysis(detected_type: &str, scope: &str, files: &[(&str, &str)]) -> CommitAnalysis {
+        CommitAnalysis {
+            detected_type: detected_type.to_string(),
+            detected_scope: scope.to_string(),
+            proposed_message: String::new(),
+            file_changes: make_file_changes(files),
+            diff_summary: String::new(),
+            diff_file: String::new(),
+            file_diffs: Vec::new(),
+        }
+    }
+
+    // ── suggest_message (#1566) ──────────────────────────────────────
+
+    #[test]
+    fn suggest_message_adds_type_and_scope_from_defs() {
+        let analysis = make_analysis("feat", "stale", &[("M", "src/cli/commands.rs")]);
+        let defs = vec![make_scope_def("cli", &["src/cli/**"])];
+        assert_eq!(
+            analysis.suggest_message("add flag", &defs),
+            "feat(cli): add flag"
+        );
+    }
+
+    #[test]
+    fn suggest_message_falls_back_to_detected_scope_without_defs() {
+        let analysis = make_analysis("feat", "git", &[("M", "src/git/x.rs")]);
+        assert_eq!(
+            analysis.suggest_message("add flag", &[]),
+            "feat(git): add flag"
+        );
+    }
+
+    #[test]
+    fn suggest_message_omits_scope_when_none_known() {
+        let analysis = make_analysis("chore", "", &[("M", "x.txt")]);
+        assert_eq!(analysis.suggest_message("tidy", &[]), "chore: tidy");
+    }
+
+    #[test]
+    fn suggest_message_corrects_scope_of_conventional_subject() {
+        let analysis = make_analysis("feat", "", &[("M", "src/cli/commands.rs")]);
+        let defs = vec![make_scope_def("cli", &["src/cli/**"])];
+        assert_eq!(
+            analysis.suggest_message("feat(git): add flag", &defs),
+            "feat(cli): add flag"
+        );
+    }
+
+    #[test]
+    fn suggest_message_leaves_conforming_message_unchanged() {
+        let analysis = make_analysis("feat", "cli", &[("M", "src/cli/commands.rs")]);
+        let defs = vec![make_scope_def("cli", &["src/cli/**"])];
+        let message = "feat(cli): add flag\n\nBody line.\n";
+        assert_eq!(analysis.suggest_message(message, &defs), message);
+    }
+
+    #[test]
+    fn suggest_message_preserves_body_verbatim() {
+        let analysis = make_analysis("fix", "", &[("M", "src/cli/commands.rs")]);
+        let defs = vec![make_scope_def("cli", &["src/cli/**"])];
+        assert_eq!(
+            analysis.suggest_message("repair thing\n\nWhy it broke.\n\nFixes #1", &defs),
+            "fix(cli): repair thing\n\nWhy it broke.\n\nFixes #1"
+        );
+    }
+
+    #[test]
+    fn suggest_message_generates_description_for_placeholder_subject() {
+        let analysis = make_analysis("docs", "", &[("M", "README.md")]);
+        assert_eq!(
+            analysis.suggest_message("stuff", &[]),
+            "docs: update documentation"
+        );
+        assert_eq!(
+            analysis.suggest_message("", &[]),
+            "docs: update documentation"
+        );
     }
 
     #[test]

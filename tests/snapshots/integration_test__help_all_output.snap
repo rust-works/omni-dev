@@ -6881,7 +6881,7 @@ Options:
       --no-coherence
           Disables the cross-commit coherence pass
       --no-ai
-          Skips AI processing and only outputs repository YAML
+          Skips AI processing and amends commits to a deterministic suggestion (detected type and scope, corrected against scopes.yaml)
       --fresh
           Ignores existing commit messages and generates fresh ones based solely on diffs. This is the default behavior
       --refine

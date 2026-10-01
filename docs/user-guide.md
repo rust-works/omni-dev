@@ -185,7 +185,7 @@ omni-dev git commit message twiddle [RANGE] [OPTIONS]
 | `--beta-header KEY:VALUE` | Beta header to send with API requests (only sent if the model supports it) | `--beta-header key:value` |
 | `--concurrency N` | Number of parallel commit processors (default: 4) | `--concurrency 2` |
 | `--no-coherence` | Skip cross-commit coherence refinement pass | `--no-coherence` |
-| `--no-ai` | Skip AI processing and only output the repository analysis YAML | `--no-ai` |
+| `--no-ai` | Skip AI; amend commits to a deterministic suggestion (detected type and scope, corrected against `scopes.yaml`) and leave already-conforming commits untouched | `--no-ai` |
 | `--auto-apply` | Apply changes without confirmation | `--auto-apply` |
 | `--allow-pushed` | Allow amending commits already in remote main branches (rewrites published history) | `--allow-pushed` |
 | `--check` | Run commit message validation after applying amendments | `--check` |
@@ -1897,7 +1897,7 @@ and you can inspect the analysis or validate the result:
 # Keep the existing messages as the AI's starting point
 omni-dev git commit message twiddle 'main..HEAD' --refine
 
-# Skip the AI entirely and print the repository analysis YAML
+# Skip the AI entirely: amend to a deterministic type(scope) suggestion
 omni-dev git commit message twiddle 'main..HEAD' --no-ai
 
 # Validate the amended messages right after applying them
