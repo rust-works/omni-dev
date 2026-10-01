@@ -9,6 +9,7 @@ import { constants as fsConstants, promises as fs } from "fs";
 import * as path from "path";
 import { promisify } from "util";
 import * as vscode from "vscode";
+import { registerTerminalInEditor } from "./terminalInEditor";
 import {
   Envelope,
   RegisterPayload,
@@ -519,6 +520,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   piTitleExtensionPath = context.asAbsolutePath("dist/pi-title.mjs");
   output = vscode.window.createOutputChannel("omni-dev");
   context.subscriptions.push(output);
+
+  context.subscriptions.push(registerTerminalInEditor(vscode));
 
   await register();
   await reportSessionWindow();
