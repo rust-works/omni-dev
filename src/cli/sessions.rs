@@ -240,13 +240,22 @@ impl HookCommand {
         // Read before stdin, while the agent that spawned this hook is surely
         // still alive to be our parent.
         let pid = agent_pid(std::os::unix::process::parent_id());
-        let mut input = String::new();
-        if std::io::stdin().read_to_string(&mut input).is_err() {
-            tracing::debug!(agent = ?self.agent, outcome = "stdin_read_failed", "session_hook_skipped");
-            return Ok(());
+        if let Some(input) = self.read_input(std::io::stdin()) {
+            self.report(&input, pid).await;
         }
-        self.report(&input, pid).await;
         Ok(())
+    }
+
+    /// Reads the whole hook payload from `reader`, or `None` — after a debug
+    /// line — when it cannot be read (an I/O error, or bytes that are not
+    /// UTF-8). Split out so tests can feed it a reader that fails.
+    fn read_input(&self, mut reader: impl Read) -> Option<String> {
+        let mut input = String::new();
+        if reader.read_to_string(&mut input).is_err() {
+            tracing::debug!(agent = ?self.agent, outcome = "stdin_read_failed", "session_hook_skipped");
+            return None;
+        }
+        Some(input)
     }
 
     /// Parses the hook JSON, maps it to an op, and best-effort sends it. Split
@@ -260,8 +269,10 @@ impl HookCommand {
             return;
         };
         let Ok(socket) = server::resolve_socket(self.socket.clone()) else {
+            // omni-dev: coverage ignore reason="resolve_socket fails only when the platform has no data directory to put the default socket in (no resolvable home), which a test cannot reproduce on macOS or Linux; the sink is fail-open by design, so this is the same silent return as every other skipped hook"
             tracing::debug!(agent = ?self.agent, outcome = "socket_resolution_failed", "session_hook_skipped");
             return;
+            // omni-dev: coverage end
         };
         let env = DaemonEnvelope::service(SERVICE, op, payload);
         let outcome =
@@ -395,12 +406,14 @@ impl HookPayload {
         if let Ok(payload) = serde_json::to_value(request) {
             Some(("observe", payload))
         } else {
+            // omni-dev: coverage ignore reason="to_value on an ObserveRequest fails only for a non-UTF-8 cwd, and the hook payload's cwd is deserialized from a JSON string, so it is always UTF-8; the arm exists so a future non-string field cannot silently drop the report"
             tracing::debug!(
                 ?agent,
                 outcome = "serialization_failed",
                 "session_hook_skipped"
             );
             None
+            // omni-dev: coverage end
         }
     }
 }
@@ -463,10 +476,12 @@ fn session_event_for(
         "Elicitation" => SessionEvent::Notification(NotificationKind::AgentNeedsInput),
         "Notification" => {
             let kind = classify_notification(notification_type, message);
+            let has_notification_type = notification_type.is_some();
+            let has_message = message.is_some();
             tracing::debug!(
                 ?kind,
-                has_notification_type = notification_type.is_some(),
-                has_message = message.is_some(),
+                has_notification_type,
+                has_message,
                 "session_notification_classified"
             );
             SessionEvent::Notification(kind)
@@ -3665,6 +3680,84 @@ mod tests {
         // Unmappable input returns before any socket work.
         cmd.report("not json", None).await;
         cmd.report(r#"{"hook_event_name":"Stop"}"#, None).await; // no session_id → no op
+    }
+
+    #[test]
+    fn hook_input_that_cannot_be_read_is_skipped_with_a_debug_line() {
+        /// A reader whose every read fails, like a stdin closed under the sink.
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("stdin went away"))
+            }
+        }
+        let cmd = HookCommand {
+            socket: None,
+            agent: HookAgent::Claude,
+        };
+        let logs = crate::test_support::capture_at(tracing::Level::DEBUG, || {
+            // Bytes that are not UTF-8 fail `read_to_string`, as does an I/O error.
+            assert_eq!(cmd.read_input(&b"\xff\xfe"[..]), None);
+            assert_eq!(cmd.read_input(Broken), None);
+        });
+        assert_eq!(logs.matches("stdin_read_failed").count(), 2, "{logs}");
+        assert_eq!(
+            cmd.read_input(&b"{\"session_id\":\"s1\"}"[..]).as_deref(),
+            Some("{\"session_id\":\"s1\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_report_logs_a_daemon_rejection_without_its_content() {
+        let (_dir, sock, server) = fake_daemon(json!({"ok": false, "error": "HOOK_REPLY_SECRET"}));
+        let cmd = HookCommand {
+            socket: Some(sock),
+            agent: HookAgent::Claude,
+        };
+        let ((), logs) = crate::test_support::capture_future_at(
+            tracing::Level::DEBUG,
+            cmd.report(r#"{"session_id":"s1","hook_event_name":"Stop"}"#, None),
+        )
+        .await;
+        server.await.unwrap();
+        assert!(logs.contains("daemon_rejected"), "{logs}");
+        assert!(!logs.contains("HOOK_REPLY_SECRET"), "{logs}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hook_report_gives_up_on_a_wedged_daemon() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join("d.sock");
+        // Bound but never accepted: the connect lands in the backlog and the
+        // request in the socket buffer, so only the hook timeout can end the
+        // exchange. With the clock paused, that two-second wait costs no wall time.
+        let _wedged = tokio::net::UnixListener::bind(&sock).unwrap();
+        let cmd = HookCommand {
+            socket: Some(sock),
+            agent: HookAgent::Claude,
+        };
+        let ((), logs) = crate::test_support::capture_future_at(
+            tracing::Level::DEBUG,
+            cmd.report(r#"{"session_id":"s1","hook_event_name":"Stop"}"#, None),
+        )
+        .await;
+        assert!(logs.contains("timeout"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn hook_report_logs_a_delivered_event() {
+        let (_dir, sock, server) = fake_daemon(json!({"ok": true, "payload": {}}));
+        let cmd = HookCommand {
+            socket: Some(sock),
+            agent: HookAgent::Claude,
+        };
+        let ((), logs) = crate::test_support::capture_future_at(
+            tracing::Level::DEBUG,
+            cmd.report(r#"{"session_id":"s1","hook_event_name":"Stop"}"#, None),
+        )
+        .await;
+        server.await.unwrap();
+        assert!(logs.contains("delivered"), "{logs}");
     }
 
     /// Spawns a minimal fake daemon on a short-path Unix socket that answers one

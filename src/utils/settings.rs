@@ -563,6 +563,18 @@ impl LoadWarnDedup {
 
 static LOAD_WARN_DEDUP: LoadWarnDedup = LoadWarnDedup::new();
 
+/// Warns that settings failed to load and defaults are being used, unless
+/// `dedup` has already reported this exact failure. Takes the dedup as a
+/// parameter so a test can assert the once-only behaviour on a private one.
+fn warn_settings_fallback(dedup: &LoadWarnDedup, message: &str) {
+    if dedup.observe(Some(message)) {
+        tracing::warn!(
+            "{message}; falling back to default settings for this invocation — \
+             any settings.json configuration is being ignored"
+        );
+    }
+}
+
 /// Whether `key` is a registered secret, so it has a `_FILE` companion.
 fn is_secret_env_var(key: &str) -> bool {
     secret_env::SECRET_ENV_VARS.contains(&key)
@@ -625,13 +637,7 @@ impl Settings {
                 settings
             }
             Err(e) => {
-                let message = format!("{e:#}");
-                if LOAD_WARN_DEDUP.observe(Some(&message)) {
-                    tracing::warn!(
-                        "{message}; falling back to default settings for this invocation — \
-                         any settings.json configuration is being ignored"
-                    );
-                }
+                warn_settings_fallback(&LOAD_WARN_DEDUP, &format!("{e:#}"));
                 Self::default()
             }
         }
@@ -654,12 +660,7 @@ impl Settings {
     /// Records a bootstrap settings failure after tracing has been installed.
     /// Shares deduplication with later settings reads in the same process.
     pub fn warn_bootstrap_failure(message: &str) {
-        if LOAD_WARN_DEDUP.observe(Some(message)) {
-            tracing::warn!(
-                "{message}; falling back to default settings for this invocation — \
-                any settings.json configuration is being ignored"
-            );
-        }
+        warn_settings_fallback(&LOAD_WARN_DEDUP, message);
     }
 
     /// Loads settings from a specific path.
@@ -1538,6 +1539,64 @@ mod tests {
             assert!(settings.drive.accounts.is_empty());
         });
         assert!(logs.contains("settings.json"), "{logs}");
+    }
+
+    #[test]
+    fn load_daemon_reads_the_daemon_section_of_settings_json() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_dir = dir.path().join(".omni-dev");
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::write(
+            settings_dir.join("settings.json"),
+            r#"{"daemon":{"log_level":"omni_dev::sessions=debug"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            Settings::load_daemon().log_level.as_deref(),
+            Some("omni_dev::sessions=debug")
+        );
+    }
+
+    #[test]
+    fn load_daemon_warns_and_falls_back_when_settings_json_fails_to_parse() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let settings_dir = dir.path().join(".omni-dev");
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::write(settings_dir.join("settings.json"), "{not valid json").unwrap();
+
+        let logs = crate::test_support::capture_at(tracing::Level::WARN, || {
+            assert!(Settings::load_daemon().log_level.is_none());
+        });
+        assert!(logs.contains("settings.json"), "{logs}");
+    }
+
+    #[test]
+    fn a_settings_fallback_is_warned_about_once_per_distinct_failure() {
+        let dedup = LoadWarnDedup::new();
+        let logs = crate::test_support::capture_at(tracing::Level::WARN, || {
+            warn_settings_fallback(&dedup, "broken A");
+            warn_settings_fallback(&dedup, "broken A");
+            warn_settings_fallback(&dedup, "broken B");
+        });
+        assert_eq!(logs.matches("broken A").count(), 1, "{logs}");
+        assert_eq!(logs.matches("broken B").count(), 1, "{logs}");
+        assert!(logs.contains("falling back to default settings"), "{logs}");
+    }
+
+    #[test]
+    fn warn_bootstrap_failure_reports_the_failure_it_is_handed() {
+        // The bootstrap load in `main` fails before tracing exists, so it hands
+        // its error over afterwards. Repeat suppression is asserted above on a
+        // private dedup: doing it here would race every parallel test whose
+        // successful load resets the process-wide one.
+        let message = "Failed to parse settings file: /bootstrap-test/settings.json";
+        let logs = crate::test_support::capture_at(tracing::Level::WARN, || {
+            Settings::warn_bootstrap_failure(message);
+        });
+        assert!(logs.contains("/bootstrap-test/settings.json"), "{logs}");
     }
 
     #[test]

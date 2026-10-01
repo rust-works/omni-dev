@@ -127,10 +127,7 @@ fn init_tracing(daemon_run: bool) {
     // Loading through the normal warning loader here would lose its warning:
     // there is no subscriber yet. Emit once after installation instead.
     let (daemon_filter, settings_error) = if daemon_run {
-        match omni_dev::utils::settings::Settings::load() {
-            Ok(settings) => (settings.daemon.log_level, None),
-            Err(error) => (None, Some(format!("{error:#}"))),
-        }
+        daemon_filter_from(omni_dev::utils::settings::Settings::load())
     } else {
         (None, None)
     };
@@ -141,6 +138,23 @@ fn init_tracing(daemon_run: bool) {
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .init();
+    emit_bootstrap_warnings(&rejected, settings_error.as_deref());
+}
+
+/// Splits a bootstrap settings load into the daemon's configured log filter and,
+/// when the load failed, the error to report once tracing is installed.
+fn daemon_filter_from(
+    loaded: anyhow::Result<omni_dev::utils::settings::Settings>,
+) -> (Option<String>, Option<String>) {
+    match loaded {
+        Ok(settings) => (settings.daemon.log_level, None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    }
+}
+
+/// Reports what could not be said before the subscriber existed: each rejected
+/// filter directive, and the settings failure the bootstrap load hit.
+fn emit_bootstrap_warnings(rejected: &[&str], settings_error: Option<&str>) {
     for source in rejected {
         tracing::warn!(
             source,
@@ -148,7 +162,7 @@ fn init_tracing(daemon_run: bool) {
         );
     }
     if let Some(error) = settings_error {
-        omni_dev::utils::settings::Settings::warn_bootstrap_failure(&error);
+        omni_dev::utils::settings::Settings::warn_bootstrap_failure(error);
     }
 }
 
@@ -229,6 +243,55 @@ mod tests {
             assert_eq!(filter.to_string(), expected);
             assert_eq!(errors.len(), rejected);
         }
+    }
+
+    #[test]
+    fn a_failed_bootstrap_settings_load_is_carried_for_later_reporting() {
+        let (filter, error) = daemon_filter_from(Err(anyhow::anyhow!("settings.json is broken")));
+        assert_eq!(filter, None);
+        assert_eq!(error.as_deref(), Some("settings.json is broken"));
+
+        let settings: omni_dev::utils::settings::Settings =
+            serde_json::from_str(r#"{"daemon":{"log_level":"debug"}}"#).unwrap();
+        assert_eq!(
+            daemon_filter_from(Ok(settings)),
+            (Some("debug".to_string()), None)
+        );
+    }
+
+    #[test]
+    fn bootstrap_warnings_name_each_rejected_source_and_the_settings_failure() {
+        use std::io::{Read, Seek};
+        use std::sync::Arc;
+
+        // A temp file is the capture buffer: `&File` is already `Write`, so no
+        // custom writer is needed.
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(Arc::clone(&file))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            // Nothing failed, so nothing is said.
+            emit_bootstrap_warnings(&[], None);
+            assert_eq!(file.metadata().unwrap().len(), 0);
+
+            emit_bootstrap_warnings(
+                &["RUST_LOG", "daemon.log_level"],
+                Some("main-test bootstrap settings failure"),
+            );
+        });
+        let mut logs = String::new();
+        (&*file).rewind().unwrap();
+        (&*file).read_to_string(&mut logs).unwrap();
+        assert!(logs.contains("invalid tracing directive"), "{logs}");
+        assert!(logs.contains("RUST_LOG"), "{logs}");
+        assert!(logs.contains("daemon.log_level"), "{logs}");
+        assert!(
+            logs.contains("main-test bootstrap settings failure"),
+            "{logs}"
+        );
     }
 
     #[test]

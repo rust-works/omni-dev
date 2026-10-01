@@ -855,7 +855,8 @@ impl SessionsRegistry {
         let (known, flipped) = known;
         // A known session flipped to `ended`; otherwise only this call's inline
         // reap could have changed anything.
-        if flipped || reaped > 0 {
+        let bumped = flipped || reaped > 0;
+        if bumped {
             self.bump();
         }
         tracing::debug!(
@@ -864,7 +865,7 @@ impl SessionsRegistry {
             ?old_state,
             outcome,
             reaped,
-            bumped = flipped || reaped > 0,
+            bumped,
             "session_end"
         );
         known
@@ -1297,12 +1298,37 @@ mod tests {
                 Some("/project"),
             ));
             registry.end("missing", None, None);
+            registry.end("diagnostics", None, None);
         });
         assert!(logs.contains("state_changed") || logs.contains("created"));
         assert!(logs.contains("heartbeat_only"));
         assert!(logs.contains("unknown"));
+        assert!(logs.contains("outcome=\"ended\""), "{logs}");
         assert!(logs.contains("bumped=true"));
         assert!(logs.contains("bumped=false"));
+    }
+
+    #[test]
+    fn attribution_misses_are_logged_with_each_candidate_window() {
+        let windows = vec![window_entry("w1", 20), window_entry("w2", 5)];
+        let logs = crate::test_support::capture_at(tracing::Level::TRACE, || {
+            assert_eq!(
+                resolve_source(Some(Path::new("/elsewhere/x")), &windows),
+                Source::Terminal
+            );
+            assert_eq!(resolve_source(None, &windows), Source::Terminal);
+        });
+        assert!(logs.contains("session_attribution_miss"), "{logs}");
+        assert!(logs.contains("missing_cwd"), "{logs}");
+        assert_eq!(
+            logs.matches("session_attribution_candidate").count(),
+            2,
+            "{logs}"
+        );
+        assert!(
+            logs.contains("window_key=w1") && logs.contains("window_key=w2"),
+            "{logs}"
+        );
     }
 
     fn observe_request(session_id: &str, event: SessionEvent, cwd: Option<&str>) -> ObserveRequest {
@@ -1868,6 +1894,10 @@ mod tests {
         assert!(!sessions.contains_key("older"));
         assert!(sessions.contains_key("young"));
         assert!(sessions.contains_key("old"));
+        // An empty map is a no-op, not a panic.
+        let mut empty: HashMap<String, SessionEntry> = HashMap::new();
+        evict_oldest_session(&mut empty);
+        assert!(empty.is_empty());
     }
 
     #[test]

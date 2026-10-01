@@ -133,12 +133,31 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
     }
 }
 
+/// Keeps one extra dispatcher registered for the life of the process, so that
+/// [`capture_at`] and [`capture_future_at`] cannot lose events to a race.
+///
+/// `tracing-core` caches each callsite's interest. While only *one* dispatcher is
+/// registered it recomputes that interest against the *calling thread's* default
+/// instead of every registered dispatcher. In the parallel test binary that
+/// lets a thread with no subscriber installed — the first to reach a callsite
+/// while another thread's capture subscriber is the only one live — cache
+/// "never" for it, and the capturing thread's event is then silently dropped:
+/// a flake in the capturing test, and a macro line that reports uncovered. A
+/// second, never-dropped registration keeps `tracing-core` on the path that
+/// consults every live dispatcher. It is never installed as a default, so it
+/// changes what no thread logs.
+fn keep_every_dispatcher_consulted() {
+    static KEEP: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    KEEP.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
 /// Runs `f` under a thread-local subscriber that captures every event at
 /// `level` or above, and returns everything it logged. `f` must be fully
 /// synchronous on this thread. The one shared home for this capture
 /// pattern (issue #1744); per-module `capture_info`/`capture_warnings`
 /// helpers are thin aliases over it.
 pub(crate) fn capture_at(level: tracing::Level, f: impl FnOnce()) -> String {
+    keep_every_dispatcher_consulted();
     let writer = CaptureWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(level)
@@ -158,6 +177,7 @@ pub(crate) async fn capture_future_at<F: std::future::Future>(
     future: F,
 ) -> (F::Output, String) {
     use tracing::instrument::WithSubscriber;
+    keep_every_dispatcher_consulted();
     let writer = CaptureWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(level)

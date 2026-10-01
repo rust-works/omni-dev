@@ -108,6 +108,15 @@ fn is_recent(modified: SystemTime, now: SystemTime) -> bool {
     }
 }
 
+/// The session id a transcript path names: its file stem, when that is
+/// non-empty UTF-8 (a session id is a UUID, so anything else is not one).
+fn session_id_of(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Scans `root` for `*.jsonl` transcripts and returns the sightings since the
 /// previous scan, updating `state` (path → last size) in place.
 ///
@@ -136,8 +145,10 @@ fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
     };
     for project in project_dirs {
         let Ok(project) = project else {
+            // omni-dev: coverage ignore reason="read_dir yields an Err entry only on an I/O fault (EIO, a vanished directory mid-iteration), which a test cannot provoke; the scan counts it and moves on, the same handling as the unreadable project directory below"
             io_errors += 1;
             continue;
+            // omni-dev: coverage end
         };
         let Ok(files) = std::fs::read_dir(project.path()) else {
             io_errors += 1;
@@ -145,33 +156,34 @@ fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
         };
         for file in files {
             let Ok(file) = file else {
+                // omni-dev: coverage ignore reason="read_dir yields an Err entry only on an I/O fault (EIO, a vanished directory mid-iteration), which a test cannot provoke; the scan counts it and moves on, the same handling as the unreadable project directory above"
                 io_errors += 1;
                 continue;
+                // omni-dev: coverage end
             };
             let path = file.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
             scanned += 1;
-            let Some(session_id) = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-            else {
+            let Some(session_id) = session_id_of(&path) else {
                 invalid_names += 1;
                 continue;
             };
             let Ok(meta) = file.metadata() else {
+                // omni-dev: coverage ignore reason="DirEntry::metadata does not follow symlinks, so it fails only when the entry vanished between read_dir and the stat, a race a test cannot provoke; the scan counts it and moves on"
                 io_errors += 1;
                 continue;
+                // omni-dev: coverage end
             };
             let size = meta.len();
             let recent = if let Ok(modified) = meta.modified() {
                 is_recent(modified, now)
             } else {
+                // omni-dev: coverage ignore reason="Metadata::modified fails only on a platform with no mtime, and every supported one (Linux, macOS) has it"
                 io_errors += 1;
                 false
+                // omni-dev: coverage end
             };
             let previous = state.insert(path.clone(), size);
             if !recent {
@@ -195,9 +207,10 @@ fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
             });
         }
     }
+    let found = sightings.len();
     tracing::debug!(
         scanned,
-        sightings = sightings.len(),
+        sightings = found,
         io_errors,
         invalid_names,
         inactive,
@@ -234,9 +247,11 @@ pub fn spawn(registry: Arc<SessionsRegistry>, token: CancellationToken) -> JoinH
             })
             .await
             .unwrap_or_else(|error| {
+                // omni-dev: coverage ignore reason="spawn_blocking's JoinError needs the scan closure to panic or the runtime to shut down mid-scan; scan has no panicking path, and the runtime outlives the watcher, whose token is cancelled first"
                 tracing::warn!(%error, outcome = "state_reset", "session_transcript_scan_failed");
                 (ScanState::new(), Vec::new())
             });
+            // omni-dev: coverage end
             state = returned_state;
             for sighting in sightings {
                 registry.observe(sighting.into_observe());
@@ -267,6 +282,43 @@ mod tests {
         assert_eq!(logs.matches("session_transcript_scan").count(), 2);
         assert!(logs.contains("scanned=1"));
         assert!(logs.contains("unchanged=1"));
+    }
+
+    #[test]
+    fn a_session_id_is_the_non_empty_utf8_file_stem() {
+        assert_eq!(
+            session_id_of(Path::new("/p/abc-123.jsonl")).as_deref(),
+            Some("abc-123")
+        );
+        // No file name at all, so no stem.
+        assert_eq!(session_id_of(Path::new("/")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_counts_a_non_utf8_transcript_name_and_skips_it() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"\xff\xfe.jsonl");
+        // macOS filesystems refuse names that are not valid UTF-8; Linux accepts them.
+        if std::fs::write(project.join(name), b"x").is_err() {
+            return;
+        }
+        let mut state = ScanState::new();
+        let logs = crate::test_support::capture_at(tracing::Level::DEBUG, || {
+            assert!(scan(dir.path(), &mut state, SystemTime::now()).is_empty());
+        });
+        assert!(logs.contains("invalid_names=1"), "{logs}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_file_name_is_not_a_session_id() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/p/\xff\xfe.jsonl"));
+        assert_eq!(session_id_of(path), None);
     }
 
     /// Creates `root/<project>/<session>.jsonl` with `contents`, returning its path.
