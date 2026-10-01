@@ -247,6 +247,10 @@ omni-dev atlassian confluence create page.md --space ENG --title "New Page"
 omni-dev atlassian convert to-adf input.md
 ```
 
+Self-hosted PATs use `atlassian auth login --auth-mode bearer` without email.
+See [PAT authentication and compatibility limits](docs/user-guide.md#serverdata-center-personal-access-tokens);
+most service operations still target Cloud APIs.
+
 ### 📊 Datadog Integration (read-only)
 
 Authenticate against the Datadog API and query metrics, monitors, dashboards,

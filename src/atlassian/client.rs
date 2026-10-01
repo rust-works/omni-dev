@@ -1,14 +1,16 @@
-//! Atlassian Cloud REST API client.
+//! Atlassian REST API client with Basic and Bearer authentication.
 //!
 //! Provides HTTP access to JIRA Cloud REST API v3 for reading and
-//! writing issues. Uses Basic Auth (email + API token).
+//! writing issues. Most operations use Cloud APIs; auth probes also support self-hosted APIs.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use reqwest::Client;
+use reqwest::{header::HeaderValue, Client};
+
+use crate::atlassian::auth::{AtlassianAuth, AuthMode};
 use tokio_util::io::ReaderStream;
 
 use crate::atlassian::adf::AdfDocument;
@@ -44,6 +46,36 @@ use crate::atlassian::jira_types::{
 };
 use crate::request_log;
 use crate::utils::http::{connect_timeout, read_timeout, retry_429};
+
+/// Service used for an authentication probe.
+#[derive(Debug, Clone, Copy, clap::ValueEnum, Default)]
+pub enum AuthService {
+    /// Jira current user.
+    #[default]
+    Jira,
+    /// Confluence current user.
+    Confluence,
+}
+
+/// Authenticated identity, allowing Cloud and self-hosted user identifiers.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthIdentity {
+    /// User display name.
+    pub display_name: String,
+    /// Email, when disclosed by the service.
+    pub email_address: Option<String>,
+    /// Cloud account ID, when present.
+    pub account_id: Option<String>,
+    /// Self-hosted username.
+    #[serde(alias = "name")]
+    pub username: Option<String>,
+    /// Self-hosted user key.
+    #[serde(alias = "userKey")]
+    pub key: Option<String>,
+    #[serde(rename = "type")]
+    user_type: Option<String>,
+}
 
 /// Internal page size for auto-pagination. Individual API calls request
 /// this many items per page; the `limit` parameter controls the total.
@@ -93,25 +125,26 @@ fn jira_write_error(status: u16, body: String) -> anyhow::Error {
     AtlassianError::ApiRequestFailed { status, body }.into()
 }
 
-/// Shared HTTP client for Atlassian Cloud REST APIs.
+/// Shared HTTP client with Basic and Bearer authentication.
 ///
 /// Backs every JIRA, Confluence, and Agile helper exposed by this crate.
 /// Construct directly via [`AtlassianClient::new`] (instance URL + email + API
 /// token) or, more commonly, via [`AtlassianClient::from_credentials`] which
 /// accepts an [`AtlassianCredentials`](crate::atlassian::auth::AtlassianCredentials)
 /// resolved from the `ATLASSIAN_INSTANCE_URL`, `ATLASSIAN_EMAIL`, and
-/// `ATLASSIAN_API_TOKEN` environment variables (falling back to
+/// `ATLASSIAN_API_TOKEN` (or `ATLASSIAN_PAT`) environment variables (falling back to
 /// `~/.omni-dev/settings.json`) by
 /// [`load_credentials`](crate::atlassian::auth::load_credentials).
 ///
-/// Authenticates every request with HTTP Basic auth: a precomputed
-/// `Authorization: Basic <base64(email:api_token)>` header is attached to all
+/// Authenticates every request with the selected Basic or Bearer header.
+/// The precomputed, sensitive Authorization header is attached to all
 /// outbound calls. Requests time out after 30s and automatically retry up to
 /// three times on HTTP 429, honoring any `Retry-After` header.
 pub struct AtlassianClient {
     client: Client,
     instance_url: String,
-    auth_header: String,
+    auth_header: HeaderValue,
+    auth_mode: AuthMode,
 }
 
 /// Maps a raw `(schema.type, schema.custom)` pair from the JIRA field API into
@@ -223,15 +256,20 @@ mod tests {
         let expected_credentials = "user@test.com:token";
         let expected_encoded =
             base64::engine::general_purpose::STANDARD.encode(expected_credentials);
-        assert_eq!(client.auth_header, format!("Basic {expected_encoded}"));
+        assert_eq!(
+            client.auth_header.to_str().unwrap(),
+            format!("Basic {expected_encoded}")
+        );
     }
 
     #[test]
     fn from_credentials() {
         let creds = crate::atlassian::auth::AtlassianCredentials {
             instance_url: "https://org.atlassian.net".to_string(),
-            email: "user@test.com".to_string(),
-            api_token: "token123".into(),
+            auth: crate::atlassian::auth::AtlassianAuth::Basic {
+                email: "user@test.com".to_string(),
+                api_token: "token123".into(),
+            },
         };
         let client = AtlassianClient::from_credentials(&creds).unwrap();
         assert_eq!(client.instance_url(), "https://org.atlassian.net");
@@ -6501,30 +6539,45 @@ impl AtlassianClient {
     ///
     /// Constructs the Basic Auth header from the email and API token.
     pub fn new(instance_url: &str, email: &str, api_token: &str) -> Result<Self> {
+        Self::with_auth(
+            instance_url,
+            &AtlassianAuth::Basic {
+                email: email.to_string(),
+                api_token: api_token.into(),
+            },
+        )
+    }
+
+    /// Creates a client using Basic or Bearer credentials.
+    pub fn with_auth(instance_url: &str, auth: &AtlassianAuth) -> Result<Self> {
+        auth.validate()?;
         let client = Client::builder()
             .connect_timeout(connect_timeout())
             .read_timeout(read_timeout())
             .build()
             .context("Failed to build HTTP client")?;
-
-        let credentials = format!("{email}:{api_token}");
-        let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
-        let auth_header = format!("Basic {encoded}");
-
+        let header = match auth {
+            AtlassianAuth::Basic { email, api_token } => {
+                let encoded = base64::engine::general_purpose::STANDARD
+                    .encode(format!("{email}:{}", api_token.expose_secret()));
+                format!("Basic {encoded}")
+            }
+            AtlassianAuth::Bearer { token } => format!("Bearer {}", token.expose_secret()),
+        };
+        let mut auth_header =
+            HeaderValue::from_str(&header).context("Invalid Atlassian authorization header")?;
+        auth_header.set_sensitive(true);
         Ok(Self {
             client,
             instance_url: instance_url.trim_end_matches('/').to_string(),
             auth_header,
+            auth_mode: auth.mode(),
         })
     }
 
     /// Creates a client from stored credentials.
     pub fn from_credentials(creds: &crate::atlassian::auth::AtlassianCredentials) -> Result<Self> {
-        Self::new(
-            &creds.instance_url,
-            &creds.email,
-            creds.api_token.expose_secret(),
-        )
+        Self::with_auth(&creds.instance_url, &creds.auth)
     }
 
     /// Returns the instance URL.
@@ -9349,6 +9402,36 @@ impl AtlassianClient {
         Ok(())
     }
 
+    /// Verifies credentials against the selected service's current-user API.
+    pub async fn auth_identity(&self, service: AuthService) -> Result<AuthIdentity> {
+        let path = match (self.auth_mode, service) {
+            (AuthMode::Basic, AuthService::Jira) => "/rest/api/3/myself",
+            (AuthMode::Bearer, AuthService::Jira) => "/rest/api/2/myself",
+            (AuthMode::Basic, AuthService::Confluence) => "/wiki/rest/api/user/current",
+            (AuthMode::Bearer, AuthService::Confluence) => "/rest/api/user/current",
+        };
+        let url = format!("{}{path}", self.instance_url);
+        let response = self.get_json(&url).await?;
+        // Auth diagnostics must not echo a remote body containing credentials.
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "Atlassian authentication failed: HTTP {}",
+                response.status().as_u16()
+            );
+        }
+        let identity: AuthIdentity = response
+            .json()
+            .await
+            .context("Failed to parse authenticated user")?;
+        let has_id = [&identity.account_id, &identity.username, &identity.key]
+            .iter()
+            .any(|id| id.as_ref().is_some_and(|value| !value.trim().is_empty()));
+        if identity.user_type.as_deref() == Some("anonymous") || !has_id {
+            anyhow::bail!("Atlassian did not return an authenticated user");
+        }
+        Ok(identity)
+    }
+
     /// Verifies authentication by fetching the current user.
     pub async fn get_myself(&self) -> Result<JiraUser> {
         let url = format!("{}/rest/api/3/myself", self.instance_url);
@@ -9368,5 +9451,173 @@ impl AtlassianClient {
             .json()
             .await
             .context("Failed to parse user response")
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod pat_tests {
+    use super::*;
+    use wiremock::{
+        matchers::{header, method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    fn bearer(base: &str) -> AtlassianClient {
+        AtlassianClient::with_auth(
+            base,
+            &AtlassianAuth::Bearer {
+                token: "private-pat".into(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bearer_header_is_exact_sensitive_and_rejects_control_characters() {
+        let client = bearer("https://self.example");
+        assert_eq!(client.auth_header.to_str().unwrap(), "Bearer private-pat");
+        assert!(client.auth_header.is_sensitive());
+        assert!(!format!("{:?}", client.auth_header).contains("private-pat"));
+        let err = AtlassianClient::with_auth(
+            "https://self.example",
+            &AtlassianAuth::Bearer {
+                token: "private-pat\r\nInjected: yes".into(),
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(!format!("{err:#}").contains("private-pat"));
+    }
+
+    #[tokio::test]
+    async fn bearer_authenticates_shared_transports_and_multipart() {
+        let server = MockServer::start().await;
+        for verb in ["GET", "POST", "PUT", "DELETE"] {
+            Mock::given(method(verb))
+                .and(header("Authorization", "Bearer private-pat"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(if verb == "POST" { 2 } else { 1 })
+                .mount(&server)
+                .await;
+        }
+        let client = bearer(&server.uri());
+        assert!(client
+            .get_json(&server.uri())
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        assert!(client
+            .post_json(&server.uri(), &serde_json::json!({}))
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        assert!(client
+            .put_json(&server.uri(), &serde_json::json!({}))
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        assert!(client
+            .delete(&server.uri())
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        assert!(client
+            .post_multipart(&server.uri(), reqwest::multipart::Form::new(), &[])
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+    }
+
+    #[tokio::test]
+    async fn self_hosted_probes_preserve_context_and_identity() {
+        for (service, endpoint, identity) in [
+            (
+                AuthService::Jira,
+                "/context/rest/api/2/myself",
+                serde_json::json!({"displayName":"Alice", "name":"alice", "key":"JIRAUSER1"}),
+            ),
+            (
+                AuthService::Confluence,
+                "/context/rest/api/user/current",
+                serde_json::json!({"displayName":"Alice", "username":"alice", "userKey":"user1", "type":"known"}),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .and(header("Authorization", "Bearer private-pat"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(identity))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = bearer(&format!("{}/context/", server.uri()));
+            let user = client.auth_identity(service).await.unwrap();
+            assert_eq!(user.username.as_deref(), Some("alice"));
+            assert!(user.account_id.is_none());
+            assert!(user.key.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_confluence_probe_uses_basic_and_wiki_path() {
+        let server = MockServer::start().await;
+        let client = AtlassianClient::new(&server.uri(), "alice@example.com", "token").unwrap();
+        Mock::given(method("GET"))
+            .and(path("/wiki/rest/api/user/current"))
+            .and(header(
+                "Authorization",
+                client.auth_header.to_str().unwrap(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"displayName":"Alice", "accountId":"cloud-id", "type":"known"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            client
+                .auth_identity(AuthService::Confluence)
+                .await
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some("cloud-id")
+        );
+    }
+
+    #[tokio::test]
+    async fn probes_reject_anonymous_malformed_and_auth_errors_without_fallback() {
+        for (status, body) in [
+            (200, r#"{"displayName":"Anonymous","type":"anonymous"}"#),
+            (
+                200,
+                r#"{"displayName":"Anonymous","username":"anonymous","type":"anonymous"}"#,
+            ),
+            (200, r#"{"displayName":"Alice"}"#),
+            (200, "malformed"),
+            (401, "private-pat"),
+            (403, "private-pat"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/rest/api/user/current"))
+                .and(header("Authorization", "Bearer private-pat"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let err = bearer(&server.uri())
+                .auth_identity(AuthService::Confluence)
+                .await
+                .unwrap_err();
+            assert!(!format!("{err:#}").contains("private-pat"));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
     }
 }

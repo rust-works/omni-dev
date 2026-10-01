@@ -201,7 +201,7 @@ project listing and create-screen introspection, and changelog history.
 
 | Tool | Purpose |
 |------|---------|
-| `atlassian_auth_status` | Boolean credential-presence flags only — never emits secret values |
+| `atlassian_auth_status` | Credential presence, auth mode and configuration state; never resolves or emits secrets |
 | `atlassian_convert` | Bidirectional JFM ↔ ADF conversion (offline, no network) |
 
 ### Datadog (14 tools)

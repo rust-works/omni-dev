@@ -1032,3 +1032,13 @@ message improvement is very low cost.
 - Use `--auto-apply` for automated workflows
 - Test thoroughly in development first
 - Be mindful of API rate limits
+
+### Atlassian PAT configuration conflicts
+
+`ATLASSIAN_PAT` and `ATLASSIAN_API_TOKEN` select different authentication modes.
+If both token sources resolve from the environment/settings, unset the obsolete
+source (including `_FILE`/`_COMMAND` companions). An API token without email does
+not become a Bearer PAT. Use `atlassian auth login --auth-mode bearer` for a
+self-hosted PAT and `auth status --service confluence` for a Confluence-only
+instance. Existing Cloud API routes may still be incompatible with self-hosted
+instances; see [PAT scope and setup](user-guide.md#serverdata-center-personal-access-tokens).

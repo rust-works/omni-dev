@@ -73,6 +73,7 @@ pub const SECRET_ENV_VARS: &[&str] = &[
     "OMNI_DEV_JEV_API_KEY",
     // Atlassian
     "ATLASSIAN_API_TOKEN",
+    "ATLASSIAN_PAT",
     // Datadog
     "DATADOG_API_KEY",
     "DATADOG_APP_KEY",
