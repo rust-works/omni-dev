@@ -565,6 +565,12 @@ struct WindowEntry {
     report: WindowReport,
     /// When the report last arrived (register or refresh).
     last_seen: DateTime<Utc>,
+    /// When this key first registered, preserved across refreshes. Ranks
+    /// overlapping windows in [`pick_window`] (#1451): a reload registers a new
+    /// key, so it outranks the stale predecessor still inside its TTL, while
+    /// two live windows keep a stable winner — `last_seen` would flap between
+    /// them on every heartbeat.
+    registered_at: DateTime<Utc>,
 }
 
 /// The cross-window session registry.
@@ -864,20 +870,24 @@ impl SessionsRegistry {
         let changed = {
             let mut windows = self.lock_windows();
             let reaped = reap_windows(&mut windows, self.window_ttl, now);
-            let mutated = if let Some(previous) = windows.get(&report.key) {
-                previous.report.folders != report.folders
-                    || previous.report.has_embedding() != report.has_embedding()
+            let (mutated, registered_at) = if let Some(previous) = windows.get(&report.key) {
+                (
+                    previous.report.folders != report.folders
+                        || previous.report.has_embedding() != report.has_embedding(),
+                    previous.registered_at,
+                )
             } else {
                 if windows.len() >= MAX_WINDOWS {
                     evict_oldest_window(&mut windows);
                 }
-                true
+                (true, now)
             };
             windows.insert(
                 report.key.clone(),
                 WindowEntry {
                     report,
                     last_seen: now,
+                    registered_at,
                 },
             );
             mutated || reaped > 0
@@ -923,13 +933,13 @@ impl SessionsRegistry {
             reap_sessions(&mut guard, self.session_ttl, self.ended_ttl, now);
             guard.values().cloned().collect()
         };
-        let windows: Vec<WindowReport> = {
+        let windows: Vec<WindowEntry> = {
             let mut guard = self.lock_windows();
             reap_windows(&mut guard, self.window_ttl, now);
             guard
                 .values()
-                .map(|e| e.report.clone())
-                .filter(WindowReport::has_embedding)
+                .filter(|e| e.report.has_embedding())
+                .cloned()
                 .collect()
         };
         for session in &mut sessions {
@@ -955,12 +965,8 @@ impl SessionsRegistry {
         let now = Utc::now();
         let mut windows = self.lock_windows();
         reap_windows(&mut windows, self.window_ttl, now);
-        windows
-            .values()
-            .map(|e| &e.report)
-            .filter(|w| w.has_embedding())
-            .filter(|w| w.folders.iter().any(|f| cwd.starts_with(f)))
-            .find_map(|w| w.folders.first().cloned())
+        pick_window(&cwd, windows.values().filter(|e| e.report.has_embedding()))
+            .and_then(|w| w.folders.first().cloned())
     }
 }
 
@@ -1024,23 +1030,47 @@ fn fill<T: PartialEq>(slot: &mut Option<T>, incoming: Option<T>) -> bool {
 /// Resolves a session's [`Source`] by joining its `cwd` against the live
 /// window-embedding reports.
 ///
-/// Among the windows whose folder is a prefix of `cwd`, the one with the lowest
-/// key wins (a deterministic tiebreak). A session with no `cwd`, or no matching
-/// window, is [`Source::Terminal`].
-fn resolve_source(cwd: Option<&Path>, windows: &[WindowReport]) -> Source {
+/// Among the windows whose folder is a prefix of `cwd`, [`pick_window`] chooses
+/// the winner. A session with no `cwd`, or no matching window, is
+/// [`Source::Terminal`].
+fn resolve_source(cwd: Option<&Path>, windows: &[WindowEntry]) -> Source {
     let Some(cwd) = cwd else {
         return Source::Terminal;
     };
-    let matched = windows
-        .iter()
-        .filter(|w| w.folders.iter().any(|f| cwd.starts_with(f)))
-        .min_by(|a, b| a.key.cmp(&b.key));
-    match matched {
+    match pick_window(cwd, windows) {
         Some(window) => Source::VsCode {
             window_key: window.key.clone(),
         },
         None => Source::Terminal,
     }
+}
+
+/// Picks the window a session at `cwd` is attributed to, among the windows with
+/// a folder that is a prefix of it: the most recently registered, then the
+/// lowest key (#1451).
+///
+/// A window reload registers a fresh companion-generated key while the old
+/// registration can live on for up to the window TTL, so the newest
+/// registration is the live window. Ranking by key alone — the earlier rule —
+/// picked whichever UUID sorted lowest. `registered_at` rather than
+/// `last_seen`, because every open window refreshes `last_seen` on its own
+/// heartbeat, so two live windows on one folder would alternate. The key tail
+/// only keeps equal stamps deterministic. Shared by [`resolve_source`] and
+/// [`SessionsRegistry::focus_folder`] so the tray focuses the window the tree
+/// attributes the session to.
+fn pick_window<'a>(
+    cwd: &Path,
+    windows: impl IntoIterator<Item = &'a WindowEntry>,
+) -> Option<&'a WindowReport> {
+    windows
+        .into_iter()
+        .filter(|e| e.report.folders.iter().any(|f| cwd.starts_with(f)))
+        .min_by(|a, b| {
+            b.registered_at
+                .cmp(&a.registered_at)
+                .then_with(|| a.report.key.cmp(&b.report.key))
+        })
+        .map(|e| &e.report)
 }
 
 /// Removes sessions last seen longer than their TTL ago (a shorter
@@ -1442,31 +1472,115 @@ mod tests {
         assert_eq!(reg.list()[0].source, Source::Terminal);
     }
 
+    /// A window entry covering `/p`, registered `age_secs` ago.
+    fn window_entry(key: &str, age_secs: i64) -> WindowEntry {
+        let now = Utc::now();
+        WindowEntry {
+            report: window_report(key, "/p", true),
+            last_seen: now,
+            registered_at: now - chrono::Duration::seconds(age_secs),
+        }
+    }
+
+    fn vscode(key: &str) -> Source {
+        Source::VsCode {
+            window_key: key.to_string(),
+        }
+    }
+
     #[test]
-    fn resolve_source_prefers_lowest_key_on_overlap() {
-        // Two windows both cover the cwd; the lowest key wins deterministically.
-        let windows = vec![
-            WindowReport {
-                key: "w2".to_string(),
-                folders: vec![PathBuf::from("/p")],
-                tabs: 1,
-                terminals: 0,
-            },
-            WindowReport {
-                key: "w1".to_string(),
-                folders: vec![PathBuf::from("/p")],
-                tabs: 1,
-                terminals: 0,
-            },
-        ];
+    fn resolve_source_prefers_newest_registration_over_key_order() {
+        // `w1` sorts lowest but registered earlier: the newer `w2` wins (#1451).
+        let windows = vec![window_entry("w1", 20), window_entry("w2", 5)];
         assert_eq!(
             resolve_source(Some(Path::new("/p/x")), &windows),
-            Source::VsCode {
-                window_key: "w1".to_string()
-            }
+            vscode("w2")
         );
         // No cwd → terminal.
         assert_eq!(resolve_source(None, &windows), Source::Terminal);
+    }
+
+    #[test]
+    fn resolve_source_breaks_equal_registrations_by_lowest_key() {
+        let now = Utc::now();
+        let at_now = |key: &str| WindowEntry {
+            report: window_report(key, "/p", true),
+            last_seen: now,
+            registered_at: now,
+        };
+        let windows = vec![at_now("w2"), at_now("w1")];
+        assert_eq!(
+            resolve_source(Some(Path::new("/p/x")), &windows),
+            vscode("w1")
+        );
+    }
+
+    #[test]
+    fn reload_overlap_attributes_to_the_new_window_even_if_its_key_sorts_higher() {
+        // The #1451 scenario: the old registration is still live inside its
+        // TTL (and even still heartbeating) when the reloaded window registers.
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::PreToolUse,
+            Some("/p/sub"),
+        ));
+        reg.report_window(window_report("39-old", "/p", true));
+        {
+            let mut guard = reg.lock_windows();
+            guard.get_mut("39-old").unwrap().registered_at =
+                Utc::now() - chrono::Duration::seconds(60);
+        }
+        reg.report_window(window_report("52-new", "/p", true));
+        assert_eq!(reg.list()[0].source, vscode("52-new"));
+        // A heartbeat from the old window must not take the session back.
+        reg.report_window(window_report("39-old", "/p", true));
+        assert_eq!(reg.list()[0].source, vscode("52-new"));
+    }
+
+    #[test]
+    fn refreshing_a_window_preserves_its_registration_time() {
+        let reg = SessionsRegistry::new();
+        reg.report_window(window_report("w1", "/p", true));
+        let first = reg.lock_windows()["w1"].registered_at;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        reg.report_window(window_report("w1", "/p", true));
+        let guard = reg.lock_windows();
+        assert_eq!(guard["w1"].registered_at, first);
+        assert!(guard["w1"].last_seen > first);
+    }
+
+    #[test]
+    fn reregistering_after_unregister_gets_a_fresh_registration_time() {
+        let reg = SessionsRegistry::new();
+        reg.report_window(window_report("w1", "/p", true));
+        let first = reg.lock_windows()["w1"].registered_at;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(reg.unregister_window("w1"));
+        reg.report_window(window_report("w1", "/p", true));
+        assert!(reg.lock_windows()["w1"].registered_at > first);
+    }
+
+    #[test]
+    fn focus_folder_agrees_with_list_on_overlap() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::PreToolUse,
+            Some("/p/sub"),
+        ));
+        let mut old = window_report("a-old", "/p", true);
+        old.folders = vec![PathBuf::from("/p/old-root"), PathBuf::from("/p")];
+        reg.report_window(old);
+        {
+            let mut guard = reg.lock_windows();
+            guard.get_mut("a-old").unwrap().registered_at =
+                Utc::now() - chrono::Duration::seconds(60);
+        }
+        reg.report_window(window_report("z-new", "/p", true));
+        assert_eq!(reg.list()[0].source, vscode("z-new"));
+        // Not the old window's first folder `/p/old-root`.
+        assert_eq!(reg.focus_folder("s1"), Some(PathBuf::from("/p")));
     }
 
     #[test]
@@ -1791,6 +1905,7 @@ mod tests {
                             terminals: 0,
                         },
                         last_seen: base - chrono::Duration::milliseconds(i as i64),
+                        registered_at: base,
                     },
                 );
             }
@@ -1820,6 +1935,7 @@ mod tests {
                 terminals: 0,
             },
             last_seen: now - chrono::Duration::seconds(secs),
+            registered_at: now,
         };
         windows.insert("young".to_string(), at("young", 0));
         windows.insert("old-b".to_string(), at("old-b", 10));
