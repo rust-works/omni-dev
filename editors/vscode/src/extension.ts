@@ -145,14 +145,12 @@ let output: vscode.OutputChannel | undefined;
 // --- Tree-view UI state ------------------------------------------------------
 let treeView: vscode.TreeView<Node> | undefined;
 let provider: WorktreesTreeDataProvider | undefined;
-/** Paints each worktree row's colored PR-check badge (#1324); pulsed on snapshots. */
-let decorationProviders: WorktreeDecorationProvider[] = [];
+/** Paints PR-check badges and combined check/session colours; pulsed on snapshots. */
+let decorationProvider: WorktreeDecorationProvider | undefined;
 
-/** Re-queries every worktree row's badges, on both decoration dimensions. */
+/** Re-queries every worktree row's badge and colour. */
 function refreshDecorations(): void {
-  for (const provider of decorationProviders) {
-    provider.refresh();
-  }
+  decorationProvider?.refresh();
 }
 /** The last worktree click, for the manual double-click timer in `onItemClicked`. */
 let lastClick: { id: string; at: number } | undefined;
@@ -620,25 +618,15 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   view.message = DAEMON_DOWN_MESSAGE;
   context.subscriptions.push(view, treeProvider);
 
-  // The colored badges: the PR CI-check verdict (#1324) and the Claude session
-  // cue (#1406), painted off the custom-scheme `resourceUri` the tree items
-  // carry. Two providers because one decoration's badge holds only two
-  // characters; VS Code concatenates them onto the row. They are `refresh()`ed
-  // on every snapshot so colours track the lazily-fetched PR and session state.
-  //
-  // Registration order sets the order of the merged glyphs — the workbench
-  // iterates providers most-recently-registered first — so the session cue is
-  // registered last to lead. Both share one severity-ranked colour regardless.
-  decorationProviders = [
-    new WorktreeDecorationProvider("checks"),
-    new WorktreeDecorationProvider("sessions"),
-  ];
-  for (const decorations of decorationProviders) {
-    context.subscriptions.push(
-      decorations,
-      vscode.window.registerFileDecorationProvider(decorations),
-    );
-  }
+  // One decoration paints the PR-check badge and combined check/session colour
+  // from the tree item's custom-scheme resourceUri. Session counts remain in
+  // the description and tooltip. Refresh on snapshots and state changes so
+  // colours track the lazily-fetched PR and session state.
+  decorationProvider = new WorktreeDecorationProvider();
+  context.subscriptions.push(
+    decorationProvider,
+    vscode.window.registerFileDecorationProvider(decorationProvider),
+  );
 
   const sub = new TreeSubscription(socketPath(), {
     onSnapshot: (snapshot) => {
@@ -2026,7 +2014,7 @@ export async function deactivate(): Promise<void> {
   // The tree view, provider, decoration provider, and subscription are torn down
   // via `context.subscriptions`; drop our references so a reactivation starts fresh.
   provider = undefined;
-  decorationProviders = [];
+  decorationProvider = undefined;
   treeView = undefined;
   lastClick = undefined;
   await send(unregisterEnvelope(windowKey));
