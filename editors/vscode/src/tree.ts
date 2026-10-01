@@ -529,7 +529,7 @@ export interface CheckDecoration {
 
 /**
  * Maps a rolled-up PR {@link PrCheckState} to its colored badge decoration (#1324):
- * a green `✓` (passing), red `✗` (failing), or yellow `●` (pending). A PR with no
+ * a green `✓` (passing), red `✗` (failing), or yellow `⋯` (pending). A PR with no
  * checks configured (`none`) gets `undefined` — no badge. The `charts.{green,red,
  * yellow}` color ids match the palette the open-state icon already uses
  * (`treeDataProvider.ts`), so the badge adapts to light/dark themes. This is the
@@ -554,10 +554,9 @@ export function checkStateDecoration(checks: PrCheckState): CheckDecoration | un
 }
 
 /**
- * Severity order for a row's badge colour, most severe first. A row can carry a
- * PR check verdict *and* a Claude session cue, and VS Code paints every merged
- * decoration in a single colour (`_appendForMany` picks one), so the two have to
- * agree on which one that is.
+ * Severity order for a row's decoration colour, most severe first. The single
+ * decoration combines the PR check verdict and agent session state so either
+ * can draw attention to the row, including when it has no check badge.
  */
 const COLOR_SEVERITY = ["charts.red", "charts.yellow", "charts.green", "descriptionForeground"];
 
@@ -565,10 +564,9 @@ const COLOR_SEVERITY = ["charts.red", "charts.yellow", "charts.green", "descript
  * The most severe of the given badge colours: red over yellow over green over
  * muted, ignoring absent ones.
  *
- * Both decoration providers call this with the *same* inputs and hand VS Code
- * the same colour, so the merged badge is coloured by severity rather than by
- * whichever provider the workbench happens to iterate first. An unrecognized
- * colour sorts last but is still returned when it is all there is.
+ * The decoration provider combines check and session colours with this rule.
+ * An unrecognized colour sorts last but is still returned when it is all there
+ * is.
  */
 export function rowColorId(...colorIds: (string | undefined)[]): string | undefined {
   let best: string | undefined;

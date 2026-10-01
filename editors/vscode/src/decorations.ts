@@ -1,8 +1,8 @@
 // The `vscode`-facing file-decoration layer for the Worktrees tree: the badges
 // that carry a worktree's PR CI-check verdict (#1324) and colours that also
-// reflect its running agent sessions (#1406). Every glyph/colour decision is pure and unit-tested — in
-// `tree.ts` and `sessionCounts.ts`; this file owns only the custom `resourceUri`
-// scheme and the mapping onto a `vscode.FileDecoration`.
+// reflect its running agent sessions (#1406). Every glyph/colour decision is
+// pure and unit-tested in `tree.ts` and `sessionCounts.ts`; this file owns only
+// the custom `resourceUri` scheme and the mapping onto a `vscode.FileDecoration`.
 //
 // A custom scheme (not `file:`) keeps these decorations from colliding with the
 // built-in git SCM provider, which decorates real folder URIs. Both states are
@@ -37,7 +37,7 @@ export const WORKTREE_URI_SCHEME = "omnidev-worktree";
 /**
  * Builds a worktree row's decoratable `resourceUri`: the custom scheme, the
  * worktree path, and both decoratable states in the query — the PR `checks`
- * verdict and the row's Claude session tally. Encoding the state means a change
+ * verdict and the row's agent session tally. Encoding the state means a change
  * (e.g. `pending` → `success`, or a session starting to wait) produces a **new**
  * URI, which VS Code re-queries for a decoration on its own.
  */
