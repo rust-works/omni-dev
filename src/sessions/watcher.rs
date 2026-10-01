@@ -125,33 +125,64 @@ fn is_recent(modified: SystemTime, now: SystemTime) -> bool {
 /// unit-tested against a temp directory.
 fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
     let mut sightings = Vec::new();
+    let mut scanned = 0_u64;
+    let mut io_errors = 0_u64;
+    let mut invalid_names = 0_u64;
+    let mut inactive = 0_u64;
+    let mut unchanged = 0_u64;
     let Ok(project_dirs) = std::fs::read_dir(root) else {
+        tracing::debug!(outcome = "root_unreadable", "session_transcript_scan");
         return sightings;
     };
-    for project in project_dirs.flatten() {
+    for project in project_dirs {
+        let project = match project {
+            Ok(project) => project,
+            Err(_) => {
+                io_errors += 1;
+                continue;
+            }
+        };
         let Ok(files) = std::fs::read_dir(project.path()) else {
+            io_errors += 1;
             continue;
         };
-        for file in files.flatten() {
+        for file in files {
+            let file = match file {
+                Ok(file) => file,
+                Err(_) => {
+                    io_errors += 1;
+                    continue;
+                }
+            };
             let path = file.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
+            scanned += 1;
             let Some(session_id) = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
             else {
+                invalid_names += 1;
                 continue;
             };
             let Ok(meta) = file.metadata() else {
+                io_errors += 1;
                 continue;
             };
             let size = meta.len();
-            let recent = meta.modified().is_ok_and(|m| is_recent(m, now));
+            let recent = match meta.modified() {
+                Ok(modified) => is_recent(modified, now),
+                Err(_) => {
+                    io_errors += 1;
+                    false
+                }
+            };
             let previous = state.insert(path.clone(), size);
             if !recent {
+                inactive += 1;
                 // Record the size (for a future growth comparison) but do not
                 // announce an inactive session.
                 continue;
@@ -159,7 +190,10 @@ fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
             let event = match previous {
                 None => SessionEvent::TranscriptDiscovered,
                 Some(prev) if size > prev => SessionEvent::TranscriptGrew,
-                Some(_) => continue,
+                Some(_) => {
+                    unchanged += 1;
+                    continue;
+                }
             };
             sightings.push(Sighting {
                 session_id,
@@ -168,6 +202,15 @@ fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
             });
         }
     }
+    tracing::debug!(
+        scanned,
+        sightings = sightings.len(),
+        io_errors,
+        invalid_names,
+        inactive,
+        unchanged,
+        "session_transcript_scan"
+    );
     sightings
 }
 
@@ -197,7 +240,10 @@ pub fn spawn(registry: Arc<SessionsRegistry>, token: CancellationToken) -> JoinH
                 (owned_state, sightings)
             })
             .await
-            .unwrap_or_else(|_| (ScanState::new(), Vec::new()));
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, outcome = "state_reset", "session_transcript_scan_failed");
+                (ScanState::new(), Vec::new())
+            });
             state = returned_state;
             for sighting in sightings {
                 registry.observe(sighting.into_observe());
@@ -215,6 +261,20 @@ pub fn spawn(registry: Arc<SessionsRegistry>, token: CancellationToken) -> JoinH
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn scan_diagnostics_summarize_candidates_and_unchanged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_transcript(dir.path(), "project", "session", b"hello");
+        let mut state = ScanState::new();
+        let logs = crate::test_support::capture_at(tracing::Level::DEBUG, || {
+            assert_eq!(scan(dir.path(), &mut state, SystemTime::now()).len(), 1);
+            assert!(scan(dir.path(), &mut state, SystemTime::now()).is_empty());
+        });
+        assert_eq!(logs.matches("session_transcript_scan").count(), 2);
+        assert!(logs.contains("scanned=1"));
+        assert!(logs.contains("unchanged=1"));
+    }
 
     /// Creates `root/<project>/<session>.jsonl` with `contents`, returning its path.
     fn write_transcript(root: &Path, project: &str, session: &str, contents: &[u8]) -> PathBuf {

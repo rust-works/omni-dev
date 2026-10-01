@@ -912,3 +912,140 @@ always includes it.
 - **Windows** support waits on the broader daemon Windows work (#1363); the hook
   sink and transcript scheme are already portable, only the socket transport is
   Unix-only.
+
+
+## Troubleshooting
+
+Session diagnostics let you follow a sighting through ingestion, the registry,
+the daemon subscription, and the VS Code companion. They preserve existing
+state and attribution rules; an attribution mismatch remains a separate bug
+to investigate using the evidence.
+
+### Enable and read daemon diagnostics
+
+Set `daemon.log_level` in `$HOME/.omni-dev/settings.json`:
+
+```json
+{
+  "daemon": {
+    "log_level": "info,omni_dev::sessions=debug,omni_dev::daemon=debug"
+  }
+}
+```
+
+Restart the daemon, then follow its log:
+
+```bash
+omni-dev daemon restart
+omni-dev daemon logs --follow
+```
+
+The log reader supports foreground/background file-log launches and launchd;
+a foreground `daemon run` emits tracing to stderr. For a systemd user unit,
+read the journal with `journalctl --user -u omni-dev.service -f` instead.
+See [configuration](configuration.md#daemon-and-mcp-tracing-settings) for
+precedence and fallback behavior. `RUST_LOG` in the daemon process overrides
+the settings filter; shell exports are not inherited by socket activation.
+
+Use `omni_dev::daemon::server=trace` to see each subscription sample's
+`change_notification` or `periodic_tick` trigger and `pushed` versus
+`suppressed_identical` result. Initial snapshots and terminal counts are
+accounted for too. A subscription ends with a distinct `ClientCancel`,
+`ClientEof`, `ReadDecodeError`, `DaemonShutdown`, or `WriteFailure` reason.
+Cancellation and EOF are normal debug events; failed writes and service
+rejections are warnings visible at the default `info` level.
+
+Registry `session_observed` records include identity, agent/PID/event,
+old/new states, an outcome, reap count, and the actual `bumped` decision.
+`heartbeat_only` refreshes liveness without triggering a change notification;
+`replaced_pid_ignored` explains a late event from the process an in-place resume
+replaced. `ended_passive_ignored` prevents passive sightings reviving ended
+sessions. `session_end` distinguishes unknown, already ended, ignored, and
+newly ended sessions. Window reports and unregisters expose their bump decision.
+
+Positive TTL reap counts and capacity evictions explain disappearing entries.
+At trace level, individual reaps identify `session_ttl`, `ended_ttl`, or
+`window_ttl`; `session_process_ended` identifies PID-based cleanup. Busy
+stream-wrapper sessions keep alive, while idle ones can age out. A
+`session_attribution_miss` reports cwd and the live-window count; trace-level
+candidate folders help reveal lexical mismatches such as `/tmp` versus
+`/private/tmp`. Matching still uses the existing folder specificity,
+registration time, and key ordering, without canonicalization.
+
+Feed 2 emits one scan summary containing candidate/sighting and skip/error
+counts. A blocking scan failure warns that tracking state was reset. Repository
+enrichment task failures warn separately from a normal nonrepository cwd.
+
+### Hook diagnostics
+
+Hook sinks are short-lived CLI processes; daemon settings do not set their
+filter. To investigate hooks, run the configured hook command with
+`RUST_LOG=omni_dev::cli::sessions=debug` in its own environment. Diagnostics go
+to stderr, never stdout, and do not change exit 0 or the report timeout.
+`session_hook_skipped` identifies read/JSON/identity/event/socket gates;
+`session_hook_report` distinguishes delivery, timeout, transport failure, and
+daemon rejection. Notification diagnostics contain the classification and
+presence of type/message fields, never the raw notification text. Claude and
+Codex sightings are tagged separately by the shared hook sink.
+
+### Opt-in wrapper metadata file
+
+For the Claude stream wrapper, set `OMNI_DEV_CLAUDE_WRAP_LOG` to an absolute
+file path in the environment of the process launching the wrapper. For example,
+when launching a fresh VS Code process from a shell:
+
+```bash
+OMNI_DEV_CLAUDE_WRAP_LOG="$HOME/claude-wrap-diagnostics.jsonl" code .
+```
+
+An already running VS Code process may retain its earlier environment; fully
+quit/relaunch it and start a new wrapped Claude process to apply the change.
+The variable does not enable or install the wrapper by itself: use the Feed 4
+installation instructions above first.
+
+The file contains newline-delimited metadata: process start/exit, learned
+session identity/cwd/model, state reports, report outcome codes, and periodic
+plus final cumulative diagnostic summaries. `tee_full` identifies dropped
+observer lines when a slow daemon backs up the bounded tee; `tee_closed`,
+`tee_oversize`, and `tee_non_utf8` distinguish other drops. Tracker counters
+identify parse failure, unknown control shapes, missing permission IDs, and
+permission-cap drops. Known unrelated control requests are ignored normally.
+The summary also counts drops from the independent diagnostic queue.
+
+When unset or empty, no file, writer, or diagnostic counters are created.
+When enabled, a separate thread appends records through a bounded nonblocking
+queue; byte pumps only update counters. New files use `0600`; symlinks and
+nonregular targets are refused, and existing file permissions are left intact.
+Open/write failures silently disable writing without preventing Claude from
+launching. Shutdown waits at most 200 ms for diagnostics; a killed process,
+stuck disk, or full queue can lose records. Files append across processes and
+include session/PID metadata where known; there is no automatic rotation.
+
+Conversation messages, tool inputs/results, raw stdio/hook payloads, and daemon
+error text are never written to this wrapper file. Paths and identifiers are
+still personal metadata: inspect logs before sharing them. Remove the variable
+and launch new wrapper processes to disable logging; delete the file when the
+investigation is finished. This is an explicit metadata-only persistence
+exception to Feed 4's normal no-persistence rule.
+
+### VS Code output and tracing a stale cue
+
+Open **View → Output → omni-dev**. One-shot requests now report daemon
+rejections as well as transport failures. A rejected/unreachable session-window
+report includes the window key; invalid subscription frames report a reason
+without dumping the frame, preserving the last valid snapshot. A rejected
+subscription continues to use the existing unsupported/fallback behavior.
+
+Compare evidence in this order:
+
+1. Did the hook/watcher/wrapper deliver a sighting, or record a gate/drop?
+2. Did `session_observed` accept it, change state/metadata, and bump?
+3. Did the subscription wake and push, or suppress an identical snapshot?
+4. Was the window report accepted and cwd matched to a live window?
+5. Did the companion reject the frame or report a connection problem?
+6. Did TTL/PID cleanup or capacity eviction remove the session afterward?
+
+Sessions outside tracked worktrees legitimately contribute no row count.
+The pure tally function remains unchanged and does not log every unmatched
+session. Gather logs for the narrow reproduction window; use trace only when
+debug cannot identify the failing hop.

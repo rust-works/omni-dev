@@ -38,6 +38,7 @@ import {
   treeEnvelope,
   unregisterEnvelope,
 } from "./socket";
+import { sendWithDiagnostics } from "./replyDiagnostics";
 import { runGh } from "./gh";
 import { PullRequest, parsePrList, prFallbackBadge, prListArgsForRepo } from "./github";
 import { countClaudeTabs, countClaudeTerminals } from "./claudeEmbeddings";
@@ -257,15 +258,9 @@ function registerPayload(): RegisterPayload {
  * when the daemon was unreachable. `timeoutMs` overrides the default for a
  * long-running op (the `close` execute waits on windows closing).
  */
-async function send(envelope: Envelope, timeoutMs?: number): Promise<Reply | undefined> {
-  try {
-    return await sendEnvelope(socketPath(), envelope, timeoutMs);
-  } catch (err) {
-    output?.appendLine(
-      `${envelope.op} skipped: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return undefined;
-  }
+async function send(envelope: Envelope, timeoutMs?: number, context?: string): Promise<Reply | undefined> {
+  return sendWithDiagnostics(envelope, () => sendEnvelope(socketPath(), envelope, timeoutMs),
+    (message) => output?.appendLine(message), context);
 }
 
 /**
@@ -486,7 +481,7 @@ function claudeEmbeddings(): { tabs: number; terminals: number } {
 async function reportSessionWindow(): Promise<void> {
   const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
   const { tabs, terminals } = claudeEmbeddings();
-  await send(sessionWindowEnvelope({ key: windowKey, folders, tabs, terminals }));
+  await send(sessionWindowEnvelope({ key: windowKey, folders, tabs, terminals }), undefined, `window=${windowKey}`);
 }
 
 async function heartbeat(): Promise<void> {

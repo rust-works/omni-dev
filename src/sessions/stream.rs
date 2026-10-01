@@ -114,6 +114,19 @@ struct ControlBody {
     model: Option<String>,
 }
 
+/// Content-free cumulative protocol diagnostics for one wrapped process.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct StreamDiagnostics {
+    /// Nonempty lines that could not be parsed after terminal-prefix recovery.
+    pub parse_failures: u64,
+    /// Control requests whose subtype/body is missing or unknown.
+    pub unknown_controls: u64,
+    /// Permission prompts without a usable correlation id.
+    pub missing_permission_ids: u64,
+    /// Permission prompts dropped at the bounded pending-request ceiling.
+    pub permission_cap_drops: u64,
+}
+
 /// The authoritative session-state machine over one wrapped `claude` process.
 ///
 /// Feed it every line of both stdio directions; it returns an [`ObserveRequest`]
@@ -142,6 +155,7 @@ pub struct StreamTracker {
     /// independently: an ordinary turn changes state without the model, while
     /// a mid-turn `set_model` changes the model without the state.
     reported: Option<(SessionState, Option<String>)>,
+    diagnostics: StreamDiagnostics,
 }
 
 impl StreamTracker {
@@ -160,7 +174,14 @@ impl StreamTracker {
             base: SessionState::Idle,
             pending: HashSet::new(),
             reported: None,
+            diagnostics: StreamDiagnostics::default(),
         }
+    }
+
+    /// Returns cumulative metadata-only protocol diagnostic counts.
+    #[must_use]
+    pub fn diagnostics(&self) -> StreamDiagnostics {
+        self.diagnostics
     }
 
     /// The session id, once a line has carried one.
@@ -201,7 +222,13 @@ impl StreamTracker {
         // line here is a JSON object, so skipping to the first `{` recovers
         // it without needing to understand escape-sequence structure at all.
         let json = line.find('{').map_or(line, |start| &line[start..]);
-        let parsed: StreamLine = serde_json::from_str(json).ok()?;
+        let parsed: StreamLine = match serde_json::from_str(json) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                self.diagnostics.parse_failures = self.diagnostics.parse_failures.saturating_add(1);
+                return None;
+            }
+        };
         self.absorb_identity(direction, &parsed);
         self.apply(direction, &parsed);
         self.emit_if_changed()
@@ -322,14 +349,25 @@ impl StreamTracker {
     /// state signal and is ignored.
     fn open_permission(&mut self, parsed: &StreamLine) {
         let body = parsed.request.as_ref();
-        if body.and_then(|b| b.subtype.as_deref()) != Some("can_use_tool") {
-            return;
+        match body.and_then(|b| b.subtype.as_deref()) {
+            Some("can_use_tool") => {}
+            Some("initialize" | "hook_callback" | "mcp_message" | "set_model") => return,
+            _ => {
+                self.diagnostics.unknown_controls =
+                    self.diagnostics.unknown_controls.saturating_add(1);
+                return;
+            }
         }
         let Some(id) = correlation_id(parsed, body) else {
+            self.diagnostics.missing_permission_ids =
+                self.diagnostics.missing_permission_ids.saturating_add(1);
             return;
         };
         if self.pending.len() < MAX_PENDING_PERMISSIONS {
             self.pending.insert(id);
+        } else {
+            self.diagnostics.permission_cap_drops =
+                self.diagnostics.permission_cap_drops.saturating_add(1);
         }
     }
 
@@ -401,6 +439,34 @@ fn correlation_id(parsed: &StreamLine, body: Option<&ControlBody>) -> Option<Str
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn diagnostics_count_drift_without_flagging_known_controls() {
+        let mut tracker = StreamTracker::new();
+        for line in [
+            " ",
+            "not json",
+            r#"{"type":"control_request","request":{}}"#,
+            r#"{"type":"control_request","request":{"subtype":"can_use_tool"}}"#,
+            r#"{"type":"control_request","request":{"subtype":"initialize"}}"#,
+            r#"{"type":"control_request","request":{"subtype":"set_model"}}"#,
+        ] {
+            tracker.observe_line(Direction::FromClaude, line);
+        }
+        assert_eq!(
+            tracker.diagnostics(),
+            StreamDiagnostics {
+                parse_failures: 1,
+                unknown_controls: 1,
+                missing_permission_ids: 1,
+                permission_cap_drops: 0,
+            }
+        );
+        for id in 0..=MAX_PENDING_PERMISSIONS {
+            tracker.observe_line(Direction::FromClaude, &format!(r#"{{"type":"control_request","request_id":"{id}","request":{{"subtype":"can_use_tool"}}}}"#));
+        }
+        assert_eq!(tracker.diagnostics().permission_cap_drops, 1);
+    }
+
     use super::*;
 
     const INIT: &str = r#"{"type":"system","subtype":"init","session_id":"sess-1","cwd":"/w/repo","model":"claude-opus-5","tools":["Read"]}"#;

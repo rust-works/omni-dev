@@ -124,13 +124,56 @@ fn default_filter(daemon_run: bool) -> &'static str {
 /// daemon/debug logs off stdout. The default level when `RUST_LOG` is unset is
 /// [`default_filter`]; `RUST_LOG` still overrides it.
 fn init_tracing(daemon_run: bool) {
+    // Loading through the normal warning loader here would lose its warning:
+    // there is no subscriber yet. Emit once after installation instead.
+    let (daemon_filter, settings_error) = if daemon_run {
+        match omni_dev::utils::settings::Settings::load() {
+            Ok(settings) => (settings.daemon.log_level, None),
+            Err(error) => (None, Some(format!("{error:#}"))),
+        }
+    } else {
+        (None, None)
+    };
+    let env_filter = std::env::var("RUST_LOG").ok();
+    let (filter, rejected) =
+        resolve_filter(daemon_run, env_filter.as_deref(), daemon_filter.as_deref());
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter(daemon_run))),
-        )
+        .with_env_filter(filter)
         .init();
+    for source in rejected {
+        tracing::warn!(
+            source,
+            "invalid tracing directive; using next filter source"
+        );
+    }
+    if let Some(error) = settings_error {
+        omni_dev::utils::settings::Settings::warn_bootstrap_failure(&error);
+    }
+}
+
+/// Resolves injected directives without a global subscriber or environment mutation.
+fn resolve_filter(
+    daemon_run: bool,
+    environment: Option<&str>,
+    daemon: Option<&str>,
+) -> (tracing_subscriber::EnvFilter, Vec<&'static str>) {
+    let mut rejected = Vec::new();
+    for (source, directive) in [
+        ("RUST_LOG", environment),
+        ("daemon.log_level", daemon.filter(|_| daemon_run)),
+    ] {
+        if let Some(directive) = directive {
+            match tracing_subscriber::EnvFilter::try_new(directive) {
+                Ok(filter) => return (filter, rejected),
+                Err(_) => rejected.push(source),
+            }
+        }
+    }
+    (
+        tracing_subscriber::EnvFilter::new(default_filter(daemon_run)),
+        rejected,
+    )
 }
 
 /// Prints an error and its source chain to stderr, then exits non-zero.
@@ -169,6 +212,23 @@ mod tests {
         assert!(!is_daemon_run(&path(&["daemon"])));
         assert!(!is_daemon_run(&path(&["jira", "read"])));
         assert!(!is_daemon_run(&[]));
+    }
+
+    #[test]
+    fn tracing_filter_precedence_and_fallbacks() {
+        for (daemon_run, env, daemon, expected, rejected) in [
+            (true, Some("trace"), Some("debug"), "trace", 0),
+            (true, None, Some("debug"), "debug", 0),
+            (true, None, None, "info", 0),
+            (false, None, Some("debug"), "warn", 0),
+            (true, Some("["), Some("debug"), "debug", 1),
+            (true, None, Some("["), "info", 1),
+            (false, Some("["), Some("debug"), "warn", 1),
+        ] {
+            let (filter, errors) = resolve_filter(daemon_run, env, daemon);
+            assert_eq!(filter.to_string(), expected);
+            assert_eq!(errors.len(), rejected);
+        }
     }
 
     #[test]

@@ -332,7 +332,7 @@ async fn handle_connection(
         if let Some(name) = envelope.service.as_deref() {
             if name != DAEMON_SERVICE {
                 if let Some(stream) = registry.subscribe(name, &envelope.op, &envelope.payload) {
-                    run_stream(&mut framed, stream, &shutdown).await;
+                    run_stream(&mut framed, stream, &shutdown, name, &envelope.op).await;
                     return;
                 }
             }
@@ -355,46 +355,91 @@ async fn handle_connection(
 /// The subscription owns the connection for its lifetime: any further inbound
 /// line is treated as an explicit cancel and ends the stream, matching the
 /// one-op-per-connection the companion uses (a dedicated subscribe socket).
+/// Reasons a subscription ends; no incoming line content is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEnd {
+    ClientCancel,
+    ClientEof,
+    ReadDecodeError,
+    DaemonShutdown,
+    WriteFailure,
+}
+
+fn inbound_end(line: Option<Result<String, LinesCodecError>>) -> StreamEnd {
+    match line {
+        Some(Ok(_)) => StreamEnd::ClientCancel,
+        None => StreamEnd::ClientEof,
+        Some(Err(_)) => StreamEnd::ReadDecodeError,
+    }
+}
+
 async fn run_stream(
     framed: &mut Framed<UnixStream, LinesCodec>,
     mut stream: Box<dyn ServiceStream>,
     shutdown: &CancellationToken,
-) {
-    // Initial snapshot up front. The stream's change source was captured when it
-    // was built (before this snapshot), so the loop below only pushes deltas —
-    // and any change racing this initial sample is caught by the first wakeup.
+    service: &str,
+    op: &str,
+) -> StreamEnd {
+    tracing::debug!(service, op, "subscription_started");
+    let mut pushed = 0_u64;
+    let mut suppressed = 0_u64;
     let mut last = stream.snapshot().await;
-    if !send_reply(framed, DaemonReply::ok(last.clone())).await {
-        return;
-    }
-
-    // `interval` fires immediately on the first `tick()`; consume that so the
-    // periodic re-sample starts one full interval out.
-    let mut tick = tokio::time::interval(stream_tick());
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    tick.tick().await;
-
-    loop {
-        tokio::select! {
-            () = stream.changed() => {}
-            _ = tick.tick() => {}
-            // Reading `framed` serves double duty and every outcome ends the
-            // stream: an inbound line is an explicit cancel, `None` is the client
-            // hanging up, and an `Err` is a read/decode error. `Framed`'s decode
-            // buffer lives in the codec, not this future, so cancelling this arm
-            // mid-poll loses no buffered bytes.
-            _ = framed.next() => break,
-            () = shutdown.cancelled() => break,
-        }
-        // Any wakeup means "maybe changed": re-sample and push only a real delta.
-        let snap = stream.snapshot().await;
-        if snap != last {
-            if !send_reply(framed, DaemonReply::ok(snap.clone())).await {
-                break;
+    let end = if !send_reply(framed, DaemonReply::ok(last.clone())).await {
+        StreamEnd::WriteFailure
+    } else {
+        pushed += 1;
+        tracing::trace!(
+            service,
+            op,
+            trigger = "initial",
+            outcome = "pushed",
+            "subscription_sample"
+        );
+        let mut tick = tokio::time::interval(stream_tick());
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        loop {
+            let trigger = tokio::select! {
+                () = stream.changed() => "change_notification",
+                _ = tick.tick() => "periodic_tick",
+                line = framed.next() => {
+                    // A line is cancel, EOF is hangup, and a codec error is a
+                    // broken read. Never log the line (it may contain content).
+                    if let Some(Err(error)) = &line {
+                        tracing::debug!(service, op, %error, "subscription_read_failed");
+                    }
+                    break inbound_end(line);
+                },
+                () = shutdown.cancelled() => break StreamEnd::DaemonShutdown,
+            };
+            let snap = stream.snapshot().await;
+            if snap != last {
+                if !send_reply(framed, DaemonReply::ok(snap.clone())).await {
+                    break StreamEnd::WriteFailure;
+                }
+                pushed = pushed.saturating_add(1);
+                last = snap;
+                tracing::trace!(
+                    service,
+                    op,
+                    trigger,
+                    outcome = "pushed",
+                    "subscription_sample"
+                );
+            } else {
+                suppressed = suppressed.saturating_add(1);
+                tracing::trace!(
+                    service,
+                    op,
+                    trigger,
+                    outcome = "suppressed_identical",
+                    "subscription_sample"
+                );
             }
-            last = snap;
         }
-    }
+    };
+    tracing::debug!(service, op, outcome = ?end, pushed, suppressed, "subscription_ended");
+    end
 }
 
 /// Encodes and writes one reply line. Returns `false` when the connection
@@ -408,7 +453,7 @@ async fn send_reply(framed: &mut Framed<UnixStream, LinesCodec>, reply: DaemonRe
         }
     };
     if let Err(e) = framed.send(encoded).await {
-        tracing::debug!("daemon client write failed: {e}");
+        tracing::warn!(error = %e, "daemon_client_write_failed");
         return false;
     }
     true
@@ -423,7 +468,13 @@ async fn dispatch_envelope(
     shutdown: &CancellationToken,
 ) -> DaemonReply {
     match envelope.service.as_deref() {
-        None | Some(DAEMON_SERVICE) => handle_builtin(&envelope.op, registry, shutdown).await,
+        None | Some(DAEMON_SERVICE) => {
+            let reply = handle_builtin(&envelope.op, registry, shutdown).await;
+            if !reply.ok {
+                tracing::warn!(service = DAEMON_SERVICE, op = %envelope.op, error = ?reply.error, "daemon_dispatch_failed");
+            }
+            reply
+        }
         Some(name) => {
             // Correlate any HTTP the service issues to the originating client's
             // invocation, when it threaded its id across the socket (#1198).
@@ -439,7 +490,10 @@ async fn dispatch_envelope(
                 // query failed: snowflake server error (000630): …") so the
                 // client can see the underlying cause, not just the top-level
                 // wrapper.
-                Err(e) => DaemonReply::err(format!("{e:#}")),
+                Err(e) => {
+                    tracing::warn!(service = name, op = %envelope.op, error = %format!("{e:#}"), "daemon_dispatch_failed");
+                    DaemonReply::err(format!("{e:#}"))
+                }
             }
         }
     }
@@ -502,6 +556,86 @@ pub fn resolve_socket(socket: Option<PathBuf>) -> Result<PathBuf> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+
+    #[tokio::test]
+    async fn subscriptions_report_all_terminal_causes() {
+        use tokio::io::AsyncWriteExt;
+        for expected in [
+            StreamEnd::ClientCancel,
+            StreamEnd::ClientEof,
+            StreamEnd::ReadDecodeError,
+            StreamEnd::DaemonShutdown,
+            StreamEnd::WriteFailure,
+        ] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let (_tx, rx) = watch::channel(0_u64);
+            let fake = FakeStream {
+                rx,
+                snap: Arc::new(StdMutex::new(json!({"n":0}))),
+            };
+            let token = CancellationToken::new();
+            let shutdown = token.clone();
+            let task = tokio::spawn(async move {
+                let mut framed = Framed::new(server, LinesCodec::new_with_max_length(64));
+                crate::test_support::capture_future_at(
+                    tracing::Level::TRACE,
+                    run_stream(
+                        &mut framed,
+                        Box::new(fake),
+                        &shutdown,
+                        "sessions",
+                        "subscribe",
+                    ),
+                )
+                .await
+            });
+            if expected == StreamEnd::WriteFailure {
+                drop(client);
+            } else {
+                let mut reader = BufReader::new(&mut client);
+                let _ = read_reply(&mut reader).await;
+                drop(reader);
+                match expected {
+                    StreamEnd::ClientCancel => {
+                        client.write_all(b"cancel\n").await.unwrap();
+                    }
+                    StreamEnd::ClientEof => {
+                        client.shutdown().await.unwrap();
+                    }
+                    StreamEnd::ReadDecodeError => {
+                        client.write_all(&[b'x'; 65]).await.unwrap();
+                    }
+                    StreamEnd::DaemonShutdown => token.cancel(),
+                    StreamEnd::WriteFailure => unreachable!(),
+                }
+            }
+            let (cause, logs) = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cause, expected);
+            assert!(logs.contains("subscription_started"));
+            assert!(logs.contains("subscription_ended"));
+            assert!(logs.contains(&format!("outcome={expected:?}")));
+            if expected != StreamEnd::WriteFailure {
+                assert!(logs.contains("pushed=1"));
+            }
+        }
+    }
+
+    #[test]
+    fn inbound_subscription_end_reasons_are_distinct() {
+        assert_eq!(
+            super::inbound_end(Some(Ok("cancel".into()))),
+            super::StreamEnd::ClientCancel
+        );
+        assert_eq!(super::inbound_end(None), super::StreamEnd::ClientEof);
+        assert_eq!(
+            super::inbound_end(Some(Err(LinesCodecError::MaxLineLengthExceeded))),
+            super::StreamEnd::ReadDecodeError
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -650,7 +784,14 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let mut framed = Framed::new(server, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
-            run_stream(&mut framed, Box::new(fake), &server_shutdown).await;
+            run_stream(
+                &mut framed,
+                Box::new(fake),
+                &server_shutdown,
+                "fake",
+                "subscribe",
+            )
+            .await;
         });
 
         let mut reader = BufReader::new(client);
@@ -690,7 +831,14 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let mut framed = Framed::new(server, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
-            run_stream(&mut framed, Box::new(fake), &server_shutdown).await;
+            run_stream(
+                &mut framed,
+                Box::new(fake),
+                &server_shutdown,
+                "fake",
+                "subscribe",
+            )
+            .await;
         });
 
         let mut reader = BufReader::new(&mut client);
@@ -814,7 +962,7 @@ mod tests {
         let mut framed = Framed::new(server, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
         tokio::time::timeout(
             Duration::from_secs(2),
-            run_stream(&mut framed, Box::new(fake), &shutdown),
+            run_stream(&mut framed, Box::new(fake), &shutdown, "fake", "subscribe"),
         )
         .await
         .expect("run_stream should return promptly when the initial send fails");
