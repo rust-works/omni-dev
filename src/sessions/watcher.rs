@@ -135,24 +135,18 @@ fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
         return sightings;
     };
     for project in project_dirs {
-        let project = match project {
-            Ok(project) => project,
-            Err(_) => {
-                io_errors += 1;
-                continue;
-            }
+        let Ok(project) = project else {
+            io_errors += 1;
+            continue;
         };
         let Ok(files) = std::fs::read_dir(project.path()) else {
             io_errors += 1;
             continue;
         };
         for file in files {
-            let file = match file {
-                Ok(file) => file,
-                Err(_) => {
-                    io_errors += 1;
-                    continue;
-                }
+            let Ok(file) = file else {
+                io_errors += 1;
+                continue;
             };
             let path = file.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -173,12 +167,11 @@ fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
                 continue;
             };
             let size = meta.len();
-            let recent = match meta.modified() {
-                Ok(modified) => is_recent(modified, now),
-                Err(_) => {
-                    io_errors += 1;
-                    false
-                }
+            let recent = if let Ok(modified) = meta.modified() {
+                is_recent(modified, now)
+            } else {
+                io_errors += 1;
+                false
             };
             let previous = state.insert(path.clone(), size);
             if !recent {

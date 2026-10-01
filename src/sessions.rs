@@ -1123,17 +1123,16 @@ fn resolve_source(cwd: Option<&Path>, windows: &[WindowEntry]) -> Source {
         tracing::trace!(outcome = "missing_cwd", "session_attribution_miss");
         return Source::Terminal;
     };
-    match pick_window(cwd, windows) {
-        Some(window) => Source::VsCode {
+    if let Some(window) = pick_window(cwd, windows) {
+        Source::VsCode {
             window_key: window.key.clone(),
-        },
-        None => {
-            tracing::debug!(cwd = %cwd.display(), window_count = windows.len(), "session_attribution_miss");
-            for window in windows {
-                tracing::trace!(window_key = %window.report.key, folders = ?window.report.folders, "session_attribution_candidate");
-            }
-            Source::Terminal
         }
+    } else {
+        tracing::debug!(cwd = %cwd.display(), window_count = windows.len(), "session_attribution_miss");
+        for window in windows {
+            tracing::trace!(window_key = %window.report.key, folders = ?window.report.folders, "session_attribution_candidate");
+        }
+        Source::Terminal
     }
 }
 
