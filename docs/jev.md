@@ -194,7 +194,7 @@ Picks exactly one of a labelled set of options.
 | Flag                    | Meaning                                                |
 |-------------------------|--------------------------------------------------------|
 | `--instructions <TEXT>` | What to choose and why (required).                     |
-| `--option <NAME=DESC>`  | One option. Repeatable, and at least two are required. |
+| `--option <NAME=DESC>`  | One option. Repeatable, and at least two are required (255 at most on `jev-1.13`). |
 
 `--option` splits on the **first** `=` only, so `--option "eq=a = b"` keeps
 `a = b` as the description. An empty name is rejected, and so is a duplicate
@@ -236,7 +236,7 @@ Rates the state against an ordered scale.
 | Flag                    | Meaning                                                                                          |
 |-------------------------|--------------------------------------------------------------------------------------------------|
 | `--instructions <TEXT>` | What to rate and how (required).                                                                 |
-| `--level <DESC>`        | One scale level, **low to high**. Repeatable, and at least two are required. Order is preserved. |
+| `--level <DESC>`        | One scale level, **low to high**. Repeatable, and at least two are required (10 at most on `jev-1.13`). Order is preserved. |
 
 ```bash
 $ omni-dev ai jev score "This is the THIRD time I've asked. Fix it today." \
@@ -317,8 +317,8 @@ the Jev wire shape, with a `type` of `choice`, `score` or `noul`:
 
 | `type`   | `criteria`                                                |
 |----------|-----------------------------------------------------------|
-| `choice` | Required map of option name to description, at least two. |
-| `score`  | Required list of levels, low to high, at least two.       |
+| `choice` | Required map of option name to description, at least two (255 at most on `jev-1.13`). |
+| `score`  | Required list of levels, low to high, at least two (10 at most on `jev-1.13`). |
 | `noul`   | Optional map with `"true"` and/or `"false"` descriptions. |
 
 ```yaml
@@ -397,7 +397,9 @@ a spec with an unknown `type` or a missing required field, which fails with
 `Failed to parse questions file <path>` plus the parser's reason. Each spec is
 also held to the same minimums as the single-question subcommands: a `choice`
 with fewer than two options, or a `score` with fewer than two levels, fails
-with an error naming the question.
+with an error naming the question. The same goes for a `choice` over 255
+options or a `score` over 10 levels (see
+[Keep the state small and relevant](#keep-the-state-small-and-relevant)).
 
 These minimums are omni-dev's own rule, not the API's. The API accepts a
 one-option `choice` or a one-level `score`, but it can only answer either one
@@ -1359,10 +1361,19 @@ the version you use. TypeSafe's
 about 32k tokens for the whole request, so treat 32k as the safe budget until
 the two agree.
 
-omni-dev checks only the minimums locally (two options, two levels). It does
-not check the token limits or the 255-option and 10-level caps, so the API is
-what rejects an oversized request. If a `choice` needs more than 255 options,
-split it into two stages: first choose a group, then choose within that group.
+omni-dev checks the minimums (two options, two levels) and the 255-option and
+10-level caps locally, before any request is sent, and the error names the
+question. It does not check the token limits, so the API is what rejects an
+oversized request. If a `choice` needs more than 255 options, split it into two
+stages: first choose a group, then choose within that group.
+
+The caps belong to a model version, so omni-dev enforces them only where it
+knows them: for `jev-latest` (which resolves to `jev-1.13.x` today) and for
+`jev-1.13` and `jev-1.13.<patch>`. For any other `--jev-model` the caps are
+not checked, so a later model that raises them is not blocked by a stale
+number, and the API stays the judge. The minimums apply to every model. When
+TypeSafe documents new caps, add them to `QuestionLimits::for_model` in
+`src/jev/protocol.rs`.
 
 ### Leave exact work to code
 

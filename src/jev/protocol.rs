@@ -81,6 +81,61 @@ pub const MIN_CHOICE_OPTIONS: usize = 2;
 /// Minimum number of levels a [`Question::Score`] scale must have.
 pub const MIN_SCORE_LEVELS: usize = 2;
 
+/// Most options a [`Question::Choice`] may offer on `jev-1.13`.
+pub const MAX_CHOICE_OPTIONS: usize = 255;
+
+/// Most levels a [`Question::Score`] scale may have on `jev-1.13`.
+pub const MAX_SCORE_LEVELS: usize = 10;
+
+/// The upper size limits a model accepts, per question type.
+///
+/// Unlike the minimums, which are omni-dev policy, these are **API limits that
+/// belong to a model version**: a later model may raise them. `None` means
+/// "not known, so not enforced", which is what every model without an entry in
+/// [`QuestionLimits::for_model`] gets, so a stale cap can never block a valid
+/// request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuestionLimits {
+    /// Most options a `choice` may offer.
+    pub max_choice_options: Option<usize>,
+    /// Most levels a `score` scale may have.
+    pub max_score_levels: Option<usize>,
+}
+
+impl QuestionLimits {
+    /// No caps are enforced.
+    pub const UNLIMITED: Self = Self {
+        max_choice_options: None,
+        max_score_levels: None,
+    };
+
+    /// The documented `jev-1.13.0` caps.
+    const JEV_1_13: Self = Self {
+        max_choice_options: Some(MAX_CHOICE_OPTIONS),
+        max_score_levels: Some(MAX_SCORE_LEVELS),
+    };
+
+    /// The limits for `model`: the single table to extend when a model
+    /// documents different caps.
+    ///
+    /// `jev-latest` is enforced with the `jev-1.13` caps because that is what
+    /// it resolves to today; re-check it when the alias moves. `jev-1.13` and
+    /// `jev-1.13.<patch>` match, but `jev-1.130` does not. Any other model gets
+    /// [`Self::UNLIMITED`].
+    #[must_use]
+    pub fn for_model(model: &str) -> Self {
+        let is_1_13 = model == "jev-1.13"
+            || model
+                .strip_prefix("jev-1.13.")
+                .is_some_and(|patch| !patch.is_empty());
+        if model == DEFAULT_MODEL || is_1_13 {
+            Self::JEV_1_13
+        } else {
+            Self::UNLIMITED
+        }
+    }
+}
+
 impl Question {
     /// Rejects degenerate questions: a `choice` needs at least
     /// [`MIN_CHOICE_OPTIONS`] options and a `score` at least
@@ -95,6 +150,44 @@ impl Question {
     /// [`BTreeMap`] has already collapsed them — so the `--option` parser
     /// checks those itself.
     pub fn validate(&self) -> Result<(), JevError> {
+        self.check_minimums()
+    }
+
+    /// [`Self::validate`], plus the upper size limits `model` is known to
+    /// enforce (see [`QuestionLimits::for_model`]). The minimums apply to every
+    /// model; the caps only to a model whose limits are known, so the error
+    /// names the model they came from.
+    pub fn validate_for_model(&self, model: &str) -> Result<(), JevError> {
+        self.check_minimums()?;
+        let limits = QuestionLimits::for_model(model);
+        match self {
+            Self::Choice { criteria, .. }
+                if limits
+                    .max_choice_options
+                    .is_some_and(|max| criteria.len() > max) =>
+            {
+                Err(JevError::InvalidQuestionSpec(format!(
+                    "a choice question accepts at most {} options on {model}, got {}",
+                    limits.max_choice_options.unwrap_or_default(),
+                    criteria.len()
+                )))
+            }
+            Self::Score { criteria, .. }
+                if limits
+                    .max_score_levels
+                    .is_some_and(|max| criteria.len() > max) =>
+            {
+                Err(JevError::InvalidQuestionSpec(format!(
+                    "a score question accepts at most {} levels on {model}, got {}",
+                    limits.max_score_levels.unwrap_or_default(),
+                    criteria.len()
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn check_minimums(&self) -> Result<(), JevError> {
         match self {
             Self::Choice { criteria, .. } if criteria.len() < MIN_CHOICE_OPTIONS => {
                 Err(JevError::InvalidQuestionSpec(format!(
@@ -402,6 +495,64 @@ mod tests {
             assert!(err.to_string().contains(&format!("got {n}")));
         }
         score_with(2).validate().unwrap();
+    }
+
+    #[test]
+    fn validate_for_model_enforces_the_caps_at_their_boundary() {
+        choice_with(255).validate_for_model("jev-1.13.0").unwrap();
+        let err = choice_with(256)
+            .validate_for_model("jev-1.13.0")
+            .unwrap_err();
+        assert!(matches!(err, JevError::InvalidQuestionSpec(_)));
+        assert_eq!(
+            err.to_string(),
+            "Invalid question specification: a choice question accepts at most 255 options on jev-1.13.0, got 256"
+        );
+        score_with(10).validate_for_model("jev-1.13.0").unwrap();
+        let err = score_with(11).validate_for_model("jev-1.13.0").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("a score question accepts at most 10 levels on jev-1.13.0, got 11"));
+    }
+
+    #[test]
+    fn validate_for_model_enforces_the_caps_for_the_default_alias() {
+        assert!(choice_with(256).validate_for_model(DEFAULT_MODEL).is_err());
+        assert!(score_with(11).validate_for_model(DEFAULT_MODEL).is_err());
+    }
+
+    #[test]
+    fn validate_for_model_leaves_unknown_models_uncapped() {
+        for model in ["jev-2.0", "jev-1.130", "jev-1.13.", "jev-1.14.0", ""] {
+            choice_with(300).validate_for_model(model).unwrap();
+            score_with(20).validate_for_model(model).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_for_model_keeps_the_minimums_for_every_model() {
+        for model in ["jev-1.13.0", "jev-2.0"] {
+            assert!(choice_with(1).validate_for_model(model).is_err());
+            assert!(score_with(1).validate_for_model(model).is_err());
+        }
+    }
+
+    #[test]
+    fn for_model_matches_the_1_13_family_only() {
+        let capped = QuestionLimits {
+            max_choice_options: Some(255),
+            max_score_levels: Some(10),
+        };
+        for model in ["jev-latest", "jev-1.13", "jev-1.13.0", "jev-1.13.7"] {
+            assert_eq!(QuestionLimits::for_model(model), capped, "{model}");
+        }
+        for model in ["jev-1.130", "jev-1.12.0", "jev-2.0.0", "jev-latest-x"] {
+            assert_eq!(
+                QuestionLimits::for_model(model),
+                QuestionLimits::UNLIMITED,
+                "{model}"
+            );
+        }
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub struct ChoiceCommand {
     #[arg(long)]
     pub instructions: String,
 
-    /// A `NAME=DESCRIPTION` option. Repeatable; at least two are required.
+    /// A `NAME=DESCRIPTION` option. Repeatable; at least two are required (255 at most on `jev-1.13`).
     #[arg(long = "option", value_name = "NAME=DESC", value_parser = parse_option_kv)]
     pub option: Vec<(String, String)>,
 
@@ -83,7 +83,7 @@ fn parse_option_kv(s: &str) -> Result<(String, String), String> {
 
 /// Builds and sends the choice request, returning the formatted output.
 ///
-/// Pure validation (duplicate names, then the minimum option count via
+/// Pure validation (duplicate names, then the option-count limits via
 /// [`Question::validate`]) happens here, before stdin is read, rather than
 /// in `execute`, so it is testable without an env or a network call
 /// (STYLE-0025).
@@ -110,7 +110,7 @@ async fn run_choice(
         instructions: instructions.to_string(),
         criteria,
     };
-    question.validate()?;
+    question.validate_for_model(model)?;
 
     let raw_state = resolve_state(state)?;
     let state_value = build_state_value(&raw_state, state_json)?;
@@ -205,6 +205,71 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("got 0"));
+    }
+
+    fn numbered_options(n: usize) -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| (format!("o{i}"), "desc".to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn run_choice_rejects_more_than_255_options_before_any_request() {
+        let err = run_choice(
+            &dead_client(),
+            "jev-1.13.0",
+            Some("state".to_string()),
+            false,
+            "route this",
+            numbered_options(256),
+            JevFormat::Json,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<JevError>(),
+            Some(JevError::InvalidQuestionSpec(_))
+        ));
+        assert!(err
+            .to_string()
+            .contains("at most 255 options on jev-1.13.0, got 256"));
+    }
+
+    #[tokio::test]
+    async fn run_choice_sends_more_than_255_options_to_an_unknown_model() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/systemone"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "jev-2.0.0",
+                    "answers": {
+                        "answer": {
+                            "type": "choice",
+                            "choice": "o0",
+                            "confidence": 0.5,
+                            "probabilities": {"o0": 0.5}
+                        }
+                    },
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = JevClient::new(&server.uri(), "my-key").unwrap();
+        run_choice(
+            &client,
+            "jev-2.0.0",
+            Some("state".to_string()),
+            false,
+            "route this",
+            numbered_options(300),
+            JevFormat::Json,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

@@ -312,7 +312,7 @@ Arguments:
 Options:
       --state-json                   Parses `state` as JSON/YAML instead of sending it as a literal string
       --instructions <INSTRUCTIONS>  What to choose and why
-      --option <NAME=DESC>           A `NAME=DESCRIPTION` option. Repeatable; at least two are required
+      --option <NAME=DESC>           A `NAME=DESCRIPTION` option. Repeatable; at least two are required (255 at most on `jev-1.13`)
   -o, --output <OUTPUT>              Output format [default: json] [possible values: json, yaml]
       --jev-model <MODEL>            Overrides the configured Jev model for this call
   -h, --help                         Print help (see more with '--help')
@@ -380,7 +380,7 @@ Arguments:
 Options:
       --state-json                   Parses `state` as JSON/YAML instead of sending it as a literal string
       --instructions <INSTRUCTIONS>  What to rate and how
-      --level <DESC>                 A scale level, low to high. Repeatable; at least two are required. Order is significant and preserved
+      --level <DESC>                 A scale level, low to high. Repeatable; at least two are required (10 at most on `jev-1.13`). Order is significant and preserved
   -o, --output <OUTPUT>              Output format [default: json] [possible values: json, yaml]
       --jev-model <MODEL>            Overrides the configured Jev model for this call
   -h, --help                         Print help (see more with '--help')
