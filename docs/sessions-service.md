@@ -258,17 +258,29 @@ a new `confirm_pid_liveness`:
   immediately, through the same short ended-linger window a clean `SessionEnd`
   uses, instead of lingering for up to 5 minutes.
 - **A pid is alive, its identity is confirmed, the session has had at least one
-  `UserPromptSubmit`, and it is the most recently *active* `session_id` (by
-  `last_seen`) among every candidate sharing that pid:** refresh `last_seen`,
+  `UserPromptSubmit`, it has never been reported by the
+  [stream wrapper](#the-stream-wrapper-feed-4), and it is the most recently
+  *active* `session_id` (by `last_seen`) among every candidate sharing that
+  pid:** refresh `last_seen`,
   which is all it takes to keep the ordinary TTL reap from ever seeing the
   entry go stale.
 
-The two extra conditions on the second bullet close two ways a live pid could
+The extra conditions on the second bullet close three ways a live pid could
 still be the *wrong* reason to keep a row:
 
 - **Prompted.** Otherwise a spare process VS Code keeps alive that is never
   prompted would pin a `starting` row forever just because its pid lives — the
   #1454-style pinning bug this feature must not reintroduce.
+- **Not stream-wrapped (#1454).** `claude-wrap` is only attached to a VS Code/SDK
+  `claude`, whose extension keeps a process per *chat* rather than per visible
+  tab. A finished chat that was prompted keeps a live pid indefinitely, so on an
+  install with both the hooks and the wrapper this watcher would pin it exactly as
+  the wrapper's idle keep-alive used to. A session the wrapper has reported
+  (`SessionEntry::streamed`, set by a Claude `StreamState` and never cleared) is
+  therefore left to the TTL — the wrapper's own keep-alive holds its *busy* states
+  — while a confirmed pid still *ending* it on exit is unchanged. Codex's wrapper
+  and pi's extension are not affected. A terminal `claude` has no such
+  per-chat-process behaviour and keeps the exemption.
 - **Most recently active under the pid, by `last_seen` rather than creation
   order.** `/clear` (and possibly `/resume`) can start a new `session_id` in
   the *same* process without necessarily firing `SessionEnd` for the old one,
@@ -462,8 +474,18 @@ losing state visibility, never Claude failing to launch. It **never logs or
 persists conversation content** — only the state, `session_id`, `cwd` and model
 leave the process.
 
-It also re-reports the current state every 30s, so a wrapped session idle at the
-prompt does **not** age out on the 5-minute TTL the way a hook-fed one does.
+It also re-reports a **busy** state (`working`, `waiting_for_*`) every 30s, so a
+long silent turn or an unanswered permission prompt does not age out on the
+5-minute TTL. An **idle** session is deliberately *not* re-reported (#1454): the
+Claude VS Code extension keeps a `claude` process per chat in a window, not per
+visible tab, so a never-prompted spare or a conversation finished hours ago stays
+alive indefinitely, and pinning every such process would inflate a worktree's
+session cue and `sessions list` — and only ever grow within a long-lived window.
+Process lifetime is not tab visibility. The transition to idle is still reported
+once, after which the session ages out on the TTL like a hook-fed one and
+re-appears the moment it next does anything. The same reasoning excludes a session
+the wrapper has reported from the [pid liveness watcher's](#pid-based-liveness-1916)
+TTL exemption, though its death is still noticed promptly.
 
 Coverage is the VS Code extension's Claude tabs. Terminal Claude
 (`claudeCode.useTerminal`, or `claude` in any shell) is not stream-json and is not
@@ -862,8 +884,11 @@ always includes it.
 
 - **Idle-session liveness.** Without a dedicated event, idle sessions age out on
   the TTL — for the feeds that lack one. A wrapped session (Feed 4) heartbeats
-  itself; a future refinement could keep the rest alive off their window's
-  heartbeat.
+  itself while busy only, deliberately not while idle (#1454); a future refinement
+  could keep the rest alive off their window's heartbeat. Capping a window's
+  sessions by its reported tab count, or hiding sessions whose transcript file does
+  not exist, would trim the phantoms a long-lived idle chat sits among without
+  this cost, and remain unbuilt.
 - **Per-tab attribution** stays heuristic until (if ever) the Claude extension
   exposes a tab↔session API. Note the wrapper does *not* fix this: it knows its
   own session exactly, but still cannot say which tab is showing it.
