@@ -31,6 +31,14 @@ it never runs git.
 If the daemon is **not running**, every call is a silent no-op: the extension
 never surfaces an error or blocks the window.
 
+## Terminal in Editor
+
+Open the terminal panel's **+ ▾** menu and choose **Terminal in Editor** to
+create a fresh shell terminal as a focused editor tab. Each selection opens a
+new terminal using VS Code's normal shell and working-directory configuration.
+This works without the omni-dev daemon running. Existing terminal profiles and
+the default **+** action keep their configured behavior.
+
 ## Worktrees view
 
 The **Worktrees** activity-bar view lists every repository and git worktree open

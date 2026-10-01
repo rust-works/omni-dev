@@ -22,10 +22,20 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onTerminalProfile:omniDevWorktrees.terminalInEditor"
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "terminal": {
+      "profiles": [
+        {
+          "id": "omniDevWorktrees.terminalInEditor",
+          "title": "Terminal in Editor",
+          "icon": "terminal"
+        }
+      ]
+    },
     "configurationDefaults": {
       "terminal.integrated.tabs.title": "${sequence}"
     },
