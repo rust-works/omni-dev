@@ -1046,8 +1046,10 @@ fn resolve_source(cwd: Option<&Path>, windows: &[WindowEntry]) -> Source {
 }
 
 /// Picks the window a session at `cwd` is attributed to, among the windows with
-/// a folder that is a prefix of it: the most recently registered, then the
-/// lowest key (#1451).
+/// a folder that is a prefix of it: the longest matching folder (the most
+/// specific root, so a later-opened parent-folder window does not outrank the
+/// window the session actually runs in), then the most recently registered,
+/// then the lowest key (#1451).
 ///
 /// A window reload registers a fresh companion-generated key while the old
 /// registration can live on for up to the window TTL, so the newest
@@ -1064,13 +1066,24 @@ fn pick_window<'a>(
 ) -> Option<&'a WindowReport> {
     windows
         .into_iter()
-        .filter(|e| e.report.folders.iter().any(|f| cwd.starts_with(f)))
-        .min_by(|a, b| {
-            b.registered_at
-                .cmp(&a.registered_at)
+        .filter_map(|e| Some((e, match_depth(cwd, &e.report.folders)?)))
+        .min_by(|(a, a_depth), (b, b_depth)| {
+            b_depth
+                .cmp(a_depth)
+                .then_with(|| b.registered_at.cmp(&a.registered_at))
                 .then_with(|| a.report.key.cmp(&b.report.key))
         })
-        .map(|e| &e.report)
+        .map(|(e, _)| &e.report)
+}
+
+/// The component count of the longest of `folders` that is a prefix of `cwd`,
+/// or `None` when none is.
+fn match_depth(cwd: &Path, folders: &[PathBuf]) -> Option<usize> {
+    folders
+        .iter()
+        .filter(|f| cwd.starts_with(f))
+        .map(|f| f.components().count())
+        .max()
 }
 
 /// Removes sessions last seen longer than their TTL ago (a shorter
@@ -1536,6 +1549,31 @@ mod tests {
         // A heartbeat from the old window must not take the session back.
         reg.report_window(window_report("39-old", "/p", true));
         assert_eq!(reg.list()[0].source, vscode("52-new"));
+    }
+
+    #[test]
+    fn a_more_specific_folder_outranks_a_newer_parent_window() {
+        let now = Utc::now();
+        let entry = |key: &str, folder: &str, age_secs: i64| WindowEntry {
+            report: window_report(key, folder, true),
+            last_seen: now,
+            registered_at: now - chrono::Duration::seconds(age_secs),
+        };
+        // `parent` registered later and has the lower key, but `/repo/sub` is the
+        // root the session actually runs in.
+        let windows = vec![
+            entry("a-parent", "/repo", 1),
+            entry("z-sub", "/repo/sub", 50),
+        ];
+        assert_eq!(
+            resolve_source(Some(Path::new("/repo/sub/x")), &windows),
+            vscode("z-sub")
+        );
+        // A session outside `/repo/sub` still falls to the parent window.
+        assert_eq!(
+            resolve_source(Some(Path::new("/repo/other")), &windows),
+            vscode("a-parent")
+        );
     }
 
     #[test]
