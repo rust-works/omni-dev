@@ -915,7 +915,7 @@ omni-dev git commit message twiddle 'main..HEAD' --concurrency 2
 | `--beta-header KEY:VALUE` | Beta header for API requests (model-gated) | `--beta-header key:value` |
 | `--concurrency N` | Number of parallel commit processors (default: 4) | `--concurrency 3` |
 | `--no-coherence` | Skip cross-commit coherence refinement pass | `--no-coherence` |
-| `--no-ai` | Skip AI; output the repository analysis YAML only | `--no-ai` |
+| `--no-ai` | Skip AI; amend to a deterministic type/scope suggestion, leaving conforming commits untouched | `--no-ai` |
 | `--auto-apply` | Apply without confirmation | `--auto-apply` |
 | `--allow-pushed` | Allow amending commits already in remote main branches | `--allow-pushed` |
 | `--check` | Validate the messages after applying | `--check` |
