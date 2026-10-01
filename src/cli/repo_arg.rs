@@ -1,10 +1,11 @@
 //! The `-C/--repo` flag, scoped to the commands that act on a local repository.
 //!
 //! Flattened as a subtree-`global = true` arg onto `git`, `coverage`,
-//! `config scopes`, and `ai claude skills` (every leaf below them reads it), and onto the
-//! `worktrees rebase` / `worktrees push` leaves (the only `worktrees`
-//! subcommands that touch the local repository) — per the placement rule in
-//! [`crate::cli::ai_backend_args`]. Everywhere else clap rejects it rather
+//! `config scopes`, and `ai claude skills` (every leaf below them reads it),
+//! and onto the `worktrees rebase` / `worktrees push` leaves (the only
+//! `worktrees` subcommands that touch the local repository) — per the
+//! placement rule in [`crate::cli::ai_backend_args`]. Everywhere else clap
+//! rejects it rather
 //! than silently ignoring it (#1778).
 
 use std::path::{Path, PathBuf};
