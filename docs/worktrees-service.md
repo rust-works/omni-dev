@@ -1109,7 +1109,10 @@ real rebase-target divergence, with no rebase — or even a fetch — required.
 2. **Execute.** The daemon **re-plans from scratch** (a worktree that went dirty
    between the phases is skipped, not rebased) and rebases each still-pending
    worktree sequentially, then a summary toast reports the outcome, naming every
-   worktree left mid-rebase with a conflict.
+   worktree left mid-rebase with a conflict. Structural skips are counted with
+   readable, grouped reasons, including in a mixed batch: `rebased 2 worktrees;
+   1 skipped (uncommitted changes)`. Skips or conflicts raise a warning; a failed
+   fetch takes precedence as an error. The summary uses execution-time results.
 
 **Conflicts are left in place.** This surface always sends `keep_conflicts`, so a
 worktree that hits conflicts stays **mid-rebase** with its markers on disk instead
