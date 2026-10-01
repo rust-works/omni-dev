@@ -133,9 +133,9 @@ export async function rebaseOnMain(
 }
 
 /**
- * Toasts the phase-2 outcome. A worktree left mid-rebase raises this to a warning
- * and is named — it is the one case that still needs the user, and the tree row
- * keeps cueing it until the conflict is resolved.
+ * Toasts the phase-2 outcome. Conflicts and structural skips raise a warning;
+ * failed fetches raise an error. Conflicted worktrees are named, and their tree
+ * rows keep cueing them until the conflicts are resolved.
  */
 function reportSummary(reply: RebaseReply): void {
   const { severity, message } = summarize(reply);

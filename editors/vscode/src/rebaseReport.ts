@@ -92,14 +92,19 @@ export function nothingToRebaseMessage(reply: RebaseReply, total: number): strin
       ? `${upToDate === total ? "all" : upToDate} already up to date`
       : "nothing to rebase";
   }
-  const reasons = [...new Set(skipped.map((s) => skipReasonText(s.reason)))].join(", ");
+  const reasons = skipReasons(skipped);
   const upToDateSuffix = upToDate > 0 ? `, ${upToDate} already up to date` : "";
   return `${skipped.length} of ${total} skipped (${reasons})${upToDateSuffix}`;
 }
 
+/** Distinct readable skip reasons, in the order first reported by the daemon. */
+function skipReasons(skipped: RebaseOutcome[]): string {
+  return [...new Set(skipped.map((s) => skipReasonText(s.reason)))].join(", ");
+}
+
 /** How a phase-2 result should be surfaced. */
 export interface RebaseSummary {
-  /** `error` for a failure, `warning` for conflicts to resolve, else `info`. */
+  /** `error` for a failed fetch, `warning` for conflicts or skips, else `info`. */
   severity: "info" | "warning" | "error";
   message: string;
 }
@@ -118,6 +123,9 @@ export function summarize(reply: RebaseReply): RebaseSummary {
   const rebased = worktrees.filter((w) => w.status === REBASED);
   const conflicted = worktrees.filter((w) => w.status === CONFLICT);
   const failedFetch = worktrees.filter((w) => w.status === "fetch-failed");
+  // skippedOutcomes is a phase-1 exclusion filter; on phase 2 it would also
+  // count rebased/conflicted/fetch-failed rows. Only structural skips belong here.
+  const skipped = worktrees.filter((w) => w.status === "skipped");
 
   const parts: string[] = [];
   if (rebased.length > 0) {
@@ -135,10 +143,17 @@ export function summarize(reply: RebaseReply): RebaseSummary {
   if (failedFetch.length > 0) {
     parts.push(`${failedFetch.length} skipped after a failed fetch`);
   }
+  if (skipped.length > 0) {
+    parts.push(`${skipped.length} skipped (${skipReasons(skipped)})`);
+  }
   if (parts.length === 0) {
     return { severity: "info", message: "nothing was rebased" };
   }
   const severity: RebaseSummary["severity"] =
-    failedFetch.length > 0 ? "error" : conflicted.length > 0 ? "warning" : "info";
+    failedFetch.length > 0
+      ? "error"
+      : conflicted.length > 0 || skipped.length > 0
+        ? "warning"
+        : "info";
   return { severity, message: parts.join("; ") };
 }

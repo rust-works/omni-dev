@@ -156,3 +156,86 @@ test("summarize escalates a failed fetch to an error", () => {
 test("summarize says so when nothing happened", () => {
   assert.deepEqual(summarize({}), { severity: "info", message: "nothing was rebased" });
 });
+
+test("summarize warns when a mixed batch skips a dirty worktree", () => {
+  assert.deepEqual(
+    summarize({
+      worktrees: [
+        outcome({ status: "rebased", branch: "a" }),
+        outcome({ status: "rebased", branch: "b" }),
+        outcome({ status: "skipped", branch: "c", reason: "dirty" }),
+      ],
+    }),
+    { severity: "warning", message: "rebased 2 worktrees; 1 skipped (uncommitted changes)" },
+  );
+});
+
+test("summarize counts skipped worktrees and groups reasons in first-seen order", () => {
+  assert.deepEqual(
+    summarize({
+      worktrees: [
+        outcome({ status: "rebased" }),
+        outcome({ status: "skipped", reason: "dirty" }),
+        outcome({ status: "skipped", reason: "detached-head" }),
+        outcome({ status: "skipped", reason: "dirty" }),
+        outcome({ status: "skipped", reason: "operation-in-progress" }),
+        outcome({ status: "up-to-date" }),
+      ],
+    }),
+    {
+      severity: "warning",
+      message:
+        "rebased 1 worktree; 4 skipped (uncommitted changes, detached HEAD, a rebase or merge already in progress)",
+    },
+  );
+});
+
+test("summarize reports an execute-time all-skipped batch with fallback reasons", () => {
+  assert.deepEqual(
+    summarize({
+      worktrees: [
+        outcome({ status: "skipped", reason: "dirty" }),
+        outcome({ status: "skipped", reason: "something-new" }),
+        outcome({ status: "skipped" }),
+      ],
+    }),
+    { severity: "warning", message: "3 skipped (uncommitted changes, something-new, skipped)" },
+  );
+});
+
+test("summarize keeps conflict guidance alongside structural skips", () => {
+  assert.deepEqual(
+    summarize({
+      worktrees: [
+        outcome({ status: "rebased", branch: "a" }),
+        outcome({ status: "conflict", branch: "b", left_in_place: true }),
+        outcome({ status: "skipped", reason: "dirty" }),
+      ],
+    }),
+    {
+      severity: "warning",
+      message:
+        "rebased 1 worktree; 1 left mid-rebase to resolve: b — fix the conflicts, then `git rebase --continue`; 1 skipped (uncommitted changes)",
+    },
+  );
+});
+
+test("summarize gives failed fetches priority without counting them as structural skips", () => {
+  for (const conflicts of [[], [outcome({ status: "conflict", branch: "b", left_in_place: true })]]) {
+    const summary = summarize({
+      worktrees: [
+        outcome({ status: "rebased" }),
+        ...conflicts,
+        outcome({ status: "fetch-failed" }),
+        outcome({ status: "skipped", reason: "dirty" }),
+        outcome({ status: "up-to-date" }),
+      ],
+    });
+    assert.equal(summary.severity, "error");
+    assert.match(summary.message, /rebased 1 worktree/);
+    assert.match(summary.message, /1 skipped after a failed fetch; 1 skipped \(uncommitted changes\)$/);
+    if (conflicts.length > 0) {
+      assert.match(summary.message, /left mid-rebase to resolve: b/);
+    }
+  }
+});

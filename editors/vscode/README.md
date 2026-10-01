@@ -174,11 +174,13 @@ once** for the whole batch, so keeping a fan-out of feature branches, and your
 own main checkout, current is one gesture instead of one `cd` and one
 `git pull --rebase` each.
 
-- It **always confirms first**, listing exactly which branches would be
-  rewritten, each with its real behind-count measured against the freshly
-  fetched target — a rebase rewrites history.
+- It **checks first, then executes without a confirmation modal**. The daemon
+  re-checks every worktree before rewriting it ([ADR-0062](../../docs/adrs/adr-0062.md)).
 - Worktrees with uncommitted changes, a detached `HEAD`, or a rebase already in
-  progress are **reported and skipped**, not touched.
+  progress are **reported and skipped**, not touched. If some worktrees rebase
+  while others are skipped, the completion warning reports both the rebased
+  count and the skip count with reasons, for example: `rebased 2 worktrees;
+  1 skipped (uncommitted changes)`.
 - A rebase that hits **conflicts is left mid-rebase** rather than rolled back,
   so you can resolve it in place and finish with `git rebase --continue`; the
   row keeps cueing it until you do, even across a restart. The rest of the
