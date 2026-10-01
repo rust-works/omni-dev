@@ -42,12 +42,12 @@ use super::ledger::{
 use super::progress::InsertProgressEvent;
 use super::report::{InsertAction, InsertError, InsertReport, SkipReason};
 
-/// Default `--concurrency`. Deliberately far below `sync`'s default of 20:
+/// Default `--concurrency`. The shared cap is five; four limits the number
+/// of inserts in flight (and thus un-ledgered) if the process crashes.
 /// `messages.insert` costs [`MESSAGES_INSERT_COST_UNITS`] (25) against a
-/// 100-units/second bucket, so the limiter admits at most roughly 4 inserts/second
-/// before probe costs, regardless of fan-out — a wider `buffer_unordered` window
-/// buys no extra throughput here, and only widens the set of inserts that
-/// are in flight (and thus un-ledgered) if the process crashes mid-run.
+/// 100-units/second bucket, giving a sustained admission ceiling of roughly
+/// four inserts/second before probe costs. Actual throughput also depends
+/// on request latency and the concurrency bound.
 pub(crate) const DEFAULT_INSERT_CONCURRENCY: usize = 4;
 
 /// Number of ledger entries between checkpoints during the fan-out — an
