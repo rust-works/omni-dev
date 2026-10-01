@@ -729,6 +729,17 @@ mod tests {
     }
 
     #[test]
+    fn deferred_warning_lines_reports_an_unscheduled_entry() {
+        let entry = DeferredFetch {
+            next_retry_at: None,
+            last_error: None,
+            ..deferred("m1", 2)
+        };
+        let lines = deferred_warning_lines(&[entry]);
+        assert!(lines[1].contains("next retry unscheduled"), "{}", lines[1]);
+    }
+
+    #[test]
     fn deferred_warning_lines_caps_the_per_id_lines_and_counts_the_rest() {
         let many: Vec<DeferredFetch> = (0..13).map(|n| deferred(&format!("m{n}"), 2)).collect();
         let lines = deferred_warning_lines(&many);

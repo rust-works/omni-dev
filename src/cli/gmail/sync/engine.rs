@@ -1645,6 +1645,31 @@ not-really-a-pdf\r\n\
         }
     }
 
+    #[tokio::test]
+    async fn run_sync_with_unreadable_state_reconciles_from_scratch() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(state_path(&output_dir), "not json\n").unwrap();
+
+        mount_profile(&server, "user@example.com", "999").await;
+        mount_message_list(&server, &["m1"]).await;
+        mount_raw_get(&server, "m1", "Hello").await;
+
+        let report = run_sync(&client, &opts(output_dir.clone())).await.unwrap();
+
+        assert!(report.actions.iter().any(
+            |a| matches!(a, SyncAction::Note { message } if message.contains("state.json unreadable"))
+        ));
+        assert!(report
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Fetched { id, .. } if id == "m1")));
+        assert_eq!(load_present(&output_dir).history_id, "999");
+    }
+
     // ── valid watermark applies all 4 event types ─────────────────────
 
     #[tokio::test]
@@ -3448,10 +3473,11 @@ not-really-a-pdf\r\n\
         assert_eq!(report.deferred[0].id, "m1");
         assert_eq!(report.deferred[0].failures, 3);
         assert_eq!(report.deferred[0].next_retry_at, entry.next_retry_at);
-        assert!(!report.actions.iter().any(|a| matches!(
-            a,
-            SyncAction::Note { message } if message.contains("retrying")
-        )));
+        assert!(
+            report.actions.is_empty(),
+            "a deferred id is neither fetched nor retried: {:?}",
+            report.actions
+        );
         let s = load_present(&output_dir);
         assert_eq!(s.history_id, "200", "the watermark still advances");
         assert_eq!(s.pending_fetch, [entry], "a deferred entry is untouched");
