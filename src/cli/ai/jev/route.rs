@@ -15,10 +15,10 @@ use crate::jev::citations::{find_citations, Citation};
 use crate::jev::client::JevClient;
 use crate::jev::config::JevConfig;
 use crate::jev::route::{
-    build_route_citation_text, is_ignored_closed, render_route_text, render_route_text_styled,
-    run_route_with_reference_fetch_failures, Ladder, OpenDependencies, Provider,
-    ReferenceFetchFailure, ReferenceFetchFailures, RouteOptions, RouteReport, TerminalStyle, Tiers,
-    DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
+    build_route_citation_text_with_drafts, is_ignored_closed, render_route_text,
+    render_route_text_styled, run_route_with_reference_fetch_failures, Ladder, OpenDependencies,
+    Provider, ReferenceFetchFailure, ReferenceFetchFailures, RouteOptions, RouteReport,
+    TerminalStyle, Tiers, DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
 };
 use crate::provider::{GitProvider, IssueDoc, ItemKind, ItemRef, ItemState};
 use crate::utils::env::{EnvSource, SystemEnv};
@@ -95,6 +95,10 @@ pub struct RouteCommand {
     #[arg(long)]
     pub all_open: bool,
 
+    /// Append a local UTF-8 comment for preview without posting it. Repeatable; one issue only.
+    #[arg(long, value_name = "FILE", conflicts_with = "all_open")]
+    pub draft_comment: Vec<PathBuf>,
+
     /// Ladder names to route against (comma-separated, repeatable): a built-in provider
     /// name or one registered via --ladder-definition.
     #[arg(
@@ -152,6 +156,7 @@ impl RouteCommand {
     /// Executes the route command.
     pub async fn execute(self) -> Result<()> {
         // omni-dev: coverage ignore reason="RouteCommand::execute is the process-bound wiring shell; fetch_docs, run_route_with_reference_fetch_failures, render_output_with_style and terminal_style_with provide its deterministic seams"
+        let drafts = self.load_draft_comments()?;
         let env = crate::utils::settings::SettingsEnv::load();
         let mut config = JevConfig::from_env_with(&env)?;
         if let Some(model) = &self.jev_model {
@@ -159,7 +164,8 @@ impl RouteCommand {
         }
         let ladders = build_ladders(&self.ladders, &self.ladder_definition)?;
         let client = JevClient::from_config(&config)?;
-        let opts = self.route_options(config.model);
+        let mut opts = self.route_options(config.model);
+        opts.draft_comments = drafts.clone();
 
         let bin = crate::pr_status::resolve_gh_binary();
         let cwd = self
@@ -189,6 +195,7 @@ impl RouteCommand {
                 all_open,
                 max_input_chars,
                 ignore_closed,
+                &drafts,
             )
         })
         .await
@@ -199,7 +206,7 @@ impl RouteCommand {
         }
         let (docs, dependencies, reference_fetch_failures) = fetched?;
 
-        let report = run_route_with_reference_fetch_failures(
+        let mut report = run_route_with_reference_fetch_failures(
             &client,
             &docs,
             &ladders,
@@ -208,6 +215,9 @@ impl RouteCommand {
             &reference_fetch_failures,
         )
         .await?;
+        for issue in &mut report.issues {
+            issue.draft_comments.clone_from(&self.draft_comment);
+        }
         print!(
             "{}",
             render_output_with_style(
@@ -223,8 +233,26 @@ impl RouteCommand {
         // omni-dev: coverage end
     }
 
+    fn load_draft_comments(&self) -> Result<Vec<String>> {
+        if !self.draft_comment.is_empty() && (self.all_open || self.issues.len() != 1) {
+            bail!("--draft-comment applies to exactly one ISSUE; cannot preview --all-open or multiple issues");
+        }
+        self.draft_comment
+            .iter()
+            .map(|path| {
+                let body = std::fs::read_to_string(path)
+                    .with_context(|| format!("Failed to read draft comment {}", path.display()))?;
+                if body.trim().is_empty() {
+                    bail!("Draft comment {} is empty", path.display());
+                }
+                Ok(body)
+            })
+            .collect()
+    }
+
     fn route_options(&self, model: String) -> RouteOptions {
         RouteOptions {
+            draft_comments: vec![],
             model,
             close_call: self.close_call,
             effort_advice: self.effort_advice,
@@ -410,6 +438,7 @@ fn failure_summary(report: &RouteReport) -> Option<String> {
 /// when an argument needs it. With `ignore_closed`, a closed issue's
 /// citations are not resolved, since the engine will skip it (#2000).
 /// **Blocking.**
+#[allow(clippy::too_many_arguments)]
 fn fetch_docs(
     bin: &Path,
     cache: &IssueCache,
@@ -418,6 +447,7 @@ fn fetch_docs(
     all_open: bool,
     max_input_chars: usize,
     ignore_closed: bool,
+    drafts: &[String],
 ) -> Result<(Vec<IssueDoc>, OpenDependencies, ReferenceFetchFailures)> {
     let default_project = if all_open || issues.iter().any(|a| needs_default_project(a)) {
         Some(resolve_current_project(bin, cwd).context(
@@ -463,7 +493,7 @@ fn fetch_docs(
         .filter(|d| !is_ignored_closed(d, ignore_closed))
         .collect();
     let (dependencies, reference_fetch_failures) =
-        find_open_dependencies(bin, cache, &routable, max_input_chars)?;
+        find_open_dependencies(bin, cache, &routable, max_input_chars, drafts)?;
     Ok((docs, dependencies, reference_fetch_failures))
 }
 
@@ -476,6 +506,7 @@ fn find_open_dependencies(
     cache: &IssueCache,
     docs: &[&IssueDoc],
     max_input_chars: usize,
+    drafts: &[String],
 ) -> Result<(OpenDependencies, ReferenceFetchFailures)> {
     let mut per_issue: Vec<((String, u64), Vec<Citation>)> = Vec::new();
     let mut seen = HashSet::new();
@@ -487,7 +518,7 @@ fn find_open_dependencies(
             kind: doc.kind,
             number: doc.number,
         };
-        let text = build_route_citation_text(doc, max_input_chars);
+        let text = build_route_citation_text_with_drafts(doc, max_input_chars, drafts);
         let citations = find_citations(&text, &doc.project, &judged);
         for citation in &citations {
             let key = (citation.item_ref.project.clone(), citation.item_ref.number);
@@ -570,6 +601,157 @@ mod tests {
             panic!("expected ai jev route");
         };
         Ok(route)
+    }
+
+    #[test]
+    fn draft_comments_load_in_order_and_preserve_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.md");
+        let second = dir.path().join("second.md");
+        std::fs::write(&first, "  décision\n\n  indented\n").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        let cmd = parse(&[
+            "#1",
+            "--draft-comment",
+            first.to_str().unwrap(),
+            "--draft-comment",
+            second.to_str().unwrap(),
+            "--draft-comment",
+            first.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd.draft_comment,
+            [first, second, cmd.draft_comment[0].clone()]
+        );
+        assert_eq!(
+            cmd.load_draft_comments().unwrap(),
+            [
+                "  décision\n\n  indented\n",
+                "second",
+                "  décision\n\n  indented\n"
+            ]
+        );
+        assert!(parse(&["#1"])
+            .unwrap()
+            .load_draft_comments()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn draft_comments_reject_batches_before_reading_files() {
+        assert!(parse(&["--all-open", "--draft-comment", "missing.md"]).is_err());
+        for issues in [["#1", "#2"], ["#1", "1"]] {
+            let cmd = parse(&[issues[0], issues[1], "--draft-comment", "missing.md"]).unwrap();
+            assert!(cmd
+                .load_draft_comments()
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one ISSUE"));
+        }
+    }
+
+    #[test]
+    fn draft_comment_file_errors_name_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("draft.md");
+        let error = || {
+            parse(&["#1", "--draft-comment", path.to_str().unwrap()])
+                .unwrap()
+                .load_draft_comments()
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(error().contains(path.to_str().unwrap()));
+        for bytes in [b"".as_slice(), b" \n\t", &[0xff]] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(error().contains(path.to_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn draft_only_citations_are_resolved_using_retained_masked_input() {
+        for state in ["OPEN", "CLOSED"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (bin, _shim) = fake_gh_with_states(dir.path(), "OPEN", state);
+            let script = std::fs::read_to_string(&bin)
+                .unwrap()
+                .replace("see #2", "No references.");
+            std::fs::write(&bin, script).unwrap();
+            let drafts = ["`#99` and #2 and #2 and #1".into()];
+            let (docs, fetched_deps, fetched_failures) = retry_on_etxtbsy(|| {
+                fetch_docs(
+                    &bin,
+                    &IssueCache::disabled(),
+                    dir.path(),
+                    &["#1".into()],
+                    false,
+                    DEFAULT_MAX_INPUT_CHARS,
+                    false,
+                    &drafts,
+                )
+            })
+            .unwrap();
+            assert_eq!(docs[0].body, "No references.");
+            assert!(docs[0].comments.is_empty());
+            let (deps, failures) = retry_on_etxtbsy(|| {
+                find_open_dependencies(
+                    &bin,
+                    &IssueCache::disabled(),
+                    &[&docs[0]],
+                    DEFAULT_MAX_INPUT_CHARS,
+                    &drafts,
+                )
+            })
+            .unwrap();
+            assert_eq!(deps, fetched_deps);
+            assert_eq!(failures, fetched_failures);
+            assert!(failures.is_empty());
+            if state == "OPEN" {
+                assert_eq!(deps[&(docs[0].project.clone(), 1)].len(), 1);
+                assert_eq!(deps[&(docs[0].project.clone(), 1)][0].raw, "#2");
+            } else {
+                assert!(deps.is_empty());
+            }
+            let (deps, failures) =
+                find_open_dependencies(&bin, &IssueCache::disabled(), &[&docs[0]], 1, &drafts)
+                    .unwrap();
+            assert!(deps.is_empty());
+            assert!(failures.is_empty());
+        }
+    }
+
+    #[test]
+    fn unresolved_draft_citation_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _shim) = fake_gh_with_missing_citation(dir.path());
+        let (mut docs, _, _) = retry_on_etxtbsy(|| {
+            fetch_docs(
+                &bin,
+                &IssueCache::disabled(),
+                dir.path(),
+                &["#1".into()],
+                false,
+                DEFAULT_MAX_INPUT_CHARS,
+                false,
+                &[],
+            )
+        })
+        .unwrap();
+        docs[0].body.clear();
+        let (deps, failures) = retry_on_etxtbsy(|| {
+            find_open_dependencies(
+                &bin,
+                &IssueCache::disabled(),
+                &[&docs[0]],
+                DEFAULT_MAX_INPUT_CHARS,
+                &["See #2".into()],
+            )
+        })
+        .unwrap();
+        assert!(deps.is_empty());
+        assert_eq!(failures[&(docs[0].project.clone(), 1)][0].item_ref, "#2");
     }
 
     #[test]
@@ -826,6 +1008,7 @@ mod tests {
             probabilities: BTreeMap::new(),
         };
         let issue = |outcome| IssueRoute {
+            draft_comments: vec![],
             item_ref: "o/r#1".to_string(),
             url: String::new(),
             title: String::new(),
@@ -886,6 +1069,7 @@ mod tests {
         let report = RouteReport {
             model: "jev-1.13.0".to_string(),
             issues: vec![IssueRoute {
+                draft_comments: vec![],
                 item_ref: "o/r#1".to_string(),
                 url: "u".to_string(),
                 title: "t".to_string(),
@@ -1087,6 +1271,7 @@ mod tests {
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
                 false,
+                &[],
             )
         })
         .unwrap();
@@ -1118,6 +1303,7 @@ mod tests {
                     false,
                     DEFAULT_MAX_INPUT_CHARS,
                     false,
+                    &[],
                 )
             })
             .unwrap();
@@ -1145,6 +1331,7 @@ mod tests {
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
                 false,
+                &[],
             )
         })
         .unwrap();
@@ -1166,6 +1353,7 @@ mod tests {
                 true,
                 DEFAULT_MAX_INPUT_CHARS,
                 false,
+                &[],
             )
         })
         .unwrap();
@@ -1184,6 +1372,7 @@ mod tests {
             false,
             DEFAULT_MAX_INPUT_CHARS,
             false,
+            &[],
         )
         .unwrap_err();
         assert!(err.to_string().contains("-C/--repo"), "{err}");
@@ -1243,6 +1432,7 @@ mod tests {
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
                 false,
+                &[],
             )
         })
         .unwrap();
@@ -1274,6 +1464,7 @@ mod tests {
                 true,
                 DEFAULT_MAX_INPUT_CHARS,
                 true,
+                &[],
             )
         })
         .unwrap();
@@ -1300,6 +1491,7 @@ mod tests {
                 true,
                 DEFAULT_MAX_INPUT_CHARS,
                 false,
+                &[],
             )
         })
         .unwrap();
@@ -1325,6 +1517,7 @@ mod tests {
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
                 true,
+                &[],
             )
         })
         .unwrap();
@@ -1389,6 +1582,7 @@ mod tests {
                     false,
                     DEFAULT_MAX_INPUT_CHARS,
                     false,
+                    &[],
                 )
             })
             .unwrap()
@@ -1488,6 +1682,7 @@ mod tests {
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
                 false,
+                &[],
             )
         })
         .unwrap();
@@ -1515,6 +1710,7 @@ mod tests {
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
                 false,
+                &[],
             )
         })
         .unwrap();
@@ -1538,6 +1734,7 @@ mod tests {
                     false,
                     DEFAULT_MAX_INPUT_CHARS,
                     ignore_closed,
+                    &[],
                 )
             })
             .unwrap()
@@ -1565,6 +1762,7 @@ mod tests {
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
                 false,
+                &[],
             )
         })
         .unwrap();
@@ -1617,6 +1815,7 @@ mod tests {
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
                 false,
+                &[],
             )
         })
         .unwrap();
@@ -1669,6 +1868,7 @@ mod tests {
                 false,
                 DEFAULT_MAX_INPUT_CHARS,
                 false,
+                &[],
             )
         })
         .unwrap();

@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
     let config = JevConfig::from_env()?;
     let client = JevClient::from_config(&config)?;
     let mut options = RouteOptions {
+        draft_comments: vec![],
         model: config.model,
         close_call: DEFAULT_CLOSE_CALL,
         effort_advice: false,
