@@ -520,7 +520,15 @@ omni-dev ai claude skills status --worktrees --format yaml
 # Remove the symlinks and exclude-block entries
 omni-dev ai claude skills clean --worktrees
 omni-dev ai claude skills clean --dry-run
+
+# Run against another repository without cd-ing into it (like `git -C`)
+omni-dev ai claude skills sync -C ~/wrk/canonical --target ../feature-branch
+omni-dev ai claude skills status -C ~/wrk/feature-branch
 ```
+
+`-C/--repo <PATH>` replaces the current directory as the default source
+(`sync`) or target (`status`, `clean`), and a relative `--source`/`--target`
+resolves against it; an absolute path is used as given.
 
 **End-to-end walkthrough**:
 
