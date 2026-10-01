@@ -820,7 +820,7 @@ mod tests {
         assert!(!default.ignore_closed);
         assert_eq!(default.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
         assert!((default.close_call - DEFAULT_CLOSE_CALL).abs() < f64::EPSILON);
-        assert_eq!(default.close_call_margin, DEFAULT_CLOSE_CALL_MARGIN);
+        assert!((default.close_call_margin - DEFAULT_CLOSE_CALL_MARGIN).abs() < f64::EPSILON);
 
         let enabled = parse(&[
             "#1",
@@ -840,7 +840,7 @@ mod tests {
         assert!(enabled.allow_closed);
         assert_eq!(enabled.max_input_chars, 1234);
         assert!((enabled.close_call - 0.42).abs() < f64::EPSILON);
-        assert_eq!(enabled.close_call_margin, 0.15);
+        assert!((enabled.close_call_margin - 0.15).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -852,7 +852,10 @@ mod tests {
                     args.push("--effort-advice");
                 }
                 let options = parse(&args).unwrap().route_options("model".into());
-                assert_eq!(options.close_call_margin, margin.parse::<f64>().unwrap());
+                assert!(
+                    (options.close_call_margin - margin.parse::<f64>().unwrap()).abs()
+                        < f64::EPSILON
+                );
             }
         }
         for margin in ["-0.1", "1.1", "NaN", "inf", "-inf", "invalid"] {
