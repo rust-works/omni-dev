@@ -2358,7 +2358,7 @@ mod tests {
     // ── End-to-end run() tests via shell-script shims ───────────────
 
     #[cfg(unix)]
-    use crate::test_support::shim::{shim_lock, write_exec_script};
+    use crate::test_support::shim::{shim_lock, write_exec_script, write_warmed_exec_script};
 
     /// Exercises the poison-recovery branch of `shim_lock()`: panics in
     /// a helper thread while holding the guard so the mutex becomes
@@ -2701,7 +2701,10 @@ mod tests {
             "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nsleep 30\n",
             pid_file.display()
         );
-        write_exec_script(&shim, &script);
+        // Warmed: the first exec of a freshly-written file costs 150-600 ms on a
+        // loaded macOS host, which would exhaust the 500 ms budget before the
+        // shim recorded the PID (#1598). The budget stays tight on purpose.
+        write_warmed_exec_script(&shim, &script);
 
         let cli = ClaudeCliAiClient::new_with_config(
             "sonnet".to_string(),

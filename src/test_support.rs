@@ -355,6 +355,13 @@ pub(crate) mod shim {
     //! host) starves timing-sensitive subprocess tests — a freshly-spawned shim
     //! scheduled too late to write its state before a short run timeout reaps
     //! it. See `claude::ai::claude_cli::tests::timeout_reaps_full_process_group`.
+    //!
+    //! Neither of those fixes the *first exec* of a freshly-written file being
+    //! slow: page-in plus, on macOS, the quarantine/Gatekeeper check. Measured
+    //! at 150-600 ms cold against ~7-19 ms warm on a loaded machine, and it is
+    //! paid per file, so every test pays it. A test whose run timeout is
+    //! shorter than that never lets the shim do its work (#1598).
+    //! [`write_warmed_exec_script`] moves that cost out of the timed region.
     use std::path::Path;
     use std::sync::{Mutex, MutexGuard};
 
@@ -467,9 +474,82 @@ pub(crate) mod shim {
         drop(file);
     }
 
+    /// Environment variable that makes a shim written by
+    /// [`write_warmed_exec_script`] exit immediately; set only for the warm-up
+    /// exec.
+    const WARMUP_ENV: &str = "OMNI_DEV_SHIM_WARMUP";
+
+    /// Like [`write_exec_script`], but then execs the shim once, to
+    /// completion, so the cold-exec cost (page-in plus the macOS
+    /// quarantine/Gatekeeper check, 150-600 ms on a loaded machine) is paid
+    /// here rather than inside the caller's timed region (#1598).
+    ///
+    /// `script` must start with a `#!` line. A guard that exits when
+    /// [`WARMUP_ENV`] is set is inserted right after it, so the warm-up exec
+    /// has no side effects: the body never runs. Use this instead of
+    /// widening a timeout when the test asserts *what the shim did* before a
+    /// short timeout fired, so the timeout can stay tight and a genuine
+    /// regression still surfaces quickly.
+    ///
+    /// The warm-up exec goes through [`retry_on_etxtbsy`], like any exec of a
+    /// freshly-written shim.
+    pub(crate) fn write_warmed_exec_script(path: &Path, script: &str) {
+        let (shebang, body) = script
+            .split_once('\n')
+            .expect("a warmed shim script must start with a shebang line");
+        assert!(
+            shebang.starts_with("#!"),
+            "a warmed shim script must start with a shebang line, got {shebang:?}"
+        );
+        write_exec_script(
+            path,
+            &format!("{shebang}\n[ -n \"${WARMUP_ENV}\" ] && exit 0\n{body}"),
+        );
+        retry_on_etxtbsy(|| {
+            let status = std::process::Command::new(path)
+                .env(WARMUP_ENV, "1")
+                .status()?;
+            anyhow::ensure!(status.success(), "shim warm-up exited with {status}");
+            Ok(())
+        })
+        .expect("shim warm-up exec");
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn warmed_script_exits_on_warmup_without_running_its_body() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let marker = tmp.path().join("ran");
+            let shim = tmp.path().join("shim");
+            write_warmed_exec_script(&shim, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+            assert!(
+                !marker.exists(),
+                "the warm-up exec must not run the script body"
+            );
+        }
+
+        #[test]
+        fn warmed_script_runs_its_body_on_a_normal_exec() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let marker = tmp.path().join("ran");
+            let shim = tmp.path().join("shim");
+            write_warmed_exec_script(&shim, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
+            // The guard is keyed on the env var alone, so a plain exec runs it.
+            let status =
+                retry_on_etxtbsy(|| Ok(std::process::Command::new(&shim).status()?)).unwrap();
+            assert!(status.success());
+            assert!(marker.exists(), "a normal exec must run the script body");
+        }
+
+        #[test]
+        #[should_panic(expected = "shebang")]
+        fn warmed_script_without_a_shebang_is_rejected() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_warmed_exec_script(&tmp.path().join("shim"), "echo hi\n");
+        }
 
         /// An `ETXTBSY` `io::Error` wrapped in `.context(..)`, matching how the
         /// exec failure reaches a test through a caller's error chain.
