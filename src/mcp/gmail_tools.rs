@@ -87,14 +87,13 @@ pub struct GmailSearchParams {
     pub limit: Option<usize>,
     /// When `true`, enrich each hit with From/Subject/Date/snippet via one
     /// extra `messages.get` request per hit. Defaults to `false` (ids-only,
-    /// the quota-safe default — `messages.get` costs 5 units against
-    /// Gmail's 250 units/user/second budget).
+    /// the cheaper default — `messages.get` costs 20 units).
     #[serde(default)]
     pub enrich: Option<bool>,
     /// Bounds concurrent `messages.get` calls when `enrich` is true (has no
-    /// effect otherwise). Defaults to 4, clamped to 1-50 regardless of what
-    /// is requested — Gmail's quota is 250 units/user/second and
-    /// `messages.get` costs 5 units, so a higher value could burst past it.
+    /// effect otherwise). Defaults to 4, clamped to 1-5 based on a
+    /// 100-units/second pacing budget and 20 units per get. Bounds fan-out,
+    /// not sustained request rate.
     #[serde(default)]
     pub concurrency: Option<usize>,
     #[doc = account_param_doc!()]
@@ -151,7 +150,7 @@ pub struct GmailDraftListParams {
     pub query: Option<String>,
     /// Maximum drafts to return. Defaults to 50 when omitted; `0` explicitly
     /// means every draft, up to the hard cap (10000). Each draft costs one
-    /// extra `messages.get` request (5 quota units).
+    /// extra `messages.get` request (20 quota units).
     #[serde(default)]
     pub limit: Option<usize>,
     #[doc = account_param_doc!()]
@@ -219,7 +218,7 @@ impl OmniDevServer {
     #[tool(
         description = "Search Gmail messages with a Gmail query (same syntax as the Gmail \
                        search box, e.g. `label:finance after:2026/01/01`). Returns only \
-                       id/threadId per hit by default (ids-only, quota-safe). Set `enrich: true` \
+                       id/threadId per hit by default (ids-only, cheaper). Set `enrich: true` \
                        to add From/Subject/Date/snippet — this costs one extra `messages.get` \
                        request per hit, bounded by `concurrency` (default 4). `limit` defaults \
                        to 50 when omitted; pass `0` explicitly to auto-paginate up to a hard cap \
