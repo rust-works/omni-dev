@@ -23,6 +23,10 @@ pub struct SkillsCommand {
     /// Skills subcommand to execute.
     #[command(subcommand)]
     pub command: SkillsSubcommands,
+
+    /// `-C/--repo`, inherited by every skills subcommand.
+    #[command(flatten)]
+    pub repo: crate::cli::repo_arg::RepoArg,
 }
 
 /// Skills subcommands.
@@ -38,11 +42,15 @@ pub enum SkillsSubcommands {
 
 impl SkillsCommand {
     /// Executes the skills command.
+    ///
+    /// `-C/--repo` is resolved here (`None` = current working directory) and
+    /// threaded explicitly to the leaf.
     pub fn execute(self) -> Result<()> {
+        let repo = self.repo.path();
         match self.command {
-            SkillsSubcommands::Sync(cmd) => cmd.execute(),
-            SkillsSubcommands::Clean(cmd) => cmd.execute(),
-            SkillsSubcommands::Status(cmd) => cmd.execute(),
+            SkillsSubcommands::Sync(cmd) => cmd.execute(repo),
+            SkillsSubcommands::Clean(cmd) => cmd.execute(repo),
+            SkillsSubcommands::Status(cmd) => cmd.execute(repo),
         }
     }
 }
@@ -636,6 +644,7 @@ mod tests {
         fs::write(skills_dir.join("SKILL.md"), "# alpha").unwrap();
 
         let cmd = SkillsCommand {
+            repo: crate::cli::repo_arg::RepoArg::default(),
             command: SkillsSubcommands::Sync(sync::SyncCommand {
                 source: Some(src.path().to_path_buf()),
                 target: Some(tgt.path().to_path_buf()),
@@ -654,6 +663,7 @@ mod tests {
         init_repo(tgt.path());
 
         let cmd = SkillsCommand {
+            repo: crate::cli::repo_arg::RepoArg::default(),
             command: SkillsSubcommands::Clean(clean::CleanCommand {
                 target: Some(tgt.path().to_path_buf()),
                 worktrees: false,
@@ -670,6 +680,7 @@ mod tests {
         init_repo(tgt.path());
 
         let cmd = SkillsCommand {
+            repo: crate::cli::repo_arg::RepoArg::default(),
             command: SkillsSubcommands::Status(status::StatusCommand {
                 target: Some(tgt.path().to_path_buf()),
                 worktrees: false,
@@ -677,5 +688,81 @@ mod tests {
             }),
         };
         cmd.execute().unwrap();
+    }
+
+    fn parse(argv: &[&str]) -> SkillsCommand {
+        SkillsCommand::try_parse_from(std::iter::once("skills").chain(argv.iter().copied()))
+            .unwrap()
+    }
+
+    fn seed_skill(root: &Path, name: &str) {
+        let dir = root.join(".claude/skills").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), format!("# {name}")).unwrap();
+    }
+
+    #[test]
+    fn repo_flag_parses_before_and_after_the_leaf() {
+        for flag in ["-C", "--repo"] {
+            for argv in [["status", flag, "/tmp/r"], [flag, "/tmp/r", "status"]] {
+                let cmd = parse(&argv);
+                assert_eq!(cmd.repo.path(), Some(Path::new("/tmp/r")), "{argv:?}");
+            }
+        }
+        assert!(parse(&["status"]).repo.path().is_none());
+    }
+
+    /// `-C` is the default `sync` source and the base for a relative
+    /// `--target`, with no `chdir` — the process CWD is not a repo under test.
+    #[test]
+    fn sync_uses_repo_as_source_and_base_for_relative_target() {
+        let parent = tempdir();
+        let src = parent.path().join("src");
+        let tgt = parent.path().join("tgt");
+        for d in [&src, &tgt] {
+            fs::create_dir_all(d).unwrap();
+            init_repo(d);
+        }
+        seed_skill(&src, "alpha");
+
+        let cmd = parse(&["sync", "-C", src.to_str().unwrap(), "--target", "../tgt"]);
+        cmd.execute().unwrap();
+        assert!(tgt.join(".claude/skills/alpha").exists());
+    }
+
+    #[test]
+    fn clean_acts_on_repo_not_cwd() {
+        let src = tempdir();
+        let tgt = tempdir();
+        init_repo(src.path());
+        init_repo(tgt.path());
+        seed_skill(src.path(), "alpha");
+        parse(&[
+            "sync",
+            "--source",
+            src.path().to_str().unwrap(),
+            "--target",
+            tgt.path().to_str().unwrap(),
+        ])
+        .execute()
+        .unwrap();
+        let link = tgt.path().join(".claude/skills/alpha");
+        assert!(link.symlink_metadata().is_ok());
+
+        parse(&["clean", "-C", tgt.path().to_str().unwrap()])
+            .execute()
+            .unwrap();
+        assert!(link.symlink_metadata().is_err(), "symlink not cleaned");
+    }
+
+    /// The process CWD (the crate root) is a git repo, so `status` could only
+    /// fail here by resolving `-C` — a non-repo directory — instead.
+    #[test]
+    fn status_resolves_repo_flag_instead_of_cwd() {
+        let plain = TempDir::new().unwrap();
+        let err = parse(&["status", "-C", plain.path().to_str().unwrap()])
+            .execute()
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("git rev-parse"), "{err:?}");
     }
 }

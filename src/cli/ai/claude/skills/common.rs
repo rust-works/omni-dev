@@ -53,6 +53,16 @@ pub(super) fn git_command() -> Command {
     cmd
 }
 
+/// Resolves an explicit `--source`/`--target` seed against the base directory.
+///
+/// `base` is `-C/--repo` (or the current directory when it is absent). Like
+/// `git -C`, a relative `explicit` path is taken relative to `base` and an
+/// absolute one wins; with no `explicit` the seed is `base` itself. Without
+/// `-C` the base is the current directory, so behaviour is unchanged.
+pub(super) fn seed_path(base: &Path, explicit: Option<&Path>) -> PathBuf {
+    explicit.map_or_else(|| base.to_path_buf(), |p| base.join(p))
+}
+
 /// Runs `git rev-parse --show-toplevel` from `path` and returns the absolute root.
 pub(super) fn resolve_toplevel(path: &Path) -> Result<PathBuf> {
     let output = git_command()

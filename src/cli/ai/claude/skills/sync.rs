@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use super::common::{
     enumerate_skills, exclude_entry_for, exclude_file_for, list_worktrees, resolve_toplevel,
-    upsert_skills_block, OutputFormat, SKILLS_SUBPATH,
+    seed_path, upsert_skills_block, OutputFormat, SKILLS_SUBPATH,
 };
 
 /// Syncs Claude skills from a source repository into one or more target worktrees.
@@ -39,12 +39,18 @@ pub struct SyncCommand {
 
 impl SyncCommand {
     /// Executes the sync command.
-    pub fn execute(self) -> Result<()> {
-        let cwd = std::env::current_dir().context("Failed to determine current directory")?;
-        let source_seed = self.source.clone().unwrap_or_else(|| cwd.clone());
+    ///
+    /// `repo` is `-C/--repo` (`None` = current directory): the default source
+    /// and the base that a relative `--source`/`--target` resolves against.
+    pub fn execute(self, repo: Option<&Path>) -> Result<()> {
+        let base = super::resolve_base_dir(repo)?;
+        let source_seed = seed_path(&base, self.source.as_deref());
         let source_root = resolve_toplevel(&source_seed)?;
 
-        let target_seed = self.target.clone().unwrap_or_else(|| source_root.clone());
+        let target_seed = match self.target.as_deref() {
+            Some(t) => base.join(t),
+            None => source_root.clone(),
+        };
         let target_root = resolve_toplevel(&target_seed)?;
 
         let mut targets = vec![target_root.clone()];
@@ -526,7 +532,7 @@ mod tests {
             dry_run: false,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
 
         let link = tgt_tmp.path().join(SKILLS_SUBPATH).join("alpha");
         assert!(fs::symlink_metadata(&link)
@@ -557,7 +563,7 @@ mod tests {
             dry_run: true,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
     }
 
     #[test]
@@ -576,7 +582,7 @@ mod tests {
             dry_run: false,
             format: OutputFormat::Text,
         };
-        let err = cmd.execute().unwrap_err().to_string();
+        let err = cmd.execute(None).unwrap_err().to_string();
         assert!(err.contains("blocked by existing files"));
     }
 
@@ -593,7 +599,7 @@ mod tests {
             dry_run: false,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
     }
 
     #[test]
@@ -607,7 +613,7 @@ mod tests {
             dry_run: true,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
     }
 
     #[test]
@@ -623,7 +629,7 @@ mod tests {
             dry_run: false,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
         let skill = src.path().join(SKILLS_SUBPATH).join("alpha");
         let meta = fs::symlink_metadata(&skill).unwrap();
         assert!(meta.is_dir() && !meta.file_type().is_symlink());
@@ -762,7 +768,7 @@ mod tests {
             dry_run: false,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
 
         assert!(
             fs::symlink_metadata(tgt_main.path().join(".claude/skills/alpha"))
@@ -791,7 +797,7 @@ mod tests {
             dry_run: false,
             format: OutputFormat::Yaml,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
     }
 
     #[test]

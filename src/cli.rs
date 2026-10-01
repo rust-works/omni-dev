@@ -365,6 +365,7 @@ mod tests {
                     "config scopes",
                     "worktrees rebase",
                     "worktrees push",
+                    "ai claude skills",
                     "ai jev route",
                     "ai jev verify-decision",
                 ],
@@ -428,6 +429,7 @@ mod tests {
             "omni-dev git --repo",
             "omni-dev coverage --repo",
             "omni-dev config scopes --repo",
+            "omni-dev ai claude skills --repo",
             // `RepoArg` is `global = true` even on this leaf (a no-op there).
             "omni-dev ai jev route --repo",
             "omni-dev ai jev verify-decision --repo",

@@ -8,8 +8,8 @@ use clap::Parser;
 use serde::Serialize;
 
 use super::common::{
-    exclude_file_for, list_worktrees, remove_skills_block, resolve_toplevel, OutputFormat,
-    SKILLS_SUBPATH,
+    exclude_file_for, list_worktrees, remove_skills_block, resolve_toplevel, seed_path,
+    OutputFormat, SKILLS_SUBPATH,
 };
 
 /// Removes skill symlinks and the managed exclude block from one or more targets.
@@ -34,9 +34,12 @@ pub struct CleanCommand {
 
 impl CleanCommand {
     /// Executes the clean command.
-    pub fn execute(self) -> Result<()> {
-        let cwd = std::env::current_dir().context("Failed to determine current directory")?;
-        let target_seed = self.target.clone().unwrap_or(cwd);
+    ///
+    /// `repo` is `-C/--repo` (`None` = current directory): the default target
+    /// and the base that a relative `--target` resolves against.
+    pub fn execute(self, repo: Option<&Path>) -> Result<()> {
+        let base = super::resolve_base_dir(repo)?;
+        let target_seed = seed_path(&base, self.target.as_deref());
         let target_root = resolve_toplevel(&target_seed)?;
 
         let mut targets = vec![target_root.clone()];
@@ -400,7 +403,7 @@ mod tests {
             dry_run: false,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
 
         assert!(!target_skills_dir.join("alpha").exists());
         let content = fs::read_to_string(&exclude_path).unwrap();
@@ -430,7 +433,7 @@ mod tests {
             dry_run: true,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
         assert!(target_skills_dir.join("alpha").exists());
         assert!(target_skills_dir.join("keep.txt").exists());
     }
@@ -455,7 +458,7 @@ mod tests {
             dry_run: false,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
         assert!(!target_skills_dir.exists());
     }
 
@@ -544,7 +547,7 @@ mod tests {
             dry_run: false,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
 
         assert!(!tgt_main.path().join(SKILLS_SUBPATH).exists());
         assert!(!linked.join(SKILLS_SUBPATH).exists());
@@ -570,7 +573,7 @@ mod tests {
             dry_run: false,
             format: OutputFormat::Yaml,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
     }
 
     #[test]

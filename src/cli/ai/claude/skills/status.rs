@@ -8,8 +8,8 @@ use clap::Parser;
 use serde::Serialize;
 
 use super::common::{
-    exclude_file_for, list_worktrees, read_skills_block_entries, resolve_toplevel, OutputFormat,
-    SKILLS_SUBPATH,
+    exclude_file_for, list_worktrees, read_skills_block_entries, resolve_toplevel, seed_path,
+    OutputFormat, SKILLS_SUBPATH,
 };
 
 /// Reports what `sync` has left behind in the current target (and optionally all worktrees).
@@ -30,9 +30,12 @@ pub struct StatusCommand {
 
 impl StatusCommand {
     /// Executes the status command.
-    pub fn execute(self) -> Result<()> {
-        let cwd = std::env::current_dir().context("Failed to determine current directory")?;
-        let target_seed = self.target.clone().unwrap_or(cwd);
+    ///
+    /// `repo` is `-C/--repo` (`None` = current directory): the default target
+    /// and the base that a relative `--target` resolves against.
+    pub fn execute(self, repo: Option<&Path>) -> Result<()> {
+        let base = super::resolve_base_dir(repo)?;
+        let target_seed = seed_path(&base, self.target.as_deref());
         let target_root = resolve_toplevel(&target_seed)?;
 
         let mut targets = vec![target_root.clone()];
@@ -277,7 +280,7 @@ mod tests {
             worktrees: false,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
     }
 
     #[test]
@@ -300,7 +303,7 @@ mod tests {
             worktrees: false,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
     }
 
     #[test]
@@ -323,7 +326,7 @@ mod tests {
             worktrees: false,
             format: OutputFormat::Yaml,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
     }
 
     #[test]
@@ -353,7 +356,7 @@ mod tests {
             worktrees: true,
             format: OutputFormat::Text,
         };
-        cmd.execute().unwrap();
+        cmd.execute(None).unwrap();
     }
 
     #[test]
