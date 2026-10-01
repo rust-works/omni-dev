@@ -7,7 +7,7 @@
 //! These tests verify that the prompt carries the complete inventory and that the
 //! guidelines' examples use declared scopes.
 //!
-//! The same file is also the source of truth for the commit *syntax* the code has to
+//! `commit-guidelines.md` is also the source of truth for the commit *syntax* the code has to
 //! parse, so `example_subjects_are_parseable_by_parse_subject` closes the second half
 //! of that contract: every subject the guidelines demonstrate must be parseable by the
 //! parser every scope-aware code path runs on. The old `SCOPE_RE` had drifted the
@@ -193,8 +193,28 @@ fn check_prompt_injects_repository_scopes_without_a_markdown_inventory() {
     );
 
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let scopes = omni_dev::claude::context::load_project_scopes(&omni_dev_dir(), &repo_root);
-    assert!(!scopes.is_empty());
+    // A developer's local override must not replace the repository fixture. The
+    // copied YAML also wins over global fallback without changing process env.
+    let config_dir = tempfile::tempdir().unwrap();
+    fs::copy(
+        omni_dev_dir().join("scopes.yaml"),
+        config_dir.path().join("scopes.yaml"),
+    )
+    .unwrap();
+    let scopes = omni_dev::claude::context::load_project_scopes(config_dir.path(), &repo_root);
+    let yaml = yaml_scopes();
+    assert!(
+        !yaml.is_empty(),
+        "repository scope fixture must not be empty"
+    );
+    for (name, description) in &yaml {
+        assert!(
+            scopes
+                .iter()
+                .any(|scope| scope.name == *name && scope.description == *description),
+            "repository scope missing from resolved set: {name}"
+        );
+    }
     for name in ["cargo", "core", "lib", "test"] {
         assert!(scopes.iter().any(|scope| scope.name == name));
     }
@@ -207,6 +227,14 @@ fn check_prompt_injects_repository_scopes_without_a_markdown_inventory() {
     assert_eq!(prompt.matches(header).count(), 1);
     let inventory = prompt.split_once(header).unwrap().1;
     let inventory = inventory.split_once("\n## Scope Checking Rules").unwrap().0;
+    assert_eq!(
+        inventory
+            .lines()
+            .filter(|line| line.starts_with("- `"))
+            .count(),
+        scopes.len(),
+        "injected inventory must contain only the resolved scopes"
+    );
     for scope in &scopes {
         let entry = format!("- `{}`: {}", scope.name, scope.description);
         assert_eq!(
