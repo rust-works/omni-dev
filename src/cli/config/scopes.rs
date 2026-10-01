@@ -413,6 +413,13 @@ fn render_report(report: &ScopesLintReport, format: OutputFormat) -> Result<()> 
     }
 }
 
+/// The three ways to clear an unscoped-file violation, printed under the
+/// list so the failure says what to do about it (#1469), not just which
+/// files tripped it.
+const UNSCOPED_REMEDY: &str = "Fix each by adding a scope to scopes.yaml, extending an existing \
+scope's file_patterns, or — only for shared code with no subsystem owner — adding it to \
+`allow:` with a justification.";
+
 fn render_text_report(report: &ScopesLintReport) -> Result<()> {
     let project_only_label = if report.project_only {
         "project-only"
@@ -444,6 +451,7 @@ fn render_text_report(report: &ScopesLintReport) -> Result<()> {
         for file in &report.unscoped_files {
             println!("   {file}");
         }
+        println!("   {UNSCOPED_REMEDY}");
     }
 
     let total = report.dead_patterns.len() + report.unscoped_files.len();
@@ -652,6 +660,81 @@ mod tests {
             true,
         );
         assert_eq!(report.unscoped_files, vec!["src/newmod/foo.rs".to_string()]);
+    }
+
+    #[test]
+    fn empty_scope_set_reports_every_file_under_root() {
+        // A scope set with no patterns must fail naming every file, never
+        // pass — the vacuous-truth failure mode this lint exists to avoid.
+        let scopes = vec![scope("empty", &[])];
+        let report = lint_scopes(
+            &files(&["src/a.rs", "src/b/c.rs", "docs/outside.md"]),
+            &scopes,
+            &[],
+            &["src".to_string()],
+            &[],
+            true,
+        );
+        assert_eq!(
+            report.unscoped_files,
+            vec!["src/a.rs".to_string(), "src/b/c.rs".to_string()]
+        );
+        assert_eq!(report.files_checked, 2);
+    }
+
+    #[test]
+    fn allowed_path_also_covered_by_a_scope_is_not_reported() {
+        let scopes = vec![scope("foo", &["src/foo/**"])];
+        let report = lint_scopes(
+            &files(&["src/foo/a.rs"]),
+            &scopes,
+            &[],
+            &["src".to_string()],
+            &["src/foo/**".to_string()],
+            true,
+        );
+        assert!(report.unscoped_files.is_empty());
+        assert!(report.dead_patterns.is_empty());
+    }
+
+    #[test]
+    fn allow_does_not_make_a_scope_pattern_dead() {
+        // `allow` only ever excuses a path from needing a scope; the
+        // dead-pattern check still sees the full tracked-file set, so a
+        // pattern whose only match is an allowed file stays live.
+        let scopes = vec![scope("foo", &["src/foo.rs"])];
+        let report = lint_scopes(
+            &files(&["src/foo.rs"]),
+            &scopes,
+            &[],
+            &["src".to_string()],
+            &["src/foo.rs".to_string()],
+            true,
+        );
+        assert!(report.dead_patterns.is_empty());
+    }
+
+    #[test]
+    fn allow_never_hides_a_path_outside_its_globs() {
+        let report = lint_scopes(
+            &files(&["src/utils/a.rs", "src/utils2/a.rs", "src/newmod/a.rs"]),
+            &[scope("cli", &["src/cli/**"])],
+            &[],
+            &["src".to_string()],
+            &["src/utils/**".to_string()],
+            true,
+        );
+        assert_eq!(
+            report.unscoped_files,
+            vec!["src/newmod/a.rs".to_string(), "src/utils2/a.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn unscoped_remedy_names_all_three_fixes() {
+        assert!(UNSCOPED_REMEDY.contains("adding a scope"));
+        assert!(UNSCOPED_REMEDY.contains("file_patterns"));
+        assert!(UNSCOPED_REMEDY.contains("`allow:` with a justification"));
     }
 
     // ── --project-only regression (the one that matters most) ─────────

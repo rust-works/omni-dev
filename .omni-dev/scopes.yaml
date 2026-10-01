@@ -110,18 +110,34 @@ scopes:
 
 # Paths that legitimately belong to no scope, per the `lib` convention:
 # generic/shared utilities and top-level entry points that don't belong to
-# any single subsystem. Checked by `omni-dev config scopes lint` (#1475).
+# any single subsystem. Checked by `omni-dev config scopes lint` (#1475) and
+# guarded by `binary_config_scopes_lint_reports_a_clean_run` (#1469).
+#
+# Every entry needs a one-line justification. This list can rot — an entry
+# added to silence a failure looks just like a correct one — so keep it
+# small, and prefer adding a scope or extending a `file_patterns` entry.
 allow:
+  # Shared helpers (env, secrets, settings, HTTP) with no single owner.
   - "src/utils.rs"
   - "src/utils/**"
+  # Crate root and module declarations — spans every subsystem.
   - "src/lib.rs"
+  # Fixtures shared by every subsystem's unit tests.
   - "src/test_support.rs"
+  # Standalone helper binaries (ADF schema codegen/drift), not a subsystem.
   - "src/bin/**"
+  # Embedded prompt/config templates consumed by many subsystems.
   - "src/templates/**"
+  # Build-time git provenance constants; read by version reporting, no subsystem.
   - "src/build_info.rs"
+  # Provider-neutral GitHub issue fetch + cache shared by jev route/verify-decision.
   - "src/github_issues.rs"
   - "src/github_issues/**"
+  # `gh` invocation counting (`run_gh`), shared by every GitHub call site.
   - "src/github_metrics.rs"
+  # `gh api rate_limit` resolution engine for the daemon budget monitor.
   - "src/github_rate_limit.rs"
+  # PR check-badge resolution engine for the daemon worktrees poller.
   - "src/pr_status.rs"
+  # Provider-neutral issue types (`GitProvider`, `IssueDoc`); GitHub-only slice.
   - "src/provider.rs"

@@ -391,12 +391,17 @@ with the scope definitions in `.omni-dev/scopes.yaml`:
 4. **Tree coverage** — every tracked file under `src/`, `editors/` and `.github/` must be
    matched by some scope's `file_patterns` (or listed in the `allow:` list for files that
    legitimately belong to no subsystem). When a new subsystem or module facade lands,
-   `scopes.yaml` must gain a pattern for it in the same change.
+   `scopes.yaml` must gain a pattern for it in the same change. Coverage is checked against
+   the project scopes only, never the ecosystem `lib` scope's `src/**` catch-all, which would
+   make the check vacuously true. Each `allow:` entry carries a one-line justification
+   comment. The list can rot — an entry added to silence a failure looks just like a correct
+   one — so keep it small and prefer a scope or a `file_patterns` entry; growing it is at
+   least a visible diff in review, unlike a catch-all that absorbs new subsystems silently.
 
 Clauses 1–3 are enforced by
 [`tests/commit_guidelines_scopes_test.rs`](../tests/commit_guidelines_scopes_test.rs); clause
-4 is enforced by `omni-dev config scopes lint`, exercised end-to-end by the
-`binary_config_scopes_lint_*` tests in
+4 is enforced by `omni-dev config scopes lint --root src --root editors --root .github`,
+exercised end-to-end by the `binary_config_scopes_lint_*` tests in
 [`tests/integration_test.rs`](../tests/integration_test.rs). Together they make a divergence
 fail the build rather than silently degrading the prompt.
 
