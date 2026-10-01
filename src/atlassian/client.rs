@@ -10,11 +10,11 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use reqwest::{header::HeaderValue, Client};
 
-use crate::atlassian::auth::{AtlassianAuth, AuthMode};
 use tokio_util::io::ReaderStream;
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::ValidatedAdfDocument;
+use crate::atlassian::auth::{AtlassianAuth, AuthMode};
 use crate::atlassian::confluence_types::{
     ConfluenceContentSearchResponse, ConfluenceSearchResult, ConfluenceSearchResults,
     ConfluenceUserGetEntry, ConfluenceUserGetResults, ConfluenceUserRecord,
@@ -6587,7 +6587,7 @@ impl AtlassianClient {
     }
 
     /// Appends a best-effort HTTP record for one request attempt. The service
-    /// tag is `confluence` for `/wiki/` paths, else `jira`.
+    /// tag is `confluence` for `/wiki/` paths and Confluence current-user probes, else `jira`.
     fn log_request(
         &self,
         method: &str,
@@ -6595,7 +6595,7 @@ impl AtlassianClient {
         started: Instant,
         result: &reqwest::Result<reqwest::Response>,
     ) {
-        let service = if url.contains("/wiki/") {
+        let service = if url.contains("/wiki/") || url.ends_with("/rest/api/user/current") {
             "confluence"
         } else {
             "jira"
