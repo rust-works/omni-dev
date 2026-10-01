@@ -52,11 +52,11 @@ pub(super) enum RouteFormat {
 stages. Add --effort-advice for per-model effort recommendations.\n\nMakes one Jev call per issue. Jev judges the issue's title, body and human \
 comments (never the issues or pull requests it references) and picks, for each stage, the \
 least capable class likely to do it correctly with no rework. The issue's class is the \
-higher of its design and implement choices, and a stage whose confidence is below \
+higher of its design and implement choices (class_from names which one supplied it; a tie goes to implement), and a stage whose confidence is below \
 --close-call is listed under close_calls.\n\nThe classes come from a named model ladder: \
 built-in ladders are anthropic (sonnet/opus, the default), openai (terra/sol/astra) \
 and gemini (flash/pro/deep-think). --ladders NAMES routes against several ladders at once, \
-still in one Jev call per issue, and the output nests stages, class and close_calls under \
+still in one Jev call per issue, and the output nests stages, class, class_from and close_calls under \
 each ladder's name. --ladder-definition NAME=FILE registers a custom ladder under NAME, its \
 tiers loaded from a YAML file, so it can be routed alongside built-in ladders in the same \
 --ladders list; a built-in name cannot be redefined, and a definition never listed in \
@@ -816,7 +816,7 @@ mod tests {
     fn failure_summary_counts_only_failed_issues() {
         use crate::jev::protocol::Usage;
         use crate::jev::route::{
-            IssueRoute, ProviderRoute, RouteOutcome, StageAnswer, StageAnswers,
+            ClassSource, IssueRoute, ProviderRoute, RouteOutcome, StageAnswer, StageAnswers,
         };
         let answer = || StageAnswer {
             effort_by_model: BTreeMap::new(),
@@ -843,6 +843,7 @@ mod tests {
                             review: answer(),
                         },
                         class: "sonnet".to_string(),
+                        class_from: ClassSource::Implement,
                         close_calls: vec![],
                     },
                 )]),
@@ -872,8 +873,8 @@ mod tests {
     fn render_output_dispatches_on_format() {
         use crate::jev::protocol::Usage;
         use crate::jev::route::{
-            IssueRoute, ProviderRoute, ReferenceFetchFailure, RouteOutcome, StageAnswer,
-            StageAnswers,
+            ClassSource, IssueRoute, ProviderRoute, ReferenceFetchFailure, RouteOutcome,
+            StageAnswer, StageAnswers,
         };
         let answer = || StageAnswer {
             effort_by_model: BTreeMap::new(),
@@ -898,6 +899,7 @@ mod tests {
                                 review: answer(),
                             },
                             class: "sonnet".to_string(),
+                            class_from: ClassSource::Implement,
                             close_calls: vec![],
                         },
                     )]),

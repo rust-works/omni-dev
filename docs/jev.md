@@ -450,6 +450,7 @@ issues:
         implement: {choice: sonnet, confidence: 0.83, probabilities: {opus: 0.17, sonnet: 0.83}}
         review:    {choice: opus,   confidence: 0.41, probabilities: {opus: 0.41, sonnet: 0.59}}
       class: opus
+      class_from: design
       close_calls: [review]
     openai:
       stages:
@@ -457,6 +458,7 @@ issues:
         implement: {choice: terra, confidence: 0.80, probabilities: {astra: 0.0, sol: 0.14, terra: 0.86}}
         review:    {choice: sol,   confidence: 0.22, probabilities: {astra: 0.02, sol: 0.53, terra: 0.45}}
       class: astra
+      class_from: design
       close_calls: [review]
   depends_on:
   - ref: "#1129"
@@ -470,13 +472,22 @@ usage: {input_tokens: 1432, output_tokens: 61}
 ```
 
 - **`providers`** holds one entry per requested ladder (default `anthropic`),
-  keyed by that ladder's own name, each with its own `stages`, `class` and
-  `close_calls`. A built-in ladder is keyed by its provider name; a custom
+  keyed by that ladder's own name, each with its own `stages`, `class`,
+  `class_from` and `close_calls`. A built-in ladder is keyed by its provider name; a custom
   one registered via `--ladder-definition` is keyed by the name it was given.
 - **`class`** is the higher of the design and implement choices. The most
   capable class earns its cost in the design stage; once a plan exists, the
   design answer usually becomes `none` and implementation drops to a cheaper
   class. Review does not count towards the class.
+- **`class_from`** (`design` or `implement`) names the stage that supplied
+  `class` ([#2051](https://github.com/rust-works/omni-dev/issues/2051)). It is
+  derived from the stage answers already returned, so it adds no Jev question
+  or call and never changes `class`. A tie goes to `implement`: `design` means
+  design chose a strictly higher tier than implement, so design alone raised
+  the class, while `implement` means implementation would have produced that
+  class without help from design. Design `none` ranks below every tier and
+  review is never a source, so those two values are the only ones. Each
+  ladder has its own `class_from`.
 - **`close_calls`** lists the stages whose confidence is below `--close-call`
   (default `0.3`, a working heuristic that has not been validated). Jev is
   noisy on close calls: identical inputs changed the design answer in 2 of 19
@@ -563,7 +574,7 @@ styling.
 
 ```
 rust-works/omni-dev#1641 — Some issue title
-  opus — design needs opus (0.52), implementation sonnet (0.83), review opus (0.41, close call — sonnet 0.59)
+  opus (from design) — design needs opus (0.52), implementation sonnet (0.83), review opus (0.41, close call — sonnet 0.59)
   cites open #1129 (blocker), which could leave less design work if resolved (0.75)
   reference fetch failed: #404 (not found)
 
@@ -576,8 +587,10 @@ alphabetical tie break and leaves the alternative out if none is available.
 Confidence and the alternative's probability are separate Jev values.
 
 Routing against several `--ladders` adds one indented line per ladder,
-labelled `<ladder>: <class> — ...` (a single ladder, the common case,
-drops the label, as above). A failed issue's line reads `  failed: <error>`
+labelled `<ladder>: <class> (from <stage>) — ...` (a single ladder, the common
+case, drops the label, as above). `<stage>` is `design` or `implementation`,
+the stage that supplied the class (`class_from` in JSON/YAML,
+[#2051](https://github.com/rust-works/omni-dev/issues/2051)). A failed issue's line reads `  failed: <error>`
 instead of a routing. A truncated issue gets a trailing `  input truncated at
 <N> characters` line; an issue with no open citations has no `cites` line.
 An issue that cites more than one open item gets one `cites` line per
@@ -586,7 +599,7 @@ citation, in citation order, rather than one line joining every clause with
 
 ```
 rust-works/omni-dev#1845 — feat(drive): randomizeRange for drive sheets (#1830)
-  opus — design needs opus (0.42), implementation sonnet (0.66), review opus (0.36)
+  opus (from design) — design needs opus (0.42), implementation sonnet (0.66), review opus (0.36)
   cites open #1830 (tracker), which could leave less design work if resolved (0.46)
   cites open #1831 (blocker), which could leave less design work if resolved (0.52)
 ```
@@ -595,13 +608,13 @@ When any stage's chosen tier name is multi-model (a custom ladder's
 comma-joined tier name, [#1826](https://github.com/rust-works/omni-dev/issues/1826)),
 the compact line above would repeat that name up to four times and become
 unreadable, so the block switches to one line per fact instead
-([#1847](https://github.com/rust-works/omni-dev/issues/1847)): `class:` once,
-then `design:`/`implementation:`/`review:` each on their own line, with the
+([#1847](https://github.com/rust-works/omni-dev/issues/1847)): `class:` once
+(with its `(from <stage>)` source), then `design:`/`implementation:`/`review:` each on their own line, with the
 close-call marker still per stage:
 
 ```
 rust-works/omni-dev#1832 — feat(drive): banded ranges for drive sheets (#1830)
-  class: global.anthropic.claude-sonnet-4-6,global.anthropic.claude-sonnet-5
+  class: global.anthropic.claude-sonnet-4-6,global.anthropic.claude-sonnet-5 (from implementation)
   design: needs no further work (0.94)
   implementation: global.anthropic.claude-sonnet-4-6,global.anthropic.claude-sonnet-5 (0.94)
   review: global.anthropic.claude-sonnet-4-6,global.anthropic.claude-sonnet-5 (0.70)

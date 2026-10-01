@@ -493,6 +493,29 @@ pub struct IssueRoute {
     pub truncated: bool,
 }
 
+/// The stage whose choice supplied an issue's class (#2051).
+///
+/// Review never supplies it, and neither does design `none`, so there are
+/// only two sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClassSource {
+    /// Design chose a strictly higher tier than implement.
+    Design,
+    /// Implement chose the class; design chose the same tier or a lower one.
+    Implement,
+}
+
+impl ClassSource {
+    /// The stage name as shown in text output, e.g. `design`.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Design => "design",
+            Self::Implement => "implementation",
+        }
+    }
+}
+
 /// One provider's routing of an issue (#1820).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProviderRoute {
@@ -500,6 +523,9 @@ pub struct ProviderRoute {
     pub stages: StageAnswers,
     /// The issue's class: the higher of the design and implement choices.
     pub class: String,
+    /// Which stage supplied `class`. A tie goes to `implement`, so `design`
+    /// means design alone raised the class above what implementation chose.
+    pub class_from: ClassSource,
     /// Stages whose confidence is below the close-call threshold.
     pub close_calls: Vec<Stage>,
 }
@@ -863,8 +889,10 @@ fn provider_routes(
                         effort::decode(ladder, stage, answer, answers, close_call)?;
                 }
             }
+            let (class, class_from) = issue_class(&stages, &ladder.tiers);
             let route = ProviderRoute {
-                class: issue_class(&stages, &ladder.tiers),
+                class,
+                class_from,
                 close_calls: close_calls(&stages, close_call),
                 stages,
             };
@@ -909,14 +937,20 @@ fn stage_answers(answers: &BTreeMap<String, Answer>, ladder: &Ladder) -> Result<
     })
 }
 
-/// The higher of the design and implement choices. Implement is always a
-/// tier, so the result is always a tier, never [`NO_DESIGN`].
-fn issue_class(stages: &StageAnswers, tiers: &Tiers) -> String {
-    [&stages.design, &stages.implement]
-        .into_iter()
-        .max_by_key(|a| tiers.rank(&a.choice).unwrap_or_default())
-        .map(|a| a.choice.clone())
-        .unwrap_or_default()
+/// The higher of the design and implement choices, and the stage that
+/// supplied it. Implement is always a tier, so the result is always a tier,
+/// never [`NO_DESIGN`].
+///
+/// Tie rule (#2051): when both stages choose the same tier, implement
+/// supplies it. Design is credited only when it strictly outranks implement,
+/// which is the case worth reporting — design alone raised the class.
+fn issue_class(stages: &StageAnswers, tiers: &Tiers) -> (String, ClassSource) {
+    let rank = |a: &StageAnswer| tiers.rank(&a.choice).unwrap_or_default();
+    if rank(&stages.design) > rank(&stages.implement) {
+        (stages.design.choice.clone(), ClassSource::Design)
+    } else {
+        (stages.implement.choice.clone(), ClassSource::Implement)
+    }
 }
 
 /// The stages whose confidence is below `threshold`, in stage order.
@@ -1303,7 +1337,11 @@ fn render_provider_line_compact(
     ladder: Option<&Ladder>,
     style: TerminalStyle,
 ) -> String {
-    let class = color_choice(&route.class, ladder, style);
+    let class = format!(
+        "{} (from {})",
+        color_choice(&route.class, ladder, style),
+        route.class_from.label()
+    );
     let lead = if provider_count > 1 {
         format!("{provider}: {class}")
     } else {
@@ -1380,8 +1418,9 @@ fn render_provider_block(
         "  "
     };
     lines.push(format!(
-        "{indent}class: {}",
-        color_choice(&route.class, ladder, style)
+        "{indent}class: {} (from {})",
+        color_choice(&route.class, ladder, style),
+        route.class_from.label()
     ));
     for stage in Stage::ALL {
         lines.push(format!(
@@ -2097,16 +2136,35 @@ mod tests {
     }
 
     #[test]
-    fn class_is_the_higher_of_design_and_implement() {
+    fn design_supplies_the_class_when_it_outranks_implement() {
         let tiers = default_tiers();
         assert_eq!(
             issue_class(&stages("opus", "sonnet", "sonnet"), &tiers),
-            "opus"
+            ("opus".to_string(), ClassSource::Design)
         );
+    }
+
+    #[test]
+    fn implement_supplies_the_class_when_it_outranks_design() {
+        let tiers = default_tiers();
         assert_eq!(
             issue_class(&stages("sonnet", "opus", "sonnet"), &tiers),
-            "opus"
+            ("opus".to_string(), ClassSource::Implement)
         );
+    }
+
+    /// The tie rule (#2051): equal choices credit implement, so `design`
+    /// only ever means design alone raised the class.
+    #[test]
+    fn a_tie_goes_to_implement() {
+        let tiers = default_tiers();
+        for tier in ["sonnet", "opus"] {
+            assert_eq!(
+                issue_class(&stages(tier, tier, "sonnet"), &tiers),
+                (tier.to_string(), ClassSource::Implement),
+                "{tier}"
+            );
+        }
     }
 
     #[test]
@@ -2114,7 +2172,7 @@ mod tests {
         let tiers = default_tiers();
         assert_eq!(
             issue_class(&stages("none", "sonnet", "opus"), &tiers),
-            "sonnet"
+            ("sonnet".to_string(), ClassSource::Implement)
         );
     }
 
@@ -2546,6 +2604,7 @@ mod tests {
         assert_eq!(issue.item_ref, "rust-works/omni-dev#7");
         let route = provider(&issue.outcome, "anthropic");
         assert_eq!(route.class, "opus");
+        assert_eq!(route.class_from, ClassSource::Design);
         assert_eq!(route.close_calls, [Stage::Review]);
         assert!(!issue.truncated);
 
@@ -2707,8 +2766,16 @@ mod tests {
             ["anthropic", "openai"]
         );
         assert_eq!(provider(outcome, "anthropic").class, "opus");
+        assert_eq!(
+            provider(outcome, "anthropic").class_from,
+            ClassSource::Design
+        );
         assert!(provider(outcome, "anthropic").close_calls.is_empty());
         assert_eq!(provider(outcome, "openai").class, "sol");
+        assert_eq!(
+            provider(outcome, "openai").class_from,
+            ClassSource::Implement
+        );
         assert_eq!(provider(outcome, "openai").close_calls, [Stage::Implement]);
         assert_eq!(depends_on.len(), 1);
         assert_eq!(reference_fetch_failures[0].item_ref, "#404");
@@ -3001,6 +3068,7 @@ mod tests {
                         ProviderRoute {
                             stages: stages("none", "sonnet", "opus"),
                             class: "sonnet".to_string(),
+                            class_from: ClassSource::Implement,
                             close_calls: vec![],
                         },
                     )]),
@@ -3066,6 +3134,7 @@ mod tests {
                                 review: answer("opus", 0.41),
                             },
                             class: "opus".to_string(),
+                            class_from: ClassSource::Design,
                             close_calls: vec![Stage::Review],
                         },
                     )]),
@@ -3090,7 +3159,7 @@ mod tests {
         assert_eq!(
             text,
             "rust-works/omni-dev#1641 — Some issue title\n\
-             \x20\x20opus — design needs opus (0.52), implementation sonnet (0.83), review \
+             \x20\x20opus (from design) — design needs opus (0.52), implementation sonnet (0.83), review \
              opus (0.41, close call)\n\
              \x20\x20cites open #1129 (relation unspecified), which could leave less design work if resolved (0.75)\n\n\
              model: jev-1.13.0, usage: 1432 input tokens, 61 output tokens\n"
@@ -3112,6 +3181,7 @@ mod tests {
                         ProviderRoute {
                             stages: stages("none", "sonnet", "sonnet"),
                             class: "sonnet".to_string(),
+                            class_from: ClassSource::Implement,
                             close_calls: vec![],
                         },
                     )]),
@@ -3181,6 +3251,7 @@ mod tests {
         let route = |class: &str| ProviderRoute {
             stages: stages("none", "sonnet", "sonnet"),
             class: class.to_string(),
+            class_from: ClassSource::Implement,
             close_calls: vec![],
         };
         let report = RouteReport {
@@ -3204,8 +3275,14 @@ mod tests {
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
-        assert!(text.contains("  anthropic: sonnet —"), "{text}");
-        assert!(text.contains("  openai: terra —"), "{text}");
+        assert!(
+            text.contains("  anthropic: sonnet (from implementation) —"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  openai: terra (from implementation) —"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -3301,6 +3378,7 @@ mod tests {
                         ProviderRoute {
                             stages: stages("none", "sonnet", "sonnet"),
                             class: "sonnet".to_string(),
+                            class_from: ClassSource::Implement,
                             close_calls: vec![],
                         },
                     )]),
@@ -3334,6 +3412,7 @@ mod tests {
                         ProviderRoute {
                             stages: stages("none", "sonnet", "sonnet"),
                             class: "sonnet".to_string(),
+                            class_from: ClassSource::Implement,
                             close_calls: vec![],
                         },
                     )]),
@@ -3369,6 +3448,7 @@ mod tests {
                     ProviderRoute {
                         stages: stages("none", "sonnet", "sonnet"),
                         class: "sonnet".to_string(),
+                        class_from: ClassSource::Implement,
                         close_calls: vec![],
                     },
                 )]),
@@ -3407,6 +3487,7 @@ mod tests {
                         ProviderRoute {
                             stages: stages("none", "sonnet", "sonnet"),
                             class: "sonnet".to_string(),
+                            class_from: ClassSource::Implement,
                             close_calls: vec![],
                         },
                     )]),
@@ -3445,6 +3526,7 @@ mod tests {
                                 review: answer(multi, 0.70),
                             },
                             class: multi.to_string(),
+                            class_from: ClassSource::Implement,
                             close_calls: vec![],
                         },
                     )]),
@@ -3467,7 +3549,7 @@ mod tests {
             text,
             format!(
                 "rust-works/omni-dev#1832 — feat(drive): banded ranges for drive sheets (#1830)\n\
-                 \x20\x20class: {multi}\n\
+                 \x20\x20class: {multi} (from implementation)\n\
                  \x20\x20design: needs no further work (0.94)\n\
                  \x20\x20implementation: {multi} (0.94)\n\
                  \x20\x20review: {multi} (0.70)\n\
@@ -3494,6 +3576,7 @@ mod tests {
                         ProviderRoute {
                             stages: stages("opus", "sonnet", "opus"),
                             class: "opus".to_string(),
+                            class_from: ClassSource::Design,
                             close_calls: vec![],
                         },
                     )]),
@@ -3508,8 +3591,8 @@ mod tests {
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
         assert!(
             text.contains(
-                "  opus — design needs opus (0.90), implementation sonnet (0.90), review \
-                 opus (0.90)"
+                "  opus (from design) — design needs opus (0.90), implementation sonnet (0.90), \
+                 review opus (0.90)"
             ),
             "{text}"
         );
@@ -3527,6 +3610,7 @@ mod tests {
                 review: answer(class, 0.9),
             },
             class: class.to_string(),
+            class_from: ClassSource::Implement,
             close_calls: vec![],
         };
         let report = RouteReport {
@@ -3550,9 +3634,15 @@ mod tests {
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
-        assert!(text.contains("  anthropic:\n    class: a,b\n"), "{text}");
+        assert!(
+            text.contains("  anthropic:\n    class: a,b (from implementation)\n"),
+            "{text}"
+        );
         assert!(text.contains("    implementation: a,b (0.90)"), "{text}");
-        assert!(text.contains("  openai:\n    class: c,d\n"), "{text}");
+        assert!(
+            text.contains("  openai:\n    class: c,d (from implementation)\n"),
+            "{text}"
+        );
         assert!(text.contains("    implementation: c,d (0.90)"), "{text}");
     }
 
@@ -3568,11 +3658,13 @@ mod tests {
                 review: answer("a,b", 0.9),
             },
             class: "a,b".to_string(),
+            class_from: ClassSource::Implement,
             close_calls: vec![],
         };
         let compact_route = ProviderRoute {
             stages: stages("none", "terra", "terra"),
             class: "terra".to_string(),
+            class_from: ClassSource::Implement,
             close_calls: vec![],
         };
         let report = RouteReport {
@@ -3596,9 +3688,12 @@ mod tests {
             usage: Usage::default(),
         };
         let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
-        assert!(text.contains("  anthropic:\n    class: a,b\n"), "{text}");
         assert!(
-            text.contains("  openai: terra — design needs no further work"),
+            text.contains("  anthropic:\n    class: a,b (from implementation)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  openai: terra (from implementation) — design needs no further work"),
             "{text}"
         );
     }
@@ -3626,6 +3721,7 @@ mod tests {
                                 review,
                             },
                             class: "a,b".to_string(),
+                            class_from: ClassSource::Implement,
                             close_calls: vec![Stage::Review],
                         },
                     )]),
@@ -3806,6 +3902,7 @@ mod tests {
                     ProviderRoute {
                         stages: stages(NO_DESIGN, "opus", "sonnet"),
                         class: "opus".to_string(),
+                        class_from: ClassSource::Implement,
                         close_calls: vec![],
                     },
                 )]),
@@ -3854,7 +3951,9 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("\x1b[31mopus\x1b[0m — design needs \x1b[32mno further work\x1b[0m"),
+            text.contains(
+                "\x1b[31mopus\x1b[0m (from implementation) — design needs \x1b[32mno further work\x1b[0m"
+            ),
             "{text}"
         );
         assert!(text.contains("review \x1b[32msonnet\x1b[0m"), "{text}");
@@ -3898,6 +3997,7 @@ mod tests {
                         ProviderRoute {
                             stages: stages(NO_DESIGN, tier, "basic"),
                             class: tier.to_string(),
+                            class_from: ClassSource::Implement,
                             close_calls: vec![],
                         },
                     )]),
@@ -3927,6 +4027,109 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("  review: \x1b[32mbasic\x1b[0m"), "{text}");
+    }
+
+    /// A two-ladder report with one design-led and one implement-led
+    /// routing, for the `class_from` serialisation and text tests (#2051).
+    fn mixed_source_report() -> RouteReport {
+        RouteReport {
+            model: "jev-1.13.0".to_string(),
+            issues: vec![IssueRoute {
+                item_ref: "o/r#1".to_string(),
+                url: "u".to_string(),
+                title: "t".to_string(),
+                state: ItemState::Open,
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([
+                        (
+                            "anthropic".to_string(),
+                            ProviderRoute {
+                                stages: stages("opus", "sonnet", "sonnet"),
+                                class: "opus".to_string(),
+                                class_from: ClassSource::Design,
+                                close_calls: vec![],
+                            },
+                        ),
+                        (
+                            "openai".to_string(),
+                            ProviderRoute {
+                                stages: stages(NO_DESIGN, "sol", "terra"),
+                                class: "sol".to_string(),
+                                class_from: ClassSource::Implement,
+                                close_calls: vec![],
+                            },
+                        ),
+                    ]),
+                    depends_on: vec![],
+                    reference_fetch_failures: vec![],
+                },
+                truncated: false,
+            }],
+            ignored_closed: vec![],
+            usage: Usage::default(),
+        }
+    }
+
+    #[test]
+    fn class_from_is_serialised_per_provider_in_json_and_yaml() {
+        let report = mixed_source_report();
+        let json = serde_json::to_value(&report).unwrap();
+        let providers = &json["issues"][0]["providers"];
+        assert_eq!(providers["anthropic"]["class_from"], "design");
+        assert_eq!(providers["openai"]["class_from"], "implement");
+
+        let yaml = serde_yaml::to_string(&report).unwrap();
+        assert!(
+            yaml.contains("class: opus\n      class_from: design\n"),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains("class: sol\n      class_from: implement\n"),
+            "{yaml}"
+        );
+    }
+
+    #[test]
+    fn text_output_names_the_class_source_for_each_ladder() {
+        let text = render_route_text(&mixed_source_report(), DEFAULT_MAX_INPUT_CHARS);
+        assert!(
+            text.contains("  anthropic: opus (from design) — "),
+            "{text}"
+        );
+        assert!(
+            text.contains("  openai: sol (from implementation) — "),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn text_output_names_the_class_source_in_the_multi_line_layout() {
+        let multi = "a,b";
+        let report = RouteReport {
+            issues: vec![IssueRoute {
+                outcome: RouteOutcome::Routed {
+                    providers: BTreeMap::from([(
+                        "anthropic".to_string(),
+                        ProviderRoute {
+                            stages: StageAnswers {
+                                design: answer(multi, 0.9),
+                                implement: answer("basic", 0.9),
+                                review: answer("basic", 0.9),
+                            },
+                            class: multi.to_string(),
+                            class_from: ClassSource::Design,
+                            close_calls: vec![],
+                        },
+                    )]),
+                    depends_on: vec![],
+                    reference_fetch_failures: vec![],
+                },
+                ..mixed_source_report().issues.remove(0)
+            }],
+            ..mixed_source_report()
+        };
+        let text = render_route_text(&report, DEFAULT_MAX_INPUT_CHARS);
+        assert!(text.contains("  class: a,b (from design)\n"), "{text}");
     }
 
     #[test]
