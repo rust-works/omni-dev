@@ -276,7 +276,8 @@ still be the *wrong* reason to keep a row:
   tab. A finished chat that was prompted keeps a live pid indefinitely, so on an
   install with both the hooks and the wrapper this watcher would pin it exactly as
   the wrapper's idle keep-alive used to. A session the wrapper has reported
-  (`SessionEntry::streamed`, set by a Claude `StreamState` and never cleared) is
+  (`SessionEntry::streamed`, set by a Claude `StreamState` and cleared when a different
+  process takes the session over) is
   therefore left to the TTL — the wrapper's own keep-alive holds its *busy* states
   — while a confirmed pid still *ending* it on exit is unchanged. Codex's wrapper
   and pi's extension are not affected. A terminal `claude` has no such
@@ -483,7 +484,9 @@ alive indefinitely, and pinning every such process would inflate a worktree's
 session cue and `sessions list` — and only ever grow within a long-lived window.
 Process lifetime is not tab visibility. The transition to idle is still reported
 once, after which the session ages out on the TTL like a hook-fed one and
-re-appears the moment it next does anything. The same reasoning excludes a session
+re-appears the moment it next does anything — which also means an idle chat
+stays absent after a daemon restart (the registry is in-memory) until it is next
+touched. The same reasoning excludes a session
 the wrapper has reported from the [pid liveness watcher's](#pid-based-liveness-1916)
 TTL exemption, though its death is still noticed promptly.
 
