@@ -9,7 +9,7 @@ use omni_dev::jev::client::JevClient;
 use omni_dev::jev::config::JevConfig;
 use omni_dev::jev::route::{
     build_route_questions, run_route, Ladder, OpenDependencies, Provider, RouteOptions, Tiers,
-    DEFAULT_CLOSE_CALL, DEFAULT_MAX_INPUT_CHARS,
+    DEFAULT_CLOSE_CALL, DEFAULT_CLOSE_CALL_MARGIN, DEFAULT_MAX_INPUT_CHARS,
 };
 use omni_dev::provider::IssueDoc;
 
@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
         draft_comments: vec![],
         model: config.model,
         close_call: DEFAULT_CLOSE_CALL,
+        close_call_margin: DEFAULT_CLOSE_CALL_MARGIN,
         effort_advice: false,
         max_input_chars: DEFAULT_MAX_INPUT_CHARS,
         allow_closed: true,

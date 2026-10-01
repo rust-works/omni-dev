@@ -97,6 +97,10 @@ impl Provider {
 /// working heuristic from the #1779 backlog run, not a validated threshold.
 pub const DEFAULT_CLOSE_CALL: f64 = 0.3;
 
+/// Default top-two probability margin below which a model-class stage is a
+/// close call. A configurable working heuristic, not a calibrated threshold.
+pub const DEFAULT_CLOSE_CALL_MARGIN: f64 = 0.2;
+
 /// Default cap, in characters, on the issue text sent to Jev. Jev's input
 /// limit is undocumented; the longest input tested was about 48k characters.
 pub const DEFAULT_MAX_INPUT_CHARS: usize = 60_000;
@@ -556,7 +560,7 @@ pub struct ProviderRoute {
     /// Which stage supplied `class`. A tie goes to `implement`, so `design`
     /// means design alone raised the class above what implementation chose.
     pub class_from: ClassSource,
-    /// Stages whose confidence is below the close-call threshold.
+    /// Stages below the confidence threshold or top-two model-class probability margin.
     pub close_calls: Vec<Stage>,
 }
 
@@ -638,6 +642,9 @@ pub struct RouteOptions {
     pub model: String,
     /// Confidence below which a stage is a close call.
     pub close_call: f64,
+    /// Top-two model-class probability margin below which a stage is a close call.
+    /// Zero disables margin flagging; effort advice uses only `close_call`.
+    pub close_call_margin: f64,
     /// Ask for per-model effort advice as well as class routing.
     pub effort_advice: bool,
     /// Cap, in characters, on each issue's text.
@@ -764,6 +771,7 @@ pub async fn run_route_with_reference_fetch_failures(
                     &response.answers,
                     ladders,
                     opts.close_call,
+                    opts.close_call_margin,
                     opts.effort_advice,
                 ) {
                     Ok(providers) => RouteOutcome::Routed {
@@ -889,6 +897,12 @@ fn validate_options(docs: &[&IssueDoc], ladders: &[Ladder], opts: &RouteOptions)
             opts.close_call
         );
     }
+    if !(0.0..=1.0).contains(&opts.close_call_margin) {
+        bail!(
+            "the close-call margin must be between 0 and 1, got {}",
+            opts.close_call_margin
+        );
+    }
     if opts.max_input_chars == 0 {
         bail!("the input cap must be at least 1 character");
     }
@@ -917,6 +931,7 @@ fn provider_routes(
     answers: &BTreeMap<String, Answer>,
     ladders: &[Ladder],
     close_call: f64,
+    close_call_margin: f64,
     effort_advice: bool,
 ) -> Result<BTreeMap<String, ProviderRoute>> {
     ladders
@@ -937,7 +952,7 @@ fn provider_routes(
             let route = ProviderRoute {
                 class,
                 class_from,
-                close_calls: close_calls(&stages, close_call),
+                close_calls: close_calls(&stages, &ladder.tiers, close_call, close_call_margin),
                 stages,
             };
             Ok((ladder.name.clone(), route))
@@ -997,11 +1012,39 @@ fn issue_class(stages: &StageAnswers, tiers: &Tiers) -> (String, ClassSource) {
     }
 }
 
-/// The stages whose confidence is below `threshold`, in stage order.
-fn close_calls(stages: &StageAnswers, threshold: f64) -> Vec<Stage> {
+/// The top-two usable probabilities among options offered to this stage.
+/// Partial maps are usable with two entries; no normalization or imputation.
+fn top_two_margin(answer: &StageAnswer, stage: Stage, tiers: &Tiers) -> Option<f64> {
+    let mut usable: Vec<_> = answer
+        .probabilities
+        .iter()
+        .filter(|(name, probability)| {
+            probability.is_finite()
+                && (0.0..=1.0).contains(*probability)
+                && match tiers.rank(name) {
+                    Some(0) => stage == Stage::Design,
+                    Some(_) => true,
+                    None => false,
+                }
+        })
+        .collect();
+    usable.sort_by(|a, b| b.1.total_cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let [first, second, ..] = usable.as_slice() else {
+        return None;
+    };
+    Some(first.1 - second.1)
+}
+
+/// Flag confidence or top-two margin below its threshold, in stage order.
+/// Strict comparisons let a zero margin threshold recover confidence-only behavior.
+fn close_calls(stages: &StageAnswers, tiers: &Tiers, threshold: f64, margin: f64) -> Vec<Stage> {
     Stage::ALL
         .into_iter()
-        .filter(|&s| stages.get(s).confidence < threshold)
+        .filter(|&stage| {
+            let answer = stages.get(stage);
+            answer.confidence < threshold
+                || top_two_margin(answer, stage, tiers).is_some_and(|gap| gap < margin)
+        })
         .collect()
 }
 
@@ -1661,6 +1704,7 @@ mod tests {
             draft_comments: vec![],
             model: "jev-latest".to_string(),
             close_call: DEFAULT_CLOSE_CALL,
+            close_call_margin: DEFAULT_CLOSE_CALL_MARGIN,
             effort_advice: false,
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             allow_closed: false,
@@ -2389,7 +2433,240 @@ mod tests {
         s.review.confidence = 0.1;
         s.design.confidence = 0.29;
         s.implement.confidence = 0.3;
-        assert_eq!(close_calls(&s, 0.3), [Stage::Design, Stage::Review]);
+        assert_eq!(
+            close_calls(&s, &default_tiers(), 0.3, DEFAULT_CLOSE_CALL_MARGIN),
+            [Stage::Design, Stage::Review]
+        );
+    }
+
+    fn distribution(entries: &[(&str, f64)]) -> BTreeMap<String, f64> {
+        entries
+            .iter()
+            .map(|(name, p)| ((*name).into(), *p))
+            .collect()
+    }
+
+    #[test]
+    fn close_call_flags_3017_split_and_preserves_class() {
+        let mut s = stages("none", "sonnet", "opus");
+        s.implement.confidence = 0.32;
+        s.implement.probabilities = distribution(&[("sonnet", 0.55), ("opus", 0.45)]);
+        assert_eq!(
+            close_calls(&s, &default_tiers(), 0.3, 0.2),
+            [Stage::Implement]
+        );
+        assert!(close_calls(&s, &default_tiers(), 0.3, 0.0).is_empty());
+        assert_eq!(
+            issue_class(&s, &default_tiers()),
+            ("sonnet".into(), ClassSource::Implement)
+        );
+    }
+
+    #[test]
+    fn close_call_predicates_are_strict_independent_and_ordered() {
+        let tiers = default_tiers();
+        let mut s = stages("sonnet", "sonnet", "sonnet");
+        for (confidence, gap, expected) in [
+            (0.25, 0.25, false),  // Both exactly equal.
+            (0.125, 0.5, true),   // Confidence only.
+            (0.5, 0.125, true),   // Margin only.
+            (0.125, 0.125, true), // Both.
+            (0.5, 0.5, false),    // Neither.
+        ] {
+            s.design.confidence = confidence;
+            s.design.probabilities = distribution(&[("sonnet", 0.5 + gap), ("opus", 0.5)]);
+            assert_eq!(
+                close_calls(&s, &tiers, 0.25, 0.25).contains(&Stage::Design),
+                expected
+            );
+        }
+        s.design.confidence = 0.1;
+        s.design.probabilities = distribution(&[("sonnet", 0.5), ("opus", 0.5)]);
+        s.implement.probabilities = s.design.probabilities.clone();
+        s.review.probabilities = s.design.probabilities.clone();
+        assert_eq!(close_calls(&s, &tiers, 0.3, 0.2), Stage::ALL);
+        assert_eq!(close_calls(&s, &tiers, 0.3, 0.0), [Stage::Design]);
+        s.design.confidence = 0.9;
+        s.design.probabilities = distribution(&[("sonnet", 1.0), ("opus", 0.0)]);
+        assert!(!close_calls(&s, &tiers, 0.3, 1.0).contains(&Stage::Design));
+    }
+
+    #[test]
+    fn margin_uses_only_finite_offered_probabilities_without_imputation() {
+        let tiers = default_tiers();
+        let mut a = answer("sonnet", 0.9);
+        assert_eq!(top_two_margin(&a, Stage::Design, &tiers), None);
+        a.probabilities = distribution(&[("sonnet", 0.5)]);
+        assert_eq!(top_two_margin(&a, Stage::Design, &tiers), None);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            a.probabilities = distribution(&[("sonnet", 0.5), ("opus", invalid), ("unknown", 0.5)]);
+            assert_eq!(top_two_margin(&a, Stage::Implement, &tiers), None);
+        }
+        a.probabilities = distribution(&[("none", 0.5), ("sonnet", 0.5), ("unknown", 0.5)]);
+        assert_eq!(top_two_margin(&a, Stage::Design, &tiers), Some(0.0));
+        for stage in [Stage::Implement, Stage::Review] {
+            assert_eq!(top_two_margin(&a, stage, &tiers), None);
+        }
+        // Missing chosen probability and a partial, non-unit sum remain usable.
+        a.probabilities = distribution(&[("none", 0.375), ("opus", 0.25)]);
+        assert_eq!(top_two_margin(&a, Stage::Design, &tiers), Some(0.125));
+        // The top two need not include the chosen option.
+        let openai = Provider::OpenAi.tiers().unwrap();
+        a.choice = "terra".into();
+        a.probabilities = distribution(&[("terra", 0.0), ("sol", 0.5), ("astra", 0.5)]);
+        assert_eq!(top_two_margin(&a, Stage::Implement, &openai), Some(0.0));
+    }
+
+    #[test]
+    fn invalid_probabilities_retain_existing_confidence_behavior() {
+        let mut s = stages("none", "sonnet", "opus");
+        s.design.confidence = 0.1;
+        s.design.probabilities = distribution(&[("sonnet", f64::NAN), ("opus", -1.0)]);
+        s.implement.confidence = f64::NAN;
+        s.review.confidence = f64::NEG_INFINITY;
+        assert_eq!(
+            close_calls(&s, &default_tiers(), 0.3, 0.2),
+            [Stage::Design, Stage::Review]
+        );
+        s.implement.probabilities = distribution(&[("sonnet", 0.5), ("opus", 0.5)]);
+        assert_eq!(close_calls(&s, &default_tiers(), 0.3, 0.2), Stage::ALL);
+    }
+
+    #[test]
+    fn custom_and_multiple_ladders_share_flags_across_output_formats() {
+        let ladders = [
+            Ladder::named("custom".into(), Tiers::parse("tiers:\n  - name: small,alternative\n    description: Local work\n  - name: large\n    description: Complex work\n").unwrap()),
+            class_only(Provider::Anthropic).unwrap(),
+        ];
+        let mut answers = BTreeMap::new();
+        for ladder in &ladders {
+            let first = &ladder.tiers.as_slice()[0].name;
+            let second = &ladder.tiers.as_slice()[1].name;
+            for stage in Stage::ALL {
+                let (p1, p2) = if ladder.name == "custom" && stage == Stage::Implement {
+                    (0.55, 0.45)
+                } else {
+                    (0.9, 0.1)
+                };
+                answers.insert(
+                    stage.question_key(&ladder.name),
+                    Answer::Choice {
+                        choice: first.clone(),
+                        confidence: 0.32,
+                        probabilities: distribution(&[(first, p1), (second, p2)]),
+                    },
+                );
+            }
+        }
+        let routes = provider_routes(&answers, &ladders, 0.3, 0.2, false).unwrap();
+        assert!(routes["anthropic"].close_calls.is_empty());
+        let route = &routes["custom"];
+        assert_eq!(route.close_calls, [Stage::Implement]);
+        let json = serde_json::to_value(route).unwrap();
+        let yaml: serde_json::Value =
+            serde_yaml::from_str(&serde_yaml::to_string(route).unwrap()).unwrap();
+        assert_eq!(json, yaml);
+        assert_eq!(json["close_calls"], serde_json::json!(["implement"]));
+        for stage in Stage::ALL {
+            let clause = render_stage_clause(
+                stage,
+                &route.stages,
+                &route.close_calls,
+                None,
+                TerminalStyle::default(),
+            );
+            let line = render_stage_line(
+                stage,
+                &route.stages,
+                &route.close_calls,
+                Some(&ladders[0]),
+                TerminalStyle::default(),
+            );
+            for text in [clause, line] {
+                assert_eq!(
+                    text.contains("close call"),
+                    stage == Stage::Implement,
+                    "{text}"
+                );
+                if stage == Stage::Implement {
+                    assert!(text.contains("0.32, close call — large 0.45"), "{text}");
+                }
+            }
+        }
+        let confidence_only = provider_routes(&answers, &ladders, 0.3, 0.0, false).unwrap();
+        assert!(confidence_only["custom"].close_calls.is_empty());
+        assert_eq!(route.class, confidence_only["custom"].class);
+        assert_eq!(route.class_from, confidence_only["custom"].class_from);
+    }
+
+    #[tokio::test]
+    async fn run_route_applies_the_configured_margin_without_changing_requests() {
+        let server = wiremock::MockServer::start().await;
+        let mut implementation = choice_json("sonnet", 0.32);
+        implementation["probabilities"] = serde_json::json!({"sonnet": 0.55, "opus": 0.45});
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/systemone"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "jev-1.13.0", "answers": {
+                        "anthropic.stage_design": choice_json("none", 0.9),
+                        "anthropic.stage_implement": implementation,
+                        "anthropic.stage_review": choice_json("opus", 0.9)
+                    }, "usage": {"input_tokens": 100, "output_tokens": 10}
+                })),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = JevClient::new(&server.uri(), "key").unwrap();
+        for margin in [0.0, DEFAULT_CLOSE_CALL_MARGIN] {
+            let mut options = opts();
+            options.close_call_margin = margin;
+            let report = run_route(
+                &client,
+                &[doc(1, ItemState::Open)],
+                &anthropic(),
+                &options,
+                &OpenDependencies::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                provider(&report.issues[0].outcome, "anthropic")
+                    .close_calls
+                    .contains(&Stage::Implement),
+                margin > 0.0
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body, requests[1].body);
+    }
+
+    #[tokio::test]
+    async fn invalid_margins_fail_before_a_jev_request() {
+        let server = wiremock::MockServer::start().await;
+        let client = JevClient::new(&server.uri(), "key").unwrap();
+        for margin in [-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut options = opts();
+            options.close_call_margin = margin;
+            let err = run_route(
+                &client,
+                &[doc(1, ItemState::Open)],
+                &anthropic(),
+                &options,
+                &OpenDependencies::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("close-call margin"), "{err}");
+        }
+        for margin in [0.0, 1.0] {
+            let mut options = opts();
+            options.close_call_margin = margin;
+            validate_options(&[&doc(1, ItemState::Open)], &anthropic(), &options).unwrap();
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]
