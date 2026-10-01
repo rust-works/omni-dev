@@ -756,6 +756,20 @@ The join is at the **session level** (by `cwd`), not the tab level: the Claude
 extension exposes no API to bind a specific tab to a session, so one Claude tab in
 a window/cwd is unambiguous, but several in the same cwd cannot be told apart.
 
+When more than one live window covers a `cwd`, the winner is, in order: the
+window whose matching folder is the **longest** (the most specific root — a window
+on `/repo/sub` beats a later-opened one on `/repo` for a session in `/repo/sub`),
+then the **most recently registered** key, then the lowest key (only so equal
+stamps stay deterministic). Registration time is when a key first registered, and
+a heartbeat refresh does not move it. A window reload registers a fresh key while
+the old one lives on for up to the 30s window TTL, so the newest registration is
+the live window ([#1451](https://github.com/rust-works/omni-dev/issues/1451)).
+`last_seen` is deliberately not the criterion: every open window refreshes it on
+its own heartbeat, so two live windows on one folder would alternate. After a
+daemon restart the windows re-register in arbitrary order, which fixes the order
+among them until a window next registers. The tray's `focus:<session_id>` action
+resolves its window by the same rule.
+
 ## Security
 
 **No new trust boundary** — the same posture as [ADR-0039](adrs/adr-0039.md) and
