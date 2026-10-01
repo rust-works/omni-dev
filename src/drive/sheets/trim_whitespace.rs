@@ -426,15 +426,14 @@ fn validate_scope_syntax(opts: &TrimWhitespaceOptions) -> Result<(), String> {
             if opts.sheet.as_ref().is_none_or(|s| s.trim().is_empty()) {
                 return Err("--whole-sheet needs --sheet to name the sheet to trim".to_string());
             }
-            Ok(())
         }
         TrimScope::Range => {
             if opts.range.as_ref().is_none_or(|r| r.trim().is_empty()) {
                 return Err("pass --range, or --whole-sheet to trim an entire sheet".to_string());
             }
-            Ok(())
         }
     }
+    Ok(())
 }
 
 /// The sheet title and grid range the caller's scope names.

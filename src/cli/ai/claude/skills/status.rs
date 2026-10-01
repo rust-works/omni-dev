@@ -138,11 +138,9 @@ struct StatusOutput<'a> {
 fn print_report(report: &StatusReport, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Text => {
-            if report.is_empty() {
-                return Ok(());
+            if !report.is_empty() {
+                print_report_text(report);
             }
-            print_report_text(report);
-            Ok(())
         }
         OutputFormat::Yaml => {
             let output = StatusOutput {
@@ -151,9 +149,9 @@ fn print_report(report: &StatusReport, format: OutputFormat) -> Result<()> {
             let yaml = serde_yaml::to_string(&output)
                 .context("Failed to serialize status report as YAML")?;
             print!("{yaml}");
-            Ok(())
         }
     }
+    Ok(())
 }
 
 fn print_report_text(report: &StatusReport) {

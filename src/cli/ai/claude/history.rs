@@ -54,10 +54,7 @@ pub(super) fn print_report(
     format: OutputFormat,
 ) -> Result<()> {
     match format {
-        OutputFormat::Text => {
-            print_report_text(report, dry_run);
-            Ok(())
-        }
+        OutputFormat::Text => print_report_text(report, dry_run),
         OutputFormat::Yaml => {
             let output = SyncOutput {
                 dry_run,
@@ -67,9 +64,9 @@ pub(super) fn print_report(
             let yaml = serde_yaml::to_string(&output)
                 .context("Failed to serialize sync report as YAML")?;
             print!("{yaml}");
-            Ok(())
         }
     }
+    Ok(())
 }
 
 fn print_report_text(report: &sync::SyncReport, dry_run: bool) {

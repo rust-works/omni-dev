@@ -163,10 +163,7 @@ struct CleanOutput<'a> {
 
 fn print_report(report: &CleanReport, dry_run: bool, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Text => {
-            print_report_text(report, dry_run);
-            Ok(())
-        }
+        OutputFormat::Text => print_report_text(report, dry_run),
         OutputFormat::Yaml => {
             let output = CleanOutput {
                 dry_run,
@@ -175,9 +172,9 @@ fn print_report(report: &CleanReport, dry_run: bool, format: OutputFormat) -> Re
             let yaml = serde_yaml::to_string(&output)
                 .context("Failed to serialize clean report as YAML")?;
             print!("{yaml}");
-            Ok(())
         }
     }
+    Ok(())
 }
 
 fn print_report_text(report: &CleanReport, dry_run: bool) {
