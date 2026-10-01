@@ -1327,9 +1327,10 @@ fn render_provider_line(
     lines
 }
 
-/// Renders one provider's routing as an indented line, e.g. `  sonnet —
-/// design needs opus (0.52), ...` or, with more than one provider requested,
-/// `  anthropic: sonnet — design needs opus (0.52), ...`.
+/// Renders one provider's routing as an indented line, e.g. `  opus (from
+/// design) — design needs opus (0.52), ...` or, with more than one provider
+/// requested, `  anthropic: opus (from design) — design needs opus (0.52),
+/// ...`.
 fn render_provider_line_compact(
     provider: &str,
     route: &ProviderRoute,
