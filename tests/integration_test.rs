@@ -318,6 +318,20 @@ fn binary_config_models_show_succeeds() {
 // `src/resources/**` pattern was dead). #1468 fixed scopes.yaml, so it now
 // asserts a clean run instead — inverted rather than deleted, so a future
 // regression is still caught here.
+//
+// This is the guard #1469 asked for (STYLE-0007 clause 4): every tracked
+// file under `src/`, `editors/` and `.github/` is matched by some project
+// scope's `file_patterns` or by the `allow:` list in scopes.yaml. It runs
+// the lint with project scopes only (the default), because the ecosystem
+// `lib` scope's `src/**` catch-all would make the check vacuously true.
+//
+// The honest trade-off: the `allow:` list can itself rot — an entry added
+// to silence this failure looks, at a glance, just like one that is
+// genuinely right. The mitigations are that it stays small, that every
+// entry in scopes.yaml carries a written justification, and that growing it
+// is a visible diff in review rather than a silent resolution inside an AI
+// prompt. That is still strictly better than a `src/**` catch-all absorbing
+// new subsystems automatically.
 #[test]
 fn binary_config_scopes_lint_reports_a_clean_run() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
@@ -327,6 +341,12 @@ fn binary_config_scopes_lint_reports_a_clean_run() {
             "--repo",
             env!("CARGO_MANIFEST_DIR"),
             "lint",
+            "--root",
+            "src",
+            "--root",
+            "editors",
+            "--root",
+            ".github",
             "-o",
             "json",
         ])
@@ -334,18 +354,21 @@ fn binary_config_scopes_lint_reports_a_clean_run() {
         .expect("failed to run binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let report: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON report");
+    let unscoped = report["unscoped_files"]
+        .as_array()
+        .expect("unscoped_files array");
+    let dead = report["dead_patterns"]
+        .as_array()
+        .expect("dead_patterns array");
     assert!(
-        output.status.success(),
-        "expected a clean `config scopes lint` run against today's scopes.yaml, got: {report}"
+        output.status.success() && unscoped.is_empty() && dead.is_empty(),
+        "`config scopes lint` found drift between .omni-dev/scopes.yaml and the tree.\n\
+         Unscoped files: {unscoped:#?}\n\
+         Dead patterns: {dead:#?}\n\
+         Fix each by adding a scope, extending an existing scope's `file_patterns`, or — only \
+         for shared code with no subsystem owner — adding the path to `allow:` in scopes.yaml \
+         with a one-line justification (STYLE-0007)."
     );
-    assert!(report["dead_patterns"]
-        .as_array()
-        .expect("dead_patterns array")
-        .is_empty());
-    assert!(report["unscoped_files"]
-        .as_array()
-        .expect("unscoped_files array")
-        .is_empty());
 }
 
 #[test]
