@@ -157,6 +157,16 @@ finish after the turn's `Stop`, and a manual `/compact` can run from idle. No
 event afterwards would release a `working`, so treating them as `working` would
 leave an idle row showing `working`. A `SessionStart` with `source: "compact"` follows a compaction, which can run
 mid-turn. It isn't a new session, so it doesn't reset the state to `starting`.
+Claude subagent hooks carrying `agent_id` share the parent's `session_id`.
+Their tool activity refreshes liveness without changing the parent's state
+(#1926), so background tools after `Stop` leave the session idle. Permission
+requests, classified notifications and elicitation still show waits. A tool
+completion (including failure or permission denial), `ElicitationResult`, or
+`SubagentStop` releases only that subagent's wait and restores the underlying
+parent state once all subagent waits are resolved. Overlapping permission waits
+have display priority over input waits. Parent hooks retain their existing wait
+release behavior; passive sightings and transcript growth cannot clear waits.
+
 `PostToolBatch` is not installed. Every tool
 in a batch has already sent its own `PostToolUse` or `PostToolUseFailure`, so it
 would only add a process spawn per batch.

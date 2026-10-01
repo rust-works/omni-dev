@@ -283,6 +283,9 @@ fn agent_pid(parent: u32) -> Option<u32> {
 /// to parse (the sink then simply produces no op). See the hooks docs.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct HookPayload {
+    /// Subagent hooks share the parent session id.
+    #[serde(default)]
+    agent_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
@@ -335,7 +338,7 @@ impl HookPayload {
             }
             return Some(("end", payload));
         }
-        let event = match agent {
+        let mut event = match agent {
             HookAgent::Claude => session_event_for(
                 event_name,
                 self.source.as_deref(),
@@ -348,7 +351,15 @@ impl HookPayload {
                 self.tool_name.as_deref(),
             )?,
         };
+        let agent_id = (agent == HookAgent::Claude)
+            .then(|| self.agent_id.clone())
+            .flatten()
+            .filter(|id| !id.trim().is_empty());
+        if agent_id.is_some() && event_name == "SubagentStop" {
+            event = SessionEvent::PostToolUse;
+        }
         let request = ObserveRequest {
+            agent_id,
             agent: agent.agent(),
             session_id,
             cwd: self.cwd.clone(),
@@ -367,7 +378,9 @@ impl HookPayload {
 /// separately (it maps to the `end` op, not `observe`).
 ///
 /// Everything lands on the **existing** events, so the engine's state machine
-/// is unchanged (the Codex precedent, ADR-0087):
+/// handles parent hooks as before (the Codex precedent, ADR-0087). Subagent
+/// identity travels separately so the registry can preserve parent activity
+/// and release only the wait belonging to a completing subagent (#1926):
 ///
 /// - `PermissionRequest` is the dedicated "a prompt is about to be shown"
 ///   event, so it sets the permission wait without matching `Notification`
@@ -2028,6 +2041,149 @@ mod tests {
                 "{preserving}"
             );
         }
+    }
+
+    fn observe_claude_hook(reg: &crate::sessions::SessionsRegistry, event: &str, id: Option<&str>) {
+        let hook = json!({"session_id": "s1", "hook_event_name": event, "agent_id": id});
+        let (_, payload) = hook_op(&hook.to_string()).unwrap();
+        reg.observe(serde_json::from_value(payload).unwrap());
+    }
+
+    #[test]
+    fn background_subagent_tools_preserve_parent_state_and_refresh_liveness() {
+        use crate::sessions::SessionsRegistry;
+        for (parent, expected) in [
+            ("Stop", SessionState::Idle),
+            ("UserPromptSubmit", SessionState::Working),
+        ] {
+            let reg = SessionsRegistry::new();
+            observe_claude_hook(&reg, parent, None);
+            for event in [
+                "PreToolUse",
+                "PostToolUse",
+                "PostToolUseFailure",
+                "PermissionDenied",
+                "SubagentStop",
+            ] {
+                let before = reg.list()[0].last_seen;
+                observe_claude_hook(&reg, event, Some("child"));
+                assert_eq!(reg.list()[0].state, expected, "{parent}: {event}");
+                assert!(reg.list()[0].last_seen >= before);
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_completion_releases_only_its_own_wait_to_parent_state() {
+        use crate::sessions::SessionsRegistry;
+        for (parent, expected) in [
+            ("Stop", SessionState::Idle),
+            ("UserPromptSubmit", SessionState::Working),
+        ] {
+            for (wait, waiting, completions) in [
+                (
+                    "PermissionRequest",
+                    SessionState::WaitingForPermission,
+                    vec![
+                        "PostToolUse",
+                        "PostToolUseFailure",
+                        "PermissionDenied",
+                        "SubagentStop",
+                    ],
+                ),
+                (
+                    "Elicitation",
+                    SessionState::WaitingForInput,
+                    vec!["ElicitationResult", "SubagentStop"],
+                ),
+            ] {
+                for completion in completions {
+                    let reg = SessionsRegistry::new();
+                    observe_claude_hook(&reg, parent, None);
+                    observe_claude_hook(&reg, wait, Some("a"));
+                    observe_claude_hook(&reg, "PostToolUse", Some("b"));
+                    observe_claude_hook(&reg, "PreToolUse", Some("a"));
+                    observe_claude_hook(&reg, "Notification", Some("a"));
+                    assert_eq!(reg.list()[0].state, waiting);
+                    observe_claude_hook(&reg, completion, Some("a"));
+                    assert_eq!(
+                        reg.list()[0].state,
+                        expected,
+                        "{parent}: {wait}/{completion}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_subagent_waits_resolve_independently() {
+        let reg = crate::sessions::SessionsRegistry::new();
+        observe_claude_hook(&reg, "Stop", None);
+        observe_claude_hook(&reg, "PermissionRequest", Some("a"));
+        observe_claude_hook(&reg, "Elicitation", Some("b"));
+        assert_eq!(reg.list()[0].state, SessionState::WaitingForPermission);
+        observe_claude_hook(&reg, "PostToolUse", Some("a"));
+        assert_eq!(reg.list()[0].state, SessionState::WaitingForInput);
+        observe_claude_hook(&reg, "ElicitationResult", Some("b"));
+        assert_eq!(reg.list()[0].state, SessionState::Idle);
+    }
+
+    #[test]
+    fn first_subagent_wait_and_parent_wait_release_remain_supported() {
+        let reg = crate::sessions::SessionsRegistry::new();
+        observe_claude_hook(&reg, "PermissionRequest", Some("a"));
+        assert_eq!(reg.list()[0].state, SessionState::WaitingForPermission);
+        observe_claude_hook(&reg, "PostToolUse", None);
+        assert_eq!(reg.list()[0].state, SessionState::Working);
+        observe_claude_hook(&reg, "Stop", None);
+        observe_claude_hook(&reg, "PostToolUse", Some("a"));
+        assert_eq!(reg.list()[0].state, SessionState::Idle);
+        observe_claude_hook(&reg, "PermissionRequest", None);
+        observe_claude_hook(&reg, "PostToolUse", Some("b"));
+        assert_eq!(reg.list()[0].state, SessionState::WaitingForPermission);
+    }
+
+    #[test]
+    fn subagent_notifications_survive_passive_evidence_and_end_ignores_late_tools() {
+        let reg = crate::sessions::SessionsRegistry::new();
+        observe_claude_hook(&reg, "Stop", None);
+        let hook = json!({"session_id":"s1", "hook_event_name":"Notification", "agent_id":"a", "notification_type":"permission_prompt"});
+        let (_, payload) = hook_op(&hook.to_string()).unwrap();
+        reg.observe(serde_json::from_value(payload).unwrap());
+        for event in [
+            SessionEvent::TranscriptDiscovered,
+            SessionEvent::TranscriptGrew,
+        ] {
+            let req: ObserveRequest =
+                serde_json::from_value(json!({"session_id":"s1", "event":event})).unwrap();
+            reg.observe(req);
+            assert_eq!(reg.list()[0].state, SessionState::WaitingForPermission);
+        }
+        observe_claude_hook(&reg, "PostToolUse", Some("a"));
+        assert_eq!(reg.list()[0].state, SessionState::Idle);
+        reg.end("s1", None, None);
+        let before = reg.list()[0].last_seen;
+        observe_claude_hook(&reg, "PostToolUse", Some("a"));
+        assert_eq!(reg.list()[0].state, SessionState::Ended);
+        assert_eq!(reg.list()[0].last_seen, before);
+    }
+
+    #[test]
+    fn subagent_identity_is_optional_and_claude_only() {
+        for id in [None, Some(""), Some("  ")] {
+            let hook = json!({"session_id":"s1", "hook_event_name":"PostToolUse", "agent_id":id});
+            let payload = hook_op(&hook.to_string()).unwrap().1;
+            assert!(payload.get("agent_id").is_none());
+            let request: ObserveRequest = serde_json::from_value(payload).unwrap();
+            assert!(request.agent_id.is_none());
+        }
+        let hook = json!({"session_id":"c1", "hook_event_name":"PostToolUse", "agent_id":"child"});
+        assert!(codex_op(&hook.to_string())
+            .unwrap()
+            .1
+            .get("agent_id")
+            .is_none());
     }
 
     #[test]

@@ -353,6 +353,9 @@ impl Agent {
 /// existing entry without ever clobbering known data with `None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObserveRequest {
+    /// Claude subagent identity; absent for parent hooks and other feeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     /// The Claude `session_id` (a UUID) — the primary key. Equal to the
     /// transcript filename stem and (per ADR-0052) the VS Code extension's tab
     /// key, so the three feeds join without heuristics.
@@ -426,6 +429,12 @@ impl WindowReport {
 /// then).
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionEntry {
+    /// Parent state hidden by outstanding subagent waits.
+    #[serde(skip)]
+    pub(crate) subagent_base: Option<SessionState>,
+    /// Outstanding waits, released only by their owning subagent.
+    #[serde(skip)]
+    pub(crate) subagent_waits: HashMap<String, SessionState>,
     /// The Claude `session_id`.
     pub session_id: String,
     /// The session's working directory, when known.
@@ -477,6 +486,56 @@ pub struct SessionEntry {
     /// `end` from one of them is ignored (#1948).
     #[serde(skip)]
     pub(crate) replaced_pids: VecDeque<u32>,
+}
+
+/// Subagent activity shares the parent's session id but does not run its turn.
+fn subagent_state(
+    entry: &mut SessionEntry,
+    event: SessionEvent,
+    agent_id: Option<&str>,
+) -> SessionState {
+    if let Some(id) = agent_id.filter(|id| !id.trim().is_empty()) {
+        match event {
+            SessionEvent::Notification(
+                NotificationKind::PermissionPrompt
+                | NotificationKind::IdlePrompt
+                | NotificationKind::AgentNeedsInput,
+            ) => {
+                entry.subagent_base.get_or_insert(entry.state);
+                entry
+                    .subagent_waits
+                    .insert(id.to_owned(), SessionState::for_event(&event, None));
+            }
+            SessionEvent::PostToolUse => {
+                entry.subagent_waits.remove(id);
+            }
+            _ => {}
+        }
+        if entry
+            .subagent_waits
+            .values()
+            .any(|s| *s == SessionState::WaitingForPermission)
+        {
+            return SessionState::WaitingForPermission;
+        }
+        if !entry.subagent_waits.is_empty() {
+            return SessionState::WaitingForInput;
+        }
+        return entry.subagent_base.take().unwrap_or(entry.state);
+    }
+    let next = SessionState::for_event(&event, Some(entry.state));
+    // Passive evidence cannot release a wait. Parent hooks remain the fallback
+    // release when the parent Task completes or a new turn starts.
+    if !matches!(
+        event,
+        SessionEvent::TranscriptDiscovered
+            | SessionEvent::TranscriptGrew
+            | SessionEvent::Notification(NotificationKind::Other)
+    ) {
+        entry.subagent_waits.clear();
+        entry.subagent_base = None;
+    }
+    next
 }
 
 /// One pid-bearing session, as [`SessionsRegistry::pid_liveness_candidates`]
@@ -612,6 +671,10 @@ impl SessionsRegistry {
     /// fire on every tool call (the `heartbeat` precedent in
     /// [`WorktreesRegistry`](crate::worktrees::WorktreesRegistry)).
     pub fn observe(&self, req: ObserveRequest) {
+        let agent_id = req
+            .agent_id
+            .as_deref()
+            .filter(|id| req.agent == Agent::Claude && !id.trim().is_empty());
         let now = Utc::now();
         let changed = {
             let mut sessions = self.lock_sessions();
@@ -622,7 +685,8 @@ impl SessionsRegistry {
                 // short ended-linger window (#1909).
                 Some(entry)
                     if entry.state == SessionState::Ended
-                        && req.event == SessionEvent::TranscriptDiscovered =>
+                        && (req.event == SessionEvent::TranscriptDiscovered
+                            || agent_id.is_some()) =>
                 {
                     false
                 }
@@ -641,7 +705,7 @@ impl SessionsRegistry {
                 Some(entry) => {
                     track_pid(entry, req.pid);
                     entry.prompted |= req.event == SessionEvent::UserPromptSubmit;
-                    let next = SessionState::for_event(&req.event, Some(entry.state));
+                    let next = subagent_state(entry, req.event, agent_id);
                     let state_changed = next != entry.state;
                     entry.state = next;
                     entry.last_event = req.event;
@@ -658,28 +722,34 @@ impl SessionsRegistry {
                     if sessions.len() >= MAX_SESSIONS {
                         evict_oldest_session(&mut sessions);
                     }
-                    let state = SessionState::for_event(&req.event, None);
+                    let state = if agent_id.is_some() {
+                        SessionState::Idle
+                    } else {
+                        SessionState::for_event(&req.event, None)
+                    };
                     let prompted = req.event == SessionEvent::UserPromptSubmit;
-                    sessions.insert(
-                        req.session_id.clone(),
-                        SessionEntry {
-                            session_id: req.session_id,
-                            cwd: req.cwd,
-                            transcript_path: req.transcript_path,
-                            repo: req.repo,
-                            model: req.model,
-                            agent: req.agent,
-                            state,
-                            source: Source::Terminal,
-                            last_event: req.event,
-                            started_at: now,
-                            last_seen: now,
-                            pid: req.pid,
-                            pid_start: None,
-                            prompted,
-                            replaced_pids: VecDeque::new(),
-                        },
-                    );
+                    let session_id = req.session_id.clone();
+                    let mut entry = SessionEntry {
+                        subagent_base: None,
+                        subagent_waits: HashMap::new(),
+                        session_id: req.session_id,
+                        cwd: req.cwd,
+                        transcript_path: req.transcript_path,
+                        repo: req.repo,
+                        model: req.model,
+                        agent: req.agent,
+                        state,
+                        source: Source::Terminal,
+                        last_event: req.event,
+                        started_at: now,
+                        last_seen: now,
+                        pid: req.pid,
+                        pid_start: None,
+                        prompted,
+                        replaced_pids: VecDeque::new(),
+                    };
+                    entry.state = subagent_state(&mut entry, req.event, agent_id);
+                    sessions.insert(session_id, entry);
                     true
                 }
             };
@@ -1052,6 +1122,7 @@ mod tests {
 
     fn observe_request(session_id: &str, event: SessionEvent, cwd: Option<&str>) -> ObserveRequest {
         ObserveRequest {
+            agent_id: None,
             pid: None,
             agent: Agent::Claude,
             session_id: session_id.to_string(),
@@ -1426,6 +1497,8 @@ mod tests {
             sessions.insert(
                 id.to_string(),
                 SessionEntry {
+                    subagent_base: None,
+                    subagent_waits: HashMap::new(),
                     pid: None,
                     pid_start: None,
                     prompted: false,
@@ -1455,6 +1528,7 @@ mod tests {
         let reg = SessionsRegistry::new();
         for (id, repo) in [("z", "repo-a"), ("a", "repo-b"), ("m", "repo-a")] {
             reg.observe(ObserveRequest {
+                agent_id: None,
                 pid: None,
                 agent: Agent::Claude,
                 session_id: id.to_string(),
@@ -1486,6 +1560,7 @@ mod tests {
         // tagged source, and omitted `None` fields.
         let reg = SessionsRegistry::new();
         reg.observe(ObserveRequest {
+            agent_id: None,
             pid: None,
             agent: Agent::Claude,
             session_id: "s1".to_string(),
@@ -1668,6 +1743,8 @@ mod tests {
                 sessions.insert(
                     id.clone(),
                     SessionEntry {
+                        subagent_base: None,
+                        subagent_waits: HashMap::new(),
                         pid: None,
                         pid_start: None,
                         prompted: false,
@@ -1943,6 +2020,7 @@ mod tests {
     /// A hook sighting from agent process `pid`.
     fn observe_from(session_id: &str, event: SessionEvent, pid: u32) -> ObserveRequest {
         ObserveRequest {
+            agent_id: None,
             pid: Some(pid),
             ..observe_request(session_id, event, None)
         }
