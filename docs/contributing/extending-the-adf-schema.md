@@ -5,7 +5,7 @@ Flavoured Markdown (JFM, see [ADR-0020](../adrs/adr-0020.md)). Three layers
 have to agree for a new ADF node type to work end-to-end:
 
 1. **Vendored upstream schema** at [`assets/adf-schema/`](../../assets/adf-schema/) — the JSON snapshot from `@atlaskit/adf-schema` npm.
-2. **Hand-maintained quantifier table** at [`src/atlassian/adf_schema/mod.rs`](../../src/atlassian/adf_schema/mod.rs) — encodes arity (`+`, `*`, `?`) the upstream JSON loses ([ADR-0023](../adrs/adr-0023.md)).
+2. **Hand-maintained quantifier table** at [`src/atlassian/adf_schema.rs`](../../src/atlassian/adf_schema.rs) — encodes arity (`+`, `*`, `?`) the upstream JSON loses ([ADR-0023](../adrs/adr-0023.md)).
 3. **JFM converter and spec** at [`src/atlassian/convert.rs`](../../src/atlassian/convert.rs) and [`docs/specs/jfm.md`](../specs/jfm.md) — define how the node renders to/from markdown.
 
 This recipe walks you through adding a new node type (we'll use
@@ -17,7 +17,7 @@ This recipe walks you through adding a new node type (we'll use
 |---|---|
 | [`src/atlassian/adf.rs`](../../src/atlassian/adf.rs) | Add `impl AdfNode { pub fn inline_card(...) }` constructor. |
 | [`src/atlassian/convert.rs`](../../src/atlassian/convert.rs) | Add a parse arm in `try_container_directive` or `try_leaf_directive`; add `from-adf` rendering. |
-| [`src/atlassian/adf_schema/mod.rs`](../../src/atlassian/adf_schema/mod.rs) | Add a `CONTENT_ENTRIES` tuple for the new parent (if any) and add the atom to allowed-children sets where it can legally appear. |
+| [`src/atlassian/adf_schema.rs`](../../src/atlassian/adf_schema.rs) | Add a `CONTENT_ENTRIES` tuple for the new parent (if any) and add the atom to allowed-children sets where it can legally appear. |
 | [`docs/specs/jfm.md`](../specs/jfm.md) | Add a row to *Supported Block Nodes* or *Supported Inline Nodes* (around lines 120–178). |
 | [`tests/adf_schema_test.rs`](../../tests/adf_schema_test.rs) | Add validator tests for round-trip and nesting rules. |
 
@@ -51,7 +51,7 @@ roundtrip-assertion pattern.
 
 ### 3. Content model — `CONTENT_ENTRIES`
 
-[`src/atlassian/adf_schema/mod.rs:597`](../../src/atlassian/adf_schema/mod.rs#L597)
+[`src/atlassian/adf_schema.rs:597`](../../src/atlassian/adf_schema.rs#L597)
 holds the alphabetically-sorted list of `(parent, &[ContentTerm])` tuples.
 Two edits, usually:
 
@@ -82,7 +82,7 @@ Two edits, usually:
 The hand-maintained table is reconciled against the upstream JSON by
 [`tests/adf_schema_drift_bin_test.rs`](../../tests/adf_schema_drift_bin_test.rs)
 — if you miss a parent or add an atom upstream doesn't allow, that test
-fails. Inline comments in `mod.rs` (search for "LENIENT") flag a small
+fails. Inline comments in `src/atlassian/adf_schema.rs` (search for "LENIENT") flag a small
 allowlist of deliberate deviations; mirror that style if you have a
 documented reason to diverge.
 
@@ -131,7 +131,9 @@ version:
    with the new version, URL, and SHA-256s.
 3. Run `cargo run --bin adf-schema-codegen` to regenerate
    [`src/atlassian/adf_schema/generated.rs`](../../src/atlassian/adf_schema/generated.rs).
-4. Run `cargo run --bin adf-schema-codegen -- --check` to confirm the
+4. Update `SCHEMA_VERSION` and `UPSTREAM_TARBALL_SHA256` in
+   `src/atlassian/adf_schema.rs` to match the refreshed provenance.
+5. Run `cargo run --bin adf-schema-codegen -- --check` to confirm the
    committed file matches what codegen now produces. CI runs this same
    check.
 

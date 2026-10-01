@@ -375,7 +375,7 @@ When the desired nesting is rejected, common rewrites are:
 
 ### Coverage and limits
 
-As of `SCHEMA_VERSION 56.1.18-2026-07-28`, the validator covers:
+As of `SCHEMA_VERSION 57.6.19-2026-10-01`, the validator covers:
 
 - Allowed-children sets for every container node type.
 - Per-term quantifiers and content-term sequences (e.g. empty `bulletList`,
@@ -387,6 +387,9 @@ As of `SCHEMA_VERSION 56.1.18-2026-07-28`, the validator covers:
 - Node attribute-value schemas (allowed values for `panel.panelType`,
   `status.color`, `heading.level`, etc.), reported as
   `AdfSchemaViolation::MissingAttr` / `InvalidAttr`.
+
+Status badge `color` accepts `neutral`, `purple`, `blue`, `red`, `yellow`,
+`green`, or a six-digit hex color such as `#aB12Cd`.
 
 ### Nesting depth limit
 

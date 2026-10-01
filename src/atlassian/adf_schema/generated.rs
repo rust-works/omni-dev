@@ -9,7 +9,9 @@
 //! 2. Update `assets/adf-schema/provenance.json` with the new version and
 //!    tarball/JSON SHA-256s.
 //! 3. Run `cargo run --bin adf-schema-codegen`.
-//! 4. Commit `full.json`, `provenance.json`, and this file together.
+//! 4. Update the runtime provenance constants in `src/atlassian/adf_schema.rs`
+//!    and review content, attribute, and mark rules against the new schema.
+//! 5. Commit `full.json`, `provenance.json`, this file, and runtime changes together.
 //!
 //! See issue #732 (ADR-0023 follow-up) for the rationale.
 
@@ -17,15 +19,15 @@
 pub const UPSTREAM_PACKAGE: &str = "@atlaskit/adf-schema";
 
 /// Upstream npm package version this snapshot was generated from.
-pub const UPSTREAM_VERSION: &str = "56.1.18";
+pub const UPSTREAM_VERSION: &str = "57.6.19";
 
 /// SHA-256 of the upstream tarball that produced this snapshot.
 pub const UPSTREAM_TARBALL_SHA256: &str =
-    "402cc55a1b402d060ae257073715c8620744d948897625a29a9d726a4fde646a";
+    "bafc2e41ed5757e1f63a4434c68546a1b645c03cb2fca0a942e6b9253c7245ce";
 
 /// SHA-256 of the vendored `assets/adf-schema/full.json` bytes.
 pub const UPSTREAM_FULL_JSON_SHA256: &str =
-    "75f080928a970250eb8289e9cae5374e3c2a6c0ac3ca22478acaa9d3f39484a3";
+    "5128562b75278c8a83e7e3619a570205bc80d59696985ec31a7a7883cff66fbe";
 
 /// Per-parent allowed-children atoms, derived faithfully from the upstream
 /// `@atlaskit/adf-schema` JSON schema in `assets/adf-schema/full.json`.
@@ -35,11 +37,11 @@ pub const UPSTREAM_FULL_JSON_SHA256: &str =
 /// (`+`, `*`, `?`, `{n}`, `{m,n}`, sequence order) is *not* preserved here —
 /// the upstream JSON schema's `anyOf`-of-`$ref` shape does not encode it in
 /// a parseable way. See [`super::CONTENT_ENTRIES`] in
-/// `src/atlassian/adf_schema/mod.rs` for the runtime model that layers
+/// `src/atlassian/adf_schema.rs` for the runtime model that layers
 /// quantifier arity on top of these atoms.
 ///
 /// The unit test `generated_upstream_atoms_match_local_snapshot` in
-/// `src/atlassian/adf_schema/mod.rs` asserts that the flattened atoms from
+/// `src/atlassian/adf_schema.rs` asserts that the flattened atoms from
 /// [`super::CONTENT_ENTRIES`] agree with `UPSTREAM_ENTRIES` modulo a small
 /// allowlist of documented leniency deviations.
 pub const UPSTREAM_ENTRIES: &[(&str, &[&str])] = &[
