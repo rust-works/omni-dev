@@ -17,7 +17,8 @@
 //! full, and every reporting error is swallowed exactly as the `sessions hook`
 //! sink swallows its own.
 //!
-//! Nothing is logged or persisted. The observer reads only the state, the
+//! Conversation content is never logged or persisted. An optional metadata-only
+//! file sink is enabled by `OMNI_DEV_CLAUDE_WRAP_LOG`; it never runs on the byte pump. The observer reads only the state, the
 //! `session_id`, the `cwd` and the model out of the stream, and reports them to
 //! the daemon's existing `0600` Unix socket.
 
@@ -41,6 +42,9 @@ use crate::sessions::stream::{Direction, StreamTracker};
 
 /// The `sessions` service routing key on the daemon control socket.
 const SERVICE: &str = "sessions";
+
+mod diagnostics;
+use diagnostics::{increment, Diagnostics};
 
 /// How long a fire-and-forget report waits for the daemon before giving up.
 /// Short, and on a task that no byte ever waits behind.
@@ -147,12 +151,13 @@ fn exec_replace(program: &str, args: &[String]) -> anyhow::Error {
 
 /// Wraps `program`, joining it to this process's own stdin and stdout.
 async fn wrap(program: &str, args: &[String], socket: Option<PathBuf>) -> Result<i32> {
-    wrap_io(
+    wrap_io_diagnostics(
         program,
         args,
         socket,
         tokio::io::stdin(),
         tokio::io::stdout(),
+        std::env::var_os("OMNI_DEV_CLAUDE_WRAP_LOG").map(PathBuf::from),
     )
     .await
 }
@@ -164,6 +169,7 @@ async fn wrap(program: &str, args: &[String], socket: Option<PathBuf>) -> Result
 /// Generic over the two endpoints so the wrapping can be tested against a real
 /// child process without touching the test runner's own stdio — which is also
 /// the only way to assert that the forwarding is byte-for-byte lossless.
+#[cfg(test)]
 async fn wrap_io<R, W>(
     program: &str,
     args: &[String],
@@ -175,6 +181,23 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    wrap_io_diagnostics(program, args, socket, input, output, None).await
+}
+
+async fn wrap_io_diagnostics<R, W>(
+    program: &str,
+    args: &[String],
+    socket: Option<PathBuf>,
+    input: R,
+    output: W,
+    log_path: Option<PathBuf>,
+) -> Result<i32>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (diagnostics, log_done) = Diagnostics::open(log_path.as_deref());
+    diagnostics.record(|| json!({"event":"process_start"}));
     // stderr is inherited and env is left untouched, so the child sees exactly
     // the environment it would have without the wrapper. The child is
     // deliberately *not* put in its own process group (unlike the managed
@@ -200,31 +223,34 @@ where
 
     let (tee, lines) = mpsc::channel::<(Direction, String)>(TEE_CAPACITY);
     let (title_tx, title_rx) = watch::channel::<Option<String>>(None);
-    let observer = tokio::spawn(observe(
+    let observer = tokio::spawn(observe_diagnostics(
         lines,
         socket,
         KEEPALIVE_INTERVAL,
         title_tx,
         child_pid,
+        diagnostics.clone(),
     ));
     let signals = tokio::spawn(forward_signals(child_pid));
 
     // The title rewrite only ever applies to the FromClaude direction — it
     // rewrites what Claude asserts about itself, never what we send it.
     let from_child_title_rx = title_rewrite_enabled().then_some(title_rx);
-    let from_child = tokio::spawn(pump(
+    let from_child = tokio::spawn(pump_diagnostics(
         child_stdout,
         output,
         Direction::FromClaude,
         tee.clone(),
         from_child_title_rx,
+        diagnostics.clone(),
     ));
-    let to_child = tokio::spawn(pump(
+    let to_child = tokio::spawn(pump_diagnostics(
         input,
         child_stdin,
         Direction::ToClaude,
         tee.clone(),
         None,
+        diagnostics.clone(),
     ));
     drop(tee);
 
@@ -244,7 +270,13 @@ where
         .await
         .context("failed to wait for the wrapped process")?;
     let _ = observer.await;
-    Ok(exit_code(status))
+    let code = exit_code(status);
+    diagnostics.record(|| json!({"event":"process_exit", "pid":child_pid, "code":code}));
+    drop(diagnostics);
+    if let Some(done) = log_done {
+        let _ = tokio::time::timeout(Duration::from_millis(200), done).await;
+    }
+    Ok(code)
 }
 
 /// Copies `reader` to `writer` byte-for-byte, teeing complete lines to the
@@ -275,12 +307,35 @@ where
 /// updates it, this branch simply never fires — it cannot hang the pump.
 ///
 /// [`try_send`]: tokio::sync::mpsc::Sender::try_send
+#[cfg(test)]
 async fn pump<R, W>(
+    reader: R,
+    writer: W,
+    direction: Direction,
+    tee: mpsc::Sender<(Direction, String)>,
+    title_rx: Option<watch::Receiver<Option<String>>>,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    pump_diagnostics(
+        reader,
+        writer,
+        direction,
+        tee,
+        title_rx,
+        Diagnostics::default(),
+    )
+    .await;
+}
+
+async fn pump_diagnostics<R, W>(
     mut reader: R,
     mut writer: W,
     direction: Direction,
     tee: mpsc::Sender<(Direction, String)>,
     mut title_rx: Option<watch::Receiver<Option<String>>>,
+    diagnostics: Diagnostics,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -316,7 +371,7 @@ async fn pump<R, W>(
                 if write_result.is_err() || writer.flush().await.is_err() {
                     break;
                 }
-                tee_chunk(chunk, direction, &tee, &mut line);
+                tee_chunk_diagnostics(chunk, direction, &tee, &mut line, &diagnostics);
             }
             changed = title_changed => {
                 match changed {
@@ -570,18 +625,40 @@ fn title_prefix_for_model(model_id: &str) -> String {
 /// Reassembles newline-delimited lines out of a forwarded chunk and offers each
 /// to the observer, dropping any that is over-long, not UTF-8, or arrives while
 /// the channel is full.
+#[cfg(test)]
 fn tee_chunk(
     chunk: &[u8],
     direction: Direction,
     tee: &mpsc::Sender<(Direction, String)>,
     line: &mut Vec<u8>,
 ) {
+    tee_chunk_diagnostics(chunk, direction, tee, line, &Diagnostics::default());
+}
+
+fn tee_chunk_diagnostics(
+    chunk: &[u8],
+    direction: Direction,
+    tee: &mpsc::Sender<(Direction, String)>,
+    line: &mut Vec<u8>,
+    diagnostics: &Diagnostics,
+) {
     for &byte in chunk {
         if byte == b'\n' {
             if line.len() < MAX_LINE_BYTES {
                 if let Ok(text) = std::str::from_utf8(line) {
-                    let _ = tee.try_send((direction, text.to_string()));
+                    if let Err(error) = tee.try_send((direction, text.to_string())) {
+                        if let Some(c) = diagnostics.counts() {
+                            match error {
+                                mpsc::error::TrySendError::Full(_) => increment(&c.full),
+                                mpsc::error::TrySendError::Closed(_) => increment(&c.closed),
+                            }
+                        }
+                    }
+                } else if let Some(c) = diagnostics.counts() {
+                    increment(&c.non_utf8);
                 }
+            } else if let Some(c) = diagnostics.counts() {
+                increment(&c.oversize);
             }
             line.clear();
         } else if line.len() < MAX_LINE_BYTES {
@@ -600,18 +677,41 @@ fn tee_chunk(
 /// cannot end the resumed session (#1948). It is also the seed for pid-based
 /// liveness (#1916), whose identity-token reading is entirely the daemon's own
 /// [`pid_watcher`](crate::sessions::pid_watcher) work, never this wrapper's.
+#[cfg(test)]
 async fn observe(
-    mut lines: mpsc::Receiver<(Direction, String)>,
+    lines: mpsc::Receiver<(Direction, String)>,
     socket: Option<PathBuf>,
     every: Duration,
     title_tx: watch::Sender<Option<String>>,
     child_pid: Option<u32>,
 ) {
+    observe_diagnostics(
+        lines,
+        socket,
+        every,
+        title_tx,
+        child_pid,
+        Diagnostics::default(),
+    )
+    .await;
+}
+
+async fn observe_diagnostics(
+    mut lines: mpsc::Receiver<(Direction, String)>,
+    socket: Option<PathBuf>,
+    every: Duration,
+    title_tx: watch::Sender<Option<String>>,
+    child_pid: Option<u32>,
+    diagnostics: Diagnostics,
+) {
     let Ok(socket) = server::resolve_socket(socket) else {
+        diagnostics
+            .record(|| json!({"event":"observer_stopped", "outcome":"socket_resolution_failed"}));
         return;
     };
     let mut tracker = StreamTracker::new();
     let mut last_model: Option<String> = None;
+    let mut last_identity = None;
     let mut keepalive = tokio::time::interval(every);
     // The first tick of a tokio interval completes immediately; consume it so
     // the keep-alive does not fire before anything has been observed.
@@ -623,7 +723,10 @@ async fn observe(
                 Some((direction, text)) => tracker.observe_line(direction, &text),
                 None => break,
             },
-            _ = keepalive.tick() => tracker.keepalive(),
+            _ = keepalive.tick() => {
+                diagnostics.summary(tracker.diagnostics());
+                tracker.keepalive()
+            },
         };
         // Publish the classified title prefix whenever the model changes —
         // independent of `observed`, since a mid-session model switch does
@@ -636,8 +739,30 @@ async fn observe(
         }
         if let Some(mut request) = observed {
             request.pid = child_pid;
+            if diagnostics.enabled() {
+                let identity = (
+                    request.session_id.clone(),
+                    request.cwd.clone(),
+                    request.model.clone(),
+                );
+                if last_identity.as_ref() != Some(&identity) {
+                    diagnostics.record(|| {
+                        json!({"event":"session_identity", "session_id":identity.0,
+                        "cwd":identity.1, "model":identity.2, "pid":child_pid})
+                    });
+                    last_identity = Some(identity);
+                }
+            }
+            diagnostics.record(|| {
+                json!({"event":"state_report", "session_id":request.session_id,
+                "state":request.event, "pid":child_pid})
+            });
             if let Ok(payload) = serde_json::to_value(request) {
-                report(&socket, "observe", payload).await;
+                report_diagnostics(&socket, "observe", payload, &diagnostics).await;
+            } else {
+                diagnostics.record(
+                    || json!({"event":"report", "op":"observe", "outcome":"serialization_failed"}),
+                );
             }
         }
     }
@@ -647,15 +772,25 @@ async fn observe(
         if let Some(pid) = child_pid {
             payload["pid"] = Value::from(pid);
         }
-        report(&socket, "end", payload).await;
+        report_diagnostics(&socket, "end", payload, &diagnostics).await;
     }
+    diagnostics.summary(tracker.diagnostics());
 }
 
 /// Sends one bounded, fire-and-forget op to the daemon's `sessions` service,
 /// swallowing every failure — a missing or wedged daemon must be a silent no-op.
-async fn report(socket: &Path, op: &str, payload: Value) {
+async fn report_diagnostics(socket: &Path, op: &str, payload: Value, diagnostics: &Diagnostics) {
     let envelope = DaemonEnvelope::service(SERVICE, op, payload);
-    let _ = tokio::time::timeout(REPORT_TIMEOUT, DaemonClient::new(socket).request(envelope)).await;
+    let outcome =
+        match tokio::time::timeout(REPORT_TIMEOUT, DaemonClient::new(socket).request(envelope))
+            .await
+        {
+            Err(_) => "timeout",
+            Ok(Err(_)) => "transport_failed",
+            Ok(Ok(reply)) if !reply.ok => "daemon_rejected",
+            Ok(Ok(_)) => "delivered",
+        };
+    diagnostics.record(|| json!({"event":"report", "op":op, "outcome":outcome}));
 }
 
 /// Relays `SIGINT`/`SIGTERM` to the child, so a caller that signals the wrapper
@@ -700,6 +835,131 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
+
+    #[tokio::test]
+    async fn diagnostic_tee_counts_each_drop_reason() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let (diagnostics, done) = Diagnostics::open(Some(&dir.path().join("log")));
+        let (tee, lines) = mpsc::channel(1);
+        let mut buffer = Vec::new();
+        tee_chunk_diagnostics(
+            b"a\nb\n",
+            Direction::FromClaude,
+            &tee,
+            &mut buffer,
+            &diagnostics,
+        );
+        drop(lines);
+        tee_chunk_diagnostics(
+            b"c\n",
+            Direction::FromClaude,
+            &tee,
+            &mut buffer,
+            &diagnostics,
+        );
+        tee_chunk_diagnostics(
+            b"\xff\n",
+            Direction::FromClaude,
+            &tee,
+            &mut buffer,
+            &diagnostics,
+        );
+        tee_chunk_diagnostics(
+            &vec![b'x'; MAX_LINE_BYTES],
+            Direction::FromClaude,
+            &tee,
+            &mut buffer,
+            &diagnostics,
+        );
+        tee_chunk_diagnostics(
+            b"\n",
+            Direction::FromClaude,
+            &tee,
+            &mut buffer,
+            &diagnostics,
+        );
+        let counts = diagnostics.counts().unwrap();
+        assert_eq!(counts.full.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.closed.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.oversize.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.non_utf8.load(Ordering::Relaxed), 1);
+        drop(diagnostics);
+        done.unwrap().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabled_diagnostics_preserve_bytes_and_exclude_conversation_content() {
+        let (dir, socket, _seen) = fake_daemon();
+        let log = dir.path().join("wrapper.jsonl");
+        let output = Sink::default();
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"private-test","cwd":"/project","model":"test"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":"CONVERSATION_SECRET"}}"#,
+            "\n",
+            r#"{"type":"control_request","request_id":"perm","request":{"subtype":"can_use_tool","input":"TOOL_SECRET"}}"#,
+            "\n",
+            r#"{"type":"result"}"#,
+            "\n"
+        );
+        let code = wrap_io_diagnostics(
+            "/bin/cat",
+            &[],
+            Some(socket),
+            stream.as_bytes(),
+            output.clone(),
+            Some(log.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(output.contents(), stream);
+        let text = std::fs::read_to_string(log).unwrap();
+        assert!(text.contains("session_identity"));
+        assert!(text.contains("process_exit"));
+        assert!(text.contains("state_report"));
+        assert!(!text.contains("CONVERSATION_SECRET"));
+        assert!(!text.contains("TOOL_SECRET"));
+        for line in text.lines() {
+            serde_json::from_str::<Value>(line).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_report_rejection_does_not_persist_daemon_error_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed =
+                tokio_util::codec::Framed::new(stream, tokio_util::codec::LinesCodec::new());
+            use futures::{SinkExt, StreamExt};
+            framed.next().await.unwrap().unwrap();
+            framed
+                .send(r#"{"ok":false,"error":"DAEMON_CONTENT_SECRET"}"#.to_string())
+                .await
+                .unwrap();
+        });
+        let path = dir.path().join("log");
+        let (diagnostics, done) = Diagnostics::open(Some(&path));
+        report_diagnostics(&socket, "observe", json!({}), &diagnostics).await;
+        server.await.unwrap();
+        report_diagnostics(
+            &dir.path().join("missing.sock"),
+            "observe",
+            json!({}),
+            &diagnostics,
+        )
+        .await;
+        drop(diagnostics);
+        done.unwrap().await.unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("daemon_rejected"));
+        assert!(text.contains("transport_failed"));
+        assert!(!text.contains("DAEMON_CONTENT_SECRET"));
+    }
 
     /// An [`AsyncWrite`] that appends into a shared buffer, so a test can assert
     /// on exactly the bytes the wrapper forwarded.

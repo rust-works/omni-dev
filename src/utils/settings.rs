@@ -372,6 +372,15 @@ pub struct LeaseSettings {
     pub allow_headless: bool,
 }
 
+/// Defaults for the long-lived daemon, independent of the launcher's environment.
+#[derive(Debug, Default, Deserialize)]
+pub struct DaemonSettings {
+    /// Tracing directive (e.g. `"info"` or `"omni_dev::sessions=debug"`).
+    /// A valid `RUST_LOG` overrides this; the built-in fallback is `"info"`.
+    #[serde(default)]
+    pub log_level: Option<String>,
+}
+
 /// Settings loaded from $HOME/.omni-dev/settings.json.
 #[derive(Debug, Default, Deserialize)]
 pub struct Settings {
@@ -389,6 +398,10 @@ pub struct Settings {
     /// [`McpSettings::default`].
     #[serde(default)]
     pub mcp: McpSettings,
+
+    /// Daemon tracing defaults; an absent section preserves the built-in filter.
+    #[serde(default)]
+    pub daemon: DaemonSettings,
 
     /// Named Gmail accounts (issue #1500); an absent block yields
     /// [`GmailSettings::default`], which is an empty account map.
@@ -631,6 +644,22 @@ impl Settings {
     /// [`Self::load_or_warn_default`] (issue #1744).
     pub fn load_mcp() -> McpSettings {
         Self::load_or_warn_default().mcp
+    }
+
+    /// Loads daemon defaults with the shared warn-and-default contract.
+    pub fn load_daemon() -> DaemonSettings {
+        Self::load_or_warn_default().daemon
+    }
+
+    /// Records a bootstrap settings failure after tracing has been installed.
+    /// Shares deduplication with later settings reads in the same process.
+    pub fn warn_bootstrap_failure(message: &str) {
+        if LOAD_WARN_DEDUP.observe(Some(message)) {
+            tracing::warn!(
+                "{message}; falling back to default settings for this invocation — \
+                any settings.json configuration is being ignored"
+            );
+        }
     }
 
     /// Loads settings from a specific path.
@@ -1404,6 +1433,21 @@ pub fn get_env_vars(keys: &[&str]) -> Result<String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn daemon_settings_are_optional_and_accept_directives() {
+        for json in ["{}", r#"{"daemon":{}}"#] {
+            let settings: super::Settings = serde_json::from_str(json).unwrap();
+            assert!(settings.daemon.log_level.is_none());
+        }
+        let settings: super::Settings =
+            serde_json::from_str(r#"{"daemon":{"log_level":"info,omni_dev::sessions=debug"}}"#)
+                .unwrap();
+        assert_eq!(
+            settings.daemon.log_level.as_deref(),
+            Some("info,omni_dev::sessions=debug")
+        );
+    }
+
     use super::*;
     use crate::test_support::env::MapEnv;
     use std::env;

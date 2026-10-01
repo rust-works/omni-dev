@@ -113,6 +113,7 @@ impl Action {
     fn apply(self, registry: &SessionsRegistry, now: DateTime<Utc>) {
         match self {
             Self::End { session_id } => {
+                tracing::debug!(%session_id, reason = "pid_liveness", "session_process_ended");
                 registry.end(&session_id, Some("pid liveness watcher"), None);
             }
             Self::Confirm {

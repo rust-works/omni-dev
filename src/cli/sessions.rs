@@ -242,6 +242,7 @@ impl HookCommand {
         let pid = agent_pid(std::os::unix::process::parent_id());
         let mut input = String::new();
         if std::io::stdin().read_to_string(&mut input).is_err() {
+            tracing::debug!(agent = ?self.agent, outcome = "stdin_read_failed", "session_hook_skipped");
             return Ok(());
         }
         self.report(&input, pid).await;
@@ -252,18 +253,26 @@ impl HookCommand {
     /// out so tests can exercise the send path against a fake socket.
     async fn report(&self, input: &str, pid: Option<u32>) {
         let Ok(hook) = serde_json::from_str::<HookPayload>(input) else {
+            tracing::debug!(agent = ?self.agent, outcome = "invalid_json", "session_hook_skipped");
             return;
         };
         let Some((op, payload)) = hook.to_op(self.agent, pid) else {
             return;
         };
         let Ok(socket) = server::resolve_socket(self.socket.clone()) else {
+            tracing::debug!(agent = ?self.agent, outcome = "socket_resolution_failed", "session_hook_skipped");
             return;
         };
-        // Bounded, and every failure ignored: the daemon may be down, and that
-        // must be a silent no-op.
         let env = DaemonEnvelope::service(SERVICE, op, payload);
-        let _ = tokio::time::timeout(HOOK_TIMEOUT, DaemonClient::new(&socket).request(env)).await;
+        let outcome =
+            match tokio::time::timeout(HOOK_TIMEOUT, DaemonClient::new(&socket).request(env)).await
+            {
+                Err(_) => "timeout",
+                Ok(Err(_)) => "transport_failed",
+                Ok(Ok(reply)) if !reply.ok => "daemon_rejected",
+                Ok(Ok(_)) => "delivered",
+            };
+        tracing::debug!(agent = ?self.agent, session_id = ?hook.session_id, ?pid, op, outcome, "session_hook_report");
     }
 }
 
@@ -326,8 +335,18 @@ impl HookPayload {
     /// entirely the daemon's own [`pid_watcher`](crate::sessions::pid_watcher)
     /// work, never this sink's.
     fn to_op(&self, agent: HookAgent, pid: Option<u32>) -> Option<(&'static str, Value)> {
-        let session_id = self.session_id.clone().filter(|s| !s.trim().is_empty())?;
-        let event_name = self.hook_event_name.as_deref()?;
+        let Some(session_id) = self.session_id.clone().filter(|s| !s.trim().is_empty()) else {
+            tracing::debug!(
+                ?agent,
+                outcome = "missing_session_id",
+                "session_hook_skipped"
+            );
+            return None;
+        };
+        let Some(event_name) = self.hook_event_name.as_deref() else {
+            tracing::debug!(?agent, outcome = "missing_event", "session_hook_skipped");
+            return None;
+        };
         if event_name == "SessionEnd" {
             let mut payload = json!({ "session_id": session_id });
             if let Some(reason) = self.reason.as_ref().or(self.message.as_ref()) {
@@ -338,18 +357,22 @@ impl HookPayload {
             }
             return Some(("end", payload));
         }
-        let mut event = match agent {
+        let mapped = match agent {
             HookAgent::Claude => session_event_for(
                 event_name,
                 self.source.as_deref(),
                 self.notification_type.as_deref(),
                 self.message.as_deref(),
-            )?,
+            ),
             HookAgent::Codex => codex_session_event_for(
                 event_name,
                 self.source.as_deref(),
                 self.tool_name.as_deref(),
-            )?,
+            ),
+        };
+        let Some(mut event) = mapped else {
+            tracing::debug!(?agent, outcome = "unmapped_event", "session_hook_skipped");
+            return None;
         };
         let agent_id = (agent == HookAgent::Claude)
             .then(|| self.agent_id.clone())
@@ -369,7 +392,17 @@ impl HookPayload {
             model: self.model.clone(),
             pid,
         };
-        Some(("observe", serde_json::to_value(request).ok()?))
+        match serde_json::to_value(request) {
+            Ok(payload) => Some(("observe", payload)),
+            Err(_) => {
+                tracing::debug!(
+                    ?agent,
+                    outcome = "serialization_failed",
+                    "session_hook_skipped"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -430,7 +463,14 @@ fn session_event_for(
         "PermissionRequest" => SessionEvent::Notification(NotificationKind::PermissionPrompt),
         "Elicitation" => SessionEvent::Notification(NotificationKind::AgentNeedsInput),
         "Notification" => {
-            SessionEvent::Notification(classify_notification(notification_type, message))
+            let kind = classify_notification(notification_type, message);
+            tracing::debug!(
+                ?kind,
+                has_notification_type = notification_type.is_some(),
+                has_message = message.is_some(),
+                "session_notification_classified"
+            );
+            SessionEvent::Notification(kind)
         }
         _ => return None,
     })
@@ -1739,6 +1779,34 @@ fn age_secs(ts: Option<&str>) -> i64 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[tokio::test]
+    async fn hook_diagnostics_identify_gates_without_logging_payload_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = HookCommand {
+            socket: Some(dir.path().join("missing.sock")),
+            agent: HookAgent::Claude,
+        };
+        let (_, logs) = crate::test_support::capture_future_at(tracing::Level::DEBUG, async {
+            for input in ["not json HOOK_CONTENT_SECRET", "{}",
+                r#"{"session_id":"test"}"#,
+                r#"{"session_id":"test","hook_event_name":"future-event"}"#,
+                r#"{"session_id":"test","hook_event_name":"Notification","message":"HOOK_CONTENT_SECRET"}"#] {
+                command.report(input, None).await;
+            }
+        }).await;
+        for reason in [
+            "invalid_json",
+            "missing_session_id",
+            "missing_event",
+            "unmapped_event",
+            "transport_failed",
+        ] {
+            assert!(logs.contains(reason), "missing {reason}: {logs}");
+        }
+        assert!(logs.contains("session_notification_classified"));
+        assert!(!logs.contains("HOOK_CONTENT_SECRET"));
+    }
+
     use super::*;
     use crate::sessions::SessionState;
 

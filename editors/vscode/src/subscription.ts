@@ -191,6 +191,10 @@ export class DaemonSubscription<T> {
       this.onError?.(`malformed snapshot: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
+    if (!reply || typeof reply !== "object" || typeof reply.ok !== "boolean") {
+      this.onError?.("invalid snapshot envelope");
+      return;
+    }
     // An explicit error reply means the daemon is up but will not serve this op
     // — almost always a daemon too old to know it. Hand that to the caller so it
     // can degrade, and stop: reconnecting would only re-earn the same refusal.
@@ -198,6 +202,14 @@ export class DaemonSubscription<T> {
       const message = reply.error ?? "daemon refused the subscription";
       this.close();
       this.onUnsupported(message);
+      return;
+    }
+    if (!reply.ok) {
+      this.onError?.(reply.error ?? "daemon refused the subscription");
+      return;
+    }
+    if (!reply.payload || typeof reply.payload !== "object" || !this.isSnapshot(reply.payload)) {
+      this.onError?.("invalid snapshot payload for this subscription");
       return;
     }
     // Ignore anything that is not a well-formed snapshot for this stream; a

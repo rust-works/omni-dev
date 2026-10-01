@@ -330,3 +330,34 @@ test("sessions subscribe: without onUnsupported an error reply is ignored, as be
   // behaviour `TreeSubscription` still relies on.
   assert.equal(received[0].sessions[0].session_id, "s1");
 });
+
+
+test("sessions subscribe: invalid frames report errors and retain the last valid snapshot", async (t: TestContext) => {
+  const socketPath = tempSocketPath();
+  const srv = trackingServer((conn) => {
+    conn.on("data", () => {
+      for (const frame of ["null", "{}", '{"ok":true,"payload":{}}',
+        sessionsLine([]), '{"ok":true,"payload":{"wrong":[]}}',
+        '{"ok":false,"error":"refused"}', "not json"]) {
+        conn.write(frame.endsWith("\n") ? frame : frame + "\n");
+      }
+    });
+  });
+  await srv.listen(socketPath);
+  const received: SessionsSnapshot[] = [];
+  const errors: string[] = [];
+  const statuses: boolean[] = [];
+  const sub = new SessionsSubscription(socketPath, {
+    onSnapshot: (snapshot) => received.push(snapshot),
+    onError: (message) => errors.push(message),
+    onStatus: (status) => statuses.push(status),
+  });
+  t.after(() => { sub.close(); srv.close(); });
+  sub.start();
+  await waitFor(() => errors.length === 6);
+  assert.equal(received.length, 1);
+  assert.deepEqual(statuses, [true]);
+  assert.match(errors[0], /invalid snapshot envelope/);
+  assert.match(errors[2], /invalid snapshot payload/);
+  assert.equal(errors[4], "refused");
+});

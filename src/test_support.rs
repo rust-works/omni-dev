@@ -150,6 +150,25 @@ pub(crate) fn capture_at(level: tracing::Level, f: impl FnOnce()) -> String {
     logs
 }
 
+/// Captures events from an async future on every poll, even across worker threads.
+/// Spawned child tasks still need their own subscriber; this does not install a
+/// global subscriber or hold a thread-local guard across an await.
+pub(crate) async fn capture_future_at<F: std::future::Future>(
+    level: tracing::Level,
+    future: F,
+) -> (F::Output, String) {
+    use tracing::instrument::WithSubscriber;
+    let writer = CaptureWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_ansi(false)
+        .with_writer(writer.clone())
+        .finish();
+    let result = future.with_subscriber(subscriber).await;
+    let logs = String::from_utf8_lossy(&writer.0.lock().unwrap()).into_owned();
+    (result, logs)
+}
+
 pub(crate) mod failing_io {
     //! Writer fixture that always returns `ErrorKind::Other` from
     //! `write` and `flush`. Used to drive `?`-propagation Err branches

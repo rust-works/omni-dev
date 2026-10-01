@@ -134,9 +134,15 @@ impl DaemonService for SessionsService {
                 // a caller already supplied `repo`.
                 if req.repo.is_none() {
                     if let Some(cwd) = req.cwd.clone() {
-                        req.repo = tokio::task::spawn_blocking(move || repo_name_for(&cwd))
+                        req.repo = match tokio::task::spawn_blocking(move || repo_name_for(&cwd))
                             .await
-                            .unwrap_or_default();
+                        {
+                            Ok(repo) => repo,
+                            Err(error) => {
+                                tracing::warn!(session_id = %req.session_id, %error, "sessions_repo_enrichment_failed");
+                                None
+                            }
+                        };
                     }
                 }
                 self.registry.observe(req);

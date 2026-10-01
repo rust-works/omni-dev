@@ -1187,3 +1187,32 @@ Configure one token mode only. Both token keys accept `_FILE` and `_COMMAND`.
 Process sources override the selected settings profile; a selected profile does
 not inherit the base `env`. See [Atlassian PAT setup and compatibility](user-guide.md#serverdata-center-personal-access-tokens)
 for login, verification, mode switching, context-path examples and limitations.
+
+## Daemon and MCP tracing settings
+
+The per-user `$HOME/.omni-dev/settings.json` file accepts tracing defaults
+independently of project configuration:
+
+```json
+{
+  "daemon": { "log_level": "info,omni_dev::sessions=debug,omni_dev::daemon=debug" },
+  "mcp": { "log_level": "warn" }
+}
+```
+
+For `omni-dev daemon run`, the first valid filter wins: process `RUST_LOG`,
+`daemon.log_level`, then `info`. Directives can be plain levels (`debug`) or
+comma-separated module filters. Invalid directives fall through to the next
+source with a startup warning; malformed/unreadable settings warn and use
+built-in defaults. A missing file or missing `daemon` block is normal.
+An empty directive is a valid filter that enables no events.
+
+The daemon reads this file at startup, including launchd/socket-activated and
+systemd launches that do not inherit a shell's environment. Restart the daemon
+after changing it (`omni-dev daemon restart`). Other CLI commands retain
+`RUST_LOG` → `warn` and do not use `daemon.log_level`.
+
+`mcp.log_level` configures the separate MCP server (valid `RUST_LOG` takes
+precedence there too); it does not control the daemon or hook subprocesses.
+See [session troubleshooting](sessions-service.md#troubleshooting) for targeted
+filters, the wrapper's opt-in metadata file, and where to read the logs.

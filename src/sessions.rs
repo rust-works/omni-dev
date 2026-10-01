@@ -695,10 +695,16 @@ impl SessionsRegistry {
             .agent_id
             .as_deref()
             .filter(|id| req.agent == Agent::Claude && !id.trim().is_empty());
+        let session_id = req.session_id.clone();
+        let event = req.event;
+        let agent = req.agent;
+        let pid = req.pid;
         let now = Utc::now();
-        let changed = {
+        let (changed, old_state, new_state, outcome, reaped) = {
             let mut sessions = self.lock_sessions();
             let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, now);
+            let old_state = sessions.get(&session_id).map(|entry| entry.state);
+            let mut outcome = "created";
             let mutated = match sessions.get_mut(&req.session_id) {
                 // A passive re-sighting (the Codex rollout watcher's heartbeat)
                 // must not refresh an ended session, or it would outlive its
@@ -708,6 +714,7 @@ impl SessionsRegistry {
                         && (req.event == SessionEvent::TranscriptDiscovered
                             || agent_id.is_some()) =>
                 {
+                    outcome = "ended_passive_ignored";
                     false
                 }
                 // A straggling sighting from a process this session's resume
@@ -720,6 +727,7 @@ impl SessionsRegistry {
                         .pid
                         .is_some_and(|pid| entry.replaced_pids.contains(&pid)) =>
                 {
+                    outcome = "replaced_pid_ignored";
                     false
                 }
                 Some(entry) => {
@@ -737,7 +745,16 @@ impl SessionsRegistry {
                     let filled_transcript = fill(&mut entry.transcript_path, req.transcript_path);
                     let filled_repo = fill(&mut entry.repo, req.repo);
                     let filled_model = fill(&mut entry.model, req.model);
-                    state_changed || filled_cwd || filled_transcript || filled_repo || filled_model
+                    let metadata_changed =
+                        filled_cwd || filled_transcript || filled_repo || filled_model;
+                    outcome = if state_changed {
+                        "state_changed"
+                    } else if metadata_changed {
+                        "metadata_enriched"
+                    } else {
+                        "heartbeat_only"
+                    };
+                    state_changed || metadata_changed
                 }
                 None => {
                     if sessions.len() >= MAX_SESSIONS {
@@ -776,11 +793,19 @@ impl SessionsRegistry {
                     true
                 }
             };
-            mutated || reaped > 0
+            (
+                mutated || reaped > 0,
+                old_state,
+                sessions.get(&session_id).map(|entry| entry.state),
+                outcome,
+                reaped,
+            )
         };
         if changed {
             self.bump();
         }
+        tracing::debug!(%session_id, ?agent, ?pid, ?agent_id, ?event, ?old_state, ?new_state, outcome,
+            reaped, bumped = changed, "session_observed");
     }
 
     /// Marks a session ended (`SessionEnd`), so `list` shows it as `ended` for a
@@ -798,19 +823,26 @@ impl SessionsRegistry {
     /// longer owns.
     pub fn end(&self, session_id: &str, _reason: Option<&str>, pid: Option<u32>) -> bool {
         let now = Utc::now();
-        let (known, reaped) = {
+        let (known, reaped, old_state, outcome) = {
             let mut sessions = self.lock_sessions();
             let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, now);
+            let old_state = sessions.get(session_id).map(|entry| entry.state);
+            let mut outcome = "unknown";
             let known = match sessions.get_mut(session_id) {
                 // Already ended (a hook and a watcher can both end it): leave the
                 // linger window alone rather than restart it.
-                Some(entry) if entry.state == SessionState::Ended => (true, false),
+                Some(entry) if entry.state == SessionState::Ended => {
+                    outcome = "already_ended";
+                    (true, false)
+                }
                 // The replaced process's late `SessionEnd`: the resumed session
                 // lives on under its new process.
                 Some(entry) if pid.is_some_and(|pid| entry.replaced_pids.contains(&pid)) => {
+                    outcome = "replaced_pid_ignored";
                     (true, false)
                 }
                 Some(entry) => {
+                    outcome = "ended";
                     entry.state = SessionState::Ended;
                     entry.last_event = SessionEvent::Stop;
                     entry.last_seen = now;
@@ -818,7 +850,7 @@ impl SessionsRegistry {
                 }
                 None => (false, false),
             };
-            (known, reaped)
+            (known, reaped, old_state, outcome)
         };
         let (known, flipped) = known;
         // A known session flipped to `ended`; otherwise only this call's inline
@@ -826,6 +858,15 @@ impl SessionsRegistry {
         if flipped || reaped > 0 {
             self.bump();
         }
+        tracing::debug!(
+            session_id,
+            ?pid,
+            ?old_state,
+            outcome,
+            reaped,
+            bumped = flipped || reaped > 0,
+            "session_end"
+        );
         known
     }
 
@@ -884,10 +925,17 @@ impl SessionsRegistry {
     /// window sends, which would otherwise put a permanent push floor under the
     /// daemon proportional to the window count.
     pub fn report_window(&self, report: WindowReport) {
+        let window_key = report.key.clone();
+        let folder_count = report.folders.len();
         let now = Utc::now();
-        let changed = {
+        let (changed, outcome, reaped) = {
             let mut windows = self.lock_windows();
             let reaped = reap_windows(&mut windows, self.window_ttl, now);
+            let outcome = if windows.contains_key(&report.key) {
+                "refresh"
+            } else {
+                "registered"
+            };
             let (mutated, registered_at) = if let Some(previous) = windows.get(&report.key) {
                 (
                     previous.report.folders != report.folders
@@ -908,11 +956,20 @@ impl SessionsRegistry {
                     registered_at,
                 },
             );
-            mutated || reaped > 0
+            (
+                mutated || reaped > 0,
+                if outcome == "refresh" && mutated {
+                    "embedding_changed"
+                } else {
+                    outcome
+                },
+                reaped,
+            )
         };
         if changed {
             self.bump();
         }
+        tracing::debug!(%window_key, folder_count, outcome, reaped, bumped = changed, "session_window_reported");
     }
 
     /// Drops a companion window-embedding report (the window closed). Returns
@@ -925,6 +982,12 @@ impl SessionsRegistry {
         if removed {
             self.bump();
         }
+        tracing::debug!(
+            window_key = key,
+            removed,
+            bumped = removed,
+            "session_window_unregistered"
+        );
         removed
     }
 
@@ -1057,13 +1120,20 @@ fn fill<T: PartialEq>(slot: &mut Option<T>, incoming: Option<T>) -> bool {
 /// [`Source::Terminal`].
 fn resolve_source(cwd: Option<&Path>, windows: &[WindowEntry]) -> Source {
     let Some(cwd) = cwd else {
+        tracing::trace!(outcome = "missing_cwd", "session_attribution_miss");
         return Source::Terminal;
     };
     match pick_window(cwd, windows) {
         Some(window) => Source::VsCode {
             window_key: window.key.clone(),
         },
-        None => Source::Terminal,
+        None => {
+            tracing::debug!(cwd = %cwd.display(), window_count = windows.len(), "session_attribution_miss");
+            for window in windows {
+                tracing::trace!(window_key = %window.report.key, folders = ?window.report.folders, "session_attribution_candidate");
+            }
+            Source::Terminal
+        }
     }
 }
 
@@ -1142,9 +1212,17 @@ fn reap_sessions(
         } else {
             session_max
         };
-        (now - e.last_seen).num_seconds() <= max_age
+        let keep = (now - e.last_seen).num_seconds() <= max_age;
+        if !keep {
+            tracing::trace!(session_id = %e.session_id, reason = if e.state == SessionState::Ended { "ended_ttl" } else { "session_ttl" }, "session_reaped");
+        }
+        keep
     });
-    before - sessions.len()
+    let count = before - sessions.len();
+    if count > 0 {
+        tracing::debug!(count, "sessions_reaped");
+    }
+    count
 }
 
 /// Removes window-embedding reports last refreshed longer than `ttl` ago.
@@ -1155,8 +1233,18 @@ fn reap_windows(
 ) -> usize {
     let max_age = ttl.as_secs() as i64;
     let before = windows.len();
-    windows.retain(|_, e| (now - e.last_seen).num_seconds() <= max_age);
-    before - windows.len()
+    windows.retain(|key, e| {
+        let keep = (now - e.last_seen).num_seconds() <= max_age;
+        if !keep {
+            tracing::trace!(window_key = %key, reason = "window_ttl", "session_window_reaped");
+        }
+        keep
+    });
+    let count = before - windows.len();
+    if count > 0 {
+        tracing::debug!(count, "session_windows_reaped");
+    }
+    count
 }
 
 /// Removes the session with the oldest `last_seen` (ties broken by lowest
@@ -1173,6 +1261,7 @@ fn evict_oldest_session(sessions: &mut HashMap<String, SessionEntry>) {
         .map(|e| e.session_id.clone());
     if let Some(key) = oldest {
         sessions.remove(&key);
+        tracing::debug!(session_id = %key, reason = "capacity", "session_evicted");
     }
 }
 
@@ -1185,6 +1274,7 @@ fn evict_oldest_window(windows: &mut HashMap<String, WindowEntry>) {
         .map(|(k, _)| k.clone());
     if let Some(key) = oldest {
         windows.remove(&key);
+        tracing::debug!(window_key = %key, reason = "capacity", "session_window_evicted");
     }
 }
 
@@ -1192,6 +1282,29 @@ fn evict_oldest_window(windows: &mut HashMap<String, WindowEntry>) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_diagnostics_distinguish_transition_heartbeat_and_unknown_end() {
+        let registry = SessionsRegistry::new();
+        let logs = crate::test_support::capture_at(tracing::Level::DEBUG, || {
+            registry.observe(observe_request(
+                "diagnostics",
+                SessionEvent::UserPromptSubmit,
+                Some("/project"),
+            ));
+            registry.observe(observe_request(
+                "diagnostics",
+                SessionEvent::UserPromptSubmit,
+                Some("/project"),
+            ));
+            registry.end("missing", None, None);
+        });
+        assert!(logs.contains("state_changed") || logs.contains("created"));
+        assert!(logs.contains("heartbeat_only"));
+        assert!(logs.contains("unknown"));
+        assert!(logs.contains("bumped=true"));
+        assert!(logs.contains("bumped=false"));
+    }
 
     fn observe_request(session_id: &str, event: SessionEvent, cwd: Option<&str>) -> ObserveRequest {
         ObserveRequest {
