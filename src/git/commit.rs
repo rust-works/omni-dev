@@ -378,12 +378,22 @@ impl CommitAnalysis {
             .split_once('\n')
             .map_or((original_message, None), |(f, r)| (f, Some(r)));
 
-        let subject = Self::generate_proposed_message_from(
-            first_line,
-            &self.detected_type,
-            &scope,
-            &self.file_changes,
-        );
+        // Subjects git generates, and ones that already have conventional
+        // shape (including `type!:` and any type word), are not ours to
+        // reclassify: only their scope may be corrected.
+        if is_git_generated_subject(first_line) {
+            return original_message.to_string();
+        }
+        let subject = if lint::parse_subject(first_line).is_some() {
+            first_line.to_string()
+        } else {
+            Self::generate_proposed_message_from(
+                first_line,
+                &self.detected_type,
+                &scope,
+                &self.file_changes,
+            )
+        };
         let subject = refine_message_scope(&subject, &files, scope_defs);
 
         match body {
@@ -798,6 +808,15 @@ impl CommitInfoForAI {
             ));
         }
     }
+}
+
+/// Returns `true` for subjects git or the user's tooling generates
+/// (`Merge …`, `Revert "…"`, `fixup!`/`squash!`/`amend!`), which must not be
+/// rewritten into conventional form.
+fn is_git_generated_subject(first_line: &str) -> bool {
+    ["Merge ", "Revert ", "fixup! ", "squash! ", "amend! "]
+        .iter()
+        .any(|prefix| first_line.starts_with(prefix))
 }
 
 /// Resolves the best scope for a set of files using scope definition file patterns.
@@ -1298,6 +1317,27 @@ mod tests {
             analysis.suggest_message("repair thing\n\nWhy it broke.\n\nFixes #1", &defs),
             "fix(cli): repair thing\n\nWhy it broke.\n\nFixes #1"
         );
+    }
+
+    #[test]
+    fn suggest_message_keeps_conventionally_shaped_subjects() {
+        let analysis = make_analysis("chore", "", &[("M", "x.txt")]);
+        for message in ["feat!: drop API", "deps: bump serde", "revert: undo thing"] {
+            assert_eq!(analysis.suggest_message(message, &[]), message);
+        }
+    }
+
+    #[test]
+    fn suggest_message_leaves_git_generated_subjects_alone() {
+        let analysis = make_analysis("chore", "", &[("M", "x.txt")]);
+        for message in [
+            "Merge branch 'x' into main",
+            "Revert \"feat: add flag\"",
+            "fixup! feat: add flag",
+            "squash! feat: add flag",
+        ] {
+            assert_eq!(analysis.suggest_message(message, &[]), message);
+        }
     }
 
     #[test]
