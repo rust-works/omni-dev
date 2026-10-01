@@ -5,7 +5,7 @@ import { test } from "node:test";
 import type * as vscode from "vscode";
 import { registerTerminalInEditor, TERMINAL_IN_EDITOR_PROFILE_ID } from "./terminalInEditor";
 
-function harness() {
+function harness(settings: Record<string, unknown> = {}, shell = "/bin/zsh") {
   let provider: vscode.TerminalProfileProvider | undefined;
   let registeredId: string | undefined;
   let disposed = false;
@@ -23,6 +23,13 @@ function harness() {
         return {
           dispose() { disposed = true; },
         };
+      },
+    },
+    env: { shell },
+    workspace: {
+      getConfiguration(section: string) {
+        assert.equal(section, "terminal.integrated");
+        return { get<T>(key: string) { return settings[key] as T | undefined; } };
       },
     },
     TerminalProfile: class {
@@ -144,5 +151,42 @@ test("closing or failing a terminal during startup does not leave an unhandled r
       show() { throw new Error("terminal disposed"); },
     });
     await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+});
+
+
+test("configured default profiles retain the resolved shell, args, env, and cwd", async () => {
+  const platform = process.platform === "darwin" ? "osx"
+    : process.platform === "win32" ? "windows" : "linux";
+  const h = harness({
+    [`defaultProfile.${platform}`]: "Custom shell",
+    [`profiles.${platform}`]: {
+      "Custom shell": { args: ["--login"], env: { MARKER: "inherited", REMOVE: null } },
+    },
+    cwd: "${workspaceFolder}/subdir",
+  }, "/bin/bash");
+  const profile = await h.provider.provideTerminalProfile(token());
+  assert.ok(profile);
+  assert.deepEqual(profile.options, {
+    location: 2,
+    shellPath: "/bin/bash",
+    shellArgs: ["--login"],
+    env: { MARKER: "inherited", REMOVE: null },
+    cwd: "${workspaceFolder}/subdir",
+  });
+});
+
+test("blank cwd and disabled or unresolved profiles preserve native defaults", async () => {
+  const platform = process.platform === "darwin" ? "osx"
+    : process.platform === "win32" ? "windows" : "linux";
+  for (const entry of [undefined, null, {}]) {
+    const h = harness({
+      [`defaultProfile.${platform}`]: "Missing shell",
+      [`profiles.${platform}`]: { "Missing shell": entry },
+      cwd: "  ",
+    }, "");
+    const profile = await h.provider.provideTerminalProfile(token());
+    assert.ok(profile);
+    assert.deepEqual(profile.options, { location: 2 });
   }
 });
