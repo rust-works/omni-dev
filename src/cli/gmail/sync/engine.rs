@@ -4126,6 +4126,7 @@ not-really-a-pdf\r\n\
                     rx,
                     &limiter,
                     &options,
+                    &no_schedule(),
                     &mut report,
                     None,
                 )
@@ -4138,6 +4139,7 @@ not-really-a-pdf\r\n\
                     &ids,
                     &limiter,
                     &options,
+                    &no_schedule(),
                     &mut report,
                     None,
                 )
