@@ -114,7 +114,7 @@ impl TwiddleCommand {
         };
         let repo_root = repo_root.as_path();
 
-        // If --no-ai flag is set, skip AI processing and output YAML directly
+        // If --no-ai flag is set, skip AI processing and amend deterministically
         if self.no_ai {
             return self.execute_no_ai(repo_root).await;
         }
@@ -1065,51 +1065,52 @@ impl TwiddleCommand {
             amendments: deterministic_amendments(&repo_view, &scope_defs),
         };
 
-        if amendment_file.amendments.is_empty() {
-            println!("✨ No changes needed: every commit message already conforms.");
-            return Ok(());
-        }
-
-        // Handle different output modes
+        // Handle different output modes (an empty file is still written, so
+        // scripts reading it can tell "nothing to do" from a failure)
         if let Some(save_path) = &self.save_only {
             amendment_file.save_to_file(save_path)?;
             println!("💾 Amendments saved to file");
             return Ok(());
         }
 
-        // Handle amendments using the same flow as the AI-powered version
-        if !amendment_file.amendments.is_empty() {
-            // Create temporary file for amendments
-            let temp_dir = tempfile::tempdir()?;
-            let amendments_file = temp_dir.path().join("twiddle_amendments.yaml");
-            amendment_file.save_to_file(&amendments_file)?;
-
-            // Show file path and get user choice
-            {
-                use std::io::IsTerminal;
-                if !self.auto_apply
-                    && !self.handle_amendments_file(
-                        &amendments_file,
-                        &amendment_file,
-                        std::io::stdin().is_terminal(),
-                        &mut std::io::BufReader::new(std::io::stdin()),
-                    )?
-                {
-                    println!("❌ Amendment cancelled by user");
-                    return Ok(());
-                }
-            }
-
-            // Apply amendments (re-read from file to capture any user edits)
-            self.apply_amendments_from_file(repo_root, &amendments_file)?;
-            println!("✅ Commit messages applied successfully!");
-
-            // Run post-twiddle check if --check flag is set
-            if self.check {
-                self.run_post_twiddle_check(repo_root).await?;
-            }
-        } else {
+        if repo_view.commits.is_empty() {
             println!("✨ No commits found to process!");
+            return Ok(());
+        }
+        if amendment_file.amendments.is_empty() {
+            println!("✨ No changes needed: every commit message already conforms.");
+            return Ok(());
+        }
+
+        // Handle amendments using the same flow as the AI-powered version
+        // Create temporary file for amendments
+        let temp_dir = tempfile::tempdir()?;
+        let amendments_file = temp_dir.path().join("twiddle_amendments.yaml");
+        amendment_file.save_to_file(&amendments_file)?;
+
+        // Show file path and get user choice
+        {
+            use std::io::IsTerminal;
+            if !self.auto_apply
+                && !self.handle_amendments_file(
+                    &amendments_file,
+                    &amendment_file,
+                    std::io::stdin().is_terminal(),
+                    &mut std::io::BufReader::new(std::io::stdin()),
+                )?
+            {
+                println!("❌ Amendment cancelled by user");
+                return Ok(());
+            }
+        }
+
+        // Apply amendments (re-read from file to capture any user edits)
+        self.apply_amendments_from_file(repo_root, &amendments_file)?;
+        println!("✅ Commit messages applied successfully!");
+
+        // Run post-twiddle check if --check flag is set
+        if self.check {
+            self.run_post_twiddle_check(repo_root).await?;
         }
 
         Ok(())
@@ -2420,22 +2421,31 @@ mod execute_tests {
         assert_eq!(amendment.summary, "");
     }
 
-    /// Test 4 — `--no-ai` leaves a conformant commit alone: nothing is
-    /// saved and nothing is rewritten.
+    /// Test 4 — `--no-ai` leaves a conformant commit alone: `--save-only`
+    /// writes an empty amendments file, and an applying run does not
+    /// rewrite the commit.
     #[tokio::test]
     async fn execute_no_ai_skips_conforming_commits() {
-        let (temp_dir, _) = init_test_repo_with_commit();
+        let (temp_dir, hash) = init_test_repo_with_commit();
         let save_path = temp_dir.path().join("amendments.yaml");
 
         make_no_ai_cmd(&save_path)
             .execute(Some(temp_dir.path()))
             .await
             .unwrap();
+        let saved = AmendmentFile::load_from_file(&save_path).unwrap();
+        assert!(saved.amendments.is_empty());
 
-        assert!(
-            !save_path.exists(),
-            "an all-conforming range must not produce an amendments file"
-        );
+        let apply = TwiddleCommand {
+            auto_apply: true,
+            save_only: None,
+            ..make_no_ai_cmd(&save_path)
+        };
+        apply.execute(Some(temp_dir.path())).await.unwrap();
+
+        let repo = Repository::open(temp_dir.path()).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.id().to_string(), hash, "HEAD must not be rewritten");
     }
 
     /// Test 5 — `deterministic_amendments` keeps only the commits whose
