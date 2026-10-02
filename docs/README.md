@@ -96,6 +96,8 @@ Each file in [`plan/`](plan/) carries a `**Status:**` header (`Built`, `In Progr
 
 ### Retrospectives
 
+- **[GitHub Conditional Request Evaluation](evaluations/github-conditional-requests.md)** - Current REST/GraphQL candidates, decision to retain existing fetch paths, and criteria for future ETag polling
+
 - **[v0.18.0 Retrospective](retrospective-v0.18.0.md)** - ADR-guided code quality and issue-driven development
 
 ### Development & Release
