@@ -80,11 +80,12 @@ pub fn create_client_from(credentials: auth::DriveCredentials) -> Result<DriveCl
 /// or a named one with no value set for `f` to read. The load/resolve/match
 /// dance every "active account's X" helper needs, factored out once so it
 /// cannot drift between them the way copied-by-hand code eventually does.
-fn active_account_field<T>(
+fn account_field<T>(
+    account: Option<&str>,
     f: impl FnOnce(&DriveAccountSettings) -> Option<T>,
 ) -> Result<Option<T>> {
     let settings = Settings::load_or_warn_default();
-    let resolved = auth::resolve(&settings.drive, None)?;
+    let resolved = auth::resolve(&settings.drive, account)?;
     Ok(match &resolved {
         ResolvedAccount::Named(name) => settings.drive.accounts.get(name).and_then(f),
         ResolvedAccount::Unconfigured => None,
@@ -101,7 +102,7 @@ fn active_account_field<T>(
 /// `permissions check` — previously each of the five reimplemented this
 /// identically.
 pub fn active_account_rules() -> Result<Vec<FolderPermissionRule>> {
-    Ok(active_account_field(|a| Some(a.write_permissions.rules.clone()))?.unwrap_or_default())
+    account_rules(None)
 }
 
 /// Reads the active account's `lease_backup_folder_id`
@@ -111,7 +112,17 @@ pub fn active_account_rules() -> Result<Vec<FolderPermissionRule>> {
 /// either of which means `drive lease acquire` refuses every native-
 /// document target for this account.
 pub fn active_account_lease_backup_folder_id() -> Result<Option<String>> {
-    active_account_field(|a| a.lease_backup_folder_id.clone())
+    account_lease_backup_folder_id(None)
+}
+
+/// Reads write rules for the same explicit account used to load credentials.
+pub(crate) fn account_rules(account: Option<&str>) -> Result<Vec<FolderPermissionRule>> {
+    Ok(account_field(account, |a| Some(a.write_permissions.rules.clone()))?.unwrap_or_default())
+}
+
+/// Reads the native backup folder for the selected account.
+pub(crate) fn account_lease_backup_folder_id(account: Option<&str>) -> Result<Option<String>> {
+    account_field(account, |a| a.lease_backup_folder_id.clone())
 }
 
 /// Resolves the lease ledger path for a leased Drive write command.

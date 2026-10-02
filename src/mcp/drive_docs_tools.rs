@@ -6,8 +6,8 @@
 //!
 //! Both tools are read-only. Per [ADR-0071](../../docs/adrs/adr-0071.md) §11
 //! the Docs read path (like Sheets') consults no write gate — unlike `docs
-//! replace`/`append`/`create`, which stay CLI-only for now
-//! ([ADR-0076](../../docs/adrs/adr-0076.md) §12; see issue #1641). That means
+//! replace`/`append`, whose MCP handlers live in `drive_write_tools`
+//! (ADR-0091); `create` stays CLI-only. That means
 //! these tools need no `FolderPermissionRule`s, no `dry_run` param, no
 //! ADR-0080 lease, and can never produce a `RefusedNoLease`-shaped outcome —
 //! those concepts belong to the write engines alone.
@@ -124,7 +124,7 @@ impl OmniDevServer {
                        that path and returns a short summary instead — recommended for a large \
                        document. \
                        Read-only — no write gate, lease or dry-run applies (unlike `docs \
-                       replace`/`append`/`create`, which have no MCP equivalent yet). \
+                       replace`/`append`, exposed by separate gated write tools). \
                        Mirrors `omni-dev drive docs read`. Output is YAML."
     )]
     pub async fn drive_docs_read(

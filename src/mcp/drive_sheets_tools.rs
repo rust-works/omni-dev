@@ -6,8 +6,7 @@
 //! Both tools are read-only. Per [`crate::drive::sheets::read`]'s own module
 //! doc and [ADR-0071](../../docs/adrs/adr-0071.md) §11, the Sheets read path
 //! consults no write gate — unlike `sheets write`/`append`/`clear`, which
-//! stay CLI-only for now ([ADR-0073](../../docs/adrs/adr-0073.md) §12; see
-//! issue #1614). That means these tools need no `FolderPermissionRule`s, no
+//! are exposed separately in `drive_write_tools` (ADR-0091). That means these tools need no `FolderPermissionRule`s, no
 //! `dry_run` param, and can never produce a `RefusedNoVisibleParents`-shaped
 //! outcome — that concept belongs to the write gate alone.
 //!
@@ -116,7 +115,7 @@ impl OmniDevServer {
                        and returns a short summary instead — recommended for a large \
                        whole-workbook read. \
                        Read-only — no write gate or dry-run applies (unlike `sheets \
-                       write`/`append`/`clear`, which have no MCP equivalent yet). \
+                       write`/`append`/`clear`, whose MCP handlers live in `drive_write_tools`). \
                        Mirrors `omni-dev drive sheets read`. Output is YAML."
     )]
     pub async fn drive_sheets_read(

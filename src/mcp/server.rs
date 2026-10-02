@@ -52,6 +52,7 @@ impl OmniDevServer {
             + Self::drive_tool_router()
             + Self::drive_sheets_tool_router()
             + Self::drive_docs_tool_router()
+            + Self::drive_write_tool_router()
             + Self::log_tool_router()
             + Self::transcript_tool_router()
             + Self::coverage_tool_router()
@@ -412,6 +413,12 @@ mod tests {
             "drive_sheets_read",
             "drive_docs_info",
             "drive_docs_read",
+            "drive_docs_replace",
+            "drive_docs_append",
+            "drive_sheets_write",
+            "drive_sheets_append",
+            "drive_sheets_clear",
+            "drive_lease_acquire",
         ] {
             assert!(server.tool_router.has_route(name), "missing route: {name}");
         }

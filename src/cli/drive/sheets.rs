@@ -69,14 +69,17 @@ pub enum SheetsSubcommands {
     /// `drive` scope (`drive auth login --write-file`/`--write-full`). Drops a
     /// cell's rich-text runs even when the value is unchanged; see
     /// `docs/drive.md`.
+    /// (mirrors the `drive_sheets_write` MCP tool).
     Write(write::WriteCommand),
     /// Appends rows after the last row of a range's table, gated by the
     /// write-permission rules (issues #1589, #1612). Presumably drops
     /// rich-text runs on an existing cell like `sheets write` does, though
     /// this hasn't been measured; see `docs/drive.md`.
+    /// (mirrors the `drive_sheets_append` MCP tool).
     Append(write::AppendCommand),
     /// Clears a range's values, leaving formatting intact. Gated by the
     /// write-permission rules (issues #1589, #1612).
+    /// (mirrors the `drive_sheets_clear` MCP tool).
     Clear(write::ClearCommand),
     /// Finds text and replaces it across a range, one sheet, or the workbook.
     /// Gated by `sheets-write` (issue #1841, ADR-0083 §1).

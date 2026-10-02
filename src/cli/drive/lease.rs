@@ -51,6 +51,7 @@ pub struct LeaseCommand {
 enum LeaseAction {
     /// Backs up a file and mints a lease token, prompting for device-owner
     /// authentication (Touch ID or the account password).
+    /// (mirrors the `drive_lease_acquire` MCP tool).
     Acquire(AcquireCommand),
     /// Restores a file from a backup lease's recorded content, minting a
     /// fresh lease of its own before writing.
@@ -180,15 +181,15 @@ pub struct LeaseFlags {
 
 /// What [`LeaseFlags`] resolved to, after layering the CLI flags over
 /// `OMNI_DEV_DRIVE_LEASE_*`/`settings.json`/hard-coded defaults.
-struct ResolvedLeaseFlags {
-    backup_dir: std::path::PathBuf,
-    expiry: chrono::Duration,
-    auth_policy: AuthPolicy,
-    allow_headless: bool,
+pub(crate) struct ResolvedLeaseFlags {
+    pub(crate) backup_dir: std::path::PathBuf,
+    pub(crate) expiry: chrono::Duration,
+    pub(crate) auth_policy: AuthPolicy,
+    pub(crate) allow_headless: bool,
 }
 
 impl LeaseFlags {
-    fn resolve(self) -> Result<ResolvedLeaseFlags> {
+    pub(crate) fn resolve(self) -> Result<ResolvedLeaseFlags> {
         // One disk read/parse of settings.json, not two — `SettingsEnv::load()`
         // and `Settings::load_lease()` each independently re-read it;
         // `SettingsEnv::from_settings` was added for exactly this (issue
