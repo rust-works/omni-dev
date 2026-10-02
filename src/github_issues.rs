@@ -543,7 +543,7 @@ fn build_updated_at_query(refs: &[ItemRef]) -> Option<(String, QueryIndex)> {
 fn parse_updated_at_response(
     body: &Value,
     index: &QueryIndex,
-) -> Result<HashMap<(String, u64), Option<DateTime<Utc>>>> {
+) -> Result<Parsed<Option<DateTime<Utc>>>> {
     parse_aliased_response(body, index, |item_ref, node| {
         let timestamp = node
             .get("updatedAt")
