@@ -500,8 +500,8 @@ mod tests {
             file_id: Some("p1".into()),
             folder_id: None,
             recursive: false,
-            allow: [DriveOperation::SlidesWrite].into_iter().collect(),
-            deny: Default::default(),
+            allow: std::iter::once(DriveOperation::SlidesWrite).collect(),
+            deny: std::collections::HashSet::default(),
             require_lease,
         }
     }
