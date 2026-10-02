@@ -135,6 +135,7 @@ allow:
   - "src/github_issues/**"
   # `gh` invocation counting (`run_gh`), shared by every GitHub call site.
   - "src/github_metrics.rs"
+  - "src/github_metrics/**"
   # `gh api rate_limit` resolution engine for the daemon budget monitor.
   - "src/github_rate_limit.rs"
   # PR check-badge resolution engine for the daemon worktrees poller.

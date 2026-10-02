@@ -364,7 +364,7 @@ omni-dev git branch create pr [BASE_BRANCH] [OPTIONS]
 **Requirements:**
 
 - Clean working directory (no uncommitted changes)
-- GitHub CLI (`gh`) installed and authenticated
+- GitHub CLI (`gh`) installed and authenticated (see [GitHub authentication](#github-authentication))
 - Branch pushed to remote (will push automatically if needed)
 - Claude API key configured
 
@@ -2247,3 +2247,49 @@ See [Troubleshooting Guide](troubleshooting.md) for common issues and solutions.
 - 📝 [Examples](examples.md) - Real-world usage examples
 - 💬 [GitHub Discussions](https://github.com/rust-works/omni-dev/discussions) - Community support
 - 🐛 [GitHub Issues](https://github.com/rust-works/omni-dev/issues) - Bug reports and features
+
+## GitHub authentication
+
+By default, omni-dev uses the GitHub CLI's existing credentials, including any
+`GH_TOKEN` or `GITHUB_TOKEN` override. `OMNI_DEV_GITHUB_AUTH=pat` explicitly selects
+this default.
+
+For an independent GitHub App installation identity, create a GitHub App, install
+it on the repositories you need, and generate an RSA private key in the App
+settings. Grant the App permissions for the operations you use: for example,
+Issues and Pull requests read access for polling, write access for mutations,
+and Checks/Commit statuses read access for PR checks. Projects queries require
+corresponding organization Projects permissions; some user-only GitHub APIs
+cannot be accessed with installation tokens.
+
+```bash
+export OMNI_DEV_GITHUB_AUTH=app
+export OMNI_DEV_GITHUB_APP_ID=123456
+export OMNI_DEV_GITHUB_APP_INSTALLATION_ID=789012
+export OMNI_DEV_GITHUB_APP_PRIVATE_KEY_PATH=/absolute/path/to/app-private-key.pem
+omni-dev ai jev route 1813 --repo rust-works/omni-dev
+```
+
+Use the numeric App ID (not its client ID) and installation ID. The private-key
+file must contain an unencrypted RSA PKCS#1 (`BEGIN RSA PRIVATE KEY`, as downloaded
+from GitHub) or PKCS#8 (`BEGIN PRIVATE KEY`) PEM. Restrict file access to your user
+(e.g. `chmod 600`). These settings are process environment variables; pass them
+to the daemon's environment too when using background polling.
+
+App mode sets both `GH_TOKEN` and `GITHUB_TOKEN` on each `gh` child process,
+overriding inherited personal tokens without changing the parent environment.
+Installation tokens are cached only in process memory and refreshed within five
+minutes of the expiry returned by GitHub (normally one hour). Concurrent calls
+share a mint; separate CLI processes mint separately. Keys are read again on
+refresh, so replacing a key file takes effect at the next refresh. Tokens, JWTs,
+private keys and token response bodies are excluded from auth errors and logs.
+
+Incomplete configuration, an unreadable/invalid key, or an exchange failure
+stops that call with an error; App mode never falls back to personal credentials.
+For HTTP 401/403/404, check the IDs, active key, installation, repository access
+and App permissions. Local `gh --version`/`--help` probes do not mint tokens.
+The App exchange currently targets GitHub.com; `GH_HOST` must be unset or
+`github.com`, and Enterprise-specific host options are unsupported in App mode.
+
+GitHub documents [JWT signing requirements](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app)
+and the [installation token exchange](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app).

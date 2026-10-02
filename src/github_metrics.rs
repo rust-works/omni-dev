@@ -1,8 +1,8 @@
 //! Counting every GitHub API invocation omni-dev makes (#1387).
 //!
 //! Every GitHub call funnels through the `gh` CLI subprocess (ADR-0003 /
-//! ADR-0050 — the token never enters our process), so there is no in-process
-//! HTTP transport to instrument. Instead, [`run_gh`] is the single choke point
+//! ADR-0050). Opt-in App authentication mints installation tokens in process.
+//! [`run_gh`] is the single choke point
 //! every Rust `gh` call site routes through: it spawns `gh`, records one
 //! `kind: "gh"` line to the request log ([`crate::request_log::record_gh`]), and
 //! returns the process `Output` **unchanged** so call-site behavior and exit
@@ -21,6 +21,8 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 
 use crate::request_log::{self, GhOutcome, LogRecord, RecordKind, Source};
+
+mod app_auth;
 
 /// Whether a `gh` invocation hit the GitHub API, and how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -96,7 +98,8 @@ where
     }
 
     let started = Instant::now();
-    let result = cmd.output();
+    let result = app_auth::configure(&mut cmd, &argv, &crate::utils::env::SystemEnv)
+        .and_then(|()| cmd.output());
     let duration = started.elapsed();
 
     let (exit_code, error) = match &result {
