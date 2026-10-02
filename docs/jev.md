@@ -1119,12 +1119,16 @@ actually resolved and `could_be_cheaper`'s prediction was checked against
 what really happened. Treat the score as informative, not calibrated.
 
 The [#1871 follow-up evaluation](evaluations/jev-route-1871/README.md)
-records 14 public-issue cases, 56 pinned Jev requests, and explicit relation
-readings. It supports conservative relation labels but leaves the proposed
-implementation-stage `could_be_cheaper` and bounded-spike questions
-unshipped: the implementation examples all hit the minimum tier, and an
-independent spike case landed close to a negative case. No threshold or
-rewording has been validated for those questions.
+retains 14 historical public-issue cases and 56 requests, with a documented
+baseline mismatch: the old harness inserted literal patch artifacts in its
+question strings. Conservative relation labels were checked independently
+against source text and tests. A corrected eleven-case, 44-request comparison
+uses the production design question directly. It observed no stage-choice drift
+in class-only single-ladder requests, but all implementation choices still hit
+the minimum tier and an independent pending measurement remained close to a
+conditional-plan negative on the spike score. Both proposed signals remain
+unshipped; no threshold has been validated. The frozen inputs, exact requests,
+responses, usage and remaining shipping gates are in the evaluation record.
 
 ## verify-decision
 

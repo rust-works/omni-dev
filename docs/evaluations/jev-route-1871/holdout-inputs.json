@@ -21,7 +21,8 @@
       ],
       "closed_by": [],
       "url": "https://github.com/rust-works/succinctly/issues/2640"
-    }
+    },
+    "citation": null
   },
   {
     "id": "succinctly-1779-current",
@@ -45,7 +46,8 @@
       ],
       "closed_by": [],
       "url": "https://github.com/rust-works/succinctly/issues/1779"
-    }
+    },
+    "citation": null
   },
   {
     "id": "succinctly-2511-current",
@@ -63,7 +65,8 @@
       "comments": [],
       "closed_by": [],
       "url": "https://github.com/rust-works/succinctly/issues/2511"
-    }
+    },
+    "citation": "#1351"
   },
   {
     "id": "succinctly-2705-current",
@@ -87,6 +90,7 @@
       ],
       "closed_by": [],
       "url": "https://github.com/rust-works/succinctly/issues/2705"
-    }
+    },
+    "citation": "#2709"
   }
 ]

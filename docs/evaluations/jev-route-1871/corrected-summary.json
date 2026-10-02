@@ -1,0 +1,196 @@
+{
+  "requests": 44,
+  "pairs": 22,
+  "models": [
+    "jev-1.13.0"
+  ],
+  "stage_choice_drift": {
+    "design": 0,
+    "implement": 0,
+    "review": 0
+  },
+  "usage": {
+    "baseline": {
+      "input_tokens": 87180,
+      "output_tokens": 3704
+    },
+    "candidate": {
+      "input_tokens": 90804,
+      "output_tokens": 4388
+    }
+  },
+  "cases": [
+    {
+      "id": "omni-dev-1845-current",
+      "implementation_choices": [
+        "sonnet",
+        "sonnet",
+        "sonnet",
+        "sonnet"
+      ],
+      "spike": [
+        0.11,
+        0.12
+      ],
+      "implementation_bearing": [
+        0.32,
+        0.33
+      ]
+    },
+    {
+      "id": "omni-dev-1871-current",
+      "implementation_choices": [
+        "sonnet",
+        "sonnet",
+        "sonnet",
+        "sonnet"
+      ],
+      "spike": [
+        0.09,
+        0.09
+      ],
+      "implementation_bearing": [
+        0.19,
+        0.19
+      ]
+    },
+    {
+      "id": "succinctly-1740-current",
+      "implementation_choices": [
+        "sonnet",
+        "sonnet",
+        "sonnet",
+        "sonnet"
+      ],
+      "spike": [
+        0.13,
+        0.14
+      ],
+      "implementation_bearing": [
+        0.8,
+        0.8
+      ]
+    },
+    {
+      "id": "omni-dev-1845-pre-probe-reconstruction",
+      "implementation_choices": [
+        "sonnet",
+        "sonnet",
+        "sonnet",
+        "sonnet"
+      ],
+      "spike": [
+        0.88,
+        0.9
+      ],
+      "implementation_bearing": [
+        0.33,
+        0.34
+      ]
+    },
+    {
+      "id": "succinctly-2640-current",
+      "implementation_choices": [
+        "sonnet",
+        "sonnet",
+        "sonnet",
+        "sonnet"
+      ],
+      "spike": [
+        0.55,
+        0.58
+      ],
+      "implementation_bearing": []
+    },
+    {
+      "id": "succinctly-2705-current",
+      "implementation_choices": [
+        "sonnet",
+        "sonnet",
+        "sonnet",
+        "sonnet"
+      ],
+      "spike": [
+        0.44,
+        0.47
+      ],
+      "implementation_bearing": [
+        0.75,
+        0.78
+      ]
+    },
+    {
+      "id": "succinctly-3182-pending-reconstruction",
+      "implementation_choices": [
+        "sonnet",
+        "sonnet",
+        "sonnet",
+        "sonnet"
+      ],
+      "spike": [
+        0.31,
+        0.27
+      ],
+      "implementation_bearing": []
+    },
+    {
+      "id": "succinctly-3191-pending-reconstruction",
+      "implementation_choices": [
+        "sonnet",
+        "sonnet",
+        "sonnet",
+        "sonnet"
+      ],
+      "spike": [
+        0.21,
+        0.23
+      ],
+      "implementation_bearing": []
+    },
+    {
+      "id": "succinctly-2889-pending-reconstruction",
+      "implementation_choices": [
+        "sonnet",
+        "sonnet",
+        "sonnet",
+        "sonnet"
+      ],
+      "spike": [
+        0.23,
+        0.23
+      ],
+      "implementation_bearing": [
+        0.62,
+        0.62
+      ]
+    },
+    {
+      "id": "omni-dev-1814-current",
+      "implementation_choices": [
+        "sonnet",
+        "sonnet",
+        "sonnet",
+        "sonnet"
+      ],
+      "spike": [
+        0.21,
+        0.2
+      ],
+      "implementation_bearing": []
+    },
+    {
+      "id": "succinctly-2999-pending-reconstruction",
+      "implementation_choices": [
+        "sonnet",
+        "sonnet",
+        "sonnet",
+        "sonnet"
+      ],
+      "spike": [
+        0.44,
+        0.42
+      ],
+      "implementation_bearing": []
+    }
+  ]
+}
