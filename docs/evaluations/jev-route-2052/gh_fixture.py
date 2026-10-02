@@ -16,6 +16,10 @@ def main():
     args = sys.argv[1:]
     if not (args[:2] in (["api", "graphql"], ["repo", "view"], ["issue", "list"])):
         raise SystemExit("fixture refuses commands other than read-only route fetches")
+    if args[:2] == ["api", "graphql"] and not (
+        len(args) == 4 and args[2] == "-f" and args[3].startswith("query=query{")
+    ):
+        raise SystemExit("fixture requires the route's read-only GraphQL query shape")
     key = hashlib.sha256(json.dumps(args).encode()).hexdigest()
     replay = os.environ.get("ROUTE_GH_REPLAY")
     root = Path(replay or os.environ["ROUTE_GH_FIXTURE_DIR"])

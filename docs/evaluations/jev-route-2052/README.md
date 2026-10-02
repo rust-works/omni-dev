@@ -4,6 +4,7 @@ This artifact freezes an external evaluation census before any new question
 wording is tuned for [#1823](https://github.com/rust-works/omni-dev/issues/1823).
 The plan was [posted before implementation and predictions](https://github.com/rust-works/omni-dev/issues/2052#issuecomment-5944867147).
 No production routing behavior or question wording changes in this study.
+[Review findings and fixes](review.md) record the post-commit audit.
 
 ## Selection and labels
 
@@ -121,6 +122,7 @@ Offline analysis needs only Python's standard library:
 WT=/absolute/path/to/omni-dev/worktree
 EVAL="$WT/docs/evaluations/jev-route-2052"
 python3 "$EVAL/test_analyze.py"
+python3 "$EVAL/test_capture.py"
 python3 "$EVAL/analyze.py" > /private/tmp/2052-summary.json
 cmp "$EVAL/summary.json" /private/tmp/2052-summary.json
 (cd "$EVAL" && shasum -a 256 -c SHA256SUMS)

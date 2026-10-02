@@ -62,9 +62,9 @@ def summarize():
             for field in ("title", "body"):
                 if node[field] != source["issue"][field]:
                     drift.append(field)
-            frozen_comments = [(c["id"], c["body"]) for c in comments
+            frozen_comments = [(c["id"], (c.get("user") or {}).get("login", "ghost"), c["body"]) for c in comments
                                if (c.get("user") or {}).get("type") != "Bot"]
-            actual_comments = [(c.get("databaseId"), c["body"])
+            actual_comments = [(c.get("databaseId"), (c.get("author") or {}).get("login", "ghost"), c["body"])
                                for c in node["comments"]["nodes"]
                                if (c.get("author") or {}).get("__typename") != "Bot"]
             if frozen_comments != actual_comments:
