@@ -17,6 +17,7 @@ pub(crate) mod read;
 pub(crate) mod rename;
 pub(crate) mod search;
 pub(crate) mod sheets;
+pub(crate) mod slides;
 pub(crate) mod sync;
 pub(crate) mod trash;
 pub(crate) mod upload;
@@ -101,6 +102,8 @@ pub enum DriveSubcommands {
     /// Reads the structure and text of a Google Doc via the Docs v1 API
     /// (issue #1615).
     Docs(docs::DocsCommand),
+    /// Reads Slides objects and replaces text on ordinary slides.
+    Slides(slides::SlidesCommand),
     /// Reads and writes the cells of a Google Sheet via the Sheets v4 API
     /// (issue #1589).
     Sheets(sheets::SheetsCommand),
@@ -178,6 +181,7 @@ impl DriveSubcommands {
             Self::Rename(cmd) => cmd.execute(client).await,
             Self::Move(cmd) => cmd.execute(client).await,
             Self::Docs(cmd) => cmd.execute(client).await,
+            Self::Slides(cmd) => cmd.execute(client).await,
             Self::Sheets(cmd) => cmd.execute(client).await,
         }
     }
@@ -444,6 +448,26 @@ mod tests {
         };
         let err = cmd.execute().await.unwrap_err();
         assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_slides_read_verbs_to_the_slides_host() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        guard.redirect_api_hosts_to_a_dead_port();
+        for command in [
+            slides::SlidesSubcommands::Info(slides::info::InfoCommand {
+                presentation_id: "p".into(),
+                output: OutputFormat::Table,
+            }),
+            slides::SlidesSubcommands::Read(slides::read::ReadCommand {
+                presentation_id: "p".into(),
+                slides: vec![],
+                output: OutputFormat::Table,
+            }),
+        ] {
+            let cmd = DriveSubcommands::Slides(slides::SlidesCommand { command });
+            assert!(cmd.dispatch(&dead_client()).await.is_err());
+        }
     }
 
     #[tokio::test]

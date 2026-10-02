@@ -64,9 +64,10 @@ walkthrough — this page is the topic-by-topic reference.
 16. [Lease](#lease)
 17. [Sheets](#sheets)
 18. [Docs](#docs)
-18. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-19. [Troubleshooting](#troubleshooting)
-20. [See also](#see-also)
+19. [Slides](#slides)
+20. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+21. [Troubleshooting](#troubleshooting)
+22. [See also](#see-also)
 
 ## Prerequisites
 
@@ -781,6 +782,7 @@ operation anywhere in a target's ancestor chain:
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`, `delete-duplicates`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `docs-write`        | deny    | `docs replace`, `docs append`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `slides-write`      | deny    | `slides replace`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `trash`             | deny    | `trash`, `untrash` (individual files only)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 There is no "enabled: true" flag — an absent or empty rule list already
@@ -933,7 +935,7 @@ the one Drive it came from. A rule keys on **either** a `folder_id` or a
   `file_id` is a configuration error rather than a no-op.
 - `allow`/`deny` — any of `read`, `create`, `upload`, `edit`,
   `sheets-write`, `sheets-structure`, `sheets-delete`, `sheets-protection`,
-  `docs-write`, `trash`. A `deny`
+  `docs-write`, `trash`, `slides-write`. A `deny`
   entry for `read` is schema-ready today for a future `search`/`read`/
   `dedupe` enforcement fast-follow (not wired up yet — see
   [ADR-0071](adrs/adr-0071.md) §11); the write operations are enforced now.
@@ -4143,6 +4145,65 @@ There is no `files.delete` anywhere in this integration, so an empty document
 cannot be cleaned up automatically and must never be reported as a plain
 failure that leaves something you can't find. Delete it yourself if you don't
 want it.
+
+## Slides
+
+`drive slides` reads the object graph of a presentation through the Slides v1
+API and replaces text on ordinary slides. It shares Drive accounts and OAuth
+sessions. Enable the Google Slides API in the OAuth application's Cloud project.
+Use `drive auth login --write-file` or `--write-full` for replacement, and grant
+`slides-write` explicitly; `edit`, `docs-write` and `sheets-write` do not grant it.
+
+```bash
+omni-dev drive slides info PRESENTATION_ID
+omni-dev drive slides read PRESENTATION_ID -o json
+omni-dev drive slides read PRESENTATION_ID --slide SLIDE_OBJECT_ID -o jsonl
+omni-dev drive slides replace PRESENTATION_ID --search 'Q3' --replace 'Q4' --dry-run
+omni-dev drive lease acquire PRESENTATION_ID
+omni-dev drive slides replace PRESENTATION_ID --search 'Q3' --replace 'Q4' --lease TOKEN
+omni-dev drive slides replace PRESENTATION_ID --search 'Q3' --replace 'Q4' --slide SLIDE_OBJECT_ID --lease TOKEN
+```
+
+Presentation IDs are the `/d/<ID>/` segment of a Slides URL. `info` lists ordinary
+slide IDs, page dimensions and the editor-only revision ID. `read` emits one row
+per shape, image, group, unknown element or table cell, recursively walking groups.
+Rows carry a one-based slide position plus slide/page/element IDs. Cells carry
+zero-based grid coordinates. Speaker notes have a separate `notes` kind and notes
+page ID. Repeat `--slide` to select several ordinary slides. JSONL emits one object
+row per line; JSON/YAML include presentation identity/title/revision and rows.
+Table output sanitizes terminal controls; structured output preserves text.
+
+Unlike `drive read --content`'s text export, these commands expose object IDs.
+No numeric text index is accepted or computed. Full unmasked presentations are
+fetched before filtering, with a 64 MiB response cap; `--slide` does not reduce
+fetch size. Layouts and masters are fetched but not included in element output.
+
+Replacement is literal and case-sensitive by default. Use `--ignore-case` for
+case-insensitive matching; an empty `--replace ''` removes matched text. Every
+request explicitly names ordinary-slide page IDs, including when no filter is
+supplied. Notes, layouts and masters are excluded. Unknown/non-slide IDs and empty
+decks are refused. Each invocation sends one request, under the revision obtained
+from its own preceding read; there is no force or unleased revision path.
+
+Dry-run counts are snapshot estimates per shape/cell, joining runs within each
+text object and never matching across objects. Unicode case matching may differ
+from the server. Counts never suppress writes: even a zero estimate sends the
+request on a real run, and the server reports the actual changed count. Dry runs
+still require a `slides-write` grant but consume no Drive lease.
+
+A real write also requires a Drive lease unless its deciding rule has
+`require_lease: false`. Native lease acquisition needs `native_backup_folder_id`;
+Slides backups are copied decks with no typed restore command yet. A volunteered
+lease is checked even when the rule makes it optional. See [Lease](#lease).
+
+A stale revision is refused atomically. Re-run against a fresh read. Unknown
+revision-error wording may appear as `failed` with Google's diagnostic; exact
+Slides stale-error wording has not been verified live. `applied-response-unreadable`
+means HTTP success with an unreadable reply: inspect the deck before retrying.
+Mutation logs contain metadata/counts, never searched/replacement prose.
+
+Object deletion, adding slides, styling, index insertion and MCP are deferred.
+See [ADR-0093](adrs/adr-0093.md).
 
 ## Rate limits and retry behaviour
 

@@ -47,9 +47,7 @@ pub(crate) const GOOGLE_DOC_MIME_TYPE: &str = "application/vnd.google-apps.docum
 
 /// MIME type marking a Google Slides presentation.
 ///
-/// Present only so the Docs commands can say "Slides isn't supported yet"
-/// instead of the generic "not a Google Doc" — there is no Slides surface in
-/// the tree, and adding one is a separate issue.
+/// Used by Slides target classification and native-document refusals.
 pub(crate) const GOOGLE_SLIDES_MIME_TYPE: &str = "application/vnd.google-apps.presentation";
 
 /// MIME type marking a Drive shortcut.

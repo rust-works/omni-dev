@@ -116,3 +116,4 @@ by Michael Nygard.
 | [ADR-0090](adr-0090.md)                                 | ✅ Accepted                              | 2026-09-30 | Fetch Secrets On Demand with `<NAME>_COMMAND`                                               |
 | [ADR-0091](adr-0091.md)                                 | 🟡 Proposed                              | 2026-10-02 | Gated Sheets and Docs Content Writes over MCP                                               |
 | [ADR-0092](adr-0092.md)                                 | ✅ Accepted                              | 2026-10-02 | Gated Trash and Restore for Individual Drive Files                                          |
+| [ADR-0093](adr-0093.md)                                 | ✅ Accepted                              | 2026-10-02 | Google Slides object reads and guarded text replacement                                     |
