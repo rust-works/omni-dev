@@ -162,10 +162,10 @@ mod tests {
                 "json",
             ])
             .unwrap();
-            let leaf = match cmd.command {
-                crate::cli::drive::DriveSubcommands::Trash(cmd)
-                | crate::cli::drive::DriveSubcommands::Untrash(cmd) => cmd,
-                _ => panic!("wrong subcommand"),
+            let (crate::cli::drive::DriveSubcommands::Trash(leaf)
+            | crate::cli::drive::DriveSubcommands::Untrash(leaf)) = cmd.command
+            else {
+                panic!("wrong subcommand");
             };
             assert_eq!(leaf.file_id, "file-1");
             assert!(leaf.dry_run);

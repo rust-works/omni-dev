@@ -94,6 +94,7 @@ impl JsonlSerialize for TrashOutcome {
 }
 
 /// Changes the target's trashed state after evaluating `trash` permissions.
+///
 /// Every real attempt writes a best-effort mutation record, including refusals
 /// and no-ops. Dry runs never mutate or write mutation records.
 pub async fn trash(
