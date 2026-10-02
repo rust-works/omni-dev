@@ -26,6 +26,7 @@ pub mod lease;
 pub mod permissions_api;
 pub mod rename;
 pub mod sheets;
+pub(crate) mod sync;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod types;
