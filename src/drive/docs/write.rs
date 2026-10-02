@@ -151,24 +151,6 @@ impl WritePayload {
             _ => Ok(()),
         }
     }
-
-    /// The single `DocsRequest` this payload sends.
-    fn to_request(&self, edit: Option<&EditPreview>) -> Result<DocsRequest, AnchorError> {
-        Ok(match self {
-            Self::Replace {
-                search,
-                replace,
-                match_case,
-            } => DocsRequest::replace_all_text(search, replace, *match_case),
-            Self::Append { text } => DocsRequest::insert_text_at_end(text),
-            Self::Insert { text, .. } => {
-                DocsRequest::insert_text_at(text, edit.ok_or(AnchorError::InvalidIndices)?)
-            }
-            Self::Delete { .. } => {
-                DocsRequest::delete_range(edit.ok_or(AnchorError::InvalidIndices)?)
-            }
-        })
-    }
 }
 
 /// Which text mutation to perform.
@@ -582,64 +564,57 @@ async fn write_inner(
         return gated(WriteResult::RefusedNoRevisionId, None);
     };
 
-    let edit = match &opts.payload {
+    // Request and preview are built together from *this* snapshot, before the
+    // dry-run branch, so a dry run and a real run cannot disagree about what
+    // they saw (ADR-0076 §7). Building the request here, before the ledger
+    // gate, also means no fallible work can orphan a pending intent.
+    let (request, preview) = match &opts.payload {
+        WritePayload::Replace {
+            search,
+            replace,
+            match_case,
+        } => {
+            // Across every tab, because a `replaceAllText` with no
+            // `tabsCriteria` spans every tab (ADR-0076 §11).
+            let corpus = document_text(&document);
+            (
+                DocsRequest::replace_all_text(search, replace, *match_case),
+                WriteResult::WouldReplace {
+                    occurrences: count_occurrences(&corpus, search, *match_case),
+                },
+            )
+        }
+        WritePayload::Append { text } => (
+            DocsRequest::insert_text_at_end(text),
+            WriteResult::WouldAppend {
+                document_end_index: body_end_index(&document),
+                chars: text.chars().count(),
+                bytes: text.len(),
+            },
+        ),
         WritePayload::Insert {
             anchor,
             side,
             text,
             match_case,
-        } => anchor::resolve_insert(&document, anchor, *side, text, *match_case).map(Some),
+        } => match anchor::resolve_insert(&document, anchor, *side, text, *match_case) {
+            Ok(edit) => (
+                DocsRequest::insert_text_at(text, &edit),
+                WriteResult::WouldInsert { edit },
+            ),
+            Err(error) => return gated(WriteResult::RefusedAnchor { error }, Some(revision_id)),
+        },
         WritePayload::Delete {
             from,
             to,
             match_case,
-        } => anchor::resolve_delete(&document, from, to.as_deref(), *match_case).map(Some),
-        _ => Ok(None),
-    };
-    let edit = match edit {
-        Ok(edit) => edit,
-        Err(error) => return gated(WriteResult::RefusedAnchor { error }, Some(revision_id)),
-    };
-    // Build before the ledger gate: no fallible work may orphan a pending intent.
-    let request = match opts.payload.to_request(edit.as_ref()) {
-        Ok(request) => request,
-        Err(error) => return gated(WriteResult::RefusedAnchor { error }, Some(revision_id)),
-    };
-    // Computed from *this* snapshot, before the dry-run branch, so a dry run
-    // and a real run cannot disagree about what they saw (ADR-0076 §7).
-    let preview = match (&opts.payload, edit.as_ref()) {
-        (
-            WritePayload::Replace {
-                search, match_case, ..
-            },
-            _,
-        ) => {
-            // Across every tab, because a `replaceAllText` with no
-            // `tabsCriteria` spans every tab (ADR-0076 §11).
-            let corpus = document_text(&document);
-            WriteResult::WouldReplace {
-                occurrences: count_occurrences(&corpus, search, *match_case),
-            }
-        }
-        (WritePayload::Append { text }, _) => WriteResult::WouldAppend {
-            document_end_index: body_end_index(&document),
-            chars: text.chars().count(),
-            bytes: text.len(),
+        } => match anchor::resolve_delete(&document, from, to.as_deref(), *match_case) {
+            Ok(edit) => (
+                DocsRequest::delete_range(&edit),
+                WriteResult::WouldDelete { edit },
+            ),
+            Err(error) => return gated(WriteResult::RefusedAnchor { error }, Some(revision_id)),
         },
-        (WritePayload::Insert { .. }, Some(edit)) => {
-            WriteResult::WouldInsert { edit: edit.clone() }
-        }
-        (WritePayload::Delete { .. }, Some(edit)) => {
-            WriteResult::WouldDelete { edit: edit.clone() }
-        }
-        _ => {
-            return gated(
-                WriteResult::RefusedAnchor {
-                    error: AnchorError::InvalidIndices,
-                },
-                Some(revision_id),
-            )
-        }
     };
 
     if opts.dry_run {
@@ -697,9 +672,11 @@ async fn write_inner(
             WritePayload::Insert { .. } | WritePayload::Delete { .. } => match preview {
                 WriteResult::WouldInsert { edit } => WriteResult::Inserted { edit },
                 WriteResult::WouldDelete { edit } => WriteResult::Deleted { edit },
+                // omni-dev: coverage ignore reason="`preview` is built by the payload match above, so an Insert/Delete payload always carries a WouldInsert/WouldDelete preview; this arm exists solely for exhaustiveness over the shared WriteResult enum"
                 _ => WriteResult::Failed {
                     detail: "missing resolved edit preview".to_owned(),
                 },
+                // omni-dev: coverage end
             },
         },
         Err(err) => {
@@ -2243,6 +2220,256 @@ mod tests {
                     serde_json::json!({"startIndex": 1, "endIndex": 16, "tabId": "child"})
                 );
             }
+        }
+    }
+
+    // ── Anchored payload validation, rendering and logging ─────────────
+
+    fn insert_payload(anchor: &str, text: &str) -> WritePayload {
+        WritePayload::Insert {
+            anchor: anchor.into(),
+            side: Side::After,
+            text: text.into(),
+            match_case: true,
+        }
+    }
+
+    fn delete_payload(from: &str, to: Option<&str>) -> WritePayload {
+        WritePayload::Delete {
+            from: from.into(),
+            to: to.map(Into::into),
+            match_case: true,
+        }
+    }
+
+    #[test]
+    fn validate_refuses_anchored_payloads_that_cannot_address_an_edit() {
+        let nothing_left = insert_payload("a", "\0\r\u{e000}").validate().unwrap_err();
+        assert!(nothing_left.contains("nothing to insert"), "{nothing_left}");
+
+        for anchor in ["", "two\nlines", "carriage\rreturn"] {
+            let err = insert_payload(anchor, "x").validate().unwrap_err();
+            assert!(err.contains("anchor must be nonempty"), "{anchor:?}: {err}");
+        }
+        for (from, to) in [
+            ("", None),
+            ("two\nlines", None),
+            ("a", Some("")),
+            ("a", Some("two\nlines")),
+            ("a", Some("carriage\rreturn")),
+        ] {
+            let err = delete_payload(from, to).validate().unwrap_err();
+            assert!(
+                err.contains("anchors must be nonempty"),
+                "{from:?}..{to:?}: {err}"
+            );
+        }
+
+        assert!(insert_payload("a", "x").validate().is_ok());
+        assert!(delete_payload("a", None).validate().is_ok());
+        assert!(delete_payload("a", Some("b")).validate().is_ok());
+    }
+
+    /// An unaddressable payload is refused before any request, so a typo in an
+    /// anchor never costs a round-trip or touches the lease.
+    #[tokio::test]
+    async fn an_unaddressable_anchored_payload_fails_before_any_network_call() {
+        for payload in [
+            insert_payload("", "x"),
+            insert_payload("a", "\0"),
+            delete_payload("", None),
+            delete_payload("a", Some("two\nlines")),
+        ] {
+            let server = MockServer::start().await;
+            let (drive, docs) = clients(&server).await;
+            let mut opts = replace_opts(false);
+            opts.payload = payload;
+            let outcome = write(&drive, &docs, &opts, &[]).await;
+            assert!(
+                matches!(outcome.result, WriteResult::Failed { .. }),
+                "{:?}",
+                outcome.result
+            );
+            assert!(server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.url.path() == "/token"));
+        }
+    }
+
+    fn preview_edit() -> EditPreview {
+        EditPreview {
+            start_index: 4,
+            end_index: 6,
+            tab_id: None,
+            paragraphs: 1,
+            chars: 1,
+            bytes: 4,
+        }
+    }
+
+    fn outcome_with(result: WriteResult) -> WriteOutcome {
+        WriteOutcome {
+            document_id: "doc-1".to_string(),
+            file_name: Some("Budget".to_string()),
+            resolved_folder_id: None,
+            required_revision_id: None,
+            result,
+        }
+    }
+
+    #[test]
+    fn describe_renders_each_anchored_outcome_with_its_utf16_range() {
+        for (result, verb, expected) in [
+            (
+                WriteResult::WouldInsert {
+                    edit: preview_edit(),
+                },
+                WriteVerb::Insert,
+                "Would insert",
+            ),
+            (
+                WriteResult::Inserted {
+                    edit: preview_edit(),
+                },
+                WriteVerb::Insert,
+                "Inserted",
+            ),
+            (
+                WriteResult::WouldDelete {
+                    edit: preview_edit(),
+                },
+                WriteVerb::Delete,
+                "Would delete",
+            ),
+            (
+                WriteResult::Deleted {
+                    edit: preview_edit(),
+                },
+                WriteVerb::Delete,
+                "Deleted",
+            ),
+        ] {
+            let text = describe(&outcome_with(result), verb);
+            assert_eq!(
+                text,
+                format!(
+                    "{expected}: 1 char(s) / 4 byte(s) in 'Budget' at [4, 6) UTF-16 code units, tab first, 1 paragraph(s)"
+                )
+            );
+        }
+
+        let mut edit = preview_edit();
+        edit.tab_id = Some("t.1".to_string());
+        let text = describe(
+            &outcome_with(WriteResult::Deleted { edit }),
+            WriteVerb::Delete,
+        );
+        assert!(text.contains("tab t.1,"), "{text}");
+    }
+
+    #[test]
+    fn describe_names_the_unresolved_anchor_without_quoting_document_text() {
+        let text = describe(
+            &outcome_with(WriteResult::RefusedAnchor {
+                error: AnchorError::Ambiguous { count: 2 },
+            }),
+            WriteVerb::Insert,
+        );
+        assert!(text.starts_with("Refused: unsafe or unresolved anchor in 'Budget'"));
+        assert!(text.contains("Ambiguous"), "{text}");
+    }
+
+    #[test]
+    fn refusals_name_the_verb_and_the_grant_that_would_allow_it() {
+        let not_a_doc = WriteResult::RefusedNotADocument {
+            mime_type: GOOGLE_SHEET_MIME_TYPE.to_string(),
+        };
+        for (verb, label) in [
+            (WriteVerb::Replace, "replace"),
+            (WriteVerb::Append, "append"),
+            (WriteVerb::Insert, "insert"),
+            (WriteVerb::Delete, "delete"),
+        ] {
+            let text = describe(&outcome_with(not_a_doc.clone()), verb);
+            assert!(text.contains(&format!("`drive docs {label}`")), "{text}");
+        }
+
+        for (verb, grant) in [
+            (WriteVerb::Insert, "docs-write"),
+            (WriteVerb::Delete, "docs-delete"),
+        ] {
+            let text = describe(&outcome_with(WriteResult::RefusedNoVisibleParents), verb);
+            assert!(text.contains(&format!("[\"{grant}\"]")), "{text}");
+            assert!(
+                text.contains(&format!("granting that folder `{grant}`")),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn describe_names_the_rule_that_blocked_a_write_or_the_default_policy() {
+        let blocked = |decided_by| {
+            describe(
+                &outcome_with(WriteResult::Blocked { decided_by }),
+                WriteVerb::Delete,
+            )
+        };
+        assert_eq!(
+            blocked(Some(DecidingRule::Folder {
+                folder_id: "folder-1".to_string(),
+                depth: 2,
+            })),
+            "Blocked: 'Budget' — refused by rule on folder folder-1 (depth 2)"
+        );
+        assert_eq!(
+            blocked(Some(DecidingRule::File {
+                file_id: "doc-1".to_string(),
+            })),
+            "Blocked: 'Budget' — refused by rule on file doc-1"
+        );
+        assert_eq!(
+            blocked(None),
+            "Blocked: 'Budget' — refused by default policy (no matching rule)"
+        );
+    }
+
+    #[test]
+    fn dry_run_statuses_are_named_for_the_log_even_though_only_writes_record() {
+        for (result, status) in [
+            (
+                WriteResult::WouldReplace { occurrences: 1 },
+                "would-replace",
+            ),
+            (
+                WriteResult::WouldInsert {
+                    edit: preview_edit(),
+                },
+                "would-insert",
+            ),
+            (
+                WriteResult::WouldDelete {
+                    edit: preview_edit(),
+                },
+                "would-delete",
+            ),
+            (
+                WriteResult::Inserted {
+                    edit: preview_edit(),
+                },
+                "inserted",
+            ),
+            (
+                WriteResult::Deleted {
+                    edit: preview_edit(),
+                },
+                "deleted",
+            ),
+        ] {
+            assert_eq!(result.log_status(), status);
         }
     }
 }
