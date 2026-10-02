@@ -3955,6 +3955,8 @@ Commands:
   create       Creates a new file or folder, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
   upload       Uploads local content as a new file, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
   edit         Replaces an existing file's content, gated by the write-permission rules (issues #1574, #1612). Requires the `drive.file` scope if `omni-dev` created the file, or the unrestricted `drive` scope for any pre-existing file (`drive auth login --write-file` or `--write-full`)
+  trash        Moves an individual file to Drive Trash, gated by `trash` permission. Refuses folders; lease-exempt. Requires `drive auth login --write`
+  untrash      Restores an individual file from Drive Trash under `trash` permission. Refuses folders; lease-exempt. Requires `drive auth login --write`
   lease        Backs up a file and mints a Touch ID-authorised lease token, required by `drive edit` and (in later phases) every other content-mutating verb ([ADR-0080](../../docs/adrs/adr-0080.md))
   rename       Renames a single Drive file. Requires the `drive.metadata` scope (`drive auth login --write`)
   move         Moves one or more Drive files into a destination folder. Requires the `drive.metadata` scope (`drive auth login --write`)
@@ -4385,7 +4387,7 @@ Arguments:
   <ID>  The folder or file id to evaluate
 
 Options:
-      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write, sheets-structure, sheets-delete, sheets-protection, docs-write]
+      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write, sheets-structure, sheets-delete, sheets-protection, docs-write, trash]
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
@@ -6603,6 +6605,40 @@ Options:
           Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help
           Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive trash - Moves an individual file to Drive Trash, gated by `trash` permission. Refuses folders; lease-exempt. Requires `drive auth login --write`
+
+Moves an individual file to Drive Trash, gated by `trash` permission. Refuses folders; lease-exempt. Requires `drive auth login --write`
+
+Usage: trash [OPTIONS] <FILE_ID>
+
+Arguments:
+  <FILE_ID>  Drive file ID
+
+Options:
+      --dry-run          Reports the permission verdict and action without mutating
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive untrash - Restores an individual file from Drive Trash under `trash` permission. Refuses folders; lease-exempt. Requires `drive auth login --write`
+
+Restores an individual file from Drive Trash under `trash` permission. Refuses folders; lease-exempt. Requires `drive auth login --write`
+
+Usage: untrash [OPTIONS] <FILE_ID>
+
+Arguments:
+  <FILE_ID>  Drive file ID
+
+Options:
+      --dry-run          Reports the permission verdict and action without mutating
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
