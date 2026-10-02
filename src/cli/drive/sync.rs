@@ -163,4 +163,30 @@ mod tests {
         assert!(!text.contains(['\x1b', '\r']));
         assert!(text.contains("failed=1"));
     }
+
+    #[test]
+    fn table_propagates_a_writer_failure_from_every_line() {
+        let mut report = SyncReport {
+            dry_run: true,
+            ..Default::default()
+        };
+        report.items.push(crate::drive::sync::SyncItem {
+            id: "id".into(),
+            path: "name".into(),
+            action: "failed",
+            error: Some("bad".into()),
+        });
+        let mut full = Vec::new();
+        render_sync_table(&report, &mut full).unwrap();
+        // A fixed-size slice fails with WriteZero once full, so every shorter
+        // capacity fails inside the header, item or summary write in turn.
+        for capacity in 0..full.len() {
+            let mut buf = vec![0u8; capacity];
+            let mut out = buf.as_mut_slice();
+            assert!(
+                render_sync_table(&report, &mut out).is_err(),
+                "capacity {capacity}"
+            );
+        }
+    }
 }
