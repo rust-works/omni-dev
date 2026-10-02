@@ -94,9 +94,11 @@ Each file in [`plan/`](plan/) carries a `**Status:**` header (`Built`, `In Progr
 - **[AI Client](plan/AiClient.md)** *(Built)* - Multi-provider AI abstraction · [ADR-0002](adrs/adr-0002.md) · [ADR-0014](adrs/adr-0014.md)
 - **[Commit Message Check](plan/commit-message-check.md)** *(Built)* - Non-interactive commit message validation
 
-### Retrospectives
+### Evaluations
 
 - **[GitHub Conditional Request Evaluation](evaluations/github-conditional-requests.md)** - Current REST/GraphQL candidates, decision to retain existing fetch paths, and criteria for future ETag polling
+
+### Retrospectives
 
 - **[v0.18.0 Retrospective](retrospective-v0.18.0.md)** - ADR-guided code quality and issue-driven development
 
