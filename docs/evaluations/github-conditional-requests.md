@@ -33,6 +33,11 @@ See [GitHub's rate-limit documentation](https://docs.github.com/en/rest/using-th
   documents include the latest 100 comments and closing-PR references. A REST
   issue GET alone does not supply that aggregate; comment and other representations
   need their own requests and validators. Retain the bounded GraphQL batches.
+- **Labels and board data:** the audited issue-document and PR queries do not
+  fetch label collections or Projects-v2 board items. These are motivation for a
+  future consumer, not current cached representations to convert. Evaluate such
+  a consumer's exact endpoint and dependencies when it exists; neither the current
+  disk cache nor an issue GET's validator establishes board freshness.
 - **Cached issue or PR state:** [`IssueCache`](../../src/github_issues/cache.rs)
   reuses documents for a default 300 seconds. `fetch_issues_cached_current` and
   `fetch_items_cached_current` validate state with a shallow aliased `fetch_states`
