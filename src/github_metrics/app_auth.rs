@@ -441,8 +441,19 @@ mod tests {
                 let n = stream.read(&mut buf).unwrap();
                 assert!(n > 0);
                 request.extend_from_slice(&buf[..n]);
-                if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
                 }
             }
             write!(
@@ -470,6 +481,7 @@ mod tests {
         assert!(request.starts_with("post /app/installations/456/access_tokens"));
         assert!(request.contains("authorization: bearer signed-jwt"));
         assert!(request.contains("x-github-api-version: 2022-11-28"));
+        assert!(request.ends_with("\r\n\r\n{}"));
     }
 
     #[test]
@@ -487,6 +499,7 @@ mod tests {
                 .to_string();
             server.join().unwrap();
             assert!(!err.contains("SECRET"));
+            assert!(err.contains(&status.to_string()) || status == 201, "{err}");
         }
     }
 }
