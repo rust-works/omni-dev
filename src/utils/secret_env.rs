@@ -94,6 +94,16 @@ pub const SECRET_ENV_VARS: &[&str] = &[
 /// exception to STYLE-0030.
 pub const EXEMPT_SECRET_ENV_VARS: &[(&str, &str)] = &[
     (
+        "GH_TOKEN",
+        "GitHub CLI child-environment output, never read by omni-dev; PAT mode \
+         preserves gh's own credential resolution and App mode mints this value",
+    ),
+    (
+        "GITHUB_TOKEN",
+        "GitHub CLI child-environment output, never read by omni-dev; set alongside \
+         GH_TOKEN so inherited credentials cannot override App authentication",
+    ),
+    (
         "GMAIL_CLIENT_SECRET",
         "GMAIL_CLIENT_SECRET_FILE already names a Google client_secret.json for \
          `gmail auth import`; an installed-app OAuth client secret is not \
