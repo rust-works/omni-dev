@@ -176,7 +176,11 @@ impl<'a> FilesApi<'a> {
     /// Renames a file (`files.update` with a `name` body, no `parents`
     /// change — renaming never affects visibility, see ADR-0070). Requires
     /// the `drive.metadata` scope (`drive auth login --write`).
-    pub async fn rename(&self, file_id: &str, new_name: &str) -> Result<DriveFile> {
+    pub(in crate::drive) async fn rename(
+        &self,
+        file_id: &str,
+        new_name: &str,
+    ) -> Result<DriveFile> {
         let url = build_file_update_url(self.client.base_url(), file_id, None, None)?;
         let response = self
             .client
@@ -192,7 +196,7 @@ impl<'a> FilesApi<'a> {
     /// `removeParents` query params, comma-separated file ids — Drive v3 has
     /// no separate move endpoint). Requires the `drive.metadata` scope
     /// (`drive auth login --write`).
-    pub async fn move_to(
+    pub(in crate::drive) async fn move_to(
         &self,
         file_id: &str,
         add_parents: &str,
