@@ -73,8 +73,13 @@ case "$status" in
     # with the matching finding count is evidence of failed validation.
     if jq -e --argjson status "$status" '
       (.commits | type == "array") and
-      (if $status == 1 then (.summary.error_count | numbers) > 0
-       else (.summary.warning_count | numbers) > 0 end)
+      (if $status == 1 then
+         ((.summary.error_count | numbers) > 0) and
+         any(.commits[].issues[]; .severity == "error")
+       else
+         ((.summary.warning_count | numbers) > 0) and
+         any(.commits[].issues[]; .severity == "warning")
+       end)
     ' "$output" >/dev/null 2>&1; then
       {
         echo "Commit messages need attention before stopping:"
