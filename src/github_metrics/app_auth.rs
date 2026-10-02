@@ -197,6 +197,12 @@ fn exchange(url: &str, jwt: &Secret) -> io::Result<Token> {
             ureq::Error::StatusCode(code) => error(format!("GitHub App token exchange failed (HTTP {code}); check App installation and permissions")),
             _ => error("GitHub App token exchange failed (transport error)"),
         })?;
+    if response.status().as_u16() != 201 {
+        return Err(error(format!(
+            "GitHub App token exchange returned unexpected HTTP {}",
+            response.status().as_u16()
+        )));
+    }
     // Never propagate decoder errors, which could contain credential material.
     let body = response
         .body_mut()
@@ -229,7 +235,7 @@ mod tests {
     use aws_lc_rs::{
         encoding::AsDer,
         rsa::KeySize,
-        signature::{UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256},
+        signature::{KeyPair as _, UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256},
     };
     use std::{
         io::{Read, Write},
@@ -470,6 +476,8 @@ mod tests {
     fn exchange_errors_do_not_expose_response_or_jwt() {
         for (status, body) in [
             (403, "SECRET BODY"),
+            (302, "SECRET REDIRECT BODY"),
+            (200, "SECRET UNEXPECTED SUCCESS"),
             (201, "SECRET INVALID JSON"),
             (201, "{\"token\":\"SECRET\",\"expires_at\":\"SECRET\"}"),
         ] {
