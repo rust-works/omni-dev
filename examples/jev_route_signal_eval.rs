@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use omni_dev::jev::client::JevClient;
 use omni_dev::jev::config::JevConfig;
-use omni_dev::jev::protocol::{Question, SystemOneRequest};
+use omni_dev::jev::protocol::{Question, SystemOneRequest, SystemOneResponse};
 use omni_dev::jev::route::{
     build_route_questions, build_route_state, could_be_cheaper_question, Ladder, Provider, Tiers,
     DEFAULT_MAX_INPUT_CHARS,
@@ -104,10 +104,30 @@ fn validate_cases(cases: &[Case]) -> Result<()> {
     for case in cases {
         anyhow::ensure!(!case.id.trim().is_empty(), "case id must not be empty");
         anyhow::ensure!(ids.insert(&case.id), "duplicate case id {:?}", case.id);
+        let (_, truncated) = build_route_state(&case.doc, DEFAULT_MAX_INPUT_CHARS);
+        anyhow::ensure!(
+            !truncated,
+            "case {:?} exceeds the route input limit; freeze and label the submitted text first",
+            case.id
+        );
         if let Some(target) = &case.citation {
             anyhow::ensure!(!target.trim().is_empty(), "empty citation in {:?}", case.id);
         }
     }
+    Ok(())
+}
+
+fn validate_response(request: &SystemOneRequest, response: &SystemOneResponse) -> Result<()> {
+    anyhow::ensure!(
+        response.model == request.model,
+        "expected model {:?}, received {:?}",
+        request.model,
+        response.model
+    );
+    anyhow::ensure!(
+        request.questions.keys().eq(response.answers.keys()),
+        "response answer keys do not match the requested questions"
+    );
     Ok(())
 }
 
@@ -159,6 +179,8 @@ async fn main() -> Result<()> {
                     .system_one(&request)
                     .await
                     .with_context(|| format!("{} {variant} repeat {repeat}", case.id))?;
+                // Preserve even an incompatible response for diagnosis before stopping.
+                let validation = validate_response(&request, &response);
                 observations.push(Observation {
                     id: case.id.clone(),
                     variant: variant.to_string(),
@@ -167,6 +189,7 @@ async fn main() -> Result<()> {
                     response: serde_json::to_value(response)?,
                 });
                 checkpoint(&mut output, &observations)?;
+                validation.with_context(|| format!("{} {variant} repeat {repeat}", case.id))?;
                 println!("{} {variant} repeat {repeat}", case.id);
             }
         }
@@ -249,6 +272,51 @@ mod tests {
             serde_json::from_reader::<_, serde_json::Value>(&file).unwrap(),
             serde_json::json!([])
         );
+    }
+
+    #[test]
+    fn rejects_model_drift_and_missing_or_unrequested_answers() {
+        use omni_dev::jev::protocol::Answer;
+        let request = SystemOneRequest {
+            state: serde_json::json!("text"),
+            model: "jev-1.13.0".into(),
+            questions: BTreeMap::from([("bounded_spike".into(), spike_question())]),
+        };
+        let mut response = SystemOneResponse {
+            model: request.model.clone(),
+            answers: BTreeMap::from([("bounded_spike".into(), Answer::Noul { noul: 0.2 })]),
+            usage: Default::default(),
+        };
+        validate_response(&request, &response).unwrap();
+        response.model = "jev-other".into();
+        assert!(validate_response(&request, &response)
+            .unwrap_err()
+            .to_string()
+            .contains("expected model"));
+        response.model = request.model.clone();
+        response.answers.clear();
+        assert!(validate_response(&request, &response).is_err());
+        response
+            .answers
+            .insert("unrequested".into(), Answer::Noul { noul: 0.2 });
+        assert!(validate_response(&request, &response).is_err());
+        response
+            .answers
+            .insert("bounded_spike".into(), Answer::Noul { noul: 0.2 });
+        assert!(validate_response(&request, &response).is_err());
+    }
+
+    #[test]
+    fn rejects_inputs_that_would_silently_truncate() {
+        let mut cases: Vec<Case> = serde_json::from_str(include_str!(
+            "../docs/evaluations/jev-route-1871/corrected-inputs.json"
+        ))
+        .unwrap();
+        cases[0].doc.body = "x".repeat(DEFAULT_MAX_INPUT_CHARS + 1);
+        assert!(validate_cases(&cases)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds the route input limit"));
     }
 
     #[test]
