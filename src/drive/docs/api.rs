@@ -427,8 +427,8 @@ mod tests {
     /// `targetRevisionId` field, or hand-building a `serde_json::json!` body
     /// that bypasses the typed struct entirely — and that second route is
     /// not hypothetical, since `sheets/api.rs` builds request bodies exactly
-    /// that way. This closes both, and also pins §4's claim that no
-    /// destructive request is constructible.
+    /// that way. This closes both, and permits only the typed content-range
+    /// deletion introduced by ADR-0094; other destructive requests stay absent.
     #[test]
     fn no_unleased_or_unmodelled_destructive_request_is_reachable() {
         let sources = [

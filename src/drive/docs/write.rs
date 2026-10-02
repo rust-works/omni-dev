@@ -132,9 +132,10 @@ impl WritePayload {
             Self::Append { text } if text.is_empty() => {
                 Err("nothing to append: the text is empty".to_string())
             }
-            Self::Insert { text, .. } if text.is_empty() => {
-                Err("nothing to insert: the text is empty".to_string())
-            }
+            Self::Insert { text, .. } if anchor::insertion_counts(text).0 == 0 => Err(
+                "nothing to insert: no text remains after Docs strips unsupported characters"
+                    .to_string(),
+            ),
             Self::Insert { anchor, .. } if anchor.is_empty() || anchor.contains(['\n', '\r']) => {
                 Err("anchor must be nonempty and within one paragraph".to_owned())
             }
@@ -1989,7 +1990,7 @@ mod tests {
             let rule = rule_for(&payload);
             let mut opts = replace_opts(true);
             opts.payload = payload;
-            let preview = write(&drive, &docs, &opts, &[rule.clone()]).await;
+            let preview = write(&drive, &docs, &opts, std::slice::from_ref(&rule)).await;
             let expected = match &preview.result {
                 WriteResult::WouldInsert { edit } | WriteResult::WouldDelete { edit } => {
                     edit.clone()
@@ -2168,7 +2169,7 @@ mod tests {
             let server = MockServer::start().await;
             let (drive, docs) = anchored_setup(&server).await;
             Mock::given(method("POST")).and(path("/v1/documents/doc-1:batchUpdate"))
-                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": {"code": 400, "message": "The provided revision ID does not match the current revision ID."}})))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": {"code": 400, "message": "The required revision ID 'rev-anchor' does not match the latest revision."}})))
                 .expect(1).mount(&server).await;
             let mut opts = replace_opts(false);
             opts.payload = payload.clone();
@@ -2178,6 +2179,70 @@ mod tests {
                     .result,
                 WriteResult::StaleRevision { .. }
             ));
+        }
+    }
+    #[tokio::test]
+    async fn anchored_edits_send_the_child_tab_and_cross_paragraph_range() {
+        for payload in [
+            WritePayload::Insert {
+                anchor: "needle".into(),
+                side: Side::After,
+                text: "text".into(),
+                match_case: true,
+            },
+            WritePayload::Delete {
+                from: "first".into(),
+                to: Some("needle".into()),
+                match_case: true,
+            },
+        ] {
+            let server = MockServer::start().await;
+            let (drive, docs) = clients(&server).await;
+            mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+                .mount(&server)
+                .await;
+            mount_folder("folder-1").mount(&server).await;
+            Mock::given(method("GET")).and(path("/v1/documents/doc-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "revisionId": "tab-revision", "tabs": [{
+                        "tabProperties": {"tabId": "parent"}, "childTabs": [{
+                            "tabProperties": {"tabId": "child"}, "documentTab": {"body": {"content": [
+                                {"startIndex": 1, "endIndex": 7, "paragraph": {"elements": [{"startIndex": 1, "endIndex": 7, "textRun": {"content": "first\n"}}]}},
+                                {"startIndex": 7, "endIndex": 17, "paragraph": {"elements": [{"startIndex": 7, "endIndex": 17, "textRun": {"content": "😀 needle\n"}}]}}
+                            ]}}
+                        }]
+                    }]
+                }))).mount(&server).await;
+            mount_batch_update(serde_json::json!({"replies": [{}]}))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut opts = replace_opts(false);
+            opts.payload = payload.clone();
+            let outcome = write(&drive, &docs, &opts, &[rule_for(&payload)]).await;
+            let edit = match outcome.result {
+                WriteResult::Inserted { edit } | WriteResult::Deleted { edit } => edit,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(edit.tab_id.as_deref(), Some("child"));
+            let requests = server.received_requests().await.unwrap();
+            let batch = requests
+                .iter()
+                .find(|r| r.url.path().ends_with(":batchUpdate"))
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+            if payload.verb() == WriteVerb::Insert {
+                assert_eq!(
+                    body["requests"][0]["insertText"]["location"],
+                    serde_json::json!({"index": 16, "tabId": "child"})
+                );
+            } else {
+                assert_eq!((edit.chars, edit.bytes, edit.paragraphs), (14, 17, 2));
+                assert_eq!(
+                    body["requests"][0]["deleteContentRange"]["range"],
+                    serde_json::json!({"startIndex": 1, "endIndex": 16, "tabId": "child"})
+                );
+            }
         }
     }
 }

@@ -4136,13 +4136,17 @@ The resolver searches all tab bodies and table cells, including child tabs.
 An anchor may span adjacent formatting runs within one paragraph, but cannot
 span paragraph breaks, images or other inline objects. A deletion range may
 span ordinary paragraphs, but cannot cross table/cell boundaries, structural
-elements, non-text content or pending insertion/deletion suggestions. The last
-newline of a body or cell, and newlines immediately before structural elements,
+elements, non-text inline content or pending insertion/deletion suggestions.
+The last newline of a body or cell, and newlines immediately before structural elements,
 are preserved. Headers, footers, footnotes and tables of contents are outside
-this surface; their text does not participate in uniqueness checks.
+this surface; their text does not participate in uniqueness checks. As the Docs
+API merges paragraphs, a cross-paragraph deletion can also affect paragraph
+styles, lists, positioned objects and bookmarks attached to those paragraphs.
 
 Dry runs and successful outcomes report the same resolved UTF-16 range (empty
 for insertion), tab, paragraph count, Unicode scalar count and UTF-8 byte count.
+Insertion counts exclude the control and BMP private-use characters that the
+Docs API strips; input with nothing remaining is refused before any request.
 Indices come from the invocation's own inline document snapshot, whose revision
 is required by the write. There is no numeric `--index` flag or automatic retry
 against a newer revision. Missing or inconsistent index metadata, no match,
