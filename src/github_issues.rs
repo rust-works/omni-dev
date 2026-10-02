@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -525,6 +526,35 @@ fn build_state_query(refs: &[ItemRef]) -> Option<(String, QueryIndex)> {
     build_aliased_query(refs, state_fragment)
 }
 
+/// Minimal timestamp selection for either item type. The aliases key replies.
+fn updated_at_fragment(alias: &str, number: u64) -> String {
+    format!(
+        r"{alias}: issueOrPullRequest(number:{number}){{
+      ... on Issue {{ updatedAt }}
+      ... on PullRequest {{ updatedAt }}
+    }}"
+    )
+}
+
+fn build_updated_at_query(refs: &[ItemRef]) -> Option<(String, QueryIndex)> {
+    build_aliased_query(refs, updated_at_fragment)
+}
+
+fn parse_updated_at_response(
+    body: &Value,
+    index: &QueryIndex,
+) -> Result<HashMap<(String, u64), Option<DateTime<Utc>>>> {
+    parse_aliased_response(body, index, |item_ref, node| {
+        let timestamp = node
+            .get("updatedAt")
+            .and_then(Value::as_str)
+            .with_context(|| format!("item {item_ref}: response had no string `updatedAt`"))?;
+        DateTime::parse_from_rfc3339(timestamp)
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .with_context(|| format!("item {item_ref}: invalid `updatedAt` {timestamp:?}"))
+    })
+}
+
 /// Builds the single aliased query for every ref, grouped by project so each
 /// repository appears once, resolving each ref with `fragment`. Returns `None`
 /// for an empty slice.
@@ -758,6 +788,28 @@ pub fn fetch_items(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<IssueDoc>>
 /// **Blocking.**
 pub fn fetch_states(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<ItemState>>> {
     fetch_aliased(bin, refs, build_state_query, parse_state_response)
+}
+
+/// Fetches only GitHub's `updatedAt` for each issue or pull request.
+///
+/// Returns one timestamp per ref in caller order (including duplicates), or
+/// `None` for an item or repository GitHub cannot find. Empty input makes no
+/// request. Uses the same repository aliases and bounded batches as [`fetch_items`].
+/// Other GraphQL, transport, and malformed timestamp errors fail the call.
+/// **Blocking** — callers must be on a blocking thread.
+///
+/// A caller can retain this timestamp alongside a fetched document, then
+/// compare for equality on a later check. Fetch full data with [`fetch_issues`]
+/// or [`fetch_items`] when the timestamp differs (in either direction) or no
+/// baseline exists. Neither `None` nor a failed check certifies a cached copy
+/// as fresh. The shallow and full requests are separate, not an atomic snapshot.
+/// This helper does not renew [`IssueCache`] entries itself.
+///
+/// This checks issue-level edits, including state, labels and new comments.
+/// Projects-v2 board/column changes live on `ProjectV2Item` and do **not** bump
+/// the issue's `updatedAt`: this check cannot establish board-state freshness.
+pub fn fetch_updated_at(bin: &Path, refs: &[ItemRef]) -> Result<Vec<Option<DateTime<Utc>>>> {
+    fetch_aliased(bin, refs, build_updated_at_query, parse_updated_at_response)
 }
 
 /// One reply's parsed items, keyed by `(project, number)`.
@@ -1907,6 +1959,137 @@ mod tests {
             closed_by: Vec::new(),
             url: "u".to_string(),
         }
+    }
+
+    // ── updatedAt recheck (#1815) ───────────────────────────────────
+
+    #[test]
+    fn updated_at_query_groups_repositories_and_selects_only_timestamps() {
+        assert!(build_updated_at_query(&[]).is_none());
+        let (query, index) =
+            build_updated_at_query(&[item_ref("a/b", 1), item_ref("c/d", 2), item_ref("a/b", 3)])
+                .unwrap();
+        assert_eq!(index.len(), 3);
+        let expected = r#"query{
+r0: repository(owner:"a", name:"b"){
+i0: issueOrPullRequest(number:1){
+      ... on Issue { updatedAt }
+      ... on PullRequest { updatedAt }
+    }
+i1: issueOrPullRequest(number:3){
+      ... on Issue { updatedAt }
+      ... on PullRequest { updatedAt }
+    }
+}
+r1: repository(owner:"c", name:"d"){
+i0: issueOrPullRequest(number:2){
+      ... on Issue { updatedAt }
+      ... on PullRequest { updatedAt }
+    }
+}
+}"#;
+        assert_eq!(query, expected);
+        assert_eq!(index[&(0, 1)].number, 3);
+        assert_eq!(index[&(1, 0)].project, "c/d");
+    }
+
+    #[test]
+    fn fetch_updated_at_preserves_order_duplicates_and_normalizes_offsets() {
+        assert!(fetch_updated_at(Path::new("/no/such/gh"), &[])
+            .unwrap()
+            .is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let reply = serde_json::json!({"data": {
+            "r0": {"i0": {"updatedAt": "2026-10-02T10:00:00+10:00"}},
+            "r1": {"i0": {"updatedAt": "2026-10-01T00:00:00Z"},
+                   "i1": {"updatedAt": "2026-10-01T00:00:00Z"}}
+        }})
+        .to_string();
+        let (bin, _shim) = fake_gh(dir.path(), &reply, 0);
+        let mut pr = item_ref("a/b", 2);
+        pr.kind = ItemKind::ChangeRequest;
+        let refs = [item_ref("c/d", 1), pr, item_ref("c/d", 1)];
+        let stamps = retry_on_etxtbsy(|| fetch_updated_at(&bin, &refs)).unwrap();
+        let utc = |s: &str| Some(DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc));
+        assert_eq!(
+            stamps,
+            [
+                utc("2026-10-01T00:00:00Z"),
+                utc("2026-10-02T00:00:00Z"),
+                utc("2026-10-01T00:00:00Z")
+            ]
+        );
+    }
+
+    #[test]
+    fn updated_at_parser_rejects_invalid_timestamps_with_item_context() {
+        let (_, index) = build_updated_at_query(&[item_ref("a/b", 42)]).unwrap();
+        for node in [
+            serde_json::json!({}),
+            serde_json::json!({"updatedAt": null}),
+            serde_json::json!({"updatedAt": 123}),
+            serde_json::json!({"updatedAt": "yesterday"}),
+        ] {
+            let err = parse_updated_at_response(
+                &serde_json::json!({"data": {"r0": {"i0": node}}}),
+                &index,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("a/b#42"), "{err}");
+            assert!(err.to_string().contains("updatedAt"), "{err}");
+        }
+    }
+
+    #[test]
+    fn updated_at_parser_handles_missing_items_repositories_and_errors() {
+        let (_, index) = build_updated_at_query(&[item_ref("a/b", 1)]).unwrap();
+        for path in [serde_json::json!(["r0", "i0"]), serde_json::json!(["r0"])] {
+            let body = serde_json::json!({"data": {"r0": null}, "errors": [{"type": "NOT_FOUND", "path": path}]});
+            assert_eq!(
+                parse_updated_at_response(&body, &index).unwrap()[&("a/b".to_string(), 1)],
+                None
+            );
+        }
+        let null = serde_json::json!({"data": {"r0": {"i0": null}}});
+        assert_eq!(
+            parse_updated_at_response(&null, &index).unwrap()[&("a/b".to_string(), 1)],
+            None
+        );
+        for error in [
+            serde_json::json!({"type": "RATE_LIMITED", "message": "slow down"}),
+            serde_json::json!({"type": "NOT_FOUND", "path": ["r9"]}),
+        ] {
+            assert!(parse_updated_at_response(
+                &serde_json::json!({"data": {}, "errors": [error]}),
+                &index
+            )
+            .is_err());
+        }
+        assert!(parse_updated_at_response(&serde_json::json!({}), &index).is_err());
+    }
+
+    #[test]
+    fn fetch_updated_at_chunks_requests_and_propagates_subprocess_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let nodes: serde_json::Map<String, Value> = (0..MAX_ISSUES_PER_QUERY)
+            .map(|i| {
+                (
+                    format!("i{i}"),
+                    serde_json::json!({"updatedAt": "2026-10-01T00:00:00Z"}),
+                )
+            })
+            .collect();
+        let reply = serde_json::json!({"data": {"r0": nodes}}).to_string();
+        let refs: Vec<_> = (1..=26).map(|n| item_ref("a/b", n)).collect();
+        {
+            let (bin, _shim) = counting_gh(dir.path(), &reply, 0);
+            let stamps = retry_on_etxtbsy(|| fetch_updated_at(&bin, &refs)).unwrap();
+            assert_eq!(stamps.len(), refs.len());
+            assert!(stamps.iter().all(Option::is_some));
+            assert_eq!(gh_calls(dir.path()), 2);
+        }
+        let (bin, _shim) = fake_gh(dir.path(), "unavailable", 1);
+        assert!(retry_on_etxtbsy(|| fetch_updated_at(&bin, &refs)).is_err());
     }
 
     // ── state recheck (#2041) ────────────────────────────────────────
