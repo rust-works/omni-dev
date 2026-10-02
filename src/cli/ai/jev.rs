@@ -3,13 +3,15 @@
 //! Wraps [`crate::jev::client::JevClient`]'s single `system_one` call behind
 //! four subcommands: `choice`, `score`, `noul` (single-question) and `ask`
 //! (multi-question, from a file), plus `route`, which asks the stage questions
-//! of [`crate::jev::route`] about GitHub issues, and `verify-decision`, which
+//! of [`crate::jev::route`] about GitHub issues, `exists`, which retrieves local
+//! signatures for existence screening, and `verify-decision`, which
 //! checks a decision comment against the sources it cites
 //! ([`crate::jev::verify`]). See `docs/jev.md` for the operator guide.
 
 mod ask;
 mod choice;
 mod common;
+mod exists;
 mod noul;
 mod route;
 mod score;
@@ -24,7 +26,7 @@ use clap::{Parser, Subcommand};
     long_about = "TypeSafe Jev typed judgments (choice, score, yes/no).\n\nJev is a \
 separate typed-judgment API, not a chat model, so most jev subcommands do **not** accept \
 the AI backend flags (`--ai-backend`, `--model`, `--claude-cli-*`, ...) — passing any \
-of them is a clap error on those leaves. `route` and `verify-decision` are the two \
+of them is a clap error on those leaves. `route`, `exists` and `verify-decision` are the three \
 exceptions to `-C/--repo`, and `verify-decision` is the one subcommand that also accepts \
 the AI backend flags, since it uses an AI backend to split a decision comment into \
 statements before checking them with Jev. An exported `OMNI_DEV_MODEL` is silently ignored \
@@ -49,6 +51,8 @@ pub enum JevSubcommands {
     Ask(ask::AskCommand),
     /// Routes issues to model classes for their design, implement and review stages.
     Route(route::RouteCommand),
+    /// Screens local Rust signatures for work an issue proposes writing.
+    Exists(exists::ExistsCommand),
     /// Checks a decision comment against the issues or pull requests it cites.
     VerifyDecision(verify_decision::VerifyDecisionCommand),
 }
@@ -62,6 +66,7 @@ impl JevCommand {
             JevSubcommands::Noul(cmd) => cmd.execute().await,
             JevSubcommands::Ask(cmd) => cmd.execute().await,
             JevSubcommands::Route(cmd) => cmd.execute().await,
+            JevSubcommands::Exists(cmd) => cmd.execute().await,
             JevSubcommands::VerifyDecision(cmd) => cmd.execute().await,
         }
     }

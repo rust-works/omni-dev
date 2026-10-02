@@ -1,0 +1,14 @@
+{
+  "number": 3017,
+  "labeling_order": "Before the first dry-run or live Jev result; after implementation, using source inspection of pinned current HEAD",
+  "author": "Codex implementation agent (not an independent blinded evaluator)",
+  "source_revision": "1ebdda39729110ab0d513b35a990d0d170c1fbf6",
+  "operation": "Read-only recursive traversal of computed destructuring pattern keys, including expression predicates",
+  "known_positive_definitions": [
+    {"path": "src/jq/walk.rs", "symbol": "any_pattern_key", "line": 765, "basis": "Its documented read-only pattern-key traversal recurses through nested object and array patterns."},
+    {"path": "src/jq/walk.rs", "symbol": "any_subexpr", "line": 1126, "basis": "At this post-fix HEAD the predicate walker delegates to the corrected exhaustive search traversal."},
+    {"path": "src/jq/walk.rs", "symbol": "search_subexpr", "line": 1158, "basis": "At this post-fix HEAD the search traversal visits computed keys in destructuring patterns."}
+  ],
+  "outside_scope": ["Executing the decisive oracle probe", "Discovering the Vec double-push trap from function bodies"],
+  "scope_caveat": "This diagnostic does not measure historical pre-fix behavior or held-out precision. Other candidates need separate adjudication; this is a known-positive retrieval probe, not exhaustive ground truth."
+}
