@@ -21,7 +21,11 @@ The pair uses the fetched current body, before and after the first triage
 comment; it excludes the later implementation plan. Historical body revisions
 have not been verified, so it is explicitly a reconstruction, not a claimed
 historical snapshot. Each input records provenance. The synthetic controls are
-sanity checks, not held-out public issue evidence.
+sanity checks, not held-out public issue evidence. This harness isolates class
+questions: effort advice and citation `noul` questions are omitted in both
+variants. It measures effects on stage/class answers in that mode, not every
+possible production request shape. All states are used verbatim; prepare frozen
+states using the production input cap when evaluating longer issues.
 
 ## Reproduce
 
