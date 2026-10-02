@@ -4,7 +4,7 @@ omni-dev exposes access to the Google Drive v3 API through the `omni-dev
 drive` command tree — search, read a file's metadata or content, find
 duplicates, rename a file, move it between folders, and create/upload/edit
 file content. `drive.readonly` (the default scope) is enough for
-search/read/dedupe; rename/move need the opt-in `drive.metadata` scope
+search/read/dedupe/sync; rename/move need the opt-in `drive.metadata` scope
 (`drive auth login --write`), the narrowest write scope Google offers — it
 covers `files.update` on `name`/`parents` only, with no file-content access
 at all. Content mutation needs a broader grant still: `--write-file`
@@ -52,18 +52,19 @@ walkthrough — this page is the topic-by-topic reference.
 5. [Search](#search)
 6. [Read](#read)
 7. [Duplicate detection](#duplicate-detection)
-8. [Rename](#rename)
-9. [Move](#move)
-10. [Write permissions](#write-permissions)
-11. [Create](#create)
-12. [Upload](#upload)
-13. [Edit](#edit)
-14. [Lease](#lease)
-15. [Sheets](#sheets)
-16. [Docs](#docs)
-17. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
-18. [Troubleshooting](#troubleshooting)
-19. [See also](#see-also)
+8. [Sync](#sync)
+9. [Rename](#rename)
+10. [Move](#move)
+11. [Write permissions](#write-permissions)
+12. [Create](#create)
+13. [Upload](#upload)
+14. [Edit](#edit)
+15. [Lease](#lease)
+16. [Sheets](#sheets)
+17. [Docs](#docs)
+18. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
+19. [Troubleshooting](#troubleshooting)
+20. [See also](#see-also)
 
 ## Prerequisites
 
@@ -555,6 +556,67 @@ Table output columns: `HASH | COUNT | FILES`, with `FILES` a comma-joined
 
 Grouping is currently fixed to `md5Checksum` — there's no `--by` flag to
 choose `sha1Checksum`/`sha256Checksum` instead.
+
+## Sync
+
+```bash
+omni-dev drive sync FOLDER_ID --dest ./reference-docs
+omni-dev drive sync FOLDER_ID --dest ./reference-docs --dry-run -o json
+omni-dev drive sync FOLDER_ID --dest ./reference-docs --verify
+omni-dev drive sync FOLDER_ID --dest ./pdf-copies --export-mime-type application/pdf
+```
+
+`sync` recursively mirrors one Drive folder's children into a local directory.
+It uses only `drive.readonly`; no Drive content or metadata is changed. The
+positional argument is a folder ID, rather than a search query. Shortcuts are
+skipped, cycles and repeated IDs are visited once, and trashed items are excluded.
+An incomplete listing, listing failure, or a folder reaching the 10,000-item
+listing cap aborts discovery before local writes.
+
+The first run requires an empty (or nonexistent) destination. Later runs use
+`<DIR>/.omni-dev-sync.json`; keep that file with the mirror. A different root,
+unsupported manifest version, or invalid path in the manifest is refused.
+The version-1 JSON records the root folder ID and a `files` map keyed by Drive
+ID, including folders. Entries contain `rel_path`, `remote_name`, `mime_type`,
+`export_mime_type`, `modified_time`, `md5`, `sha256`, and `size`.
+`orphan_paths` reserves old paths left behind by renames and export changes.
+Files and the manifest are replaced atomically; the manifest is checkpointed
+after each successful item so completed work survives an interrupted run.
+
+Unchanged binaries are skipped when their MD5 matches the manifest (falling back
+to a present `modifiedTime` when MD5 is absent). Native exports use a present
+`modifiedTime` and matching export MIME. Path or MIME changes, missing local
+files, and absent change markers trigger a download. This trusts the manifest
+and does not hash local content by default. `--verify` checks both newly
+downloaded and skipped binary bytes against Drive's SHA-256; missing checksums
+or mismatches fail that file. Native exports have no Drive checksum and continue
+without verification. Defaults match `drive read --content`: Docs → `.md`,
+Sheets → `.csv` (**first sheet only**), Slides → `.txt`. An explicit export MIME
+applies to every native file; unsupported native types without one fail individually.
+Binary downloads retain the 500 MiB cap; native exports retain Drive's 10 MB cap.
+
+Remote names are sanitized into portable, bounded path segments. Unsafe and
+empty names get safe replacements. Native exports receive an extension matching
+the export MIME (unknown MIME types use `.export`). Sibling collisions, including
+case differences, receive numeric suffixes in Drive-ID order. The manifest name
+and all historical paths are reserved. New collisions do not displace existing
+owners. A local file without ownership in the manifest is never overwritten;
+pre-existing symlinks in the destination or output paths are refused.
+
+**One-way mirror:** local changes to owned files can be overwritten when Drive
+changes. Remote removals, moves, renames and export changes leave old local copies
+in place and report them as `orphaned`. Nothing is deleted, and nothing is uploaded.
+Use a destination dedicated to this mirror and serialize sync runs; do not modify
+the destination concurrently. Symlink checks protect against pre-existing links,
+not a hostile process swapping filesystem paths while a run is in progress.
+
+The report lists `created`, `updated`, `skipped`, `failed` and `orphaned` items and
+totals, in the usual table/JSON/YAML formats. Individual failures do not stop
+other downloads; the command prints the report and exits non-zero if any item
+failed. `--dry-run` reports planned create/update counts without downloading
+content or writing directories/files/manifest. With `--verify` it may read and
+check existing binary copies. Downloads are sequential and reuse client retries.
+Query mode, pruning, concurrent downloads and an MCP sync tool are follow-ups.
 
 ## Rename
 
@@ -4051,6 +4113,14 @@ invocation.
 [Drive's error-handling guide]: https://developers.google.com/workspace/drive/api/guides/handle-errors
 
 ## Troubleshooting
+
+### Sync destination refused
+
+If sync reports “manifest belongs to a different Drive folder”, choose a separate
+`--dest` for that root. If the destination is non-empty without a manifest, use an
+empty directory; do not fabricate a manifest to claim unrelated files. Resolve
+symlink/path errors without pointing the mirror at unrelated local content.
+
 
 ### Credentials not configured
 

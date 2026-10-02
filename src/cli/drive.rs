@@ -17,6 +17,7 @@ pub(crate) mod read;
 pub(crate) mod rename;
 pub(crate) mod search;
 pub(crate) mod sheets;
+pub(crate) mod sync;
 pub(crate) mod upload;
 
 use anyhow::Result;
@@ -25,7 +26,7 @@ use clap::{Parser, Subcommand};
 use crate::drive::account::DRIVE_ACCOUNT_ENV;
 use crate::drive::client::DriveClient;
 
-/// Drive: search, read, rename, and move Google Drive files via OAuth2.
+/// Drive: search, read, sync, rename, and move Google Drive files via OAuth2.
 #[derive(Parser)]
 pub struct DriveCommand {
     /// Selects a named Drive account configured in
@@ -59,6 +60,8 @@ pub enum DriveSubcommands {
     Read(read::ReadCommand),
     /// Finds Drive files sharing the same content hash.
     Dedupe(dedupe::DedupeCommand),
+    /// Mirrors a Drive folder recursively to local disk (one-way, read-only scope).
+    Sync(sync::SyncCommand),
     /// Creates a new file or folder, gated by the folder write-permission
     /// rules (issue #1574). Requires the `drive.file` or `drive` scope
     /// (`drive auth login --write-file`/`--write-full`).
@@ -159,6 +162,7 @@ impl DriveSubcommands {
             Self::Search(cmd) => cmd.execute(client).await,
             Self::Read(cmd) => cmd.execute(client).await,
             Self::Dedupe(cmd) => cmd.execute(client).await,
+            Self::Sync(cmd) => cmd.execute(client).await,
             Self::Create(cmd) => cmd.execute(client).await,
             Self::Upload(cmd) => cmd.execute(client).await,
             Self::Edit(cmd) => cmd.execute(client).await,
@@ -1816,6 +1820,46 @@ mod tests {
             output: OutputFormat::Table,
         });
         assert!(cmd.dispatch(&dead_client()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = DriveSubcommands::Sync(sync::SyncCommand {
+            folder_id: "root".into(),
+            dest: dir.path().into(),
+            export_mime_type: None,
+            verify: false,
+            dry_run: true,
+            output: OutputFormat::Json,
+        });
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn sync_parser_requires_destination_and_accepts_options() {
+        use clap::Parser;
+        assert!(DriveCommand::try_parse_from(["drive", "sync", "root"]).is_err());
+        let cmd = DriveCommand::try_parse_from([
+            "drive",
+            "sync",
+            "root",
+            "--dest",
+            "mirror",
+            "--verify",
+            "--dry-run",
+            "--export-mime-type",
+            "application/pdf",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        let DriveSubcommands::Sync(sync) = cmd.command else {
+            panic!("expected sync");
+        };
+        assert!(sync.verify && sync.dry_run);
+        assert_eq!(sync.export_mime_type.as_deref(), Some("application/pdf"));
     }
 
     #[tokio::test]
