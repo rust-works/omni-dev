@@ -399,7 +399,10 @@ fn validate_ladder_name(name: &str) -> Result<()> {
 /// `--ladder-definition` never referenced by `--ladders` is an error, since
 /// that is more likely a typo'd `--ladders` entry than an intentionally
 /// unused definition.
-fn build_ladders(ladders: &[String], definitions: &[(String, PathBuf)]) -> Result<Vec<Ladder>> {
+pub(crate) fn build_ladders(
+    ladders: &[String],
+    definitions: &[(String, PathBuf)],
+) -> Result<Vec<Ladder>> {
     let mut custom: BTreeMap<&str, &Path> = BTreeMap::new();
     for (name, path) in definitions {
         validate_ladder_name(name)?;
@@ -458,7 +461,7 @@ fn failure_summary(report: &RouteReport) -> Option<String> {
 /// citations are not resolved, since the engine will skip it (#2000).
 /// **Blocking.**
 #[allow(clippy::too_many_arguments)]
-fn fetch_docs(
+pub(crate) fn fetch_docs(
     bin: &Path,
     cache: &IssueCache,
     cwd: &Path,

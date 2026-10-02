@@ -1205,6 +1205,8 @@ async fn list_tools_includes_phase_3_tools() -> Result<()> {
     let names: Vec<_> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
     for expected in [
         "ai_chat",
+        "jev_route",
+        "jev_verify_decision",
         "claude_skills_sync",
         "claude_skills_clean",
         "claude_skills_status",
@@ -2932,6 +2934,44 @@ async fn drive_write_tools_round_trip_and_reject_policy_parameters() -> Result<(
             message.contains("unknown field") && message.contains("allow_headless"),
             "{name}: {message}"
         );
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn jev_tools_publish_schemas_and_reject_invalid_requests() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let tools = client.list_tools(None).await?;
+    for (name, field) in [("jev_route", "issues"), ("jev_verify_decision", "issue")] {
+        let tool = tools
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .expect("Jev tool");
+        assert!(tool.input_schema["properties"].get(field).is_some());
+    }
+    for (name, arguments, diagnostic) in [
+        (
+            "jev_route",
+            serde_json::json!({"issues":["#1"],"all_open":true}),
+            "exclusively",
+        ),
+        (
+            "jev_verify_decision",
+            serde_json::json!({"issue":"#1","threshold":-1}),
+            "threshold",
+        ),
+    ] {
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new(name)
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            )
+            .await;
+        let error = response.expect_err("invalid parameters must fail before remote work");
+        assert!(error.to_string().contains(diagnostic), "{error}");
     }
     client.cancel().await?;
     let _ = server_handle.await;

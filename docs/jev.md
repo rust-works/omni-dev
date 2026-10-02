@@ -1765,3 +1765,50 @@ that part is expected: see the footgun note above.
   [How to build with System One](https://docs.typesafe.ai/concepts/how-to-build-with-system-one),
   [Jev 1.13 jaggedness](https://docs.typesafe.ai/model-jaggedness/jev-1.13)
   (its known weak spots) and [Models](https://docs.typesafe.ai/models) (limits).
+
+## MCP tools
+
+The `mcp` feature exposes `jev_route` and `jev_verify_decision`, using the same
+fetching, questions, engines and verdict rules as the CLI. Both return JSON by
+default; set `output` to `"yaml"` for YAML. Reports retain model identifiers,
+token usage and `github_cache` metadata when cached items were reused. Set
+`refresh: true` to fetch fresh GitHub input.
+
+For example, call `jev_route` with:
+
+```json
+{"issues": ["rust-works/omni-dev#1779"], "ladders": ["anthropic", "openai"], "effort_advice": true}
+```
+
+Supply `issues` or `all_open: true`, exclusively. `repo` names a local repository
+directory for bare references and `all_open`; it defaults to the server's working
+directory. `ladders` defaults to `["anthropic"]`. Custom ladders use
+`ladder_definition: [{"name": "custom", "path": "/path/to/tiers.yaml"}]` and
+must also appear in `ladders`. `draft_comment` accepts local UTF-8 file paths
+for a single issue preview; no comment is posted. `close_call` (0.3),
+`close_call_margin` (0.2), `max_input_chars` (60000), `allow_closed` and
+`ignore_closed` have the CLI's meanings and defaults. The two closed-issue
+policies are mutually exclusive. Routing returns partial results with
+`isError: true` if an individual issue fails; authentication/setup failures
+return an MCP error.
+
+Call `jev_verify_decision` with:
+
+```json
+{"issue": "rust-works/omni-dev#1779", "comment": "latest", "threshold": 0.5, "reject_below": 0.3, "coverage_threshold": 0.5}
+```
+
+`comment` defaults to `latest`, the most recent comment citing another item;
+it also accepts a numeric comment ID or an issue-comment URL. `repo`, `refresh`
+and `max_input_chars` work as above. Verdicts `accepted`, `rejected` and
+`needs_review` are successful tool results: they are judgment data, not server
+failures. Low coverage alone means `needs_review`. This checks fidelity to cited
+sources; it does not judge whether a decision is appropriate.
+
+Configure GitHub (`gh`), Jev credentials and the splitter AI backend in the MCP
+server environment/settings as for the CLI. Both tools accept `jev_model` for
+Jev calls. Verification additionally accepts `model` for its AI splitter;
+backend selection stays in server configuration. The splitter model defaults to
+`settings.mcp.default_model`, then the backend default. Request overrides do not
+change process environment or working directory. The MCP tools do not expose
+CLI backend/sandbox escape-hatch flags or human text output.
