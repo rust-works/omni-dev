@@ -553,6 +553,31 @@ mod tests {
         assert!(cmd.dispatch(&dead_client()).await.is_ok());
     }
 
+    /// Like the Docs write verbs, trash and untrash report a refusal or an
+    /// unreachable API through their **output** and exit 0, so `is_ok()` is
+    /// the routing proof here. `--dry-run` plus a cleared credential store
+    /// (no rules, so the default policy refuses) keeps it from mutating
+    /// anything even if the dead port were somehow live.
+    #[tokio::test]
+    async fn dispatch_routes_trash_and_untrash() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let leaf = || trash::TrashCommand {
+            file_id: "file-1".to_string(),
+            dry_run: true,
+            output: OutputFormat::Table,
+        };
+        assert!(DriveSubcommands::Trash(leaf())
+            .dispatch(&dead_client())
+            .await
+            .is_ok());
+        assert!(DriveSubcommands::Untrash(leaf())
+            .dispatch(&dead_client())
+            .await
+            .is_ok());
+    }
+
     #[tokio::test]
     async fn dispatch_routes_sheets_info() {
         // Unlike every other routing test, this one needs an env guard: a
