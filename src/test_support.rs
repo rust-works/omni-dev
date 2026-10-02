@@ -696,3 +696,40 @@ pub(crate) mod shim {
         }
     }
 }
+
+pub(crate) mod git_repo {
+    //! A throwaway git repository with one commit, for tests that read `HEAD`.
+    use std::process::Command;
+
+    /// Creates a repository whose single commit holds `files` (path, bytes).
+    ///
+    /// Bytes rather than `&str` so a test can commit a non-UTF-8 file.
+    pub(crate) fn commit_files(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stderr}");
+        };
+        run(&["init", "-q"]);
+        for (path, bytes) in files {
+            std::fs::write(dir.path().join(path), bytes).unwrap();
+        }
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-qm",
+            "test: fixture",
+        ]);
+        dir
+    }
+}

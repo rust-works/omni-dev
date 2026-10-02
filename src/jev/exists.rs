@@ -187,7 +187,7 @@ fn git(repo: &Path, args: &[&str], cap: usize, allow_no_hits: bool) -> Result<(V
     if overflow {
         // Best-effort cleanup: git may already have exited after filling the pipe.
         if let Err(error) = child.kill() {
-            tracing::debug!("git retrieval cleanup: {error}");
+            tracing::debug!("git retrieval cleanup: {error}"); // omni-dev: coverage ignore-line reason="Child::kill returns Ok for a child that has exited but not been reaped, and wait() only runs after this call, so only an OS-level failure such as EPERM reaches this arm; it exists so that failure is logged rather than silently dropped"
         }
         bytes.truncate(cap);
     }
@@ -550,35 +550,11 @@ mod tests {
     use super::*;
 
     fn fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let run = |args: &[&str]| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        run(&["init", "-q"]);
-        for (path, source) in files {
-            std::fs::write(dir.path().join(path), source).unwrap();
-        }
-        run(&["add", "."]);
-        run(&[
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.com",
-            "commit",
-            "-qm",
-            "test: fixture",
-        ]);
-        dir
+        let files: Vec<_> = files
+            .iter()
+            .map(|(path, source)| (*path, source.as_bytes()))
+            .collect();
+        crate::test_support::git_repo::commit_files(&files)
     }
 
     #[test]
@@ -765,6 +741,123 @@ mod tests {
         assert_eq!(bytes.len(), 2);
         result.issue = "x".repeat(MAX_STATE_BYTES + 1);
         assert!(build_request(&result, "m").is_err());
+    }
+
+    #[test]
+    fn clipping_never_splits_a_character() {
+        assert_eq!(clipped("aé", 3), "aé");
+        assert_eq!(clipped("aé", 2), "a");
+        assert_eq!(clipped("é", 1), "");
+    }
+
+    #[test]
+    fn only_a_matching_bare_run_closes_a_fence() {
+        // A different marker, or a closing run carrying text, stays inside the fence.
+        assert_eq!(
+            extract_identifiers("```\n~~~\n`hidden`\n``` text\n`also_hidden`\n```\n`real`"),
+            ["real"]
+        );
+    }
+
+    #[test]
+    fn oversized_signatures_are_skipped_not_truncated() {
+        let params = (0..200)
+            .map(|n| format!("argument_{n}: u32"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!("fn caller({params}) {{}}\nfn adjacent() {{}}\n");
+        let dir = fixture(&[("a.rs", &source)]);
+        let result = retrieve(dir.path(), "`caller`").unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].symbol, "adjacent");
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w == "skipped oversized signature: a.rs:1"));
+    }
+
+    #[test]
+    fn only_literal_doc_comments_are_retained() {
+        let source = "#[inline]\n#[doc(hidden)]\n#[doc = include_str!(\"a.md\")]\n#[doc = 5]\n#[doc = \"literal\"]\nfn caller() {}";
+        let dir = fixture(&[("a.rs", source)]);
+        let result = retrieve(dir.path(), "`caller`").unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].doc_comments, "literal");
+    }
+
+    #[test]
+    fn a_capped_grep_listing_is_reported_and_its_cut_entry_dropped() {
+        // Each entry is `<sha>:fNN.rs\0`, so the first listing's cap lands mid-entry.
+        let files: Vec<_> = (0..60)
+            .map(|n| (format!("f{n:02}.rs"), "fn caller() {}".to_owned()))
+            .collect();
+        let refs: Vec<_> = files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let dir = fixture(&refs);
+        let result = retrieve(dir.path(), "`caller`").unwrap();
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w == "grep output cap reached"));
+        assert!(!result.candidates.is_empty());
+        assert!(result
+            .candidates
+            .iter()
+            .all(|c| c.path.starts_with('f') && c.path.ends_with(".rs") && c.path.len() == 6));
+    }
+
+    #[test]
+    fn a_failing_grep_is_an_error_not_an_empty_listing() {
+        let dir = fixture(&[("a.rs", "fn caller() {}")]);
+        let mut warnings = Vec::new();
+        let result = matching_paths(
+            dir.path(),
+            "no-such-revision",
+            &["caller".into()],
+            &mut warnings,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn skips_non_utf8_files() {
+        let dir = crate::test_support::git_repo::commit_files(&[
+            ("bad.rs", b"fn caller() {}\n// \xff\n"),
+            ("good.rs", b"fn caller() {}\n"),
+        ]);
+        let result = retrieve(dir.path(), "`caller`").unwrap();
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w == "skipped non-UTF-8 file: bad.rs"));
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].path, "good.rs");
+    }
+
+    #[test]
+    fn candidates_are_dropped_until_the_serialized_state_fits() {
+        // JSON escapes every quote, so each doc comment roughly doubles in the state.
+        let quotes = "\"".repeat(MAX_SNIPPET_BYTES);
+        let mut source = String::new();
+        for n in 0..MAX_CANDIDATES {
+            source.push_str(&format!("/// {quotes}\nfn caller{n}() {{ caller(); }}\n"));
+        }
+        let dir = fixture(&[("a.rs", &source)]);
+        let result = retrieve(dir.path(), "`caller`").unwrap();
+        assert_eq!(result.status, "ready");
+        assert!(!result.candidates.is_empty());
+        assert!(result.candidates.len() < MAX_CANDIDATES);
+        assert_eq!(
+            result
+                .warnings
+                .iter()
+                .filter(|w| *w == "state cap reached")
+                .count(),
+            1
+        );
+        assert!(build_request(&result, "m").is_ok());
     }
 
     #[tokio::test]
