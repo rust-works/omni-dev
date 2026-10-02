@@ -78,3 +78,29 @@ pub(crate) use common::{format_output_with_cache, JevFormat};
 pub(crate) use route::{build_ladders, fetch_docs};
 #[cfg(feature = "mcp")]
 pub(crate) use verify_decision::fetch_input;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exists_runs_through_the_group_dispatch() {
+        // A dry run needs neither credentials nor a network, so the real
+        // `execute` shell (process environment, stdout) is safe to drive.
+        let dir = crate::test_support::git_repo::commit_files(&[("walk.rs", b"fn caller() {}\n")]);
+        let issue = dir.path().join("issue.txt");
+        std::fs::write(&issue, "Reuse `caller`.").unwrap();
+        let command = JevCommand::try_parse_from([
+            "jev",
+            "exists",
+            "--issue-file",
+            issue.to_str().unwrap(),
+            "-C",
+            dir.path().to_str().unwrap(),
+            "--dry-run",
+        ])
+        .unwrap();
+        command.execute().await.unwrap();
+    }
+}
