@@ -58,7 +58,9 @@ cargo run --manifest-path "$WT/Cargo.toml" --example jev_route_signal_eval -- \
 
 Use a new output filename for each input. The harness creates the output
 exclusively and checkpoints it after every response; a failed request leaves
-completed observations available rather than discarding the run. These are
+completed observations available rather than discarding the run. It rejects
+oversized inputs before making requests and stops on a model-version or answer-key
+mismatch after preserving the returned response for diagnosis. These are
 public issue texts; the harness does not fetch linked ADR or cited issue content. The
 pre-probe reconstructions are not evidence of the exact historic output.
 
