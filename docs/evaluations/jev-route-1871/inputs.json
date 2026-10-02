@@ -26,7 +26,8 @@
       ],
       "closed_by": [],
       "url": "https://github.com/rust-works/omni-dev/issues/1845"
-    }
+    },
+    "citation": "#1830"
   },
   {
     "id": "omni-dev-1871-current",
@@ -60,7 +61,8 @@
       ],
       "closed_by": [],
       "url": "https://github.com/rust-works/omni-dev/issues/1871"
-    }
+    },
+    "citation": "#1845"
   },
   {
     "id": "omni-dev-1880-current",
@@ -84,7 +86,8 @@
       ],
       "closed_by": [],
       "url": "https://github.com/rust-works/omni-dev/issues/1880"
-    }
+    },
+    "citation": null
   },
   {
     "id": "omni-dev-1858-current",
@@ -108,7 +111,8 @@
       ],
       "closed_by": [],
       "url": "https://github.com/rust-works/omni-dev/issues/1858"
-    }
+    },
+    "citation": null
   },
   {
     "id": "succinctly-1356-current",
@@ -132,7 +136,8 @@
       ],
       "closed_by": [],
       "url": "https://github.com/rust-works/succinctly/issues/1356"
-    }
+    },
+    "citation": "#1129"
   },
   {
     "id": "succinctly-1343-current",
@@ -156,7 +161,8 @@
       ],
       "closed_by": [],
       "url": "https://github.com/rust-works/succinctly/issues/1343"
-    }
+    },
+    "citation": "#2063"
   },
   {
     "id": "succinctly-1740-current",
@@ -180,7 +186,8 @@
       ],
       "closed_by": [],
       "url": "https://github.com/rust-works/succinctly/issues/1740"
-    }
+    },
+    "citation": "#1753"
   },
   {
     "id": "succinctly-1998-current",
@@ -204,7 +211,8 @@
       ],
       "closed_by": [],
       "url": "https://github.com/rust-works/succinctly/issues/1998"
-    }
+    },
+    "citation": "#1419"
   },
   {
     "id": "omni-dev-1845-pre-probe-reconstruction",
@@ -222,7 +230,8 @@
       "comments": [],
       "closed_by": [],
       "url": "https://github.com/rust-works/omni-dev/issues/1845"
-    }
+    },
+    "citation": "#1830"
   },
   {
     "id": "omni-dev-1843-pre-probe-reconstruction",
@@ -240,6 +249,7 @@
       "comments": [],
       "closed_by": [],
       "url": "https://github.com/rust-works/omni-dev/issues/1843"
-    }
+    },
+    "citation": "#1830"
   }
 ]

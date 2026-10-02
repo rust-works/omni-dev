@@ -1,0 +1,58 @@
+[
+  {
+    "id": "omni-dev-1845-current",
+    "bounded_spike": "negative",
+    "prior_reading": "Probe completed; parent tracker is provenance."
+  },
+  {
+    "id": "omni-dev-1871-current",
+    "bounded_spike": "negative",
+    "prior_reading": "Discusses a worked example and asks to design new signals; own validation does not settle already-decided architecture."
+  },
+  {
+    "id": "succinctly-1740-current",
+    "bounded_spike": "negative",
+    "prior_reading": "Cited work absorbs implementation; no pending bounded design test."
+  },
+  {
+    "id": "omni-dev-1845-pre-probe-reconstruction",
+    "bounded_spike": "positive",
+    "prior_reading": "Pending API probe with pre-decided scope gates; reconstructed positive."
+  },
+  {
+    "id": "succinctly-2640-current",
+    "bounded_spike": "borderline",
+    "prior_reading": "Pending measurement with triage decision threshold, but which optimization to do still entails judgment.",
+    "post_run_source_review": "The original prior reading was too conservative: the triage comment specifies deterministic attribution against a stated threshold and actions for either result. Treat this as an independent positive bounded-measurement case; any later implementation escalation is conditional. This correction was made after viewing the scores and is not an additional blind label. Its 0.55–0.58 score therefore remains weak independent-positive separation from #2705."
+  },
+  {
+    "id": "succinctly-2705-current",
+    "bounded_spike": "negative",
+    "prior_reading": "Conditional implementation plan is not a pending empirical fork."
+  },
+  {
+    "id": "succinctly-3182-pending-reconstruction",
+    "bounded_spike": "borderline",
+    "prior_reading": "Independent pending representation measurement, but acceptance bar is linked ADR context rather than fully stated outcomes. Do not assume it is a strict positive."
+  },
+  {
+    "id": "succinctly-3191-pending-reconstruction",
+    "bounded_spike": "negative",
+    "prior_reading": "Representation measurement plus unsafe and price judgment; linked ADR acceptance context cannot settle the own-text fork."
+  },
+  {
+    "id": "succinctly-2889-pending-reconstruction",
+    "bounded_spike": "negative",
+    "prior_reading": "Complex embed identity implementation, blocked on #2999 representation decision. Implementation bearing plausible, but not necessarily less own code after a decision."
+  },
+  {
+    "id": "omni-dev-1814-current",
+    "bounded_spike": "negative",
+    "prior_reading": "Call-site suitability and architecture choice require judgment; no specific empirical test with settled branches."
+  },
+  {
+    "id": "succinctly-2999-pending-reconstruction",
+    "bounded_spike": "borderline",
+    "prior_reading": "Independent pending Experiment C has acceptance criteria in own text; involves implementing a representation and explaining clone behavior, with no explicit numeric performance acceptance band. Not a clean fully pre-decided binary probe."
+  }
+]

@@ -1171,11 +1171,12 @@ fn could_be_cheaper_key(i: usize) -> String {
 }
 
 /// Builds the `could_be_cheaper` question for one open citation (#1812).
+///
 /// Design-stage only for v1 — the exact wording validated live against
 /// `jev-1.13.0`, 2026-09-20; see docs/jev.md for the evidence. Do not reword
 /// without re-validating (pinned by
 /// `could_be_cheaper_question_is_the_tested_wording`).
-fn could_be_cheaper_question(citation: &str) -> Question {
+pub fn could_be_cheaper_question(citation: &str) -> Question {
     Question::Noul {
         instructions: format!(
             "This issue cites {citation}, which is still open. If {citation} is resolved, how \
