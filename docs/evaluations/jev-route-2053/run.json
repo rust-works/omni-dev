@@ -1,0 +1,20 @@
+{
+  "date": "2026-10-02",
+  "requested_model_v1": "jev-latest",
+  "requested_model_candidates": "jev-1.13.0",
+  "returned_model": "jev-1.13.0",
+  "repeats": 2,
+  "cli_for_candidates": "omni-dev 0.43.0 (8ec2bfe3 2026-09-28)",
+  "candidate_selection": "v1, v2, v3 selected using only #3017 and synthetic controls. No held-out predictions inspected until v3 was selected. No labels modified.",
+  "calls": {
+    "supplementary_v1": 28,
+    "heldout_v1": 136,
+    "supplementary_v2": 28,
+    "supplementary_v3": 28,
+    "heldout_v3": 136,
+    "sandbox_attempt": 28
+  },
+  "monetary_cost": null,
+  "cost_note": "No billing receipt available. Raw usage and exact requests are retained; no dollar amount invented.",
+  "execution": "v1: compiled jev_open_questions_eval example. v2/v3: installed omni-dev ai jev ask via a temporary copy of run_candidate.py, with frozen baseline stage questions and explicit candidate JSON."
+}

@@ -1,0 +1,10 @@
+{
+  "type": "choice",
+  "instructions": "What kind of questions is still open in the issue after considering all comments? Unknown existing-code facts and genuine design tradeoffs are different kinds. A suggested fix direction does not settle unverified factual premises, such as whether a reusable helper already exists. A code-informed decision with a concrete plan does settle them: carrying out its prescribed caller audits, code edits, tests, or verification is execution work, not an open question. Routine coding choices do not count as design tradeoffs. Judge the remaining uncertainty, not the amount of work.",
+  "criteria": {
+    "none": "The latest text establishes the relevant existing-code facts and prescribes the approach. Executing its specified plan, including audits and verification, does not itself create open questions.",
+    "factual": "Only existing-code facts remain unsettled: whether a reusable helper exists, what it does, or which existing sites need changes. A suggested fix with uncertain reuse or scope is factual even if its intended behavior is clear; inspecting code can settle it without a discretionary design tradeoff.",
+    "design": "Only genuine choices between competing approaches remain, requiring judgment about behavior, architecture, or tradeoffs even after existing-code facts are known. Routine choices while implementing a prescribed fix do not qualify.",
+    "both": "Both unresolved existing-code premises and genuine choices between competing designs remain. Code reading alone cannot settle the design tradeoffs."
+  }
+}

@@ -1,0 +1,65 @@
+[
+  {
+    "id": "succinctly-3017-before",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/3017",
+    "reconstructed": true,
+    "provenance": "Current body; no comments. Historical body revisions not verified.",
+    "pinned_on": "2026-10-02"
+  },
+  {
+    "id": "succinctly-3017-after",
+    "expected": [
+      "none"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/3017#issuecomment-5750762536",
+    "reconstructed": true,
+    "provenance": "Same body plus first triage comment; excludes later implementation plan.",
+    "pinned_on": "2026-10-02",
+    "triage_comment_created_at": "2026-09-20T15:32:41Z"
+  },
+  {
+    "id": "control-none",
+    "expected": [
+      "none"
+    ],
+    "provenance": "Synthetic supplementary control; labels fixed before the first call. Ambiguous case accepts multiple labels and is reported separately.",
+    "pinned_on": "2026-10-02"
+  },
+  {
+    "id": "control-factual",
+    "expected": [
+      "factual"
+    ],
+    "provenance": "Synthetic supplementary control; labels fixed before the first call. Ambiguous case accepts multiple labels and is reported separately.",
+    "pinned_on": "2026-10-02"
+  },
+  {
+    "id": "control-design",
+    "expected": [
+      "design"
+    ],
+    "provenance": "Synthetic supplementary control; labels fixed before the first call. Ambiguous case accepts multiple labels and is reported separately.",
+    "pinned_on": "2026-10-02"
+  },
+  {
+    "id": "control-both",
+    "expected": [
+      "both"
+    ],
+    "provenance": "Synthetic supplementary control; labels fixed before the first call. Ambiguous case accepts multiple labels and is reported separately.",
+    "pinned_on": "2026-10-02"
+  },
+  {
+    "id": "control-ambiguous",
+    "expected": [
+      "factual",
+      "design",
+      "both"
+    ],
+    "provenance": "Synthetic supplementary control; labels fixed before the first call. Ambiguous case accepts multiple labels and is reported separately.",
+    "pinned_on": "2026-10-02"
+  }
+]

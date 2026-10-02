@@ -1,0 +1,308 @@
+[
+  {
+    "id": "succinctly-2520-holdout",
+    "expected": [
+      "none"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2520",
+    "source_updated_at": "2026-09-12T04:23:46Z",
+    "cheap_round_limit": "Premise already fixed; add regression pins."
+  },
+  {
+    "id": "succinctly-2588-holdout",
+    "expected": [
+      "both"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2588",
+    "source_updated_at": "2026-09-12T04:34:50Z",
+    "cheap_round_limit": "Probe trailing control/zero-output behavior; choose rewrite/continue semantics across consumers."
+  },
+  {
+    "id": "succinctly-2598-holdout",
+    "expected": [
+      "design"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2598",
+    "source_updated_at": "2026-09-12T04:26:20Z",
+    "cheap_round_limit": "Key-anchor alias targets need a borrow-shape decision preserving structural identity."
+  },
+  {
+    "id": "succinctly-2607-holdout",
+    "expected": [
+      "design"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2607",
+    "source_updated_at": "2026-09-12T04:45:36Z",
+    "cheap_round_limit": "Choose span scanner strategy and measure hot-path cost on two architectures."
+  },
+  {
+    "id": "succinctly-2640-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2640",
+    "source_updated_at": "2026-09-12T05:06:26Z",
+    "cheap_round_limit": "Measure residual cost before deciding whether fusion is warranted."
+  },
+  {
+    "id": "succinctly-2643-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2643",
+    "source_updated_at": "2026-09-24T15:24:43Z",
+    "cheap_round_limit": "Probe live-parent/copy-on-bind semantics; later comment matrices expand cases."
+  },
+  {
+    "id": "succinctly-2663-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2663",
+    "source_updated_at": "2026-09-12T05:07:36Z",
+    "cheap_round_limit": "Three variants and two-architecture A/B determine whether to retain the fork."
+  },
+  {
+    "id": "succinctly-2664-holdout",
+    "expected": [
+      "both"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2664",
+    "source_updated_at": "2026-09-26T01:30:14Z",
+    "cheap_round_limit": "Oracle/source-document sentinels, depth errors and key spelling require decisions."
+  },
+  {
+    "id": "succinctly-2705-holdout",
+    "expected": [
+      "none"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2705",
+    "source_updated_at": "2026-09-12T04:36:09Z",
+    "cheap_round_limit": "Depends on the prescribed recorder fix in #2709; test-only afterward."
+  },
+  {
+    "id": "succinctly-2706-holdout",
+    "expected": [
+      "none"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2706",
+    "source_updated_at": "2026-09-12T04:34:35Z",
+    "cheap_round_limit": "Posted plan resolves predicate widening versus runner split."
+  },
+  {
+    "id": "succinctly-2707-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2707",
+    "source_updated_at": "2026-09-12T04:33:28Z",
+    "cheap_round_limit": "Oracle matrices define emitter rules; definition snippets cannot establish round-trip fidelity."
+  },
+  {
+    "id": "succinctly-2708-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2708",
+    "source_updated_at": "2026-09-12T04:26:39Z",
+    "cheap_round_limit": "Remaining flow-key probes and renderer round-trip behavior need execution."
+  },
+  {
+    "id": "succinctly-2709-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2709",
+    "source_updated_at": "2026-09-12T04:25:12Z",
+    "cheap_round_limit": "Check retry rollback and per-fork order by execution."
+  },
+  {
+    "id": "succinctly-2712-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2712",
+    "source_updated_at": "2026-09-12T04:33:05Z",
+    "cheap_round_limit": "Probe untested multiline flow property coordinates."
+  },
+  {
+    "id": "succinctly-2783-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2783",
+    "source_updated_at": "2026-09-12T04:19:08Z",
+    "cheap_round_limit": "Reference parse/evaluation quirks need live oracle confirmation."
+  },
+  {
+    "id": "succinctly-2784-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2784",
+    "source_updated_at": "2026-09-12T04:41:22Z",
+    "cheap_round_limit": "Sibling-scan cost needs measurement and body/caller inspection."
+  },
+  {
+    "id": "succinctly-2796-holdout",
+    "expected": [
+      "design"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2796",
+    "source_updated_at": "2026-09-12T04:23:22Z",
+    "cheap_round_limit": "Write semantics and metadata preservation span evaluator and renderer."
+  },
+  {
+    "id": "succinctly-2799-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2799",
+    "source_updated_at": "2026-09-28T22:35:27Z",
+    "cheap_round_limit": "Scalar-text equality and grouping semantics require oracle matrix evidence."
+  },
+  {
+    "id": "succinctly-2800-holdout",
+    "expected": [
+      "both"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2800",
+    "source_updated_at": "2026-09-12T04:33:46Z",
+    "cheap_round_limit": "Wildcard and typed-key lookup have multiple semantic forks and consumer audits."
+  },
+  {
+    "id": "succinctly-2801-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2801",
+    "source_updated_at": "2026-09-12T04:35:57Z",
+    "cheap_round_limit": "Typed-register consumers must be audited; definition existence does not prove compatibility."
+  },
+  {
+    "id": "succinctly-2802-holdout",
+    "expected": [
+      "design"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2802",
+    "source_updated_at": "2026-09-12T04:26:30Z",
+    "cheap_round_limit": "ADR must select among three value representations; roughly 900 match sites need audit."
+  },
+  {
+    "id": "succinctly-2806-holdout",
+    "expected": [
+      "none"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2806",
+    "source_updated_at": "2026-09-12T04:20:32Z",
+    "cheap_round_limit": "Existing shape and render helper; sequence-item twin scoped out by plan."
+  },
+  {
+    "id": "succinctly-2875-holdout",
+    "expected": [
+      "design"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2875",
+    "source_updated_at": "2026-09-12T23:00:02Z",
+    "cheap_round_limit": "Missing-content versus explicit-null representation unresolved; no posted plan."
+  },
+  {
+    "id": "succinctly-2883-holdout",
+    "expected": [
+      "design"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/2883",
+    "source_updated_at": "2026-09-12T23:50:56Z",
+    "cheap_round_limit": "Bridge route unification and value conversion unresolved; no posted plan."
+  },
+  {
+    "id": "succinctly-3241-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/3241",
+    "source_updated_at": "2026-09-27T11:20:31Z",
+    "cheap_round_limit": "Prescribed fast path requires identity sweep and controlled two-machine measurements."
+  },
+  {
+    "id": "succinctly-3272-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/3272",
+    "source_updated_at": "2026-10-02T02:45:39Z",
+    "cheap_round_limit": "Prescribed seed exception requires emission-order and accepting-direction checks."
+  },
+  {
+    "id": "succinctly-3455-holdout",
+    "expected": [
+      "none"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/3455",
+    "source_updated_at": "2026-09-30T14:26:23Z",
+    "cheap_round_limit": "Existing memo precedent and name-index plan prescribe the implementation."
+  },
+  {
+    "id": "succinctly-3459-holdout",
+    "expected": [
+      "design"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/3459",
+    "source_updated_at": "2026-09-30T14:22:43Z",
+    "cheap_round_limit": "Expose dropped register and choose internally-indexing builtin scope."
+  },
+  {
+    "id": "succinctly-3460-holdout",
+    "expected": [
+      "both"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/3460",
+    "source_updated_at": "2026-09-30T14:22:47Z",
+    "cheap_round_limit": "Derive builtin identity from C source/oracle and choose safe register carry rules."
+  },
+  {
+    "id": "succinctly-3479-holdout",
+    "expected": [
+      "factual"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/3479",
+    "source_updated_at": "2026-10-01T07:52:38Z",
+    "cheap_round_limit": "Latest implementation plan settles direction; WP0 measurements choose fallback."
+  },
+  {
+    "id": "succinctly-3507-holdout",
+    "expected": [
+      "none"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/3507",
+    "source_updated_at": "2026-09-30T14:23:26Z",
+    "cheap_round_limit": "Existing sinks/INIT drive prescribe change; state-before-emission invariant remains."
+  },
+  {
+    "id": "succinctly-3512-holdout",
+    "expected": [
+      "design"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/3512",
+    "source_updated_at": "2026-09-30T14:23:30Z",
+    "cheap_round_limit": "Choose stashed-escape transport and Halt semantics."
+  },
+  {
+    "id": "succinctly-3513-holdout",
+    "expected": [
+      "none"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/3513",
+    "source_updated_at": "2026-09-30T14:23:34Z",
+    "cheap_round_limit": "Mirror bounded sibling arm after #3515."
+  },
+  {
+    "id": "succinctly-3514-holdout",
+    "expected": [
+      "design"
+    ],
+    "source_url": "https://github.com/rust-works/succinctly/issues/3514",
+    "source_updated_at": "2026-09-30T14:23:38Z",
+    "cheap_round_limit": "Choose streamable stages at eager boundary without breaking rollback/retry."
+  }
+]

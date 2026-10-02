@@ -612,34 +612,42 @@ pub struct OpenQuestions {
 
 fn open_questions_question() -> Question {
     Question::Choice {
-        instructions:
-            "What kind of open questions remains before implementation can start, given the \
-             issue text and comments? Distinguish unknown facts about existing code from \
-             decisions requiring design judgment. Do not count routine implementation details \
-             as open questions. Judge what remains, not the length of the text."
-                .to_string(),
+        instructions: "What kind of questions is still open in the issue after considering all \
+                comments? Unknown existing-code facts and genuine design tradeoffs are different \
+                kinds. A suggested fix direction does not settle unverified factual premises, \
+                such as whether a reusable helper already exists. A code-informed decision with \
+                a concrete plan does settle them: carrying out its prescribed caller audits, \
+                code edits, tests, or verification is execution work, not an open question. \
+                Routine coding choices do not count as design tradeoffs. Judge the remaining \
+                uncertainty, not the amount of work."
+            .to_string(),
         criteria: BTreeMap::from([
             (
                 "none".to_string(),
-                "No open questions remain: the text settles the approach and the relevant facts."
+                "The latest text establishes the relevant existing-code facts and prescribes the \
+                approach. Executing its specified plan, including audits and verification, does \
+                not itself create open questions."
                     .to_string(),
             ),
             (
                 "factual".to_string(),
-                "Only factual questions remain, answerable by reading the existing codebase: \
-             whether something exists, how it behaves, or which sites use it."
+                "Only existing-code facts remain unsettled: whether a reusable helper exists, \
+                what it does, or which existing sites need changes. A suggested fix with \
+                uncertain reuse or scope is factual even if its intended behavior is clear; \
+                inspecting code can settle it without a discretionary design tradeoff."
                     .to_string(),
             ),
             (
                 "design".to_string(),
-                "Only design questions remain: choosing between alternatives requires judgment, \
-             rather than discovering what the existing code already does."
+                "Only genuine choices between competing approaches remain, requiring judgment \
+                about behavior, architecture, or tradeoffs even after existing-code facts are \
+                known. Routine choices while implementing a prescribed fix do not qualify."
                     .to_string(),
             ),
             (
                 "both".to_string(),
-                "Both factual questions about existing code and design decisions between \
-             alternatives remain."
+                "Both unresolved existing-code premises and genuine choices between competing \
+                designs remain. Code reading alone cannot settle the design tradeoffs."
                     .to_string(),
             ),
         ]),
@@ -3148,6 +3156,18 @@ mod tests {
     }
 
     // ── run_route (wiremock) ─────────────────────────────────────────
+
+    #[test]
+    fn open_questions_uses_the_evaluated_wording() {
+        let evaluated: serde_json::Value = serde_json::from_str(include_str!(
+            "../../docs/evaluations/jev-route-2053/candidate-v3.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(open_questions_question()).unwrap(),
+            evaluated
+        );
+    }
 
     #[test]
     fn open_questions_is_once_per_issue_in_both_modes() {

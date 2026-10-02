@@ -1,0 +1,16 @@
+{
+  "anthropic": [
+    "sonnet",
+    "opus"
+  ],
+  "gemini": [
+    "flash",
+    "pro",
+    "deep-think"
+  ],
+  "openai": [
+    "terra",
+    "sol",
+    "astra"
+  ]
+}
