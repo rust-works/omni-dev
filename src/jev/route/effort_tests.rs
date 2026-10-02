@@ -58,7 +58,9 @@ fn response(ladders: &[Ladder]) -> BTreeMap<String, Answer> {
             let Question::Choice { criteria, .. } = q else {
                 panic!()
             };
-            let choice = if key.ends_with(".remaining") {
+            let choice = if key == "open_questions" {
+                "none".to_string()
+            } else if key.ends_with(".remaining") {
                 "remaining".to_string()
             } else if key.contains(".effort_") {
                 criteria
@@ -107,8 +109,8 @@ fn builtins_offer_only_their_native_levels_and_keep_original_stage_questions() {
         .collect();
     let q = build_route_questions(&ladders).unwrap();
     // 9 class + 21 configurable-model effort (anthropic 2 rungs since #1903,
-    // openai 3, gemini 2) + 3 Deep Think applicability questions.
-    assert_eq!(q.len(), 33);
+    // openai 3, gemini 2) + 3 Deep Think applicability + one open-question choice.
+    assert_eq!(q.len(), 34);
     let keys = |key: &str| {
         let Question::Choice { criteria, .. } = &q[key] else {
             panic!()
@@ -144,7 +146,7 @@ fn builtins_offer_only_their_native_levels_and_keep_original_stage_questions() {
 fn custom_models_use_stage_overrides_and_shared_applicability() {
     let ladder = custom();
     let q = build_route_questions(std::slice::from_ref(&ladder)).unwrap();
-    assert_eq!(q.len(), 9); // three class, three configurable, three applicability
+    assert_eq!(q.len(), 10); // three class, three configurable, three applicability, one open-question choice
     let Question::Choice {
         criteria,
         instructions,
@@ -435,7 +437,7 @@ fn legacy_custom_ladders_are_explicitly_unspecified() {
         Tiers::parse("tiers: [{name: a, description: A}, {name: b, description: B}]").unwrap(),
     );
     let mut answers = response(std::slice::from_ref(&ladder));
-    assert_eq!(answers.len(), 3);
+    assert_eq!(answers.len(), 4);
     set_choice(&mut answers, "old.stage_design", "none");
     let routes = provider_routes(&answers, &[ladder], 0.3).unwrap();
     assert_eq!(
@@ -549,7 +551,7 @@ async fn all_ladders_and_efforts_share_one_request_and_fail_only_the_bad_issue()
     assert!(text.contains("Model / effort"), "{text}");
     let requests = server.received_requests().await.unwrap();
     let request: serde_json::Value = requests[0].body_json().unwrap();
-    assert_eq!(request["questions"].as_object().unwrap().len(), 43);
+    assert_eq!(request["questions"].as_object().unwrap().len(), 44);
     assert!(request["questions"].get("could_be_cheaper_0").is_some());
 }
 
@@ -564,11 +566,13 @@ async fn class_only_route_omits_effort_questions_and_output_for_builtin_and_cust
         custom(),
     ];
     let questions = super::super::build_route_questions_for_mode(&ladders, false).unwrap();
-    assert_eq!(questions.len(), 9);
-    assert!(questions.keys().all(|key| key.contains(".stage_")));
+    assert_eq!(questions.len(), 10);
+    assert!(questions
+        .keys()
+        .all(|key| key.contains(".stage_") || key == "open_questions"));
     let mut answers = response(&ladders);
     answers.retain(|key, _| questions.contains_key(key));
-    assert_eq!(answers.len(), 9);
+    assert_eq!(answers.len(), 10);
     answers.insert("could_be_cheaper_0".into(), Answer::Noul { noul: 0.4 });
 
     let server = wiremock::MockServer::start().await;
@@ -646,7 +650,7 @@ async fn class_only_route_omits_effort_questions_and_output_for_builtin_and_cust
     assert!(text.contains("openai:") && text.contains("anthropic:") && text.contains("custom:"));
     let requests = server.received_requests().await.unwrap();
     let request: serde_json::Value = requests[0].body_json().unwrap();
-    assert_eq!(request["questions"].as_object().unwrap().len(), 10);
+    assert_eq!(request["questions"].as_object().unwrap().len(), 11);
     assert!(request["questions"].get("could_be_cheaper_0").is_some());
 }
 

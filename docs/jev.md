@@ -413,8 +413,9 @@ issue: the **design** (choosing the approach and settling open questions), the
 **implementation** and the **review**. The classes come from a named model
 ladder (see [Built-in ladders](#built-in-ladders) and
 [Custom ladders](#custom-ladders)); `--ladders` routes against several at
-once. It makes one Jev call per issue, with three `choice` questions per
-ladder plus one `noul` question per open issue/PR the text cites, and
+once. It makes one Jev call per issue, with three stage `choice` questions per
+ladder, one issue-level `open_questions` choice, and one `noul` question per
+open issue/PR the text cites, and
 fetches the issues through `gh`. Per-model effort advice is opt-in with
 `--effort-advice`; it adds questions to that same Jev call and increases
 token use. `-o` selects the output format independently.
@@ -445,6 +446,7 @@ issues:
 - ref: rust-works/omni-dev#1641
   url: https://github.com/rust-works/omni-dev/issues/1641
   title: ...
+  open_questions: {choice: factual, confidence: 0.80, probabilities: {none: 0.05, factual: 0.80, design: 0.05, both: 0.10}}
   providers:
     anthropic:
       stages:
@@ -477,6 +479,19 @@ usage: {input_tokens: 1432, output_tokens: 61}
   keyed by that ladder's own name, each with its own `stages`, `class`,
   `class_from` and `close_calls`. A built-in ladder is keyed by its provider name; a custom
   one registered via `--ladder-definition` is keyed by the name it was given.
+- **`open_questions`** is one independent answer per issue, shared across providers:
+  `none` means the text settles the relevant facts and approach; `factual` means
+  unknowns can be settled by reading existing code (whether something exists,
+  how it behaves, or which sites use it); `design` means choosing between
+  alternatives requires judgment; `both` means both kinds remain. It carries
+  `choice`, `confidence`, and `probabilities`, and text output shows
+  `open_questions: factual (0.80)` once per issue. Routine implementation details
+  do not count. This answer never overrides `class`, stage choices, close calls,
+  or effort advice. It judges only the supplied text and comments; it does not
+  retrieve code or establish that a proposed solution exists. Missing or unsupported
+  answers fail that issue, while the rest of a batch continues.
+  The wording remains gated on [the calibration prerequisite #2052](https://github.com/rust-works/omni-dev/issues/2052);
+  see [evaluation status](evaluations/jev-route-2053/README.md).
 - **`class`** is the higher of the design and implement choices. The most
   capable class earns its cost in the design stage; once a plan exists, the
   design answer usually becomes `none` and implementation drops to a cheaper
@@ -596,6 +611,7 @@ styling.
 
 ```
 rust-works/omni-dev#1641 — Some issue title
+  open_questions: factual (0.80)
   opus (from design) — design needs opus (0.52), implementation sonnet (0.83), review opus (0.41, close call — sonnet 0.59)
   cites open #1129 (blocker), which could leave less design work if resolved (0.75)
   reference fetch failed: #404 (not found)

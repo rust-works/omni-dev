@@ -1062,6 +1062,11 @@ mod tests {
         };
         let routed = || {
             issue(RouteOutcome::Routed {
+                open_questions: crate::jev::route::OpenQuestions {
+                    choice: crate::jev::route::OpenQuestionKind::None,
+                    confidence: 0.9,
+                    probabilities: BTreeMap::new(),
+                },
                 providers: BTreeMap::from([(
                     "anthropic".to_string(),
                     ProviderRoute {
@@ -1119,6 +1124,11 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
+                    open_questions: crate::jev::route::OpenQuestions {
+                        choice: crate::jev::route::OpenQuestionKind::None,
+                        confidence: 0.9,
+                        probabilities: BTreeMap::new(),
+                    },
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
                         ProviderRoute {
