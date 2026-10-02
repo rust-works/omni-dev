@@ -1,0 +1,719 @@
+{
+  "declared_at": "2026-10-02T03:08:25.447704+00:00",
+  "author": "Codex implementation agent, before inspecting baseline output",
+  "source_label_caveat": "Externally posted labels/plans may themselves be agent-assisted; author login is not proof of unaided human judgment. No explicit source design/review class labels found. Implementation labels are inherited, not independently adjudicated.",
+  "stage_rubric": "Design none when latest plan explicitly settles approach; opus when plans leave interacting semantic/representation choices. Review sonnet for bounded oracle-pinned edits, opus for acceptance widening, shared semantic invariants or rollback. Ambiguous stages unscored. No Fable coercion.",
+  "cases": [
+    {
+      "number": 2520,
+      "source_class": "sonnet",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643430896
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "sonnet",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "none",
+        "implement": null,
+        "review": "sonnet"
+      },
+      "review_rationale": "Test/documentation-only regression pin; no evaluator change.",
+      "open_question_kind": "none",
+      "cheap_round_limit": "Premise already fixed; add regression pins."
+    },
+    {
+      "number": 2588,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643481015
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "both",
+      "cheap_round_limit": "Probe trailing control/zero-output behavior; choose rewrite/continue semantics across consumers."
+    },
+    {
+      "number": 2598,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643442326
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "opus",
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "design",
+      "cheap_round_limit": "Key-anchor alias targets need a borrow-shape decision preserving structural identity."
+    },
+    {
+      "number": 2607,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643528283
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "design",
+      "cheap_round_limit": "Choose span scanner strategy and measure hot-path cost on two architectures."
+    },
+    {
+      "number": 2640,
+      "source_class": "sonnet",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643638156
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "sonnet",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Measure residual cost before deciding whether fusion is warranted."
+    },
+    {
+      "number": 2643,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643421563
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Probe live-parent/copy-on-bind semantics; later comment matrices expand cases."
+    },
+    {
+      "number": 2663,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643645292
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "none",
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Three variants and two-architecture A/B determine whether to retain the fork."
+    },
+    {
+      "number": 2664,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643633670
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "opus",
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "both",
+      "cheap_round_limit": "Oracle/source-document sentinels, depth errors and key spelling require decisions."
+    },
+    {
+      "number": 2705,
+      "source_class": "sonnet",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643487006
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "sonnet",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "none",
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "none",
+      "cheap_round_limit": "Depends on the prescribed recorder fix in #2709; test-only afterward."
+    },
+    {
+      "number": 2706,
+      "source_class": "sonnet",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643479991
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "sonnet",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "none",
+        "implement": null,
+        "review": "opus"
+      },
+      "review_rationale": "Subtree anchor soundness and ordering require review beyond output examples.",
+      "open_question_kind": "none",
+      "cheap_round_limit": "Posted plan resolves predicate widening versus runner split."
+    },
+    {
+      "number": 2707,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643475181
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Oracle matrices define emitter rules; definition snippets cannot establish round-trip fidelity."
+    },
+    {
+      "number": 2708,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643443768
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Remaining flow-key probes and renderer round-trip behavior need execution."
+    },
+    {
+      "number": 2709,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643437347
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Check retry rollback and per-fork order by execution."
+    },
+    {
+      "number": 2712,
+      "source_class": "sonnet",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643473320
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "sonnet",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Probe untested multiline flow property coordinates."
+    },
+    {
+      "number": 2783,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643410015
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Reference parse/evaluation quirks need live oracle confirmation."
+    },
+    {
+      "number": 2784,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643509506
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Sibling-scan cost needs measurement and body/caller inspection."
+    },
+    {
+      "number": 2796,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643429172
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "design",
+      "cheap_round_limit": "Write semantics and metadata preservation span evaluator and renderer."
+    },
+    {
+      "number": 2799,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643469859
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Scalar-text equality and grouping semantics require oracle matrix evidence."
+    },
+    {
+      "number": 2800,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643476470
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "both",
+      "cheap_round_limit": "Wildcard and typed-key lookup have multiple semantic forks and consumer audits."
+    },
+    {
+      "number": 2801,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643486189
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Typed-register consumers must be audited; definition existence does not prove compatibility."
+    },
+    {
+      "number": 2802,
+      "source_class": "fable",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643443066
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "design",
+      "cheap_round_limit": "ADR must select among three value representations; roughly 900 match sites need audit."
+    },
+    {
+      "number": 2806,
+      "source_class": "sonnet",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5643415918
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "sonnet",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "none",
+        "implement": null,
+        "review": "sonnet"
+      },
+      "review_rationale": "Bounded rendering changes with captured oracle rows and the existing stored shape.",
+      "open_question_kind": "none",
+      "cheap_round_limit": "Existing shape and render helper; sequence-item twin scoped out by plan."
+    },
+    {
+      "number": 2875,
+      "source_class": "sonnet",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "sonnet",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "design",
+      "cheap_round_limit": "Missing-content versus explicit-null representation unresolved; no posted plan."
+    },
+    {
+      "number": 2883,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "design",
+      "cheap_round_limit": "Bridge route unification and value conversion unresolved; no posted plan."
+    },
+    {
+      "number": 3241,
+      "source_class": "sonnet",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5855314447
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "sonnet",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Prescribed fast path requires identity sweep and controlled two-machine measurements."
+    },
+    {
+      "number": 3272,
+      "source_class": "sonnet",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5855169338
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "sonnet",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Prescribed seed exception requires emission-order and accepting-direction checks."
+    },
+    {
+      "number": 3455,
+      "source_class": "sonnet",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5913291074
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "sonnet",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "none",
+      "cheap_round_limit": "Existing memo precedent and name-index plan prescribe the implementation."
+    },
+    {
+      "number": 3459,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5913218240
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "opus",
+        "implement": null,
+        "review": "opus"
+      },
+      "review_rationale": "Acceptance widening can fabricate writes; verify shadowing, mode gate and sweep.",
+      "open_question_kind": "design",
+      "cheap_round_limit": "Expose dropped register and choose internally-indexing builtin scope."
+    },
+    {
+      "number": 3460,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5913219675
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": null,
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "both",
+      "cheap_round_limit": "Derive builtin identity from C source/oracle and choose safe register carry rules."
+    },
+    {
+      "number": 3479,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5913227927,
+        5927196083
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "none",
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "factual",
+      "cheap_round_limit": "Latest implementation plan settles direction; WP0 measurements choose fallback."
+    },
+    {
+      "number": 3507,
+      "source_class": "sonnet",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5913232454
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "sonnet",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "none",
+        "implement": null,
+        "review": "opus"
+      },
+      "review_rationale": "Plan explicitly calls out the code-review gate for state-before-emission and retry invariants.",
+      "open_question_kind": "none",
+      "cheap_round_limit": "Existing sinks/INIT drive prescribe change; state-before-emission invariant remains."
+    },
+    {
+      "number": 3512,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5913233789
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "opus",
+        "implement": null,
+        "review": null
+      },
+      "review_rationale": null,
+      "open_question_kind": "design",
+      "cheap_round_limit": "Choose stashed-escape transport and Halt semantics."
+    },
+    {
+      "number": 3513,
+      "source_class": "sonnet",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5913235088
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "sonnet",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "none",
+        "implement": null,
+        "review": "sonnet"
+      },
+      "review_rationale": "Sibling-arm parity, a bounded gate and oracle-pinned outputs.",
+      "open_question_kind": "none",
+      "cheap_round_limit": "Mirror bounded sibling arm after #3515."
+    },
+    {
+      "number": 3514,
+      "source_class": "opus",
+      "source_class_origin": "GitHub label (label description: suitable to implement); posted rationale where available",
+      "plan_comment_ids": [
+        5913236391
+      ],
+      "source_stage_labels": {
+        "design": null,
+        "implement": "opus",
+        "review": null
+      },
+      "evaluator_stage_expectations": {
+        "design": "opus",
+        "implement": null,
+        "review": "opus"
+      },
+      "review_rationale": "Streaming/eager boundary, rollback and stashed-escape behavior interact.",
+      "open_question_kind": "design",
+      "cheap_round_limit": "Choose streamable stages at eager boundary without breaking rollback/retry."
+    }
+  ]
+}
