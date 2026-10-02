@@ -544,6 +544,14 @@ mod tests {
             (false, false, false, 200, "blocked", 0),
         ] {
             std::fs::write(&log_path, "").unwrap();
+            // Other engine tests can log concurrently without changing env vars.
+            // Exercise that contamination explicitly, even for a serial run.
+            request_log::record_drive_mutation(DriveMutationOutcome {
+                operation: "edit",
+                file_id: "file-1".into(),
+                status: "edited".into(),
+                ..Default::default()
+            });
             let server = MockServer::start().await;
             let client = client_with_bootstrapped_token(&server).await;
             if trashed {
@@ -579,7 +587,15 @@ mod tests {
                 .unwrap()
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
-                .filter(|rec: &serde_json::Value| rec["kind"] == "drivemutation")
+                .filter(|rec: &serde_json::Value| {
+                    rec["kind"] == "drivemutation"
+                        && rec["context"]["file_id"] == "file-1"
+                        && rec["command"]
+                            == serde_json::json!([
+                                "drive",
+                                if restore { "untrash" } else { "trash" }
+                            ])
+                })
                 .collect();
             assert_eq!(records.len(), usize::from(!dry_run));
             if !dry_run {
