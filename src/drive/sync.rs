@@ -16,7 +16,7 @@ use crate::cli::drive::read::{
     resolve_export_mime_type, verify_sha256_checksum, GOOGLE_FOLDER, GOOGLE_SHORTCUT,
 };
 use crate::drive::client::DriveClient;
-use crate::drive::files_api::{FilesApi, HARD_CAP};
+use crate::drive::files_api::{FilesApi, HARD_CAP, MAX_PAGE_LIMIT};
 use crate::drive::types::DriveFile;
 
 const MANIFEST: &str = ".omni-dev-sync.json";
@@ -51,6 +51,8 @@ struct ManifestEntry {
     md5: Option<String>,
     sha256: Option<String>,
     size: Option<String>,
+    #[serde(default)]
+    pending: bool,
 }
 
 impl ManifestEntry {
@@ -64,6 +66,7 @@ impl ManifestEntry {
             md5: file.md5_checksum.clone(),
             sha256: file.sha256_checksum.clone(),
             size: file.size.clone(),
+            pending: false,
         }
     }
 }
@@ -132,13 +135,7 @@ async fn walk_folder(api: &FilesApi<'_>, root: &str) -> Result<Vec<RemoteEntry>>
     while let Some(parent_id) = queue.pop_front() {
         let escaped = parent_id.replace('\\', "\\\\").replace('\'', "\\'");
         let query = format!("'{escaped}' in parents and trashed = false");
-        let mut list = api.search_all(Some(&query), 0).await?;
-        ensure!(
-            list.files.len() < HARD_CAP
-                && list.incomplete_search != Some(true)
-                && list.next_page_token.is_none(),
-            "folder {parent_id}: incomplete listing or {HARD_CAP}-file safety cap reached"
-        );
+        let mut list = list_children(api, &query, &parent_id).await?;
         list.files.sort_by(|a, b| a.id.cmp(&b.id));
         for file in list.files {
             if !visited.insert(file.id.clone()) {
@@ -154,6 +151,39 @@ async fn walk_folder(api: &FilesApi<'_>, root: &str) -> Result<Vec<RemoteEntry>>
         }
     }
     Ok(entries)
+}
+
+/// Check every page: search_all's final-page incompleteSearch is insufficient.
+async fn list_children(
+    api: &FilesApi<'_>,
+    query: &str,
+    folder: &str,
+) -> Result<crate::drive::types::FileListResponse> {
+    let mut result = crate::drive::types::FileListResponse::default();
+    let mut token = None;
+    let mut seen_tokens = BTreeSet::new();
+    loop {
+        let page = api
+            .search(Some(query), MAX_PAGE_LIMIT, token.as_deref())
+            .await?;
+        ensure!(
+            page.incomplete_search != Some(true),
+            "folder {folder}: incomplete listing"
+        );
+        result.files.extend(page.files);
+        ensure!(
+            result.files.len() < HARD_CAP,
+            "folder {folder}: {HARD_CAP}-file safety cap reached"
+        );
+        let Some(next) = page.next_page_token else {
+            return Ok(result);
+        };
+        ensure!(
+            !next.is_empty() && seen_tokens.insert(next.clone()),
+            "folder {folder}: repeated or empty pagination token"
+        );
+        token = Some(next);
+    }
 }
 
 /// Portable segments, with room left for an export extension and collision suffix.
@@ -173,22 +203,26 @@ fn sanitize_segment(name: &str) -> String {
     while out.len() > 180 {
         out.pop();
     }
+    out = out.trim_end_matches(['.', ' ']).to_string();
     if out.is_empty() {
         out.push('_');
     }
-    let stem = out
+    if is_windows_device(&out) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+fn is_windows_device(name: &str) -> bool {
+    let stem = name
         .split('.')
         .next()
         .unwrap_or_default()
         .to_ascii_uppercase();
-    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || (stem.len() == 4
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
             && matches!(stem.as_bytes()[3], b'1'..=b'9'))
-    {
-        out.insert(0, '_');
-    }
-    out
 }
 
 fn extension(mime: &str) -> &'static str {
@@ -217,7 +251,8 @@ fn path_key(path: &Path) -> String {
 fn validate_relative(path: &Path) -> Result<()> {
     ensure!(
         !path.as_os_str().is_empty()
-            && path.components().all(|c| matches!(c, Component::Normal(_))),
+            && path.components().all(|c| matches!(c, Component::Normal(_)))
+            && path.as_os_str() == path.components().collect::<PathBuf>().as_os_str(),
         "invalid manifest path: {}",
         path.display()
     );
@@ -231,7 +266,8 @@ fn validate_relative(path: &Path) -> Result<()> {
                 && !name.chars().any(|c| c.is_control()
                     || matches!(c, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'))
                 && !name.ends_with(['.', ' '])
-                && name.len() <= 240,
+                && name.len() <= 240
+                && !is_windows_device(name),
             "unsafe manifest path: {}",
             path.display()
         );
@@ -263,7 +299,8 @@ fn safe_path(dest: &Path, rel: &Path) -> Result<PathBuf> {
 }
 
 fn load_manifest(opts: &SyncOptions) -> Result<Manifest> {
-    if let Ok(meta) = fs::symlink_metadata(&opts.dest) {
+    let dest: PathBuf = opts.dest.components().collect();
+    if let Ok(meta) = fs::symlink_metadata(&dest) {
         ensure!(
             meta.is_dir() && !meta.file_type().is_symlink(),
             "destination must be a directory, not a symlink"
@@ -292,10 +329,11 @@ fn load_manifest(opts: &SyncOptions) -> Result<Manifest> {
                 "duplicate manifest path"
             );
         }
+        let mut orphan_keys = BTreeSet::new();
         for path in manifest.orphan_paths.keys() {
             validate_relative(path)?;
             ensure!(
-                !paths.contains_key(&path_key(path)),
+                !paths.contains_key(&path_key(path)) && orphan_keys.insert(path_key(path)),
                 "orphan path overlaps active manifest path"
             );
         }
@@ -383,7 +421,8 @@ fn allocate_path(
 }
 
 fn unchanged(file: &DriveFile, entry: &ManifestEntry, path: &Path, export: Option<&str>) -> bool {
-    if entry.rel_path != path
+    if entry.pending
+        || entry.rel_path != path
         || entry.mime_type != file.mime_type
         || entry.export_mime_type.as_deref() != export
     {
@@ -407,8 +446,15 @@ async fn sync_content(
     rel: &Path,
     export: Option<&str>,
     old: Option<&ManifestEntry>,
+    manifest: &mut Manifest,
 ) -> Result<&'static str> {
     let path = safe_path(&opts.dest, rel)?;
+    if opts.verify && !file.is_google_native() {
+        ensure!(
+            file.sha256_checksum.as_ref().is_some_and(|s| !s.is_empty()),
+            "--verify requires Drive's SHA-256 checksum for binary files"
+        );
+    }
     let exists = match fs::symlink_metadata(&path) {
         Ok(meta) => {
             ensure!(
@@ -443,7 +489,11 @@ async fn sync_content(
             .is_none_or(|s| s <= MAX_BYTES),
         "file exceeds 500 MiB download cap"
     );
-    let action = if old.is_some() { "updated" } else { "created" };
+    let action = if old.is_some_and(|e| !e.pending) {
+        "updated"
+    } else {
+        "created"
+    };
     if !opts.dry_run {
         let bytes = if let Some(mime) = export {
             api.export(&file.id, mime).await?
@@ -453,6 +503,17 @@ async fn sync_content(
         if opts.verify && !file.is_google_native() {
             verify_sha256_checksum(&bytes, file.sha256_checksum.as_deref())?;
         }
+        // Claim only after download/verification succeed, but before replacing bytes.
+        // A crash before the completion checkpoint leaves an explicitly retryable entry.
+        let mut pending = ManifestEntry::new(file, rel.to_path_buf(), export.map(str::to_string));
+        pending.pending = true;
+        if let Some(old) = old.filter(|e| e.rel_path != rel) {
+            manifest
+                .orphan_paths
+                .insert(old.rel_path.clone(), file.id.clone());
+        }
+        manifest.files.insert(file.id.clone(), pending);
+        save_manifest(&opts.dest, manifest)?;
         atomic_write(&opts.dest, rel, &bytes)?;
     }
     Ok(action)
@@ -531,7 +592,17 @@ pub(crate) async fn run_sync(client: &DriveClient, opts: &SyncOptions) -> Result
                 continue;
             }
         } else {
-            match sync_content(&api, opts, &file, &rel, export.as_deref(), old).await {
+            match sync_content(
+                &api,
+                opts,
+                &file,
+                &rel,
+                export.as_deref(),
+                old,
+                &mut manifest,
+            )
+            .await
+            {
                 Ok(action) => report.push(&file.id, &rel, action, None),
                 Err(e) => {
                     report.push(&file.id, &rel, "failed", Some(format!("{e:#}")));

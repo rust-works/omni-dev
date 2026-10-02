@@ -24,6 +24,7 @@ pub struct SyncCommand {
     pub export_mime_type: Option<String>,
     /// Verify downloaded and skipped binary files against Drive's SHA-256.
     /// Native exports have no checksum and are not verified.
+    /// Interrupted writes are retried using the local manifest.
     #[arg(long)]
     pub verify: bool,
     /// Report planned actions without creating directories or downloading content.

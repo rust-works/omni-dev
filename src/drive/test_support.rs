@@ -223,6 +223,36 @@ impl Authenticator for FakeAuthenticator {
     }
 }
 
+/// A read-only Drive client with OAuth refresh directed at the local mock server.
+pub(crate) async fn client_with_bootstrapped_token(
+    server: &wiremock::MockServer,
+) -> crate::drive::client::DriveClient {
+    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
+    use crate::drive::client::DriveClient;
+    use crate::utils::secret::Secret;
+    let credentials = DriveCredentials {
+        client_id: "client".into(),
+        client_secret: Secret::new("secret"),
+        refresh_token: Secret::new("refresh"),
+        scope: DriveGrantedScopes::READONLY,
+    };
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/token"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"access_token":"token","expires_in":3600})),
+        )
+        .mount(server)
+        .await;
+    let mut client = DriveClient::new(&server.uri(), &credentials).unwrap();
+    crate::drive::client::test_support::replace_session(
+        &mut client,
+        &credentials,
+        &format!("{}/token", server.uri()),
+    );
+    client
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -295,34 +325,4 @@ mod tests {
             offenders.join("\n") // omni-dev: coverage ignore-line reason="assert! message args only evaluate when the condition is false, i.e. an offender was found"
         );
     }
-}
-
-/// A read-only Drive client with OAuth refresh directed at the local mock server.
-pub(crate) async fn client_with_bootstrapped_token(
-    server: &wiremock::MockServer,
-) -> crate::drive::client::DriveClient {
-    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
-    use crate::drive::client::DriveClient;
-    use crate::utils::secret::Secret;
-    let credentials = DriveCredentials {
-        client_id: "client".into(),
-        client_secret: Secret::new("secret"),
-        refresh_token: Secret::new("refresh"),
-        scope: DriveGrantedScopes::READONLY,
-    };
-    wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/token"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"access_token":"token","expires_in":3600})),
-        )
-        .mount(server)
-        .await;
-    let mut client = DriveClient::new(&server.uri(), &credentials).unwrap();
-    crate::drive::client::test_support::replace_session(
-        &mut client,
-        &credentials,
-        &format!("{}/token", server.uri()),
-    );
-    client
 }

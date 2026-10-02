@@ -294,6 +294,9 @@ async fn dry_run_does_not_create_destination_or_download() {
     opts.dry_run = true;
     assert_eq!(run_sync(&client, &opts).await.unwrap().created, 2);
     assert!(!dest.exists());
+    opts.verify = true;
+    assert_eq!(run_sync(&client, &opts).await.unwrap().failed, 2);
+    assert!(!dest.exists());
 }
 
 #[test]
@@ -494,6 +497,11 @@ async fn symlink_directory_and_destination_never_receive_writes() {
     assert!(run_sync(&client, &options(&dir.path().join("dest")))
         .await
         .is_err());
+    assert!(load_manifest(&options(&PathBuf::from(format!(
+        "{}/dest/",
+        dir.path().display()
+    ))))
+    .is_err());
 }
 
 #[tokio::test]
@@ -509,4 +517,66 @@ async fn checksum_failure_does_not_write_content_or_claim_ownership() {
     assert_eq!(run_sync(&client, &opts).await.unwrap().failed, 1);
     assert!(!dir.path().join("a").exists());
     assert!(load_manifest(&opts).unwrap().files.is_empty());
+}
+
+#[tokio::test]
+async fn interrupted_pending_writes_are_redownloaded_and_completed() {
+    let (server, client) = fixture().await;
+    list(&server, "root", json!([binary("a", "a", "hash")])).await;
+    download(&server, "a", "complete", 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let opts = options(dir.path());
+    // Simulate interruption after the pending checkpoint and content replacement,
+    // before the completion checkpoint. The remote marker already matches.
+    let file: DriveFile = serde_json::from_value(binary("a", "a", "hash")).unwrap();
+    let mut manifest = load_manifest(&opts).unwrap();
+    let mut entry = ManifestEntry::new(&file, "a".into(), None);
+    entry.pending = true;
+    manifest.files.insert("a".into(), entry);
+    save_manifest(dir.path(), &manifest).unwrap();
+    fs::write(dir.path().join("a"), "interrupted").unwrap();
+    let report = run_sync(&client, &opts).await.unwrap();
+    assert_eq!((report.created, report.skipped, report.failed), (1, 0, 0));
+    assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"complete");
+    assert!(!load_manifest(&opts).unwrap().files["a"].pending);
+    // Also recover interruption before content replacement (no local file).
+    let mut manifest = load_manifest(&opts).unwrap();
+    manifest.files.get_mut("a").unwrap().pending = true;
+    save_manifest(dir.path(), &manifest).unwrap();
+    fs::remove_file(dir.path().join("a")).unwrap();
+    assert_eq!(run_sync(&client, &opts).await.unwrap().created, 1);
+}
+
+#[tokio::test]
+async fn every_page_is_checked_and_repeated_tokens_abort_discovery() {
+    for incomplete in [true, false] {
+        let (server, client) = fixture().await;
+        Mock::given(method("GET"))
+            .and(path("/drive/v3/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"files":[],"incompleteSearch":incomplete,"nextPageToken":"repeated"}),
+            ))
+            .expect(if incomplete { 1 } else { 2 })
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let error = run_sync(&client, &options(dir.path())).await.unwrap_err();
+        assert!(error.to_string().contains(if incomplete {
+            "incomplete"
+        } else {
+            "pagination token"
+        }));
+        assert!(!dir.path().join(MANIFEST).exists());
+    }
+}
+
+#[test]
+fn manifest_rejects_path_aliases_and_device_names() {
+    for name in ["a/./b", "a//b", "a/", "NUL", "COM1.txt"] {
+        assert!(validate_relative(Path::new(name)).is_err(), "{name}");
+    }
+    let boundary = format!("{}.rest", "a".repeat(179));
+    let name = sanitize_segment(&boundary);
+    assert!(!name.ends_with('.'));
+    validate_relative(Path::new(&name)).unwrap();
 }
