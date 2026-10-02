@@ -104,4 +104,89 @@ mod tests {
             .ignore_case
         );
     }
+
+    use crate::drive::slides::client::test_support::mock_clients;
+    use crate::drive::types::GOOGLE_SLIDES_MIME_TYPE;
+    use crate::drive::write_gate::DriveOperation;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn opts(dry_run: bool) -> WriteOptions {
+        WriteOptions {
+            presentation_id: "p1".into(),
+            search: "Q3".into(),
+            replace: "Q4".into(),
+            match_case: true,
+            slides: vec![],
+            dry_run,
+            lease_token: None,
+            ledger_path: std::path::PathBuf::new(),
+        }
+    }
+    fn allow_p1() -> FolderPermissionRule {
+        FolderPermissionRule {
+            file_id: Some("p1".into()),
+            folder_id: None,
+            recursive: false,
+            allow: std::iter::once(DriveOperation::SlidesWrite).collect(),
+            deny: std::collections::HashSet::default(),
+            require_lease: false,
+        }
+    }
+    async fn serve_file(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/drive/v3/files/p1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"p1","name":"Deck","mimeType":GOOGLE_SLIDES_MIME_TYPE,"version":"1"
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn run_write_renders_a_dry_run_in_every_format_without_mutating() {
+        for output in [
+            OutputFormat::Table,
+            OutputFormat::Json,
+            OutputFormat::Yaml,
+            OutputFormat::Jsonl,
+        ] {
+            let server = MockServer::start().await;
+            let (drive, slides) = mock_clients(&server).await;
+            serve_file(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/v1/presentations/p1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "revisionId":"rev-1",
+                    "slides":[{"objectId":"s1","pageElements":[{"objectId":"e","shape":{"text":{"textElements":[{"textRun":{"content":"Q3"}}]}}}]}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/presentations/p1:batchUpdate"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+            run_write(&drive, &slides, &opts(true), &[allow_p1()], &output)
+                .await
+                .unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn run_write_reports_a_refusal_as_output_rather_than_an_error() {
+        let server = MockServer::start().await;
+        let (drive, slides) = mock_clients(&server).await;
+        serve_file(&server).await;
+        Mock::given(path("/v1/presentations/p1"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        // No rules and no parents: refused before any Slides read.
+        run_write(&drive, &slides, &opts(true), &[], &OutputFormat::Table)
+            .await
+            .unwrap();
+    }
 }

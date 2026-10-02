@@ -132,4 +132,83 @@ mod tests {
         assert!(!text.contains('\u{1b}'));
         assert!(text.contains("edit access required"));
     }
+
+    use crate::drive::slides::client::test_support::mock_clients;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn serve(server: &MockServer, endpoint: &str, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(response)
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+    fn api_error(code: u16, status: &str) -> ResponseTemplate {
+        ResponseTemplate::new(code).set_body_json(
+            serde_json::json!({"error":{"code":code,"status":status,"message":"nope"}}),
+        )
+    }
+
+    #[tokio::test]
+    async fn run_info_succeeds_in_every_output_format() {
+        for output in [
+            OutputFormat::Table,
+            OutputFormat::Json,
+            OutputFormat::Yaml,
+            OutputFormat::Yamls,
+            OutputFormat::Jsonl,
+        ] {
+            let server = MockServer::start().await;
+            let (drive, slides) = mock_clients(&server).await;
+            serve(
+                &server,
+                "/v1/presentations/p1",
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "title": "Deck", "revisionId": "rev-1",
+                    "slides": [{"objectId":"s1","pageElements":[{"objectId":"e"}]}]
+                })),
+            )
+            .await;
+            run_info(&drive, &slides, "p1", &output).await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn run_info_explains_a_target_that_is_not_a_presentation() {
+        let server = MockServer::start().await;
+        let (drive, slides) = mock_clients(&server).await;
+        serve(&server, "/v1/presentations/p1", api_error(404, "NOT_FOUND")).await;
+        serve(
+            &server,
+            "/drive/v3/files/p1",
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"p1","name":"Budget","mimeType":crate::drive::types::GOOGLE_SHEET_MIME_TYPE
+            })),
+        )
+        .await;
+        let err = run_info(&drive, &slides, "p1", &OutputFormat::Json)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a Google Slides presentation"), "{err}");
+        assert!(err.contains("drive slides info"), "{err}");
+    }
+    #[tokio::test]
+    async fn run_info_keeps_the_slides_error_when_the_target_cannot_be_classified() {
+        let server = MockServer::start().await;
+        let (drive, slides) = mock_clients(&server).await;
+        serve(
+            &server,
+            "/v1/presentations/p1",
+            api_error(403, "PERMISSION_DENIED"),
+        )
+        .await;
+        serve(&server, "/drive/v3/files/p1", ResponseTemplate::new(404)).await;
+        let err = run_info(&drive, &slides, "p1", &OutputFormat::Json)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Slides API request failed"), "{err}");
+    }
 }
