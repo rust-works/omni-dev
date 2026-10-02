@@ -4446,6 +4446,11 @@ revision](#every-edit-is-leased-against-a-revision).
 If it happens repeatedly, the document is being actively edited; `--dry-run`
 first to see what your change would touch.
 
+`drive slides replace` also asserts its freshly read revision. A Slides
+`stale-revision` outcome means no change was applied; re-run against the current
+deck. Unrecognized error wording remains `failed` with the server diagnostic.
+See [Slides](#slides).
+
 ### `Refused: … returned no revision id`
 
 ```bash
@@ -4454,6 +4459,8 @@ Refused: 'Roadmap' returned no revision id, which Google sends only to
 callers with edit access — so this write cannot be leased against a known
 version. Request edit access, or check the account in use.
 ```
+
+This also applies to `drive slides replace`.
 
 The account can *read* the document but not edit it. Google signals that by
 omitting the revision id, and rather than attempt a write that would fail
