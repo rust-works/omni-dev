@@ -388,6 +388,10 @@ pub enum DriveOperation {
     /// Default-deny and lease-exempt: recovery is provided by Drive Trash.
     /// A future permanent delete must use separate consent, never this variant.
     Trash,
+    /// Replace text on ordinary Google Slides pages (ADR-0093).
+    /// Existing Edit/DocsWrite/SheetsWrite grants never authorize Slides.
+    /// Object deletion must receive its own operation and explicit consent.
+    SlidesWrite,
 }
 
 impl std::fmt::Display for DriveOperation {
@@ -405,6 +409,7 @@ impl std::fmt::Display for DriveOperation {
             Self::SheetsProtection => "sheets-protection",
             Self::DocsWrite => "docs-write",
             Self::Trash => "trash",
+            Self::SlidesWrite => "slides-write",
         };
         write!(f, "{s}")
     }
@@ -427,7 +432,8 @@ impl DriveOperation {
             | Self::SheetsDelete
             | Self::SheetsProtection
             | Self::DocsWrite
-            | Self::Trash => Verdict::Deny,
+            | Self::Trash
+            | Self::SlidesWrite => Verdict::Deny,
         }
     }
 
@@ -455,7 +461,8 @@ impl DriveOperation {
             | Self::SheetsStructure
             | Self::SheetsDelete
             | Self::SheetsProtection
-            | Self::DocsWrite => true,
+            | Self::DocsWrite
+            | Self::SlidesWrite => true,
         }
     }
 }
@@ -1252,6 +1259,46 @@ mod tests {
         let decision = resolve(&chain(&["f"]), DriveOperation::SheetsStructure, &[]);
         assert_eq!(decision.verdict, Verdict::Deny);
         assert!(decision.decided_by.is_none());
+    }
+
+    #[test]
+    fn slides_write_is_a_distinct_default_deny_leased_operation() {
+        assert_eq!(DriveOperation::SlidesWrite.to_string(), "slides-write");
+        assert!(DriveOperation::SlidesWrite.ever_requires_lease());
+        assert_eq!(
+            serde_json::to_string(&DriveOperation::SlidesWrite).unwrap(),
+            "\"slides-write\""
+        );
+        assert_eq!(
+            resolve(&chain(&["target"]), DriveOperation::SlidesWrite, &[]).verdict,
+            Verdict::Deny
+        );
+        for granted in [
+            DriveOperation::Edit,
+            DriveOperation::DocsWrite,
+            DriveOperation::SheetsWrite,
+        ] {
+            let rules = [rule("target", true, &[granted], &[])];
+            assert_eq!(
+                resolve(&chain(&["target"]), DriveOperation::SlidesWrite, &rules).verdict,
+                Verdict::Deny
+            );
+        }
+        let rules = [rule("target", true, &[DriveOperation::SlidesWrite], &[])];
+        assert_eq!(
+            resolve(&chain(&["target"]), DriveOperation::SlidesWrite, &rules).verdict,
+            Verdict::Allow
+        );
+        for other in [
+            DriveOperation::Edit,
+            DriveOperation::DocsWrite,
+            DriveOperation::SheetsWrite,
+        ] {
+            assert_eq!(
+                resolve(&chain(&["target"]), other, &rules).verdict,
+                Verdict::Deny
+            );
+        }
     }
 
     #[test]

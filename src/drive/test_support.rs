@@ -13,6 +13,7 @@ use crate::drive::auth::{
 };
 use crate::drive::docs::client::DOCS_API_URL;
 use crate::drive::sheets::client::SHEETS_API_URL;
+use crate::drive::slides::client::SLIDES_API_URL;
 
 /// Process-wide mutex serialising tests that mutate `HOME` and the Drive
 /// credential environment variables.
@@ -36,7 +37,7 @@ impl EnvGuard {
         let lock = DRIVE_ENV_MUTEX
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // The three `*_API_URL` host overrides are snapshotted for two
+        // The four `*_API_URL` host overrides are snapshotted for two
         // reasons: a developer with one exported must not silently redirect
         // a test's requests, and a test that points one at a local server
         // must not leak that setting into the next test. Their absence here
@@ -54,6 +55,7 @@ impl EnvGuard {
             DRIVE_API_URL,
             SHEETS_API_URL,
             DOCS_API_URL,
+            SLIDES_API_URL,
         ];
         let snapshot = keys
             .into_iter()
@@ -84,6 +86,7 @@ impl EnvGuard {
         std::env::remove_var(DRIVE_API_URL);
         std::env::remove_var(SHEETS_API_URL);
         std::env::remove_var(DOCS_API_URL);
+        std::env::remove_var(SLIDES_API_URL);
         dir
     }
 
@@ -102,6 +105,7 @@ impl EnvGuard {
         std::env::set_var(DRIVE_API_URL, "http://127.0.0.1:1");
         std::env::set_var(SHEETS_API_URL, "http://127.0.0.1:1");
         std::env::set_var(DOCS_API_URL, "http://127.0.0.1:1");
+        std::env::set_var(SLIDES_API_URL, "http://127.0.0.1:1");
     }
 }
 

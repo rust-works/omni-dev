@@ -837,3 +837,13 @@ field is `#[serde(default)]` and every optional field is `skip_serializing_if`.
 A newer reader never chokes on an older line, and an older reader never chokes on
 a newer one — the same forward-rolling contract the daemon wire types use. The
 record id is time-sortable, so sorting lines by `id` ≈ sorting by time.
+
+### Slides replacement
+
+`drive slides replace` records operation `slides-replace` in `drivemutation`
+records. Outcomes include `replaced`, `blocked`, `stale-revision`, lease refusals,
+and `applied-response-unreadable` (HTTP success; inspect before retrying). Records
+include file identity, revision and server-reported occurrences when available.
+Search/replacement prose and server diagnostics are excluded because an error
+may echo request text. Dry runs emit no mutation record. Drive lease audit pairs
+use `slides-replace` and conclude an unreadable successful response as `allowed`.

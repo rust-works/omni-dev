@@ -41,6 +41,8 @@ pub enum OperationArg {
     DocsWrite,
     /// Moving an individual file to Trash or restoring it.
     Trash,
+    /// Replacing text on ordinary Slides pages.
+    SlidesWrite,
 }
 
 impl From<OperationArg> for DriveOperation {
@@ -56,6 +58,7 @@ impl From<OperationArg> for DriveOperation {
             OperationArg::SheetsProtection => Self::SheetsProtection,
             OperationArg::DocsWrite => Self::DocsWrite,
             OperationArg::Trash => Self::Trash,
+            OperationArg::SlidesWrite => Self::SlidesWrite,
         }
     }
 }
@@ -275,6 +278,14 @@ fn print_report(report: &CheckReport) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn slides_operation_maps_to_the_distinct_engine_grant() {
+        assert_eq!(
+            super::DriveOperation::from(super::OperationArg::SlidesWrite),
+            super::DriveOperation::SlidesWrite
+        );
+    }
+
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::utils::secret::Secret;
