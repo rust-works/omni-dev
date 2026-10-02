@@ -145,7 +145,7 @@ impl VerifyDecisionCommand {
 
 /// Resolves `<ISSUE>` and fetches everything `verify-decision` needs.
 /// **Blocking** — callers must be on a blocking thread.
-fn fetch_input(
+pub(crate) fn fetch_input(
     bin: &Path,
     cache: &IssueCache,
     cwd: &Path,

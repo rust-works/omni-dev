@@ -18,7 +18,7 @@ use crate::jev::protocol::{Answer, SystemOneResponse, Usage};
 /// with different variants would be confusing — do not re-export this type
 /// from `crate::cli::ai`.
 #[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum JevFormat {
+pub(crate) enum JevFormat {
     /// Pretty-printed JSON (default).
     #[default]
     Json,
@@ -161,7 +161,7 @@ struct WithGithubCache<'a, T> {
 /// [`format_output`] for a report whose GitHub input may have come from the
 /// cache: `cache_use` is added as `github_cache`, and omitted when `None`, so
 /// a run that reused nothing prints exactly what it did before the cache.
-pub(super) fn format_output_with_cache<T: Serialize>(
+pub(crate) fn format_output_with_cache<T: Serialize>(
     value: &T,
     cache_use: Option<CacheUsage>,
     format: JevFormat,

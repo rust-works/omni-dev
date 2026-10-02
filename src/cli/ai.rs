@@ -2,7 +2,7 @@
 
 mod chat;
 mod claude;
-mod jev;
+pub(crate) mod jev;
 
 pub use chat::{run_chat, ChatCommand};
 pub use claude::skills::{run_clean, run_status, run_sync, OutputFormat, SkillsFormat};

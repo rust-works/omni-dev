@@ -66,3 +66,10 @@ impl JevCommand {
         }
     }
 }
+
+#[cfg(feature = "mcp")]
+pub(crate) use common::{format_output_with_cache, JevFormat};
+#[cfg(feature = "mcp")]
+pub(crate) use route::{build_ladders, fetch_docs};
+#[cfg(feature = "mcp")]
+pub(crate) use verify_decision::fetch_input;

@@ -46,6 +46,7 @@ impl OmniDevServer {
             + Self::confluence_tool_router()
             + Self::atlassian_tool_router()
             + Self::ai_tool_router()
+            + Self::jev_tool_router()
             + Self::config_tool_router()
             + Self::datadog_tool_router()
             + Self::gmail_tool_router()
