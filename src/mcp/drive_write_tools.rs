@@ -423,30 +423,12 @@ async fn run_docs_write(
 }
 
 fn append_text(params: &DriveDocsAppendParams) -> Result<String> {
-    anyhow::ensure!(
-        params.text.is_none() || params.text_path.is_none(),
-        "Provide either text or text_path, not both"
-    );
-    if let Some(path) = &params.text_path {
-        anyhow::ensure!(
-            path != "-",
-            "text_path must be a file; stdin is unsupported"
-        );
-        anyhow::ensure!(
-            std::fs::metadata(path)?.len() <= crate::drive::files_api::MAX_UPLOAD_BYTES,
-            "text_path exceeds the upload byte cap"
-        );
-    }
-    let text = super::content_input::require_content_input(
+    super::content_input::require_bounded_content_input(
         params.text.as_deref(),
         params.text_path.as_deref(),
         "text",
-    )?;
-    anyhow::ensure!(
-        text.len() as u64 <= crate::drive::files_api::MAX_UPLOAD_BYTES,
-        "text exceeds the upload byte cap"
-    );
-    Ok(text)
+        crate::drive::files_api::MAX_UPLOAD_BYTES,
+    )
 }
 
 fn parse_values_format(value: Option<&str>) -> Result<ValuesFormat> {
@@ -487,7 +469,13 @@ fn sheets_values(params: &DriveSheetsWriteParams) -> Result<Vec<Vec<String>>> {
                 path != "-",
                 "values_path must be a file; stdin is unsupported"
             );
-            crate::cli::drive::sheets::write::read_values(path, format)
+            let content = super::content_input::require_bounded_content_input(
+                None,
+                Some(path),
+                "values",
+                crate::drive::files_api::MAX_UPLOAD_BYTES,
+            )?;
+            crate::cli::drive::sheets::values::parse(&content, format.resolve(path))
         }
         (None, None) => anyhow::bail!("Provide either values or values_path"),
     }
