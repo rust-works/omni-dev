@@ -2977,3 +2977,126 @@ async fn jev_tools_publish_schemas_and_reject_invalid_requests() -> Result<()> {
     let _ = server_handle.await;
     Ok(())
 }
+
+/// Exercise the production handlers in an isolated child environment: no
+/// process-wide environment changes can race with other integration tests.
+#[cfg(unix)]
+#[tokio::test]
+async fn jev_tools_return_reports_through_the_mcp_binary() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    use wiremock::{
+        matchers::{body_partial_json, method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    let temp = tempfile::tempdir()?;
+    let gh = temp.path().join("fake-gh");
+    let issue = serde_json::json!({
+        "title":"Small change", "body":"Change a setting", "state":"OPEN",
+        "url":"https://github.com/o/r/issues/1",
+        "comments":{"totalCount":1,"nodes":[{
+            "databaseId":123,"author":{"login":"human"},"body":"Use the existing default."
+        }]}, "closedByPullRequestsReferences":{"nodes":[]}
+    });
+    fs::write(&gh, format!("#!/bin/sh\ncase \"$1\" in\nauth) echo test-token ;;\napi) cat <<'JSON'\n{{\"data\":{{\"r0\":{{\"i0\":{issue}}}}}}}\nJSON\n;;\nesac\n"))?;
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))?;
+    let draft = temp.path().join("draft.md");
+    fs::write(&draft, "Local preview")?;
+
+    let mock = MockServer::start().await;
+    let choice = |name: &str| {
+        serde_json::json!({
+            "type":"choice","choice":name,"confidence":0.9,"probabilities":{name:0.9}
+        })
+    };
+    for (model, answers) in [
+        (
+            "jev-test",
+            serde_json::json!({
+                "open_questions":choice("none"), "anthropic.stage_design":choice("none"),
+                "anthropic.stage_implement":choice("sonnet"), "anthropic.stage_review":choice("sonnet")
+            }),
+        ),
+        ("jev-bad", serde_json::json!({})),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(body_partial_json(serde_json::json!({"model":model})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model":"jev-mock", "answers":answers,"usage":{"input_tokens":11,"output_tokens":3}
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+    }
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_omni-dev-mcp"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", temp.path())
+        .env("OMNI_DEV_GH_BIN", &gh)
+        .env("TYPESAFE_API_KEY", "test-key")
+        .env("OMNI_DEV_JEV_BASE_URL", mock.uri())
+        .env("OMNI_DEV_GITHUB_CACHE_TTL_SECS", "0")
+        .env("OMNI_DEV_AI_BACKEND", "default")
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .current_dir(temp.path())
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let client = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        TestClient.serve((stdout, stdin)),
+    )
+    .await??;
+
+    for (model, failed) in [("jev-test", false), ("jev-bad", true)] {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20),
+            client.call_tool(CallToolRequestParams::new("jev_route").with_arguments(
+                serde_json::json!({"issues":["o/r#1"],"jev_model":model,"draft_comment":[draft]})
+                    .as_object().unwrap().clone()))).await??;
+        assert_eq!(result.is_error, Some(failed));
+        let ContentBlock::Text(text) = &result.content[0] else {
+            panic!("text report");
+        };
+        let report: serde_json::Value = serde_json::from_str(&text.text)?;
+        assert_eq!(report["model"], "jev-mock");
+        assert_eq!(report["usage"]["input_tokens"], 11);
+        assert_eq!(
+            report["issues"][0]["draft_comments"][0],
+            draft.to_str().unwrap()
+        );
+        if failed {
+            assert!(report["issues"][0]["error"].is_string());
+        } else {
+            assert_eq!(
+                report["issues"][0]["providers"]["anthropic"]["class"],
+                "sonnet"
+            );
+        }
+    }
+    let result = tokio::time::timeout(std::time::Duration::from_secs(20),
+        client.call_tool(CallToolRequestParams::new("jev_verify_decision").with_arguments(
+            serde_json::json!({"issue":"o/r#1","comment":"123","model":"claude-sonnet-4-6","output":"yaml"})
+                .as_object().unwrap().clone()))).await??;
+    assert_eq!(result.is_error, Some(false));
+    let ContentBlock::Text(text) = &result.content[0] else {
+        panic!("text report");
+    };
+    let report: serde_json::Value = serde_yaml::from_str(&text.text)?;
+    assert_eq!(report["verdict"], "needs_review");
+    assert_eq!(report["comment"]["id"], 123);
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "uncited verification must not call Jev");
+    for request in requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+        assert!(body["state"].as_str().unwrap().contains("Local preview"));
+    }
+    client.cancel().await?;
+    child.kill().await?;
+    Ok(())
+}
