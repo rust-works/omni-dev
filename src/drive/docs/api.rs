@@ -430,11 +430,24 @@ mod tests {
     /// that way. This closes both, and also pins §4's claim that no
     /// destructive request is constructible.
     #[test]
-    fn no_destructive_or_unleased_request_is_reachable() {
+    fn no_unleased_or_unmodelled_destructive_request_is_reachable() {
         let sources = [
             ("api.rs", include_str!("api.rs")),
             ("write_types.rs", include_str!("write_types.rs")),
+            ("write.rs", include_str!("write.rs")),
+            ("anchor.rs", include_str!("anchor.rs")),
+            ("create.rs", include_str!("create.rs")),
+            ("client.rs", include_str!("client.rs")),
+            ("types.rs", include_str!("types.rs")),
+            ("structure.rs", include_str!("structure.rs")),
+            ("target.rs", include_str!("target.rs")),
+            ("read.rs", include_str!("read.rs")),
+            (
+                "cli/write.rs",
+                include_str!("../../cli/drive/docs/write.rs"),
+            ),
         ];
+        let mut deletion_renames = 0;
         for (name, source) in sources {
             // Production code only: the tests and docs below deliberately
             // name the things they assert the absence of.
@@ -453,8 +466,12 @@ mod tests {
                     "{name}:{}: the Docs write path must never bypass the lease: {line}",
                     number + 1
                 );
-                let destroys = code.contains("deleteContentRange")
-                    || code.contains("deletePositionedObject")
+                if code.contains("deleteContentRange") {
+                    assert_eq!(name, "write_types.rs");
+                    assert_eq!(code, "#[serde(rename = \"deleteContentRange\")]");
+                    deletion_renames += 1;
+                }
+                let destroys = code.contains("deletePositionedObject")
                     || code.contains("deleteTableRow")
                     || code.contains("deleteTableColumn");
                 assert!(
@@ -464,5 +481,6 @@ mod tests {
                 );
             }
         }
+        assert_eq!(deletion_renames, 1, "exactly one typed deletion request");
     }
 }

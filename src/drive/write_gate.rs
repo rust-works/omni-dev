@@ -383,6 +383,8 @@ pub enum DriveOperation {
     /// must not silently become consent to remove content tomorrow. When
     /// deletion is designed it needs its own operation, or explicit
     /// re-consent. Same rule ADR-0075 §1 records for `sheets-structure`.
+    /// Anchored insertion joins this operation because, like append, it only
+    /// adds text. Deletion is gated separately by `DocsDelete` (ADR-0094).
     DocsWrite,
     /// Moving an individual file to Trash or restoring it (ADR-0092).
     /// Default-deny and lease-exempt: recovery is provided by Drive Trash.
@@ -392,6 +394,10 @@ pub enum DriveOperation {
     /// Existing Edit/DocsWrite/SheetsWrite grants never authorize Slides.
     /// Object deletion must receive its own operation and explicit consent.
     SlidesWrite,
+    /// Anchor-addressed document content removal. Separate from `DocsWrite`:
+    /// an existing text-write grant must never silently widen to deletion.
+    /// Future structural/object deletion verbs need their own explicit decision.
+    DocsDelete,
 }
 
 impl std::fmt::Display for DriveOperation {
@@ -410,6 +416,7 @@ impl std::fmt::Display for DriveOperation {
             Self::DocsWrite => "docs-write",
             Self::Trash => "trash",
             Self::SlidesWrite => "slides-write",
+            Self::DocsDelete => "docs-delete",
         };
         write!(f, "{s}")
     }
@@ -433,7 +440,8 @@ impl DriveOperation {
             | Self::SheetsProtection
             | Self::DocsWrite
             | Self::Trash
-            | Self::SlidesWrite => Verdict::Deny,
+            | Self::SlidesWrite
+            | Self::DocsDelete => Verdict::Deny,
         }
     }
 
@@ -462,7 +470,8 @@ impl DriveOperation {
             | Self::SheetsDelete
             | Self::SheetsProtection
             | Self::DocsWrite
-            | Self::SlidesWrite => true,
+            | Self::SlidesWrite
+            | Self::DocsDelete => true,
         }
     }
 }
@@ -1082,6 +1091,7 @@ mod tests {
             DriveOperation::SheetsDelete,
             DriveOperation::SheetsProtection,
             DriveOperation::DocsWrite,
+            DriveOperation::DocsDelete,
         ] {
             assert!(op.ever_requires_lease(), "{op:?} should be lease-eligible");
         }
@@ -1209,6 +1219,7 @@ mod tests {
             DriveOperation::SheetsProtection,
             DriveOperation::DocsWrite,
             DriveOperation::Trash,
+            DriveOperation::DocsDelete,
         ] {
             let wire = serde_json::to_string(&op).unwrap();
             assert_eq!(

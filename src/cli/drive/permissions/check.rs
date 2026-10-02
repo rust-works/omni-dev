@@ -43,6 +43,8 @@ pub enum OperationArg {
     Trash,
     /// Replacing text on ordinary Slides pages.
     SlidesWrite,
+    /// Anchor-addressed content deletion; separate from docs-write.
+    DocsDelete,
 }
 
 impl From<OperationArg> for DriveOperation {
@@ -59,6 +61,7 @@ impl From<OperationArg> for DriveOperation {
             OperationArg::DocsWrite => Self::DocsWrite,
             OperationArg::Trash => Self::Trash,
             OperationArg::SlidesWrite => Self::SlidesWrite,
+            OperationArg::DocsDelete => Self::DocsDelete,
         }
     }
 }
@@ -825,5 +828,12 @@ mod tests {
             "a file_id rule must not grant a folder target"
         );
         assert_eq!(evaluated.decision.decided_by, None);
+    }
+    #[test]
+    fn docs_delete_operation_arg_maps_to_the_separate_gate() {
+        assert_eq!(
+            DriveOperation::from(OperationArg::DocsDelete),
+            DriveOperation::DocsDelete
+        );
     }
 }

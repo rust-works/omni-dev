@@ -3,11 +3,12 @@
 use std::io::Read;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 use crate::cli::drive::format::{output_as, sanitize_for_terminal, OutputFormat};
 use crate::cli::drive::helpers;
 use crate::drive::client::DriveClient;
+use crate::drive::docs::anchor::Side;
 use crate::drive::docs::client::DocsClient;
 use crate::drive::docs::write::{describe, write, WriteOptions, WritePayload};
 use crate::drive::write_gate::FolderPermissionRule;
@@ -74,6 +75,137 @@ pub struct AppendCommand {
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
+}
+
+/// Inserts text next to one unique body anchor, under docs-write.
+#[derive(Parser)]
+#[command(group(ArgGroup::new("anchor").required(true).args(["before", "after"])))]
+pub struct InsertCommand {
+    /// Document id.
+    pub document_id: String,
+    /// Insert before this unique literal text (within one paragraph).
+    #[arg(long)]
+    pub before: Option<String>,
+    /// Insert after this unique literal text (within one paragraph).
+    #[arg(long)]
+    pub after: Option<String>,
+    /// Text to insert.
+    #[arg(
+        long,
+        conflicts_with = "text_file",
+        required_unless_present = "text_file"
+    )]
+    pub text: Option<String>,
+    /// Read insertion text from a file, or `-` for stdin.
+    #[arg(long, value_name = "PATH")]
+    pub text_file: Option<String>,
+    /// Match anchors case-insensitively using Unicode simple case folding.
+    #[arg(long)]
+    pub ignore_case: bool,
+    /// Resolve and report the UTF-16 insertion point without writing.
+    #[arg(long)]
+    pub dry_run: bool,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+/// Deletes one unique match or an inclusive anchor range, under docs-delete.
+#[derive(Parser)]
+#[command(group(ArgGroup::new("selection").required(true).args(["match_text", "from"])))]
+pub struct DeleteCommand {
+    /// Document id.
+    pub document_id: String,
+    /// Remove this unique literal match (within one paragraph).
+    #[arg(long = "match", conflicts_with = "to")]
+    pub match_text: Option<String>,
+    /// Remove from the start of this unique anchor, inclusively.
+    #[arg(long, requires = "to")]
+    pub from: Option<String>,
+    /// Remove through the end of this unique anchor, inclusively.
+    #[arg(long, requires = "from")]
+    pub to: Option<String>,
+    /// Match anchors case-insensitively using Unicode simple case folding.
+    #[arg(long)]
+    pub ignore_case: bool,
+    /// Resolve and report the UTF-16 range without writing.
+    #[arg(long)]
+    pub dry_run: bool,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl InsertCommand {
+    /// Resolve an anchor and insert through the shared gated engine.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let docs = DocsClient::from_drive_client(client)?;
+        let (anchor, side) = match (self.before, self.after) {
+            (Some(anchor), None) => (anchor, Side::Before),
+            (None, Some(anchor)) => (anchor, Side::After),
+            _ => anyhow::bail!("exactly one of --before or --after is required"),
+        };
+        let text = match (self.text, self.text_file.as_deref()) {
+            (Some(text), None) => text,
+            (None, Some(source)) => read_text(source)?,
+            _ => anyhow::bail!("exactly one of --text or --text-file is required"),
+        };
+        let opts = WriteOptions {
+            document_id: self.document_id,
+            payload: WritePayload::Insert {
+                anchor,
+                side,
+                text,
+                match_case: !self.ignore_case,
+            },
+            dry_run: self.dry_run,
+            lease_token: self.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+        };
+        run_write(
+            client,
+            &docs,
+            &opts,
+            &helpers::active_account_rules()?,
+            &self.output,
+        )
+        .await
+    }
+}
+
+impl DeleteCommand {
+    /// Resolve a range and delete through the separately gated engine.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        let docs = DocsClient::from_drive_client(client)?;
+        let (from, to) = match (self.match_text, self.from, self.to) {
+            (Some(text), None, None) => (text, None),
+            (None, Some(from), Some(to)) => (from, Some(to)),
+            _ => anyhow::bail!("use --match or both --from and --to"),
+        };
+        let opts = WriteOptions {
+            document_id: self.document_id,
+            payload: WritePayload::Delete {
+                from,
+                to,
+                match_case: !self.ignore_case,
+            },
+            dry_run: self.dry_run,
+            lease_token: self.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+        };
+        run_write(
+            client,
+            &docs,
+            &opts,
+            &helpers::active_account_rules()?,
+            &self.output,
+        )
+        .await
+    }
 }
 
 impl ReplaceCommand {
@@ -254,5 +386,56 @@ mod tests {
         .is_err());
         assert!(AppendCommand::try_parse_from(["append", "d1", "--text", "x"]).is_ok());
         assert!(AppendCommand::try_parse_from(["append", "d1", "--text-file", "f.txt"]).is_ok());
+    }
+    #[test]
+    fn insert_requires_one_anchor_and_one_text_source() {
+        assert!(InsertCommand::try_parse_from(["insert", "d", "--text", "x"]).is_err());
+        assert!(InsertCommand::try_parse_from([
+            "insert", "d", "--before", "a", "--after", "b", "--text", "x"
+        ])
+        .is_err());
+        assert!(InsertCommand::try_parse_from(["insert", "d", "--before", "a"]).is_err());
+        assert!(InsertCommand::try_parse_from([
+            "insert",
+            "d",
+            "--before",
+            "a",
+            "--text",
+            "x",
+            "--text-file",
+            "f"
+        ])
+        .is_err());
+        assert!(
+            InsertCommand::try_parse_from(["insert", "d", "--after", "a", "--text-file", "f"])
+                .is_ok()
+        );
+        let cmd =
+            InsertCommand::try_parse_from(["insert", "d", "--before", "a", "--text", "x"]).unwrap();
+        assert!(!cmd.ignore_case);
+    }
+
+    #[test]
+    fn delete_requires_a_match_or_both_range_anchors() {
+        for args in [
+            vec!["delete", "d"],
+            vec!["delete", "d", "--from", "a"],
+            vec!["delete", "d", "--to", "b"],
+            vec!["delete", "d", "--match", "x", "--to", "b"],
+            vec!["delete", "d", "--match", "x", "--from", "a", "--to", "b"],
+        ] {
+            assert!(DeleteCommand::try_parse_from(args).is_err());
+        }
+        assert!(DeleteCommand::try_parse_from(["delete", "d", "--from", "a", "--to", "b"]).is_ok());
+        assert!(
+            !DeleteCommand::try_parse_from(["delete", "d", "--match", "x"])
+                .unwrap()
+                .ignore_case
+        );
+        assert!(
+            DeleteCommand::try_parse_from(["delete", "d", "--match", "x", "--ignore-case"])
+                .unwrap()
+                .ignore_case
+        );
     }
 }

@@ -14,10 +14,8 @@
 //!   `Vec`, and its `write_control` is **not** `Option`.
 //!
 //! [`DocsRequest`] models only the requests the typed verbs need.
-//! `deleteContentRange` has no representation here at all — not a variant,
-//! not a struct, not a string constant — which is what makes "`omni-dev`
-//! cannot delete document content" a property of the build rather than a
-//! promise in prose (ADR-0076 §4, adopting ADR-0075 §4's stance).
+//! Anchored insertion and deletion use indices resolved from the leased snapshot
+//! (ADR-0094). Unmodelled destructive requests remain guarded by a source test.
 
 use serde::{Deserialize, Serialize};
 
@@ -79,9 +77,7 @@ impl BatchUpdateDocumentRequest {
 /// Externally tagged, matching the API's own wire shape: a `Request` is an
 /// object with exactly one populated field naming the operation.
 ///
-/// **Only the requests the typed verbs need are modelled.** There is no
-/// `deleteContentRange` variant, and adding one is a deliberate act guarded
-/// by `no_destructive_or_unleased_request_is_reachable`.
+/// Only requests consumed by the gated engines are modelled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum DocsRequest {
     /// Replace every occurrence of some text.
@@ -90,6 +86,9 @@ pub enum DocsRequest {
     /// Insert text at the end of a segment.
     #[serde(rename = "insertText")]
     InsertText(InsertTextRequest),
+    /// Delete an anchor-resolved content range under `DocsDelete`.
+    #[serde(rename = "deleteContentRange")]
+    DeleteContentRange(DeleteContentRangeRequest),
 }
 
 /// A `replaceAllText` request.
@@ -124,19 +123,56 @@ pub struct SubstringMatchCriteria {
 
 /// An `insertText` request.
 ///
-/// Only the `endOfSegmentLocation` arm of the API's location union is
-/// modelled. The other arm takes an explicit numeric `index`, and modelling
-/// it would put UTF-16 index arithmetic into this crate — wrong for
-/// astral-plane characters in a way that corrupts silently — as well as
-/// reintroducing the off-by-one at a segment's trailing newline. ADR-0076
-/// §5 records that as the entry cost `--index` insertion must pay.
+/// Location is a union, preserving the existing append wire shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InsertTextRequest {
     /// The text to insert.
     pub text: String,
-    /// Where it goes: the end of the body segment of the first tab.
+    /// Exactly one location arm.
+    #[serde(flatten)]
+    pub location: InsertLocation,
+}
+
+/// The two supported insert locations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum InsertLocation {
+    /// Append to the first tab's body.
     #[serde(rename = "endOfSegmentLocation")]
-    pub end_of_segment_location: EndOfSegmentLocation,
+    EndOfSegment(EndOfSegmentLocation),
+    /// Anchor-resolved UTF-16 index in a tab body.
+    #[serde(rename = "location")]
+    At(Location),
+}
+
+/// A body insertion point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Location {
+    /// Server UTF-16 index.
+    pub index: i64,
+    /// Omitted only for legacy top-level bodies.
+    #[serde(rename = "tabId", skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+}
+
+/// A body content range with explicit tab identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContentRange {
+    /// Inclusive server UTF-16 start.
+    #[serde(rename = "startIndex")]
+    pub start_index: i64,
+    /// Exclusive server UTF-16 end.
+    #[serde(rename = "endIndex")]
+    pub end_index: i64,
+    /// Omitted only for legacy top-level bodies.
+    #[serde(rename = "tabId", skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+}
+
+/// A single typed deletion request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeleteContentRangeRequest {
+    /// Anchor-resolved range, with no segment id (body only).
+    pub range: ContentRange,
 }
 
 /// The end of a segment.
@@ -167,7 +203,30 @@ impl DocsRequest {
     pub fn insert_text_at_end(text: &str) -> Self {
         Self::InsertText(InsertTextRequest {
             text: text.to_string(),
-            end_of_segment_location: EndOfSegmentLocation::default(),
+            location: InsertLocation::EndOfSegment(EndOfSegmentLocation::default()),
+        })
+    }
+    /// Insert at an anchor-resolved point.
+    #[must_use]
+    pub(in crate::drive) fn insert_text_at(text: &str, edit: &super::anchor::EditPreview) -> Self {
+        Self::InsertText(InsertTextRequest {
+            text: text.to_owned(),
+            location: InsertLocation::At(Location {
+                index: edit.start_index,
+                tab_id: edit.tab_id.clone(),
+            }),
+        })
+    }
+
+    /// Delete the range resolved from this invocation's snapshot.
+    #[must_use]
+    pub(in crate::drive) fn delete_range(edit: &super::anchor::EditPreview) -> Self {
+        Self::DeleteContentRange(DeleteContentRangeRequest {
+            range: ContentRange {
+                start_index: edit.start_index,
+                end_index: edit.end_index,
+                tab_id: edit.tab_id.clone(),
+            },
         })
     }
 }
@@ -351,5 +410,34 @@ mod tests {
             serde_json::from_value(serde_json::json!({"documentId": "d1"})).unwrap();
         assert!(response.replies.is_empty());
         assert_eq!(response.occurrences_changed(), None);
+    }
+    #[test]
+    fn anchored_wire_shapes_include_tab_identity_and_exactly_one_leased_request() {
+        let edit = super::super::anchor::EditPreview {
+            start_index: 4,
+            end_index: 10,
+            tab_id: Some("child-tab".into()),
+            paragraphs: 1,
+            chars: 6,
+            bytes: 6,
+        };
+        let insert = serde_json::to_value(BatchUpdateDocumentRequest::new(
+            DocsRequest::insert_text_at("hi", &edit),
+            "rev",
+        ))
+        .unwrap();
+        assert_eq!(
+            insert["requests"][0]["insertText"],
+            serde_json::json!({"text": "hi", "location": {"index": 4, "tabId": "child-tab"}})
+        );
+        let delete = serde_json::to_value(BatchUpdateDocumentRequest::new(
+            DocsRequest::delete_range(&edit),
+            "rev",
+        ))
+        .unwrap();
+        assert_eq!(
+            delete,
+            serde_json::json!({"requests": [{"deleteContentRange": {"range": {"startIndex": 4, "endIndex": 10, "tabId": "child-tab"}}}], "writeControl": {"requiredRevisionId": "rev"}})
+        );
     }
 }

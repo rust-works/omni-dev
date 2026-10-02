@@ -19,8 +19,8 @@
 //!   chars, not bytes. Any code deriving an index from a `&str` must use
 //!   `s.encode_utf16().count()`. The difference is invisible in ASCII and
 //!   wrong the moment a document contains an emoji or a CJK astral
-//!   character, so nothing in this crate computes one — see
-//!   `crate::drive::docs::structure`.
+//!   character, so only the anchor resolver computes one — see
+//!   `crate::drive::docs::anchor`.
 //! - **An empty message still serialises as `{}` when present.** A
 //!   `sectionBreak` with no fields set arrives as `"sectionBreak": {}`, so
 //!   the union variants this module does not inspect are modelled as
@@ -552,6 +552,20 @@ pub struct ParagraphElement {
 /// A run of text with uniform styling.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TextRun {
+    /// Pending insertions: unsafe to use as an edit anchor.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "suggestedInsertionIds"
+    )]
+    pub suggested_insertion_ids: Vec<String>,
+    /// Pending deletions: unsafe to include in an edit range.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "suggestedDeletionIds"
+    )]
+    pub suggested_deletion_ids: Vec<String>,
     /// The run's text, including any trailing newline.
     #[serde(default)]
     pub content: String,

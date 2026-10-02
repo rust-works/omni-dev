@@ -34,6 +34,7 @@ use serde::Serialize;
 
 use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
+use crate::drive::docs::anchor::{self, AnchorError, EditPreview, Side};
 use crate::drive::docs::api::{is_stale_revision, DocsApi, SuggestionsViewMode};
 use crate::drive::docs::client::DocsClient;
 use crate::drive::docs::write_types::DocsRequest;
@@ -71,6 +72,26 @@ pub enum WritePayload {
         /// The text to insert.
         text: String,
     },
+    /// Insert next to a unique body anchor.
+    Insert {
+        /// Literal text to locate in the snapshot.
+        anchor: String,
+        /// Which edge of the anchor to use.
+        side: Side,
+        /// Text to insert.
+        text: String,
+        /// Case-sensitive by default.
+        match_case: bool,
+    },
+    /// Delete a unique match or an inclusive pair of anchors.
+    Delete {
+        /// First anchor (or the entire single match).
+        from: String,
+        /// Last anchor, when deleting an inclusive range.
+        to: Option<String>,
+        /// Case-sensitive by default.
+        match_case: bool,
+    },
 }
 
 impl WritePayload {
@@ -80,7 +101,22 @@ impl WritePayload {
         match self {
             Self::Replace { .. } => WriteVerb::Replace,
             Self::Append { .. } => WriteVerb::Append,
+            Self::Insert { .. } => WriteVerb::Insert,
+            Self::Delete { .. } => WriteVerb::Delete,
         }
+    }
+
+    /// Permission vocabulary is independent of the request's wire operation.
+    #[must_use]
+    pub const fn gate_operation(&self) -> DriveOperation {
+        match self {
+            Self::Delete { .. } => DriveOperation::DocsDelete,
+            _ => DriveOperation::DocsWrite,
+        }
+    }
+
+    const fn index_addressed(&self) -> bool {
+        matches!(self, Self::Insert { .. } | Self::Delete { .. })
     }
 
     /// Rejects a payload that cannot produce a valid request, before any
@@ -96,20 +132,41 @@ impl WritePayload {
             Self::Append { text } if text.is_empty() => {
                 Err("nothing to append: the text is empty".to_string())
             }
+            Self::Insert { text, .. } if text.is_empty() => {
+                Err("nothing to insert: the text is empty".to_string())
+            }
+            Self::Insert { anchor, .. } if anchor.is_empty() || anchor.contains(['\n', '\r']) => {
+                Err("anchor must be nonempty and within one paragraph".to_owned())
+            }
+            Self::Delete { from, to, .. }
+                if from.is_empty()
+                    || from.contains(['\n', '\r'])
+                    || to
+                        .as_ref()
+                        .is_some_and(|to| to.is_empty() || to.contains(['\n', '\r'])) =>
+            {
+                Err("anchors must be nonempty and within one paragraph".to_owned())
+            }
             _ => Ok(()),
         }
     }
 
     /// The single `DocsRequest` this payload sends.
-    fn to_request(&self) -> DocsRequest {
-        match self {
+    fn to_request(&self, edit: Option<&EditPreview>) -> Result<DocsRequest, AnchorError> {
+        Ok(match self {
             Self::Replace {
                 search,
                 replace,
                 match_case,
             } => DocsRequest::replace_all_text(search, replace, *match_case),
             Self::Append { text } => DocsRequest::insert_text_at_end(text),
-        }
+            Self::Insert { text, .. } => {
+                DocsRequest::insert_text_at(text, edit.ok_or(AnchorError::InvalidIndices)?)
+            }
+            Self::Delete { .. } => {
+                DocsRequest::delete_range(edit.ok_or(AnchorError::InvalidIndices)?)
+            }
+        })
     }
 }
 
@@ -120,6 +177,10 @@ pub enum WriteVerb {
     Replace,
     /// Append text to the end of the document.
     Append,
+    /// Anchor-addressed insertion.
+    Insert,
+    /// Anchor-addressed deletion.
+    Delete,
 }
 
 impl WriteVerb {
@@ -132,6 +193,8 @@ impl WriteVerb {
         match self {
             Self::Replace => "docs-replace",
             Self::Append => "docs-append",
+            Self::Insert => "docs-insert",
+            Self::Delete => "docs-delete",
         }
     }
 
@@ -140,6 +203,8 @@ impl WriteVerb {
         match self {
             Self::Replace => "replace",
             Self::Append => "append",
+            Self::Insert => "insert",
+            Self::Delete => "delete",
         }
     }
 }
@@ -183,6 +248,31 @@ pub enum WriteResult {
         chars: usize,
         /// UTF-8 bytes being inserted.
         bytes: usize,
+    },
+    /// Dry-run metadata for insertion.
+    WouldInsert {
+        /// Resolved effect, in UTF-16 units.
+        edit: EditPreview,
+    },
+    /// Dry-run metadata for deletion.
+    WouldDelete {
+        /// Resolved effect, in UTF-16 units.
+        edit: EditPreview,
+    },
+    /// An insertion landed at the resolved position.
+    Inserted {
+        /// The same metadata as the preview.
+        edit: EditPreview,
+    },
+    /// A deletion landed over the resolved range.
+    Deleted {
+        /// The same metadata as the preview.
+        edit: EditPreview,
+    },
+    /// An anchor could not safely identify a unique effect.
+    RefusedAnchor {
+        /// Typed reason containing no anchor text.
+        error: AnchorError,
     },
     /// The target is not a Google Doc.
     RefusedNotADocument {
@@ -273,6 +363,11 @@ impl WriteResult {
         match self {
             Self::WouldReplace { .. } => "would-replace",
             Self::WouldAppend { .. } => "would-append",
+            Self::WouldInsert { .. } => "would-insert",
+            Self::WouldDelete { .. } => "would-delete",
+            Self::Inserted { .. } => "inserted",
+            Self::Deleted { .. } => "deleted",
+            Self::RefusedAnchor { .. } => "refused-anchor",
             Self::RefusedNotADocument { .. } => "refused-not-a-document",
             Self::RefusedShortcut => "refused-shortcut",
             Self::RefusedNoVisibleParents => "refused-no-visible-parents",
@@ -413,7 +508,7 @@ async fn write_inner(
     let evaluated = match folder_ancestry::resolve_decision_for_file_target(
         &files_api,
         &target,
-        DriveOperation::DocsWrite,
+        opts.payload.gate_operation(),
         rules,
     )
     .await
@@ -461,7 +556,14 @@ async fn write_inner(
     // ── The read that mints the lease and computes the preview ─────────
     let api = DocsApi::new(docs);
     let document = match api
-        .get_document(&opts.document_id, SuggestionsViewMode::default())
+        .get_document(
+            &opts.document_id,
+            if opts.payload.index_addressed() {
+                SuggestionsViewMode::Inline
+            } else {
+                SuggestionsViewMode::default()
+            },
+        )
         .await
     {
         Ok(document) => document,
@@ -479,12 +581,38 @@ async fn write_inner(
         return gated(WriteResult::RefusedNoRevisionId, None);
     };
 
+    let edit = match &opts.payload {
+        WritePayload::Insert {
+            anchor,
+            side,
+            text,
+            match_case,
+        } => anchor::resolve_insert(&document, anchor, *side, text, *match_case).map(Some),
+        WritePayload::Delete {
+            from,
+            to,
+            match_case,
+        } => anchor::resolve_delete(&document, from, to.as_deref(), *match_case).map(Some),
+        _ => Ok(None),
+    };
+    let edit = match edit {
+        Ok(edit) => edit,
+        Err(error) => return gated(WriteResult::RefusedAnchor { error }, Some(revision_id)),
+    };
+    // Build before the ledger gate: no fallible work may orphan a pending intent.
+    let request = match opts.payload.to_request(edit.as_ref()) {
+        Ok(request) => request,
+        Err(error) => return gated(WriteResult::RefusedAnchor { error }, Some(revision_id)),
+    };
     // Computed from *this* snapshot, before the dry-run branch, so a dry run
     // and a real run cannot disagree about what they saw (ADR-0076 §7).
-    let preview = match &opts.payload {
-        WritePayload::Replace {
-            search, match_case, ..
-        } => {
+    let preview = match (&opts.payload, edit.as_ref()) {
+        (
+            WritePayload::Replace {
+                search, match_case, ..
+            },
+            _,
+        ) => {
             // Across every tab, because a `replaceAllText` with no
             // `tabsCriteria` spans every tab (ADR-0076 §11).
             let corpus = document_text(&document);
@@ -492,11 +620,25 @@ async fn write_inner(
                 occurrences: count_occurrences(&corpus, search, *match_case),
             }
         }
-        WritePayload::Append { text } => WriteResult::WouldAppend {
+        (WritePayload::Append { text }, _) => WriteResult::WouldAppend {
             document_end_index: body_end_index(&document),
             chars: text.chars().count(),
             bytes: text.len(),
         },
+        (WritePayload::Insert { .. }, Some(edit)) => {
+            WriteResult::WouldInsert { edit: edit.clone() }
+        }
+        (WritePayload::Delete { .. }, Some(edit)) => {
+            WriteResult::WouldDelete { edit: edit.clone() }
+        }
+        _ => {
+            return gated(
+                WriteResult::RefusedAnchor {
+                    error: AnchorError::InvalidIndices,
+                },
+                Some(revision_id),
+            )
+        }
     };
 
     if opts.dry_run {
@@ -514,11 +656,6 @@ async fn write_inner(
     // `batchUpdate`, not a reuse of the metadata fetched before the
     // (potentially slow) ancestor-chain walk and `documents.get` above.
     //
-    // `opts.payload.to_request()` — the build-before-gate invariant's
-    // "build" step for this engine — is called below only *after* this
-    // gate succeeds (see the mutating call itself), which trivially
-    // satisfies the invariant: there is no pre-gate build to fail and
-    // orphan a `pending` record (#1688/#1742).
     let leased = LeasedWrite {
         log_prefix: "drive docs write",
         operation: opts.payload.verb().log_operation(),
@@ -542,7 +679,7 @@ async fn write_inner(
         leased,
         &lease_grant,
         &files_api,
-        api.batch_update(&opts.document_id, opts.payload.to_request(), &revision_id)
+        api.batch_update(&opts.document_id, request, &revision_id)
             .await,
         ToString::to_string,
     )
@@ -555,6 +692,13 @@ async fn write_inner(
             WritePayload::Append { text } => WriteResult::Appended {
                 chars: text.chars().count(),
                 bytes: text.len(),
+            },
+            WritePayload::Insert { .. } | WritePayload::Delete { .. } => match preview {
+                WriteResult::WouldInsert { edit } => WriteResult::Inserted { edit },
+                WriteResult::WouldDelete { edit } => WriteResult::Deleted { edit },
+                _ => WriteResult::Failed {
+                    detail: "missing resolved edit preview".to_owned(),
+                },
             },
         },
         Err(err) => {
@@ -638,6 +782,7 @@ fn record_attempt(outcome: &WriteOutcome, opts: &WriteOptions, duration: Duratio
     };
     let inserted_chars = match &outcome.result {
         WriteResult::Appended { chars, .. } => Some(*chars as i64),
+        WriteResult::Inserted { edit } => Some(edit.chars as i64),
         _ => None,
     };
 
@@ -681,6 +826,23 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
                 .unwrap_or_default();
             format!("Would append: {chars} char(s) / {bytes} byte(s) to '{name}'{where_}")
         }
+        WriteResult::WouldInsert { edit }
+        | WriteResult::Inserted { edit }
+        | WriteResult::WouldDelete { edit }
+        | WriteResult::Deleted { edit } => {
+            let action = match &outcome.result {
+                WriteResult::WouldInsert { .. } => "Would insert",
+                WriteResult::Inserted { .. } => "Inserted",
+                WriteResult::WouldDelete { .. } => "Would delete",
+                _ => "Deleted",
+            };
+            format!("{action}: {} char(s) / {} byte(s) in '{name}' at [{}, {}) UTF-16 code units, tab {}, {} paragraph(s)",
+                edit.chars, edit.bytes, edit.start_index, edit.end_index,
+                edit.tab_id.as_deref().unwrap_or("first"), edit.paragraphs)
+        }
+        WriteResult::RefusedAnchor { error } => {
+            format!("Refused: unsafe or unresolved anchor in '{name}': {error:?}")
+        }
         WriteResult::RefusedNotADocument { mime_type } => format!(
             "Refused: '{name}' is not a Google Doc (mimeType: {mime_type}); \
              `drive docs {}` only works on Google Docs",
@@ -695,8 +857,18 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
             "Refused: '{name}' has no parent folder visible to this account, so no folder \
              rule can apply to it. This is normal for a Doc shared by link or email. \
              Grant it by id instead: add {{\"file_id\": \"<document id>\", \"allow\": \
-             [\"docs-write\"]}} to write_permissions.rules. (Adding it to a folder in your \
-             own Drive and granting that folder `docs-write` also works.)"
+             [\"{}\"]}} to write_permissions.rules. (Adding it to a folder in your \
+             own Drive and granting that folder `{}` also works.)",
+            if verb == WriteVerb::Delete {
+                "docs-delete"
+            } else {
+                "docs-write"
+            },
+            if verb == WriteVerb::Delete {
+                "docs-delete"
+            } else {
+                "docs-write"
+            }
         ),
         WriteResult::RefusedNoRevisionId => format!(
             "Refused: '{name}' returned no revision id, which Google sends only to callers \
@@ -827,8 +999,8 @@ mod tests {
         let mut body = serde_json::json!({
             "documentId": "doc-1",
             "body": {"content": [{
-                "startIndex": 1, "endIndex": 1 + text.encode_utf16().count() as i64,
-                "paragraph": {"elements": [{"textRun": {"content": format!("{text}\n")}}]},
+                "startIndex": 1, "endIndex": 2 + text.encode_utf16().count() as i64,
+                "paragraph": {"elements": [{"startIndex": 1, "endIndex": 2 + text.encode_utf16().count() as i64, "textRun": {"content": format!("{text}\n")}}]},
             }]},
         });
         if let Some(revision) = revision {
@@ -1759,5 +1931,253 @@ mod tests {
         let records = audit.records();
         assert_eq!(audit.verdicts(), ["pending", "failed"], "{records:?}");
         assert_eq!(records[1].error.as_deref(), Some(detail.as_str()));
+    }
+    fn anchored_payloads() -> Vec<WritePayload> {
+        vec![
+            WritePayload::Insert {
+                anchor: "Q3".into(),
+                side: Side::After,
+                text: "😀".into(),
+                match_case: true,
+            },
+            WritePayload::Delete {
+                from: "Q3".into(),
+                to: None,
+                match_case: true,
+            },
+        ]
+    }
+
+    async fn anchored_setup(server: &MockServer) -> (DriveClient, DocsClient) {
+        let clients = clients(server).await;
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(server)
+            .await;
+        mount_folder("folder-1").mount(server).await;
+        mount_document(Some("rev-anchor"), "😀 Q3 report")
+            .mount(server)
+            .await;
+        clients
+    }
+
+    fn rule_for(payload: &WritePayload) -> FolderPermissionRule {
+        let mut rule = allow_rule("folder-1");
+        rule.allow = std::iter::once(payload.gate_operation()).collect();
+        rule
+    }
+
+    #[test]
+    fn every_docs_verb_maps_to_its_gate_operation() {
+        for payload in [
+            replace_opts(true).payload,
+            append_opts(true).payload,
+            anchored_payloads().remove(0),
+        ] {
+            assert_eq!(payload.gate_operation(), DriveOperation::DocsWrite);
+        }
+        assert_eq!(
+            anchored_payloads().remove(1).gate_operation(),
+            DriveOperation::DocsDelete
+        );
+    }
+
+    #[tokio::test]
+    async fn anchored_edits_read_inline_and_send_one_request_from_the_leased_snapshot() {
+        for payload in anchored_payloads() {
+            let server = MockServer::start().await;
+            let (drive, docs) = anchored_setup(&server).await;
+            let rule = rule_for(&payload);
+            let mut opts = replace_opts(true);
+            opts.payload = payload;
+            let preview = write(&drive, &docs, &opts, &[rule.clone()]).await;
+            let expected = match &preview.result {
+                WriteResult::WouldInsert { edit } | WriteResult::WouldDelete { edit } => {
+                    edit.clone()
+                }
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(
+                expected.start_index,
+                if opts.payload.verb() == WriteVerb::Insert {
+                    6
+                } else {
+                    4
+                }
+            );
+            mount_batch_update(serde_json::json!({"replies": [{}]}))
+                .expect(1)
+                .mount(&server)
+                .await;
+            opts.dry_run = false;
+            let result = write(&drive, &docs, &opts, &[rule]).await;
+            let actual = match result.result {
+                WriteResult::Inserted { edit } | WriteResult::Deleted { edit } => edit,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(actual, expected);
+            let requests = server.received_requests().await.unwrap();
+            let reads: Vec<_> = requests
+                .iter()
+                .filter(|r| r.url.path() == "/v1/documents/doc-1")
+                .collect();
+            assert_eq!(reads.len(), 2);
+            for read in reads {
+                assert!(read
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "suggestionsViewMode" && v == "SUGGESTIONS_INLINE"));
+            }
+            let batch = requests
+                .iter()
+                .find(|r| r.url.path().ends_with(":batchUpdate"))
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+            assert_eq!(
+                body["writeControl"],
+                serde_json::json!({"requiredRevisionId": "rev-anchor"})
+            );
+            assert_eq!(body["requests"].as_array().unwrap().len(), 1);
+            if opts.payload.verb() == WriteVerb::Insert {
+                assert_eq!(
+                    body["requests"][0]["insertText"],
+                    serde_json::json!({"text": "😀", "location": {"index": 6}})
+                );
+            } else {
+                assert_eq!(
+                    body["requests"][0]["deleteContentRange"]["range"],
+                    serde_json::json!({"startIndex": 4, "endIndex": 6})
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_docs_write_grant_does_not_allow_delete_and_delete_does_not_allow_other_verbs() {
+        let mut payloads = anchored_payloads();
+        payloads.push(replace_opts(false).payload);
+        payloads.push(append_opts(false).payload);
+        for payload in payloads {
+            let server = MockServer::start().await;
+            let (drive, docs) = clients(&server).await;
+            mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+                .mount(&server)
+                .await;
+            mount_folder("folder-1").mount(&server).await;
+            let mut rule = allow_rule("folder-1");
+            if payload.verb() != WriteVerb::Delete {
+                rule.allow = std::iter::once(DriveOperation::DocsDelete).collect();
+            }
+            let mut opts = replace_opts(false);
+            opts.payload = payload;
+            assert!(matches!(
+                write(&drive, &docs, &opts, &[rule]).await.result,
+                WriteResult::Blocked { .. }
+            ));
+            assert!(!server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.url.path().starts_with("/v1/documents")));
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_anchors_and_missing_revisions_never_mutate() {
+        for payload in anchored_payloads() {
+            for (text, revision, expected) in [
+                ("nothing", Some("r"), "missing"),
+                ("Q3 Q3", Some("r"), "ambiguous"),
+                ("Q3", None, "revision"),
+            ] {
+                let server = MockServer::start().await;
+                let (drive, docs) = clients(&server).await;
+                mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+                    .mount(&server)
+                    .await;
+                mount_folder("folder-1").mount(&server).await;
+                mount_document(revision, text).mount(&server).await;
+                let mut opts = replace_opts(false);
+                opts.payload = payload.clone();
+                let outcome = write(&drive, &docs, &opts, &[rule_for(&payload)]).await;
+                match expected {
+                    "missing" => assert!(matches!(
+                        outcome.result,
+                        WriteResult::RefusedAnchor {
+                            error: AnchorError::NotFound
+                        }
+                    )),
+                    "ambiguous" => assert!(matches!(
+                        outcome.result,
+                        WriteResult::RefusedAnchor {
+                            error: AnchorError::Ambiguous { count: 2 }
+                        }
+                    )),
+                    _ => assert_eq!(outcome.result, WriteResult::RefusedNoRevisionId),
+                }
+                assert!(!server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.url.path().ends_with(":batchUpdate")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn anchored_edits_preserve_every_lease_refusal() {
+        for payload in anchored_payloads() {
+            for expected in [
+                WriteResult::RefusedNoLease,
+                WriteResult::RefusedLeaseExpired,
+                WriteResult::RefusedLeaseWrongFile,
+                WriteResult::RefusedLeaseStale,
+            ] {
+                let server = MockServer::start().await;
+                let (drive, docs) = anchored_setup(&server).await;
+                let mut opts = replace_opts(false);
+                opts.payload = payload.clone();
+                opts.lease_token = match expected {
+                    WriteResult::RefusedNoLease => None,
+                    WriteResult::RefusedLeaseExpired => Some("unknown".into()),
+                    WriteResult::RefusedLeaseWrongFile => {
+                        Some(seed_lease(&opts.ledger_path, "different-doc", "1"))
+                    }
+                    _ => Some(seed_lease(&opts.ledger_path, "doc-1", "0")),
+                };
+                assert_eq!(
+                    write(&drive, &docs, &opts, &[rule_for(&payload)])
+                        .await
+                        .result,
+                    expected
+                );
+                assert!(!server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.url.path().ends_with(":batchUpdate")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn anchored_edits_refuse_stale_docs_revisions() {
+        for payload in anchored_payloads() {
+            let server = MockServer::start().await;
+            let (drive, docs) = anchored_setup(&server).await;
+            Mock::given(method("POST")).and(path("/v1/documents/doc-1:batchUpdate"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": {"code": 400, "message": "The provided revision ID does not match the current revision ID."}})))
+                .expect(1).mount(&server).await;
+            let mut opts = replace_opts(false);
+            opts.payload = payload.clone();
+            assert!(matches!(
+                write(&drive, &docs, &opts, &[rule_for(&payload)])
+                    .await
+                    .result,
+                WriteResult::StaleRevision { .. }
+            ));
+        }
     }
 }
