@@ -74,10 +74,9 @@ pub enum CreateResult {
     },
     /// Created, but the seeding write failed.
     ///
-    /// Its own variant carrying the id, because there is no `files.delete`
-    /// anywhere in this integration — the empty document cannot be rolled
-    /// back, and reporting it as a plain failure would leave an orphan the
-    /// user has no way to find.
+    /// Carries the ID because automatic rollback is not authorised by a
+    /// create grant. The operator may explicitly trash the empty document
+    /// with a separate `trash` permission; plain failure would hide its ID.
     CreatedTextFailed {
         /// The new document's id, so it is findable.
         file_id: String,
@@ -389,7 +388,8 @@ pub fn describe(outcome: &CreateOutcome) -> String {
         CreateResult::CreatedTextFailed { file_id, detail } => format!(
             "Partially failed: created '{name}' ({file_id}) in {folder}, but seeding its text \
              failed: {detail} The document exists and is empty — it cannot be rolled back \
-             automatically."
+             automatically. Clean up explicitly with `omni-dev drive trash {file_id}` \
+             (requires trash permission on the file or its folder)."
         ),
         CreateResult::Failed { detail } => format!("Failed: '{name}' in {folder}: {detail}"),
     }
@@ -599,6 +599,8 @@ mod tests {
             "the orphan must be findable: {text}"
         );
         assert!(text.contains("cannot be rolled back"), "{text}");
+        assert!(text.contains("omni-dev drive trash new-1"), "{text}");
+        assert!(text.contains("requires trash permission"), "{text}");
     }
 
     /// The ADR-0073 §11 / ADR-0076 §9 distinction: a bare default deny must

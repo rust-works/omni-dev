@@ -115,3 +115,4 @@ by Michael Nygard.
 | [ADR-0089](adr-0089.md)                                 | ✅ Accepted                              | 2026-09-27 | `<NAME>_FILE` for Every Secret Environment Variable                                         |
 | [ADR-0090](adr-0090.md)                                 | ✅ Accepted                              | 2026-09-30 | Fetch Secrets On Demand with `<NAME>_COMMAND`                                               |
 | [ADR-0091](adr-0091.md)                                 | 🟡 Proposed                              | 2026-10-02 | Gated Sheets and Docs Content Writes over MCP                                               |
+| [ADR-0092](adr-0092.md)                                 | ✅ Accepted                              | 2026-10-02 | Gated Trash and Restore for Individual Drive Files                                          |

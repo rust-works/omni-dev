@@ -384,6 +384,10 @@ pub enum DriveOperation {
     /// deletion is designed it needs its own operation, or explicit
     /// re-consent. Same rule ADR-0075 §1 records for `sheets-structure`.
     DocsWrite,
+    /// Moving an individual file to Trash or restoring it (ADR-0092).
+    /// Default-deny and lease-exempt: recovery is provided by Drive Trash.
+    /// A future permanent delete must use separate consent, never this variant.
+    Trash,
 }
 
 impl std::fmt::Display for DriveOperation {
@@ -400,6 +404,7 @@ impl std::fmt::Display for DriveOperation {
             Self::SheetsDelete => "sheets-delete",
             Self::SheetsProtection => "sheets-protection",
             Self::DocsWrite => "docs-write",
+            Self::Trash => "trash",
         };
         write!(f, "{s}")
     }
@@ -421,7 +426,8 @@ impl DriveOperation {
             | Self::SheetsStructure
             | Self::SheetsDelete
             | Self::SheetsProtection
-            | Self::DocsWrite => Verdict::Deny,
+            | Self::DocsWrite
+            | Self::Trash => Verdict::Deny,
         }
     }
 
@@ -432,7 +438,9 @@ impl DriveOperation {
     /// **new** file — there is no existing content for a lease to protect,
     /// and neither engine (`create.rs`, `upload.rs`) ever gates on
     /// `require_lease`; the field appears on their `LeasedWrite` values
-    /// only in test fixtures. Every other operation replaces or otherwise
+    /// only in test fixtures. `Trash` is reversible through Drive Trash and
+    /// exempt under ADR-0092, even with `require_lease: true`. Every other
+    /// operation replaces or otherwise
     /// mutates a target's existing content and does gate on it via
     /// [`decided_rule_requires_lease`]. This is consulted only by
     /// `drive permissions check`'s diagnostic, to keep it from reporting a
@@ -441,7 +449,7 @@ impl DriveOperation {
     #[must_use]
     pub const fn ever_requires_lease(self) -> bool {
         match self {
-            Self::Read | Self::Create | Self::Upload => false,
+            Self::Read | Self::Create | Self::Upload | Self::Trash => false,
             Self::Edit
             | Self::SheetsWrite
             | Self::SheetsStructure
@@ -1026,11 +1034,12 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_denies_create_upload_edit_with_no_rules() {
+    fn default_policy_denies_create_upload_edit_trash_with_no_rules() {
         for op in [
             DriveOperation::Create,
             DriveOperation::Upload,
             DriveOperation::Edit,
+            DriveOperation::Trash,
         ] {
             let decision = resolve(&chain(&["a"]), op, &[]);
             assert_eq!(
@@ -1043,11 +1052,12 @@ mod tests {
     }
 
     #[test]
-    fn ever_requires_lease_is_false_for_read_create_and_upload() {
+    fn ever_requires_lease_is_false_for_read_create_upload_and_trash() {
         for op in [
             DriveOperation::Read,
             DriveOperation::Create,
             DriveOperation::Upload,
+            DriveOperation::Trash,
         ] {
             assert!(
                 !op.ever_requires_lease(),
@@ -1067,6 +1077,29 @@ mod tests {
             DriveOperation::DocsWrite,
         ] {
             assert!(op.ever_requires_lease(), "{op:?} should be lease-eligible");
+        }
+    }
+
+    #[test]
+    fn trash_permission_serde_round_trip_does_not_widen_other_grants() {
+        let rule: FolderPermissionRule = serde_json::from_value(serde_json::json!({
+            "folder_id": "a", "allow": ["trash"]
+        }))
+        .unwrap();
+        assert!(rule.allow.contains(&DriveOperation::Trash));
+        assert_eq!(DriveOperation::Trash.to_string(), "trash");
+        let serialized = serde_json::to_value(&rule).unwrap();
+        assert_eq!(serialized["allow"], serde_json::json!(["trash"]));
+        for op in [
+            DriveOperation::Create,
+            DriveOperation::Edit,
+            DriveOperation::SheetsDelete,
+        ] {
+            let rule = FolderPermissionRule::folder("a").allowing([op]);
+            assert_eq!(
+                resolve(&chain(&["a"]), DriveOperation::Trash, &[rule]).verdict,
+                Verdict::Deny
+            );
         }
     }
 
@@ -1168,6 +1201,7 @@ mod tests {
             DriveOperation::SheetsDelete,
             DriveOperation::SheetsProtection,
             DriveOperation::DocsWrite,
+            DriveOperation::Trash,
         ] {
             let wire = serde_json::to_string(&op).unwrap();
             assert_eq!(
@@ -1285,6 +1319,7 @@ mod tests {
             DriveOperation::SheetsStructure,
             DriveOperation::Create,
             DriveOperation::Upload,
+            DriveOperation::Trash,
         ] {
             assert_eq!(
                 resolve(&chain(&["target"]), other, &rules).verdict,

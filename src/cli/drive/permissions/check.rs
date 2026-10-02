@@ -39,6 +39,8 @@ pub enum OperationArg {
     /// Replacing or appending text in a Google Doc — distinct from both
     /// `Edit` and `SheetsWrite`, see [`DriveOperation::DocsWrite`].
     DocsWrite,
+    /// Moving an individual file to Trash or restoring it.
+    Trash,
 }
 
 impl From<OperationArg> for DriveOperation {
@@ -53,6 +55,7 @@ impl From<OperationArg> for DriveOperation {
             OperationArg::SheetsDelete => Self::SheetsDelete,
             OperationArg::SheetsProtection => Self::SheetsProtection,
             OperationArg::DocsWrite => Self::DocsWrite,
+            OperationArg::Trash => Self::Trash,
         }
     }
 }
@@ -120,8 +123,8 @@ pub struct CheckReport {
     /// token ([`write_gate::decided_rule_requires_lease`], ADR-0080 §1/§9).
     /// Only meaningful alongside `verdict: "allow"` — a denied write never
     /// reaches the lease check either way. Always `false` for `read`,
-    /// `create` and `upload` (issue #1917,
-    /// [`DriveOperation::ever_requires_lease`]) — none of the three ever
+    /// `create`, `upload` and `trash` (issue #1917,
+    /// [`DriveOperation::ever_requires_lease`]) — none of these operations ever
     /// gates on a lease, whatever the resolved decision reports.
     pub requires_lease: bool,
 }
@@ -316,6 +319,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn trash_operation_maps_to_the_gate() {
+        assert_eq!(
+            DriveOperation::from(OperationArg::Trash),
+            DriveOperation::Trash
+        );
+    }
+
     fn test_credentials() -> DriveCredentials {
         DriveCredentials {
             client_id: "client-1".to_string(),
@@ -416,7 +427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_upload_and_read_never_report_requires_lease() {
+    async fn create_upload_read_and_trash_never_report_requires_lease() {
         // issue #1917: neither `create.rs` nor `upload.rs` ever gates on
         // `require_lease`, and `read` never mutates anything at all, so
         // `run_check`'s diagnostic must say `requires_lease: false`
@@ -441,6 +452,7 @@ mod tests {
             &[
                 DriveOperation::Create,
                 DriveOperation::Upload,
+                DriveOperation::Trash,
                 DriveOperation::Read,
             ],
         )];
@@ -449,6 +461,7 @@ mod tests {
             DriveOperation::Create,
             DriveOperation::Upload,
             DriveOperation::Read,
+            DriveOperation::Trash,
         ] {
             let evaluated = evaluate_target(&files_api, "folder-1", op, &rules)
                 .await

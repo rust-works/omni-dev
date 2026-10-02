@@ -18,6 +18,7 @@ pub(crate) mod rename;
 pub(crate) mod search;
 pub(crate) mod sheets;
 pub(crate) mod sync;
+pub(crate) mod trash;
 pub(crate) mod upload;
 
 use anyhow::Result;
@@ -76,6 +77,12 @@ pub enum DriveSubcommands {
     /// scope for any pre-existing file (`drive auth login --write-file`
     /// or `--write-full`).
     Edit(edit::EditCommand),
+    /// Moves an individual file to Drive Trash, gated by `trash` permission.
+    /// Refuses folders; lease-exempt. Requires `drive auth login --write`.
+    Trash(trash::TrashCommand),
+    /// Restores an individual file from Drive Trash under `trash` permission.
+    /// Refuses folders; lease-exempt. Requires `drive auth login --write`.
+    Untrash(trash::TrashCommand),
     /// Backs up a file and mints a Touch ID-authorised lease token,
     /// required by `drive edit` and (in later phases) every other
     /// content-mutating verb ([ADR-0080](../../docs/adrs/adr-0080.md)).
@@ -166,6 +173,8 @@ impl DriveSubcommands {
             Self::Create(cmd) => cmd.execute(client).await,
             Self::Upload(cmd) => cmd.execute(client).await,
             Self::Edit(cmd) => cmd.execute(client).await,
+            Self::Trash(cmd) => cmd.execute(client, false).await,
+            Self::Untrash(cmd) => cmd.execute(client, true).await,
             Self::Rename(cmd) => cmd.execute(client).await,
             Self::Move(cmd) => cmd.execute(client).await,
             Self::Docs(cmd) => cmd.execute(client).await,

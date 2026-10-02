@@ -3,16 +3,16 @@
 omni-dev exposes access to the Google Drive v3 API through the `omni-dev
 drive` command tree — search, read a file's metadata or content, find
 duplicates, rename a file, move it between folders, and create/upload/edit
-file content. `drive.readonly` (the default scope) is enough for
+file content, trash individual files, and restore them. `drive.readonly`
+(the default scope) is enough for
 search/read/dedupe/sync; rename/move need the opt-in `drive.metadata` scope
 (`drive auth login --write`), the narrowest write scope Google offers — it
-covers `files.update` on `name`/`parents` only, with no file-content access
+covers `files.update` on `name`/`parents`/`trashed`, with no file-content access
 at all. Content mutation needs a broader grant still: `--write-file`
 (`drive.file`, app-created files only) or `--write-full` (the unrestricted
-`drive` scope, needed to edit any pre-existing file). `drive lease prune`
-has a trash capability now ([`FilesApi::trash`](#lease), see
-[Prune](#prune)); share/permission-mutation is still absent anywhere in
-this surface.
+`drive` scope, needed to edit any pre-existing file). `drive trash` and
+`drive untrash` use metadata write access and a separate local `trash`
+permission. Permanent deletion and share/permission-mutation are absent.
 
 **Move is security-gated.** Moving a file can change who can see it — Drive
 resolves a file's effective visibility from both direct permissions on the
@@ -21,7 +21,7 @@ file changes that chain. `drive move` refuses any move that would change
 visibility **by default**; three independent `--allow-*` flags opt in. See
 [Move](#move) and [ADR-0070](adrs/adr-0070.md) for the full design.
 
-**Create/upload/edit are gated by a second, independent, local
+**Create/upload/edit/trash/untrash are gated by a second, independent, local
 permission system.** Google's OAuth scopes are all-or-nothing across your
 *entire* Drive — there's no way to grant "write access to just this
 folder." `write_permissions` rules in `settings.json` are omni-dev's own
@@ -35,7 +35,8 @@ The MCP tool surface (`drive_auth_status`/`drive_search`/`drive_dedupe`/
 `drive_file_read`/`drive_sheets_info`/`drive_sheets_read`/`drive_docs_info`/
 `drive_docs_read`/`drive_account_list`, mirroring the CLI one-for-one like
 Gmail's `gmail_*` tools) is read-only, like the rest of the MCP surface —
-`rename`/`move`/`create`/`upload`/`edit`, `sheets write`/`append`/`clear`, and
+`rename`/`move`/`create`/`upload`/`edit`/`trash`/`untrash`,
+`sheets write`/`append`/`clear`, and
 `docs replace`/`append`/`create` have no MCP equivalent. See
 [docs/mcp.md](mcp.md#drive-9-tools) for the full tool reference.
 
@@ -59,9 +60,10 @@ walkthrough — this page is the topic-by-topic reference.
 12. [Create](#create)
 13. [Upload](#upload)
 14. [Edit](#edit)
-15. [Lease](#lease)
-16. [Sheets](#sheets)
-17. [Docs](#docs)
+15. [Trash and restore](#trash-and-restore)
+16. [Lease](#lease)
+17. [Sheets](#sheets)
+18. [Docs](#docs)
 18. [Rate limits and retry behaviour](#rate-limits-and-retry-behaviour)
 19. [Troubleshooting](#troubleshooting)
 20. [See also](#see-also)
@@ -768,17 +770,18 @@ scope would technically permit.
 **Default policy** — what applies when no configured rule names an
 operation anywhere in a target's ancestor chain:
 
-| Operation           | Default | Granted to |
-|---------------------|---------|------------|
-| `read`              | allow   | `search`, `read`, `dedupe` (not yet enforced) |
-| `create`            | deny    | `create`, `sheets create` |
-| `upload`            | deny    | `upload` |
-| `edit`              | deny    | `edit` — raw file content only |
-| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets trim-whitespace` — cell values; `sheets text-to-columns` (also needs `sheets-structure`); `sheets sort-range` (also needs `sheets-structure`); `sheets randomize-range` (also needs `sheets-structure`); `sheets set-basic-filter --sort-by` (also needs `sheets-structure`); `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`) |
+| Operation           | Default | Granted to                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+|---------------------|---------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `read`              | allow   | `search`, `read`, `dedupe` (not yet enforced)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `create`            | deny    | `create`, `sheets create`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `upload`            | deny    | `upload`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `edit`              | deny    | `edit` — raw file content only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sheets-write`      | deny    | `sheets write`, `sheets append`, `sheets clear`, `sheets find-replace`, `sheets trim-whitespace` — cell values; `sheets text-to-columns` (also needs `sheets-structure`); `sheets sort-range` (also needs `sheets-structure`); `sheets randomize-range` (also needs `sheets-structure`); `sheets set-basic-filter --sort-by` (also needs `sheets-structure`); `sheets add-pivot-table` (also needs `sheets-structure`), `delete-pivot-table`, `sheets auto-fill`; `cut-paste`/`copy-paste`/`paste-data` with a value-only `--paste-type` (`cut-paste` also needs `sheets-structure` always; `copy-paste`/`paste-data` also need it for `--paste-type normal`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter` (with `--sort-by`, also needs `sheets-write`), `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `text-to-columns` (also needs `sheets-write`), `sort-range` (also needs `sheets-write`), `randomize-range` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
-| `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`, `delete-duplicates` |
-| `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range` |
-| `docs-write`        | deny    | `docs replace`, `docs append` |
+| `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`, `delete-duplicates`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `docs-write`        | deny    | `docs replace`, `docs append`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `trash`             | deny    | `trash`, `untrash` (individual files only)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 There is no "enabled: true" flag — an absent or empty rule list already
 means "deny every write everywhere," via this table alone, which *is* the
@@ -929,7 +932,8 @@ the one Drive it came from. A rule keys on **either** a `folder_id` or a
   rule: a file has no descendants, so `recursive: true` alongside a
   `file_id` is a configuration error rather than a no-op.
 - `allow`/`deny` — any of `read`, `create`, `upload`, `edit`,
-  `sheets-write`, `sheets-structure`, `sheets-delete`, `docs-write`. A `deny`
+  `sheets-write`, `sheets-structure`, `sheets-delete`, `sheets-protection`,
+  `docs-write`, `trash`. A `deny`
   entry for `read` is schema-ready today for a future `search`/`read`/
   `dedupe` enforcement fast-follow (not wired up yet — see
   [ADR-0071](adrs/adr-0071.md) §11); the write operations are enforced now.
@@ -1193,6 +1197,52 @@ Error: Drive API request failed: HTTP 403: Insufficient Permission (reason: insu
 ```
 
 Same request-log behavior as [Create](#create)/[Upload](#upload).
+
+## Trash and restore
+
+Trash an individual file, or restore it before Drive purges it:
+
+```bash
+omni-dev drive trash FILE_ID --dry-run
+omni-dev drive trash FILE_ID -o json
+omni-dev drive untrash FILE_ID
+```
+
+Both commands require metadata write access (`drive auth login --write`) and
+an explicit `trash` grant in the selected account's `write_permissions.rules`:
+
+```json
+{"folder_id": "FOLDER_ID", "allow": ["trash"]}
+```
+
+For a file shared without visible parents, use a `file_id` rule instead.
+Existing `create`, `edit` and `sheets-delete` grants do not permit trash.
+The same file-ID/current-parent rules apply when restoring; changing or removing
+a grant after trash can block untrash. Folder targets are refused for both verbs
+because changing a folder's trashed state affects descendants and could bypass
+their deny rules. Native Docs/Sheets/Slides and binary files are supported.
+A shortcut targets the shortcut itself.
+
+Trash and restore are lease-exempt: no lease ledger or Touch ID prompt, even
+with `require_lease: true`. Drive normally purges trashed files after 30 days,
+and the owner can empty Trash sooner. Trash is not an indefinite backup, and
+collaborators may still access a trashed file before permanent deletion.
+Real attempts (including refusals and no-ops) use the existing best-effort
+Drive mutation log; dry runs do not write mutation records.
+An already-trashed target or an already-restored target is a gated no-op.
+A dry run checks local permission but does not prove Google will allow the PATCH.
+
+In My Drive the file owner must perform trash; shared drives require appropriate
+organizer/file organizer rights. API permission or scope errors appear as
+`failed` outcomes. A file in a trashed parent may remain effectively trashed
+when restored; these commands never restore the parent folder. Permanent delete
+and recursive folder teardown are not implemented. See
+[Google's trash/restore reference](https://developers.google.com/workspace/drive/api/guides/delete)
+and [ADR-0092](adrs/adr-0092.md).
+
+If a Docs/Sheets create succeeds but seeding fails, its result includes the new
+file ID and an explicit `drive trash` cleanup hint. The create grant does not
+authorize automatic rollback.
 
 ## Lease
 

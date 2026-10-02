@@ -51,7 +51,7 @@ pub(crate) const MAX_UPLOAD_BYTES: u64 = 5 * 1024 * 1024;
 /// table/JSON output with zero follow-up calls per hit.
 const LIST_FIELDS: &str = "nextPageToken,incompleteSearch,files(id,name,mimeType,size,\
     md5Checksum,sha1Checksum,sha256Checksum,modifiedTime,parents,webViewLink,\
-    owners(displayName,emailAddress),driveId)";
+    owners(displayName,emailAddress),driveId,trashed)";
 
 /// `fields` value for `files.get` — additionally includes `exportLinks` so
 /// `drive read`'s content-export error path can list which MIME types a
@@ -62,7 +62,7 @@ const LIST_FIELDS: &str = "nextPageToken,incompleteSearch,files(id,name,mimeType
 /// second `files.get`.
 const GET_FIELDS: &str = "id,name,mimeType,size,md5Checksum,sha1Checksum,sha256Checksum,\
     modifiedTime,parents,webViewLink,owners(displayName,emailAddress),driveId,exportLinks,\
-    version";
+    version,trashed";
 
 /// Files API façade.
 #[derive(Debug)]
@@ -218,23 +218,11 @@ impl<'a> FilesApi<'a> {
             .map_err(|err| append_write_scope_hint(err, WriteCapability::Metadata))
     }
 
-    /// Moves a file to Drive Trash (`files.update` with `trashed: true`) —
-    /// the `drive lease prune` (#1678) mechanism for dropping a
-    /// [`LeaseBackup::DriveCopy`](crate::drive::lease::ledger::LeaseBackup::DriveCopy)
-    /// backup together with the ledger row that points at it. Deliberately
-    /// trash, not permanent delete: this is the integration's first
-    /// delete-adjacent capability, and trashing keeps it reversible (Drive
-    /// Trash, auto-purged after ~30 days, or recoverable by hand before
-    /// then) rather than adding the one irreversible Drive mutation this
-    /// codebase has otherwise never needed. Requires the `drive.metadata`
-    /// scope (`drive auth login --write`) — same as [`Self::rename`], since
-    /// a backup copy is always a file `omni-dev` itself created via
-    /// [`Self::copy`]; uses [`WriteCapability::Metadata`] rather than a
-    /// dedicated variant, since the scope it needs is identical.
-    ///
-    /// Restricted to `crate::drive` — only `crate::drive::lease::prune` may
-    /// call this, never an ungated CLI command directly (same restriction
-    /// [`Self::copy`]/[`Self::create`] carry).
+    /// Moves a file to Drive Trash (`files.update` with `trashed: true`).
+    /// Requires metadata write access (`drive auth login --write`).
+    /// Only the gated `crate::drive::trash` engine and lease backup pruning
+    /// may call this; never an ungated CLI command. Recovery is available
+    /// until Drive purges the file (normally after 30 days).
     pub(in crate::drive) async fn trash(&self, file_id: &str) -> Result<DriveFile> {
         let url = build_file_update_url(self.client.base_url(), file_id, None, None)?;
         let response = self
@@ -243,6 +231,19 @@ impl<'a> FilesApi<'a> {
             .await?;
         self.client
             .parse_response(response, "Failed to parse files.update (trash) response")
+            .await
+            .map_err(|err| append_write_scope_hint(err, WriteCapability::Metadata))
+    }
+
+    /// Restores a file from Drive Trash. Restricted to the gated trash engine.
+    pub(in crate::drive) async fn untrash(&self, file_id: &str) -> Result<DriveFile> {
+        let url = build_file_update_url(self.client.base_url(), file_id, None, None)?;
+        let response = self
+            .client
+            .patch_json(url.as_str(), &serde_json::json!({ "trashed": false }))
+            .await?;
+        self.client
+            .parse_response(response, "Failed to parse files.update (untrash) response")
             .await
             .map_err(|err| append_write_scope_hint(err, WriteCapability::Metadata))
     }
@@ -743,6 +744,7 @@ mod tests {
                 "https://export.example.com/md".to_string(),
             )])),
             version: Some("1".to_string()),
+            trashed: Some(false),
         }
     }
 
@@ -1387,6 +1389,66 @@ mod tests {
             .await;
 
         let err = FilesApi::new(&client).trash("f1").await.unwrap_err();
+        assert!(
+            err.to_string().contains("drive auth login --write"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn untrash_sends_a_trashed_false_body() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"trashed": false}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "f1", "name": "backup", "trashed": false,
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let file = FilesApi::new(&client).untrash("f1").await.unwrap();
+        assert_eq!(file.id, "f1");
+    }
+
+    #[tokio::test]
+    async fn untrash_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client).untrash("f1").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn untrash_appends_write_scope_hint_on_insufficient_permissions() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/drive/v3/files/f1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": {
+                        "message": "Insufficient Permission",
+                        "errors": [{"reason": "insufficientPermissions"}],
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = FilesApi::new(&client).untrash("f1").await.unwrap_err();
         assert!(
             err.to_string().contains("drive auth login --write"),
             "{err}"
