@@ -112,6 +112,17 @@ impl JevRouteParams {
         if !self.draft_comment.is_empty() && (self.all_open || self.issues.len() != 1) {
             bail!("draft_comment requires exactly one issue");
         }
+        if let Some(names) = &self.ladders {
+            if names.is_empty() {
+                bail!("ladders must not be empty");
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for name in names {
+                if !seen.insert(name) {
+                    bail!("ladder {name:?} is listed more than once");
+                }
+            }
+        }
         let opts = RouteOptions {
             model,
             draft_comments: vec![],
@@ -236,9 +247,6 @@ async fn run_route(params: JevRouteParams) -> Result<CallToolResult> {
     let draft_paths = params.draft_comment.clone();
     let (ladders, drafts) = tokio::task::spawn_blocking(move || {
         let names = params.ladders.unwrap_or_else(|| vec!["anthropic".into()]);
-        if names.is_empty() {
-            bail!("ladders must not be empty");
-        }
         let definitions = params
             .ladder_definition
             .into_iter()
@@ -360,8 +368,8 @@ mod tests {
         let p = route(json!({"issues": ["#1779"]}));
         let o = p.options("jev-test".into()).unwrap();
         assert_eq!(o.model, "jev-test");
-        assert_eq!(o.close_call, DEFAULT_CLOSE_CALL);
-        assert_eq!(o.close_call_margin, DEFAULT_CLOSE_CALL_MARGIN);
+        assert!((o.close_call - DEFAULT_CLOSE_CALL).abs() < f64::EPSILON);
+        assert!((o.close_call_margin - DEFAULT_CLOSE_CALL_MARGIN).abs() < f64::EPSILON);
         assert_eq!(o.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
         assert!(!o.allow_closed && !o.ignore_closed && !o.effort_advice);
         assert!(matches!(p.output, JevOutputFormat::Json));
@@ -369,9 +377,9 @@ mod tests {
             .options("jev-test".into())
             .unwrap();
         assert_eq!(o.jev_model, "jev-test");
-        assert_eq!(o.supported, DEFAULT_SUPPORTED);
-        assert_eq!(o.reject_below, DEFAULT_REJECT_BELOW);
-        assert_eq!(o.coverage, DEFAULT_COVERAGE);
+        assert!((o.supported - DEFAULT_SUPPORTED).abs() < f64::EPSILON);
+        assert!((o.reject_below - DEFAULT_REJECT_BELOW).abs() < f64::EPSILON);
+        assert!((o.coverage - DEFAULT_COVERAGE).abs() < f64::EPSILON);
         assert_eq!(o.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
     }
 
@@ -384,8 +392,8 @@ mod tests {
             "close_call": 0.7, "close_call_margin": 0.25, "max_input_chars": 123,
             "allow_closed": true, "refresh": true, "jev_model": "jev-1.13.0", "output": "yaml"}));
         let o = p.options(p.jev_model.clone().unwrap()).unwrap();
-        assert_eq!(o.close_call, 0.7);
-        assert_eq!(o.close_call_margin, 0.25);
+        assert!((o.close_call - 0.7).abs() < f64::EPSILON);
+        assert!((o.close_call_margin - 0.25).abs() < f64::EPSILON);
         assert_eq!(o.max_input_chars, 123);
         assert!(o.allow_closed && o.effort_advice && p.refresh);
         assert_eq!(p.repo, Some(PathBuf::from("/tmp/repo")));
@@ -418,9 +426,9 @@ mod tests {
         assert_eq!(o.jev_model, "jev-test");
         assert_eq!(p.model.as_deref(), Some("ai-test"));
         assert_eq!(p.comment.as_deref(), Some("123"));
-        assert_eq!(o.supported, 0.8);
-        assert_eq!(o.reject_below, 0.2);
-        assert_eq!(o.coverage, 0.6);
+        assert!((o.supported - 0.8).abs() < f64::EPSILON);
+        assert!((o.reject_below - 0.2).abs() < f64::EPSILON);
+        assert!((o.coverage - 0.6).abs() < f64::EPSILON);
         assert_eq!(o.max_input_chars, 20);
         for field in ["threshold", "reject_below", "coverage_threshold"] {
             for value in [-0.1, 1.1] {
@@ -516,6 +524,7 @@ mod tests {
         for value in [
             json!({"issues":["#1"],"ladders":[]}),
             json!({"issues":["#1"],"ladders":["missing"]}),
+            json!({"issues":["#1"],"ladders":["anthropic","anthropic"]}),
         ] {
             let err = server
                 .jev_route(Parameters(route(value)))
