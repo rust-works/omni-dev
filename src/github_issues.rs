@@ -2433,8 +2433,13 @@ i0: issueOrPullRequest(number:2){
 
     /// Runs the shim once so its first `execve` (which can hit `ETXTBSY`, and
     /// which `auth_scope` would swallow into `None`) is behind us.
+    ///
+    /// The result is discarded *outside* the retry: `retry_on_etxtbsy` hands a
+    /// non-`ETXTBSY` failure (a shim that exits 1 or prints nothing) straight
+    /// back, but it can only retry an `ETXTBSY` it actually sees, so the error
+    /// must not be swallowed inside the closure.
     fn warm(bin: &Path) {
-        let _ = retry_on_etxtbsy(|| checked_auth_scope(bin).or_else(|_| Ok(String::new())));
+        let _ = retry_on_etxtbsy(|| checked_auth_scope(bin));
     }
 
     #[test]
