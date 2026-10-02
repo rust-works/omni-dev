@@ -580,3 +580,92 @@ fn manifest_rejects_path_aliases_and_device_names() {
     assert!(!name.ends_with('.'));
     validate_relative(Path::new(&name)).unwrap();
 }
+
+#[test]
+fn export_extensions_cover_every_known_type_and_default_to_export() {
+    for (mime, ext) in [
+        ("text/markdown", "md"),
+        ("text/csv", "csv"),
+        ("text/plain", "txt"),
+        ("text/html", "html"),
+        ("application/pdf", "pdf"),
+        ("application/zip", "zip"),
+        ("application/json", "json"),
+        (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "docx",
+        ),
+        (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "xlsx",
+        ),
+        (
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "pptx",
+        ),
+        ("image/png", "png"),
+        ("image/jpeg", "jpg"),
+        ("image/svg+xml", "svg"),
+        ("application/x-unknown", "export"),
+    ] {
+        assert_eq!(extension(mime), ext, "{mime}");
+    }
+}
+
+#[test]
+fn safe_path_reports_inspection_failures_other_than_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("file"), "x").unwrap();
+    // A file used as a directory fails with ENOTDIR, which is not NotFound.
+    let err = safe_path(dir.path(), Path::new("file/child")).unwrap_err();
+    assert!(err.to_string().starts_with("inspect "), "{err:#}");
+}
+
+#[tokio::test]
+async fn a_directory_in_a_files_place_fails_only_that_file() {
+    let (server, client) = fixture().await;
+    list(&server, "root", json!([binary("a", "a", "hash")])).await;
+    download(&server, "a", "hello", 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let opts = options(dir.path());
+    save_manifest(dir.path(), &load_manifest(&opts).unwrap()).unwrap();
+    fs::create_dir(dir.path().join("a")).unwrap();
+    let report = run_sync(&client, &opts).await.unwrap();
+    assert_eq!(report.failed, 1);
+    assert!(report.items[0]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("not a regular file"));
+    assert!(dir.path().join("a").is_dir());
+}
+
+#[tokio::test]
+async fn dry_run_flags_a_local_file_where_a_folder_belongs() {
+    let (server, client) = fixture().await;
+    list(
+        &server,
+        "root",
+        json!([{"id":"dir","name":"nested","mimeType":GOOGLE_FOLDER}]),
+    )
+    .await;
+    list(&server, "dir", json!([binary("b", "b", "hash")])).await;
+    download(&server, "b", "hello", 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(dir.path());
+    save_manifest(dir.path(), &load_manifest(&opts).unwrap()).unwrap();
+    fs::write(dir.path().join("nested"), "not a folder").unwrap();
+    opts.dry_run = true;
+    let report = run_sync(&client, &opts).await.unwrap();
+    // The blocked folder fails, and so does the file that would land beneath it.
+    assert_eq!(report.failed, 2);
+    assert!(report.items[0]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("not a directory"));
+    assert_eq!(
+        fs::read(dir.path().join("nested")).unwrap(),
+        b"not a folder"
+    );
+}
