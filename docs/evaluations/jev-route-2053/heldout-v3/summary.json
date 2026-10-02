@@ -1,0 +1,1018 @@
+{
+  "answer_field_change_counts": {
+    "choice": 23,
+    "confidence": 516,
+    "probabilities": 524
+  },
+  "baseline_repeat_changes": [
+    {
+      "after": "sol",
+      "before": "terra",
+      "id": "succinctly-2588-holdout",
+      "key": "openai.stage_review",
+      "repeat": 1
+    },
+    {
+      "after": "sol",
+      "before": "terra",
+      "id": "succinctly-2598-holdout",
+      "key": "openai.stage_review",
+      "repeat": 1
+    },
+    {
+      "after": "sonnet",
+      "before": "opus",
+      "id": "succinctly-2643-holdout",
+      "key": "anthropic.stage_implement",
+      "repeat": 1
+    },
+    {
+      "after": "none",
+      "before": "pro",
+      "id": "succinctly-2708-holdout",
+      "key": "gemini.stage_design",
+      "repeat": 1
+    },
+    {
+      "after": "none",
+      "before": "sol",
+      "id": "succinctly-2709-holdout",
+      "key": "openai.stage_design",
+      "repeat": 1
+    },
+    {
+      "after": "sol",
+      "before": "terra",
+      "id": "succinctly-2709-holdout",
+      "key": "openai.stage_review",
+      "repeat": 1
+    },
+    {
+      "after": "pro",
+      "before": "none",
+      "id": "succinctly-2783-holdout",
+      "key": "gemini.stage_design",
+      "repeat": 1
+    },
+    {
+      "after": "sonnet",
+      "before": "opus",
+      "id": "succinctly-2799-holdout",
+      "key": "anthropic.stage_implement",
+      "repeat": 1
+    },
+    {
+      "after": "pro",
+      "before": "deep-think",
+      "id": "succinctly-2875-holdout",
+      "key": "gemini.stage_design",
+      "repeat": 1
+    },
+    {
+      "after": "terra",
+      "before": "sol",
+      "id": "succinctly-3460-holdout",
+      "key": "openai.stage_review",
+      "repeat": 1
+    },
+    {
+      "after": "none",
+      "before": "opus",
+      "id": "succinctly-3479-holdout",
+      "key": "anthropic.stage_design",
+      "repeat": 1
+    }
+  ],
+  "billed_cost": null,
+  "class_changes": [
+    {
+      "after": "pro",
+      "before": "flash",
+      "id": "succinctly-2607-holdout",
+      "key": "gemini",
+      "repeat": 0
+    },
+    {
+      "after": "sonnet",
+      "before": "opus",
+      "id": "succinctly-2663-holdout",
+      "key": "anthropic",
+      "repeat": 0
+    },
+    {
+      "after": "flash",
+      "before": "pro",
+      "id": "succinctly-2708-holdout",
+      "key": "gemini",
+      "repeat": 0
+    },
+    {
+      "after": "terra",
+      "before": "sol",
+      "id": "succinctly-2709-holdout",
+      "key": "openai",
+      "repeat": 0
+    },
+    {
+      "after": "pro",
+      "before": "flash",
+      "id": "succinctly-2783-holdout",
+      "key": "gemini",
+      "repeat": 0
+    },
+    {
+      "after": "pro",
+      "before": "deep-think",
+      "id": "succinctly-2875-holdout",
+      "key": "gemini",
+      "repeat": 0
+    },
+    {
+      "after": "sonnet",
+      "before": "opus",
+      "id": "succinctly-3479-holdout",
+      "key": "anthropic",
+      "repeat": 0
+    },
+    {
+      "after": "deep-think",
+      "before": "pro",
+      "id": "succinctly-2875-holdout",
+      "key": "gemini",
+      "repeat": 1
+    },
+    {
+      "after": "deep-think",
+      "before": "pro",
+      "id": "succinctly-2883-holdout",
+      "key": "gemini",
+      "repeat": 1
+    }
+  ],
+  "confusion": {
+    "both -> design": 4,
+    "both -> factual": 4,
+    "design -> both": 6,
+    "design -> design": 12,
+    "factual -> both": 2,
+    "factual -> design": 8,
+    "factual -> factual": 10,
+    "factual -> none": 8,
+    "none -> design": 2,
+    "none -> factual": 4,
+    "none -> none": 8
+  },
+  "failures": [],
+  "models": [
+    "jev-1.13.0"
+  ],
+  "predictions": [
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-2520-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "both"
+      ],
+      "id": "succinctly-2588-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-2598-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-2607-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2640-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2643-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2663-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "both"
+      ],
+      "id": "succinctly-2664-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-2705-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-2706-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2707-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2708-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2709-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2712-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2783-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2784-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "both",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-2796-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "both",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2799-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "both"
+      ],
+      "id": "succinctly-2800-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2801-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "both",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-2802-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-2806-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-2875-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-2883-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-3241-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-3272-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-3455-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-3459-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "both"
+      ],
+      "id": "succinctly-3460-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-3479-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-3507-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "both",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-3512-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-3513-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-3514-holdout",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-2520-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "both"
+      ],
+      "id": "succinctly-2588-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-2598-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-2607-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2640-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2643-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2663-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "both"
+      ],
+      "id": "succinctly-2664-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-2705-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-2706-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2707-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2708-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2709-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2712-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2783-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2784-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "both",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-2796-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "both",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2799-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "both"
+      ],
+      "id": "succinctly-2800-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-2801-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "both",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-2802-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-2806-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-2875-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-2883-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-3241-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-3272-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-3455-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-3459-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "both"
+      ],
+      "id": "succinctly-3460-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-3479-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-3507-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "both",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-3512-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-3513-holdout",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "succinctly-3514-holdout",
+      "repeat": 1
+    }
+  ],
+  "stage_changes": [
+    {
+      "after": "sol",
+      "before": "terra",
+      "id": "succinctly-2588-holdout",
+      "key": "openai.stage_review",
+      "repeat": 0
+    },
+    {
+      "after": "sol",
+      "before": "terra",
+      "id": "succinctly-2598-holdout",
+      "key": "openai.stage_review",
+      "repeat": 0
+    },
+    {
+      "after": "pro",
+      "before": "none",
+      "id": "succinctly-2607-holdout",
+      "key": "gemini.stage_design",
+      "repeat": 0
+    },
+    {
+      "after": "terra",
+      "before": "none",
+      "id": "succinctly-2640-holdout",
+      "key": "openai.stage_design",
+      "repeat": 0
+    },
+    {
+      "after": "sonnet",
+      "before": "opus",
+      "id": "succinctly-2643-holdout",
+      "key": "anthropic.stage_implement",
+      "repeat": 0
+    },
+    {
+      "after": "none",
+      "before": "opus",
+      "id": "succinctly-2663-holdout",
+      "key": "anthropic.stage_design",
+      "repeat": 0
+    },
+    {
+      "after": "none",
+      "before": "pro",
+      "id": "succinctly-2708-holdout",
+      "key": "gemini.stage_design",
+      "repeat": 0
+    },
+    {
+      "after": "none",
+      "before": "sol",
+      "id": "succinctly-2709-holdout",
+      "key": "openai.stage_design",
+      "repeat": 0
+    },
+    {
+      "after": "sol",
+      "before": "terra",
+      "id": "succinctly-2709-holdout",
+      "key": "openai.stage_review",
+      "repeat": 0
+    },
+    {
+      "after": "pro",
+      "before": "none",
+      "id": "succinctly-2783-holdout",
+      "key": "gemini.stage_design",
+      "repeat": 0
+    },
+    {
+      "after": "sonnet",
+      "before": "opus",
+      "id": "succinctly-2799-holdout",
+      "key": "anthropic.stage_implement",
+      "repeat": 0
+    },
+    {
+      "after": "flash",
+      "before": "pro",
+      "id": "succinctly-2800-holdout",
+      "key": "gemini.stage_implement",
+      "repeat": 0
+    },
+    {
+      "after": "sol",
+      "before": "terra",
+      "id": "succinctly-2801-holdout",
+      "key": "openai.stage_review",
+      "repeat": 0
+    },
+    {
+      "after": "pro",
+      "before": "deep-think",
+      "id": "succinctly-2875-holdout",
+      "key": "gemini.stage_design",
+      "repeat": 0
+    },
+    {
+      "after": "none",
+      "before": "opus",
+      "id": "succinctly-3479-holdout",
+      "key": "anthropic.stage_design",
+      "repeat": 0
+    },
+    {
+      "after": "terra",
+      "before": "sol",
+      "id": "succinctly-2598-holdout",
+      "key": "openai.stage_review",
+      "repeat": 1
+    },
+    {
+      "after": "opus",
+      "before": "sonnet",
+      "id": "succinctly-2643-holdout",
+      "key": "anthropic.stage_implement",
+      "repeat": 1
+    },
+    {
+      "after": "flash",
+      "before": "pro",
+      "id": "succinctly-2708-holdout",
+      "key": "gemini.stage_review",
+      "repeat": 1
+    },
+    {
+      "after": "terra",
+      "before": "sol",
+      "id": "succinctly-2709-holdout",
+      "key": "openai.stage_review",
+      "repeat": 1
+    },
+    {
+      "after": "flash",
+      "before": "pro",
+      "id": "succinctly-2784-holdout",
+      "key": "gemini.stage_review",
+      "repeat": 1
+    },
+    {
+      "after": "deep-think",
+      "before": "pro",
+      "id": "succinctly-2875-holdout",
+      "key": "gemini.stage_design",
+      "repeat": 1
+    },
+    {
+      "after": "deep-think",
+      "before": "pro",
+      "id": "succinctly-2883-holdout",
+      "key": "gemini.stage_design",
+      "repeat": 1
+    },
+    {
+      "after": "pro",
+      "before": "flash",
+      "id": "succinctly-2883-holdout",
+      "key": "gemini.stage_review",
+      "repeat": 1
+    }
+  ],
+  "usage": {
+    "input_tokens": 833516,
+    "output_tokens": 52577
+  }
+}

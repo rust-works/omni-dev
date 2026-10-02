@@ -1,0 +1,10 @@
+{
+  "type": "choice",
+  "instructions": "What kind of unresolved questions prevents settling the implementation approach, given the latest issue text and comments? Distinguish discovering existing-code facts from choosing between genuinely competing designs. A specified implementation plan is settled even when executing it requires code reading, caller audits, tests, or verification. Do not count those execution tasks, routine coding choices, or already answered questions as open. Judge the remaining uncertainty, not the amount of work.",
+  "criteria": {
+    "none": "The text settles the approach and relevant premises. Carrying out a specified plan, including caller audits and verification, does not itself create open questions.",
+    "factual": "Only unknown facts about the existing code prevent settling the approach: whether a reusable helper exists, what it does, or how existing callers behave. Discovering the right existing integration is factual, not a design tradeoff.",
+    "design": "Only genuine choices between competing approaches remain, requiring judgment about behavior, architecture, or tradeoffs even after existing-code facts are known. Routine choices while implementing a prescribed fix do not qualify.",
+    "both": "Both unresolved existing-code premises and genuine choices between competing designs remain. Code reading alone cannot settle the design tradeoffs."
+  }
+}

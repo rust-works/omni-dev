@@ -1,0 +1,13 @@
+{
+  "parent_pr": "https://github.com/rust-works/omni-dev/pull/2094",
+  "parent_commit": "51bbb0ac2f0397f6c4d59a1ffb0734402c5cd5cb",
+  "source_hashes": {
+    "sources.json.gz": "fb58557c5edca50750b3510becfb5b98b86789513c7ef4f8343054b1b1a92649",
+    "labels.json": "81f0b2f8bfb00bb1f4617882ab2df4a767cc415ec701d5f7961de961cc28ea2b",
+    "templates.json": "d9bec885315fb9a194c10a5c0a384ce38f70b5b61c1393e6a7c0a9922d100f27"
+  },
+  "question_commit": "adcb5a6abb8c5bc450e09695b2adc6fd78b86842",
+  "labels_declared_at": "2026-10-02T03:08:25.447704+00:00",
+  "source_label_caveat": "Externally posted labels/plans may themselves be agent-assisted; author login is not proof of unaided human judgment. No explicit source design/review class labels found. Implementation labels are inherited, not independently adjudicated.",
+  "states": "Production build_route_state layout; no bot comments; no truncation needed. No labels or wording tuned against this set."
+}

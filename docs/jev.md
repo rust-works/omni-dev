@@ -438,7 +438,7 @@ in the current repository instead. Quote `#N` in the shell, where an unquoted
 This class/dependency excerpt shows the default output. Without
 `--effort-advice`, each stage omits `effort_by_model`; see
 [Reading effort advice](#reading-effort-advice) for the opt-in shape.
-The usage numbers below predate the extra effort questions.
+The illustrative usage numbers below predate the extra effort and open-question questions.
 
 ```yaml
 model: jev-1.13.0
@@ -490,8 +490,9 @@ usage: {input_tokens: 1432, output_tokens: 61}
   or effort advice. It judges only the supplied text and comments; it does not
   retrieve code or establish that a proposed solution exists. Missing or unsupported
   answers fail that issue, while the rest of a batch continues.
-  The wording remains gated on [the calibration prerequisite #2052](https://github.com/rust-works/omni-dev/issues/2052);
-  see [evaluation status](evaluations/jev-route-2053/README.md).
+  The wording is experimental: the motivating pair passes, but held-out agreement
+  is limited and adding the question can change existing Jev answers. See the
+  [evaluation results and shipping gate](evaluations/jev-route-2053/README.md).
 - **`class`** is the higher of the design and implement choices. The most
   capable class earns its cost in the design stage; once a plan exists, the
   design answer usually becomes `none` and implementation drops to a cheaper

@@ -1,0 +1,184 @@
+{
+  "answer_field_change_counts": {},
+  "baseline_repeat_changes": [],
+  "billed_cost": null,
+  "class_changes": [],
+  "confusion": {},
+  "failures": [
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "succinctly-3017-before",
+      "mode": "baseline",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "succinctly-3017-before",
+      "mode": "augmented",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "succinctly-3017-after",
+      "mode": "baseline",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "succinctly-3017-after",
+      "mode": "augmented",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-none",
+      "mode": "baseline",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-none",
+      "mode": "augmented",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-factual",
+      "mode": "baseline",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-factual",
+      "mode": "augmented",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-design",
+      "mode": "baseline",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-design",
+      "mode": "augmented",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-both",
+      "mode": "baseline",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-both",
+      "mode": "augmented",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-ambiguous",
+      "mode": "baseline",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-ambiguous",
+      "mode": "augmented",
+      "repeat": 0
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "succinctly-3017-before",
+      "mode": "augmented",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "succinctly-3017-before",
+      "mode": "baseline",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "succinctly-3017-after",
+      "mode": "augmented",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "succinctly-3017-after",
+      "mode": "baseline",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-none",
+      "mode": "augmented",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-none",
+      "mode": "baseline",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-factual",
+      "mode": "augmented",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-factual",
+      "mode": "baseline",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-design",
+      "mode": "augmented",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-design",
+      "mode": "baseline",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-both",
+      "mode": "augmented",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-both",
+      "mode": "baseline",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-ambiguous",
+      "mode": "augmented",
+      "repeat": 1
+    },
+    {
+      "error": "Failed to send request to Jev API: error sending request for url (https://api.typesafe.ai/v1/systemone): client error (Connect): dns error: error resolving DNS: failed to lookup address information: nodename nor servname provided, or not known",
+      "id": "control-ambiguous",
+      "mode": "baseline",
+      "repeat": 1
+    }
+  ],
+  "models": [],
+  "predictions": [],
+  "stage_changes": [],
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  }
+}

@@ -1,0 +1,260 @@
+{
+  "answer_field_change_counts": {
+    "choice": 8,
+    "confidence": 95,
+    "probabilities": 91
+  },
+  "baseline_repeat_changes": [
+    {
+      "after": "pro",
+      "before": "deep-think",
+      "id": "control-design",
+      "key": "gemini.stage_design",
+      "repeat": 1
+    },
+    {
+      "after": "flash",
+      "before": "pro",
+      "id": "control-design",
+      "key": "gemini.stage_review",
+      "repeat": 1
+    }
+  ],
+  "billed_cost": null,
+  "class_changes": [
+    {
+      "after": "pro",
+      "before": "deep-think",
+      "id": "control-design",
+      "key": "gemini",
+      "repeat": 0
+    },
+    {
+      "after": "deep-think",
+      "before": "pro",
+      "id": "control-design",
+      "key": "gemini",
+      "repeat": 1
+    }
+  ],
+  "confusion": {
+    "both -> both": 2,
+    "design -> design": 2,
+    "factual -> both": 2,
+    "factual -> factual": 2,
+    "none -> factual": 2,
+    "none -> none": 2
+  },
+  "failures": [],
+  "models": [
+    "jev-1.13.0"
+  ],
+  "predictions": [
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "both",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-3017-before",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-3017-after",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "none"
+      ],
+      "id": "control-none",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "factual"
+      ],
+      "id": "control-factual",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "control-design",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "both",
+      "expected": [
+        "both"
+      ],
+      "id": "control-both",
+      "repeat": 0
+    },
+    {
+      "accepted": true,
+      "ambiguous": true,
+      "choice": "both",
+      "expected": [
+        "factual",
+        "design",
+        "both"
+      ],
+      "id": "control-ambiguous",
+      "repeat": 0
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "both",
+      "expected": [
+        "factual"
+      ],
+      "id": "succinctly-3017-before",
+      "repeat": 1
+    },
+    {
+      "accepted": false,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "none"
+      ],
+      "id": "succinctly-3017-after",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "none",
+      "expected": [
+        "none"
+      ],
+      "id": "control-none",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "factual",
+      "expected": [
+        "factual"
+      ],
+      "id": "control-factual",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "design",
+      "expected": [
+        "design"
+      ],
+      "id": "control-design",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": false,
+      "choice": "both",
+      "expected": [
+        "both"
+      ],
+      "id": "control-both",
+      "repeat": 1
+    },
+    {
+      "accepted": true,
+      "ambiguous": true,
+      "choice": "both",
+      "expected": [
+        "factual",
+        "design",
+        "both"
+      ],
+      "id": "control-ambiguous",
+      "repeat": 1
+    }
+  ],
+  "stage_changes": [
+    {
+      "after": "sonnet",
+      "before": "opus",
+      "id": "control-design",
+      "key": "anthropic.stage_review",
+      "repeat": 0
+    },
+    {
+      "after": "pro",
+      "before": "deep-think",
+      "id": "control-design",
+      "key": "gemini.stage_design",
+      "repeat": 0
+    },
+    {
+      "after": "pro",
+      "before": "flash",
+      "id": "control-both",
+      "key": "gemini.stage_review",
+      "repeat": 0
+    },
+    {
+      "after": "terra",
+      "before": "sol",
+      "id": "control-both",
+      "key": "openai.stage_review",
+      "repeat": 0
+    },
+    {
+      "after": "sonnet",
+      "before": "opus",
+      "id": "control-design",
+      "key": "anthropic.stage_review",
+      "repeat": 1
+    },
+    {
+      "after": "deep-think",
+      "before": "pro",
+      "id": "control-design",
+      "key": "gemini.stage_design",
+      "repeat": 1
+    },
+    {
+      "after": "pro",
+      "before": "flash",
+      "id": "control-design",
+      "key": "gemini.stage_review",
+      "repeat": 1
+    },
+    {
+      "after": "terra",
+      "before": "sol",
+      "id": "control-both",
+      "key": "openai.stage_review",
+      "repeat": 1
+    }
+  ],
+  "usage": {
+    "input_tokens": 82974,
+    "output_tokens": 10862
+  }
+}
