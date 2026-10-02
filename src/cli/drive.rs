@@ -556,6 +556,129 @@ mod tests {
         assert!(cmd.dispatch(&dead_client()).await.is_ok());
     }
 
+    fn insert_command(
+        before: Option<&str>,
+        after: Option<&str>,
+        text: Option<&str>,
+        text_file: Option<&str>,
+    ) -> DriveSubcommands {
+        DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::Insert(docs::write::InsertCommand {
+                document_id: "d1".to_string(),
+                before: before.map(str::to_string),
+                after: after.map(str::to_string),
+                text: text.map(str::to_string),
+                text_file: text_file.map(str::to_string),
+                ignore_case: true,
+                dry_run: false,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: OutputFormat::Table,
+            }),
+        })
+    }
+
+    fn delete_command(
+        match_text: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> DriveSubcommands {
+        DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::Delete(docs::write::DeleteCommand {
+                document_id: "d1".to_string(),
+                match_text: match_text.map(str::to_string),
+                from: from.map(str::to_string),
+                to: to.map(str::to_string),
+                ignore_case: true,
+                dry_run: false,
+                lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+                output: OutputFormat::Table,
+            }),
+        })
+    }
+
+    /// `insert` reaches the engine for either anchor side and either text
+    /// source, and — like every Docs write verb — reports an unreachable API
+    /// on the output rather than the exit code (see
+    /// `dispatch_routes_docs_replace`).
+    #[tokio::test]
+    async fn dispatch_routes_docs_insert_for_every_anchor_side_and_text_source() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let file = dir.path().join("insert.txt");
+        std::fs::write(&file, "from a file").unwrap();
+        let file = file.to_str().unwrap();
+
+        for cmd in [
+            insert_command(Some("a"), None, Some("x"), None),
+            insert_command(None, Some("a"), Some("x"), None),
+            insert_command(Some("a"), None, None, Some(file)),
+            insert_command(None, Some("a"), None, Some(file)),
+        ] {
+            assert!(cmd.dispatch(&dead_client()).await.is_ok());
+        }
+    }
+
+    /// The engine never runs when the anchor or text selection is
+    /// ambiguous. clap already refuses these, so the checks guard commands
+    /// built any other way.
+    #[tokio::test]
+    async fn dispatch_refuses_an_insert_without_exactly_one_anchor_and_text_source() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        for cmd in [
+            insert_command(None, None, Some("x"), None),
+            insert_command(Some("a"), Some("b"), Some("x"), None),
+        ] {
+            let err = cmd.dispatch(&dead_client()).await.unwrap_err();
+            assert!(err.to_string().contains("--before or --after"), "{err}");
+        }
+        for cmd in [
+            insert_command(Some("a"), None, None, None),
+            insert_command(Some("a"), None, Some("x"), Some("f")),
+        ] {
+            let err = cmd.dispatch(&dead_client()).await.unwrap_err();
+            assert!(err.to_string().contains("--text or --text-file"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_docs_delete_for_a_match_and_for_a_range() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        for cmd in [
+            delete_command(Some("a"), None, None),
+            delete_command(None, Some("a"), Some("b")),
+        ] {
+            assert!(cmd.dispatch(&dead_client()).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_refuses_a_delete_that_is_not_a_match_or_a_full_range() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        for cmd in [
+            delete_command(None, None, None),
+            delete_command(None, Some("a"), None),
+            delete_command(None, None, Some("b")),
+            delete_command(Some("a"), Some("a"), Some("b")),
+            delete_command(Some("a"), Some("a"), None),
+        ] {
+            let err = cmd.dispatch(&dead_client()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("--match or both --from and --to"),
+                "{err}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_routes_docs_create() {
         let guard = crate::drive::test_support::EnvGuard::take();

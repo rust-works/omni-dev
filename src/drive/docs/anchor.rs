@@ -256,7 +256,7 @@ fn map_boundary(runs: &[Run<'_>], mut byte: usize) -> Result<i64, AnchorError> {
         }
         byte -= run.text.len();
     }
-    Err(AnchorError::InvalidIndices)
+    Err(AnchorError::InvalidIndices) // omni-dev: coverage ignore-line reason="map_boundary is only called with a byte offset inside the text its runs concatenate, so the loop always returns first; the Err keeps the function total without a panic"
 }
 
 /// Counts the text Google actually inserts, excluding documented stripped
@@ -290,7 +290,7 @@ pub fn resolve_insert(
         Side::After => found.end,
     };
     if index < p.start || index >= p.end {
-        return Err(AnchorError::UnsafeRange);
+        return Err(AnchorError::UnsafeRange); // omni-dev: coverage ignore-line reason="a match never contains the paragraph's closing newline (find rejects a needle with one) and collect verified the last run ends at it, so the index always lies inside the paragraph; kept as defence on the write boundary"
     }
     Ok(EditPreview {
         start_index: index,
@@ -336,7 +336,7 @@ pub fn resolve_delete(
     let mut count = 0;
     for p in &paragraphs[first.paragraph..=last.paragraph] {
         if p.tab != a.tab || p.container != a.container {
-            return Err(AnchorError::UnsafeRange);
+            return Err(AnchorError::UnsafeRange); // omni-dev: coverage ignore-line reason="a container switch between two paragraphs of one container is always a table, and the paragraph before it has protected_newline, so the check below refuses the range before the walk reaches a foreign paragraph; kept as defence in depth"
         }
         if p.protected_newline && start < p.end && end >= p.end {
             return Err(AnchorError::UnsafeRange);
@@ -361,7 +361,7 @@ pub fn resolve_delete(
                     chars += 1;
                     bytes += ch.len_utf8();
                 } else if index < hi && next > lo {
-                    return Err(AnchorError::InvalidIndices);
+                    return Err(AnchorError::InvalidIndices); // omni-dev: coverage ignore-line reason="lo and hi are regex match boundaries mapped through whole runs, so neither falls inside a surrogate pair; kept as defence in the UTF-16 arithmetic"
                 }
                 index = next;
             }
@@ -369,7 +369,7 @@ pub fn resolve_delete(
         }
     }
     if cursor != end {
-        return Err(AnchorError::UnsafeRange);
+        return Err(AnchorError::UnsafeRange); // omni-dev: coverage ignore-line reason="end is the end of the last anchor, which lies inside a run the loop above visits, and a gap before it already returned UnsafeRange, so the cursor always reaches it; kept as defence in depth"
     }
     Ok(EditPreview {
         start_index: start,
@@ -492,6 +492,52 @@ mod tests {
         assert_eq!(
             resolve_delete(&doc(vec![p]), "anchor", None, true),
             Err(AnchorError::InvalidIndices)
+        );
+    }
+
+    #[test]
+    fn paragraph_and_run_indices_that_do_not_nest_are_refused() {
+        type Mutation = fn(&mut Value);
+        let cases: [(&str, Mutation); 7] = [
+            ("paragraph starts before the body", |p| {
+                p["startIndex"] = json!(0);
+            }),
+            ("paragraph is empty", |p| {
+                p["endIndex"] = json!(1);
+            }),
+            ("run overlaps the previous run", |p| {
+                p["paragraph"]["elements"][1]["startIndex"] = json!(2);
+            }),
+            ("run is empty", |p| {
+                p["paragraph"]["elements"][1]["endIndex"] = json!(4);
+            }),
+            ("run overruns its paragraph", |p| {
+                p["endIndex"] = json!(7);
+            }),
+            ("last run is not newline-terminated", |p| {
+                p["paragraph"]["elements"][1]["textRun"]["content"] = json!("def");
+                p["paragraph"]["elements"][1]["endIndex"] = json!(7);
+                p["endIndex"] = json!(7);
+            }),
+            ("last run stops short of the paragraph end", |p| {
+                p["endIndex"] = json!(9);
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut p = paragraph(1, &["abc", "def\n"]);
+            mutate(&mut p);
+            assert_eq!(
+                resolve_delete(&doc(vec![p]), "abc", None, true),
+                Err(AnchorError::InvalidIndices),
+                "{name}"
+            );
+        }
+        let mut p = paragraph(1, &["abc\n"]);
+        p["paragraph"]["elements"] = json!([]);
+        assert_eq!(
+            resolve_delete(&doc(vec![p]), "abc", None, true),
+            Err(AnchorError::InvalidIndices),
+            "a paragraph with no runs"
         );
     }
 
