@@ -17,9 +17,10 @@ JSON, and no model-registry token limit to fit into.
 Jev lives under `ai` but is deliberately **not** an [AI backend](ai-backends.md).
 Most of its subcommands do not accept the AI backend flags (`--ai-backend`,
 `--model`, `--beta-header`, `--claude-cli-*`, `--models-yaml`) — passing any
-of them is a clap error, "unexpected argument". [`route`](#route) and
-[`verify-decision`](#verify-decision) are the two exceptions to `-C/--repo`,
-which they use to decide which repository a bare `#N` means.
+of them is a clap error, "unexpected argument". [`route`](#route),
+[`exists`](#code-existence-screening-experimental) and
+[`verify-decision`](#verify-decision) accept `-C/--repo` to resolve a bare `#N`;
+`exists` also searches that local repository.
 [`verify-decision`](#verify-decision) is also the one Jev command that
 **does** accept the AI backend flags: it uses an AI backend, not Jev, to
 split a decision comment into statements before checking each one with Jev.
@@ -46,14 +47,17 @@ question map) has nothing in common with a chat completion.
 16. [Request log](#request-log)
 17. [Troubleshooting](#troubleshooting)
 18. [See also](#see-also)
+19. [Code existence screening (experimental)](#code-existence-screening-experimental)
 
 ## Prerequisites
 
 - A TypeSafe account and a Jev **API key**. The same key works with
   TypeSafe's own SDKs, which read it from `TYPESAFE_API_KEY`.
-- For [`route`](#route) only: the GitHub CLI (`gh`), authenticated with read
-  access to the repositories whose issues you route. The token stays inside
-  `gh`; omni-dev never reads it.
+- For `route`, `verify-decision`, and `exists` without `--issue-file`: the
+  GitHub CLI (`gh`), authenticated with read access to the referenced repositories.
+  The token stays inside `gh`; omni-dev never reads it.
+- `exists --dry-run` and empty retrieval require no Jev key. `exists` needs a
+  local Git repository with a committed HEAD.
 
 ## Authentication
 
@@ -1812,3 +1816,54 @@ backend selection stays in server configuration. The splitter model defaults to
 `settings.mcp.default_model`, then the backend default. Request overrides do not
 change process environment or working directory. The MCP tools do not expose
 CLI backend/sandbox escape-hatch flags or human text output.
+
+## Code existence screening (experimental)
+
+`exists` screens a single issue before a more expensive code search:
+
+```sh
+omni-dev ai jev exists rust-works/succinctly#3017 -C /path/to/succinctly
+omni-dev ai jev exists --issue-file issue.txt -C /path/to/repo --dry-run
+omni-dev ai jev exists 2054 -C . --jev-model jev-1.13.0 -o yaml
+```
+
+The GitHub input is the title and body, freshly fetched, without comments or cited
+issues. `--issue-file` supplies the same plain UTF-8 text locally. A dry run needs
+no Jev credentials and prints `retrieval` plus the exact `request` (null when no
+candidate exists). Its default model is `jev-latest`; use `--jev-model` to pin it.
+Normal calls use the same settings and credentials as the other Jev commands.
+
+Retrieval pins the local repository's HEAD commit and searches committed Rust
+sources with literal word matches. It extracts exact single-backticked identifiers
+and `module::symbol` paths outside fenced examples. Qualified paths search their
+terminal identifier: no Rust name resolution occurs, and duplicate names remain
+separate candidates with source path and one-based signature line. A hit retrieves
+function/method signatures starting within 40 lines on either side, including an
+adjacent helper. Bodies are parsed locally but never enter Jev state. Only named
+candidate fields (path, line, symbol, signature, doc_comments and an initially
+null score) accompany the bounded issue text. `route` receives none of this code.
+
+All candidates are judged in **one** request, with one named `noul` each. The
+report contains source locations and scores, actual model, token usage, commit,
+identifiers, limits, and warnings. `no_identifiers`, `no_hits`, or `no_candidates`
+returns a report with null model/usage without looking up credentials or calling
+Jev. `ready` indicates scored candidates. Git failures and malformed Jev answers
+are errors, rather than evidence that the proposed work does not exist.
+
+Hard limits are 16 identifiers, 24 matching files, 512 KiB per file, 64 KiB of grep
+filenames, 24 candidates, 2 KiB of signature plus doc comments per candidate,
+16 KiB of issue text and 64 KiB of serialized state. Oversized signatures are
+skipped; docs and issue text are cut at UTF-8 boundaries. Files over the size cap,
+invalid UTF-8 sources and parser failures are skipped with warnings. Candidates
+are ordered by path/line and tail candidates are dropped to fit the state budget.
+The output records actual omissions. Uncommitted files, non-Rust code, macro-generated
+definitions, distant helpers and body-level facts can all be missed.
+
+Each question asks whether a definition already implements a concrete operation
+the issue proposes writing; integration and tests can still remain. Scores are
+screening signals, not proof that a definition supplies the whole change. Similar names and partial implementations are insufficient; signatures
+and docs can also be stale. For succinctly #3017, helper retrieval may surface
+`any_pattern_key`, but the decisive oracle probe and the `Vec` double-push trap
+require execution or body reading and remain outside this filter. Do not close an
+issue or feed an unchecked finding into a routing decision on this score alone.
+See `docs/evaluations/jev-exists-2054/` for study provenance and calibration limits.

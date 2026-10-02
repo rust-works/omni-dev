@@ -273,6 +273,7 @@ Commands:
   noul             Estimates the probability of a yes/no condition
   ask              Answers several questions about one state in a single pass, from a file
   route            Routes issues to model classes for their design, implement and review stages
+  exists           Screens local Rust signatures for work an issue proposes writing
   verify-decision  Checks a decision comment against the issues or pull requests it cites
   help             Print this message or the help of the given subcommand(s)
 
@@ -317,6 +318,26 @@ Options:
   -o, --output <OUTPUT>              Output format [default: json] [possible values: json, yaml]
       --jev-model <MODEL>            Overrides the configured Jev model for this call
   -h, --help                         Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev ai jev exists - Screens local Rust signatures for work an issue proposes writing
+
+Screens local Rust signatures for work an issue proposes writing
+
+Usage: exists [OPTIONS] [ISSUE]
+
+Arguments:
+  [ISSUE]  One issue: N, #N, owner/repo#N, or GitHub issue URL
+
+Options:
+      --issue-file <FILE>  Read pinned issue text from a UTF-8 file instead of GitHub
+      --dry-run            Inspect the exact bounded request without calling Jev or requiring credentials
+  -C, --repo <PATH>        Run as if omni-dev was started in `<PATH>` instead of the current working directory
+  -o, --output <OUTPUT>    Output format [default: json] [possible values: json, yaml]
+      --jev-model <MODEL>  Override the configured Jev model
+  -h, --help               Print help (see more with '--help')
 
 
 ================================================================================

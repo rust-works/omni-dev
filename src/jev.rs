@@ -11,6 +11,7 @@
 //! - [`citations`] — shared citation-finding, used by `route` and `verify`.
 //! - [`client`] — the `reqwest` client and its single `POST /v1/systemone` call.
 //! - [`config`] — credential and base-URL resolution.
+//! - [`exists`] — bounded signature retrieval and one-round existence screening.
 //! - [`error`] — the [`error::JevError`] domain error type.
 //! - [`input`] — shared input-text truncation, used by `route` and `verify`.
 //! - [`markdown_code`] — masks fenced code and inline code spans, so scanners skip them.
@@ -22,6 +23,7 @@ pub mod citations;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod exists;
 pub mod input;
 pub mod markdown_code;
 pub mod protocol;
