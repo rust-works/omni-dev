@@ -1,0 +1,1579 @@
+{
+  "agreement": {
+    "evaluator_design": {
+      "agree": 12,
+      "mismatches": [
+        2806
+      ],
+      "scored": 13
+    },
+    "evaluator_review": {
+      "agree": 5,
+      "mismatches": [
+        2706,
+        3507
+      ],
+      "scored": 7
+    },
+    "source_class": {
+      "agree": 30,
+      "mismatches": [
+        2663,
+        2875,
+        3479
+      ],
+      "scored": 33
+    },
+    "source_implement": {
+      "agree": 16,
+      "mismatches": [
+        2588,
+        2607,
+        2663,
+        2664,
+        2707,
+        2708,
+        2709,
+        2783,
+        2784,
+        2796,
+        2801,
+        2883,
+        3459,
+        3460,
+        3479,
+        3512,
+        3514
+      ],
+      "scored": 33
+    }
+  },
+  "all_open_count": 214,
+  "all_open_failures": [],
+  "all_open_reference_fetch_failures": [],
+  "all_open_truncated": [
+    "rust-works/succinctly#3456",
+    "rust-works/succinctly#235"
+  ],
+  "estimated_list_price_usd": 0.025493286,
+  "holdout_count": 34,
+  "holdout_failures": [],
+  "model": "jev-1.13.0",
+  "open_question_counts": {
+    "both": 4,
+    "design": 9,
+    "factual": 14,
+    "none": 7
+  },
+  "rows": [
+    {
+      "checks": {
+        "evaluator_design": true,
+        "evaluator_review": true,
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [],
+      "input_drift": [],
+      "number": 2520,
+      "open_question_kind": "none",
+      "reference_fetch_failures": [],
+      "source_class": "sonnet",
+      "stages": {
+        "design": {
+          "choice": "none",
+          "confidence": 0.43,
+          "probabilities": {
+            "none": 0.63,
+            "opus": 0.01,
+            "sonnet": 0.36
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.97,
+          "probabilities": {
+            "opus": 0.01,
+            "sonnet": 0.99
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.91,
+          "probabilities": {
+            "opus": 0.04,
+            "sonnet": 0.96
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [
+        "implement"
+      ],
+      "input_drift": [],
+      "number": 2588,
+      "open_question_kind": "both",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.65,
+          "probabilities": {
+            "none": 0.13,
+            "opus": 0.76,
+            "sonnet": 0.11
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.16,
+          "probabilities": {
+            "opus": 0.42,
+            "sonnet": 0.58
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.38,
+          "probabilities": {
+            "opus": 0.69,
+            "sonnet": 0.31
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "evaluator_design": true,
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "opus",
+      "class_from": "implement",
+      "close_calls": [
+        "implement"
+      ],
+      "input_drift": [],
+      "number": 2598,
+      "open_question_kind": "design",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.73,
+          "probabilities": {
+            "none": 0.1,
+            "opus": 0.83,
+            "sonnet": 0.07
+          }
+        },
+        "implement": {
+          "choice": "opus",
+          "confidence": 0.21,
+          "probabilities": {
+            "opus": 0.61,
+            "sonnet": 0.39
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.64,
+          "probabilities": {
+            "opus": 0.82,
+            "sonnet": 0.18
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [
+        "review"
+      ],
+      "input_drift": [],
+      "number": 2607,
+      "open_question_kind": "design",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.38,
+          "probabilities": {
+            "none": 0.23,
+            "opus": 0.59,
+            "sonnet": 0.18
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.63,
+          "probabilities": {
+            "opus": 0.18,
+            "sonnet": 0.82
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.15,
+          "probabilities": {
+            "opus": 0.58,
+            "sonnet": 0.42
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [
+        "design"
+      ],
+      "input_drift": [],
+      "number": 2640,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "sonnet",
+      "stages": {
+        "design": {
+          "choice": "sonnet",
+          "confidence": 0.25,
+          "probabilities": {
+            "none": 0.43,
+            "opus": 0.07,
+            "sonnet": 0.5
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.86,
+          "probabilities": {
+            "opus": 0.07,
+            "sonnet": 0.93
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.6,
+          "probabilities": {
+            "opus": 0.2,
+            "sonnet": 0.8
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "opus",
+      "class_from": "implement",
+      "close_calls": [
+        "implement",
+        "review"
+      ],
+      "input_drift": [],
+      "number": 2643,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.58,
+          "probabilities": {
+            "none": 0.18,
+            "opus": 0.72,
+            "sonnet": 0.1
+          }
+        },
+        "implement": {
+          "choice": "opus",
+          "confidence": 0.01,
+          "probabilities": {
+            "opus": 0.51,
+            "sonnet": 0.49
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.29,
+          "probabilities": {
+            "opus": 0.64,
+            "sonnet": 0.36
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "evaluator_design": true,
+        "source_class": false,
+        "source_implement": false
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [
+        "design",
+        "review"
+      ],
+      "input_drift": [],
+      "number": 2663,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "none",
+          "confidence": 0.18,
+          "probabilities": {
+            "none": 0.46,
+            "opus": 0.42,
+            "sonnet": 0.12
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.39,
+          "probabilities": {
+            "opus": 0.3,
+            "sonnet": 0.7
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.29,
+          "probabilities": {
+            "opus": 0.65,
+            "sonnet": 0.35
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "evaluator_design": true,
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [],
+      "input_drift": [],
+      "number": 2664,
+      "open_question_kind": "both",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.81,
+          "probabilities": {
+            "none": 0.01,
+            "opus": 0.88,
+            "sonnet": 0.11
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.36,
+          "probabilities": {
+            "opus": 0.32,
+            "sonnet": 0.68
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.3,
+          "probabilities": {
+            "opus": 0.65,
+            "sonnet": 0.35
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "evaluator_design": true,
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [
+        "design"
+      ],
+      "input_drift": [],
+      "number": 2705,
+      "open_question_kind": "none",
+      "reference_fetch_failures": [],
+      "source_class": "sonnet",
+      "stages": {
+        "design": {
+          "choice": "none",
+          "confidence": 0.23,
+          "probabilities": {
+            "none": 0.49,
+            "opus": 0.14,
+            "sonnet": 0.37
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.97,
+          "probabilities": {
+            "opus": 0.02,
+            "sonnet": 0.98
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.69,
+          "probabilities": {
+            "opus": 0.15,
+            "sonnet": 0.85
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "evaluator_design": true,
+        "evaluator_review": false,
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [
+        "design"
+      ],
+      "input_drift": [],
+      "number": 2706,
+      "open_question_kind": "none",
+      "reference_fetch_failures": [],
+      "source_class": "sonnet",
+      "stages": {
+        "design": {
+          "choice": "none",
+          "confidence": 0.21,
+          "probabilities": {
+            "none": 0.47,
+            "opus": 0.09,
+            "sonnet": 0.44
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.97,
+          "probabilities": {
+            "opus": 0.01,
+            "sonnet": 0.99
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.62,
+          "probabilities": {
+            "opus": 0.19,
+            "sonnet": 0.81
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [
+        "review"
+      ],
+      "input_drift": [],
+      "number": 2707,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.33,
+          "probabilities": {
+            "none": 0.3,
+            "opus": 0.55,
+            "sonnet": 0.15
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.33,
+          "probabilities": {
+            "opus": 0.33,
+            "sonnet": 0.67
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.19,
+          "probabilities": {
+            "opus": 0.6,
+            "sonnet": 0.4
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [],
+      "input_drift": [],
+      "number": 2708,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.42,
+          "probabilities": {
+            "none": 0.26,
+            "opus": 0.61,
+            "sonnet": 0.13
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.4,
+          "probabilities": {
+            "opus": 0.3,
+            "sonnet": 0.7
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.33,
+          "probabilities": {
+            "opus": 0.66,
+            "sonnet": 0.34
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [
+        "implement"
+      ],
+      "input_drift": [],
+      "number": 2709,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.34,
+          "probabilities": {
+            "none": 0.33,
+            "opus": 0.56,
+            "sonnet": 0.11
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.16,
+          "probabilities": {
+            "opus": 0.42,
+            "sonnet": 0.58
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.42,
+          "probabilities": {
+            "opus": 0.71,
+            "sonnet": 0.29
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [
+        "design"
+      ],
+      "input_drift": [],
+      "number": 2712,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "sonnet",
+      "stages": {
+        "design": {
+          "choice": "sonnet",
+          "confidence": 0.27,
+          "probabilities": {
+            "none": 0.29,
+            "opus": 0.2,
+            "sonnet": 0.51
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.96,
+          "probabilities": {
+            "opus": 0.02,
+            "sonnet": 0.98
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.74,
+          "probabilities": {
+            "opus": 0.13,
+            "sonnet": 0.87
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [
+        "implement",
+        "review"
+      ],
+      "input_drift": [],
+      "number": 2783,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.48,
+          "probabilities": {
+            "none": 0.22,
+            "opus": 0.66,
+            "sonnet": 0.12
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.08,
+          "probabilities": {
+            "opus": 0.46,
+            "sonnet": 0.54
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.24,
+          "probabilities": {
+            "opus": 0.62,
+            "sonnet": 0.38
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [],
+      "input_drift": [],
+      "number": 2784,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.79,
+          "probabilities": {
+            "none": 0.06,
+            "opus": 0.86,
+            "sonnet": 0.08
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.41,
+          "probabilities": {
+            "opus": 0.29,
+            "sonnet": 0.71
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.37,
+          "probabilities": {
+            "opus": 0.69,
+            "sonnet": 0.31
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [
+        "implement",
+        "review"
+      ],
+      "input_drift": [],
+      "number": 2796,
+      "open_question_kind": "design",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.83,
+          "probabilities": {
+            "none": 0.04,
+            "opus": 0.89,
+            "sonnet": 0.07
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.08,
+          "probabilities": {
+            "opus": 0.46,
+            "sonnet": 0.54
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.19,
+          "probabilities": {
+            "opus": 0.59,
+            "sonnet": 0.41
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "opus",
+      "class_from": "implement",
+      "close_calls": [
+        "implement"
+      ],
+      "input_drift": [],
+      "number": 2799,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.67,
+          "probabilities": {
+            "none": 0.11,
+            "opus": 0.77,
+            "sonnet": 0.12
+          }
+        },
+        "implement": {
+          "choice": "opus",
+          "confidence": 0.03,
+          "probabilities": {
+            "opus": 0.51,
+            "sonnet": 0.49
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.64,
+          "probabilities": {
+            "opus": 0.82,
+            "sonnet": 0.18
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "opus",
+      "class_from": "implement",
+      "close_calls": [
+        "implement"
+      ],
+      "input_drift": [],
+      "number": 2800,
+      "open_question_kind": "both",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.62,
+          "probabilities": {
+            "none": 0.19,
+            "opus": 0.75,
+            "sonnet": 0.06
+          }
+        },
+        "implement": {
+          "choice": "opus",
+          "confidence": 0.19,
+          "probabilities": {
+            "opus": 0.59,
+            "sonnet": 0.41
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.55,
+          "probabilities": {
+            "opus": 0.77,
+            "sonnet": 0.23
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [
+        "review"
+      ],
+      "input_drift": [],
+      "number": 2801,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.62,
+          "probabilities": {
+            "none": 0.19,
+            "opus": 0.74,
+            "sonnet": 0.07
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.67,
+          "probabilities": {
+            "opus": 0.17,
+            "sonnet": 0.83
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.17,
+          "probabilities": {
+            "opus": 0.58,
+            "sonnet": 0.42
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {},
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [],
+      "input_drift": [],
+      "number": 2802,
+      "open_question_kind": "design",
+      "reference_fetch_failures": [],
+      "source_class": "fable",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.79,
+          "probabilities": {
+            "none": 0.05,
+            "opus": 0.86,
+            "sonnet": 0.09
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.58,
+          "probabilities": {
+            "opus": 0.21,
+            "sonnet": 0.79
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.53,
+          "probabilities": {
+            "opus": 0.77,
+            "sonnet": 0.23
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "evaluator_design": false,
+        "evaluator_review": true,
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [
+        "design"
+      ],
+      "input_drift": [],
+      "number": 2806,
+      "open_question_kind": "none",
+      "reference_fetch_failures": [],
+      "source_class": "sonnet",
+      "stages": {
+        "design": {
+          "choice": "sonnet",
+          "confidence": 0.27,
+          "probabilities": {
+            "none": 0.41,
+            "opus": 0.08,
+            "sonnet": 0.51
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.97,
+          "probabilities": {
+            "opus": 0.02,
+            "sonnet": 0.98
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.78,
+          "probabilities": {
+            "opus": 0.11,
+            "sonnet": 0.89
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": false,
+        "source_implement": true
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [
+        "review"
+      ],
+      "input_drift": [],
+      "number": 2875,
+      "open_question_kind": "design",
+      "reference_fetch_failures": [],
+      "source_class": "sonnet",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.53,
+          "probabilities": {
+            "none": 0.01,
+            "opus": 0.68,
+            "sonnet": 0.31
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.79,
+          "probabilities": {
+            "opus": 0.1,
+            "sonnet": 0.9
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.08,
+          "probabilities": {
+            "opus": 0.46,
+            "sonnet": 0.54
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [
+        "design"
+      ],
+      "input_drift": [],
+      "number": 2883,
+      "open_question_kind": "design",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.29,
+          "probabilities": {
+            "none": 0.09,
+            "opus": 0.53,
+            "sonnet": 0.38
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.69,
+          "probabilities": {
+            "opus": 0.15,
+            "sonnet": 0.85
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.38,
+          "probabilities": {
+            "opus": 0.31,
+            "sonnet": 0.69
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [],
+      "input_drift": [],
+      "number": 3241,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "sonnet",
+      "stages": {
+        "design": {
+          "choice": "none",
+          "confidence": 0.66,
+          "probabilities": {
+            "none": 0.77,
+            "opus": 0.09,
+            "sonnet": 0.14
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.94,
+          "probabilities": {
+            "opus": 0.03,
+            "sonnet": 0.97
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.53,
+          "probabilities": {
+            "opus": 0.24,
+            "sonnet": 0.76
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [],
+      "input_drift": [],
+      "number": 3272,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "sonnet",
+      "stages": {
+        "design": {
+          "choice": "none",
+          "confidence": 0.41,
+          "probabilities": {
+            "none": 0.61,
+            "opus": 0.12,
+            "sonnet": 0.27
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.93,
+          "probabilities": {
+            "opus": 0.03,
+            "sonnet": 0.97
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.61,
+          "probabilities": {
+            "opus": 0.19,
+            "sonnet": 0.81
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [
+        "design"
+      ],
+      "input_drift": [],
+      "number": 3455,
+      "open_question_kind": "none",
+      "reference_fetch_failures": [],
+      "source_class": "sonnet",
+      "stages": {
+        "design": {
+          "choice": "sonnet",
+          "confidence": 0.26,
+          "probabilities": {
+            "none": 0.41,
+            "opus": 0.08,
+            "sonnet": 0.51
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.95,
+          "probabilities": {
+            "opus": 0.03,
+            "sonnet": 0.97
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.56,
+          "probabilities": {
+            "opus": 0.22,
+            "sonnet": 0.78
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "evaluator_design": true,
+        "evaluator_review": true,
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [
+        "review"
+      ],
+      "input_drift": [],
+      "number": 3459,
+      "open_question_kind": "design",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.85,
+          "probabilities": {
+            "none": 0.03,
+            "opus": 0.9,
+            "sonnet": 0.07
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.68,
+          "probabilities": {
+            "opus": 0.16,
+            "sonnet": 0.84
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.22,
+          "probabilities": {
+            "opus": 0.61,
+            "sonnet": 0.39
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [],
+      "input_drift": [],
+      "number": 3460,
+      "open_question_kind": "both",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.5,
+          "probabilities": {
+            "none": 0.19,
+            "opus": 0.66,
+            "sonnet": 0.15
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.43,
+          "probabilities": {
+            "opus": 0.28,
+            "sonnet": 0.72
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.45,
+          "probabilities": {
+            "opus": 0.73,
+            "sonnet": 0.27
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "evaluator_design": true,
+        "source_class": false,
+        "source_implement": false
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [
+        "design",
+        "review"
+      ],
+      "input_drift": [],
+      "number": 3479,
+      "open_question_kind": "factual",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "none",
+          "confidence": 0.18,
+          "probabilities": {
+            "none": 0.45,
+            "opus": 0.44,
+            "sonnet": 0.11
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.51,
+          "probabilities": {
+            "opus": 0.24,
+            "sonnet": 0.76
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.05,
+          "probabilities": {
+            "opus": 0.52,
+            "sonnet": 0.48
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "evaluator_design": true,
+        "evaluator_review": false,
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [],
+      "input_drift": [],
+      "number": 3507,
+      "open_question_kind": "none",
+      "reference_fetch_failures": [],
+      "source_class": "sonnet",
+      "stages": {
+        "design": {
+          "choice": "none",
+          "confidence": 0.64,
+          "probabilities": {
+            "none": 0.76,
+            "opus": 0.02,
+            "sonnet": 0.22
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.96,
+          "probabilities": {
+            "opus": 0.02,
+            "sonnet": 0.98
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.83,
+          "probabilities": {
+            "opus": 0.09,
+            "sonnet": 0.91
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "evaluator_design": true,
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [],
+      "input_drift": [],
+      "number": 3512,
+      "open_question_kind": "design",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.86,
+          "probabilities": {
+            "none": 0.01,
+            "opus": 0.91,
+            "sonnet": 0.08
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.46,
+          "probabilities": {
+            "opus": 0.27,
+            "sonnet": 0.73
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.4,
+          "probabilities": {
+            "opus": 0.7,
+            "sonnet": 0.3
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "evaluator_design": true,
+        "evaluator_review": true,
+        "source_class": true,
+        "source_implement": true
+      },
+      "class": "sonnet",
+      "class_from": "implement",
+      "close_calls": [
+        "design"
+      ],
+      "input_drift": [],
+      "number": 3513,
+      "open_question_kind": "none",
+      "reference_fetch_failures": [],
+      "source_class": "sonnet",
+      "stages": {
+        "design": {
+          "choice": "none",
+          "confidence": 0.35,
+          "probabilities": {
+            "none": 0.57,
+            "opus": 0.03,
+            "sonnet": 0.4
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.98,
+          "probabilities": {
+            "opus": 0.01,
+            "sonnet": 0.99
+          }
+        },
+        "review": {
+          "choice": "sonnet",
+          "confidence": 0.83,
+          "probabilities": {
+            "opus": 0.09,
+            "sonnet": 0.91
+          }
+        }
+      },
+      "truncated": false
+    },
+    {
+      "checks": {
+        "evaluator_design": true,
+        "evaluator_review": true,
+        "source_class": true,
+        "source_implement": false
+      },
+      "class": "opus",
+      "class_from": "design",
+      "close_calls": [],
+      "input_drift": [],
+      "number": 3514,
+      "open_question_kind": "design",
+      "reference_fetch_failures": [],
+      "source_class": "opus",
+      "stages": {
+        "design": {
+          "choice": "opus",
+          "confidence": 0.8,
+          "probabilities": {
+            "none": 0.03,
+            "opus": 0.86,
+            "sonnet": 0.11
+          }
+        },
+        "implement": {
+          "choice": "sonnet",
+          "confidence": 0.52,
+          "probabilities": {
+            "opus": 0.24,
+            "sonnet": 0.76
+          }
+        },
+        "review": {
+          "choice": "opus",
+          "confidence": 0.33,
+          "probabilities": {
+            "opus": 0.66,
+            "sonnet": 0.34
+          }
+        }
+      },
+      "truncated": false
+    }
+  ],
+  "source_class_confusion": {
+    "opus->opus": 19,
+    "opus->sonnet": 2,
+    "sonnet->opus": 1,
+    "sonnet->sonnet": 11
+  },
+  "unsupported_classes": [
+    2802
+  ],
+  "usage": {
+    "input_tokens": 606983,
+    "output_tokens": 28076
+  }
+}

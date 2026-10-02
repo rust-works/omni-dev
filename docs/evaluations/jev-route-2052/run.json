@@ -1,0 +1,32 @@
+{
+  "command": [
+    "/Users/jky/wrk/work-trees/omni-dev/issue-2052-route-calibration-set/target/debug/omni-dev",
+    "ai",
+    "jev",
+    "route",
+    "--all-open",
+    "--refresh",
+    "--ladders",
+    "anthropic",
+    "--jev-model",
+    "jev-latest",
+    "-o",
+    "json",
+    "-C",
+    "/Users/jky/wrk/rust-works/succinctly"
+  ],
+  "started_at": "2026-10-02T03:15:30.281286+00:00",
+  "finished_at": "2026-10-02T03:17:40.538220+00:00",
+  "seconds": 130.25776958395727,
+  "exit_code": 0,
+  "source_commit": "9bde7a50c5e263fb2bce32e1057f6953afc41cd6",
+  "version": "omni-dev 0.44.0 (9bde7a50 2026-10-02, dirty)",
+  "binary_sha256": "94d85d89d2baf25911b196e26841f9e60903a378f7d44ff38909aec2590bb872",
+  "fixture_environment": {
+    "OMNI_DEV_GH_BIN": "$WT/docs/evaluations/jev-route-2052/gh_fixture.py",
+    "ROUTE_GH_FIXTURE_DIR": "/private/tmp/2052-baseline/github-responses"
+  },
+  "requested_model": "jev-latest",
+  "monetary_cost": null,
+  "monetary_cost_note": "Billing receipt and dated model rate not exposed by CLI. Tokens are reported; dollars unknown."
+}
