@@ -114,7 +114,7 @@ by Michael Nygard.
 | [ADR-0088](adr-0088.md)                                 | ✅ Accepted                              | 2026-09-25 | Exact Codex Session State from a Private, Poll-Only App-Server                              |
 | [ADR-0089](adr-0089.md)                                 | ✅ Accepted                              | 2026-09-27 | `<NAME>_FILE` for Every Secret Environment Variable                                         |
 | [ADR-0090](adr-0090.md)                                 | ✅ Accepted                              | 2026-09-30 | Fetch Secrets On Demand with `<NAME>_COMMAND`                                               |
-| [ADR-0091](adr-0091.md)                                 | 🟡 Proposed                              | 2026-10-02 | Gated Sheets and Docs Content Writes over MCP                                               |
+| [ADR-0091](adr-0091.md)                                 | ✅ Accepted                              | 2026-10-02 | Gated Sheets and Docs Content Writes over MCP                                               |
 | [ADR-0092](adr-0092.md)                                 | ✅ Accepted                              | 2026-10-02 | Gated Trash and Restore for Individual Drive Files                                          |
 | [ADR-0093](adr-0093.md)                                 | ✅ Accepted                              | 2026-10-02 | Google Slides object reads and guarded text replacement                                     |
 | [ADR-0094](adr-0094.md)                                 | ✅ Accepted                              | 2026-10-02 | Anchor-Addressed Docs Insertion and Deletion                                                |

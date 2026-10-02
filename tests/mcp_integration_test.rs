@@ -2860,3 +2860,80 @@ async fn confluence_compare_min_change_chars_filters_small_edits() -> Result<()>
     let _ = server_handle.await;
     Ok(())
 }
+
+/// Schemas and dispatch reject policy overrides before credentials or consent.
+#[tokio::test]
+async fn drive_write_tools_round_trip_and_reject_policy_parameters() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let tools = client.list_tools(None).await?;
+    for (name, arguments) in [
+        (
+            "drive_docs_replace",
+            serde_json::json!({"document_id":"target","search":"a","replace":"b"}),
+        ),
+        (
+            "drive_docs_append",
+            serde_json::json!({"document_id":"target","text":"a"}),
+        ),
+        (
+            "drive_sheets_write",
+            serde_json::json!({"spreadsheet_id":"target","values":[["a"]]}),
+        ),
+        (
+            "drive_sheets_append",
+            serde_json::json!({"spreadsheet_id":"target","values":[["a"]]}),
+        ),
+        (
+            "drive_sheets_clear",
+            serde_json::json!({"spreadsheet_id":"target","range":"A1"}),
+        ),
+        (
+            "drive_lease_acquire",
+            serde_json::json!({"file_id":"target"}),
+        ),
+    ] {
+        let tool = tools.tools.iter().find(|t| t.name == name).unwrap();
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert!(properties.contains_key("account"));
+        for forbidden in [
+            "allow_headless",
+            "biometrics_only",
+            "ledger_path",
+            "supersedes",
+            "rules",
+        ] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "{name} exposes {forbidden}"
+            );
+        }
+        let mut arguments = arguments.as_object().unwrap().clone();
+        arguments.insert("allow_headless".into(), serde_json::json!(true));
+        let outcome = client
+            .call_tool(CallToolRequestParams::new(name).with_arguments(arguments))
+            .await;
+        let message = match outcome {
+            Err(err) => err.to_string(),
+            Ok(result) => {
+                assert_eq!(result.is_error, Some(true));
+                result
+                    .content
+                    .iter()
+                    .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+                    .collect::<String>()
+            }
+        };
+        assert!(
+            message.contains("unknown field") && message.contains("allow_headless"),
+            "{name}: {message}"
+        );
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}

@@ -36,9 +36,11 @@ pub enum DocsSubcommands {
     /// Replaces every occurrence of some text, gated by the
     /// write-permission rules (issue #1615). Requires the `drive.file` or
     /// `drive` scope (`drive auth login --write-file`/`--write-full`).
+    /// (mirrors the `drive_docs_replace` MCP tool).
     Replace(write::ReplaceCommand),
     /// Appends text to the end of a document, gated by the write-permission
     /// rules (issue #1615).
+    /// (mirrors the `drive_docs_append` MCP tool).
     Append(write::AppendCommand),
     /// Inserts text before or after a unique body anchor, gated by docs-write.
     Insert(write::InsertCommand),

@@ -59,7 +59,7 @@ pub struct WriteCommand {
     pub sheet: Option<String>,
 
     /// Values to write: a local file path, or `-` to read stdin. CSV unless
-    /// the path ends in `.json` or `--values-format` says otherwise.
+    /// the path ends in `.json`/`.tsv` or `--values-format` says otherwise.
     #[arg(long, value_name = "PATH|-")]
     pub values: String,
 

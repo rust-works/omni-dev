@@ -17,6 +17,7 @@ pub mod datadog_tools;
 pub mod drive_docs_tools;
 pub mod drive_sheets_tools;
 pub mod drive_tools;
+pub mod drive_write_tools;
 pub mod dry_run;
 pub mod error;
 pub mod git_tools;

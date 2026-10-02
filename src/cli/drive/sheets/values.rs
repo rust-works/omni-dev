@@ -16,12 +16,14 @@ use clap::ValueEnum;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum ValuesFormat {
-    /// Infer from the path's extension: `.json` is JSON, everything else —
+    /// Infer from the path's extension: `.json` is JSON, `.tsv` is TSV, everything else —
     /// including stdin — is CSV.
     #[default]
     Auto,
     /// RFC 4180 CSV.
     Csv,
+    /// Tab-separated values, using CSV quoting rules.
+    Tsv,
     /// A JSON array of arrays.
     Json,
 }
@@ -40,6 +42,11 @@ impl ValuesFormat {
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
                 {
                     Self::Json
+                } else if std::path::Path::new(source)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("tsv"))
+                {
+                    Self::Tsv
                 } else {
                     Self::Csv
                 }
@@ -53,6 +60,7 @@ impl ValuesFormat {
 pub fn parse(content: &str, format: ValuesFormat) -> Result<Vec<Vec<String>>> {
     match format {
         ValuesFormat::Json => parse_json(content),
+        ValuesFormat::Tsv => parse_delimited(content, b'\t'),
         // `resolve` is expected to have run first; treating a stray `Auto`
         // as CSV matches its own default rather than panicking.
         ValuesFormat::Csv | ValuesFormat::Auto => parse_csv(content),
@@ -125,6 +133,10 @@ pub fn parse(content: &str, format: ValuesFormat) -> Result<Vec<Vec<String>>> {
 /// `[""]` writes every row including a trailing blank one (see the PR
 /// description for the exact request/response pairs).
 fn parse_csv(content: &str) -> Result<Vec<Vec<String>>> {
+    parse_delimited(content, b',')
+}
+
+fn parse_delimited(content: &str, delimiter: u8) -> Result<Vec<Vec<String>>> {
     let content = content.replace("\r\n", "\n");
     // A blank line needs a newline to exist at all, so a file with no
     // final newline can only ever be missing one on its very last
@@ -132,6 +144,7 @@ fn parse_csv(content: &str) -> Result<Vec<Vec<String>>> {
     let missing_final_newline = !content.is_empty() && !content.ends_with('\n');
 
     let mut reader = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
         // Force LF as the only record terminator: by default the `csv`
@@ -459,6 +472,15 @@ mod tests {
     }
 
     // ── JSON ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn tsv_preserves_quoted_tabs_and_blank_rows() {
+        assert_eq!(ValuesFormat::Auto.resolve("cells.TSV"), ValuesFormat::Tsv);
+        assert_eq!(
+            parse("\"a\tb\"\tc\n\nlast", ValuesFormat::Tsv).unwrap(),
+            vec![vec!["a\tb", "c"], vec![""], vec!["last"]]
+        );
+    }
 
     #[test]
     fn json_parses_an_array_of_arrays() {

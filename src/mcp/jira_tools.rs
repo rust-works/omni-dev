@@ -8,7 +8,7 @@
 //!
 //! The split exists because [`create_client`] reads credentials from the
 //! filesystem; the `*_yaml` helpers accept an [`AtlassianClient`] directly so
-//! tests can wire one to a [`wiremock::MockServer`].
+//! tests can wire one to a `wiremock::MockServer`.
 
 use std::fs;
 use std::path::{Path, PathBuf};

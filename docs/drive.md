@@ -31,14 +31,16 @@ Both the OAuth scope and the local gate must allow an operation — neither
 alone is sufficient. See [Write permissions](#write-permissions) and
 [ADR-0071](adrs/adr-0071.md) for the full design.
 
-The MCP tool surface (`drive_auth_status`/`drive_search`/`drive_dedupe`/
-`drive_file_read`/`drive_sheets_info`/`drive_sheets_read`/`drive_docs_info`/
-`drive_docs_read`/`drive_account_list`, mirroring the CLI one-for-one like
-Gmail's `gmail_*` tools) is read-only, like the rest of the MCP surface —
-`rename`/`move`/`create`/`upload`/`edit`/`trash`/`untrash`,
-`sheets write`/`append`/`clear`, and
-`docs replace`/`append`/`create` have no MCP equivalent. See
-[docs/mcp.md](mcp.md#drive-9-tools) for the full tool reference.
+The [MCP tool surface](mcp.md#drive-15-tools) includes file, Docs and Sheets
+reads, Docs replace/append, Sheets write/append/clear, and `drive_lease_acquire`.
+The content write tools use the same operator rules, leases, freshness checks
+and audit paths as the CLI. Per-call `account` selects credentials, rules and
+native backup folder together. Preview first (`dry_run: true`), acquire a backup
+lease through the device-owner prompt, then supply the token to the write.
+Operator headless/biometrics policy applies unchanged; no tool can set it.
+Plain Drive writes, Docs/Sheets create and typed structure/format/delete/protection
+operations, and lease restore/release/prune remain CLI-only. The MCP reference
+explains refusal statuses, stale-lease renewal and token recovery after a timeout.
 
 New to this integration? Follow the
 [Drive Quickstart](drive-quickstart.md) for a linear, zero-to-first-search
@@ -1962,7 +1964,8 @@ available ones.
 
 **`--values`** takes a file path or `-` for stdin. CSV by default; JSON (an
 array of arrays) when the path ends in `.json` or `--values-format json` is
-given. Ragged rows are preserved rather than padded — padding would write
+given. `.tsv` or `--values-format tsv` selects tab-separated values with the
+same quoting and blank-row preservation as CSV. Ragged rows are preserved rather than padded — padding would write
 empty strings over cells you never mentioned. The first CSV row is **data,
 not a header**. Blank lines are rows too: each input line maps to exactly
 one sheet row, written as a single empty cell, so a blank line in the
