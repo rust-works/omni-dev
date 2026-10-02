@@ -309,7 +309,8 @@ types, so the log is a complete invocation history, not just an HTTP history:
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of
-  `docs-replace`/`docs-append`, and add three more omit-if-absent context
+  `docs-replace`/`docs-append` (or `slides-replace` for Slides text replacement),
+  and add three more omit-if-absent context
   keys: `occurrences_changed` (what the *server* reported changing, which
   can differ from the client-side `--dry-run` estimate), `inserted_chars`,
   and `required_revision_id` (the revision lease presented, recorded so a

@@ -1,4 +1,5 @@
 //! Guarded Slides replacement (ADR-0093).
+//!
 //! Validate -> metadata/MIME -> permission gate -> snapshot/revision/filter ->
 //! preview/dry run -> optional Drive lease -> one revision-controlled mutation.
 //! Preview counts never suppress writes; notes/templates are excluded by explicit
@@ -916,6 +917,91 @@ mod tests {
         assert!(!records.contains("Q3"));
         assert!(!records.contains("Q4"));
     }
+    #[tokio::test]
+    async fn folder_grants_and_default_deny_use_the_same_gate_before_slides_reads() {
+        for allow in [false, true] {
+            let server = MockServer::start().await;
+            let (drive, slides) = clients(&server).await;
+            Mock::given(method("GET")).and(path("/drive/v3/files/p1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"p1", "name":"Deck", "mimeType":GOOGLE_SLIDES_MIME_TYPE,"parents":["folder"],"version":"1"})))
+                .mount(&server).await;
+            Mock::given(method("GET")).and(path("/drive/v3/files/folder"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"folder","name":"Folder","mimeType":"application/vnd.google-apps.folder"})))
+                .mount(&server).await;
+            forbid_batch(&server).await;
+            let rules = if allow {
+                mount_presentation(&server, presentation(Some("r"))).await;
+                vec![FolderPermissionRule {
+                    folder_id: Some("folder".into()),
+                    file_id: None,
+                    recursive: true,
+                    ..rule(true)
+                }]
+            } else {
+                Mock::given(path("/v1/presentations/p1"))
+                    .respond_with(ResponseTemplate::new(500))
+                    .expect(0)
+                    .mount(&server)
+                    .await;
+                vec![]
+            };
+            let outcome = write_inner(
+                &drive,
+                &slides,
+                &WriteOptions {
+                    dry_run: true,
+                    ..opts()
+                },
+                &rules,
+            )
+            .await;
+            assert_eq!(outcome.resolved_folder_id.as_deref(), Some("folder"));
+            if allow {
+                assert_eq!(outcome.result, WriteResult::WouldReplace { occurrences: 2 });
+            } else {
+                assert!(matches!(
+                    outcome.result,
+                    WriteResult::Blocked { decided_by: None }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_lease_audit_does_not_record_server_echoes_of_prose() {
+        let server = MockServer::start().await;
+        let (drive, slides) = ready(&server).await;
+        batch()
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"error":{"code":400,"message":"Invalid replacement Q3 to Q4"}}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.jsonl");
+        let lease_token = Some(seed_lease(&ledger_path, "p1", "1"));
+        let audit = crate::test_support::AuditLogGuard::redirect(dir.path());
+        let outcome = write_inner(
+            &drive,
+            &slides,
+            &WriteOptions {
+                lease_token,
+                ledger_path,
+                ..opts()
+            },
+            &[rule(true)],
+        )
+        .await;
+        assert!(
+            matches!(outcome.result, WriteResult::Failed { ref detail } if detail.contains("Q3"))
+        );
+        assert_eq!(audit.verdicts(), ["pending", "failed"]);
+        let records = format!("{:?}", audit.records());
+        assert!(!records.contains("Q3"));
+        assert!(!records.contains("Q4"));
+    }
+
     #[test]
     fn case_and_multibyte_counts_are_display_only_and_nonoverlapping() {
         assert_eq!(count_occurrences("aaaa", "aa", true), 2);

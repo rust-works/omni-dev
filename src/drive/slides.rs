@@ -1,4 +1,5 @@
 //! Google Slides object graph and guarded text replacement (ADR-0093).
+//!
 //! Lives under Drive to share accounts, OAuth transport and the mutation
 //! visibility fence; Slides object IDs have no Docs index-model counterpart.
 

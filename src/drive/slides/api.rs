@@ -75,7 +75,7 @@ fn build_presentation_get_url(base: &str, id: &str) -> Result<Url> {
 async fn bounded_body(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
     anyhow::ensure!(
         response.content_length().is_none_or(|n| n <= cap as u64),
-        "Slides presentation exceeds the {cap} byte cap"
+        "Slides presentation exceeds the {cap} byte cap; use `omni-dev drive read <presentation-id> --content` for a text export"
     );
     let mut bytes = Vec::new();
     while let Some(chunk) = response
@@ -85,7 +85,7 @@ async fn bounded_body(mut response: reqwest::Response, cap: usize) -> Result<Vec
     {
         anyhow::ensure!(
             chunk.len() <= cap.saturating_sub(bytes.len()),
-            "Slides presentation exceeds the {cap} byte cap"
+            "Slides presentation exceeds the {cap} byte cap; use `omni-dev drive read <presentation-id> --content` for a text export"
         );
         bytes.extend_from_slice(&chunk);
     }
