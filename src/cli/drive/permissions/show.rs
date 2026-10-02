@@ -361,6 +361,7 @@ mod tests {
             "sheets-delete",
             "sheets-protection",
             "docs-write",
+            "trash",
         ] {
             assert!(named.contains(op), "{out} should name {op}");
         }

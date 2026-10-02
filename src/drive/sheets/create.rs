@@ -89,10 +89,9 @@ pub enum CreateResult {
     },
     /// The spreadsheet was created but seeding it failed.
     ///
-    /// Its own variant, carrying the id, because there is **no**
-    /// `files.delete` anywhere in this integration — the empty spreadsheet
-    /// cannot be rolled back, so reporting this as a plain `Failed` would
-    /// leave an orphan the user has no way to find.
+    /// Carries the ID because automatic rollback is not authorised by a
+    /// create grant. The operator may explicitly trash the empty spreadsheet
+    /// with a separate `trash` permission; plain failure would hide its ID.
     CreatedValuesFailed {
         /// The new spreadsheet's id — it exists and is empty.
         file_id: String,
@@ -343,7 +342,8 @@ pub fn describe(outcome: &CreateOutcome) -> String {
         CreateResult::CreatedValuesFailed { file_id, detail } => format!(
             "Partially failed: created '{name}' ({file_id}) in {parent}, but writing its \
              values failed: {detail}. The spreadsheet exists and is empty — it cannot be \
-             rolled back automatically."
+             rolled back automatically. Clean up explicitly with `omni-dev drive trash {file_id}` \
+             (requires trash permission on the file or its folder)."
         ),
         CreateResult::Failed { detail } => format!("Failed: '{name}' in {parent}: {detail}"),
     }
@@ -668,6 +668,8 @@ mod tests {
         assert!(text.contains("Partially failed"), "{text}");
         assert!(text.contains("new-sheet"), "{text}");
         assert!(text.contains("cannot be rolled back"), "{text}");
+        assert!(text.contains("omni-dev drive trash new-sheet"), "{text}");
+        assert!(text.contains("requires trash permission"), "{text}");
     }
 
     #[tokio::test]

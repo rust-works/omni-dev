@@ -137,6 +137,9 @@ pub struct DriveFile {
     /// document (Docs/Sheets/Slides/...) with no fixed byte content.
     #[serde(default, rename = "mimeType")]
     pub mime_type: String,
+    /// Whether the file is in Trash, explicitly or through a trashed parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trashed: Option<bool>,
     /// Size in bytes, as a decimal string. Absent for folders and
     /// Google-native documents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
