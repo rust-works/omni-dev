@@ -44,6 +44,7 @@ case "$MODE" in
   api) echo 'API credit balance exhausted' >&2; exit 1 ;;
   malformed) echo 'not JSON'; exit 1 ;;
   wrong-count) echo '{"commits":[],"summary":{"error_count":0,"warning_count":0}}'; exit 1 ;;
+  missing-findings) echo '{"commits":[],"summary":{"error_count":1,"warning_count":0}}'; exit 1 ;;
   unexpected) echo 'unavailable' >&2; exit 124 ;;
 esac
 ''')
@@ -115,15 +116,15 @@ esac
 
     def test_infrastructure_fails_open_and_retries(self):
         for mode in ('credentials', 'api', 'malformed', 'wrong-count', 'unexpected',
-                     'partial', 'malformed-clean'):
+                     'partial', 'malformed-clean', 'missing-findings'):
             with self.subTest(mode=mode):
                 result = self.run_hook(mode)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('check skipped', result.stderr)
                 self.assertEqual(result.stdout, '')
-        self.assertEqual(self.call_count(), 7)
-        self.assert_clean(self.run_hook())
         self.assertEqual(self.call_count(), 8)
+        self.assert_clean(self.run_hook())
+        self.assertEqual(self.call_count(), 9)
 
     def test_absent_binary_fails_open(self):
         self.cli.unlink()
