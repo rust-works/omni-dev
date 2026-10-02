@@ -62,6 +62,12 @@ Enforced in CI by [`.github/workflows/commit-lint.yml`](.github/workflows/commit
 runs `omni-dev git commit message lint --strict` on every push/PR to `main`). Check locally before
 pushing with `omni-dev git commit message lint origin/main..HEAD`.
 
+The [commit-message Stop hook](.claude/hooks/check-commit-messages.sh) also runs
+`omni-dev git commit message check --strict --quiet -o json` on the branch range
+at turn-end. It returns findings for correction with `commit-twiddle`, caches
+successful HEAD checks per worktree, and fails open on infrastructure errors.
+See [STYLE-0023](docs/STYLE_GUIDE.md#style-0023-validate-commit-messages-with-omni-dev-after-creation).
+
 ### Branch Strategy
 - `main` - Production-ready code
 - Feature branches - `feature/description` or `username/feature-description`

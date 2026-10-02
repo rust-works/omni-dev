@@ -1197,6 +1197,17 @@ message against the guidelines in
 calls `omni-dev git commit message view` to analyse the commit, then
 `omni-dev git commit message amend` to rewrite the message if needed.
 
+Claude Code also enforces this rule at turn-end through the
+[commit-message Stop hook](../.claude/hooks/check-commit-messages.sh), registered
+alongside the snapshot hook in `.claude/settings.json`. It checks every commit
+ahead of the default base with `omni-dev git commit message check --strict --quiet
+-o json` and feeds validation findings back to the model to fix with this skill.
+Successful checks (including empty ranges) cache HEAD in the AI scratch directory,
+with a separate cache per worktree; an unchanged checked HEAD skips the AI call.
+Re-entrant Stops are skipped. Missing tools, credential/API failures and unavailable
+scratch storage fail open with a stderr note and are retried on the next Stop.
+The hook never applies amendments itself and does not replace the post-commit skill.
+
 **Constraints to observe:**
 
 - The target commit must be at the branch tip with **no merge commit above it**. If a
