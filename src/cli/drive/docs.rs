@@ -40,6 +40,10 @@ pub enum DocsSubcommands {
     /// Appends text to the end of a document, gated by the write-permission
     /// rules (issue #1615).
     Append(write::AppendCommand),
+    /// Inserts text before or after a unique body anchor, gated by docs-write.
+    Insert(write::InsertCommand),
+    /// Deletes a unique match or inclusive anchor range, gated by docs-delete.
+    Delete(write::DeleteCommand),
     /// Creates a new Google Doc, optionally seeded with text. Gated by the
     /// write-permission rules' `create` operation (issue #1615).
     Create(create::CreateCommand),
@@ -58,6 +62,8 @@ impl DocsCommand {
             DocsSubcommands::Read(cmd) => cmd.execute(client).await,
             DocsSubcommands::Replace(cmd) => cmd.execute(client).await,
             DocsSubcommands::Append(cmd) => cmd.execute(client).await,
+            DocsSubcommands::Insert(cmd) => cmd.execute(client).await,
+            DocsSubcommands::Delete(cmd) => cmd.execute(client).await,
             DocsSubcommands::Create(cmd) => cmd.execute(client).await,
         }
     }

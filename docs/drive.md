@@ -781,9 +781,10 @@ operation anywhere in a target's ancestor chain:
 | `sheets-structure`  | deny    | `sheets add-sheet`, `rename-sheet`, `insert-rows`, `insert-columns`, `insert-range`, `move-rows`, `move-columns`, `duplicate-sheet`, `reorder-sheet`, `hide-sheet`, `show-sheet`, `update-sheet-properties`, `update-workbook-properties`, `format-cells`, `update-borders`, `merge-cells`, `unmerge-cells`, `auto-resize-dimension`, `update-dimension-properties`, `set-data-validation`, `clear-data-validation`, `set-developer-metadata`, `delete-developer-metadata`, `set-basic-filter` (with `--sort-by`, also needs `sheets-write`), `clear-basic-filter`, `add-filter-view`, `update-filter-view`, `delete-filter-view`, `add-conditional-format`, `update-conditional-format`, `delete-conditional-format`, `add-named-range`, `update-named-range`, `delete-named-range`, `add-chart`, `update-chart`, `delete-chart`, `add-slicer`, `update-slicer`, `delete-slicer`, `move-chart`, `move-slicer`, `update-chart-border`, `add-pivot-table` (also needs `sheets-write`), `text-to-columns` (also needs `sheets-write`), `sort-range` (also needs `sheets-write`), `randomize-range` (also needs `sheets-write`), `add-banding`, `update-banding`, `delete-banding`, `add-dimension-group`, `update-dimension-group`, `delete-dimension-group`, `cut-paste` (always, alongside `sheets-write`), `copy-paste`/`paste-data` with `--paste-type format` (alone) or `--paste-type normal` (also needs `sheets-write`) |
 | `sheets-delete`     | deny    | `sheets delete-sheet`, `delete-rows`, `delete-columns`, `delete-range`, `delete-duplicates`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `sheets-protection` | deny    | `sheets protect-range`, `update-protection`, `unprotect-range`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `docs-write`        | deny    | `docs replace`, `docs append`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `docs-write`        | deny    | `docs replace`, `docs append`, `docs insert`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `slides-write`      | deny    | `slides replace`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `trash`             | deny    | `trash`, `untrash` (individual files only)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `docs-delete`       | deny    | `docs delete` — anchor-addressed content removal                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 There is no "enabled: true" flag — an absent or empty rule list already
 means "deny every write everywhere," via this table alone, which *is* the
@@ -935,7 +936,7 @@ the one Drive it came from. A rule keys on **either** a `folder_id` or a
   `file_id` is a configuration error rather than a no-op.
 - `allow`/`deny` — any of `read`, `create`, `upload`, `edit`,
   `sheets-write`, `sheets-structure`, `sheets-delete`, `sheets-protection`,
-  `docs-write`, `trash`, `slides-write`. A `deny`
+  `docs-write`, `trash`, `docs-delete`, `slides-write`. A `deny`
   entry for `read` is schema-ready today for a future `search`/`read`/
   `dedupe` enforcement fast-follow (not wired up yet — see
   [ADR-0071](adrs/adr-0071.md) §11); the write operations are enforced now.
@@ -1279,7 +1280,7 @@ content-mutating write verb: `drive edit`; `drive sheets`
 `update-filter-view`/`delete-filter-view`, and
 `add-chart`/`update-chart`/`delete-chart`/`add-slicer`/`update-slicer`/
 `delete-slicer`/`move-chart`/`move-slicer`/`update-chart-border`; and
-`drive docs replace`/`append`. `--dry-run` never needs one on any of them.
+`drive docs replace`/`append`/`insert`/`delete`. `--dry-run` never needs one on any of them.
 
 **The backup fidelity splits by file type** ([ADR-0080](adrs/adr-0080.md)
 §3). A binary file backs up as **bytes on this machine**, named
@@ -4109,6 +4110,49 @@ entirely, and the edit is refused up front rather than attempted unleased.
   request is constructible anywhere in this codebase, enforced by a test.
   Replacing text *with nothing* (`--replace ""`) is the supported way to
   remove it.
+
+#### drive docs insert / delete
+
+Insert text next to one unique body anchor, or delete a unique match or inclusive
+anchor range. Insertion uses `docs-write`; deletion requires a separate
+`docs-delete` grant. Each defaults to requiring `--lease` unless the deciding
+rule opts out; both support the same output formats and `--dry-run`.
+
+```bash
+omni-dev drive docs insert <ID> --after 'Summary' --text ' (updated)' --dry-run
+omni-dev drive docs insert <ID> --before 'Conclusion' --text-file note.txt --lease <TOKEN>
+omni-dev drive docs delete <ID> --match 'obsolete sentence' --dry-run
+omni-dev drive docs delete <ID> --from 'Start marker' --to 'End marker' --lease <TOKEN>
+```
+
+`--from`/`--to` removes from the start of the first anchor through the end of
+the second, including both anchors. Each must be unique and ordered in the same
+tab and body or table cell. Anchors are literal, case-sensitive by default;
+`--ignore-case` uses Unicode simple case folding. Overlapping matches count
+separately, so `aa` in `aaa` is ambiguous and refused. `--text-file -` reads
+insertion text from stdin.
+
+The resolver searches all tab bodies and table cells, including child tabs.
+An anchor may span adjacent formatting runs within one paragraph, but cannot
+span paragraph breaks, images or other inline objects. A deletion range may
+span ordinary paragraphs, but cannot cross table/cell boundaries, structural
+elements, non-text content or pending insertion/deletion suggestions. The last
+newline of a body or cell, and newlines immediately before structural elements,
+are preserved. Headers, footers, footnotes and tables of contents are outside
+this surface; their text does not participate in uniqueness checks.
+
+Dry runs and successful outcomes report the same resolved UTF-16 range (empty
+for insertion), tab, paragraph count, Unicode scalar count and UTF-8 byte count.
+Indices come from the invocation's own inline document snapshot, whose revision
+is required by the write. There is no numeric `--index` flag or automatic retry
+against a newer revision. Missing or inconsistent index metadata, no match,
+ambiguity and unsafe ranges produce a `refused-anchor` result with a typed
+reason. These refusals and stale revisions make no content change. The CLI's
+existing structured-result convention retains exit code 0; inspect `status`.
+
+For removing every occurrence, `docs replace --search TEXT --replace ''` retains
+its existing `docs-write` semantics. Granting `docs-write` does not grant the new
+`docs delete` verb. See [ADR-0094](adrs/adr-0094.md).
 
 #### `drive docs create`
 

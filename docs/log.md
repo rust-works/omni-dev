@@ -309,15 +309,21 @@ types, so the log is a complete invocation history, not just an HTTP history:
   Text writes through the Docs API (issue
   [#1615](https://github.com/rust-works/omni-dev/issues/1615),
   [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of
-  `docs-replace`/`docs-append` (or `slides-replace` for Slides text replacement),
-  and add three more omit-if-absent context
+  `docs-replace`/`docs-append`/`docs-insert`/`docs-delete` (or `slides-replace`
+  for Slides text replacement), and add three more omit-if-absent context
   keys: `occurrences_changed` (what the *server* reported changing, which
   can differ from the client-side `--dry-run` estimate), `inserted_chars`,
   and `required_revision_id` (the revision lease presented, recorded so a
   `stale-revision` refusal is as auditable as a success — an opaque,
   short-lived id, not a secret).
 
-  **The searched, replacement and appended text are never recorded.** They
+  Anchored edits ([ADR-0094](adrs/adr-0094.md)) reuse these keys:
+  insertion reports `inserted_chars`, and deletion reports its status and
+  required revision. Resolved ranges, tab ids and paragraph/removal counts are
+  in the command outcome, rather than new log context fields.
+
+  **The searched, replacement, appended, inserted and deleted text, including
+  anchor text, are never recorded in these metadata fields.** They
   are user prose, and often the most sensitive thing in the invocation —
   sharper than the Sheets case, where an A1 range is metadata rather than
   content. Only counts and the opaque revision id go in.
