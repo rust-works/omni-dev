@@ -1,0 +1,15 @@
+{
+  "passed": 12629,
+  "failed": 0,
+  "ignored": 1,
+  "commands": [
+    "OMNI_DEV_LOG_FILE=/private/tmp/2054-validation-log.jsonl cargo test --manifest-path WORKTREE/Cargo.toml --offline",
+    "cargo clippy --manifest-path WORKTREE/Cargo.toml --offline --all-targets -- -D warnings",
+    "cargo fmt --manifest-path WORKTREE/Cargo.toml --all -- --check"
+  ],
+  "notes": [
+    "Full suite includes help_all_golden and two doc-tests.",
+    "Existing toolchain warning: unknown clippy::assert_is_empty lint; no -D warnings errors.",
+    "macOS test linker reports a large unwind section; tests passed."
+  ]
+}

@@ -21,7 +21,7 @@ const MAX_GREP_BYTES: usize = 64 * 1024;
 const MAX_CANDIDATES: usize = 24;
 const CONTEXT_LINES: usize = 40;
 const MAX_SNIPPET_BYTES: usize = 2048;
-const MAX_ISSUE_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_ISSUE_BYTES: usize = 16 * 1024;
 const MAX_STATE_BYTES: usize = 64 * 1024;
 
 /// A retrieved definition. Bodies are deliberately absent from this type.
@@ -82,10 +82,7 @@ fn clipped(text: &str, bytes: usize) -> String {
 
 /// Extracts exact single-backticked Rust identifiers and qualified paths.
 /// Fenced examples and spans containing prose, calls or expressions are ignored.
-#[allow(clippy::expect_used)] // The pattern is a compile-time constant.
 pub fn extract_identifiers(text: &str) -> Vec<String> {
-    let valid = regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$")
-        .expect("constant identifier regex");
     let mut seen = BTreeSet::new();
     let mut result = Vec::new();
     let mut fence: Option<(char, usize)> = None;
@@ -106,16 +103,66 @@ pub fn extract_identifiers(text: &str) -> Vec<String> {
         if fence.is_some() {
             continue;
         }
-        // Even-indexed pieces are prose. A doubled delimiter is not a single span.
-        let pieces: Vec<_> = line.split('`').collect();
-        for i in (1..pieces.len().saturating_sub(1)).step_by(2) {
-            let name = pieces[i];
-            if valid.is_match(name) && seen.insert(name.to_owned()) {
+        for name in single_code_spans(line) {
+            let Ok(path) = syn::parse_str::<syn::Path>(name) else {
+                continue;
+            };
+            if path
+                .segments
+                .iter()
+                .all(|segment| matches!(segment.arguments, syn::PathArguments::None))
+                && seen.insert(name.to_owned())
+            {
                 result.push(name.to_owned());
             }
         }
     }
     result
+}
+
+// Match complete delimiter runs, so nested single ticks in a multi-tick span
+// cannot be mistaken for identifiers. Backticks escaped in prose are skipped.
+fn single_code_spans(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'`' {
+            cursor += 1;
+            continue;
+        }
+        let escapes = bytes[..cursor]
+            .iter()
+            .rev()
+            .take_while(|b| **b == b'\\')
+            .count();
+        let opening = cursor;
+        while cursor < bytes.len() && bytes[cursor] == b'`' {
+            cursor += 1;
+        }
+        if escapes % 2 == 1 {
+            continue;
+        }
+        let width = cursor - opening;
+        let start = cursor;
+        while cursor < bytes.len() {
+            if bytes[cursor] != b'`' {
+                cursor += 1;
+                continue;
+            }
+            let closing = cursor;
+            while cursor < bytes.len() && bytes[cursor] == b'`' {
+                cursor += 1;
+            }
+            if cursor - closing == width {
+                if width == 1 {
+                    spans.push(&line[start..closing]);
+                }
+                break;
+            }
+        }
+    }
+    spans
 }
 
 // Consume only a bounded amount of stdout. Kill and reap a producer if the cap
@@ -177,6 +224,10 @@ impl<'ast> Visit<'ast> for Definitions {
         ));
     }
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        // A required trait method declares a contract, not an implementation.
+        if node.default.is_none() {
+            return;
+        }
         self.entries.push((
             node.sig.span().start().line,
             node.span().end().line,
@@ -253,34 +304,67 @@ fn definitions(
     Ok((candidates, warnings))
 }
 
-fn matching_paths(
+fn grep_paths<'a>(
     repo: &Path,
-    revision: &str,
-    needles: &[&str],
+    revision: &'a str,
+    args: &mut Vec<&'a str>,
+    cap: usize,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<String>> {
-    let mut args = vec!["grep", "-F", "-w", "-l", "-z"];
-    for n in needles {
-        args.extend(["-e", n]);
-    }
     args.extend([revision, "--", "*.rs"]);
-    let (files, overflow) = git(repo, &args, MAX_GREP_BYTES, true)?;
+    let (files, overflow) = git(repo, args, cap, true)?;
     if overflow {
         warnings.push("grep output cap reached".to_owned());
     }
+    let prefix = format!("{revision}:");
     let mut paths = Vec::new();
-    // Only complete NUL-terminated names are retained when output was cut.
     for raw in files.split_inclusive(|b| *b == 0) {
         if raw.last() != Some(&0) {
             continue;
         }
         let name = std::str::from_utf8(&raw[..raw.len() - 1]).context("non-UTF-8 git path")?;
-        let prefix = format!("{revision}:");
         paths.push(
             name.strip_prefix(&prefix)
                 .context("unexpected git grep path")?
                 .to_owned(),
         );
+    }
+    Ok(paths)
+}
+
+fn matching_paths(
+    repo: &Path,
+    revision: &str,
+    needles: &[String],
+    warnings: &mut Vec<String>,
+) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+    // Reserve half the total filename budget for direct definitions. Earlier
+    // issue vocabulary gets priority, followed by ordinary use-site files.
+    for needle in needles {
+        let pattern = format!(r"(^|[^[:alnum:]_])fn[[:space:]]+(r#)?{needle}[[:space:]]*[(<]");
+        let mut args = vec!["grep", "-E", "-l", "-z", "-e", pattern.as_str()];
+        for path in grep_paths(
+            repo,
+            revision,
+            &mut args,
+            MAX_GREP_BYTES / 2 / MAX_IDENTIFIERS,
+            warnings,
+        )? {
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
+    let mut args = vec!["grep", "-F", "-w", "-l", "-z"];
+    for needle in needles {
+        args.extend(["-e", needle]);
+    }
+    for path in grep_paths(repo, revision, &mut args, MAX_GREP_BYTES / 2, warnings)? {
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
     }
     Ok(paths)
 }
@@ -307,7 +391,13 @@ fn collect_definitions(
             continue;
         };
         match definitions(&source, &path, needles) {
-            Ok((found, warnings)) => {
+            Ok((mut found, warnings)) => {
+                found.sort_by_key(|candidate| {
+                    (
+                        !needles.contains(&candidate.symbol.trim_start_matches("r#")),
+                        candidate.line,
+                    )
+                });
                 retrieval.candidates.extend(found);
                 retrieval.warnings.extend(warnings);
             }
@@ -361,14 +451,16 @@ pub fn retrieve(repo: &Path, issue: &str) -> Result<Retrieval> {
     if retrieval.identifiers.is_empty() {
         return Ok(retrieval);
     }
-    let identifiers = retrieval.identifiers.clone();
-    let needles: Vec<_> = identifiers
+    let mut seen = BTreeSet::new();
+    let needles: Vec<String> = retrieval
+        .identifiers
         .iter()
         .filter_map(|id| id.rsplit("::").next())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
+        .map(|id| id.trim_start_matches("r#").to_owned())
+        .filter(|id| seen.insert(id.clone()))
         .collect();
     let paths = matching_paths(repo, &retrieval.revision, &needles, &mut retrieval.warnings)?;
+    let needles: Vec<&str> = needles.iter().map(String::as_str).collect();
     if paths.is_empty() {
         "no_hits"
     } else {
@@ -379,12 +471,10 @@ pub fn retrieve(repo: &Path, issue: &str) -> Result<Retrieval> {
         retrieval.warnings.push("file cap reached".to_owned());
     }
     collect_definitions(repo, paths, &needles, &mut retrieval)?;
+    let mut seen = BTreeSet::new();
     retrieval
         .candidates
-        .sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-    retrieval
-        .candidates
-        .dedup_by(|a, b| a.path == b.path && a.line == b.line);
+        .retain(|candidate| seen.insert((candidate.path.clone(), candidate.line)));
     if retrieval.candidates.len() > MAX_CANDIDATES {
         retrieval.warnings.push("candidate cap reached".to_owned());
         retrieval.candidates.truncate(MAX_CANDIDATES);
@@ -497,6 +587,55 @@ mod tests {
     }
 
     #[test]
+    fn code_span_delimiters_raw_identifiers_and_unicode_are_exact() {
+        assert_eq!(
+            extract_identifiers(
+                "`` `hidden` `` `real` \\`escaped\\` `r#type` `日本語` `T<u32>` `break`"
+            ),
+            ["real", "r#type", "日本語"]
+        );
+    }
+
+    #[test]
+    fn direct_definition_files_and_adjacent_helpers_survive_early_decoys() {
+        let source =
+            "fn caller() {}\n/// Implements the proposed pattern walk.\nfn adjacent_helper() {}";
+        let mut files: Vec<_> = (0..MAX_FILES + 2)
+            .map(|n| {
+                (
+                    format!("a{n:02}.rs"),
+                    "fn decoy() { let input = 0; }".to_owned(),
+                )
+            })
+            .collect();
+        files.push(("z_walk.rs".to_owned(), source.to_owned()));
+        let refs: Vec<_> = files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let dir = fixture(&refs);
+        let result = retrieve(
+            dir.path(),
+            "Proposed helper near `caller`, with `input` elsewhere.",
+        )
+        .unwrap();
+        assert_eq!(result.candidates[0].symbol, "caller");
+        assert_eq!(result.candidates[1].symbol, "adjacent_helper");
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("file cap")));
+        let dir = fixture(&[("a.rs", "fn r#type() {}\nfn 日本語() {}")]);
+        assert_eq!(
+            retrieve(dir.path(), "`r#type` `日本語`")
+                .unwrap()
+                .candidates
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn retrieves_adjacent_helpers_docs_and_multiline_signatures_without_bodies() {
         let dir = fixture(&[("walk.rs", "/// Named caller\npub fn caller(\n x: u32\n) -> bool { let secret_body = x; helper(secret_body) }\n/// Walks the proposed keys.\nfn helper(x: u32) -> bool { x > 0 }\n")]);
         let result = retrieve(
@@ -546,10 +685,14 @@ mod tests {
 
     #[test]
     fn methods_traits_duplicate_and_ambiguous_hits_are_retained_once() {
-        let source = "struct X; impl X { /// Performs the work.\nfn caller(&self) { caller(); caller(); } }\ntrait T { fn caller(&self); }";
+        let source = "struct X; impl X { /// Performs the work.\nfn caller(&self) { caller(); caller(); } }\ntrait T { fn required(&self); fn caller(&self) {} }";
         let dir = fixture(&[("a.rs", source), ("b.rs", "fn caller() {}")]);
         let result = retrieve(dir.path(), "`caller`").unwrap();
         assert_eq!(result.candidates.len(), 3);
+        assert!(result
+            .candidates
+            .iter()
+            .all(|candidate| candidate.symbol != "required"));
         assert!(result.warnings[0].contains("ambiguous"));
     }
 

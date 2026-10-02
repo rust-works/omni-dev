@@ -54,3 +54,53 @@ The #3017 oracle probe and `Vec` double-push trap require execution or inspectio
 of function bodies. The filter cannot discover either, even if it retrieves
 `any_pattern_key`. A high score must still be checked against code and behavior
 before writing a finding or making a routing decision.
+
+## Retrieval review before live judgment
+
+The initial dry-run records are preserved in `initial-dry-run.json.gz` (a map
+from original JSON filename to its exact parsed content). On the separately
+labeled #3017 diagnostic, the initial path-alphabetical filter retained 24
+benchmark definitions and missed all three known-positive walkers: 0/3 retrieved.
+This demonstrated a retrieval failure before any paid call. Review corrected
+file priority to favor direct definitions in issue-vocabulary order and then
+use sites, with named definitions first within each file. All filename reads
+still share the 64 KiB hard budget. No held-out Jev score was inspected or used
+to change the question, threshold or selected cases.
+
+Review also fixed nested single ticks inside multi-backtick spans and invalid
+UTF-8 at EOF, with deterministic regressions. Identifier validation now uses the
+Rust path parser, supporting Unicode and raw identifiers while rejecting generic
+arguments and keywords that are not paths. The implementation commit was
+`12d9758c`; final raw records and summary describe the reviewed implementation.
+
+## Final result and live-study status
+
+`final-dry-run.json.gz` holds the reviewed 35-case request records in the same
+filename-to-JSON-object format. `summary.json` records status counts, proposed
+question count, the three diagnostic retrieval labels, and the live-study block.
+The revised filter retrieves all three known-positive #3017 walkers (3/3),
+including `any_pattern_key`. This is a known-positive retrieval result on one
+post-fix diagnostic, not measured precision or probability calibration.
+
+Automatic approval review rejected the live study because sending issue text
+and repository-derived signatures/doc comments to the external paid Jev service
+requires explicit user authorization for that payload and destination. No Jev
+call was sent: paid calls and study spend are zero, actual model and token usage
+are absent, and precision is unmeasured. The PR remains a draft while that study
+is pending. Even after authorization, held-out precision/recall require separate
+existence labels; #2052's model-class labels are insufficient.
+
+To inspect either compressed bundle:
+
+```python
+import gzip, json
+with gzip.open("final-dry-run.json.gz", "rt") as stream:
+    records = json.load(stream)
+print(records["3017-request.json"])
+```
+
+`validation.json` records the final test and quality-check results. The full
+suite uses a temporary request-log override because a daemon test otherwise
+reads the user's multi-gigabyte runtime log. All unit, integration, snapshot and
+doc-tests pass; the reviewed Clippy and formatting checks pass. Trait method
+contracts without default implementations are excluded, with regression coverage.
