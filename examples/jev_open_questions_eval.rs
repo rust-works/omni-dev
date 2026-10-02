@@ -33,20 +33,22 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&output)?;
     std::fs::copy(&input, output.join("inputs.json"))?;
     // Strip effort metadata to isolate the added classifier, across all built-in ladders.
-    let ladders =
-        Provider::ALL
-            .into_iter()
-            .map(|provider| {
-                let ladder = Ladder::builtin(provider)?;
-                let tiers: Vec<_> = ladder.tiers.as_slice().iter().map(|tier| {
-            serde_json::json!({"name": tier.name, "description": tier.description})
-        }).collect();
-                Ok(Ladder::named(
-                    ladder.name,
-                    Tiers::parse(&serde_json::json!({"tiers": tiers}).to_string())?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+    let ladders = Provider::ALL
+        .into_iter()
+        .map(|provider| {
+            let ladder = Ladder::builtin(provider)?;
+            let tiers: Vec<_> = ladder
+                .tiers
+                .as_slice()
+                .iter()
+                .map(|tier| serde_json::json!({"name": tier.name, "description": tier.description}))
+                .collect();
+            Ok(Ladder::named(
+                ladder.name,
+                Tiers::parse(&serde_json::json!({"tiers": tiers}).to_string())?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let tier_order: std::collections::BTreeMap<_, Vec<_>> = ladders
         .iter()
         .map(|ladder| {
@@ -91,7 +93,13 @@ async fn main() -> Result<()> {
                     Ok(response) => serde_json::json!({"response": response}),
                     Err(error) => serde_json::json!({"error": format!("{error:#}")}),
                 };
-                results.push(serde_json::json!({"id": case.id, "repeat": repeat, "mode": mode, "request": request, "result": response}));
+                results.push(serde_json::json!({
+                    "id": case.id,
+                    "repeat": repeat,
+                    "mode": mode,
+                    "request": request,
+                    "result": response,
+                }));
                 // Persist every completed call, including errors, so an interrupted run is auditable.
                 std::fs::write(
                     output.join("results.json"),
