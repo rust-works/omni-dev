@@ -570,7 +570,7 @@ omni-dev drive sync FOLDER_ID --dest ./pdf-copies --export-mime-type application
 It uses only `drive.readonly`; no Drive content or metadata is changed. The
 positional argument is a folder ID, rather than a search query. Shortcuts are
 skipped, cycles and repeated IDs are visited once, and trashed items are excluded.
-An incomplete listing, listing failure, or a folder reaching the 10,000-item
+An incomplete page, repeated pagination token, listing failure, or a folder reaching the 10,000-item
 listing cap aborts discovery before local writes.
 
 The first run requires an empty (or nonexistent) destination. Later runs use
@@ -578,10 +578,11 @@ The first run requires an empty (or nonexistent) destination. Later runs use
 unsupported manifest version, or invalid path in the manifest is refused.
 The version-1 JSON records the root folder ID and a `files` map keyed by Drive
 ID, including folders. Entries contain `rel_path`, `remote_name`, `mime_type`,
-`export_mime_type`, `modified_time`, `md5`, `sha256`, and `size`.
+`export_mime_type`, `modified_time`, `md5`, `sha256`, `size`, and `pending`.
 `orphan_paths` reserves old paths left behind by renames and export changes.
 Files and the manifest are replaced atomically; the manifest is checkpointed
-after each successful item so completed work survives an interrupted run.
+before replacing content (marked `pending`) and after each successful item.
+An interrupted pending write is retried, never treated as unchanged.
 
 Unchanged binaries are skipped when their MD5 matches the manifest (falling back
 to a present `modifiedTime` when MD5 is absent). Native exports use a present

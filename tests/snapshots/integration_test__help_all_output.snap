@@ -3951,6 +3951,7 @@ Commands:
   search       Searches Drive files
   read         Reads a single Drive file's metadata or content
   dedupe       Finds Drive files sharing the same content hash
+  sync         Mirrors a Drive folder recursively to local disk (one-way, read-only scope)
   create       Creates a new file or folder, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
   upload       Uploads local content as a new file, gated by the folder write-permission rules (issue #1574). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`)
   edit         Replaces an existing file's content, gated by the write-permission rules (issues #1574, #1612). Requires the `drive.file` scope if `omni-dev` created the file, or the unrestricted `drive` scope for any pre-existing file (`drive auth login --write-file` or `--write-full`)
@@ -6576,6 +6577,32 @@ Options:
       --lease <TOKEN>                  The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                           Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive sync - Mirrors a Drive folder recursively to local disk (one-way, read-only scope)
+
+Mirrors a Drive folder recursively to local disk (one-way, read-only scope)
+
+Usage: sync [OPTIONS] --dest <DIR> <FOLDER_ID>
+
+Arguments:
+  <FOLDER_ID>  Root Drive folder ID (not a search query)
+
+Options:
+      --dest <DIR>
+          Local destination. Must be empty on the first run
+      --export-mime-type <EXPORT_MIME_TYPE>
+          Export MIME type for Google-native files. Defaults: Docs → Markdown, Sheets → CSV (first sheet only), Slides → plain text
+      --verify
+          Verify downloaded and skipped binary files against Drive's SHA-256. Native exports have no checksum and are not verified. Interrupted writes are retried using the local manifest
+      --dry-run
+          Report planned actions without creating directories or downloading content
+  -o, --output <OUTPUT>
+          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help
+          Print help (see more with '--help')
 
 
 ================================================================================
