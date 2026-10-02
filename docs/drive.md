@@ -1235,7 +1235,8 @@ A dry run checks local permission but does not prove Google will allow the PATCH
 In My Drive the file owner must perform trash; shared drives require appropriate
 organizer/file organizer rights. API permission or scope errors appear as
 `failed` outcomes. A file in a trashed parent may remain effectively trashed
-when restored; these commands never restore the parent folder. Permanent delete
+when restored; the result reports failure if Drive does not confirm the requested
+state. These commands never restore the parent folder. Permanent delete
 and recursive folder teardown are not implemented. See
 [Google's trash/restore reference](https://developers.google.com/workspace/drive/api/guides/delete)
 and [ADR-0092](adrs/adr-0092.md).

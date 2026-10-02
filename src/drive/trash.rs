@@ -94,8 +94,8 @@ impl JsonlSerialize for TrashOutcome {
 }
 
 /// Changes the target's trashed state after evaluating `trash` permissions.
-/// Every real attempt is audited, including refusals and no-ops. Dry runs
-/// never mutate or write audit records.
+/// Every real attempt writes a best-effort mutation record, including refusals
+/// and no-ops. Dry runs never mutate or write mutation records.
 pub async fn trash(
     client: &DriveClient,
     opts: &TrashOptions,
@@ -164,7 +164,13 @@ async fn trash_inner(
         };
         return outcome;
     }
-    if target.trashed.unwrap_or(false) != opts.restore {
+    let Some(trashed) = target.trashed else {
+        outcome.result = TrashResult::Failed {
+            detail: "Drive metadata omitted the requested trashed state".to_string(),
+        };
+        return outcome;
+    };
+    if trashed != opts.restore {
         outcome.result = if opts.restore {
             TrashResult::NotTrashed
         } else {
@@ -189,6 +195,13 @@ async fn trash_inner(
         files_api.trash(&opts.file_id).await
     };
     outcome.result = match updated {
+        Ok(updated) if updated.trashed != Some(!opts.restore) => TrashResult::Failed {
+            detail: if opts.restore {
+                "Drive did not confirm restoration; the file may still be in a trashed parent folder"
+            } else {
+                "Drive did not confirm the requested trashed state"
+            }.to_string(),
+        },
         Ok(_) if opts.restore => TrashResult::Untrashed,
         Ok(_) => TrashResult::Trashed,
         Err(err) => TrashResult::Failed {
@@ -452,6 +465,62 @@ mod tests {
             no_patch(&server).await;
             let outcome = trash(&client, &opts(false, true), &[allow()]).await;
             assert!(matches!(outcome.result, TrashResult::Failed { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_requested_state_never_reports_a_noop_or_patches() {
+        let server = MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/drive/v3/files/file-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "file-1", "name": "file-1", "mimeType": "text/plain"
+            })))
+            .mount(&server)
+            .await;
+        no_patch(&server).await;
+        let rules = [FolderPermissionRule::file("file-1").allowing([DriveOperation::Trash])];
+        for restore in [false, true] {
+            let outcome = trash(&client, &opts(restore, true), &rules).await;
+            assert!(
+                matches!(outcome.result, TrashResult::Failed { ref detail } if detail.contains("omitted"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_patch_must_confirm_the_requested_state() {
+        let _env = crate::drive::test_support::EnvGuard::take();
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("mutations.jsonl");
+        let _log =
+            crate::utils::env::ScopedEnvVar::set("OMNI_DEV_LOG_FILE", log_path.to_str().unwrap());
+        for (restore, returned) in [(true, Some(true)), (false, Some(false)), (true, None)] {
+            let server = MockServer::start().await;
+            let client = client_with_bootstrapped_token(&server).await;
+            if restore {
+                trashed_file(&server).await;
+            } else {
+                mount_file("file-1", "text/plain", &["parent-1"])
+                    .mount(&server)
+                    .await;
+            }
+            mount_folder("parent-1").mount(&server).await;
+            Mock::given(method("PATCH"))
+                .and(path("/drive/v3/files/file-1"))
+                .and(body_json(serde_json::json!({"trashed": !restore})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "file-1", "name": "file-1", "trashed": returned
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let outcome = trash(&client, &opts(restore, false), &[allow()]).await;
+            assert!(
+                matches!(outcome.result, TrashResult::Failed { ref detail } if detail.contains("did not confirm")),
+                "{outcome:?}"
+            );
         }
     }
 
