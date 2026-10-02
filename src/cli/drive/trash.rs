@@ -96,7 +96,7 @@ mod tests {
     use super::*;
     use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
     use crate::drive::types::GOOGLE_FOLDER_MIME_TYPE;
-    use crate::drive::write_gate::DriveOperation;
+    use crate::drive::write_gate::{DecidingRule, DriveOperation};
     use crate::utils::secret::Secret;
     fn test_credentials() -> DriveCredentials {
         DriveCredentials {
@@ -165,7 +165,7 @@ mod tests {
             let (crate::cli::drive::DriveSubcommands::Trash(leaf)
             | crate::cli::drive::DriveSubcommands::Untrash(leaf)) = cmd.command
             else {
-                panic!("wrong subcommand");
+                panic!("wrong subcommand"); // omni-dev: coverage ignore-line reason="guards this test's assumption; the parse above always yields a trash or untrash subcommand"
             };
             assert_eq!(leaf.file_id, "file-1");
             assert!(leaf.dry_run);
@@ -217,6 +217,17 @@ mod tests {
             TrashResult::RefusedFolder,
             TrashResult::RefusedNoVisibleParents,
             TrashResult::Blocked { decided_by: None },
+            TrashResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder\x1b[31m".into(),
+                    depth: 2,
+                }),
+            },
+            TrashResult::Blocked {
+                decided_by: Some(DecidingRule::File {
+                    file_id: "file\x1b[31m".into(),
+                }),
+            },
             TrashResult::Failed {
                 detail: "bad\x1b[31m error".into(),
             },
@@ -236,6 +247,77 @@ mod tests {
             let text = String::from_utf8(bytes).unwrap();
             assert!(!text.contains('\x1b'));
             assert!(!text.is_empty());
+        }
+    }
+
+    fn render(result: TrashResult) -> String {
+        let mut bytes = Vec::new();
+        write_outcome(
+            &TrashOutcome {
+                file_id: "f".into(),
+                file_name: None,
+                resolved_folder_id: None,
+                result,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn blocked_output_names_the_deciding_rule_or_the_default_policy() {
+        assert_eq!(
+            render(TrashResult::Blocked {
+                decided_by: Some(DecidingRule::Folder {
+                    folder_id: "folder-1".into(),
+                    depth: 2,
+                }),
+            }),
+            "Blocked: f\n  refused by rule on folder folder-1 (depth 2)\n"
+        );
+        assert_eq!(
+            render(TrashResult::Blocked {
+                decided_by: Some(DecidingRule::File {
+                    file_id: "file-1".into(),
+                }),
+            }),
+            "Blocked: f\n  refused by rule on file file-1\n"
+        );
+        assert_eq!(
+            render(TrashResult::Blocked { decided_by: None }),
+            "Blocked: f\n  refused by default policy (no matching trash rule)\n"
+        );
+    }
+
+    /// Exercises `TrashCommand::execute` itself (the other tests call
+    /// `run_trash` directly). With credentials cleared there are no
+    /// permission rules, so the dry run is refused by the default policy and
+    /// must never reach the `PATCH`.
+    #[tokio::test]
+    async fn execute_trash_and_untrash_resolve_rules_and_never_patch_on_dry_run() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+
+        let server = wiremock::MockServer::start().await;
+        let client = client_with_bootstrapped_token(&server).await;
+        mount_file("file-1", "text/plain", &["parent-1"])
+            .mount(&server)
+            .await;
+        mount_folder("parent-1").mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        for restore in [false, true] {
+            let cmd = TrashCommand {
+                file_id: "file-1".to_string(),
+                dry_run: true,
+                output: OutputFormat::Json,
+            };
+            cmd.execute(&client, restore).await.unwrap();
         }
     }
 
