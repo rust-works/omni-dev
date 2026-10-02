@@ -10,7 +10,7 @@ use super::common::{format_output, JevFormat};
 use crate::jev::{
     client::JevClient,
     config::JevConfig,
-    exists::{build_request, judge, retrieve, ExistsReport},
+    exists::{build_request, judge, retrieve, ExistsReport, MAX_ISSUE_BYTES},
 };
 
 /// Screens whether local Rust definitions already provide an issue's proposed work.
@@ -41,12 +41,12 @@ fn load_issue_text(repo: &Path, issue: Option<String>, file: Option<PathBuf>) ->
         let mut bytes = Vec::new();
         std::fs::File::open(&file)
             .with_context(|| format!("read issue file {}", file.display()))?
-            .take(16 * 1024 + 4)
+            .take((MAX_ISSUE_BYTES + 4) as u64)
             .read_to_end(&mut bytes)?;
         // The final character may have been cut by the read bound.
         let text = match std::str::from_utf8(&bytes) {
             Ok(text) => text.to_owned(),
-            Err(error) if error.error_len().is_none() => {
+            Err(error) if error.error_len().is_none() && bytes.len() == MAX_ISSUE_BYTES + 4 => {
                 std::str::from_utf8(&bytes[..error.valid_up_to()])?.to_owned()
             }
             Err(error) => return Err(error.into()),
@@ -126,6 +126,18 @@ impl ExistsCommand {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_file_rejects_invalid_utf8_and_bounds_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("issue.txt");
+        std::fs::write(&file, [b'a', 0xc3]).unwrap();
+        assert!(load_issue_text(dir.path(), None, Some(file.clone())).is_err());
+        std::fs::write(&file, "é".repeat(MAX_ISSUE_BYTES)).unwrap();
+        let text = load_issue_text(dir.path(), None, Some(file)).unwrap();
+        assert!(text.len() <= MAX_ISSUE_BYTES + 4);
+        assert!(load_issue_text(dir.path(), None, Some(dir.path().join("missing"))).is_err());
+    }
 
     #[test]
     fn exactly_one_input_and_scoped_flags_are_required() {

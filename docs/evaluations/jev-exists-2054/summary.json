@@ -1,0 +1,48 @@
+{
+  "cases": 35,
+  "held_out_inputs": 34,
+  "diagnostic_inputs": 1,
+  "requested_model": "jev-1.13.0",
+  "actual_model": null,
+  "source_revision": "1ebdda39729110ab0d513b35a990d0d170c1fbf6",
+  "retrieval_statuses": {
+    "ready": 33,
+    "no_candidates": 2
+  },
+  "candidate_questions": 792,
+  "known_positive_diagnostic": [
+    {
+      "path": "src/jq/walk.rs",
+      "symbol": "any_pattern_key",
+      "line": 765,
+      "basis": "Its documented read-only pattern-key traversal recurses through nested object and array patterns.",
+      "retrieved": true
+    },
+    {
+      "path": "src/jq/walk.rs",
+      "symbol": "any_subexpr",
+      "line": 1126,
+      "basis": "At this post-fix HEAD the predicate walker delegates to the corrected exhaustive search traversal.",
+      "retrieved": true
+    },
+    {
+      "path": "src/jq/walk.rs",
+      "symbol": "search_subexpr",
+      "line": 1158,
+      "basis": "At this post-fix HEAD the search traversal visits computed keys in destructuring patterns.",
+      "retrieved": true
+    }
+  ],
+  "diagnostic_retrieved": 3,
+  "diagnostic_known_positives": 3,
+  "precision": null,
+  "precision_reason": "No live answers or independent held-out existence labels. Routing labels do not establish existence ground truth.",
+  "live_study": {
+    "status": "blocked_by_automatic_approval_review",
+    "reason": "Explicit user authorization is required to send issue text and repository-derived signatures/doc comments to the external paid Jev service.",
+    "paid_calls": 0,
+    "study_cost_usd": 0,
+    "usage": null
+  },
+  "final_raw_sha256": "f7df6755962332e2750b5035780310d010b3043e51125213a8c44e4ddb418754"
+}

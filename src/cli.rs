@@ -367,6 +367,7 @@ mod tests {
                     "worktrees push",
                     "ai claude skills",
                     "ai jev route",
+                    "ai jev exists",
                     "ai jev verify-decision",
                 ],
             ),
@@ -432,6 +433,7 @@ mod tests {
             "omni-dev ai claude skills --repo",
             // `RepoArg` is `global = true` even on this leaf (a no-op there).
             "omni-dev ai jev route --repo",
+            "omni-dev ai jev exists --repo",
             "omni-dev ai jev verify-decision --repo",
             "omni-dev atlassian jira --instance",
             "omni-dev atlassian confluence --instance",

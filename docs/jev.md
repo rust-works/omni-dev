@@ -1834,12 +1834,15 @@ candidate exists). Its default model is `jev-latest`; use `--jev-model` to pin i
 Normal calls use the same settings and credentials as the other Jev commands.
 
 Retrieval pins the local repository's HEAD commit and searches committed Rust
-sources with literal word matches. It extracts exact single-backticked identifiers
+sources with literal word matches. Files with direct `fn` definitions get priority
+in issue-identifier order, followed by use-site files; within each file, directly
+named definitions precede nearby helpers. It extracts exact single-backticked identifiers
 and `module::symbol` paths outside fenced examples. Qualified paths search their
 terminal identifier: no Rust name resolution occurs, and duplicate names remain
 separate candidates with source path and one-based signature line. A hit retrieves
-function/method signatures starting within 40 lines on either side, including an
-adjacent helper. Bodies are parsed locally but never enter Jev state. Only named
+function/method implementations (including trait defaults) with signatures starting within 40 lines on either side, including an
+adjacent helper. Required trait methods without a default implementation are
+excluded. Bodies are parsed locally but never enter Jev state. Only named
 candidate fields (path, line, symbol, signature, doc_comments and an initially
 null score) accompany the bounded issue text. `route` receives none of this code.
 
@@ -1855,7 +1858,10 @@ filenames, 24 candidates, 2 KiB of signature plus doc comments per candidate,
 16 KiB of issue text and 64 KiB of serialized state. Oversized signatures are
 skipped; docs and issue text are cut at UTF-8 boundaries. Files over the size cap,
 invalid UTF-8 sources and parser failures are skipped with warnings. Candidates
-are ordered by path/line and tail candidates are dropped to fit the state budget.
+retain that file priority and signature-line order, and tail candidates are
+dropped to fit the state budget. Direct-definition discovery uses a bounded
+line-based Git search, so unusual multiline `fn` declarations can rely on
+use-site fallback instead.
 The output records actual omissions. Uncommitted files, non-Rust code, macro-generated
 definitions, distant helpers and body-level facts can all be missed.
 
