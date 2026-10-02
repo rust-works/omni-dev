@@ -4,6 +4,8 @@
 //! within server-indexed text runs, never by summing document text. Non-text
 //! elements break matches; ranges cannot cross containers or structural gaps.
 
+use std::collections::HashSet;
+
 use regex::RegexBuilder;
 use serde::Serialize;
 
@@ -15,6 +17,8 @@ use super::types::{Document, StructuralElement};
 pub enum AnchorError {
     /// The anchor is empty or contains a paragraph separator.
     InvalidAnchor,
+    /// No characters would remain after the API strips unsupported input.
+    InvalidInsertionText,
     /// No body text matches.
     NotFound,
     /// More than one occurrence, including overlapping occurrences.
@@ -77,6 +81,7 @@ struct Paragraph<'a> {
     runs: Vec<Run<'a>>,
 }
 
+#[derive(Clone, Copy)]
 struct Match {
     paragraph: usize,
     start: i64,
@@ -91,9 +96,16 @@ fn utf16_len(text: &str) -> Result<i64, AnchorError> {
 fn paragraphs(document: &Document) -> Result<Vec<Paragraph<'_>>, AnchorError> {
     let mut out = Vec::new();
     let mut container = 0;
+    let mut tab_ids = HashSet::new();
     for (tab, resolved) in document.resolved_tabs().iter().enumerate() {
-        if !document.tabs.is_empty() && resolved.tab_id.is_none() {
-            return Err(AnchorError::InvalidIndices);
+        if !document.tabs.is_empty() {
+            let id = resolved
+                .tab_id
+                .filter(|id| !id.is_empty())
+                .ok_or(AnchorError::InvalidIndices)?;
+            if !tab_ids.insert(id) {
+                return Err(AnchorError::InvalidIndices);
+            }
         }
         if let Some(body) = resolved.body {
             collect(
@@ -247,6 +259,14 @@ fn map_boundary(runs: &[Run<'_>], mut byte: usize) -> Result<i64, AnchorError> {
     Err(AnchorError::InvalidIndices)
 }
 
+/// Counts the text Google actually inserts, excluding documented stripped
+/// control characters and BMP private-use characters. The original text is
+/// still sent verbatim; the server performs this filtering.
+pub(crate) fn insertion_counts(text: &str) -> (usize, usize) {
+    text.chars().filter(|ch| !matches!(ch, '\u{0000}'..='\u{0008}' | '\u{000c}'..='\u{001f}' | '\u{e000}'..='\u{f8ff}'))
+        .fold((0, 0), |(chars, bytes), ch| (chars + 1, bytes + ch.len_utf8()))
+}
+
 /// Resolve insertion against a body anchor in the leased inline snapshot.
 pub fn resolve_insert(
     document: &Document,
@@ -255,6 +275,10 @@ pub fn resolve_insert(
     text: &str,
     match_case: bool,
 ) -> Result<EditPreview, AnchorError> {
+    let (chars, bytes) = insertion_counts(text);
+    if chars == 0 {
+        return Err(AnchorError::InvalidInsertionText);
+    }
     let paragraphs = paragraphs(document)?;
     let found = find(&paragraphs, anchor, match_case)?;
     if found.suggested {
@@ -273,8 +297,8 @@ pub fn resolve_insert(
         end_index: index,
         tab_id: p.tab_id.clone(),
         paragraphs: 1,
-        chars: text.chars().count(),
-        bytes: text.len(),
+        chars,
+        bytes,
     })
 }
 
@@ -293,7 +317,7 @@ pub fn resolve_delete(
     let last = if let Some(to) = to {
         find(&paragraphs, to, match_case)?
     } else {
-        Match { ..first }
+        first
     };
     let a = &paragraphs[first.paragraph];
     let b = &paragraphs[last.paragraph];
@@ -314,7 +338,7 @@ pub fn resolve_delete(
         if p.tab != a.tab || p.container != a.container {
             return Err(AnchorError::UnsafeRange);
         }
-        if p.protected_newline && start <= p.end - 1 && end > p.end - 1 {
+        if p.protected_newline && start < p.end && end >= p.end {
             return Err(AnchorError::UnsafeRange);
         }
         count += 1;
@@ -394,7 +418,7 @@ mod tests {
 
     #[test]
     fn unicode_case_folding_preserves_original_boundaries_and_matches_literals() {
-        let document = doc(vec![paragraph(1, &["😀 K.[İ]\n"])]);
+        let document = doc(vec![paragraph(1, &["😀 \u{212a}.[İ]\n"])]);
         let edit = resolve_delete(&document, "k.[İ]", None, false).unwrap();
         assert_eq!(
             (edit.start_index, edit.end_index, edit.chars, edit.bytes),
@@ -474,7 +498,7 @@ mod tests {
     #[test]
     fn suggestions_in_anchors_and_inside_ranges_are_refused() {
         for field in ["suggestedInsertionIds", "suggestedDeletionIds"] {
-            let mut p = paragraph(1, &["start ", "pending", " end\n"]);
+            let mut p = paragraph(1, &["start ", "pending", " finish\n"]);
             p["paragraph"]["elements"][1]["textRun"][field] = json!(["suggestion"]);
             let document = doc(vec![p]);
             assert_eq!(
@@ -482,7 +506,7 @@ mod tests {
                 Err(AnchorError::SuggestedContent)
             );
             assert_eq!(
-                resolve_delete(&document, "start", Some("end"), true),
+                resolve_delete(&document, "start", Some("finish"), true),
                 Err(AnchorError::SuggestedContent)
             );
             assert!(resolve_delete(&document, "start", None, true).is_ok());
@@ -590,6 +614,31 @@ mod tests {
             let edit = resolve_delete(&document, "ANCHOR", None, true).unwrap();
             prop_assert_eq!(edit.start_index, 1 + prefix.encode_utf16().count() as i64);
             prop_assert_eq!(edit.end_index, edit.start_index + 6);
+        }
+    }
+    #[test]
+    fn insertion_counts_exclude_characters_stripped_by_google() {
+        let document = doc(vec![paragraph(1, &["anchor\n"])]);
+        let edit =
+            resolve_insert(&document, "anchor", Side::After, "\0😀\r\u{e000}x\n", true).unwrap();
+        assert_eq!((edit.chars, edit.bytes), (3, 6));
+        assert_eq!(
+            resolve_insert(&document, "anchor", Side::After, "\0\r", true),
+            Err(AnchorError::InvalidInsertionText)
+        );
+    }
+
+    #[test]
+    fn missing_empty_or_duplicate_tab_ids_are_refused() {
+        for ids in [vec![None], vec![Some("")], vec![Some("same"), Some("same")]] {
+            let tabs: Vec<Value> = ids.into_iter().map(|id| json!({
+                "tabProperties": {"tabId": id}, "documentTab": {"body": {"content": [paragraph(1, &["anchor\n"])]}}
+            })).collect();
+            let document: Document = serde_json::from_value(json!({"tabs": tabs})).unwrap();
+            assert_eq!(
+                resolve_insert(&document, "anchor", Side::Before, "x", true),
+                Err(AnchorError::InvalidIndices)
+            );
         }
     }
 }
