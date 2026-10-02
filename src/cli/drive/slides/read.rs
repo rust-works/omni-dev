@@ -98,4 +98,129 @@ mod tests {
         assert!(!text.contains('\u{1b}'));
         assert_eq!(text.lines().count(), 1);
     }
+
+    use crate::drive::slides::client::test_support::mock_clients;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn serve(server: &MockServer, endpoint: &str, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(response)
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+    fn api_error(code: u16, status: &str) -> ResponseTemplate {
+        ResponseTemplate::new(code).set_body_json(
+            serde_json::json!({"error":{"code":code,"status":status,"message":"nope"}}),
+        )
+    }
+    fn opts(slides: &[&str]) -> ReadOptions {
+        ReadOptions {
+            presentation_id: "p1".into(),
+            slides: slides.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+    fn deck() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "title": "Deck", "revisionId": "rev-1",
+            "slides": [{"objectId":"s1","pageElements":[
+                {"objectId":"shape","shape":{"text":{"textElements":[{"textRun":{"content":"hi"}}]}}},
+                {"objectId":"table","table":{"tableRows":[{"tableCells":[{"text":{"textElements":[{"textRun":{"content":"cell"}}]}}]}]}}
+            ]}]
+        }))
+    }
+
+    #[tokio::test]
+    async fn run_read_succeeds_in_every_output_format() {
+        for output in [
+            OutputFormat::Table,
+            OutputFormat::Json,
+            OutputFormat::Yaml,
+            OutputFormat::Yamls,
+            OutputFormat::Jsonl,
+        ] {
+            let server = MockServer::start().await;
+            let (drive, slides) = mock_clients(&server).await;
+            serve(&server, "/v1/presentations/p1", deck()).await;
+            run_read(&drive, &slides, &opts(&["s1"]), &output)
+                .await
+                .unwrap();
+        }
+    }
+    #[test]
+    fn table_rows_carry_the_cell_coordinates_of_table_elements() {
+        let p = serde_json::from_value(serde_json::json!({"slides":[{"objectId":"s","pageElements":[
+            {"objectId":"t","table":{"tableRows":[{"tableCells":[{"text":{"textElements":[{"textRun":{"content":"x"}}]}},{"text":{"textElements":[{"textRun":{"content":"y"}}]}}]}]}}
+        ]}]})).unwrap();
+        let outcome = ReadOutcome {
+            presentation_id: "p".into(),
+            title: None,
+            revision_id: None,
+            elements: crate::drive::slides::read::flatten(&p, &["s".into()], true),
+        };
+        let mut buf = Vec::new();
+        render_table(&outcome, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("t[0,0]"), "{text}");
+        assert!(text.contains("t[0,1]"), "{text}");
+    }
+    #[tokio::test]
+    async fn run_read_explains_a_target_that_is_not_a_presentation() {
+        let server = MockServer::start().await;
+        let (drive, slides) = mock_clients(&server).await;
+        serve(&server, "/v1/presentations/p1", api_error(404, "NOT_FOUND")).await;
+        serve(
+            &server,
+            "/drive/v3/files/p1",
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"p1","name":"Notes","mimeType":crate::drive::types::GOOGLE_DOC_MIME_TYPE
+            })),
+        )
+        .await;
+        let err = run_read(&drive, &slides, &opts(&[]), &OutputFormat::Json)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a Google Slides presentation"), "{err}");
+        assert!(err.contains("drive slides read"), "{err}");
+    }
+    #[tokio::test]
+    async fn run_read_reports_an_unknown_slide_filter_unchanged_for_a_real_presentation() {
+        let server = MockServer::start().await;
+        let (drive, slides) = mock_clients(&server).await;
+        serve(&server, "/v1/presentations/p1", deck()).await;
+        serve(
+            &server,
+            "/drive/v3/files/p1",
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"p1","name":"Deck","mimeType":crate::drive::types::GOOGLE_SLIDES_MIME_TYPE
+            })),
+        )
+        .await;
+        let err = run_read(&drive, &slides, &opts(&["nope"]), &OutputFormat::Json)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope"), "{err}");
+        assert!(!err.contains("not a Google Slides presentation"), "{err}");
+    }
+    #[tokio::test]
+    async fn run_read_keeps_the_slides_error_when_the_target_cannot_be_classified() {
+        let server = MockServer::start().await;
+        let (drive, slides) = mock_clients(&server).await;
+        serve(
+            &server,
+            "/v1/presentations/p1",
+            api_error(403, "PERMISSION_DENIED"),
+        )
+        .await;
+        serve(&server, "/drive/v3/files/p1", ResponseTemplate::new(404)).await;
+        let err = run_read(&drive, &slides, &opts(&[]), &OutputFormat::Json)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Slides API request failed"), "{err}");
+    }
 }

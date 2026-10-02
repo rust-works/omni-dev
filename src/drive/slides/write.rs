@@ -446,43 +446,12 @@ pub fn describe(outcome: &WriteOutcome) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::drive::auth::{DriveCredentials, DriveGrantedScopes};
-    use crate::drive::slides::client::SLIDES_API_URL;
+    use crate::drive::slides::client::test_support::mock_clients as clients;
     use crate::drive::test_support::seed_lease;
     use crate::drive::types::GOOGLE_DOC_MIME_TYPE;
-    use crate::test_support::env::MapEnv;
-    use crate::utils::secret::Secret;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    async fn clients(server: &MockServer) -> (DriveClient, SlidesClient) {
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"access_token":"test", "expires_in":3600})),
-            )
-            .mount(server)
-            .await;
-        let credentials = DriveCredentials {
-            client_id: "client".into(),
-            client_secret: Secret::new("secret"),
-            refresh_token: Secret::new("refresh"),
-            scope: DriveGrantedScopes::READONLY,
-        };
-        let mut drive = DriveClient::new(&server.uri(), &credentials).unwrap();
-        crate::drive::client::test_support::replace_session(
-            &mut drive,
-            &credentials,
-            &format!("{}/token", server.uri()),
-        );
-        let slides = SlidesClient::from_drive_client_with(
-            &MapEnv::new().with(SLIDES_API_URL, &server.uri()),
-            &drive,
-        )
-        .unwrap();
-        (drive, slides)
-    }
     fn opts() -> WriteOptions {
         WriteOptions {
             presentation_id: "p1".into(),
@@ -1008,5 +977,301 @@ mod tests {
         assert_eq!(count_occurrences("ÉCOLE école", "école", false), 2);
         assert_eq!(count_occurrences("😀 😀", "😀", true), 2);
         assert_eq!(count_occurrences("x", "", false), 0);
+    }
+
+    #[tokio::test]
+    async fn a_metadata_failure_reports_no_file_name_and_touches_no_slides_endpoint() {
+        let server = MockServer::start().await;
+        let (drive, slides) = clients(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/drive/v3/files/p1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1/presentations/p1"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        forbid_batch(&server).await;
+        let outcome = write_inner(&drive, &slides, &opts(), &[rule(false)]).await;
+        assert!(matches!(outcome.result, WriteResult::Failed { .. }));
+        assert_eq!(outcome.file_name, None);
+    }
+    #[tokio::test]
+    async fn an_unresolvable_ancestor_chain_fails_rather_than_allowing() {
+        let server = MockServer::start().await;
+        let (drive, slides) = clients(&server).await;
+        Mock::given(method("GET")).and(path("/drive/v3/files/p1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"p1", "name":"Deck", "mimeType":GOOGLE_SLIDES_MIME_TYPE,"parents":["folder"],"version":"1"})))
+            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/drive/v3/files/folder"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1/presentations/p1"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        forbid_batch(&server).await;
+        let rules = [FolderPermissionRule {
+            folder_id: Some("folder".into()),
+            file_id: None,
+            recursive: true,
+            ..rule(false)
+        }];
+        let outcome = write_inner(&drive, &slides, &opts(), &rules).await;
+        assert!(
+            matches!(outcome.result, WriteResult::Failed { .. }),
+            "a chain that could not be resolved must never become an allow: {:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.file_name.as_deref(), Some("Deck"));
+    }
+    #[tokio::test]
+    async fn a_parentless_presentation_without_a_file_rule_is_refused_distinctly() {
+        let server = MockServer::start().await;
+        let (drive, slides) = clients(&server).await;
+        mount_file(&server, GOOGLE_SLIDES_MIME_TYPE).await;
+        Mock::given(path("/v1/presentations/p1"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        forbid_batch(&server).await;
+        let outcome = write_inner(&drive, &slides, &opts(), &[]).await;
+        assert_eq!(outcome.result, WriteResult::RefusedNoVisibleParents);
+        assert!(describe(&outcome).contains("file_id"));
+    }
+    #[tokio::test]
+    async fn a_presentation_fetch_failure_keeps_the_gate_context_and_never_mutates() {
+        let server = MockServer::start().await;
+        let (drive, slides) = clients(&server).await;
+        mount_file(&server, GOOGLE_SLIDES_MIME_TYPE).await;
+        Mock::given(method("GET")).and(path("/v1/presentations/p1"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({"error":{"code":403,"status":"PERMISSION_DENIED","message":"nope"}})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        forbid_batch(&server).await;
+        let outcome = write_inner(&drive, &slides, &opts(), &[rule(false)]).await;
+        assert!(
+            matches!(outcome.result, WriteResult::Failed { ref detail } if detail.contains("Slides API request failed")),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.file_name.as_deref(), Some("Deck"));
+        assert_eq!(outcome.required_revision_id, None);
+    }
+    #[tokio::test]
+    async fn the_public_entry_point_returns_the_engine_outcome_for_real_runs_and_dry_runs() {
+        for dry_run in [false, true] {
+            let server = MockServer::start().await;
+            let (drive, slides) = ready(&server).await;
+            let expected = if dry_run {
+                forbid_batch(&server).await;
+                WriteResult::WouldReplace { occurrences: 2 }
+            } else {
+                batch()
+                    .respond_with(ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"replies":[{"replaceAllText":{"occurrencesChanged":2}}]}),
+                    ))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                WriteResult::Replaced {
+                    occurrences_changed: 2,
+                }
+            };
+            let opts = WriteOptions { dry_run, ..opts() };
+            assert_eq!(
+                write(&drive, &slides, &opts, &[rule(false)]).await.result,
+                expected
+            );
+        }
+    }
+    #[tokio::test]
+    async fn the_public_entry_point_reports_a_denied_attempt_with_its_deciding_rule() {
+        let server = MockServer::start().await;
+        let (drive, slides) = clients(&server).await;
+        mount_file(&server, GOOGLE_SLIDES_MIME_TYPE).await;
+        forbid_batch(&server).await;
+        let mut deny = rule(false);
+        deny.allow.clear();
+        deny.deny.insert(DriveOperation::SlidesWrite);
+        let outcome = write(&drive, &slides, &opts(), &[deny]).await;
+        assert_eq!(
+            outcome.result,
+            WriteResult::Blocked {
+                decided_by: Some(DecidingRule::File {
+                    file_id: "p1".into()
+                })
+            }
+        );
+    }
+
+    fn outcome_of(result: WriteResult) -> WriteOutcome {
+        WriteOutcome {
+            presentation_id: "p1".into(),
+            file_name: Some("Deck".into()),
+            resolved_folder_id: None,
+            required_revision_id: None,
+            result,
+        }
+    }
+    #[test]
+    fn describe_names_the_deck_for_every_outcome_and_the_remedy_where_one_exists() {
+        for (result, expected) in [
+            (
+                WriteResult::WouldReplace { occurrences: 3 },
+                "Would replace: 3 estimated occurrence(s) in 'Deck'",
+            ),
+            (
+                WriteResult::Replaced {
+                    occurrences_changed: 2,
+                },
+                "Replaced: 2 occurrence(s) in 'Deck'",
+            ),
+            (
+                WriteResult::AppliedResponseUnreadable {
+                    detail: "bad json".into(),
+                },
+                "Applied: 'Deck', but the response was unreadable; inspect the presentation before retrying: bad json",
+            ),
+            (
+                WriteResult::RefusedNotAPresentation {
+                    mime_type: "text/plain".into(),
+                },
+                "'Deck' is not a Google Slides presentation (mimeType: text/plain)",
+            ),
+            (WriteResult::RefusedShortcut, "'Deck' is a shortcut"),
+            (
+                WriteResult::RefusedNoVisibleParents,
+                "grant its file_id the slides-write operation",
+            ),
+            (
+                WriteResult::RefusedNoRevisionId,
+                "'Deck' returned no revision id",
+            ),
+            (
+                WriteResult::Blocked { decided_by: None },
+                "Blocked: 'Deck' — refused by default policy (no matching rule)",
+            ),
+            (
+                WriteResult::Blocked {
+                    decided_by: Some(DecidingRule::Folder {
+                        folder_id: "f".into(),
+                        depth: 2,
+                    }),
+                },
+                "Blocked: 'Deck' — refused by rule on folder f (depth 2)",
+            ),
+            (
+                WriteResult::RefusedNoLease,
+                "'Deck' requires a Drive write lease",
+            ),
+            (WriteResult::RefusedLeaseExpired, "lease is expired"),
+            (
+                WriteResult::RefusedLeaseWrongFile,
+                "acquired for a different file",
+            ),
+            (WriteResult::RefusedLeaseStale, "'Deck' changed since"),
+            (
+                WriteResult::StaleRevision {
+                    required_revision_id: "r".into(),
+                    detail: "server echo".into(),
+                },
+                "'Deck' changed since it was read; nothing was written",
+            ),
+            (
+                WriteResult::Failed {
+                    detail: "boom".into(),
+                },
+                "Failed: 'Deck': boom",
+            ),
+        ] {
+            let text = describe(&outcome_of(result.clone()));
+            assert!(text.contains(expected), "{result:?} rendered as {text:?}");
+        }
+    }
+    #[test]
+    fn describe_falls_back_to_the_presentation_id_and_omits_server_echoes_on_a_stale_revision() {
+        let mut outcome = outcome_of(WriteResult::StaleRevision {
+            required_revision_id: "r".into(),
+            detail: "echoed Q3 prose".into(),
+        });
+        outcome.file_name = None;
+        let text = describe(&outcome);
+        assert!(text.contains("'p1'"), "{text}");
+        assert!(!text.contains("Q3"), "{text}");
+    }
+    #[test]
+    fn log_status_is_a_stable_label_per_outcome() {
+        for (result, status) in [
+            (
+                WriteResult::WouldReplace { occurrences: 1 },
+                "would-replace",
+            ),
+            (
+                WriteResult::Replaced {
+                    occurrences_changed: 1,
+                },
+                "replaced",
+            ),
+            (
+                WriteResult::AppliedResponseUnreadable { detail: "x".into() },
+                "applied-response-unreadable",
+            ),
+            (
+                WriteResult::RefusedNotAPresentation {
+                    mime_type: "x".into(),
+                },
+                "refused-not-a-presentation",
+            ),
+            (WriteResult::RefusedShortcut, "refused-shortcut"),
+            (
+                WriteResult::RefusedNoVisibleParents,
+                "refused-no-visible-parents",
+            ),
+            (WriteResult::RefusedNoRevisionId, "refused-no-revision-id"),
+            (WriteResult::Blocked { decided_by: None }, "blocked"),
+            (
+                WriteResult::RefusedNoLease,
+                LeaseGateRefusal::NoLease.log_status(),
+            ),
+            (
+                WriteResult::RefusedLeaseExpired,
+                LeaseGateRefusal::Expired.log_status(),
+            ),
+            (
+                WriteResult::RefusedLeaseWrongFile,
+                LeaseGateRefusal::WrongFile.log_status(),
+            ),
+            (
+                WriteResult::RefusedLeaseStale,
+                LeaseGateRefusal::Stale.log_status(),
+            ),
+            (
+                WriteResult::StaleRevision {
+                    required_revision_id: "r".into(),
+                    detail: "x".into(),
+                },
+                "stale-revision",
+            ),
+            (WriteResult::Failed { detail: "x".into() }, "failed"),
+        ] {
+            assert_eq!(result.log_status(), status, "{result:?}");
+        }
+    }
+    #[test]
+    fn a_failed_lease_check_becomes_a_failed_outcome_carrying_the_detail() {
+        assert_eq!(
+            WriteResult::from_lease_failed("ledger unreadable".into()),
+            WriteResult::Failed {
+                detail: "ledger unreadable".into()
+            }
+        );
     }
 }

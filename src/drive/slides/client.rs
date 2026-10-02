@@ -111,6 +111,50 @@ impl SlidesClient {
     }
 }
 
+/// A Drive + Slides client pair pointed at one wiremock server, shared by the
+/// engine and CLI tests so neither re-derives the token-endpoint wiring.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{DriveClient, DriveCredentials, SlidesClient, SLIDES_API_URL};
+    use crate::drive::auth::DriveGrantedScopes;
+    use crate::test_support::env::MapEnv;
+    use crate::utils::secret::Secret;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Mounts a `/token` endpoint on `server` and returns clients whose Drive
+    /// and Slides hosts are both `server`.
+    #[allow(clippy::unwrap_used)]
+    pub(crate) async fn mock_clients(server: &MockServer) -> (DriveClient, SlidesClient) {
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token":"test", "expires_in":3600})),
+            )
+            .mount(server)
+            .await;
+        let credentials = DriveCredentials {
+            client_id: "client".into(),
+            client_secret: Secret::new("secret"),
+            refresh_token: Secret::new("refresh"),
+            scope: DriveGrantedScopes::READONLY,
+        };
+        let mut drive = DriveClient::new(&server.uri(), &credentials).unwrap();
+        crate::drive::client::test_support::replace_session(
+            &mut drive,
+            &credentials,
+            &format!("{}/token", server.uri()),
+        );
+        let slides = SlidesClient::from_drive_client_with(
+            &MapEnv::new().with(SLIDES_API_URL, &server.uri()),
+            &drive,
+        )
+        .unwrap();
+        (drive, slides)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

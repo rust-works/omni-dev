@@ -235,4 +235,65 @@ mod tests {
         let row: serde_json::Value = serde_json::from_str(text.lines().nth(2).unwrap()).unwrap();
         assert_eq!(row["text"], "Q3");
     }
+
+    async fn serve_deck(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        wiremock::Mock::given(method("GET"))
+            .and(path("/v1/presentations/p1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "Deck",
+                "revisionId": "rev-1",
+                "slides": [
+                    {"objectId":"s1","pageElements":[{"objectId":"a","shape":{"text":{"textElements":[{"textRun":{"content":"hi"}}]}}}]},
+                    {"objectId":"s2","pageElements":[]}
+                ]
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+    #[tokio::test]
+    async fn read_returns_identity_and_rows_and_narrows_to_the_requested_slides() {
+        use crate::drive::slides::client::test_support::mock_clients;
+        for (filter, rows) in [
+            (vec![], 1),
+            (vec!["s1".to_string()], 1),
+            (vec!["s2".to_string()], 0),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            let (_drive, slides) = mock_clients(&server).await;
+            serve_deck(&server).await;
+            let outcome = read(
+                &SlidesApi::new(&slides),
+                &ReadOptions {
+                    presentation_id: "p1".into(),
+                    slides: filter,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.presentation_id, "p1");
+            assert_eq!(outcome.title.as_deref(), Some("Deck"));
+            assert_eq!(outcome.revision_id.as_deref(), Some("rev-1"));
+            assert_eq!(outcome.elements.len(), rows);
+        }
+    }
+    #[tokio::test]
+    async fn read_rejects_an_unknown_slide_filter_after_the_single_fetch() {
+        use crate::drive::slides::client::test_support::mock_clients;
+        let server = wiremock::MockServer::start().await;
+        let (_drive, slides) = mock_clients(&server).await;
+        serve_deck(&server).await;
+        let err = read(
+            &SlidesApi::new(&slides),
+            &ReadOptions {
+                presentation_id: "p1".into(),
+                slides: vec!["nope".into()],
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nope"), "{err}");
+    }
 }
