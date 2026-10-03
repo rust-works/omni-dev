@@ -17,6 +17,11 @@ import {
   unionModelFamilies,
 } from "./sessionCounts";
 import {
+  AheadBehindMemo,
+  AheadBehindBatchFetcher,
+  AheadBehindTarget,
+} from "./aheadBehindMemo";
+import {
   AheadBehindMap,
   Node,
   PrBadge,
@@ -53,10 +58,13 @@ import { worktreeResourceUri } from "./decorations";
 /**
  * Fetches ahead/behind divergence for a batch of worktree paths on demand — the
  * `ahead-behind` op (#1306). Injected so the provider stays `vscode`-testable and
- * decoupled from the socket. Resolves to an empty map when the daemon is
- * unreachable or has no such op, in which case the tree renders without sync.
+ * decoupled from the socket. Resolves to `undefined` when the daemon is
+ * unreachable or has no such op, in which case the tree renders without sync — and
+ * the failure is not cached, so the next refresh retries (#2120). The provider
+ * only calls it for worktrees whose answer may have moved; see
+ * {@link AheadBehindMemo}.
  */
-export type AheadBehindFetcher = (paths: string[]) => Promise<AheadBehindMap>;
+export type AheadBehindFetcher = AheadBehindBatchFetcher;
 
 /**
  * Resolves the open PR badge for each of a GitHub repo's branches on demand — one
@@ -124,6 +132,11 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    * `extension.ts` reads it and forwards it on every configuration change.
    */
   private rowColors: RowColorMap = {};
+  /**
+   * Remembers the `ahead-behind` answers, so a refresh that moves nothing a row
+   * shows issues no request (#2120). `undefined` when no fetcher was injected.
+   */
+  private readonly aheadBehind?: AheadBehindMemo;
   private readonly emitter = new vscode.EventEmitter<Node | undefined | null | void>();
   readonly onDidChangeTreeData = this.emitter.event;
 
@@ -137,13 +150,18 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    */
   constructor(
     private readonly windowKey?: string,
-    private readonly fetchAheadBehind?: AheadBehindFetcher,
+    fetchAheadBehind?: AheadBehindFetcher,
     private readonly fetchPrBadges?: PrBadgeFetcher,
-  ) {}
+  ) {
+    this.aheadBehind = fetchAheadBehind ? new AheadBehindMemo(fetchAheadBehind) : undefined;
+  }
 
   /** Replaces the snapshot and refreshes the whole tree. */
   update(repos: TreeRepoPayload[]): void {
     this.repos = repos;
+    // Every worktree in the snapshot, not just the visible ones: toggling
+    // show-closed must not throw away answers it will need again.
+    this.aheadBehind?.prune(repos.flatMap((repo) => repo.worktrees.map((wt) => wt.path)));
     this.emitter.fire(undefined);
   }
 
@@ -172,9 +190,11 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    *
    * Refreshing only on a real change matters more here than anywhere else: user-scope
    * settings changes fire `onDidChangeConfiguration` in **every** open window, and a
-   * refresh re-runs {@link getChildren} and so the lazy ahead/behind and PR-badge
-   * fetches (see {@link setSessionState}). Without the guard, one colour edit would
-   * cost N windows × one `ahead-behind` op per expanded repo.
+   * refresh re-runs {@link getChildren} and the whole tree rebuild with it (see
+   * {@link setSessionState}). The ahead/behind requests that used to make this
+   * N windows × one `ahead-behind` op per expanded repo are now absorbed by the
+   * {@link AheadBehindMemo} (#2120), but the guard still saves every window the
+   * rebuild and the PR-badge fallback.
    */
   setRowColors(colors: RowColorMap): boolean {
     if (sameRowColors(this.rowColors, colors)) {
@@ -193,11 +213,11 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    * change together, and an independent pair of setters would each re-fire
    * `onDidChangeTreeData` for that one poll.
    *
-   * Refreshing only on a real change is load-bearing, not an optimization:
-   * firing `onDidChangeTreeData` re-runs {@link getChildren}, which re-triggers
-   * the lazy ahead/behind and PR-badge fetches. An unchanged poll must therefore
-   * be a complete no-op, or a ~10s cue poll would turn those into a poll of
-   * their own.
+   * Refreshing only on a real change keeps an unchanged poll a complete no-op:
+   * firing `onDidChangeTreeData` re-runs {@link getChildren}, which rebuilds every
+   * expanded repo and re-evaluates the PR-badge fallback. The lazy ahead/behind fetch
+   * no longer rides that (it is memoized by what it depends on, #2120), but a
+   * ~10s cue poll should still not become a tree rebuild of its own.
    */
   setSessionState(tallies: SessionTallyMap, models: ModelFamilyMap): boolean {
     const changed =
@@ -226,6 +246,11 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     // not carry ahead/behind (#1306), which is fetched via the daemon's
     // `ahead-behind` op. Best-effort: a failure leaves just that indicator off.
     //
+    // This runs on *every* refresh, and most refreshes (a CI verdict, a session
+    // transition, a colour edit, another window opening a worktree) cannot change a
+    // count, so the answers are memoized by what they are computed from and only
+    // the worktrees whose inputs moved are re-asked (#2120).
+    //
     // PR badges are **not** in the same boat since #1337. The daemon resolves them
     // and pushes them on the snapshot, kept live by its own poller — which is the
     // whole point, because a re-render only happens when the *worktree* state
@@ -240,10 +265,12 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     // it — the very per-window burn #1370/#1389 target. So a not-polled repo issues
     // zero `gh` from here too; only a *polled* repo's transient pre-first-poll
     // window still falls back (and that goes through the shared daemon op).
-    const paths = nodes.flatMap((n) => (n.kind === "worktree" ? [n.wt.path] : []));
+    const targets: AheadBehindTarget[] = nodes.flatMap((n) =>
+      n.kind === "worktree" ? [{ wt: n.wt, repo: n.repo }] : [],
+    );
     const unbadged = unbadgedBranches(nodes);
-    const abPromise: Promise<AheadBehindMap> = this.fetchAheadBehind
-      ? this.fetchAheadBehind(paths).catch(() => ({}))
+    const abPromise: Promise<AheadBehindMap> = this.aheadBehind
+      ? this.aheadBehind.resolve(targets)
       : Promise.resolve({});
     const prPromise: Promise<Record<string, PrBadge>> =
       this.fetchPrBadges &&
