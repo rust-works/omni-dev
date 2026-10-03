@@ -462,17 +462,24 @@ The automated release pipeline requires these GitHub secrets:
 
 `scripts/check_changelog.py` ([#2129](https://github.com/rust-works/omni-dev/issues/2129)) guards both changelogs. It judges a change against the merge base with `--base`, so a pull request is blamed only for what it adds, and the workflow runs it on the pull request's merge ref and on the merge-queue branch. The first mistake is made by the merge rather than by the pull request, so a check of the pull request's own diff could not see it.
 
-- **No bullet added to a released section.** A section is released when the base changelog has it and it is not `[Unreleased]`. The check fails if such a section ends up with more bullets than it had, in `CHANGELOG.md` or `editors/vscode/CHANGELOG.md`. A section that exists only in the change is a release in preparation, so a release-prep pull request passes. Rewording a bullet, or moving one out to `[Unreleased]` (the fix for a failure), does not add one.
-- **A user-visible extension change needs an entry.** A change under `editors/vscode/` that is not a test, the changelog or readme, the lockfile, build configuration or a dotfile must add a bullet under the extension's `[Unreleased]`, or open a release section.
+- **No bullet added to a released section.** A section is released when the base changelog has it and it is not `[Unreleased]`. The check fails if such a section gains a bullet, in `CHANGELOG.md` or `editors/vscode/CHANGELOG.md`. A section that exists only in the change is a release in preparation, so a release-prep pull request passes. Moving a bullet out to `[Unreleased]` (the fix for a failure) adds nothing, and neither does fixing a typo: a bullet that is at least 80% similar to one the change removed from the same section counts as a rewording of it. A bullet swapped for an unrelated one is an addition.
+- **A user-visible extension change needs an entry.** A change under `editors/vscode/` that is not a test, the changelog or readme, the lockfile, build configuration or a dotfile must add a bullet under the extension's `[Unreleased]`, or open a release section that holds one. Changes to `package.json` count only when they go beyond `devDependencies`, `scripts` and `version`.
 
-Opt-outs are commit trailers, because commit messages exist on a merge-queue entry and a pull request body does not. Say why after the keyword:
+Opt-outs are commit trailers, because commit messages exist on a merge-queue entry and a pull request body does not. A trailer belongs in the last paragraph of the message, beside `Closes #N`; the same words in the body waive nothing. It waives the rule for the whole change, whichever commit carries it. Say why after the keyword:
 
 | Trailer                              | Waives                                                                      |
 |--------------------------------------|-----------------------------------------------------------------------------|
 | `Changelog: none <reason>`           | The extension entry, for a change that is not user-visible after all        |
 | `Changelog: amend-released <reason>` | The released-section rule, for a deliberate backfill of a published release |
 
-`python3 scripts/check_changelog.py --help` lists the flags, and `python3 -m unittest discover -s scripts -p 'test_*.py'` runs its tests. The workflow has no `paths:` filter, so its `Changelog` context reports on every pull request and can be made required without deadlocking one that touches no changelog; until it is required, the merge queue does not wait for it.
+`python3 scripts/check_changelog.py --help` lists the flags, and `python3 -m unittest discover -s scripts -p 'test_*.py'` runs its tests. The workflow has no `paths:` filter, so its `Changelog` context reports on every pull request and can be made required without deadlocking one that touches no changelog. **It is not required yet, so the merge queue does not wait for it.** The merge-queue run is the authoritative one, since a pull request's own run is not repeated when `main` moves. Making it required is a branch-protection change:
+
+```bash
+gh api -X POST repos/rust-works/omni-dev/branches/main/protection/required_status_checks/contexts \
+  --input - <<< '["Changelog"]'
+```
+
+Every run prints `N commit(s) since <base>`. On a queue entry that base must be the previous entry's tip, not the branch point: queue entries are stacked, and a base that included earlier entries' changes would blame one entry for another's, or let a release-prep entry hide the bullet behind it.
 
 ## Security Notes
 
