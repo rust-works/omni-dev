@@ -148,6 +148,14 @@ export interface AheadBehind {
   ahead?: number;
   behind?: number;
   main_behind?: number;
+  /**
+   * Set when the worktree's repository is a shallow clone (#2120): the counts then
+   * depend on how deep the clone currently is, which no commit id records, so the
+   * row must not be cached by ids (`aheadBehindMemo.ts`). Never folded onto a
+   * worktree payload by {@link withAheadBehind} — it describes the answer, not the
+   * worktree.
+   */
+  shallow?: boolean;
 }
 
 /** The `ahead-behind` op's `results`: divergence keyed by worktree path. */
@@ -244,6 +252,19 @@ export interface TreeRepoPayload {
    * Polling" menu on it; see {@link repoPollingEnabled} / {@link repoContextValue}.
    */
   polling_enabled?: boolean;
+  /**
+   * The commit the repo's remote default branch (`origin/<default>`) points at, or
+   * absent when none is locally resolvable (#2120).
+   *
+   * The third input of a worktree's lazily-fetched {@link TreeWorktreePayload.main_behind},
+   * beside {@link TreeWorktreePayload.head_sha}, and carried by the streamed snapshot
+   * for the same reason as `upstream_sha`: a fetch that advances only
+   * `origin/<default>` moves no worktree's own refs, so without it that fetch was not
+   * a visible delta and `main_behind` went stale. It is also what lets
+   * `aheadBehindMemo.ts` key its cache exactly. Per repo, since remote-tracking refs
+   * are shared by every worktree. Absent from a pre-#2120 daemon.
+   */
+  main_sha?: string;
   /** Every worktree of the repo: main working tree first, then linked. */
   worktrees: TreeWorktreePayload[];
 }

@@ -173,10 +173,11 @@ export function worktreeRowIcon(
  * Whether two colour maps are equivalent.
  *
  * The tree provider refreshes only on a real change, for the reason `sameTallies`
- * documents: firing `onDidChangeTreeData` re-runs `getChildren`, which re-triggers the
- * lazy ahead/behind and PR-badge fetches. `onDidChangeConfiguration` fires in **every**
- * open window, so without this one colour edit would cost N windows × one `ahead-behind`
- * op per expanded repo.
+ * documents: firing `onDidChangeTreeData` re-runs `getChildren`, which rebuilds every
+ * expanded repo and re-evaluates the PR-badge fallback. `onDidChangeConfiguration` fires
+ * in **every** open window, so without this one colour edit would cost every window a
+ * rebuild. (It no longer costs an `ahead-behind` op per expanded repo too: those are
+ * memoized, #2120.)
  */
 export function sameRowColors(left: RowColorMap, right: RowColorMap): boolean {
   const keys = Object.keys(left);

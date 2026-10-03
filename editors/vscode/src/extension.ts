@@ -267,12 +267,19 @@ async function send(envelope: Envelope, timeoutMs?: number, context?: string): P
  * Fetches ahead/behind divergence for a batch of worktree paths via the daemon's
  * `ahead-behind` op (#1306) — the lazy replacement for the sync counts the tree
  * snapshot no longer carries. A missing daemon (or older one without the op)
- * resolves to an empty map, so the tree simply renders without sync indicators.
+ * resolves to `undefined`, so the tree simply renders without sync indicators.
+ *
+ * `undefined` and an empty map mean different things to the memo (#2120): the
+ * daemon omits a row that resolves to nothing, so a *successful* reply may carry
+ * `{}` — a real "nothing to show" the memo keeps — while a failure must never be
+ * kept, or one dropped connection would blank a row until its refs next moved.
  */
-async function fetchAheadBehind(paths: string[]): Promise<AheadBehindMap> {
+async function fetchAheadBehind(paths: string[]): Promise<AheadBehindMap | undefined> {
   const reply = await send(aheadBehindEnvelope(paths));
-  const results = reply?.ok ? (reply.payload?.results as AheadBehindMap | undefined) : undefined;
-  return results ?? {};
+  if (!reply?.ok) {
+    return undefined;
+  }
+  return reply.payload?.results as AheadBehindMap | undefined;
 }
 
 /**
@@ -281,8 +288,8 @@ async function fetchAheadBehind(paths: string[]): Promise<AheadBehindMap> {
  * the poll fall through to, and the one to call when only the *rows* changed.
  *
  * A complete no-op when nothing changed — `setSessionState` compares first,
- * and the provider's refresh re-runs the lazy ahead/behind and PR fetches, so it
- * must only fire on a real change.
+ * and the provider's refresh rebuilds every expanded repo and re-evaluates the
+ * PR-badge fallback, so it must only fire on a real change.
  */
 function retallySessions(): void {
   if (!provider || !showClaudeSessions()) {
@@ -842,7 +849,7 @@ function setupTreeView(context: vscode.ExtensionContext): void {
       // back to the writing window too, so applying in both places would refresh it
       // twice. Deliberately no `refreshTree()`: a colour is client-side presentation and
       // needs no daemon round-trip, and the provider's own no-op guard keeps an
-      // unrelated repaint from re-triggering the lazy ahead/behind and PR fetches.
+      // unrelated repaint from rebuilding the tree and re-evaluating the PR fallback.
       if (e.affectsConfiguration(`${CONFIG_SECTION}.rowColors`)) {
         applyRowColors();
       }

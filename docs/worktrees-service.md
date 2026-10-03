@@ -1642,6 +1642,22 @@ extension never runs git.
   the two cannot drift. It is per repo rather than per worktree, since
   remote-tracking refs live in the shared common dir, and omitted when no default
   branch is locally resolvable.
+- **The extension does not re-ask what cannot have changed (#2120).** A window's
+  tree re-runs `getChildren` on *every* snapshot delta — a CI verdict landing, a
+  session transition, a colour edit, another window opening a worktree — and used to
+  re-ask `ahead-behind` for every worktree of every expanded repo each time, none of
+  which could change a count. `aheadBehindMemo.ts` now remembers each worktree's
+  answer under a key of everything the daemon computes it from — the checked-out
+  `branch`, `head_sha`, `upstream_sha`, and the repo's `main_sha` — and re-asks only
+  the worktrees whose key moved, in one batch; a request already in flight for the
+  same key is joined rather than repeated. Three rules keep it exact, and there is
+  deliberately **no TTL** (the snapshot, not a clock, is what says a refresh is
+  due): a failed request is never cached; a row is cached only if the key carries
+  every input the row evidences (`ahead`/`behind` need `upstream_sha`, `main_behind`
+  needs `main_sha`, and `head_sha` is always needed), so a daemon that predates a
+  field degrades to re-asking rather than serving a stale answer; and a `shallow` row
+  is never cached. Any other client that caches these rows should key and gate the
+  same way.
 
 ### Tuning the refresh cadence
 

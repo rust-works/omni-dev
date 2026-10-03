@@ -418,8 +418,9 @@ export function decodeSessionTally(encoded: string | null | undefined): SessionT
  * Whether two tally maps are equivalent.
  *
  * The tree provider refreshes only on a real change: firing its
- * `onDidChangeTreeData` re-runs `getChildren`, which re-triggers the lazy
- * ahead/behind and PR-badge fetches, so an unchanged poll must be a no-op.
+ * `onDidChangeTreeData` re-runs `getChildren`, which rebuilds every expanded
+ * repo and re-evaluates the PR-badge fallback, so an unchanged poll must be a
+ * no-op. (The lazy ahead/behind fetch is memoized and no longer rides it, #2120.)
  */
 export function sameTallies(left: SessionTallyMap, right: SessionTallyMap): boolean {
   const keys = Object.keys(left);
