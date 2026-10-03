@@ -44,11 +44,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
+
+use crate::utils::awake_clock::AwakeClock;
 
 #[cfg(unix)]
 pub mod codex_app_server;
@@ -174,58 +176,6 @@ pub(crate) enum Origin {
     /// after a dropped POST. Also dropped when older than what the session has
     /// already applied, so a late-read event can never undo a newer one.
     Journal,
-}
-
-/// A monotonic clock that stands still while the machine sleeps, so a TTL
-/// measured on it counts only the time the daemon could actually have heard
-/// from a session (#2108).
-///
-/// The wall clock is the wrong ruler for a liveness TTL: while the system sleeps
-/// nothing refreshes a session — no hooks, no Codex lock heartbeat, no pid
-/// watcher — so the first read after a wake-up used to find every entry "stale"
-/// and reap the lot. [`Instant`] does not advance across suspend on the
-/// platforms the daemon runs on (`CLOCK_UPTIME_RAW` on macOS, `CLOCK_MONOTONIC`
-/// on Linux), so entries stamped with it survive a sleep of any length and are
-/// reaped only after a TTL's worth of *awake* silence.
-///
-/// Stamps are a [`Duration`] since the registry was created rather than a raw
-/// [`Instant`], so tests can move the clock forward without subtracting from an
-/// `Instant` (which panics on a host with little uptime).
-#[derive(Debug)]
-struct AwakeClock {
-    /// The registry's creation, the zero of every stamp.
-    base: Instant,
-    /// Test-only extra elapsed time, in milliseconds.
-    #[cfg(test)]
-    skew_ms: std::sync::atomic::AtomicU64,
-}
-
-impl AwakeClock {
-    fn new() -> Self {
-        Self {
-            base: Instant::now(),
-            #[cfg(test)]
-            skew_ms: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    /// Awake time elapsed since the registry was created.
-    fn now(&self) -> Duration {
-        let elapsed = self.base.elapsed();
-        #[cfg(test)]
-        let elapsed = elapsed
-            + Duration::from_millis(self.skew_ms.load(std::sync::atomic::Ordering::Relaxed));
-        elapsed
-    }
-
-    /// Moves the clock forward, as if the machine had been awake that long.
-    #[cfg(test)]
-    fn advance(&self, by: Duration) {
-        self.skew_ms.fetch_add(
-            u64::try_from(by.as_millis()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
 }
 
 /// The coarse, inferred lifecycle state of a Claude Code session.

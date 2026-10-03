@@ -1,6 +1,7 @@
 //! Utility functions and helpers.
 
 pub mod ai_scratch;
+pub(crate) mod awake_clock;
 pub(crate) mod browser_command;
 pub mod env;
 pub(crate) mod http;
