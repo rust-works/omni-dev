@@ -1,0 +1,278 @@
+{
+ "recorded_before_any_round4_live_request": true,
+ "labellers": {
+  "author": "Claude Sonnet 5.5 (main session)",
+  "blind": "claude-opus-5-5 subagent given only RUBRIC and the frozen texts"
+ },
+ "author_labels_sha256_before_reading_blind_labels": "b7edefe8b8c4977b3fa1a8b9e4f62105c93ed2494f45cb4beddb5b3a6c28de5c",
+ "rubric": "see round4-rubric.md",
+ "implementation_bearing": [
+  {
+   "id": "succinctly-2800-r4",
+   "citation": "#2801",
+   "author": "no",
+   "blind": "no",
+   "agree": true,
+   "author_evidence": "Listed as 'independent'; the dependency runs the other way (setpath on a mapping needs this issue's lookup).",
+   "blind_evidence": "\"#2801 (path register — independent, but `setpath([1]; v)` on a mapping needs this issue's int-index lookup)\": the dependency runs the other way; this issue's work is unaffected."
+  },
+  {
+   "id": "succinctly-2799-r4",
+   "citation": "#1183",
+   "author": "no",
+   "blind": "no",
+   "agree": true,
+   "author_evidence": "Emitter divergence only caps container-key fidelity; the plan pins equivalence classes and does not block on it.",
+   "blind_evidence": "#1183/#1076 'cap container-key fidelity'; the plan is to 'pin the equivalence classes, not the bytes' rather than wait for them, so the work is the same either way."
+  },
+  {
+   "id": "succinctly-2799-r4",
+   "citation": "#1076",
+   "author": "no",
+   "blind": "no",
+   "agree": true,
+   "author_evidence": "Same as #1183: caps fidelity, plan does not wait for it.",
+   "blind_evidence": "Cited with #1183 as an `@yaml` emitter divergence that caps fidelity; the plan pins equivalence classes regardless, so no work is absorbed."
+  },
+  {
+   "id": "succinctly-2799-r4",
+   "citation": "#2802",
+   "author": "no",
+   "blind": "no",
+   "agree": true,
+   "author_evidence": "'affects which text the key/compare sees, not the mechanism'; the document case is recorded as a residual, 'do not block on it'.",
+   "blind_evidence": "#2802 'affects which text the key/compare sees, not the mechanism'; for the document case the plan says to 'record ... as a #2802 residual, do not block on it'."
+  },
+  {
+   "id": "succinctly-2799-r4",
+   "citation": "#2064",
+   "author": "no",
+   "blind": "no",
+   "agree": true,
+   "author_evidence": "'coordinate rather than conflict'.",
+   "blind_evidence": "\"`sort_by` on a mapping (#2064) and the path-tracked error wording (#1998) touch the same functions; coordinate rather than conflict.\""
+  },
+  {
+   "id": "succinctly-2799-r4",
+   "citation": "#1998",
+   "author": "no",
+   "blind": "no",
+   "agree": true,
+   "author_evidence": "'coordinate rather than conflict'.",
+   "blind_evidence": "Same 'coordinate rather than conflict' note as #2064; it only touches the same functions."
+  },
+  {
+   "id": "succinctly-2796-r4",
+   "citation": "#2806",
+   "author": "no",
+   "blind": "no",
+   "agree": true,
+   "author_evidence": "Listed under related: 'same to_owned_with_comments seed point'; a sibling, not a precondition.",
+   "blind_evidence": "Listed only as '#2806 (same `to_owned_with_comments` seed point)': a shared mechanism, not a prerequisite. The hard prerequisite is #2795."
+  },
+  {
+   "id": "succinctly-2709-r4",
+   "citation": "#2705",
+   "author": "no",
+   "blind": "no",
+   "agree": true,
+   "author_evidence": "'this is also the change #2705 needs, so it is done once, here' - #2705 depends on this issue, not the reverse.",
+   "blind_evidence": "\"#2705 (same mechanism; do its residual after this lands)\": #2705 depends on this issue, and this issue does the mechanism change once, here."
+  },
+  {
+   "id": "succinctly-2709-r4",
+   "citation": "#2679",
+   "author": "no",
+   "blind": "no",
+   "agree": true,
+   "author_evidence": "Related: its silent drop becomes an explicit error at step 3; own work unchanged.",
+   "blind_evidence": "#2679 is the silent-drop shape that 'step 3 turns ... into an explicit error': this issue absorbs #2679, not the reverse."
+  }
+ ],
+ "spike": [
+  {
+   "id": "succinctly-2663-r4",
+   "author": "positive",
+   "blind": "positive",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "A/B of the fn-pointer removal and a three-way comparison on both chips; the text states both outcomes (collapse the fork and close #2607's streaming path, or keep it and record the ARM figure).",
+   "blind_evidence": "The interleaved three-way A/B on both chips (fn-pointer removal measured alone first) has not been run. Step 5 states the action for each outcome: if the penalty is gone on both chips, collapse onto write_json_body_yq and delete the rationale; if it survives on either chip, keep the fork and record the ARM figure."
+  },
+  {
+   "id": "succinctly-1993-r4",
+   "author": "positive",
+   "blind": "positive",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Build both candidates, A/B under a stated protocol; ship whichever clears the x86 control floor with the smaller binary, else keep the macro and record numbers.",
+   "blind_evidence": "The two-candidate A/B on both hosts ((A) a dyn arm, (B) ASCII escaping folded into ColorSink) has not been run, being 'blocked on access to the two benchmark hosts'. The triage 'Decision' states the action for each result: ship whichever clears the x86 control floor with the smaller binary, and if neither does, keep the macro and record the numbers."
+  },
+  {
+   "id": "succinctly-3685-r4",
+   "author": "positive",
+   "blind": "positive",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Re-measure three builtins; if a row is still above the ceiling attribute and add a native arm, if all are under close with numbers.",
+   "blind_evidence": "The re-measure on both chips (adding ascii_downcase) is not yet done. The Plan gives the action for each result: a row still above the ceiling gets attributed and a native arm in eval_generic.rs; if every row is under the ceiling, close with the numbers and update limitations.md."
+  },
+  {
+   "id": "succinctly-3698-r4",
+   "author": "borderline",
+   "blind": "borderline",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Decision gate on another issue's weekday measurement (#3649) with only a qualitative threshold ('not contended', 'acceptable').",
+   "blind_evidence": "The decision waits on #3649's weekday re-measure of queue wait and merge-group wall-clock. Only one result is hedged ('if the macOS queue is not contended ... this may not be worth an extra job'), the opposite result's action is only implied by the Proposal, no thresholds are given, and the measurement belongs to #3649."
+  },
+  {
+   "id": "succinctly-3479-r4",
+   "author": "borderline",
+   "blind": "borderline",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Attribute first, then choose between mechanisms A/B from a profile; the choice stays a judgment ('prefer whichever closes the gap at lower risk').",
+   "blind_evidence": "WP0's attribution A/B and bridge census are not yet run, and 'WP0 decides' whether M1 is enough or M2 is added for rows M1 leaves outside the noise floor. But the M2 builtin set, the bench re-baselining ('decide here, with evidence') and the WP1/WP3 work still need judgment beyond the check."
+  },
+  {
+   "id": "omni-dev-2122-r4",
+   "author": "borderline",
+   "blind": "borderline",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "A broad spike with a method and completion criteria, but the outcome (replace / supplement / do nothing) is a recommendation, not a stated action per result.",
+   "blind_evidence": "The side-by-side mod vs claude-wrap spike has not been run, and its outcomes are named (replace / supplement for terminal TUI / do nothing). But the issue does not map results to those outcomes, and the recommendation, the ADR need and the install design remain judgment calls."
+  },
+  {
+   "id": "succinctly-2607-r4",
+   "author": "negative_conditional",
+   "blind": "negative_conditional",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Bug-fix plan; the step-5 A/B ('if the two-pass form regresses take the single-pass scanner') is an implementation contingency, not a pending fork.",
+   "blind_evidence": "A plain fix plan whose perf A/B on the hot path has one contingency: 'If step 1's two-pass form regresses, take the single-pass scanner variant'. It is an engineering fallback, not a decision fork."
+  },
+  {
+   "id": "succinctly-2784-r4",
+   "author": "negative_conditional",
+   "blind": "negative_conditional",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Perf fix plan with alternatives gated on 'if step 2's memo is judged too stateful'; measure after implementing.",
+   "blind_evidence": "An implementation plan (parity probe plus sequential memo) with contingencies: 'Measure step 1 + 2 first', the BP child_rank 'if step 2's memo is judged too stateful', and the carried slot 'only if steps 1-2 leave a measurable residue'."
+  },
+  {
+   "id": "succinctly-2708-r4",
+   "author": "negative",
+   "blind": "negative",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Plan with the oracle matrix already measured; goldens pin the formats.",
+   "blind_evidence": "The issue's open measurement question was already answered by the triage oracle matrix, so what remains is an implementation plan."
+  },
+  {
+   "id": "succinctly-2806-r4",
+   "author": "negative",
+   "blind": "negative",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Fix plan; no pending check.",
+   "blind_evidence": "A plain fix fully pinned by the oracle (Sonnet class); no pending empirical fork."
+  },
+  {
+   "id": "succinctly-3241-r4",
+   "author": "negative",
+   "blind": "negative",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Verification that a guard can be lifted safely is code/test analysis, not an empirical probe with stated per-result actions.",
+   "blind_evidence": "The soundness check, prototype, sweeps and timing are already done (sections 2c and 4); the remaining A/B is acceptance verification of a chosen approach."
+  },
+  {
+   "id": "succinctly-3455-r4",
+   "author": "negative",
+   "blind": "negative_conditional",
+   "agree_exact": false,
+   "agree_binary": true,
+   "author_evidence": "Two independent perf fixes; re-measure at the end.",
+   "blind_evidence": "A plain two-part fix plan with one contingency: 'DefScope::resolve: same per-name index if a profile at M=24000 still shows it; otherwise leave it and say so'."
+  },
+  {
+   "id": "succinctly-3460-r4",
+   "author": "negative",
+   "blind": "negative_conditional",
+   "agree_exact": false,
+   "agree_binary": true,
+   "author_evidence": "Fidelity refusals with a root-cause plan.",
+   "blind_evidence": "A fix plan whose probes (confirming each input-returning builtin live against jq 1.7.1, and whether `..` sources emit register_path) are ordinary implementation checks with 'if they do, the .. row falls out' contingencies."
+  },
+  {
+   "id": "omni-dev-1816-r4",
+   "author": "negative",
+   "blind": "negative",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Exploration of architectural alternatives; no check with stated actions.",
+   "blind_evidence": "An open-ended exploration ('evaluate replacing ...') with no specific check and no stated action per result; the trust-surface design pass needs judgment."
+  },
+  {
+   "id": "omni-dev-2054-r4",
+   "author": "negative",
+   "blind": "negative",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Feature plan.",
+   "blind_evidence": "A feature build; the live study only records precision, misses and cost, with no decision fork tied to its results."
+  },
+  {
+   "id": "omni-dev-2055-r4",
+   "author": "negative",
+   "blind": "negative",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Experiment without stated actions per result.",
+   "blind_evidence": "An experiment comparing route movement and accuracy, but the issue states no concrete action per outcome; automated posting 'requires a separate positive gate'."
+  },
+  {
+   "id": "omni-dev-2058-r4",
+   "author": "negative",
+   "blind": "negative",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Study with a go/no-go to be decided afterwards.",
+   "blind_evidence": "A study that ends in an 'explicit go/no-go conclusion' with no stated thresholds or per-result actions, so the conclusion needs judgment."
+  },
+  {
+   "id": "omni-dev-2132-r4",
+   "author": "negative",
+   "blind": "negative",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "Implementation plan; the A/B at the end is verification.",
+   "blind_evidence": "A plain perf fix with the design settled (byte-offset IncrementalCounts); the A/B is acceptance verification, not a fork."
+  },
+  {
+   "id": "omni-dev-2136-r4",
+   "author": "negative",
+   "blind": "negative",
+   "agree_exact": true,
+   "agree_binary": true,
+   "author_evidence": "The measurement was already done; the issue proposes counters.",
+   "blind_evidence": "A feature (delivery counters); its measurement is already done and only motivates the work."
+  }
+ ],
+ "summary": {
+  "implementation_agree": 9,
+  "implementation_total": 9,
+  "spike_agree_exact": 17,
+  "spike_agree_binary": 19,
+  "spike_total": 19
+ },
+ "variant_labels": {
+  "-noclass": "same label as the case it derives from; only the triage class paragraph is removed",
+  "-inject-open": "yes by construction (an explicit hard prerequisite was written into the text); an edited simulation, never natural evidence",
+  "-inject-resolved": "the prerequisite is stated as landed; baseline-only"
+ },
+ "previously_labelled_comparators": "corrected-labels.json (bounded_spike) and labels.json; reused as recorded, not re-labelled"
+}
