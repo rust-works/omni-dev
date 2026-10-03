@@ -862,6 +862,99 @@ mod tests {
         }
     }
 
+    fn table_common() -> docs::table::Common {
+        docs::table::Common {
+            document_id: "d1".to_string(),
+            dry_run: false,
+            ignore_case: true,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: OutputFormat::Table,
+        }
+    }
+
+    fn insert_table_command(before: Option<&str>, after: Option<&str>) -> DriveSubcommands {
+        DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::InsertTable(docs::table::InsertTableCommand {
+                common: table_common(),
+                before: before.map(str::to_string),
+                after: after.map(str::to_string),
+                rows: 2,
+                columns: 3,
+            }),
+        })
+    }
+
+    fn insert_dimension(before: bool, after: bool) -> docs::table::InsertDimensionCommand {
+        docs::table::InsertDimensionCommand {
+            common: table_common(),
+            cell: "a".to_string(),
+            before,
+            after,
+        }
+    }
+
+    fn delete_dimension() -> docs::table::DeleteDimensionCommand {
+        docs::table::DeleteDimensionCommand {
+            common: table_common(),
+            cell: "a".to_string(),
+        }
+    }
+
+    /// Every table verb reaches the shared write engine and — like every Docs
+    /// write verb — reports an unreachable API on the output rather than the
+    /// exit code (see `dispatch_routes_docs_replace`). Both insert-table
+    /// anchor sides and both insertion directions are exercised.
+    #[tokio::test]
+    async fn dispatch_routes_every_docs_table_verb() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        let wrap = |command| DriveSubcommands::Docs(docs::DocsCommand { command });
+        for cmd in [
+            insert_table_command(Some("a"), None),
+            insert_table_command(None, Some("a")),
+            wrap(docs::DocsSubcommands::InsertTableRow(insert_dimension(
+                true, false,
+            ))),
+            wrap(docs::DocsSubcommands::InsertTableRow(insert_dimension(
+                false, true,
+            ))),
+            wrap(docs::DocsSubcommands::InsertTableColumn(insert_dimension(
+                true, false,
+            ))),
+            wrap(docs::DocsSubcommands::InsertTableColumn(insert_dimension(
+                false, true,
+            ))),
+            wrap(docs::DocsSubcommands::DeleteTableRow(delete_dimension())),
+            wrap(docs::DocsSubcommands::DeleteTableColumn(delete_dimension())),
+        ] {
+            assert!(cmd.dispatch(&dead_client()).await.is_ok());
+        }
+    }
+
+    /// `insert-table` never reaches the engine without exactly one anchor
+    /// side. clap already refuses these, so the check guards commands built
+    /// any other way.
+    #[tokio::test]
+    async fn dispatch_refuses_an_insert_table_without_exactly_one_anchor_side() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        for (before, after) in [(None, None), (Some("a"), Some("b"))] {
+            let err = insert_table_command(before, after)
+                .dispatch(&dead_client())
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("exactly one of --before or --after"),
+                "{err}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_routes_docs_create() {
         let guard = crate::drive::test_support::EnvGuard::take();

@@ -1067,6 +1067,64 @@ mod tests {
         assert_eq!(para.named_style_type(), Some("NORMAL_TEXT"));
     }
 
+    /// A `suggested*` key counts only when it carries something: an empty
+    /// list or map, or an explicit null, is Docs' way of saying "none".
+    /// Any scalar value there is unexpected, so it fails closed as a
+    /// suggestion; keys without the prefix never count.
+    #[test]
+    fn has_suggestions_counts_only_non_empty_suggested_fields_at_any_depth() {
+        for (value, expected) in [
+            (serde_json::json!({"suggestedInsertionIds": ["s"]}), true),
+            (
+                serde_json::json!({"suggestedTextStyleChanges": {"s": {}}}),
+                true,
+            ),
+            (serde_json::json!({"suggestedBold": true}), true),
+            (serde_json::json!({"suggestedNote": "text"}), true),
+            (serde_json::json!({"suggestedCount": 0}), true),
+            (serde_json::json!({"suggestedInsertionIds": []}), false),
+            (serde_json::json!({"suggestedTextStyleChanges": {}}), false),
+            (serde_json::json!({"suggestedNote": null}), false),
+            (serde_json::json!({"insertionIds": ["s"]}), false),
+            (serde_json::json!({"notSuggested": true}), false),
+            (
+                serde_json::json!({"a": [{"b": {"suggestedDeletionIds": ["s"]}}]}),
+                true,
+            ),
+            (
+                serde_json::json!({"a": [{"b": {"suggestedNote": null}}]}),
+                false,
+            ),
+            (serde_json::json!("suggestedInsertionIds"), false),
+            (serde_json::json!(null), false),
+        ] {
+            assert_eq!(has_suggestions(&value), expected, "{value}");
+        }
+    }
+
+    /// The flag is captured from the raw table, including fields the read
+    /// model does not carry, and never leaks back onto the wire.
+    #[test]
+    fn a_table_remembers_unmodelled_suggestions_without_serialising_them() {
+        let clean: Table = serde_json::from_value(serde_json::json!({
+            "rows": 1,
+            "columns": 1,
+            "tableRows": [{"suggestedInsertionIds": []}],
+        }))
+        .unwrap();
+        assert!(!clean.has_pending_suggestions);
+        let suggested: Table = serde_json::from_value(serde_json::json!({
+            "rows": 1,
+            "columns": 1,
+            "tableRows": [{"tableCells": [{"tableCellStyle": {"suggestedTableCellStyleChanges": {"s": {}}}}]}],
+        }))
+        .unwrap();
+        assert!(suggested.has_pending_suggestions);
+        let wire = serde_json::to_value(&suggested).unwrap();
+        assert!(!wire.to_string().contains("suggested"), "{wire}");
+        assert!(wire.get("has_pending_suggestions").is_none());
+    }
+
     #[test]
     fn title_defaults_to_empty() {
         assert_eq!(parse(serde_json::json!({})).title(), "");
