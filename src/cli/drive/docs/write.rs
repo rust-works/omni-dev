@@ -612,6 +612,28 @@ mod tests {
         assert!(cmd.selection.ignore_case && cmd.selection.dry_run);
     }
 
+    /// Every CLI spelling maps to the Google preset it is named after, so a
+    /// transposed arm in the `From` impl cannot send the wrong glyphs.
+    #[test]
+    fn every_bullet_preset_arg_maps_to_the_google_preset_of_the_same_name() {
+        use clap::ValueEnum;
+
+        let variants = BulletPresetArg::value_variants();
+        assert_eq!(variants.len(), 15);
+        let mut seen = std::collections::HashSet::new();
+        for arg in variants {
+            let name = arg.to_possible_value().unwrap().get_name().to_owned();
+            let preset = crate::drive::docs::write_types::BulletPreset::from(*arg);
+            let wire = serde_json::to_value(preset).unwrap();
+            assert_eq!(
+                wire.as_str().unwrap(),
+                name.to_uppercase().replace('-', "_"),
+                "{name}"
+            );
+            assert!(seen.insert(wire.to_string()), "{name} maps to a duplicate");
+        }
+    }
+
     #[test]
     fn read_text_reads_a_file() {
         let dir = tempfile::tempdir().unwrap();
