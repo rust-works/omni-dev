@@ -211,7 +211,7 @@ pub(crate) fn resolve(
     }
     let id = match mutation {
         Mutation::Delete { id } | Mutation::Replace { id, .. } => id,
-        Mutation::Create { .. } => return Err(Error::UnsafeRange),
+        Mutation::Create { .. } => return Err(Error::UnsafeRange), // omni-dev: coverage ignore-line reason="the Create branch above always returns, so a Create mutation never reaches the ID lookup; the arm exists solely for exhaustiveness"
     };
     let matches: Vec<_> = tab
         .named_ranges
@@ -280,7 +280,7 @@ pub(crate) fn resolve(
                 preview,
             ))
         }
-        Mutation::Create { .. } => Err(Error::UnsafeRange),
+        Mutation::Create { .. } => Err(Error::UnsafeRange), // omni-dev: coverage ignore-line reason="the Create branch above always returns, so a Create mutation never reaches this match; the arm exists solely for exhaustiveness"
     }
 }
 
@@ -775,6 +775,154 @@ mod tests {
             resolve(&document, &scope, &replace()),
             Err(Error::UnsafeRange)
         );
+    }
+
+    /// Replaces the child tab's body with `content`, so a test states only the
+    /// paragraph shape it exercises.
+    fn set_body(document: &mut Document, content: Value) {
+        document.tabs[0].child_tabs[0]
+            .document_tab
+            .as_mut()
+            .unwrap()
+            .body
+            .as_mut()
+            .unwrap()
+            .content = serde_json::from_value(content).unwrap();
+    }
+
+    #[test]
+    fn empty_scope_ids_and_unbounded_create_spans_are_refused_before_any_read() {
+        let delete = Mutation::Delete { id: "nr".into() };
+        for scope in [
+            Scope {
+                tab_id: Some(String::new()),
+                segment_id: None,
+            },
+            Scope {
+                tab_id: None,
+                segment_id: Some(String::new()),
+            },
+        ] {
+            assert_eq!(
+                delete.validate(&scope).unwrap_err(),
+                "scope IDs cannot be empty"
+            );
+        }
+        let scope = Scope {
+            tab_id: None,
+            segment_id: None,
+        };
+        for (start_index, end_index) in [(-1, 2), (3, 3), (4, 3)] {
+            let create = Mutation::Create {
+                name: "label".into(),
+                start_index,
+                end_index,
+            };
+            assert_eq!(
+                create.validate(&scope).unwrap_err(),
+                "named-range indices must describe a nonempty bounded span",
+                "{start_index}..{end_index}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_refuses_a_span_that_is_not_safe_plain_text() {
+        let (document, scope) = fixture(None, vec![json!({"startIndex": 1, "endIndex": 3})]);
+        // [1, 10) would swallow the paragraph's newline.
+        let create = Mutation::Create {
+            name: "label".into(),
+            start_index: 1,
+            end_index: 10,
+        };
+        assert_eq!(resolve(&document, &scope, &create), Err(Error::UnsafeRange));
+    }
+
+    #[test]
+    fn an_existing_range_with_no_spans_is_unsafe_to_mutate() {
+        let (document, scope) = fixture(None, vec![]);
+        for mutation in [Mutation::Delete { id: "nr".into() }, replace()] {
+            assert_eq!(
+                resolve(&document, &scope, &mutation),
+                Err(Error::UnsafeRange)
+            );
+        }
+    }
+
+    /// Runs and non-text elements wholly outside the span are skipped rather
+    /// than refused: only what the span touches has to be plain text.
+    #[test]
+    fn elements_outside_the_span_are_skipped() {
+        let (mut document, scope) = fixture(None, vec![json!({"startIndex": 3, "endIndex": 5})]);
+        set_body(
+            &mut document,
+            json!([{"startIndex": 1, "endIndex": 10, "paragraph": {"elements": [
+                {"startIndex": 1, "endIndex": 2, "inlineObjectElement": {"inlineObjectId": "o"}},
+                {"startIndex": 2, "endIndex": 10, "textRun": {"content": "abcdefg\n"}},
+            ]}}]),
+        );
+        let (_, preview) = resolve(&document, &scope, &replace()).unwrap();
+        assert_eq!((preview.removed_chars, preview.removed_bytes), (2, 2));
+
+        let (mut document, scope) = fixture(None, vec![json!({"startIndex": 4, "endIndex": 6})]);
+        set_body(
+            &mut document,
+            json!([{"startIndex": 1, "endIndex": 10, "paragraph": {"elements": [
+                {"startIndex": 1, "endIndex": 3, "textRun": {"content": "ab"}},
+                {"startIndex": 3, "endIndex": 7, "textRun": {"content": "cdef"}},
+                {"startIndex": 7, "endIndex": 10, "textRun": {"content": "gh\n"}},
+            ]}}]),
+        );
+        let (_, preview) = resolve(&document, &scope, &replace()).unwrap();
+        assert_eq!((preview.removed_chars, preview.removed_bytes), (2, 2));
+    }
+
+    #[test]
+    fn an_index_gap_inside_the_span_is_refused() {
+        let (mut document, scope) = fixture(None, vec![json!({"startIndex": 4, "endIndex": 9})]);
+        // Index 6 belongs to no run, though both runs are internally consistent.
+        set_body(
+            &mut document,
+            json!([{"startIndex": 1, "endIndex": 11, "paragraph": {"elements": [
+                {"startIndex": 1, "endIndex": 6, "textRun": {"content": "😀 la"}},
+                {"startIndex": 7, "endIndex": 11, "textRun": {"content": "bel\n"}},
+            ]}}]),
+        );
+        assert_eq!(
+            resolve(&document, &scope, &replace()),
+            Err(Error::UnsafeRange)
+        );
+    }
+
+    /// The span must end inside a paragraph whose final run is its
+    /// newline-terminated end, or the replacement could join paragraphs.
+    #[test]
+    fn a_paragraph_that_does_not_end_in_its_newline_run_is_refused() {
+        for (span_start, span_end, paragraph_end, content) in [
+            // The last run has no newline.
+            (1, 3, 10, "abcdefghi"),
+            // The runs stop short of the paragraph's end index.
+            (1, 3, 12, "abcdefgh\n"),
+            // No run reaches the span at all.
+            (6, 8, 12, "abcd\n"),
+        ] {
+            let (mut document, scope) = fixture(
+                None,
+                vec![json!({"startIndex": span_start, "endIndex": span_end})],
+            );
+            let run_end = 1 + content.encode_utf16().count();
+            set_body(
+                &mut document,
+                json!([{"startIndex": 1, "endIndex": paragraph_end, "paragraph": {"elements": [
+                    {"startIndex": 1, "endIndex": run_end, "textRun": {"content": content}},
+                ]}}]),
+            );
+            assert_eq!(
+                resolve(&document, &scope, &replace()),
+                Err(Error::UnsafeRange),
+                "{content:?} in {span_start}..{span_end}"
+            );
+        }
     }
 
     #[test]

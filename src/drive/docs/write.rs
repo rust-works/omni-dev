@@ -957,9 +957,11 @@ async fn write_inner(
                     }
                     WriteResult::MutatedNamedRange { preview }
                 }
+                // omni-dev: coverage ignore reason="`preview` is built by the NamedRange payload match above, so a NamedRange payload always carries WouldMutateNamedRange; this arm exists solely for exhaustiveness over the shared WriteResult enum"
                 _ => WriteResult::Failed {
                     detail: "missing named-range preview".into(),
                 },
+                // omni-dev: coverage end
             },
             WritePayload::Replace { .. } => WriteResult::Replaced {
                 occurrences_changed: response.occurrences_changed_for_replace(),
@@ -2976,6 +2978,105 @@ mod tests {
         }
     }
 
+    fn named_range_preview(id: Option<&str>) -> super::super::named_range::Preview {
+        super::super::named_range::Preview {
+            effect: super::super::named_range::Effect::ReplaceContent,
+            named_range_id: id.map(str::to_owned),
+            ranges: vec![crate::drive::docs::types::Range {
+                segment_id: None,
+                tab_id: Some("t".into()),
+                start_index: Some(1),
+                end_index: Some(3),
+            }],
+            removed_chars: 2,
+            removed_bytes: 5,
+            inserted_chars: 1,
+            inserted_bytes: 4,
+        }
+    }
+
+    #[test]
+    fn named_range_results_are_named_for_the_log() {
+        for (result, status) in [
+            (
+                WriteResult::WouldMutateNamedRange {
+                    preview: named_range_preview(None),
+                },
+                "would-mutate-named-range",
+            ),
+            (
+                WriteResult::MutatedNamedRange {
+                    preview: named_range_preview(None),
+                },
+                "mutated-named-range",
+            ),
+            (
+                WriteResult::RefusedNamedRange {
+                    error: super::super::named_range::Error::UnsafeRange,
+                },
+                "refused-named-range",
+            ),
+        ] {
+            assert_eq!(result.log_status(), status);
+        }
+    }
+
+    /// A preview says "Would apply" and, before a create has been answered,
+    /// has no ID yet; the applied result names the ID and the exact effect.
+    #[test]
+    fn named_range_descriptions_report_the_action_id_counts_and_spans() {
+        let would = describe(
+            &outcome_with(WriteResult::WouldMutateNamedRange {
+                preview: named_range_preview(None),
+            }),
+            WriteVerb::CreateNamedRange,
+        );
+        assert_eq!(
+            would,
+            "Would apply create-named-range in 'Budget': ID pending, 1 span(s), removed 2 char(s) / 5 byte(s), inserted 1 char(s) / 4 byte(s); [1, 3) UTF-16, tab t, segment body"
+        );
+        let applied = describe(
+            &outcome_with(WriteResult::MutatedNamedRange {
+                preview: named_range_preview(Some("nr")),
+            }),
+            WriteVerb::ReplaceNamedRangeContent,
+        );
+        assert!(
+            applied.starts_with("Applied replace-named-range-content in 'Budget': ID nr,"),
+            "{applied}"
+        );
+        let refused = describe(
+            &outcome_with(WriteResult::RefusedNamedRange {
+                error: super::super::named_range::Error::ScopeMismatch,
+            }),
+            WriteVerb::DeleteNamedRange,
+        );
+        assert_eq!(
+            refused,
+            "Refused: unsafe or unresolved named range in 'Budget': ScopeMismatch"
+        );
+    }
+
+    /// The two content verbs share one CLI spelling and the metadata verbs
+    /// each have their own.
+    #[test]
+    fn named_range_verbs_are_labelled_with_their_cli_spelling() {
+        for (verb, label) in [
+            (WriteVerb::CreateNamedRange, "create-named-range"),
+            (WriteVerb::DeleteNamedRange, "delete-named-range"),
+            (
+                WriteVerb::ReplaceNamedRangeContent,
+                "replace-named-range-content",
+            ),
+            (
+                WriteVerb::DeleteNamedRangeContent,
+                "replace-named-range-content",
+            ),
+        ] {
+            assert_eq!(verb.label(), label);
+        }
+    }
+
     #[test]
     fn describe_reports_selected_segment_identity_without_debug_types() {
         let mut edit = preview_edit();
@@ -3136,6 +3237,10 @@ mod tests {
             (WriteVerb::DeleteBullets, "docs-write"),
             (WriteVerb::TextStyle, "docs-format"),
             (WriteVerb::ParagraphStyle, "docs-format"),
+            (WriteVerb::CreateNamedRange, "docs-structure"),
+            (WriteVerb::DeleteNamedRange, "docs-structure"),
+            (WriteVerb::ReplaceNamedRangeContent, "docs-write"),
+            (WriteVerb::DeleteNamedRangeContent, "docs-delete"),
         ] {
             let text = describe(&outcome_with(WriteResult::RefusedNoVisibleParents), verb);
             assert!(text.contains(&format!("[\"{grant}\"]")), "{text}");

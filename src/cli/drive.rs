@@ -955,6 +955,97 @@ mod tests {
         }
     }
 
+    fn scoped_args() -> docs::named_range::ScopedArgs {
+        docs::named_range::ScopedArgs {
+            document_id: "d1".to_string(),
+            tab: "legacy".to_string(),
+            segment: "body".to_string(),
+            dry_run: false,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: OutputFormat::Table,
+        }
+    }
+
+    fn named_range_command(command: docs::DocsSubcommands) -> DriveSubcommands {
+        DriveSubcommands::Docs(docs::DocsCommand { command })
+    }
+
+    fn replace_named_range_content(
+        text: Option<&str>,
+        text_file: Option<&str>,
+    ) -> DriveSubcommands {
+        named_range_command(docs::DocsSubcommands::ReplaceNamedRangeContent(
+            docs::named_range::ReplaceNamedRangeContentCommand {
+                scope: scoped_args(),
+                id: "nr".to_string(),
+                text: text.map(str::to_string),
+                text_file: text_file.map(str::to_string),
+            },
+        ))
+    }
+
+    /// All three named-range verbs reach the shared engine and, like every
+    /// Docs write verb, report an unreachable API on the output rather than
+    /// the exit code (see `dispatch_routes_docs_replace`).
+    #[tokio::test]
+    async fn dispatch_routes_docs_named_range_verbs() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        guard.redirect_api_hosts_to_a_dead_port();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "from a file").unwrap();
+
+        for cmd in [
+            named_range_command(docs::DocsSubcommands::CreateNamedRange(
+                docs::named_range::CreateNamedRangeCommand {
+                    scope: scoped_args(),
+                    name: "label".to_string(),
+                    start_index: 1,
+                    end_index: 3,
+                },
+            )),
+            named_range_command(docs::DocsSubcommands::DeleteNamedRange(
+                docs::named_range::DeleteNamedRangeCommand {
+                    scope: scoped_args(),
+                    id: "nr".to_string(),
+                },
+            )),
+            replace_named_range_content(Some("inline"), None),
+            replace_named_range_content(None, Some(file.path().to_str().unwrap())),
+        ] {
+            assert!(cmd.dispatch(&dead_client()).await.is_ok());
+        }
+    }
+
+    /// The replacement text must come from exactly one source, and a
+    /// `--text-file` that cannot be read stops the command before the engine.
+    /// clap already enforces the first, so this guards commands built any
+    /// other way.
+    #[tokio::test]
+    async fn dispatch_refuses_named_range_replacement_without_exactly_one_text_source() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        for (text, text_file) in [(None, None), (Some("x"), Some("f"))] {
+            let err = replace_named_range_content(text, text_file)
+                .dispatch(&dead_client())
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("exactly one of --text or --text-file"),
+                "{err}"
+            );
+        }
+
+        let err = replace_named_range_content(None, Some("/nonexistent/no-such-file.txt"))
+            .dispatch(&dead_client())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed to stat"), "{err}");
+    }
+
     #[tokio::test]
     async fn dispatch_routes_docs_create() {
         let guard = crate::drive::test_support::EnvGuard::take();
