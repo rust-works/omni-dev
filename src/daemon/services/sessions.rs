@@ -20,7 +20,7 @@
 //! the daemon — or working through the hook-silent "thinking window" — are still
 //! discovered and marked active. See ADR-0052.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -63,6 +63,10 @@ pub struct SessionsService {
     /// The background transcript-watcher task, once started (`None` in tests /
     /// with no runtime).
     watcher: Mutex<Option<WatcherTask>>,
+    /// Where the hook sink journals events (`<socket dir>/sessions`), when the
+    /// daemon was given one (#2108). `None` runs without the journal feed, as
+    /// tests that build a bare service do.
+    journal_dir: Option<PathBuf>,
 }
 
 impl SessionsService {
@@ -74,7 +78,17 @@ impl SessionsService {
         Self {
             registry: Arc::new(SessionsRegistry::new()),
             watcher: Mutex::new(None),
+            journal_dir: None,
         }
+    }
+
+    /// Reads the hook journals under `dir` (see
+    /// [`crate::sessions::journal`]): replayed at startup and tailed while the
+    /// daemon runs, once [`start_watcher`](Self::start_watcher) starts the task.
+    #[must_use]
+    pub fn with_journal_dir(mut self, dir: PathBuf) -> Self {
+        self.journal_dir = Some(dir);
+        self
     }
 
     /// Starts the engine-owned transcript watcher (Feed 2): a background task
@@ -96,11 +110,19 @@ impl SessionsService {
             return;
         }
         let token = CancellationToken::new();
-        let handles = vec![
+        let mut handles = vec![
             crate::sessions::watcher::spawn(self.registry.clone(), token.clone()),
             crate::sessions::codex_watcher::spawn(self.registry.clone(), token.clone()),
             crate::sessions::pid_watcher::spawn(self.registry.clone(), token.clone()),
         ];
+        if let Some(dir) = &self.journal_dir {
+            handles.push(crate::sessions::journal_watcher::spawn(
+                self.registry.clone(),
+                dir.clone(),
+                Arc::new(|cwd: &Path| repo_name_for(cwd)),
+                token.clone(),
+            ));
+        }
         *guard = Some(WatcherTask { token, handles });
     }
 
@@ -502,6 +524,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, json!({ "ended": false }));
+    }
+
+    #[tokio::test]
+    async fn a_started_service_replays_the_journals_beside_its_socket() {
+        // #2108: a session whose SessionStart was journaled while the daemon was
+        // down is listed once the daemon is up, with its cwd.
+        use crate::sessions::journal::{self, JournalRecord};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir =
+            crate::daemon::paths::sessions_journal_dir_for_socket(&tmp.path().join("daemon.sock"));
+        let id = "0b7e6c1a-2f4d-4a8e-9c3b-5d1e7f9a2b4c";
+        let stamp = EventStamp {
+            ts: chrono::Utc::now() - chrono::Duration::seconds(15),
+            seq: "7-1".to_string(),
+        };
+        let req = ObserveRequest {
+            agent_id: None,
+            session_id: id.to_string(),
+            cwd: Some(PathBuf::from("/nonexistent/proj")),
+            transcript_path: None,
+            event: SessionEvent::SessionStart,
+            repo: None,
+            model: None,
+            agent: crate::sessions::Agent::Claude,
+            pid: None,
+        };
+        journal::append(&dir, &JournalRecord::observe(&req, &stamp)).unwrap();
+
+        let svc = SessionsService::new().with_journal_dir(dir);
+        svc.start_watcher();
+        // The transcript and rollout watchers run too, so look for this session
+        // among whatever else the machine has.
+        let mut found = None;
+        for _ in 0..100 {
+            let listed = svc.handle("list", Value::Null).await.unwrap();
+            found = listed["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["session_id"] == id)
+                .cloned();
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let found = found.expect("the journaled session is listed");
+        assert_eq!(found["state"], "starting");
+        assert_eq!(found["cwd"], "/nonexistent/proj");
+        svc.shutdown().await;
     }
 
     #[tokio::test]

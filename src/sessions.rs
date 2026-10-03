@@ -55,6 +55,8 @@ pub mod codex_app_server;
 pub mod codex_watcher;
 #[cfg(unix)]
 pub mod journal;
+#[cfg(unix)]
+pub(crate) mod journal_watcher;
 pub(crate) mod pid_liveness;
 pub(crate) mod pid_watcher;
 pub mod relocate;
@@ -784,6 +786,29 @@ impl SessionsRegistry {
             clock: AwakeClock::new(),
             changes: watch::channel(0).0,
         }
+    }
+
+    /// A registry that never reaps, for assessing a journal off to the side
+    /// (#2108): the real state machine replays a session's events, and the caller
+    /// reads the resulting entry, without any TTL deciding it was already gone.
+    #[must_use]
+    pub(crate) fn scratch() -> Self {
+        Self {
+            session_ttl: Duration::MAX,
+            ended_ttl: Duration::MAX,
+            window_ttl: Duration::MAX,
+            ..Self::new()
+        }
+    }
+
+    /// The ids of the sessions that are live — present and not `ended` — so the
+    /// journal watcher can tell a journal that is still wanted from an orphan.
+    pub(crate) fn live_session_ids(&self) -> std::collections::HashSet<String> {
+        self.lock_sessions()
+            .values()
+            .filter(|entry| entry.state != SessionState::Ended)
+            .map(|entry| entry.session_id.clone())
+            .collect()
     }
 
     /// A change-notification receiver for the push subscription: it observes a

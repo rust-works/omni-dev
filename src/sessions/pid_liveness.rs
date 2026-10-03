@@ -19,6 +19,8 @@
 //! "definitely still this process") never causes an end or an exemption — see
 //! [`super::pid_watcher`]'s `plan` for how each is used.
 
+use chrono::{DateTime, Utc};
+
 /// Whether a process with this pid currently exists.
 ///
 /// `#[cfg(unix)]`: a bare `kill(pid, 0)` (no signal actually sent) — the
@@ -94,6 +96,73 @@ pub(crate) fn process_start_token(_pid: u32) -> Option<String> {
     None
 }
 
+/// When `pid`'s process started, as a timestamp, or `None` when it cannot be
+/// determined (no such pid, a read error, or an unsupported platform).
+///
+/// Unlike [`process_start_token`] this is *comparable*: replaying a hook journal
+/// after a daemon restart (#2108) has no earlier token to compare against, so it
+/// asks instead whether the process was already running when the journal's first
+/// event from that pid was written. A recycled pid started later, and fails.
+pub(crate) fn process_start_time(pid: u32) -> Option<DateTime<Utc>> {
+    #[cfg(target_os = "macos")]
+    {
+        parse_ps_lstart(&process_start_token(pid)?)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let ticks = proc_start_ticks(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)?;
+        let boot = boot_time_secs(&std::fs::read_to_string("/proc/stat").ok()?)?;
+        proc_start_time(boot, ticks)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Parses `ps -o lstart=` output (`Sat Oct  3 15:16:52 2026`), which
+/// [`process_start_token`] reads under `TZ=UTC`, so it is a UTC instant.
+#[cfg(any(target_os = "macos", test))]
+fn parse_ps_lstart(text: &str) -> Option<DateTime<Utc>> {
+    chrono::NaiveDateTime::parse_from_str(text.trim(), "%a %b %e %H:%M:%S %Y")
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
+/// The `starttime` field of a `/proc/<pid>/stat` line: clock ticks since boot.
+#[cfg(any(target_os = "linux", test))]
+fn proc_start_ticks(stat: &str) -> Option<u64> {
+    // After the last `)` (the parenthesised `comm` may contain anything), state
+    // is field 3 and `starttime` field 22, so index 19.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// The `btime` line of `/proc/stat`: the boot time, in seconds since the epoch.
+#[cfg(any(target_os = "linux", test))]
+fn boot_time_secs(proc_stat: &str) -> Option<i64> {
+    proc_stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// A process's start time from the boot time and its `starttime` ticks.
+/// `USER_HZ`, the unit of `/proc` tick counts, is 100 on every Linux ABI.
+#[cfg(any(target_os = "linux", test))]
+fn proc_start_time(boot_secs: i64, ticks: u64) -> Option<DateTime<Utc>> {
+    const USER_HZ: u64 = 100;
+    let secs = boot_secs.checked_add(i64::try_from(ticks / USER_HZ).ok()?)?;
+    DateTime::from_timestamp(secs, 0)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -124,6 +193,58 @@ mod tests {
             a, b,
             "the same still-running process must read the same token twice"
         );
+    }
+
+    #[test]
+    fn ps_lstart_is_parsed_as_utc() {
+        let parsed = parse_ps_lstart("Sat Oct  3 15:16:52 2026\n").unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-10-03T15:16:52+00:00");
+        // A two-digit day parses too, and junk does not.
+        assert!(parse_ps_lstart("Mon Oct 12 01:02:03 2026").is_some());
+        assert!(parse_ps_lstart("").is_none());
+        assert!(parse_ps_lstart("not a date").is_none());
+    }
+
+    #[test]
+    fn proc_stat_fields_are_read_after_the_last_paren_of_comm() {
+        // `comm` may itself hold spaces and parens; `starttime` is field 22.
+        let stat = "123 (we ird) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 99999 20";
+        assert_eq!(proc_start_ticks(stat), Some(99999));
+        assert_eq!(proc_start_ticks("1 (x) S 1 2"), None);
+        assert_eq!(proc_start_ticks("garbage"), None);
+        assert_eq!(
+            boot_time_secs("cpu 1 2 3\nbtime 1790000000\nprocs 4\n"),
+            Some(1_790_000_000)
+        );
+        assert_eq!(boot_time_secs("cpu 1 2 3\n"), None);
+        assert_eq!(
+            proc_start_time(1_790_000_000, 250).unwrap().timestamp(),
+            1_790_000_002
+        );
+        assert!(proc_start_time(i64::MAX, 100).is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn this_process_started_in_the_past() {
+        let started = process_start_time(std::process::id()).expect("a start time");
+        let now = Utc::now();
+        assert!(
+            started <= now + chrono::Duration::seconds(2),
+            "{started} vs {now}"
+        );
+        assert!(started > now - chrono::Duration::days(365));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_child_has_no_start_time() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true`");
+        let pid = child.id();
+        child.wait().expect("wait for `true`");
+        assert_eq!(process_start_time(pid), None);
     }
 
     #[cfg(unix)]
