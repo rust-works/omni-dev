@@ -1,13 +1,39 @@
 # Open-question classifier evaluation (#2053)
 
-## Result and shipping gate
+## Result and status
 
-**Keep this PR in draft.** Selected wording (v3) passes the motivating #3017
-pair and synthetic controls, but agrees with only **30/68 held-out predictions
-(44.1%)**, across two repeats of 34 issues. All live calls returned
-`jev-1.13.0`, with no API failures. These results do not justify trusting the
-classifier as an automatic retrieval gate. No further wording selection was
-made against the held-out failures.
+**Experimental; not validated as a retrieval gate.** This document was written
+to keep the work in draft until a calibration review. PR #2093 merged without
+that review, so the gate is still open: do not act on `open_questions`
+automatically, and do not build a retrieval gate on it until it is met.
+
+Selected wording (v3) passes the motivating #3017 pair and synthetic controls,
+but on the 34 held-out issues it is **no better than answering `factual` for
+every issue**. Both repeats gave the same answer for all 34 issues, so the 68
+predictions counted below are 34 issues' worth of evidence, not 68; the first
+write-up's "30/68 (44.1%)" is 15/34. All live calls returned `jev-1.13.0`, with
+no API failures. No further wording selection was made against the held-out
+failures.
+
+| Held-out, 34 issues (`agreement.py`)            | Three ladders (original run) | Default `anthropic` ladder |
+|-------------------------------------------------|------------------------------|----------------------------|
+| Issues whose two repeats agree                  | 34                           | 31                         |
+| Correct (issues)                                | 15 (44.1%)                   | 15.5 (45.6%)               |
+| 95% interval (Wilson, n = 34)                   | 28.9%–60.5%                  | 30.2%–61.9%                |
+| Always answering `factual`                      | 14 (41.2%)                   | 14 (41.2%)                 |
+| P(at least this many right, at the above rate)  | 0.43                         | 0.30                       |
+| Cohen's kappa                                   | 0.23                         | 0.25                       |
+| `both` correct (of 4 expected)                  | 0                            | 0                          |
+| Retrieval gate (`factual`/`both` = yes): right  | 19 of 34                     | 20.5 of 34                 |
+| Retrieval gate: always yes / always no          | 18 / 16 of 34                | 18 / 16 of 34              |
+| Retrieval gate: issues needing it that it found | 8 of 18                      | 10 of 18                   |
+
+The classifier is therefore not distinguishable from the majority-class
+baseline, and as a gate for "is reading code likely to help" it is not
+distinguishable from always saying yes. The default-ladder run
+(`heldout-default-shape/`, 2026-10-04) was added after merge because the
+original run sent all three ladders, while `ai jev route` defaults to
+`anthropic` alone; it did not change the conclusion.
 
 The calibration prerequisite became available during implementation in
 [PR #2094](https://github.com/rust-works/omni-dev/pull/2094), commit
@@ -28,7 +54,8 @@ answers.
 
 Three wording candidates were tried using only the #3017 pair and five synthetic
 controls. v1 is preserved in its raw requests; v2/v3 have explicit candidate
-JSON files. v3 was selected before held-out predictions were inspected.
+JSON files. `run.json` records that v3 was selected before held-out predictions
+were inspected; see the caveat below, which the artifacts cannot settle.
 
 - v1: #3017 returned `both` before, `factual` after in both repeats.
 - v2: returned `none` for both states; it excluded execution tasks too broadly.
@@ -36,6 +63,18 @@ JSON files. v3 was selected before held-out predictions were inspected.
   unambiguous synthetic controls pass twice; the ambiguous control returns
   `both`, within its predeclared acceptable set. This is 12/12 unambiguous
   predictions, plus two ambiguous predictions reported separately.
+
+Two limits on that selection. First, the five synthetic controls pass under v1
+and v3 alike (v2 differs only on the ambiguous control, inside its acceptable
+set), so the wording was chosen on the four #3017 predictions alone. Second, the
+trial files carry no timestamps and were committed together, so the order of the
+runs cannot be verified. The held-out v1 run (compiled example, 136 calls) is
+listed before v2 and v3 in `run.json` and used the earlier harness, so it very
+likely existed first; it answered `both` for 62 of 68 predictions, and v3 moved
+away from that. That is consistent with its outcome having been seen, though it
+does not show it. If it did, v3's held-out figures would be optimistic, which
+only strengthens the conclusion above; the order should still be established
+before these results are cited as validation.
 
 v3 distinguishes an unverified suggested fix from a code-informed decision,
 and prescribed caller audits/tests from open questions. Production wording is
@@ -56,15 +95,26 @@ For v3, expected → predicted counts across the two repeats:
 
 Every prediction and mismatch is in `heldout-v3/summary.json`. In this set,
 **both** is never selected for the eight expected-both predictions. v1 agreed
-with 10/68; its failures are retained too, without treating that comparison as
-independent confirmation of v3.
+with 10/68 (5 of 34 issues, kappa 0.01: chance level); its failures are
+retained too, without treating that comparison as independent confirmation of
+v3.
 
 Adding v3 changed **23/612 stage choices** and **9/204 provider classes** across
 paired requests. Baseline repeat-to-repeat noise changed **11/306 stage
-choices**. Thus the code does not override class, but output invariance is not
-established. Summaries count choice, confidence, and probability-map changes;
-raw answers retain every value. The supplementary v3 run changed five stage
+choices** and 5/102 provider classes; two augmented repeats differed by 14/306
+and 4/102. Neither effect is distinguishable from that noise (Fisher exact
+p = 1.0 for both), but a sample this small could not show an effect of a few
+percent either, so output invariance is not established. The code does not
+override class. `summarize.py` counts only a changed choice label as a change;
+confidence and probabilities differ in most answers in every comparison,
+including between baseline repeats. The supplementary v3 run changed five stage
 choices and one provider class; its baseline repeats changed one stage choice.
+
+On the default `anthropic` ladder (`heldout-default-shape/`), the question
+changed 4/204 stage choices and 3/68 provider classes, against baseline noise of
+1/102 and 0/34 (p = 0.67 and 0.55). The point estimates sit above the noise but
+are not distinguishable from it at this sample size. That run used 632,508
+input and 18,303 output tokens, with no API failures; billed cost is unknown.
 
 The selected held-out paired run used **833,516 input and 52,577 output tokens**.
 All trial usage is preserved separately. Actual billed dollar cost is unknown;
@@ -84,6 +134,26 @@ ladders. Baseline omits only `open_questions`; augmented includes it once.
 Call order reverses on alternate repeats. Effort and citation `noul` questions
 are omitted in both variants: this isolates class effects, not every production
 request shape. All held-out states fit the 60,000-character production cap.
+
+Production differs from the three-ladder run in two ways that the original
+evaluation did not measure. It sends the `anthropic` ladder by default, which
+`heldout-default-shape/` covers. And it adds one `could_be_cheaper` question per
+*open* cited issue; every held-out state references other issues by `#N`, so
+real requests usually carry questions that no run here includes. Which of those
+citations are open was not determined. The recorded requests place
+`open_questions` in sorted-key order (after `gemini.*`), but the committed
+`run_candidate.py` appends it last, because the trials used the temporary copy
+noted in `run.json`; the committed script is not what produced them.
+
+Recompute the effective-sample statistics (repeats counted once per issue, the
+majority-class and always-yes baselines, kappa, the retrieval-gate collapse, and
+the noise comparisons including provider classes) without any network or
+credentials:
+
+```bash
+python3 "$WT/docs/evaluations/jev-route-2053/agreement.py" \
+  "$WT/docs/evaluations/jev-route-2053/heldout-v3"
+```
 
 Recompute a saved summary without any network or credentials:
 

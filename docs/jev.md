@@ -492,11 +492,18 @@ usage: {input_tokens: 1432, output_tokens: 61}
   `open_questions: factual (0.80)` once per issue. Routine implementation details
   do not count. This answer never overrides `class`, stage choices, close calls,
   or effort advice. It judges only the supplied text and comments; it does not
-  retrieve code or establish that a proposed solution exists. Missing or unsupported
-  answers fail that issue, while the rest of a batch continues.
-  The wording is experimental: the motivating pair passes, but held-out agreement
-  is limited and adding the question can change existing Jev answers. See the
-  [evaluation results and shipping gate](evaluations/jev-route-2053/README.md).
+  retrieve code or establish that a proposed solution exists. A missing or
+  unsupported answer is dropped with a warning: the field is omitted and the
+  issue is still routed from its stage answers.
+  **The wording is experimental and not validated as a retrieval gate.** The
+  motivating pair passes, but on the 34 held-out issues it matches the expected
+  kind for 15 to 15.5 (44%–46%, depending on the ladders sent), against 14 for
+  answering `factual` every time; it never identified `both`, and as a gate for
+  "is reading code likely to help" it found 8 to 10 of the 18 issues where
+  reading code was expected to help. Adding the question changed existing Jev
+  answers no more than run-to-run noise on that set, though the sample could not
+  show a small effect. Do not act on it automatically.
+  See the [evaluation results and status](evaluations/jev-route-2053/README.md).
 - **`class`** is the higher of the design and implement choices. The most
   capable class earns its cost in the design stage; once a plan exists, the
   design answer usually becomes `none` and implementation drops to a cheaper
