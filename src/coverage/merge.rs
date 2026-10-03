@@ -11,6 +11,26 @@ use anyhow::{bail, Result};
 
 use super::model::CoverageReport;
 
+/// Runs every per-shard check on a freshly parsed `report`, before path
+/// filtering and before `prefix` is stripped.
+///
+/// This is the one place a shard is judged, shared by `coverage diff` (with more
+/// than one `--report`) and `coverage merge`, so the two cannot drift: a shard
+/// with no executable lines is an error, and one measured under another root is
+/// noted in `warnings` when `prefix` is known.
+pub fn check_shard(
+    label: &str,
+    report: &CoverageReport,
+    prefix: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    require_executable_lines(label, report)?;
+    if let Some(prefix) = prefix {
+        warnings.extend(prefix_mismatch(label, report, prefix));
+    }
+    Ok(())
+}
+
 /// Fails when `report` has no executable lines.
 ///
 /// A shard that ran instrumented tests lists every instrumented line, covered
@@ -106,6 +126,24 @@ mod tests {
     fn a_report_with_executable_lines_passes() {
         let report = report(&[("src/a.rs", &[(1, 0)])]);
         require_executable_lines("s", &report).unwrap();
+    }
+
+    #[test]
+    fn check_shard_fails_an_empty_shard_and_notes_a_foreign_one() {
+        let mut warnings = Vec::new();
+        let prefix = Path::new("/home/runner/work/repo");
+
+        let empty = check_shard("s", &CoverageReport::new(), Some(prefix), &mut warnings);
+        assert!(empty.is_err());
+        assert!(warnings.is_empty());
+
+        let foreign = report(&[("/Users/dev/work/repo/src/a.rs", &[(1, 1)])]);
+        check_shard("s", &foreign, Some(prefix), &mut warnings).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+        // Without a prefix there is nothing to compare against.
+        check_shard("s", &foreign, None, &mut warnings).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]
