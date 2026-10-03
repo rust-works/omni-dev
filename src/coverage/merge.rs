@@ -61,8 +61,8 @@ pub fn prefix_mismatch(label: &str, report: &CoverageReport, prefix: &Path) -> O
         format!(
             "coverage shard {label}: none of its {absolute} absolute file path(s) is under \
              `{}`, so it was probably measured under a different workspace root and its \
-             files will not line up with the diff; pass --strip-prefix with that root, or \
-             run every shard under the same one",
+             files will not line up with the other shards or the diff; pass --strip-prefix \
+             with that root, or run every shard under the same one",
             prefix.trim_end_matches('/')
         )
     })

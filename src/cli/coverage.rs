@@ -2,6 +2,7 @@
 
 pub(crate) mod diff;
 pub(crate) mod lint_markers;
+pub(crate) mod merge;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -25,6 +26,8 @@ pub enum CoverageSubcommands {
     Diff(Box<diff::DiffCommand>),
     /// Checks source coverage markers without generating a coverage report.
     LintMarkers(lint_markers::LintMarkersCommand),
+    /// Merges the per-shard reports of a sharded run into one lcov file.
+    Merge(merge::MergeCommand),
 }
 
 impl CoverageCommand {
@@ -37,6 +40,7 @@ impl CoverageCommand {
         match self.command {
             CoverageSubcommands::Diff(cmd) => cmd.execute(repo),
             CoverageSubcommands::LintMarkers(cmd) => cmd.execute(repo),
+            CoverageSubcommands::Merge(cmd) => cmd.execute(repo),
         }
     }
 }
@@ -77,5 +81,24 @@ mod tests {
         };
         // Reaches the leaf command and fails on the missing report file.
         assert!(cmd.execute().is_err());
+    }
+
+    /// The same for `merge`: a missing shard fails the leaf, and the output is
+    /// never created.
+    #[test]
+    fn dispatches_to_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("merged.lcov");
+        let cmd = CoverageCommand {
+            command: CoverageSubcommands::Merge(merge::MergeCommand {
+                report: vec![dir.path().join("missing.lcov")],
+                report_format: diff::ReportFormat::Auto,
+                output: output.clone(),
+                strip_prefix: None,
+            }),
+            repo: crate::cli::repo_arg::RepoArg::default(),
+        };
+        assert!(cmd.execute().is_err());
+        assert!(!output.exists());
     }
 }

@@ -84,7 +84,7 @@ fn fmt_num(x: f64) -> String {
 }
 
 /// Formats an optional percentage; `None` renders as an em dash.
-fn pct(x: Option<f64>) -> String {
+pub(crate) fn pct(x: Option<f64>) -> String {
     match x {
         Some(v) => format!("{}%", fmt_num(v)),
         None => "—".to_string(),
