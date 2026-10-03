@@ -6,7 +6,7 @@
 //! was restarting, or before a cold socket-activated daemon answered, used to be
 //! lost for good, and a restart forgot every session. The sink now appends each
 //! event to a journal **before** it posts it, and the daemon replays and tails
-//! those journals ([`journal_watcher`](super::journal_watcher)), taking whatever
+//! those journals (`journal_watcher`), taking whatever
 //! the socket missed.
 //!
 //! **Hooks own the events; the daemon owns the state.** A hook never computes a
@@ -256,7 +256,7 @@ pub fn journal_path(dir: &Path, agent: Agent, session_id: &str) -> Option<PathBu
 ///
 /// The sink cannot tell whether a daemon is reading, so it bounds itself: it does
 /// not journal at all until the daemon's runtime directory (`dir`'s parent)
-/// exists, stops appending to a file past [`SINK_MAX_BYTES`], and, whenever it
+/// exists, stops appending to a file past `SINK_MAX_BYTES`, and, whenever it
 /// starts a new journal, deletes sibling journals untouched for
 /// [`MAX_JOURNAL_AGE`]. A daemon-less install therefore cannot accumulate
 /// journals without limit.
