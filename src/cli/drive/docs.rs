@@ -10,6 +10,7 @@ pub(crate) mod create;
 pub(crate) mod info;
 pub(crate) mod read;
 pub(crate) mod style;
+pub(crate) mod table;
 pub(crate) mod write;
 
 use anyhow::Result;
@@ -55,6 +56,16 @@ pub enum DocsSubcommands {
     TextStyle(style::TextStyleCommand),
     /// Styles whole paragraphs overlapping an anchored range under docs-format.
     ParagraphStyle(style::ParagraphStyleCommand),
+    /// Inserts an empty table next to a body anchor, under docs-structure.
+    InsertTable(table::InsertTableCommand),
+    /// Inserts one empty table row above/below a reference cell, under docs-structure.
+    InsertTableRow(table::InsertDimensionCommand),
+    /// Inserts one empty table column left/right of a reference cell, under docs-structure.
+    InsertTableColumn(table::InsertDimensionCommand),
+    /// Removes one table row, under docs-table-delete; refuses the last row.
+    DeleteTableRow(table::DeleteDimensionCommand),
+    /// Removes one table column, under docs-table-delete; refuses the last column.
+    DeleteTableColumn(table::DeleteDimensionCommand),
     /// Creates a new Google Doc, optionally seeded with text. Gated by the
     /// write-permission rules' `create` operation (issue #1615).
     Create(create::CreateCommand),
@@ -79,6 +90,23 @@ impl DocsCommand {
             DocsSubcommands::DeleteBullets(cmd) => cmd.execute(client).await,
             DocsSubcommands::TextStyle(cmd) => cmd.execute(client).await,
             DocsSubcommands::ParagraphStyle(cmd) => cmd.execute(client).await,
+            DocsSubcommands::InsertTable(cmd) => cmd.execute(client).await,
+            DocsSubcommands::InsertTableRow(cmd) => {
+                cmd.execute(client, crate::drive::docs::table::TableVerb::InsertRow)
+                    .await
+            }
+            DocsSubcommands::InsertTableColumn(cmd) => {
+                cmd.execute(client, crate::drive::docs::table::TableVerb::InsertColumn)
+                    .await
+            }
+            DocsSubcommands::DeleteTableRow(cmd) => {
+                cmd.execute(client, crate::drive::docs::table::TableVerb::DeleteRow)
+                    .await
+            }
+            DocsSubcommands::DeleteTableColumn(cmd) => {
+                cmd.execute(client, crate::drive::docs::table::TableVerb::DeleteColumn)
+                    .await
+            }
             DocsSubcommands::Create(cmd) => cmd.execute(client).await,
         }
     }

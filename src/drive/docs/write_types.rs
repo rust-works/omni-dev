@@ -101,6 +101,76 @@ pub enum DocsRequest {
     /// Explicit paragraph formatting under DocsFormat.
     #[serde(rename = "updateParagraphStyle")]
     UpdateParagraphStyle(UpdateParagraphStyleRequest),
+    /// Insert an empty table at a resolved body point.
+    #[serde(rename = "insertTable")]
+    InsertTable(InsertTableRequest),
+    /// Insert one row relative to a resolved cell.
+    #[serde(rename = "insertTableRow")]
+    InsertTableRow(InsertTableRowRequest),
+    /// Insert one column relative to a resolved cell.
+    #[serde(rename = "insertTableColumn")]
+    InsertTableColumn(InsertTableColumnRequest),
+    /// Remove one row under DocsTableDelete.
+    #[serde(rename = "deleteTableRow")]
+    DeleteTableRow(TableDimensionRequest),
+    /// Remove one column under DocsTableDelete.
+    #[serde(rename = "deleteTableColumn")]
+    DeleteTableColumn(TableDimensionRequest),
+}
+
+/// Empty table insertion; location is snapshot-resolved, never caller-supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InsertTableRequest {
+    /// Number of empty rows.
+    pub rows: i64,
+    /// Number of empty columns.
+    pub columns: i64,
+    /// UTF-16 body insertion point.
+    pub location: Location,
+}
+
+/// Reference cell in a snapshot-resolved table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TableCellLocation {
+    /// Table container's start, including tab identity.
+    #[serde(rename = "tableStartLocation")]
+    pub table_start_location: Location,
+    /// Zero-based row.
+    #[serde(rename = "rowIndex")]
+    pub row_index: i64,
+    /// Zero-based column.
+    #[serde(rename = "columnIndex")]
+    pub column_index: i64,
+}
+
+/// One destructive dimension request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TableDimensionRequest {
+    /// Snapshot-resolved reference cell.
+    #[serde(rename = "tableCellLocation")]
+    pub table_cell_location: TableCellLocation,
+}
+
+/// One row insertion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InsertTableRowRequest {
+    /// Snapshot-resolved reference cell.
+    #[serde(rename = "tableCellLocation")]
+    pub table_cell_location: TableCellLocation,
+    /// Insert below rather than above the reference row.
+    #[serde(rename = "insertBelow")]
+    pub insert_below: bool,
+}
+
+/// One column insertion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InsertTableColumnRequest {
+    /// Snapshot-resolved reference cell.
+    #[serde(rename = "tableCellLocation")]
+    pub table_cell_location: TableCellLocation,
+    /// Insert right rather than left of the reference column.
+    #[serde(rename = "insertRight")]
+    pub insert_right: bool,
 }
 
 /// A `replaceAllText` request.

@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use super::table::{self, TableEdit, TableError, TablePreview, TableVerb};
 use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
 use crate::drive::docs::anchor::{self, AnchorError, EditPreview, ListPreview, Side};
@@ -58,6 +59,8 @@ use crate::request_log::{self, DriveMutationOutcome};
 /// the pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WritePayload {
+    /// Typed table structural mutation.
+    Table(TableEdit),
     /// Replace every occurrence of `search` with `replace`.
     Replace {
         /// The literal substring to find. Never a regex.
@@ -138,6 +141,7 @@ impl WritePayload {
                 ..
             } => WriteVerb::TextStyle,
             Self::Format { .. } => WriteVerb::ParagraphStyle,
+            Self::Table(edit) => WriteVerb::Table(edit.verb()),
         }
     }
 
@@ -149,6 +153,7 @@ impl WritePayload {
         match self {
             Self::Delete { .. } => DriveOperation::DocsDelete,
             Self::Format { .. } => DriveOperation::DocsFormat,
+            Self::Table(edit) => edit.verb().gate_operation(),
             _ => DriveOperation::DocsWrite,
         }
     }
@@ -156,7 +161,11 @@ impl WritePayload {
     const fn index_addressed(&self) -> bool {
         matches!(
             self,
-            Self::Insert { .. } | Self::Delete { .. } | Self::List { .. } | Self::Format { .. }
+            Self::Insert { .. }
+                | Self::Delete { .. }
+                | Self::List { .. }
+                | Self::Format { .. }
+                | Self::Table(_)
         )
     }
 
@@ -172,6 +181,7 @@ impl WritePayload {
                 .map_err(|_| "invalid segment selection".to_owned())?;
         }
         match self {
+            Self::Table(edit) => edit.validate(),
             Self::Replace { search, .. } if search.is_empty() => {
                 Err("--search cannot be empty".to_string())
             }
@@ -207,6 +217,8 @@ impl WritePayload {
 /// Which text mutation to perform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteVerb {
+    /// Table structural edit.
+    Table(TableVerb),
     /// Replace every occurrence of some text.
     Replace,
     /// Append text to the end of the document.
@@ -241,6 +253,7 @@ impl WriteVerb {
             Self::DeleteBullets => "docs-delete-bullets",
             Self::TextStyle => "docs-text-style",
             Self::ParagraphStyle => "docs-paragraph-style",
+            Self::Table(verb) => verb.log_operation(),
         }
     }
 
@@ -255,6 +268,7 @@ impl WriteVerb {
             Self::DeleteBullets => "delete-bullets",
             Self::TextStyle => "text-style",
             Self::ParagraphStyle => "paragraph-style",
+            Self::Table(verb) => verb.label(),
         }
     }
 }
@@ -283,6 +297,21 @@ pub struct WriteOptions {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum WriteResult {
+    /// Snapshot-resolved table preview.
+    WouldEditTable {
+        /// The exact structural effect.
+        edit: TablePreview,
+    },
+    /// A table mutation applied.
+    EditedTable {
+        /// Same effect metadata as the preview.
+        edit: TablePreview,
+    },
+    /// Table addressing failed closed.
+    RefusedTable {
+        /// Typed refusal, without user prose.
+        error: TableError,
+    },
     /// A dry run of a replace: how many occurrences the *snapshot* held.
     WouldReplace {
         /// Counted client-side. Display-only — see [`count_occurrences`].
@@ -447,6 +476,9 @@ impl WriteResult {
             Self::Formatted { .. } => "formatted",
             Self::WouldReplace { .. } => "would-replace",
             Self::WouldAppend { .. } => "would-append",
+            Self::WouldEditTable { .. } => "would-edit-table",
+            Self::EditedTable { .. } => "edited-table",
+            Self::RefusedTable { .. } => "refused-table",
             Self::WouldInsert { .. } => "would-insert",
             Self::WouldDelete { .. } => "would-delete",
             Self::Inserted { .. } => "inserted",
@@ -672,6 +704,10 @@ async fn write_inner(
     // they saw (ADR-0076 §7). Building the request here, before the ledger
     // gate, also means no fallible work can orphan a pending intent.
     let (request, preview) = match &opts.payload {
+        WritePayload::Table(edit) => match table::resolve(&document, edit) {
+            Ok((request, edit)) => (request, WriteResult::WouldEditTable { edit }),
+            Err(error) => return gated(WriteResult::RefusedTable { error }, Some(revision_id)),
+        },
         WritePayload::Replace {
             search,
             replace,
@@ -820,6 +856,12 @@ async fn write_inner(
     .await
     {
         Ok(response) => match &opts.payload {
+            WritePayload::Table(_) => match preview {
+                WriteResult::WouldEditTable { edit } => WriteResult::EditedTable { edit },
+                _ => WriteResult::Failed {
+                    detail: "missing resolved table preview".into(),
+                },
+            },
             WritePayload::Replace { .. } => WriteResult::Replaced {
                 occurrences_changed: response.occurrences_changed_for_replace(),
             },
@@ -963,6 +1005,20 @@ fn record_attempt(outcome: &WriteOutcome, opts: &WriteOptions, duration: Duratio
 pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
     let name = outcome.file_name.as_deref().unwrap_or(&outcome.document_id);
     match &outcome.result {
+        WriteResult::WouldEditTable { edit } | WriteResult::EditedTable { edit } => {
+            let action = if matches!(outcome.result, WriteResult::WouldEditTable { .. }) {
+                "Would apply"
+            } else {
+                "Applied"
+            };
+            format!("{action} {} in '{name}': {}x{} -> {}x{}, UTF-16 index {}, tab {}, reference row {:?}, column {:?}, insert after {}, preceding newline {}",
+                edit.operation.label(), edit.rows_before, edit.columns_before, edit.rows_after, edit.columns_after,
+                edit.location.index, edit.location.tab_id.as_deref().unwrap_or("first"), edit.row_index, edit.column_index,
+                edit.insert_after, edit.preceding_newline)
+        }
+        WriteResult::RefusedTable { error } => {
+            format!("Refused: unsafe or unresolved table in '{name}': {error:?}")
+        }
         WriteResult::WouldReplace { occurrences } => format!(
             "Would replace: {occurrences} occurrence(s) in '{name}' \
              (counted from the copy just read)"
@@ -1049,11 +1105,23 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
              [\"{}\"]}} to write_permissions.rules. (Adding it to a folder in your \
              own Drive and granting that folder `{}` also works.)",
             match verb {
+                WriteVerb::Table(v) =>
+                    if v.gate_operation() == DriveOperation::DocsStructure {
+                        "docs-structure"
+                    } else {
+                        "docs-table-delete"
+                    },
                 WriteVerb::Delete => "docs-delete",
                 WriteVerb::TextStyle | WriteVerb::ParagraphStyle => "docs-format",
                 _ => "docs-write",
             },
             match verb {
+                WriteVerb::Table(v) =>
+                    if v.gate_operation() == DriveOperation::DocsStructure {
+                        "docs-structure"
+                    } else {
+                        "docs-table-delete"
+                    },
                 WriteVerb::Delete => "docs-delete",
                 WriteVerb::TextStyle | WriteVerb::ParagraphStyle => "docs-format",
                 _ => "docs-write",
@@ -3239,6 +3307,189 @@ mod tests {
                 *from = anchor.into();
             }
             assert!(payload.validate().is_err());
+        }
+    }
+
+    fn table_payloads() -> Vec<WritePayload> {
+        use super::super::table::{TableEdit, TableVerb};
+        let mut payloads = vec![WritePayload::Table(TableEdit::Insert {
+            anchor: "Intro".into(),
+            side: Side::After,
+            rows: 2,
+            columns: 3,
+            match_case: true,
+        })];
+        for verb in [
+            TableVerb::InsertRow,
+            TableVerb::InsertColumn,
+            TableVerb::DeleteRow,
+            TableVerb::DeleteColumn,
+        ] {
+            payloads.push(WritePayload::Table(TableEdit::Dimension {
+                verb,
+                cell: "Alpha".into(),
+                after: true,
+                match_case: true,
+            }));
+        }
+        payloads
+    }
+
+    async fn table_setup(server: &MockServer) -> (DriveClient, DocsClient) {
+        let clients = clients(server).await;
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(server)
+            .await;
+        mount_folder("folder-1").mount(server).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/documents/doc-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(super::super::table::fixture()))
+            .mount(server)
+            .await;
+        clients
+    }
+
+    #[tokio::test]
+    async fn table_gate_isolation_blocks_before_content_fetch_in_preview_and_real_runs() {
+        for payload in table_payloads() {
+            for dry_run in [false, true] {
+                for grant in [
+                    DriveOperation::Edit,
+                    DriveOperation::DocsWrite,
+                    DriveOperation::DocsDelete,
+                    DriveOperation::SheetsStructure,
+                    DriveOperation::SheetsDelete,
+                    if payload.gate_operation() == DriveOperation::DocsStructure {
+                        DriveOperation::DocsTableDelete
+                    } else {
+                        DriveOperation::DocsStructure
+                    },
+                ] {
+                    let server = MockServer::start().await;
+                    let (drive, docs) = clients(&server).await;
+                    mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+                        .mount(&server)
+                        .await;
+                    mount_folder("folder-1").mount(&server).await;
+                    let mut rule = rule_for(&payload);
+                    rule.allow = [grant].into_iter().collect();
+                    let mut opts = replace_opts(dry_run);
+                    opts.payload = payload.clone();
+                    assert!(matches!(
+                        write(&drive, &docs, &opts, &[rule]).await.result,
+                        WriteResult::Blocked { .. }
+                    ));
+                    assert!(server
+                        .received_requests()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .all(|r| !r.url.path().starts_with("/v1/documents")));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn table_preview_and_leased_write_share_effects_and_one_revision_pinned_request() {
+        for payload in table_payloads() {
+            let server = MockServer::start().await;
+            let (drive, docs) = table_setup(&server).await;
+            let mut opts = replace_opts(true);
+            opts.payload = payload;
+            let rule = rule_for(&opts.payload);
+            opts.lease_token = None;
+            let preview = write(&drive, &docs, &opts, std::slice::from_ref(&rule)).await;
+            let WriteResult::WouldEditTable { edit: expected } = preview.result else {
+                panic!("{preview:?}");
+            };
+            assert!(server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| !r.url.path().ends_with(":batchUpdate")));
+            mount_batch_update(serde_json::json!({"replies":[{}]}))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (token, path) = leased_opts_for("doc-1");
+            opts.lease_token = token;
+            opts.ledger_path = path;
+            opts.dry_run = false;
+            let applied = write(&drive, &docs, &opts, &[rule]).await;
+            assert_eq!(
+                applied.result,
+                WriteResult::EditedTable {
+                    edit: expected.clone()
+                }
+            );
+            let requests = server.received_requests().await.unwrap();
+            for read in requests
+                .iter()
+                .filter(|r| r.url.path() == "/v1/documents/doc-1")
+            {
+                assert!(read
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "suggestionsViewMode" && v == "SUGGESTIONS_INLINE"));
+            }
+            let batch = requests
+                .iter()
+                .find(|r| r.url.path().ends_with(":batchUpdate"))
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+            let WritePayload::Table(edit) = &opts.payload else {
+                unreachable!()
+            };
+            let doc = serde_json::from_value(super::super::table::fixture()).unwrap();
+            let (request, _) = super::super::table::resolve(&doc, edit).unwrap();
+            assert_eq!(
+                body,
+                serde_json::to_value(super::super::write_types::BatchUpdateDocumentRequest::new(
+                    request,
+                    "rev-table"
+                ))
+                .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn table_writes_refuse_missing_and_stale_backup_leases_and_surface_stale_docs_revisions()
+    {
+        for payload in table_payloads() {
+            for stage in 0..3 {
+                let server = MockServer::start().await;
+                let (drive, docs) = table_setup(&server).await;
+                let mut opts = replace_opts(false);
+                opts.payload = payload.clone();
+                match stage {
+                    0 => opts.lease_token = None,
+                    1 => opts.lease_token = Some(seed_lease(&opts.ledger_path, "doc-1", "0")),
+                    _ => {
+                        Mock::given(method("POST")).and(path("/v1/documents/doc-1:batchUpdate"))
+                        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({"error":{"code":400,"message":"The required revision ID does not match the latest revision.","status":"INVALID_ARGUMENT"}})))
+                        .expect(1).mount(&server).await;
+                    }
+                }
+                let result = write(&drive, &docs, &opts, &[rule_for(&payload)])
+                    .await
+                    .result;
+                match stage {
+                    0 => assert!(matches!(result, WriteResult::RefusedNoLease)),
+                    1 => assert!(matches!(result, WriteResult::RefusedLeaseStale { .. })),
+                    _ => assert!(matches!(result, WriteResult::StaleRevision { .. })),
+                }
+                if stage < 2 {
+                    assert!(server
+                        .received_requests()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .all(|r| !r.url.path().ends_with(":batchUpdate")));
+                }
+            }
         }
     }
 }

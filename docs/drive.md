@@ -788,6 +788,8 @@ operation anywhere in a target's ancestor chain:
 | `trash`             | deny    | `trash`, `untrash` (individual files only)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `docs-delete`       | deny    | `docs delete` — anchor-addressed content removal                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `docs-format`       | deny    | `docs text-style` / `docs paragraph-style` — anchor-addressed formatting                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `docs-structure`    | deny    | `docs insert-table`, `docs insert-table-row`, `docs insert-table-column` — empty structural additions                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `docs-table-delete` | deny    | `docs delete-table-row`, `docs delete-table-column` — removes content in one dimension; separate consent                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
 There is no "enabled: true" flag — an absent or empty rule list already
 means "deny every write everywhere," via this table alone, which *is* the
@@ -939,7 +941,8 @@ the one Drive it came from. A rule keys on **either** a `folder_id` or a
   `file_id` is a configuration error rather than a no-op.
 - `allow`/`deny` — any of `read`, `create`, `upload`, `edit`,
   `sheets-write`, `sheets-structure`, `sheets-delete`, `sheets-protection`,
-  `docs-write`, `trash`, `docs-delete`, `docs-format`, `slides-write`. A `deny`
+  `docs-write`, `trash`, `docs-delete`, `docs-format`, `slides-write`,
+  `docs-structure`, `docs-table-delete`. A `deny`
   entry for `read` is schema-ready today for a future `search`/`read`/
   `dedupe` enforcement fast-follow (not wired up yet — see
   [ADR-0071](adrs/adr-0071.md) §11); the write operations are enforced now.
@@ -4269,6 +4272,61 @@ only existing decision/revision/status metadata under `docs-create-bullets` or
 `docs-delete-bullets`.
 
 These effects follow the [Google Docs list request reference](https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#CreateParagraphBulletsRequest).
+
+#### drive docs table edits
+
+Table additions require `docs-structure`; row/column deletion requires separate
+`docs-table-delete` consent. Existing `docs-write`, `docs-delete`, `edit` and
+Sheets grants authorize neither. Both require a backup `--lease` unless the
+deciding operator rule explicitly sets `require_lease: false`. Preview first;
+a preview does not authorize a subsequent write.
+
+```bash
+omni-dev drive docs insert-table <ID> --after 'Summary' --rows 2 --columns 3 --dry-run
+omni-dev drive docs insert-table-row <ID> --cell 'Unique heading' --after --lease <TOKEN>
+omni-dev drive docs insert-table-column <ID> --cell 'Unique heading' --before --dry-run
+omni-dev drive docs delete-table-row <ID> --cell 'Obsolete entry' --dry-run
+omni-dev drive docs delete-table-column <ID> --cell 'Obsolete heading' --lease <TOKEN>
+```
+
+`insert-table` creates an empty grid next to a unique literal anchor in an
+ordinary top-level body paragraph. Dimensions must be positive, with at most
+10,000 cells. Google inserts a newline before the table; the preview reports
+this additional effect. The insertion point is a UTF-16 body index in the
+resolved tab, and the table starts one unit after that point. The paragraph's
+existing protected closing newline is retained.
+
+Dimension verbs select the cell containing unique literal `--cell` text within
+one paragraph. `--before` means above a row or left of a column; `--after` means
+below or right. They add or remove exactly one dimension. Deletion removes all
+content in the selected row/column, rather than just the anchor match. The
+final row or column cannot be deleted, because the API would remove the entire
+table. Grant these operations explicitly by file or folder:
+
+```json
+{"file_id": "<document id>", "allow": ["docs-structure", "docs-table-delete"]}
+```
+
+Only rectangular, unmerged top-level body tables are supported. Nested tables,
+merged cells, generated tables of contents, header/footer/footnote targets,
+malformed indices and pending suggestions affecting the table are refused.
+Anchors are case-sensitive by default; `--ignore-case` uses Unicode simple case
+folding. Empty, missing or ambiguous anchors fail closed across all body tabs.
+There is no raw index, raw batch or seeded-table input.
+
+The preview reports tab identity, insertion/table-start index, reference
+row/column, before/after grid dimensions, insertion direction and the new-table
+newline without returning document prose. `-o json|yaml|yamls|jsonl` retains the
+tagged `would-edit-table`, `edited-table` or `refused-table` outcome. Permission
+refusal precedes any Docs content fetch. Each invocation reads an inline
+snapshot and sends one typed request with its `requiredRevisionId`; it never
+rebases. Use another invocation to freshly resolve coordinates after an edit.
+`stale-revision` requires rereading through the complete engine;
+`refused-lease-stale` requires a fresh authorized backup lease. Audit logging
+and lease refresh use the existing Docs write path. These verbs are CLI-only.
+
+Wire shapes and newline/whole-table deletion rules follow the
+[Google Docs request reference](https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#InsertTableRequest).
 
 #### `drive docs create`
 

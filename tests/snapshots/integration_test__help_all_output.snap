@@ -4139,18 +4139,23 @@ Reads the structure and text of a Google Doc via the Docs v1 API (issue #1615)
 Usage: docs <COMMAND>
 
 Commands:
-  info             Shows a document's title, revision id and structural outline (mirrors the `drive_docs_info` MCP tool)
-  read             Reads a document's structural elements with their index ranges (mirrors the `drive_docs_read` MCP tool)
-  replace          Replaces every occurrence of some text, gated by the write-permission rules (issue #1615). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`). (mirrors the `drive_docs_replace` MCP tool)
-  append           Appends text to the end of a document, gated by the write-permission rules (issue #1615). (mirrors the `drive_docs_append` MCP tool)
-  insert           Inserts text before or after a unique body or segment anchor, gated by docs-write
-  delete           Deletes a unique match or inclusive anchor range, gated by docs-delete
-  create-bullets   Creates bullets or numbering on anchor-selected paragraphs, under docs-write
-  delete-bullets   Removes bullets while preserving prose and indentation, under docs-write
-  text-style       Sets explicit character formatting on an anchored range under docs-format
-  paragraph-style  Styles whole paragraphs overlapping an anchored range under docs-format
-  create           Creates a new Google Doc, optionally seeded with text. Gated by the write-permission rules' `create` operation (issue #1615)
-  help             Print this message or the help of the given subcommand(s)
+  info                 Shows a document's title, revision id and structural outline (mirrors the `drive_docs_info` MCP tool)
+  read                 Reads a document's structural elements with their index ranges (mirrors the `drive_docs_read` MCP tool)
+  replace              Replaces every occurrence of some text, gated by the write-permission rules (issue #1615). Requires the `drive.file` or `drive` scope (`drive auth login --write-file`/`--write-full`). (mirrors the `drive_docs_replace` MCP tool)
+  append               Appends text to the end of a document, gated by the write-permission rules (issue #1615). (mirrors the `drive_docs_append` MCP tool)
+  insert               Inserts text before or after a unique body or segment anchor, gated by docs-write
+  delete               Deletes a unique match or inclusive anchor range, gated by docs-delete
+  create-bullets       Creates bullets or numbering on anchor-selected paragraphs, under docs-write
+  delete-bullets       Removes bullets while preserving prose and indentation, under docs-write
+  text-style           Sets explicit character formatting on an anchored range under docs-format
+  paragraph-style      Styles whole paragraphs overlapping an anchored range under docs-format
+  insert-table         Inserts an empty table next to a body anchor, under docs-structure
+  insert-table-row     Inserts one empty table row above/below a reference cell, under docs-structure
+  insert-table-column  Inserts one empty table column left/right of a reference cell, under docs-structure
+  delete-table-row     Removes one table row, under docs-table-delete; refuses the last row
+  delete-table-column  Removes one table column, under docs-table-delete; refuses the last column
+  create               Creates a new Google Doc, optionally seeded with text. Gated by the write-permission rules' `create` operation (issue #1615)
+  help                 Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -4265,6 +4270,46 @@ Options:
 
 ================================================================================
 
+omni-dev drive docs delete-table-column - Removes one table column, under docs-table-delete; refuses the last column
+
+Removes one table column, under docs-table-delete; refuses the last column
+
+Usage: delete-table-column [OPTIONS] --cell <CELL> <DOCUMENT_ID>
+
+Arguments:
+  <DOCUMENT_ID>  Google document id
+
+Options:
+      --dry-run          Resolve effects without mutating; does not authorize a subsequent write
+      --ignore-case      Match the literal anchor with Unicode simple case folding
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+      --cell <CELL>      Unique literal text in a cell of a top-level, unmerged table
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive docs delete-table-row - Removes one table row, under docs-table-delete; refuses the last row
+
+Removes one table row, under docs-table-delete; refuses the last row
+
+Usage: delete-table-row [OPTIONS] --cell <CELL> <DOCUMENT_ID>
+
+Arguments:
+  <DOCUMENT_ID>  Google document id
+
+Options:
+      --dry-run          Resolve effects without mutating; does not authorize a subsequent write
+      --ignore-case      Match the literal anchor with Unicode simple case folding
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+      --cell <CELL>      Unique literal text in a cell of a top-level, unmerged table
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev drive docs info - Shows a document's title, revision id and structural outline (mirrors the `drive_docs_info` MCP tool)
 
 Shows a document's title, revision id and structural outline (mirrors the `drive_docs_info` MCP tool)
@@ -4302,6 +4347,73 @@ Options:
       --lease <TOKEN>            The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
   -o, --output <OUTPUT>          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                     Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive docs insert-table - Inserts an empty table next to a body anchor, under docs-structure
+
+Inserts an empty table next to a body anchor, under docs-structure
+
+Usage: insert-table [OPTIONS] --rows <ROWS> --columns <COLUMNS> <--before <BEFORE>|--after <AFTER>> <DOCUMENT_ID>
+
+Arguments:
+  <DOCUMENT_ID>  Google document id
+
+Options:
+      --dry-run            Resolve effects without mutating; does not authorize a subsequent write
+      --ignore-case        Match the literal anchor with Unicode simple case folding
+      --lease <TOKEN>      The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+      --before <BEFORE>    Insert before this unique literal body anchor
+      --after <AFTER>      Insert after this unique literal body anchor
+      --rows <ROWS>        Positive row count; total grid is limited to 10000 cells
+      --columns <COLUMNS>  Positive column count
+  -h, --help               Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive docs insert-table-column - Inserts one empty table column left/right of a reference cell, under docs-structure
+
+Inserts one empty table column left/right of a reference cell, under docs-structure
+
+Usage: insert-table-column [OPTIONS] --cell <CELL> <--before|--after> <DOCUMENT_ID>
+
+Arguments:
+  <DOCUMENT_ID>  Google document id
+
+Options:
+      --dry-run          Resolve effects without mutating; does not authorize a subsequent write
+      --ignore-case      Match the literal anchor with Unicode simple case folding
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+      --cell <CELL>      Unique literal text in a cell of a top-level, unmerged table
+      --before           Insert above the row or left of the column
+      --after            Insert below the row or right of the column
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev drive docs insert-table-row - Inserts one empty table row above/below a reference cell, under docs-structure
+
+Inserts one empty table row above/below a reference cell, under docs-structure
+
+Usage: insert-table-row [OPTIONS] --cell <CELL> <--before|--after> <DOCUMENT_ID>
+
+Arguments:
+  <DOCUMENT_ID>  Google document id
+
+Options:
+      --dry-run          Resolve effects without mutating; does not authorize a subsequent write
+      --ignore-case      Match the literal anchor with Unicode simple case folding
+      --lease <TOKEN>    The lease token from `drive lease acquire`, required unless the deciding write-permission rule sets `require_lease: false` — a token presented anyway is still validated and consumed ([ADR-0080](../../../docs/adrs/adr-0080.md) §1/§9/§13). Never needed with `--dry-run`
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+      --cell <CELL>      Unique literal text in a cell of a top-level, unmerged table
+      --before           Insert above the row or left of the column
+      --after            Insert below the row or right of the column
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -4559,7 +4671,7 @@ Arguments:
   <ID>  The folder or file id to evaluate
 
 Options:
-      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write, sheets-structure, sheets-delete, sheets-protection, docs-write, trash, slides-write, docs-delete, docs-format]
+      --operation <OPERATION>  Which operation to check [possible values: read, create, upload, edit, sheets-write, sheets-structure, sheets-delete, sheets-protection, docs-write, trash, slides-write, docs-delete, docs-format, docs-structure, docs-table-delete]
   -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 

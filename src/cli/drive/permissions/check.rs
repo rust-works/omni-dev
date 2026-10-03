@@ -47,6 +47,10 @@ pub enum OperationArg {
     DocsDelete,
     /// Anchor-addressed text and paragraph styling.
     DocsFormat,
+    /// Add empty Docs tables, rows or columns.
+    DocsStructure,
+    /// Remove Docs table rows or columns.
+    DocsTableDelete,
 }
 
 impl From<OperationArg> for DriveOperation {
@@ -65,6 +69,8 @@ impl From<OperationArg> for DriveOperation {
             OperationArg::SlidesWrite => Self::SlidesWrite,
             OperationArg::DocsDelete => Self::DocsDelete,
             OperationArg::DocsFormat => Self::DocsFormat,
+            OperationArg::DocsStructure => Self::DocsStructure,
+            OperationArg::DocsTableDelete => Self::DocsTableDelete,
         }
     }
 }
