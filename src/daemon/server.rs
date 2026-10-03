@@ -184,11 +184,13 @@ async fn accept_loop<S: ConnectionSource>(
                 Ok(stream) => {
                     if let Some(recovery) = backoff.on_success(Instant::now()) {
                         registry.credit_accept_outage(recovery.outage);
-                        tracing::info!(
-                            failures = recovery.failures,
-                            outage = ?recovery.duration,
-                            "daemon accept recovered"
-                        );
+                        if recovery.announce {
+                            tracing::info!(
+                                failures = recovery.failures,
+                                outage = ?recovery.duration,
+                                "daemon accept recovered"
+                            );
+                        }
                     }
                     conns.spawn(handle_connection(
                         stream,
@@ -205,7 +207,7 @@ async fn accept_loop<S: ConnectionSource>(
                     registry.credit_accept_outage(step.outage);
                     if step.log {
                         tracing::warn!(
-                            "daemon accept error: {e} (backing off; further errors are summarised)"
+                            "daemon accept error: {e} (backing off; further errors are not logged for 30s)"
                         );
                     }
                     tokio::select! {
