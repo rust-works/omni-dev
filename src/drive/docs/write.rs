@@ -152,6 +152,9 @@ impl WritePayload {
             Self::NamedRange { mutation, .. } => match mutation {
                 super::named_range::Mutation::Create { .. } => WriteVerb::CreateNamedRange,
                 super::named_range::Mutation::Delete { .. } => WriteVerb::DeleteNamedRange,
+                super::named_range::Mutation::Replace { text, .. } if text.is_empty() => {
+                    WriteVerb::DeleteNamedRangeContent
+                }
                 super::named_range::Mutation::Replace { .. } => WriteVerb::ReplaceNamedRangeContent,
             },
         }
@@ -263,6 +266,8 @@ pub enum WriteVerb {
     DeleteNamedRange,
     /// Replace a named range's content.
     ReplaceNamedRangeContent,
+    /// The same wire verb with explicit empty content, under docs-delete.
+    DeleteNamedRangeContent,
 }
 
 impl WriteVerb {
@@ -284,7 +289,9 @@ impl WriteVerb {
             Self::Table(verb) => verb.log_operation(),
             Self::CreateNamedRange => "docs-create-named-range",
             Self::DeleteNamedRange => "docs-delete-named-range",
-            Self::ReplaceNamedRangeContent => "docs-replace-named-range-content",
+            Self::ReplaceNamedRangeContent | Self::DeleteNamedRangeContent => {
+                "docs-replace-named-range-content"
+            }
         }
     }
 
@@ -302,7 +309,9 @@ impl WriteVerb {
             Self::Table(verb) => verb.label(),
             Self::CreateNamedRange => "create-named-range",
             Self::DeleteNamedRange => "delete-named-range",
-            Self::ReplaceNamedRangeContent => "replace-named-range-content",
+            Self::ReplaceNamedRangeContent | Self::DeleteNamedRangeContent => {
+                "replace-named-range-content"
+            }
         }
     }
 
@@ -311,7 +320,7 @@ impl WriteVerb {
     const fn gate_operation(self) -> DriveOperation {
         match self {
             Self::Table(verb) => verb.gate_operation(),
-            Self::Delete => DriveOperation::DocsDelete,
+            Self::Delete | Self::DeleteNamedRangeContent => DriveOperation::DocsDelete,
             Self::TextStyle | Self::ParagraphStyle => DriveOperation::DocsFormat,
             Self::CreateNamedRange | Self::DeleteNamedRange => DriveOperation::DocsStructure,
             _ => DriveOperation::DocsWrite,
@@ -1146,7 +1155,7 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
             } else {
                 "Applied"
             };
-            format!("{action} {} in '{name}': ID {}, {} span(s), removed {} char(s) / {} byte(s), inserted {} char(s) / {} byte(s)", verb.label(), preview.named_range_id.as_deref().unwrap_or("pending"), preview.ranges.len(), preview.removed_chars, preview.removed_bytes, preview.inserted_chars, preview.inserted_bytes)
+            format!("{action} {} in '{name}': ID {}, {} span(s), removed {} char(s) / {} byte(s), inserted {} char(s) / {} byte(s); {}", verb.label(), preview.named_range_id.as_deref().unwrap_or("pending"), preview.ranges.len(), preview.removed_chars, preview.removed_bytes, preview.inserted_chars, preview.inserted_bytes, preview.describe_spans())
         }
         WriteResult::RefusedNamedRange { error } => {
             format!("Refused: unsafe or unresolved named range in '{name}': {error:?}")

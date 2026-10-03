@@ -95,9 +95,25 @@ pub enum Error {
     SuggestedContent,
 }
 
+/// Distinguishes removing a label from removing its text in structured output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Effect {
+    /// Adds only named-range metadata.
+    CreateMetadata,
+    /// Removes only named-range metadata.
+    DeleteMetadata,
+    /// Replaces existing text with nonempty content.
+    ReplaceContent,
+    /// Removes content with an explicitly empty replacement.
+    DeleteContent,
+}
+
 /// Metadata-only description of the complete selected effect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Preview {
+    /// Explicit metadata/content distinction, independent of the generic status.
+    pub effect: Effect,
     /// Stable ID; unknown before a create reply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub named_range_id: Option<String>,
@@ -153,6 +169,12 @@ pub(crate) fn resolve(
         &tab.body.ok_or(Error::InvalidScope)?.content
     };
     let mut preview = Preview {
+        effect: match mutation {
+            Mutation::Create { .. } => Effect::CreateMetadata,
+            Mutation::Delete { .. } => Effect::DeleteMetadata,
+            Mutation::Replace { text, .. } if text.is_empty() => Effect::DeleteContent,
+            Mutation::Replace { .. } => Effect::ReplaceContent,
+        },
         named_range_id: None,
         ranges: vec![],
         removed_chars: 0,
@@ -274,83 +296,121 @@ fn validate_text_range(
     if start < i64::from(!non_body) || end <= start {
         return Err(Error::UnsafeRange);
     }
+    let mut candidates = Vec::new();
+    matching_paragraphs(elements, start, end, &mut candidates);
+    let [element] = candidates.as_slice() else {
+        return Err(Error::UnsafeRange);
+    };
+    let paragraph = element.paragraph.as_ref().ok_or(Error::UnsafeRange)?;
+    let p_start = element.start_index.unwrap_or(0);
+    let p_end = element.end_index.ok_or(Error::UnsafeRange)?;
+    if p_start < i64::from(!non_body) || p_end <= p_start {
+        return Err(Error::UnsafeRange);
+    }
+    let mut previous = p_start;
+    let mut cursor = start;
+    let mut chars = 0;
+    let mut bytes = 0;
+    for inline in &paragraph.elements {
+        let lo = inline.start_index.unwrap_or(0);
+        let hi = inline.end_index.ok_or(Error::UnsafeRange)?;
+        if lo < previous || hi <= lo || hi > p_end {
+            return Err(Error::UnsafeRange);
+        }
+        previous = hi;
+        let Some(run) = &inline.text_run else {
+            if lo < end && hi > start {
+                return Err(Error::UnsafeRange);
+            }
+            continue;
+        };
+        if lo.checked_add(
+            i64::try_from(run.content.encode_utf16().count()).map_err(|_| Error::UnsafeRange)?,
+        ) != Some(hi)
+        {
+            return Err(Error::UnsafeRange);
+        }
+        if hi <= start || lo >= end {
+            continue;
+        }
+        if lo > cursor {
+            return Err(Error::UnsafeRange);
+        }
+        if !run.suggested_insertion_ids.is_empty() || !run.suggested_deletion_ids.is_empty() {
+            return Err(Error::SuggestedContent);
+        }
+        let mut index = lo;
+        for ch in run.content.chars() {
+            let next = index + ch.len_utf16() as i64;
+            if index < end && next > start {
+                if index < start || next > end || ch == '\n' {
+                    return Err(Error::UnsafeRange);
+                }
+                chars += 1;
+                bytes += ch.len_utf8();
+            }
+            index = next;
+        }
+        cursor = hi.min(end);
+    }
+    if cursor == end
+        && paragraph
+            .elements
+            .last()
+            .and_then(|e| e.text_run.as_ref())
+            .is_some_and(|run| previous == p_end && run.content.ends_with('\n'))
+    {
+        return Ok((chars, bytes));
+    }
+    Err(Error::UnsafeRange)
+}
+
+fn matching_paragraphs<'a>(
+    elements: &'a [StructuralElement],
+    start: i64,
+    end: i64,
+    out: &mut Vec<&'a StructuralElement>,
+) {
     for element in elements {
+        if element.paragraph.is_some()
+            && element.start_index.unwrap_or(0) <= start
+            && element.end_index.is_some_and(|p_end| end < p_end)
+        {
+            out.push(element);
+        }
         if let Some(table) = &element.table {
             for row in &table.table_rows {
                 for cell in &row.table_cells {
-                    if let Ok(counts) = validate_text_range(&cell.content, start, end, non_body) {
-                        return Ok(counts);
-                    }
+                    matching_paragraphs(&cell.content, start, end, out);
                 }
             }
         }
-        let Some(paragraph) = &element.paragraph else {
-            continue;
-        };
-        let p_start = element.start_index.unwrap_or(0);
-        let p_end = element.end_index.ok_or(Error::UnsafeRange)?;
-        if start < p_start || end >= p_end {
-            continue;
-        }
-        let mut previous = p_start;
-        let mut cursor = start;
-        let mut chars = 0;
-        let mut bytes = 0;
-        for inline in &paragraph.elements {
-            let lo = inline.start_index.unwrap_or(0);
-            let hi = inline.end_index.ok_or(Error::UnsafeRange)?;
-            if lo < previous || hi <= lo || hi > p_end {
-                return Err(Error::UnsafeRange);
-            }
-            previous = hi;
-            let Some(run) = &inline.text_run else {
-                if lo < end && hi > start {
-                    return Err(Error::UnsafeRange);
-                }
-                continue;
-            };
-            if lo.checked_add(
-                i64::try_from(run.content.encode_utf16().count())
-                    .map_err(|_| Error::UnsafeRange)?,
-            ) != Some(hi)
-            {
-                return Err(Error::UnsafeRange);
-            }
-            if hi <= start || lo >= end {
-                continue;
-            }
-            if lo > cursor {
-                return Err(Error::UnsafeRange);
-            }
-            if !run.suggested_insertion_ids.is_empty() || !run.suggested_deletion_ids.is_empty() {
-                return Err(Error::SuggestedContent);
-            }
-            let mut index = lo;
-            for ch in run.content.chars() {
-                let next = index + ch.len_utf16() as i64;
-                if index < end && next > start {
-                    if index < start || next > end || ch == '\n' {
-                        return Err(Error::UnsafeRange);
-                    }
-                    chars += 1;
-                    bytes += ch.len_utf8();
-                }
-                index = next;
-            }
-            cursor = hi.min(end);
-        }
-        if cursor == end
-            && paragraph
-                .elements
-                .last()
-                .and_then(|e| e.text_run.as_ref())
-                .is_some_and(|run| previous == p_end && run.content.ends_with('\n'))
-        {
-            return Ok((chars, bytes));
-        }
-        return Err(Error::UnsafeRange);
     }
-    Err(Error::UnsafeRange)
+}
+
+impl Preview {
+    /// Bounded human rendering; structured outcomes retain the complete span list.
+    pub(crate) fn describe_spans(&self) -> String {
+        let mut spans = self
+            .ranges
+            .iter()
+            .take(50)
+            .map(|range| {
+                format!(
+                    "[{}, {}) UTF-16, tab {}, segment {}",
+                    range.start_index.unwrap_or(0),
+                    range.end_index.unwrap_or(0),
+                    range.tab_id.as_deref().unwrap_or("legacy"),
+                    range.segment_id.as_deref().unwrap_or("body")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        if self.ranges.len() > 50 {
+            spans.push_str(&format!("; {} more span(s)", self.ranges.len() - 50));
+        }
+        spans
+    }
 }
 
 #[cfg(test)]
@@ -395,7 +455,7 @@ mod tests {
     #[test]
     fn nested_tab_and_segment_wire_shapes_are_bounded_and_leased() {
         for segment in [None, Some("h")] {
-            let start = if segment.is_some() { 0 } else { 1 };
+            let start = i64::from(segment.is_none());
             let (document, scope) = fixture(
                 segment,
                 vec![json!({"startIndex": start, "endIndex": start + 2, "segmentId": segment})],
@@ -621,7 +681,7 @@ mod tests {
                 "gap" => second["startIndex"] = json!(7),
                 "bad-index" => second["endIndex"] = json!(11),
                 "object" => {
-                    second = json!({"startIndex": 6, "endIndex": 10, "inlineObjectElement": {"inlineObjectId": "o"}})
+                    second = json!({"startIndex": 6, "endIndex": 10, "inlineObjectElement": {"inlineObjectId": "o"}});
                 }
                 _ => {}
             }
@@ -658,5 +718,99 @@ mod tests {
         assert!(wire["replaceNamedRangeContent"]
             .get("tabsCriteria")
             .is_none());
+    }
+    #[test]
+    fn table_cells_preserve_suggestion_refusals_and_overlapping_indices_fail_closed() {
+        let (mut document, scope) = fixture(None, vec![json!({"startIndex": 3, "endIndex": 5})]);
+        let mut p = paragraph(3, "😀 label\n");
+        let body = document.tabs[0].child_tabs[0]
+            .document_tab
+            .as_mut()
+            .unwrap()
+            .body
+            .as_mut()
+            .unwrap();
+        body.content = serde_json::from_value(json!([{"startIndex": 1, "endIndex": 14,
+            "table": {"tableRows": [{"tableCells": [{"content": [p.clone()]}]}]}}]))
+        .unwrap();
+        assert!(resolve(&document, &scope, &replace()).is_ok());
+        p["paragraph"]["elements"][0]["textRun"]["suggestedDeletionIds"] = json!(["suggestion"]);
+        document.tabs[0].child_tabs[0]
+            .document_tab
+            .as_mut()
+            .unwrap()
+            .body
+            .as_mut()
+            .unwrap()
+            .content = serde_json::from_value(json!([{"startIndex": 1, "endIndex": 14,
+                "table": {"tableRows": [{"tableCells": [{"content": [p.clone()]}]}]}}]))
+        .unwrap();
+        assert_eq!(
+            resolve(&document, &scope, &replace()),
+            Err(Error::SuggestedContent)
+        );
+        let mut plain = paragraph(3, "😀 label\n");
+        document.tabs[0].child_tabs[0]
+            .document_tab
+            .as_mut()
+            .unwrap()
+            .body
+            .as_mut()
+            .unwrap()
+            .content = serde_json::from_value(json!([plain.clone(), plain.clone()])).unwrap();
+        assert_eq!(
+            resolve(&document, &scope, &replace()),
+            Err(Error::UnsafeRange)
+        );
+        plain.as_object_mut().unwrap().remove("startIndex");
+        document.tabs[0].child_tabs[0]
+            .document_tab
+            .as_mut()
+            .unwrap()
+            .body
+            .as_mut()
+            .unwrap()
+            .content = serde_json::from_value(json!([plain])).unwrap();
+        assert_eq!(
+            resolve(&document, &scope, &replace()),
+            Err(Error::UnsafeRange)
+        );
+    }
+
+    #[test]
+    fn effects_and_bounded_rendering_distinguish_metadata_from_content_deletion() {
+        let (document, scope) = fixture(None, vec![json!({"startIndex": 1, "endIndex": 3})]);
+        let (_, metadata) =
+            resolve(&document, &scope, &Mutation::Delete { id: "nr".into() }).unwrap();
+        let (_, content) = resolve(
+            &document,
+            &scope,
+            &Mutation::Replace {
+                id: "nr".into(),
+                text: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&metadata).unwrap()["effect"],
+            "delete-metadata"
+        );
+        assert_eq!(
+            serde_json::to_value(&content).unwrap()["effect"],
+            "delete-content"
+        );
+        assert!(metadata
+            .describe_spans()
+            .contains("[1, 3) UTF-16, tab child, segment body"));
+        let mut many = metadata;
+        many.ranges = vec![many.ranges[0].clone(); 51];
+        assert!(many.describe_spans().ends_with("1 more span(s)"));
+        assert_eq!(
+            serde_json::to_value(many).unwrap()["ranges"]
+                .as_array()
+                .unwrap()
+                .len(),
+            51
+        );
     }
 }

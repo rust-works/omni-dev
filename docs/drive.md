@@ -4393,6 +4393,9 @@ Dry runs require the permission but no backup lease and write nothing. Real
 writes require the usual backup lease unless an operator rule explicitly
 exempts it, retain write-ahead auditing and refresh the ledger after success.
 `stale-revision` and `refused-lease-stale` remain separate refusal paths.
+Structured previews distinguish `create-metadata`, `delete-metadata`,
+`replace-content` and `delete-content`; table previews show the scoped UTF-16
+spans (at most 50 rendered, with the complete list in structured output).
 Previews and audit records contain metadata and counts rather than document
 prose or the supplied name; creation returns the server-assigned ID when
 present in its reply. These commands support table, JSON, YAML and JSONL
