@@ -1007,6 +1007,36 @@ impl SessionsRegistry {
     /// reaches other subscribers on the server's next periodic re-sample, whose
     /// diff sees the shrunken list — the [`WorktreesRegistry::list`] arrangement.
     ///
+    /// Pauses the window-report liveness clock for `outage`: advances every live
+    /// report's `last_seen` by that long, never past now (#2111).
+    ///
+    /// For a stretch when the daemon could not accept connections, so no window's
+    /// ~10 s refresh could arrive. Without this the first `window` op after the
+    /// outage reaps every other report that has been quiet more than the 30 s TTL,
+    /// and the sessions in those windows flip from `vscode` to `terminal` until each
+    /// window reports again — the same failure
+    /// [`WorktreesRegistry::credit_outage`] fixes for the window registry.
+    ///
+    /// Only window reports are credited. A session's own `last_seen` is not: an
+    /// ended session's linger is measured in wall time, and a live one has a
+    /// five-minute TTL that an outage rarely approaches. Not a visible change, so
+    /// it does not bump the change-notify.
+    ///
+    /// [`WorktreesRegistry::credit_outage`]: crate::worktrees::WorktreesRegistry::credit_outage
+    pub fn credit_window_outage(&self, outage: Duration) {
+        let Ok(credit) = chrono::Duration::from_std(outage) else {
+            return;
+        };
+        let now = Utc::now();
+        for entry in self.lock_windows().values_mut() {
+            // Saturate rather than overflow on an absurd credit.
+            entry.last_seen = entry
+                .last_seen
+                .checked_add_signed(credit)
+                .map_or(now, |credited| credited.min(now));
+        }
+    }
+
     /// [`WorktreesRegistry::list`]: crate::worktrees::WorktreesRegistry::list
     pub fn list(&self) -> Vec<SessionEntry> {
         let now = Utc::now();
@@ -1703,6 +1733,65 @@ mod tests {
             guard.get_mut("w1").unwrap().last_seen = Utc::now() - chrono::Duration::seconds(120);
         }
         assert_eq!(reg.list()[0].source, Source::Terminal);
+    }
+
+    #[test]
+    fn credit_window_outage_keeps_a_report_the_outage_alone_would_have_expired() {
+        let reg = SessionsRegistry::new();
+        let report = |key: &str| WindowReport {
+            key: key.to_string(),
+            folders: vec![PathBuf::from("/p")],
+            tabs: 1,
+            terminals: 0,
+        };
+        reg.report_window(report("kept"));
+        reg.report_window(report("long-gone"));
+        {
+            let mut guard = reg.lock_windows();
+            // 40 s silent is past the 30 s TTL, but 25 s of it was the outage.
+            guard.get_mut("kept").unwrap().last_seen = Utc::now() - chrono::Duration::seconds(40);
+            guard.get_mut("long-gone").unwrap().last_seen =
+                Utc::now() - chrono::Duration::seconds(300);
+        }
+        // Any read reaps; the already-dead report goes before the credit lands.
+        reg.credit_window_outage(Duration::from_secs(25));
+        reg.list();
+        let guard = reg.lock_windows();
+        assert!(guard.contains_key("kept"), "the outage must not age it out");
+        assert!(
+            !guard.contains_key("long-gone"),
+            "a report 300 s silent is dead however long the outage was"
+        );
+    }
+
+    #[test]
+    fn credit_window_outage_never_moves_last_seen_into_the_future() {
+        let reg = SessionsRegistry::new();
+        reg.report_window(WindowReport {
+            key: "w".to_string(),
+            folders: vec![PathBuf::from("/p")],
+            tabs: 1,
+            terminals: 0,
+        });
+        reg.credit_window_outage(Duration::from_secs(3600));
+        assert!(reg.lock_windows()["w"].last_seen <= Utc::now());
+        // A duration chrono cannot represent is ignored, not a panic.
+        reg.credit_window_outage(Duration::MAX);
+        assert!(reg.lock_windows()["w"].last_seen <= Utc::now());
+    }
+
+    #[test]
+    fn credit_window_outage_is_not_a_visible_change() {
+        let reg = SessionsRegistry::new();
+        reg.report_window(WindowReport {
+            key: "w".to_string(),
+            folders: vec![PathBuf::from("/p")],
+            tabs: 1,
+            terminals: 0,
+        });
+        let rx = reg.subscribe_changes();
+        reg.credit_window_outage(Duration::from_secs(5));
+        assert!(!rx.has_changed().unwrap());
     }
 
     /// A window entry covering `/p`, registered `age_secs` ago.

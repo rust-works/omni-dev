@@ -22,6 +22,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -222,6 +223,10 @@ impl DaemonService for SessionsService {
             summary,
             detail: json!({ "sessions": sessions }),
         }
+    }
+
+    fn credit_accept_outage(&self, outage: Duration) {
+        self.registry.credit_window_outage(outage);
     }
 
     async fn shutdown(&self) {
@@ -506,6 +511,31 @@ mod tests {
         assert_eq!(removed, json!({ "removed": true }));
         let listed = svc.handle("list", Value::Null).await.unwrap();
         assert_eq!(listed["sessions"][0]["source"]["kind"], "terminal");
+    }
+
+    /// The adapter forwards a daemon-level accept outage (#2111) to the registry's
+    /// window reports — covered in depth in `crate::sessions`; here it just has to
+    /// reach them and leave a live report live, so the session keeps its window.
+    #[tokio::test]
+    async fn credit_accept_outage_reaches_the_window_reports_without_dropping_a_live_one() {
+        let svc = service();
+        svc.handle(
+            "observe",
+            json!({ "session_id": "s1", "event": "pre_tool_use", "cwd": "/home/me/proj/sub" }),
+        )
+        .await
+        .unwrap();
+        svc.handle(
+            "window",
+            json!({ "key": "w1", "folders": ["/home/me/proj"], "tabs": 1, "terminals": 0 }),
+        )
+        .await
+        .unwrap();
+
+        svc.credit_accept_outage(std::time::Duration::from_secs(5));
+
+        let listed = svc.handle("list", Value::Null).await.unwrap();
+        assert_eq!(listed["sessions"][0]["source"]["window_key"], "w1");
     }
 
     #[tokio::test]
