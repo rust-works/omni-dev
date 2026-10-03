@@ -10,8 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-03
+
+### Added
+- **Terminal in Editor profile** ([#1683](https://github.com/rust-works/omni-dev/issues/1683)): the terminal **+ ▾** menu gains an entry that creates a fresh, focused shell terminal as an editor tab, using the normal shell and working-directory configuration.
+- **Session diagnostics** ([#1447](https://github.com/rust-works/omni-dev/issues/1447)): the companion reports rejected and malformed session frames, so a stale or missing session cue is diagnosable without persisting conversation content. Pairs with the daemon's configurable `daemon.log_level`; see [session troubleshooting](https://github.com/rust-works/omni-dev/blob/main/docs/sessions-service.md#troubleshooting).
+
 ### Changed
 - **Worktree session cues use the description and row colour** ([#1455](https://github.com/rust-works/omni-dev/issues/1455)): session counts no longer repeat in a file-decoration badge. The row description and tooltip retain the complete session breakdown; session state still contributes to the row colour with the existing waiting > working > idle priority. A single decoration provider displays only the PR-check badge, with the unchanged combined check/session colour.
+
+### Fixed
+- **Rebase completion reports partial skips** ([#1459](https://github.com/rust-works/omni-dev/issues/1459)): a mixed batch now shows the skipped worktree count and grouped reasons alongside the successful rebases. Structural skips raise a warning, fetch failures keep error priority, and the summary reflects the daemon's execution-time results.
 
 ## [0.10.0] - 2026-09-29
 
