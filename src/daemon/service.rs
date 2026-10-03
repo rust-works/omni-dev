@@ -8,6 +8,8 @@
 //! `daemon status` ([`status`](DaemonService::status)), and participates in
 //! graceful shutdown ([`shutdown`](DaemonService::shutdown)). See ADR-0039.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -60,6 +62,17 @@ pub trait DaemonService: Send + Sync {
     /// Gracefully stops the service, draining in-flight work. Called once on
     /// daemon shutdown.
     async fn shutdown(&self);
+
+    /// Told that the control socket could not accept connections for `outage`
+    /// (descriptor exhaustion, #2111), so no client could have reached this
+    /// service for that long.
+    ///
+    /// A service that ages entries out by how long a client has been silent should
+    /// credit the outage, or it will blame clients for silence the daemon caused.
+    /// The default does nothing, which is right for a service with no such
+    /// liveness clock. Called from the accept loop, so it must be cheap and must
+    /// not block.
+    fn credit_accept_outage(&self, _outage: Duration) {}
 }
 
 /// A live push stream a service exposes for a subscription op.

@@ -320,6 +320,32 @@ impl WorktreesRegistry {
         self.bump();
     }
 
+    /// Pauses the liveness clock for `outage`: advances every live entry's
+    /// `last_seen` by that long, never past now.
+    ///
+    /// For a stretch when the daemon could not hear its windows — its `accept`
+    /// loop was failing (#2111) — so their silence says nothing about whether they
+    /// are alive. Without this the first heartbeat after an outage reaps every
+    /// *other* window that has been quiet more than the TTL, before it has had a
+    /// chance to send its own, and whole repos vanish from the tree for a few
+    /// seconds. Only entries still in the map are credited: an entry that was
+    /// already reaped stays gone, and one that was already stale before the outage
+    /// began is credited no more than its neighbours. Not a visible change, so it
+    /// does not bump the change-notify.
+    pub fn credit_outage(&self, outage: Duration) {
+        let Ok(credit) = ChronoDuration::from_std(outage) else {
+            return;
+        };
+        let now = Utc::now();
+        for entry in self.lock().values_mut() {
+            // Saturate rather than overflow on an absurd credit.
+            entry.last_seen = entry
+                .last_seen
+                .checked_add_signed(credit)
+                .map_or(now, |credited| credited.min(now));
+        }
+    }
+
     /// Refreshes a window's liveness. Returns whether the key was known: a
     /// `false` tells a window that started before the daemon — or survived a
     /// daemon restart — to re-`register`, since the registry is in-memory and
@@ -890,6 +916,66 @@ mod tests {
         reap(&mut windows, DEFAULT_TTL, now);
         assert!(windows.contains_key("fresh"));
         assert!(!windows.contains_key("stale"));
+    }
+
+    // --- Outage credit (#2111) ----------------------------------------------
+
+    fn insert_aged(reg: &WorktreesRegistry, key: &str, age_secs: i64) {
+        reg.lock().insert(
+            key.to_string(),
+            entry_at(key, Utc::now() - ChronoDuration::seconds(age_secs)),
+        );
+    }
+
+    #[test]
+    fn credit_outage_keeps_a_window_the_outage_alone_would_have_expired() {
+        let reg = WorktreesRegistry::new();
+        // 40 s silent is past the 30 s TTL, but 25 s of it was the daemon's own
+        // outage, so it has really been silent for 15 s.
+        insert_aged(&reg, "w", 40);
+        reg.credit_outage(Duration::from_secs(25));
+        assert_eq!(reg.list().len(), 1, "an outage must not age a window out");
+    }
+
+    #[test]
+    fn without_a_credit_the_same_window_is_reaped() {
+        let reg = WorktreesRegistry::new();
+        insert_aged(&reg, "w", 40);
+        assert!(reg.list().is_empty(), "the control for the test above");
+    }
+
+    #[test]
+    fn credit_outage_does_not_resurrect_a_window_that_was_already_gone() {
+        let reg = WorktreesRegistry::new();
+        insert_aged(&reg, "dead", 120);
+        // Reaped before the credit lands (any read does this).
+        assert!(reg.list().is_empty());
+        reg.credit_outage(Duration::from_secs(300));
+        assert!(reg.list().is_empty());
+    }
+
+    #[test]
+    fn credit_outage_never_moves_last_seen_into_the_future() {
+        let reg = WorktreesRegistry::new();
+        insert_aged(&reg, "w", 1);
+        reg.credit_outage(Duration::from_secs(3600));
+        let after = reg.lock()["w"].last_seen;
+        assert!(after <= Utc::now(), "last_seen is ahead of the clock");
+        // Even a duration chrono cannot represent is harmless.
+        reg.credit_outage(Duration::MAX);
+        assert!(reg.lock()["w"].last_seen <= Utc::now());
+    }
+
+    #[test]
+    fn credit_outage_is_not_a_visible_change() {
+        let reg = WorktreesRegistry::new();
+        insert_aged(&reg, "w", 10);
+        let rx = reg.subscribe_changes();
+        reg.credit_outage(Duration::from_secs(5));
+        assert!(
+            !rx.has_changed().unwrap(),
+            "crediting must not wake every subscriber"
+        );
     }
 
     /// A minimal entry for cap/eviction tests; only `key` and `last_seen`

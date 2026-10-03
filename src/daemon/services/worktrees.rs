@@ -2032,6 +2032,10 @@ impl DaemonService for WorktreesService {
         }
     }
 
+    fn credit_accept_outage(&self, outage: Duration) {
+        self.registry.credit_outage(outage);
+    }
+
     async fn shutdown(&self) {
         // Stop the background menu-refresh task; the registry itself is in-memory
         // with nothing to drain or persist. Take the task out from under the lock
@@ -6887,6 +6891,24 @@ mod tests {
         // A missing/empty `paths` list yields an empty results object, not an error.
         let empty = svc.handle("ahead-behind", json!({})).await.unwrap();
         assert_eq!(empty.get("results"), Some(&json!({})));
+    }
+
+    /// The adapter forwards a daemon-level accept outage to its registry (#2111),
+    /// which is covered in depth in `crate::worktrees`; here it just has to reach it
+    /// and leave a live window live.
+    #[tokio::test]
+    async fn credit_accept_outage_reaches_the_registry_without_dropping_a_live_window() {
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [], "repo": "x" }),
+        )
+        .await
+        .unwrap();
+
+        svc.credit_accept_outage(Duration::from_secs(5));
+
+        assert_eq!(svc.registry.list().len(), 1);
     }
 
     /// Every window asks about the same worktrees at once (#2111): all of those
