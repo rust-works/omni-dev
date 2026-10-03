@@ -11,6 +11,7 @@ use regex::RegexSet;
 use crate::claude::context::{load_config_content, resolve_context_dir_at};
 use crate::coverage::analysis::{analyze_with_markers, Markers};
 use crate::coverage::markers::{self, FileMarkers};
+use crate::coverage::merge::{prefix_mismatch, require_executable_lines};
 use crate::coverage::{
     default_base_ref, parse, render, CoverageReport, DiffModel, DiffScope, Format, OutputFormat,
     RenderOptions,
@@ -71,11 +72,22 @@ impl From<OutputFormatArg> for OutputFormat {
 /// Analyses diff/patch coverage from a per-line report and a git diff.
 #[derive(Parser)]
 pub struct DiffCommand {
-    /// Head coverage report (lcov / llvm-cov-json / cobertura).
-    #[arg(long, value_name = "PATH")]
-    pub report: PathBuf,
+    /// Head coverage report (lcov / llvm-cov-json / cobertura); repeat once per
+    /// shard to merge a sharded run.
+    ///
+    /// Pass one `--report` per shard of a sharded coverage run and
+    /// they are merged before anything is computed. The merge is a union of the
+    /// files and of each file's executable lines, taking the larger hit count
+    /// for a line present in several — so a line any shard covered is covered,
+    /// and a line only one shard instrumented is judged by that shard alone.
+    /// With more than one `--report`, a shard with no executable lines fails the
+    /// run (it would otherwise lower the result unnoticed), and a shard whose
+    /// absolute paths all fall outside the `--strip-prefix` root draws a
+    /// warning. Shard order does not affect the output.
+    #[arg(long, value_name = "PATH", required = true)]
+    pub report: Vec<PathBuf>,
 
-    /// Format of `--report` (auto-detected by default).
+    /// Format of every `--report` (auto-detected by default).
     #[arg(long, value_enum, default_value_t = ReportFormat::Auto)]
     pub report_format: ReportFormat,
 
@@ -264,6 +276,40 @@ fn apply_ignored(report: &mut CoverageReport, markers: &BTreeMap<String, FileMar
     report.retain_lines(|path, line| markers.get(path).is_none_or(|m| !m.ignored.contains(&line)));
 }
 
+/// Resolves a relative report `path` against `repo_root`, so the report and the
+/// git repository always anchor to the same root; an absolute `path` is kept.
+fn anchor(path: &Path, repo_root: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    }
+}
+
+/// Reads and parses the report at `path`, leaving its paths as the tool wrote them.
+fn read_report(path: &Path, format: ReportFormat) -> Result<CoverageReport> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("could not read coverage report {}", path.display()))?;
+    parse(&content, format.into_format())
+        .with_context(|| format!("could not parse coverage report {}", path.display()))
+}
+
+/// Makes `report`'s paths repo-relative, then drops the files `ignore` excludes.
+fn normalise_report(
+    report: &mut CoverageReport,
+    strip_prefix: Option<&Path>,
+    ignore: Option<&RegexSet>,
+) {
+    if let Some(prefix) = strip_prefix {
+        report.strip_prefix(prefix);
+    }
+    // Match on the repo-relative path (post strip-prefix), so the same
+    // pattern applies identically to head and baseline.
+    if let Some(ignore) = ignore {
+        report.retain_paths(|path| !ignore.is_match(path));
+    }
+}
+
 /// Persistent `coverage diff` settings read from `.omni-dev/coverage.yaml`.
 ///
 /// Forward-compatible: unknown top-level keys are ignored, so a newer schema
@@ -301,6 +347,10 @@ pub struct DiffOutcome {
     /// Whether `--fail-under-lines` was set and overall line coverage fell below
     /// it — or could not be measured at all.
     pub below_line_gate: bool,
+    /// Non-fatal problems found while loading the reports (for example a shard
+    /// measured under a different workspace root). [`DiffCommand::execute`]
+    /// prints them to stderr.
+    pub warnings: Vec<String>,
 }
 
 impl DiffCommand {
@@ -314,6 +364,9 @@ impl DiffCommand {
             self.output = format;
         }
         let outcome = self.run(repo)?;
+        for warning in &outcome.warnings {
+            eprintln!("warning: {warning}");
+        }
         println!("{}", outcome.rendered);
         let failures = self.gate_failures(&outcome);
         if !failures.is_empty() {
@@ -377,12 +430,12 @@ impl DiffCommand {
         let config_ignore = self.load_config_ignore(&repo_path)?;
         let ignore = self.compile_ignore(&config_ignore)?;
 
-        let head = self.load_report(
-            &self.report,
-            self.report_format,
+        let mut warnings = Vec::new();
+        let head = self.load_head(
             strip_prefix.as_deref(),
             ignore.as_ref(),
             &repo_path,
+            &mut warnings,
         )?;
         let baseline = match &self.baseline_report {
             Some(path) => Some(self.load_report(
@@ -450,7 +503,43 @@ impl DiffCommand {
             below_gate,
             line_percent,
             below_line_gate,
+            warnings,
         })
+    }
+
+    /// Loads the head report: one `--report`, or the merge of every shard.
+    ///
+    /// Each shard is read and, when there is more than one, checked **as parsed**
+    /// — an empty one fails, one under a different workspace root is noted in
+    /// `warnings` — then normalised exactly like a lone report and merged. The
+    /// merge is a union, so shard order cannot change the result.
+    fn load_head(
+        &self,
+        strip_prefix: Option<&Path>,
+        ignore: Option<&RegexSet>,
+        repo_root: &Path,
+        warnings: &mut Vec<String>,
+    ) -> Result<CoverageReport> {
+        anyhow::ensure!(
+            !self.report.is_empty(),
+            "at least one coverage report is required"
+        );
+        let sharded = self.report.len() > 1;
+        let mut merged = CoverageReport::new();
+        for path in &self.report {
+            let path = anchor(path, repo_root);
+            let mut report = read_report(&path, self.report_format)?;
+            if sharded {
+                let label = path.display().to_string();
+                require_executable_lines(&label, &report)?;
+                if let Some(prefix) = strip_prefix {
+                    warnings.extend(prefix_mismatch(&label, &report, prefix));
+                }
+            }
+            normalise_report(&mut report, strip_prefix, ignore);
+            merged.merge(report);
+        }
+        Ok(merged)
     }
 
     /// Reads and parses a coverage report, normalising paths to be repo-relative.
@@ -460,29 +549,14 @@ impl DiffCommand {
     /// used as-is.
     fn load_report(
         &self,
-        path: &std::path::Path,
+        path: &Path,
         format: ReportFormat,
-        strip_prefix: Option<&std::path::Path>,
+        strip_prefix: Option<&Path>,
         ignore: Option<&RegexSet>,
         repo_root: &Path,
-    ) -> Result<crate::coverage::CoverageReport> {
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            repo_root.join(path)
-        };
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("could not read coverage report {}", path.display()))?;
-        let mut report = parse(&content, format.into_format())
-            .with_context(|| format!("could not parse coverage report {}", path.display()))?;
-        if let Some(prefix) = strip_prefix {
-            report.strip_prefix(prefix);
-        }
-        // Match on the repo-relative path (post strip-prefix), so the same
-        // pattern applies identically to head and baseline.
-        if let Some(ignore) = ignore {
-            report.retain_paths(|path| !ignore.is_match(path));
-        }
+    ) -> Result<CoverageReport> {
+        let mut report = read_report(&anchor(path, repo_root), format)?;
+        normalise_report(&mut report, strip_prefix, ignore);
         Ok(report)
     }
 
@@ -650,7 +724,7 @@ mod tests {
     /// repository root is supplied separately to `run`/`execute`.
     fn command(report: PathBuf, base_ref: &str) -> DiffCommand {
         DiffCommand {
-            report,
+            report: vec![report],
             report_format: ReportFormat::Auto,
             base_ref: Some(base_ref.to_string()),
             head_ref: None,
@@ -1084,6 +1158,251 @@ mod tests {
                 .unwrap();
         assert_eq!(cmd.fail_under_lines, Some(80.0));
         assert_eq!(cmd.fail_under_patch, None);
+    }
+
+    // ── sharded reports (#2114) ──────────────────────────────────────────
+
+    /// Writes an lcov shard under `repo`: `a.rs` covered at line 1, and `b.rs`
+    /// with the given `(line, hits)` records.
+    fn write_shard(repo: &Path, name: &str, b_lines: &[(u32, u64)]) -> PathBuf {
+        use std::fmt::Write as _;
+        let mut lcov = format!(
+            "SF:{}\nDA:1,1\nend_of_record\nSF:{}\n",
+            repo.join("a.rs").display(),
+            repo.join("b.rs").display()
+        );
+        for (line, hits) in b_lines {
+            let _ = writeln!(lcov, "DA:{line},{hits}");
+        }
+        lcov.push_str("end_of_record\n");
+        let path = repo.join(name);
+        fs::write(&path, lcov).unwrap();
+        path
+    }
+
+    /// A command reading several shard reports.
+    fn sharded(reports: Vec<PathBuf>, base: &str) -> DiffCommand {
+        let mut cmd = command(PathBuf::new(), base);
+        cmd.report = reports;
+        cmd
+    }
+
+    #[test]
+    fn shards_are_merged_before_the_patch_is_computed() {
+        // The shards cover different lines of `b.rs`: each alone leaves two of
+        // its three added lines uncovered, but together only line 3 is.
+        let (_dir, repo, base) = repo_with_added_file();
+        let one = write_shard(&repo, "one.lcov", &[(1, 1), (2, 0), (3, 0)]);
+        let two = write_shard(&repo, "two.lcov", &[(1, 0), (2, 1), (3, 0)]);
+
+        for alone in [&one, &two] {
+            let outcome = sharded(vec![alone.clone()], &base)
+                .run(Some(&repo))
+                .unwrap();
+            assert_eq!(outcome.patch_percent, Some(1.0 / 3.0 * 100.0));
+        }
+        let outcome = sharded(vec![one, two], &base).run(Some(&repo)).unwrap();
+        assert_eq!(outcome.patch_percent, Some(2.0 / 3.0 * 100.0));
+        // `a.rs` line 1, and `b.rs` lines 1 and 2, are covered; `b.rs` line 3 is not.
+        assert_eq!(outcome.line_percent, Some(75.0));
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    }
+
+    #[test]
+    fn shard_order_does_not_change_the_output() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let one = write_shard(&repo, "one.lcov", &[(1, 1), (2, 0), (3, 0)]);
+        let two = write_shard(&repo, "two.lcov", &[(1, 0), (2, 1), (3, 0)]);
+        let forward = sharded(vec![one.clone(), two.clone()], &base)
+            .run(Some(&repo))
+            .unwrap();
+        let reverse = sharded(vec![two, one], &base).run(Some(&repo)).unwrap();
+        assert_eq!(forward.rendered, reverse.rendered);
+        assert_eq!(forward.line_percent, reverse.line_percent);
+    }
+
+    #[test]
+    fn shards_of_different_formats_are_merged() {
+        // An lcov shard and an llvm-cov JSON shard, each auto-detected. The JSON
+        // region is uncovered over `b.rs` lines 2-4 (line 4 exists only there).
+        // Merged: line 2 stays covered (max of 1 and 0), line 4 is added
+        // uncovered, so 3 of 5 lines are covered — a figure neither shard alone
+        // (3/4 and 0/3) nor a "last shard wins" replacement (1/4) would give.
+        let (_dir, repo, base) = repo_with_added_file();
+        let lcov = write_shard(&repo, "one.lcov", &[(1, 1), (2, 1), (3, 0)]);
+        let json = repo.join("two.json");
+        fs::write(
+            &json,
+            serde_json::json!({
+                "data": [{ "files": [{
+                    "filename": repo.join("b.rs").display().to_string(),
+                    "segments": [
+                        [2, 1, 0, true, true, false],
+                        [4, 1, 0, false, false, false]
+                    ]
+                }]}],
+                "type": "llvm.coverage.json.export",
+                "version": "2.0.1"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let outcome = sharded(vec![lcov, json], &base).run(Some(&repo)).unwrap();
+        assert_eq!(outcome.line_percent, Some(60.0));
+        assert_eq!(outcome.patch_percent, Some(2.0 / 3.0 * 100.0));
+    }
+
+    #[test]
+    fn a_shard_with_no_executable_lines_fails_the_run_by_name() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let one = write_shard(&repo, "one.lcov", &[(1, 1), (2, 1), (3, 1)]);
+        // A parseable lcov whose blocks list no lines: the shape of a failed run.
+        let two = repo.join("two.lcov");
+        fs::write(&two, "TN:\nSF:b.rs\nend_of_record\n").unwrap();
+        let message = sharded(vec![one, two], &base)
+            .run(Some(&repo))
+            .err()
+            .expect("an empty shard must fail the run")
+            .to_string();
+        assert!(message.contains("two.lcov"), "{message}");
+        assert!(message.contains("no executable lines"), "{message}");
+    }
+
+    #[test]
+    fn an_unparseable_shard_fails_the_run_by_name() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let one = write_shard(&repo, "one.lcov", &[(1, 1), (2, 1), (3, 1)]);
+        let two = repo.join("two.lcov");
+        fs::write(&two, "").unwrap();
+        let message = format!(
+            "{:#}",
+            sharded(vec![one, two], &base)
+                .run(Some(&repo))
+                .err()
+                .expect("an empty file must fail the run")
+        );
+        assert!(message.contains("two.lcov"), "{message}");
+    }
+
+    #[test]
+    fn a_missing_shard_fails_the_run() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let one = write_shard(&repo, "one.lcov", &[(1, 1), (2, 1), (3, 1)]);
+        let message = sharded(vec![one, repo.join("shard-2.lcov")], &base)
+            .run(Some(&repo))
+            .err()
+            .expect("a shard that never uploaded must fail the run")
+            .to_string();
+        assert!(message.contains("shard-2.lcov"), "{message}");
+    }
+
+    #[test]
+    fn a_lone_report_with_no_lines_is_still_accepted() {
+        // The empty-shard check applies to a *set* of shards. A single report
+        // keeps its pre-sharding behaviour (`--fail-under-lines` is what rejects
+        // an empty one), so no existing invocation starts failing.
+        let (_dir, repo, base) = repo_with_added_file();
+        let empty = repo.join("empty.lcov");
+        fs::write(&empty, "TN:\nSF:b.rs\nend_of_record\n").unwrap();
+        let outcome = sharded(vec![empty], &base).run(Some(&repo)).unwrap();
+        assert_eq!(outcome.line_percent, None);
+    }
+
+    #[test]
+    fn a_shard_whose_files_are_all_ignored_is_not_empty() {
+        // The check runs on the parsed shard, before `--ignore-filename-regex`:
+        // a shard that only covers excluded files is healthy, not failed.
+        let (_dir, repo, base) = repo_with_added_file();
+        let one = write_shard(&repo, "one.lcov", &[(1, 1), (2, 1), (3, 1)]);
+        let two = repo.join("two.lcov");
+        fs::write(
+            &two,
+            format!(
+                "SF:{}\nDA:1,1\nend_of_record\n",
+                repo.join("a.rs").display()
+            ),
+        )
+        .unwrap();
+        let mut cmd = sharded(vec![one, two], &base);
+        cmd.ignore_filename_regex = vec![r"a\.rs".to_string()];
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        assert_eq!(outcome.line_percent, Some(100.0));
+    }
+
+    #[test]
+    fn a_shard_under_another_root_warns_but_still_runs() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let one = write_shard(&repo, "one.lcov", &[(1, 1), (2, 1), (3, 1)]);
+        let two = repo.join("two.lcov");
+        fs::write(
+            &two,
+            "SF:/some/other/runner/b.rs\nDA:1,1\nDA:2,1\nend_of_record\n",
+        )
+        .unwrap();
+        let outcome = sharded(vec![one, two], &base).run(Some(&repo)).unwrap();
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(outcome.warnings[0].contains("two.lcov"));
+        assert!(outcome.warnings[0].contains("--strip-prefix"));
+    }
+
+    #[test]
+    fn execute_reports_shard_warnings_without_failing() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let one = write_shard(&repo, "one.lcov", &[(1, 1), (2, 1), (3, 1)]);
+        let two = repo.join("two.lcov");
+        fs::write(&two, "SF:/some/other/runner/b.rs\nDA:1,1\nend_of_record\n").unwrap();
+        // The warning goes to stderr and the run still succeeds.
+        sharded(vec![one, two], &base).execute(Some(&repo)).unwrap();
+    }
+
+    #[test]
+    fn a_lone_report_under_another_root_does_not_warn() {
+        // Nothing disagrees when there is only one report, and the pre-sharding
+        // output stays byte-identical for existing invocations.
+        let (_dir, repo, base) = repo_with_added_file();
+        let only = repo.join("only.lcov");
+        fs::write(&only, "SF:/some/other/runner/b.rs\nDA:1,1\nend_of_record\n").unwrap();
+        let outcome = sharded(vec![only], &base).run(Some(&repo)).unwrap();
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn an_empty_report_list_is_an_error() {
+        // clap requires one `--report`; a programmatic caller (MCP) is checked here.
+        let (_dir, repo, base) = repo_with_added_file();
+        let message = sharded(Vec::new(), &base)
+            .run(Some(&repo))
+            .err()
+            .expect("no report at all must fail")
+            .to_string();
+        assert!(
+            message.contains("at least one coverage report"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn report_is_repeatable_and_still_required() {
+        use clap::Parser;
+        let cmd = DiffCommand::try_parse_from([
+            "diff",
+            "--report",
+            "one.lcov",
+            "--report",
+            "two.lcov",
+            "--report",
+            "three.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd.report,
+            vec![
+                PathBuf::from("one.lcov"),
+                PathBuf::from("two.lcov"),
+                PathBuf::from("three.json")
+            ]
+        );
+        assert!(DiffCommand::try_parse_from(["diff"]).is_err());
     }
 
     #[test]

@@ -74,7 +74,14 @@ impl From<CoverageOutputFormat> for OutputFormatArg {
 pub struct CoverageDiffParams {
     /// Head coverage report path (lcov / llvm-cov-json / cobertura). Required.
     pub report: String,
-    /// Format of `report` (auto-detected by default).
+    /// Further shard reports to merge with `report` when the coverage run was
+    /// split across jobs. The merge is a union of files and executable lines,
+    /// taking the larger hit count per line; a shard with no executable lines is
+    /// an error.
+    #[serde(default)]
+    pub additional_reports: Vec<String>,
+    /// Format of `report` and of every additional report (auto-detected by
+    /// default).
     #[serde(default)]
     pub report_format: CoverageReportFormat,
     /// Base revision to diff against (default: merge-base of `origin/main` and
@@ -162,7 +169,10 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let repo_path = params.repo_path.clone().map(PathBuf::from);
         let cmd = DiffCommand {
-            report: PathBuf::from(params.report),
+            report: std::iter::once(params.report)
+                .chain(params.additional_reports)
+                .map(PathBuf::from)
+                .collect(),
             report_format: params.report_format.into(),
             base_ref: params.base_ref,
             head_ref: params.head_ref,
@@ -209,8 +219,21 @@ fn format_coverage_payload(outcome: &DiffOutcome) -> String {
         .map(|line| format!("  {line}"))
         .collect::<Vec<_>>()
         .join("\n");
+    // JSON strings are valid YAML double-quoted scalars, so a warning containing
+    // `:` or quotes stays one list item.
+    let warnings = if outcome.warnings.is_empty() {
+        String::new()
+    } else {
+        let items = outcome
+            .warnings
+            .iter()
+            .map(|w| format!("  - {}", serde_json::to_string(w).unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("warnings:\n{items}\n")
+    };
     format!(
-        "# coverage_diff outcome\npatch_percent: {}\nbelow_gate: {}\nline_percent: {}\nbelow_line_gate: {}\nrendered: |\n{rendered}",
+        "# coverage_diff outcome\npatch_percent: {}\nbelow_gate: {}\nline_percent: {}\nbelow_line_gate: {}\n{warnings}rendered: |\n{rendered}",
         percent(outcome.patch_percent),
         outcome.below_gate,
         percent(outcome.line_percent),
@@ -247,12 +270,14 @@ mod tests {
             below_gate: false,
             line_percent: Some(61.25),
             below_line_gate: true,
+            warnings: vec!["shard \"b.lcov\": looks off".to_string()],
         };
         let payload = format_coverage_payload(&outcome);
         assert!(payload.contains("patch_percent: 87.5000"));
         assert!(payload.contains("below_gate: false"));
         assert!(payload.contains("line_percent: 61.2500"));
         assert!(payload.contains("below_line_gate: true"));
+        assert!(payload.contains("warnings:\n  - \"shard \\\"b.lcov\\\": looks off\""));
         assert!(payload.contains("  line1"));
         assert!(payload.contains("  line2"));
     }
@@ -265,12 +290,14 @@ mod tests {
             below_gate: true,
             line_percent: None,
             below_line_gate: false,
+            warnings: Vec::new(),
         };
         let payload = format_coverage_payload(&outcome);
         assert!(payload.contains("patch_percent: null"));
         assert!(payload.contains("below_gate: true"));
         assert!(payload.contains("line_percent: null"));
         assert!(payload.contains("below_line_gate: false"));
+        assert!(!payload.contains("warnings:"), "{payload}");
     }
 
     #[test]
@@ -318,6 +345,7 @@ mod tests {
         let server = OmniDevServer::new();
         let params = CoverageDiffParams {
             report: "/no/such/report.info".to_string(),
+            additional_reports: Vec::new(),
             report_format: CoverageReportFormat::Auto,
             base_ref: None,
             head_ref: None,

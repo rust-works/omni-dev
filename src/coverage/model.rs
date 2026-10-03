@@ -92,6 +92,20 @@ impl CoverageReport {
         }
     }
 
+    /// Merges `other` into this report: the files are unioned and a line present
+    /// in both takes the larger hit count.
+    ///
+    /// This is the rule for combining the reports of a sharded coverage run. It
+    /// is a union, so a line only one report instrumented keeps that report's
+    /// count rather than being scored against the other. Hit counts are maxed,
+    /// not summed: coverage is a covered-or-not question and nothing in the
+    /// line-coverage output reads the count itself.
+    pub fn merge(&mut self, other: Self) {
+        for file in other.files.into_values() {
+            self.insert(file);
+        }
+    }
+
     /// Hit count for `path`:`line`, or `None` when the line is not instrumented
     /// (or the file is absent from the report).
     pub fn hits(&self, path: &str, line: u32) -> Option<u64> {
@@ -254,6 +268,57 @@ mod tests {
         assert_eq!(report.files.len(), 1);
         assert_eq!(report.hits("src/a.rs", 1), Some(2));
         assert_eq!(report.hits("src/a.rs", 2), Some(1));
+    }
+
+    #[test]
+    fn merge_unions_files_and_takes_the_max_per_line() {
+        let mut shard_a = CoverageReport::new();
+        let mut a = FileCoverage::new("src/shared.rs");
+        a.record(1, 3);
+        a.record(2, 0);
+        shard_a.insert(a);
+        let mut only_a = FileCoverage::new("src/only_a.rs");
+        only_a.record(1, 1);
+        shard_a.insert(only_a);
+
+        let mut shard_b = CoverageReport::new();
+        let mut b = FileCoverage::new("src/shared.rs");
+        b.record(1, 0);
+        b.record(2, 7);
+        b.record(3, 0);
+        shard_b.insert(b);
+        let mut only_b = FileCoverage::new("src/only_b.rs");
+        only_b.record(1, 0);
+        shard_b.insert(only_b);
+
+        shard_a.merge(shard_b);
+
+        assert_eq!(shard_a.files.len(), 3);
+        // Line 1 was hit only in shard A, line 2 only in shard B: both count as covered.
+        assert_eq!(shard_a.hits("src/shared.rs", 1), Some(3));
+        assert_eq!(shard_a.hits("src/shared.rs", 2), Some(7));
+        // A line only one shard instrumented keeps that shard's count.
+        assert_eq!(shard_a.hits("src/shared.rs", 3), Some(0));
+        assert_eq!(shard_a.hits("src/only_a.rs", 1), Some(1));
+        assert_eq!(shard_a.hits("src/only_b.rs", 1), Some(0));
+    }
+
+    #[test]
+    fn merge_is_order_independent() {
+        let report = |lines: &[(u32, u64)]| {
+            let mut r = CoverageReport::new();
+            let mut f = FileCoverage::new("src/a.rs");
+            for &(line, hits) in lines {
+                f.record(line, hits);
+            }
+            r.insert(f);
+            r
+        };
+        let mut ab = report(&[(1, 1), (2, 0)]);
+        ab.merge(report(&[(1, 0), (2, 4)]));
+        let mut ba = report(&[(1, 0), (2, 4)]);
+        ba.merge(report(&[(1, 1), (2, 0)]));
+        assert_eq!(ab, ba);
     }
 
     #[test]

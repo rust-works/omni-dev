@@ -20,6 +20,7 @@ pub mod format;
 pub mod lcov;
 pub mod llvm_json;
 pub mod markers;
+pub mod merge;
 pub mod model;
 pub mod render;
 
