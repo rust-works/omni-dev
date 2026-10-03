@@ -127,7 +127,9 @@ before obtaining any model answer; it is retained with zero reported usage.
 Each trial directory has compressed exact requests/raw outputs, input label
 metadata, tier order, and a deterministic summary. The full frozen states are
 also in the root input files. No credentials are recorded. All issue inputs
-are from the public `rust-works/succinctly` repository.
+are from the public `rust-works/succinctly` repository. `heldout-default-shape/`
+is left out of the published crate to stay under crates.io's size limit
+(`exclude` in `Cargo.toml`); it is in the source repository.
 
 The paired harness uses identical frozen state and all three built-in class
 ladders. Baseline omits only `open_questions`; augmented includes it once.
