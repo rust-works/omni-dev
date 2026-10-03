@@ -610,6 +610,7 @@ mod tests {
             last_event: SessionEvent::PreToolUse,
             started_at: now,
             last_seen: now,
+            last_active: std::time::Duration::ZERO,
         };
         // A terminal session is a non-clickable label.
         let terminal = menu_items_for(&[base(Source::Terminal)]);
@@ -666,6 +667,7 @@ mod tests {
             last_event: SessionEvent::PreToolUse,
             started_at: now,
             last_seen: now,
+            last_active: std::time::Duration::ZERO,
         }
     }
 

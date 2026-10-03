@@ -44,7 +44,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -69,9 +69,13 @@ pub mod watcher;
 /// long is assumed gone (a `claude` that exited without firing `SessionEnd`)
 /// and reaped on the next read.
 ///
+/// The TTL is measured in *awake* time (#2108): see [`AwakeClock`]. A system
+/// sleep of any length ages no session, so the first read after a wake-up no
+/// longer reaps every live one.
+///
 /// Since #1916, a session whose pid the [`pid_watcher`] has
 /// independently confirmed alive is kept out of this TTL's reach entirely: the
-/// watcher refreshes `last_seen` itself on a schedule of its own, off this
+/// watcher refreshes `last_active` itself on a schedule of its own, off this
 /// lock, so `reap_sessions` never needs to know about pids at all. This TTL is
 /// now the fallback for a session with no pid (older hooks, the transcript
 /// watcher, pi.dev), one the watcher has not yet confirmed, or whose pid it
@@ -91,7 +95,8 @@ const ENDED_SESSION_TTL: Duration = Duration::from_secs(10);
 /// How long a companion window-embedding report survives without a refresh.
 /// Mirrors the worktrees window TTL (three missed ~10s heartbeats): a window
 /// that crashed without unregistering stops tagging its sessions as VS Code
-/// embedded on the next read.
+/// embedded on the next read. Measured in awake time like the session TTL
+/// (#2108): a window cannot heartbeat while the machine sleeps either.
 const DEFAULT_WINDOW_TTL: Duration = Duration::from_secs(30);
 
 /// Ceiling on live session entries, so a runaway feed cannot grow daemon memory
@@ -108,6 +113,58 @@ const MAX_REPLACED_PIDS: usize = 8;
 
 /// Ceiling on live window-embedding reports, mirroring the worktrees registry cap.
 const MAX_WINDOWS: usize = 256;
+
+/// A monotonic clock that stands still while the machine sleeps, so a TTL
+/// measured on it counts only the time the daemon could actually have heard
+/// from a session (#2108).
+///
+/// The wall clock is the wrong ruler for a liveness TTL: while the system sleeps
+/// nothing refreshes a session — no hooks, no Codex lock heartbeat, no pid
+/// watcher — so the first read after a wake-up used to find every entry "stale"
+/// and reap the lot. [`Instant`] does not advance across suspend on the
+/// platforms the daemon runs on (`CLOCK_UPTIME_RAW` on macOS, `CLOCK_MONOTONIC`
+/// on Linux), so entries stamped with it survive a sleep of any length and are
+/// reaped only after a TTL's worth of *awake* silence.
+///
+/// Stamps are a [`Duration`] since the registry was created rather than a raw
+/// [`Instant`], so tests can move the clock forward without subtracting from an
+/// `Instant` (which panics on a host with little uptime).
+#[derive(Debug)]
+struct AwakeClock {
+    /// The registry's creation, the zero of every stamp.
+    base: Instant,
+    /// Test-only extra elapsed time, in milliseconds.
+    #[cfg(test)]
+    skew_ms: std::sync::atomic::AtomicU64,
+}
+
+impl AwakeClock {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            #[cfg(test)]
+            skew_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Awake time elapsed since the registry was created.
+    fn now(&self) -> Duration {
+        let elapsed = self.base.elapsed();
+        #[cfg(test)]
+        let elapsed = elapsed
+            + Duration::from_millis(self.skew_ms.load(std::sync::atomic::Ordering::Relaxed));
+        elapsed
+    }
+
+    /// Moves the clock forward, as if the machine had been awake that long.
+    #[cfg(test)]
+    fn advance(&self, by: Duration) {
+        self.skew_ms.fetch_add(
+            u64::try_from(by.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
 
 /// The coarse, inferred lifecycle state of a Claude Code session.
 ///
@@ -461,8 +518,14 @@ pub struct SessionEntry {
     pub last_event: SessionEvent,
     /// When the session was first observed (RFC 3339).
     pub started_at: DateTime<Utc>,
-    /// When the registry last heard from this session (RFC 3339).
+    /// When the registry last heard from this session (RFC 3339). Wall-clock,
+    /// for display only: liveness is measured on `last_active`.
     pub last_seen: DateTime<Utc>,
+    /// When the registry last heard from this session, on the registry's
+    /// [`AwakeClock`] — the stamp [`reap_sessions`] compares against, so a system
+    /// sleep never ages an entry (#2108).
+    #[serde(skip)]
+    pub(crate) last_active: Duration,
     /// The agent process that owns the session: the pid of its latest
     /// pid-bearing sighting that did not come from a replaced process.
     #[serde(skip)]
@@ -577,8 +640,11 @@ pub(crate) struct PidCandidate {
 struct WindowEntry {
     /// The report as sent by the companion.
     report: WindowReport,
-    /// When the report last arrived (register or refresh).
-    last_seen: DateTime<Utc>,
+    /// When the report last arrived (register or refresh), on the registry's
+    /// [`AwakeClock`]. [`reap_windows`] compares against it, so a system sleep
+    /// never ages a window report (#2108); a window's wall-clock arrival time is
+    /// shown nowhere, so none is kept.
+    last_active: Duration,
     /// When this key first registered, preserved across refreshes. Ranks
     /// overlapping windows in [`pick_window`] (#1451): a reload registers a new
     /// key, so it outranks the stale predecessor still inside its TTL, while
@@ -604,6 +670,8 @@ pub struct SessionsRegistry {
     ended_ttl: Duration,
     /// How long a window-embedding report survives without a refresh.
     window_ttl: Duration,
+    /// The clock every TTL is measured on; see [`AwakeClock`].
+    clock: AwakeClock,
     /// A monotonically-bumped version counter, incremented whenever the state a
     /// subscriber renders changes. A push-subscription consumer holds a
     /// [`watch::Receiver`] from [`subscribe_changes`](Self::subscribe_changes)
@@ -630,6 +698,7 @@ impl SessionsRegistry {
             session_ttl: DEFAULT_SESSION_TTL,
             ended_ttl: ENDED_SESSION_TTL,
             window_ttl: DEFAULT_WINDOW_TTL,
+            clock: AwakeClock::new(),
             changes: watch::channel(0).0,
         }
     }
@@ -700,9 +769,10 @@ impl SessionsRegistry {
         let agent = req.agent;
         let pid = req.pid;
         let now = Utc::now();
+        let awake = self.clock.now();
         let (changed, old_state, new_state, outcome, reaped) = {
             let mut sessions = self.lock_sessions();
-            let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, now);
+            let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, awake);
             let old_state = sessions.get(&session_id).map(|entry| entry.state);
             let mut outcome = "created";
             let mutated = match sessions.get_mut(&req.session_id) {
@@ -739,6 +809,7 @@ impl SessionsRegistry {
                     entry.state = next;
                     entry.last_event = req.event;
                     entry.last_seen = now;
+                    entry.last_active = awake;
                     // Bound to locals rather than folded into the `||` below: every
                     // field must be filled, and short-circuiting would skip the rest.
                     let filled_cwd = fill(&mut entry.cwd, req.cwd);
@@ -782,6 +853,7 @@ impl SessionsRegistry {
                         last_event: req.event,
                         started_at: now,
                         last_seen: now,
+                        last_active: awake,
                         pid: req.pid,
                         pid_start: None,
                         prompted,
@@ -823,9 +895,10 @@ impl SessionsRegistry {
     /// longer owns.
     pub fn end(&self, session_id: &str, _reason: Option<&str>, pid: Option<u32>) -> bool {
         let now = Utc::now();
+        let awake = self.clock.now();
         let (known, reaped, old_state, outcome) = {
             let mut sessions = self.lock_sessions();
-            let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, now);
+            let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, awake);
             let old_state = sessions.get(session_id).map(|entry| entry.state);
             let mut outcome = "unknown";
             let known = match sessions.get_mut(session_id) {
@@ -846,6 +919,7 @@ impl SessionsRegistry {
                     entry.state = SessionState::Ended;
                     entry.last_event = SessionEvent::Stop;
                     entry.last_seen = now;
+                    entry.last_active = awake;
                     (true, true)
                 }
                 None => (false, false),
@@ -906,10 +980,12 @@ impl SessionsRegistry {
         now: DateTime<Utc>,
         pid_start: &str,
     ) {
+        let awake = self.clock.now();
         let mut sessions = self.lock_sessions();
         if let Some(entry) = sessions.get_mut(session_id) {
             if entry.state != SessionState::Ended {
                 entry.last_seen = now;
+                entry.last_active = awake;
                 if entry.pid_start.is_none() {
                     entry.pid_start = Some(pid_start.to_string());
                 }
@@ -929,9 +1005,10 @@ impl SessionsRegistry {
         let window_key = report.key.clone();
         let folder_count = report.folders.len();
         let now = Utc::now();
+        let awake = self.clock.now();
         let (changed, outcome, reaped) = {
             let mut windows = self.lock_windows();
-            let reaped = reap_windows(&mut windows, self.window_ttl, now);
+            let reaped = reap_windows(&mut windows, self.window_ttl, awake);
             let outcome = if windows.contains_key(&report.key) {
                 "refresh"
             } else {
@@ -953,7 +1030,7 @@ impl SessionsRegistry {
                 report.key.clone(),
                 WindowEntry {
                     report,
-                    last_seen: now,
+                    last_active: awake,
                     registered_at,
                 },
             );
@@ -993,7 +1070,7 @@ impl SessionsRegistry {
     }
 
     /// Pauses the window-report liveness clock for `outage`: advances every live
-    /// report's `last_seen` by that long, never past now (#2111).
+    /// report's `last_active` by that long, never past now (#2111).
     ///
     /// For a stretch when the daemon could not accept connections, so no window's
     /// ~10 s refresh could arrive. Without this the first `window` op after the
@@ -1002,23 +1079,25 @@ impl SessionsRegistry {
     /// window reports again — the same failure
     /// [`WorktreesRegistry::credit_outage`] fixes for the window registry.
     ///
-    /// Only window reports are credited. A session's own `last_seen` is not: an
-    /// ended session's linger is measured in wall time, and a live one has a
-    /// five-minute TTL that an outage rarely approaches. Not a visible change, so
+    /// `outage` is measured on a monotonic [`Instant`](std::time::Instant), the
+    /// same awake time as the [`AwakeClock`] the reports are stamped on, so the
+    /// two compose: the credit shifts a stamp by time the daemon was awake but
+    /// deaf, and a system sleep still ages nothing (#2108).
+    ///
+    /// Only window reports are credited. A session's own `last_active` is not: a
+    /// live one has a five-minute TTL that an outage rarely approaches, and an
+    /// ended one's short linger is not worth stretching. Not a visible change, so
     /// it does not bump the change-notify.
     ///
     /// [`WorktreesRegistry::credit_outage`]: crate::worktrees::WorktreesRegistry::credit_outage
     pub fn credit_window_outage(&self, outage: Duration) {
-        let Ok(credit) = chrono::Duration::from_std(outage) else {
-            return;
-        };
-        let now = Utc::now();
+        let awake = self.clock.now();
         for entry in self.lock_windows().values_mut() {
             // Saturate rather than overflow on an absurd credit.
-            entry.last_seen = entry
-                .last_seen
-                .checked_add_signed(credit)
-                .map_or(now, |credited| credited.min(now));
+            entry.last_active = entry
+                .last_active
+                .checked_add(outage)
+                .map_or(awake, |credited| credited.min(awake));
         }
     }
 
@@ -1039,15 +1118,15 @@ impl SessionsRegistry {
     ///
     /// [`WorktreesRegistry::list`]: crate::worktrees::WorktreesRegistry::list
     pub fn list(&self) -> Vec<SessionEntry> {
-        let now = Utc::now();
+        let awake = self.clock.now();
         let mut sessions: Vec<SessionEntry> = {
             let mut guard = self.lock_sessions();
-            reap_sessions(&mut guard, self.session_ttl, self.ended_ttl, now);
+            reap_sessions(&mut guard, self.session_ttl, self.ended_ttl, awake);
             guard.values().cloned().collect()
         };
         let windows: Vec<WindowEntry> = {
             let mut guard = self.lock_windows();
-            reap_windows(&mut guard, self.window_ttl, now);
+            reap_windows(&mut guard, self.window_ttl, awake);
             guard
                 .values()
                 .filter(|e| e.report.has_embedding())
@@ -1074,9 +1153,9 @@ impl SessionsRegistry {
             let sessions = self.lock_sessions();
             sessions.get(session_id).and_then(|e| e.cwd.clone())
         }?;
-        let now = Utc::now();
+        let awake = self.clock.now();
         let mut windows = self.lock_windows();
-        reap_windows(&mut windows, self.window_ttl, now);
+        reap_windows(&mut windows, self.window_ttl, awake);
         pick_window(&cwd, windows.values().filter(|e| e.report.has_embedding()))
             .and_then(|w| w.folders.first().cloned())
     }
@@ -1216,33 +1295,32 @@ fn is_claude_stream_report(req: &ObserveRequest) -> bool {
     req.agent == Agent::Claude && matches!(req.event, SessionEvent::StreamState(_))
 }
 
-/// Removes sessions last seen longer than their TTL ago (a shorter
-/// [`ended_ttl`](SessionsRegistry::ended_ttl) for `ended` sessions), returning
-/// how many were dropped. Pure CPU; the caller holds the sessions lock but never
-/// `.await`s under it.
+/// Removes sessions last active longer than their TTL ago on the awake clock
+/// (a shorter [`ended_ttl`](SessionsRegistry::ended_ttl) for `ended` sessions),
+/// returning how many were dropped. `awake` is the registry's [`AwakeClock`]
+/// reading, so time spent asleep never counts (#2108). Pure CPU; the caller
+/// holds the sessions lock but never `.await`s under it.
 ///
 /// This TTL is the fallback for a session the [`pid_watcher`] cannot vouch for
 /// (no pid, an unconfirmed pid, or one that has never been prompted) — see
 /// [`DEFAULT_SESSION_TTL`]. A pid the watcher has confirmed alive keeps this
-/// function from ever seeing the entry go stale by refreshing `last_seen`
+/// function from ever seeing the entry go stale by refreshing `last_active`
 /// itself, so no pid-specific logic belongs here: every liveness decision that
 /// needs to inspect a process happens off this lock, in the watcher.
 fn reap_sessions(
     sessions: &mut HashMap<String, SessionEntry>,
     session_ttl: Duration,
     ended_ttl: Duration,
-    now: DateTime<Utc>,
+    awake: Duration,
 ) -> usize {
-    let session_max = session_ttl.as_secs() as i64;
-    let ended_max = ended_ttl.as_secs() as i64;
     let before = sessions.len();
     sessions.retain(|_, e| {
         let max_age = if e.state == SessionState::Ended {
-            ended_max
+            ended_ttl
         } else {
-            session_max
+            session_ttl
         };
-        let keep = (now - e.last_seen).num_seconds() <= max_age;
+        let keep = awake.saturating_sub(e.last_active) <= max_age;
         if !keep {
             tracing::trace!(session_id = %e.session_id, reason = if e.state == SessionState::Ended { "ended_ttl" } else { "session_ttl" }, "session_reaped");
         }
@@ -1255,16 +1333,16 @@ fn reap_sessions(
     count
 }
 
-/// Removes window-embedding reports last refreshed longer than `ttl` ago.
+/// Removes window-embedding reports last refreshed longer than `ttl` ago on the
+/// awake clock.
 fn reap_windows(
     windows: &mut HashMap<String, WindowEntry>,
     ttl: Duration,
-    now: DateTime<Utc>,
+    awake: Duration,
 ) -> usize {
-    let max_age = ttl.as_secs() as i64;
     let before = windows.len();
     windows.retain(|key, e| {
-        let keep = (now - e.last_seen).num_seconds() <= max_age;
+        let keep = awake.saturating_sub(e.last_active) <= ttl;
         if !keep {
             tracing::trace!(window_key = %key, reason = "window_ttl", "session_window_reaped");
         }
@@ -1277,15 +1355,15 @@ fn reap_windows(
     count
 }
 
-/// Removes the session with the oldest `last_seen` (ties broken by lowest
+/// Removes the session with the oldest `last_active` (ties broken by lowest
 /// `session_id` for determinism). Called when a new session would exceed
 /// [`MAX_SESSIONS`].
 fn evict_oldest_session(sessions: &mut HashMap<String, SessionEntry>) {
     let oldest = sessions
         .values()
         .min_by(|a, b| {
-            a.last_seen
-                .cmp(&b.last_seen)
+            a.last_active
+                .cmp(&b.last_active)
                 .then_with(|| a.session_id.cmp(&b.session_id))
         })
         .map(|e| e.session_id.clone());
@@ -1295,12 +1373,16 @@ fn evict_oldest_session(sessions: &mut HashMap<String, SessionEntry>) {
     }
 }
 
-/// Removes the window report with the oldest `last_seen` (ties broken by lowest
+/// Removes the window report with the oldest `last_active` (ties broken by lowest
 /// key). Called when a new window would exceed [`MAX_WINDOWS`].
 fn evict_oldest_window(windows: &mut HashMap<String, WindowEntry>) {
     let oldest = windows
         .iter()
-        .min_by(|a, b| a.1.last_seen.cmp(&b.1.last_seen).then_with(|| a.0.cmp(b.0)))
+        .min_by(|a, b| {
+            a.1.last_active
+                .cmp(&b.1.last_active)
+                .then_with(|| a.0.cmp(b.0))
+        })
         .map(|(k, _)| k.clone());
     if let Some(key) = oldest {
         windows.remove(&key);
@@ -1507,11 +1589,8 @@ mod tests {
         let sessions = reg.list();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].state, SessionState::Ended);
-        // Age the ended entry past the short ended TTL: it reaps out.
-        {
-            let mut guard = reg.lock_sessions();
-            guard.get_mut("s1").unwrap().last_seen = Utc::now() - chrono::Duration::seconds(30);
-        }
+        // Let the ended entry sit awake past the short ended TTL: it reaps out.
+        reg.clock.advance(Duration::from_secs(30));
         assert!(reg.list().is_empty(), "ended entry reaps after ended TTL");
     }
 
@@ -1598,16 +1677,22 @@ mod tests {
         let reg = SessionsRegistry::new();
         reg.observe(observe_from("s1", SessionEvent::UserPromptSubmit, 100));
         let old = Utc::now() - chrono::Duration::seconds(1000);
+        let old_active = reg.lock_sessions()["s1"].last_active;
         {
             let mut guard = reg.lock_sessions();
             guard.get_mut("s1").unwrap().last_seen = old;
         }
+        reg.clock.advance(Duration::from_secs(1000));
 
         reg.confirm_pid_liveness("s1", Utc::now(), "tok-1");
         {
             let guard = reg.lock_sessions();
             let entry = &guard["s1"];
             assert!(entry.last_seen > old, "last_seen should be refreshed");
+            assert!(
+                entry.last_active > old_active + Duration::from_secs(999),
+                "the awake stamp the TTL reads should be refreshed too"
+            );
             assert_eq!(entry.pid_start.as_deref(), Some("tok-1"));
         }
 
@@ -1629,24 +1714,23 @@ mod tests {
         reg.observe(observe_from("s1", SessionEvent::UserPromptSubmit, 100));
         reg.end("s1", None, Some(100));
         let before = reg.lock_sessions()["s1"].last_seen;
+        let before_active = reg.lock_sessions()["s1"].last_active;
+        reg.clock.advance(Duration::from_secs(1));
         reg.confirm_pid_liveness("s1", Utc::now(), "tok");
         assert_eq!(
             reg.lock_sessions()["s1"].last_seen,
             before,
             "an ended session must not be revived by a liveness confirmation"
         );
+        assert_eq!(reg.lock_sessions()["s1"].last_active, before_active);
     }
 
     #[test]
     fn stale_working_session_reaps_but_recent_survives() {
         let reg = SessionsRegistry::new();
-        reg.observe(observe_request("fresh", SessionEvent::PreToolUse, None));
         reg.observe(observe_request("stale", SessionEvent::PreToolUse, None));
-        {
-            let mut guard = reg.lock_sessions();
-            guard.get_mut("stale").unwrap().last_seen =
-                Utc::now() - chrono::Duration::seconds(1000);
-        }
+        reg.clock.advance(Duration::from_secs(1000));
+        reg.observe(observe_request("fresh", SessionEvent::PreToolUse, None));
         let ids: Vec<String> = reg.list().into_iter().map(|s| s.session_id).collect();
         assert_eq!(ids, vec!["fresh".to_string()]);
     }
@@ -1727,11 +1811,8 @@ mod tests {
             tabs: 1,
             terminals: 0,
         });
-        // Age the window report past the window TTL.
-        {
-            let mut guard = reg.lock_windows();
-            guard.get_mut("w1").unwrap().last_seen = Utc::now() - chrono::Duration::seconds(120);
-        }
+        // Let the window report sit awake past the window TTL.
+        reg.clock.advance(Duration::from_secs(120));
         assert_eq!(reg.list()[0].source, Source::Terminal);
     }
 
@@ -1746,12 +1827,16 @@ mod tests {
         };
         reg.report_window(report("kept"));
         reg.report_window(report("long-gone"));
+        // Room on the awake clock to back-date a stamp by minutes.
+        reg.clock.advance(Duration::from_secs(1000));
         {
+            let awake = reg.clock.now();
             let mut guard = reg.lock_windows();
             // 40 s silent is past the 30 s TTL, but 25 s of it was the outage.
-            guard.get_mut("kept").unwrap().last_seen = Utc::now() - chrono::Duration::seconds(40);
-            guard.get_mut("long-gone").unwrap().last_seen =
-                Utc::now() - chrono::Duration::seconds(300);
+            guard.get_mut("kept").unwrap().last_active =
+                awake.saturating_sub(Duration::from_secs(40));
+            guard.get_mut("long-gone").unwrap().last_active =
+                awake.saturating_sub(Duration::from_secs(300));
         }
         // Any read reaps; the already-dead report goes before the credit lands.
         reg.credit_window_outage(Duration::from_secs(25));
@@ -1765,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn credit_window_outage_never_moves_last_seen_into_the_future() {
+    fn credit_window_outage_never_moves_last_active_into_the_future() {
         let reg = SessionsRegistry::new();
         reg.report_window(WindowReport {
             key: "w".to_string(),
@@ -1774,10 +1859,10 @@ mod tests {
             terminals: 0,
         });
         reg.credit_window_outage(Duration::from_secs(3600));
-        assert!(reg.lock_windows()["w"].last_seen <= Utc::now());
-        // A duration chrono cannot represent is ignored, not a panic.
+        assert!(reg.lock_windows()["w"].last_active <= reg.clock.now());
+        // A credit too large to add is saturated to now, not a panic.
         reg.credit_window_outage(Duration::MAX);
-        assert!(reg.lock_windows()["w"].last_seen <= Utc::now());
+        assert!(reg.lock_windows()["w"].last_active <= reg.clock.now());
     }
 
     #[test]
@@ -1799,7 +1884,7 @@ mod tests {
         let now = Utc::now();
         WindowEntry {
             report: window_report(key, "/p", true),
-            last_seen: now,
+            last_active: Duration::ZERO,
             registered_at: now - chrono::Duration::seconds(age_secs),
         }
     }
@@ -1827,7 +1912,7 @@ mod tests {
         let now = Utc::now();
         let at_now = |key: &str| WindowEntry {
             report: window_report(key, "/p", true),
-            last_seen: now,
+            last_active: Duration::ZERO,
             registered_at: now,
         };
         let windows = vec![at_now("w2"), at_now("w1")];
@@ -1865,7 +1950,7 @@ mod tests {
         let now = Utc::now();
         let entry = |key: &str, folder: &str, age_secs: i64| WindowEntry {
             report: window_report(key, folder, true),
-            last_seen: now,
+            last_active: Duration::ZERO,
             registered_at: now - chrono::Duration::seconds(age_secs),
         };
         // `parent` registered later and has the lower key, but `/repo/sub` is the
@@ -1890,11 +1975,12 @@ mod tests {
         let reg = SessionsRegistry::new();
         reg.report_window(window_report("w1", "/p", true));
         let first = reg.lock_windows()["w1"].registered_at;
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        let first_active = reg.lock_windows()["w1"].last_active;
+        reg.clock.advance(Duration::from_secs(5));
         reg.report_window(window_report("w1", "/p", true));
         let guard = reg.lock_windows();
         assert_eq!(guard["w1"].registered_at, first);
-        assert!(guard["w1"].last_seen > first);
+        assert!(guard["w1"].last_active > first_active);
     }
 
     #[test]
@@ -1954,7 +2040,7 @@ mod tests {
     fn evict_oldest_session_drops_the_longest_silent() {
         let now = Utc::now();
         let mut sessions = HashMap::new();
-        for (id, age) in [("young", 0), ("old", 100), ("older", 200)] {
+        for (id, age) in [("young", 0_u64), ("old", 100), ("older", 200)] {
             sessions.insert(
                 id.to_string(),
                 SessionEntry {
@@ -1975,7 +2061,8 @@ mod tests {
                     source: Source::Terminal,
                     last_event: SessionEvent::PreToolUse,
                     started_at: now,
-                    last_seen: now - chrono::Duration::seconds(age),
+                    last_seen: now,
+                    last_active: Duration::from_secs(1000 - age),
                 },
             );
         }
@@ -2226,7 +2313,8 @@ mod tests {
                         source: Source::Terminal,
                         last_event: SessionEvent::PreToolUse,
                         started_at: base,
-                        last_seen: base - chrono::Duration::milliseconds(i as i64),
+                        last_seen: base,
+                        last_active: Duration::from_millis(1_000_000 - i as u64),
                     },
                 );
             }
@@ -2257,7 +2345,7 @@ mod tests {
                             tabs: 1,
                             terminals: 0,
                         },
-                        last_seen: base - chrono::Duration::milliseconds(i as i64),
+                        last_active: Duration::from_millis(1_000_000 - i as u64),
                         registered_at: base,
                     },
                 );
@@ -2280,20 +2368,20 @@ mod tests {
     fn evict_oldest_window_breaks_ties_by_key() {
         let now = Utc::now();
         let mut windows = HashMap::new();
-        let at = |key: &str, secs: i64| WindowEntry {
+        let at = |key: &str, secs: u64| WindowEntry {
             report: WindowReport {
                 key: key.to_string(),
                 folders: vec![],
                 tabs: 1,
                 terminals: 0,
             },
-            last_seen: now - chrono::Duration::seconds(secs),
+            last_active: Duration::from_secs(100 - secs),
             registered_at: now,
         };
         windows.insert("young".to_string(), at("young", 0));
         windows.insert("old-b".to_string(), at("old-b", 10));
         windows.insert("old-a".to_string(), at("old-a", 10));
-        // Oldest `last_seen` is shared; the lowest key loses.
+        // Oldest `last_active` is shared; the lowest key loses.
         evict_oldest_window(&mut windows);
         assert!(!windows.contains_key("old-a"));
         assert!(windows.contains_key("old-b"));
@@ -2713,14 +2801,82 @@ mod tests {
         // other subscribers on the server's next periodic re-sample instead.
         let reg = SessionsRegistry::new();
         reg.observe(observe_request("s1", SessionEvent::PreToolUse, None));
-        // Age the entry past its TTL so the next `list` reaps it.
-        {
-            let mut sessions = reg.lock_sessions();
-            let entry = sessions.get_mut("s1").unwrap();
-            entry.last_seen = Utc::now() - chrono::Duration::seconds(600);
-        }
+        // Let the entry sit awake past its TTL so the next `list` reaps it.
+        reg.clock.advance(Duration::from_secs(600));
         let rx = reg.subscribe_changes();
         assert!(reg.list().is_empty(), "the stale session should be reaped");
         assert!(!rx.has_changed().unwrap(), "`list` must never bump");
+    }
+
+    // --- Sleep-safe TTLs (#2108) ---------------------------------------------
+
+    /// A hair under the session TTL, still inside it.
+    fn just_inside_the_ttl() -> Duration {
+        DEFAULT_SESSION_TTL
+            .checked_sub(Duration::from_secs(1))
+            .unwrap()
+    }
+
+    /// Moves every wall-clock stamp back by `by`, as a laptop sleeping that long
+    /// would, without any awake time passing.
+    fn jump_wall_clock_forward(reg: &SessionsRegistry, by: chrono::Duration) {
+        for entry in reg.lock_sessions().values_mut() {
+            entry.last_seen -= by;
+        }
+    }
+
+    #[test]
+    fn a_wall_clock_jump_with_no_awake_time_reaps_nothing() {
+        // The 2026-10-03 incident: a 422s sleep (and here, far longer) used to
+        // reap every live session on the first read after the wake-up.
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request("working", SessionEvent::PreToolUse, None));
+        reg.observe(observe_request("idle", SessionEvent::Stop, None));
+        reg.observe(observe_request("ended", SessionEvent::PreToolUse, None));
+        reg.end("ended", None, None);
+        reg.report_window(window_report("w1", "/p", true));
+
+        jump_wall_clock_forward(&reg, chrono::Duration::days(3));
+
+        let ids: Vec<String> = reg.list().into_iter().map(|s| s.session_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "ended".to_string(),
+                "idle".to_string(),
+                "working".to_string()
+            ],
+            "sleeping must not age a session, not even an ended one"
+        );
+        assert_eq!(reg.lock_windows().len(), 1, "nor a window report");
+        // Display still reads the wall clock: the stale `last_seen` is shown.
+        assert!(reg.list()[0].last_seen < Utc::now() - chrono::Duration::days(2));
+    }
+
+    #[test]
+    fn awake_time_past_the_ttl_still_reaps() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request("s1", SessionEvent::PreToolUse, None));
+        reg.report_window(window_report("w1", "/p", true));
+        reg.clock.advance(just_inside_the_ttl());
+        assert_eq!(reg.list().len(), 1, "inside the TTL it survives");
+        assert_eq!(reg.lock_windows().len(), 0, "the window TTL is shorter");
+        reg.clock.advance(Duration::from_secs(2));
+        assert!(
+            reg.list().is_empty(),
+            "past the TTL of awake silence it reaps"
+        );
+    }
+
+    #[test]
+    fn activity_after_a_sleep_restarts_the_awake_ttl() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request("s1", SessionEvent::PreToolUse, None));
+        reg.clock.advance(just_inside_the_ttl());
+        jump_wall_clock_forward(&reg, chrono::Duration::hours(8));
+        // A hook after the wake-up refreshes the awake stamp as well.
+        reg.observe(observe_request("s1", SessionEvent::PostToolUse, None));
+        reg.clock.advance(just_inside_the_ttl());
+        assert_eq!(reg.list().len(), 1);
     }
 }
