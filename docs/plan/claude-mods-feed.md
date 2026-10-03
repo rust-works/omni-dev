@@ -28,6 +28,10 @@ lands from the spike; the throwaway mod and harness are attached to the issue.
   the mod sees the answer (`ToolUse` render with `isRunning`, +72 ms against Feed 1's
   +28.5 s), the interrupt (`turn.complete{isAborted}`, +153 ms, where Feed 1 stayed stuck
   until the process exited), and a refused prompt (+85 ms, where Feed 1 never released).
+- **The recommended deployment works.** With the mod beside the Feed 1 hooks on one
+  registry, the answer, interrupt and refusal gains all held (+54 to +218 ms). One race
+  was found: Feed 1 overwrote the mod's `waiting_for_input` for `AskUserQuestion` 20 ms
+  later, and a one-line Feed 1 mapping fix removes it with or without a mod.
 - **Delivery is cheap and safe.** Spawning the existing sink costs a median 18-115 ms per
   event, runs off the turn's path, stays silent and exits 0 on every failure tried.
 - **Reliability is different, not worse.** `--safe-mode`, `--bare`, `disableAllHooks` and
@@ -52,8 +56,10 @@ TTY blind spot above, which contradicts ADR-0072 and the code comments) and #215
 | Installed-plugin sandbox | `claude --init-only` with a user-scope installed mod in an isolated `CLAUDE_CONFIG_DIR`, no API call                                                         | 15   |
 
 Claude Code **2.1.288** (macOS, arm64, `claude-haiku-4-5` for every turn), `omni-dev`
-0.45.0. 13 of the runs carried the forwarder prototype, one carried it beside the wrapper,
-and the rest carried a discovery logger. Three early runs were discarded: this Claude Code
+0.45.0. The first three rows are 45 timed session runs; the fourth is 15 load-path checks
+that make no model call, 60 in all. Of the session runs, 13 carried the forwarder
+prototype alone, 5 carried it beside the Feed 1 hooks on one registry, one carried it
+beside the wrapper, and the rest carried a discovery logger. Three early runs were discarded: this Claude Code
 blocks a bare `sleep N` in the Bash tool, so the "long tool" never ran (a leading
 `mkdir -p … &&` avoids the block).
 
@@ -75,8 +81,8 @@ Limits, stated plainly:
 - The TUI runs shared one trusted working directory (a fresh one needs the trust dialog
   answered, which records an entry in Claude's own config). The subscriber therefore also
   saw the previous run's `ended` session expire on the registry's 10 s ended TTL and
-  logged it as a drop: 16 such rows in 14 runs, every one an earlier session's and none
-  the run's own. No figure here uses one.
+  logged it as a drop: 16 such rows in 14 of the 20 TUI runs, every one an earlier
+  session's and none the run's own. No figure here uses one.
 
 ## Event/state matrix
 
@@ -116,12 +122,15 @@ a start, its answer or keypress for a release).
 | Scenario                    | Wrapper                              | Mod forwarder                          | Feed 1 hooks                           |
 |-----------------------------|--------------------------------------|----------------------------------------|----------------------------------------|
 | Permission prompt shown     | +0 to +26                            | +22 to +219                            | +14 to +325                            |
-| Allowed, 25 s tool          | released +4                          | released **+33,592**                   | released +32,511 (+26,157 earlier)     |
+| Allowed, 25 s tool          | released +4                          | released **+33,592**                   | released +32,511                       |
 | Allowed, 46 s tool          | released +3                          | released **+49,618**                   | released +49,554                       |
 | Denied                      | released +0                          | released +18                           | released +1,704 (to `idle`)            |
 | `AskUserQuestion`           | `waiting_for_permission` +1, rel. +1 | `waiting_for_input` +22, released +79  | `waiting_for_permission` +27, rel. +53 |
 | Interrupt (control request) | `idle` +78                           | `idle` +404 (queued behind one report) | never; `ended` at exit (+4,177)        |
 | `kill -9`                   | `ended` +10                          | `ended` +3.5 s (pid watcher)           | `ended` +3.3 to +4.9 s (pid watcher)   |
+
+A 25 s `sleep` took 26 to 34 s of wall time on the busy host (an earlier panel run measured
+Feed 1's release at +26,157 ms), which is the spread in the 25 s rows.
 
 **Terminal (TUI)**
 
@@ -142,7 +151,8 @@ Where the mod is and is not enough:
 - **Release after an allow.** Terminal: solved, by the render site. Panel: unsolved. It
   cannot be solved from the mod API; the wrapper reads the answer off stdin.
 - **Interrupt.** `Stop` does not fire on `Esc`, which is why Feed 1 sticks. `turn.complete`
-  does, with `isAborted: true`, in the terminal (+70 ms after the key) and the panel.
+  does, with `isAborted: true`, in the terminal (about 80 ms after the key in the mod's own
+  log, +153 ms for the state to reach the daemon) and in the panel.
 - **Turn start.** `turn.start` leads the wrapper's `working` by 1.3 to 2.0 s, because the
   wrapper reports `idle` at `init` and only flips on the first assistant line.
 
@@ -195,7 +205,11 @@ pid.
 - **An abort cancels an in-flight spawn.** In 2 of 13 runs a report in flight when the
   turn was interrupted or refused came back with no exit code (`rc` -1); the `Stop` that
   followed landed and the final state was right. Reports must therefore carry the state,
-  not a delta, and the last one must be enough on its own.
+  not a delta, and the last one must be enough on its own. The drainer should also retry
+  a failed spawn once, and coalesce queued reports down to the latest state, so that a
+  cancelled `idle` (nothing later repairs it, since `Esc` fires no `Stop`) is never the
+  last word. Neither was tried; in both observed cancellations the report that failed was
+  the *release*, with the `idle` queued behind it.
 - **Ordering.** A single FIFO drainer preserved order in every run. The 10 s per-handler
   budget is not reached because the handler does not wait; the spawn's own
   `timeoutMs` (5 s) bounds the drainer.
@@ -213,7 +227,8 @@ pid.
   terminal runs checked, `$PPID` equalled the pid the driver started; in the two panel runs
   it was the wrapper's child (the driver's pid plus one). So `omni-dev sessions hook` run
   by a mod already reports the right pid through `parent_id()`, and the settings-hook sink
-  reported the same pid as the mod's `$PPID` in all 19 runs where both were present.
+  reported the same pid as the mod's `$PPID` in all 19 runs that carried both the logger
+  and the Feed 1 stand-in.
 - **`kill -9`.** No `session.end` fires. The existing pid watcher (#1916) ends the entry
   in 3 to 5 s, the same path Feed 1 uses; the wrapper notices in 10 ms because the child's
   stdout closes.
@@ -223,7 +238,10 @@ pid.
 - **Model.** `$.session.model()` and `turn.step.model`; a `/model` shows within the next
   request.
 - **After a worker respawn.** `session.start` fires again, `classic.SessionStart` does not,
-  and module state is lost; the forwarder re-reads `$.session.id()` and `cwd()` there.
+  and module state is lost; the forwarder re-reads `$.session.id()` and `cwd()` there. The
+  `isInteractive` gate must be re-derived from that `session.start` too (its event carries
+  it every time), and the mod must stay silent until it is known: a default of "report"
+  would double-feed a panel session, a default of "silent" would lose the terminal feed.
 
 ## Coverage
 
@@ -247,6 +265,26 @@ over the wrapper's correct `working` and held it for 8 s, until the tool ended. 
 is the gate above: report only when `isInteractive`, so the panel and `-p` stay with the
 wrapper and Feed 1, and a terminal session, where the wrapper is silent, has only the mod.
 
+**The recommended terminal deployment: the mod beside the Feed 1 hooks, on one registry.**
+Both feeds report every terminal session, so the question is whether Feed 1's inferred
+events overwrite the mod's. Five terminal runs sent both into one daemon (`StreamState`
+reports win outright in the registry, and the later report wins between two):
+
+| Scenario                  | Result on the one registry                                                                       |
+|---------------------------|--------------------------------------------------------------------------------------------------|
+| Allowed, 25 s tool        | released +54 ms                                                                                  |
+| Allowed, 46 s tool        | released +54 ms                                                                                  |
+| `Esc` interrupt in a tool | released +55 ms, then `idle` +218 ms                                                             |
+| Refused (`Esc` at dialog) | released +121 ms                                                                                 |
+| `AskUserQuestion`         | `waiting_for_input` landed first, then Feed 1's `permission_prompt` **overwrote it** 20 ms later |
+
+The gains survive, because Feed 1 has nothing to say at an answer or an interrupt. The one
+loss is a race on `AskUserQuestion`: Feed 1's `PermissionRequest` carries the tool's name
+but its sink ignores it. A one-line change to Feed 1's mapping (a `PermissionRequest` for
+`AskUserQuestion` becomes `AgentNeedsInput`, as the Codex mapping already does for
+`request_user_input`) fixes that classification for the hook feed on its own, with no
+mod at all, and removes the race. It is included in #2151.
+
 **`claude -p` from omni-dev's own `claude-cli` backend.** The backend passes
 `--setting-sources ""`, no `--plugin-dir`, and scrubs `CLAUDE_CODE_*` from the child's
 environment. Measured with the probe installed at user scope in an isolated config
@@ -269,18 +307,19 @@ nor inheriting `CLAUDE_CODE_*`; a test should pin the latter (#2151).
 
 ## Silent-off conditions and failure modes
 
-| Condition                        | Mod                                        | Feed 1 hooks      | Wrapper | Evidence                                                          |
-|----------------------------------|--------------------------------------------|-------------------|---------|-------------------------------------------------------------------|
-| `claude` older than 2.1.287      | off                                        | on                | on      | npm `stable` was 2.1.285, `latest` 2.1.288                        |
-| `--safe-mode`                    | off                                        | off               | **on**  | measured, panel and TUI                                           |
-| `--bare`                         | off                                        | off               | on      | measured (mod), documented (hooks)                                |
-| `disableAllHooks`                | off                                        | off               | on      | measured                                                          |
-| `allowManagedModsOnly`           | off                                        | on                | on      | documented, not tested                                            |
-| `allowManagedHooksOnly`          | off (not an organisation mod)              | on (managed only) | on      | documented, not tested                                            |
-| Anthropic's remote switch        | off                                        | on                | on      | `claude plugin test` reports it; it was not engaged on 2026-10-04 |
-| A hook that spins                | one mod unloaded                           | on                | on      | measured, below                                                   |
-| Three untraceable worker crashes | every mod unloaded until `/reload-plugins` | on                | on      | documented, not forced                                            |
-| Mod not installed                | off                                        | on                | on      | by construction                                                   |
+| Condition                        | Mod                                        | Feed 1 hooks                     | Wrapper | Evidence                                                          |
+|----------------------------------|--------------------------------------------|----------------------------------|---------|-------------------------------------------------------------------|
+| `claude` older than 2.1.287      | off                                        | on                               | on      | npm `stable` was 2.1.285, `latest` 2.1.288                        |
+| `--safe-mode`                    | off                                        | off                              | **on**  | measured, panel and TUI                                           |
+| `--bare`                         | off                                        | off                              | on      | measured (mod), documented (hooks)                                |
+| `disableAllHooks`                | off                                        | off                              | on      | measured                                                          |
+| `allowManagedModsOnly`           | off                                        | on                               | on      | documented, not tested                                            |
+| `allowManagedHooksOnly`          | off (not an organisation mod)              | on (managed only)                | on      | documented, not tested                                            |
+| Anthropic's remote switch        | off                                        | on                               | on      | `claude plugin test` reports it; it was not engaged on 2026-10-04 |
+| A hook that spins                | one mod unloaded                           | on                               | on      | measured, below                                                   |
+| Three untraceable worker crashes | every mod unloaded until `/reload-plugins` | on                               | on      | documented, not forced                                            |
+| Baked `omni-dev` path gone       | loads, reports nothing                     | on (if its sink path is current) | on      | measured, below                                                   |
+| Mod not installed                | off                                        | on                               | on      | by construction                                                   |
 
 - **A spinning hook.** `claude --init-only` with a mod looping in `classic.SessionStart`
   took 10 s instead of about 1 s: the engine's heartbeat got no answer for 5 s, respawned
@@ -288,6 +327,14 @@ nor inheriting `CLAUDE_CODE_*`; a test should pin the latter (#2151).
   second mod loaded alongside it kept working, but lost one in-flight event and all its
   module state. The cost of a misbehaving mod is therefore a bounded stall plus a state
   reset; the cost of a misbehaving wrapper is a Claude that does not start.
+- **A stale binary path.** The install bakes the absolute `omni-dev` path. With the path
+  gone (`/nonexistent/bin/omni-dev`), `claude --init-only` ran normally in 4 s, and the
+  one report failed in 15 ms with no exit code and no log line outside the mod's own: the
+  mod fails open and silent. A terminal session has no wrapper to fall back on, so it drops
+  to inference with no visible sign. Feed 1 handles the same case by rewriting a stale
+  sink in place (#1927); the install must do likewise (re-running `install-mod` rewrites
+  the path and bumps `version`), and `daemon status` or the install's own check should
+  warn when the baked path no longer exists.
 - **Stale rows.** A silenced or unloaded mod simply stops reporting. The pid watcher
   ends a row whose process dies; a live but unreported row falls back to the Feed 1
   inference already present for the same session, and ages out on the session TTL. The
@@ -397,7 +444,13 @@ Registry rules the design must add:
   terminal session would age out after 5 minutes. Use a distinct marker.
 - A session reported by the wrapper is never also reported by the mod (the gate), and a
   state older than the last report from the same feed is dropped.
-- Reports carry the state, so a lost or aborted one is repaired by the next.
+- Reports carry the state, so a lost or aborted one is repaired by the next; the mod's
+  drainer retries once and coalesces to the latest.
+- Feed 1 stays installed beside the mod (a terminal session's liveness, start and end still
+  come from it) and its `PermissionRequest` mapping learns `AskUserQuestion`, so the two
+  never disagree about a classification.
+- The install detects a stale baked path and rewrites it, as `install-hooks` does for a
+  moved sink (#1927).
 
 ## Not tested
 
@@ -416,5 +469,8 @@ Registry rules the design must add:
    report`, the registry marker, `install-mod`/`uninstall-mod`, the ADR, the docs and a
    `plugin validate` CI check.
 2. **#2152**: `claude-wrap` observes nothing under a PTY, so `worktrees ui` Claude tabs are
-   not an authoritative feed. The doc and comment corrections should not wait for #2151.
+   not an authoritative feed. This change adds a caveat to CLAUDE.md and the sessions guide;
+   ADR-0072 and the two code comments (`worktrees/ui/mod.rs`, `terminal/mod.rs`) still
+   say otherwise and are left to #2152, since an ADR amendment and a code edit are outside
+   a docs-only spike.
 3. **#2153**: `claude-wrap` reports a stale `working` after an SDK `set_model`.

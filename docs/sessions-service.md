@@ -841,7 +841,9 @@ omni-dev codex-wrap -- codex resume --last
 ```
 
 `omni-dev worktrees ui` opens a Codex tab this way with `alt-⇧x` (or **New Codex
-Tab** in the menus), as `alt-⇧t` opens a Claude tab through `claude-wrap`.
+Tab** in the menus), as `alt-⇧t` opens a Claude tab through `claude-wrap`. Unlike
+`codex-wrap`, `claude-wrap` observes nothing under a PTY (it `exec`-replaces itself
+when stdout is a terminal), so that Claude tab keeps the inferred feeds (#2152).
 
 The wrapper starts `codex app-server --listen unix://<runtime-dir>/codex-wrap-<pid>.sock`
 and runs `codex --remote unix://… <args>` on your terminal. Once a second, it
