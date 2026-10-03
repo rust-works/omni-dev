@@ -671,26 +671,49 @@ pub struct SessionEntry {
     pub(crate) latest_stamp_ts: Option<DateTime<Utc>>,
 }
 
+/// Why a stamped event is not applied to its session (#2108).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skip {
+    /// A copy of an event already applied, by either route.
+    Duplicate,
+    /// A journal event older than one already applied.
+    JournalStale,
+    /// A socket event older than one already applied, within
+    /// [`SOCKET_REORDER_WINDOW`].
+    SocketReordered,
+}
+
+impl Skip {
+    /// The `outcome` the event is logged with.
+    fn outcome(self) -> &'static str {
+        match self {
+            Self::Duplicate => "duplicate_ignored",
+            Self::JournalStale => "journal_stale_ignored",
+            Self::SocketReordered => "socket_reordered_ignored",
+        }
+    }
+}
+
 impl SessionEntry {
     /// Why a stamped event must not be applied to this session, if so: it is a
     /// duplicate of one already applied, or older than one — any age for the
     /// journal route, within [`SOCKET_REORDER_WINDOW`] for the socket.
-    fn stamp_skip(&self, stamp: Option<&EventStamp>, origin: Origin) -> Option<&'static str> {
+    fn stamp_skip(&self, stamp: Option<&EventStamp>, origin: Origin) -> Option<Skip> {
         let stamp = stamp?;
         if self.seq_origin(&stamp.seq).is_some() {
-            return Some("duplicate_ignored");
+            return Some(Skip::Duplicate);
         }
         let behind = self.latest_stamp_ts.map(|latest| latest - stamp.ts);
         match (origin, behind) {
             (Origin::Journal | Origin::Replay, Some(behind))
                 if behind > chrono::Duration::zero() =>
             {
-                Some("journal_stale_ignored")
+                Some(Skip::JournalStale)
             }
             (Origin::Socket, Some(behind))
                 if behind > chrono::Duration::zero() && behind <= SOCKET_REORDER_WINDOW =>
             {
-                Some("socket_reordered_ignored")
+                Some(Skip::SocketReordered)
             }
             _ => None,
         }
@@ -709,9 +732,8 @@ impl SessionEntry {
     /// applied: the poll beat the POST (#2136). Not of a replayed one — a replay
     /// is not counted as a recovery, so its socket copy has nothing to take back —
     /// and not of one a socket copy has already confirmed.
-    fn raced_by_journal(&self, stamp: Option<&EventStamp>, origin: Origin) -> bool {
-        origin == Origin::Socket
-            && stamp.and_then(|stamp| self.seq_origin(&stamp.seq)) == Some(Origin::Journal)
+    fn raced_by_journal(&self, stamp: &EventStamp, origin: Origin) -> bool {
+        origin == Origin::Socket && self.seq_origin(&stamp.seq) == Some(Origin::Journal)
     }
 
     /// Marks the event with this `seq` as confirmed by the socket, so a further
@@ -960,6 +982,31 @@ impl SessionsRegistry {
         self.windows.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Settles what one event's arrival changes in the session's stamp ring and
+    /// the delivery counters (#2108, #2136), once it has been applied or skipped.
+    /// `applied` is whether the event counts as delivered by `origin`.
+    fn settle_delivery(
+        &self,
+        sessions: &mut HashMap<String, SessionEntry>,
+        session_id: &str,
+        stamp: Option<&EventStamp>,
+        origin: Origin,
+        skip: Option<Skip>,
+        applied: bool,
+    ) {
+        let mut raced = false;
+        if let (Some(stamp), Some(entry)) = (stamp, sessions.get_mut(session_id)) {
+            raced = entry.raced_by_journal(stamp, origin);
+            if raced {
+                entry.confirm_by_socket(&stamp.seq);
+            }
+            if skip.is_none() {
+                entry.record_stamp(stamp, origin);
+            }
+        }
+        self.delivery.record(origin, applied, raced);
+    }
+
     /// Records (upserts) a session sighting, running the [`SessionState`]
     /// inference and refreshing liveness. Reaps stale entries first, then — only
     /// when a genuinely new session would grow the map past [`MAX_SESSIONS`] —
@@ -1009,15 +1056,12 @@ impl SessionsRegistry {
             let skip = sessions
                 .get(&session_id)
                 .and_then(|entry| entry.stamp_skip(stamp.as_ref(), origin));
-            let raced = sessions
-                .get(&session_id)
-                .is_some_and(|entry| entry.raced_by_journal(stamp.as_ref(), origin));
             let mut outcome = "created";
             let mutated = match sessions.get_mut(&req.session_id) {
                 // The second copy of an event already applied, or a journal
                 // event older than one that was (#2108).
                 Some(_) if skip.is_some() => {
-                    outcome = skip.unwrap_or("skipped");
+                    outcome = skip.map_or("skipped", Skip::outcome);
                     false
                 }
                 // A passive re-sighting (the Codex rollout watcher's heartbeat)
@@ -1115,16 +1159,14 @@ impl SessionsRegistry {
                     true
                 }
             };
-            if skip.is_none() {
-                if let (Some(stamp), Some(entry)) = (&stamp, sessions.get_mut(&session_id)) {
-                    entry.record_stamp(stamp, origin);
-                }
-            }
-            if let (true, Some(stamp), Some(entry)) = (raced, &stamp, sessions.get_mut(&session_id))
-            {
-                entry.confirm_by_socket(&stamp.seq);
-            }
-            self.delivery.record(origin, skip.is_none(), raced);
+            self.settle_delivery(
+                &mut sessions,
+                &session_id,
+                stamp.as_ref(),
+                origin,
+                skip,
+                skip.is_none(),
+            );
             (
                 mutated || reaped > 0,
                 old_state,
@@ -1178,13 +1220,10 @@ impl SessionsRegistry {
             let skip = sessions
                 .get(session_id)
                 .and_then(|entry| entry.stamp_skip(stamp.as_ref(), origin));
-            let raced = sessions
-                .get(session_id)
-                .is_some_and(|entry| entry.raced_by_journal(stamp.as_ref(), origin));
             let mut outcome = "unknown";
             let known = match sessions.get_mut(session_id) {
                 Some(_) if skip.is_some() => {
-                    outcome = skip.unwrap_or("skipped");
+                    outcome = skip.map_or("skipped", Skip::outcome);
                     (true, false)
                 }
                 // Already ended (a hook and a watcher can both end it): leave the
@@ -1213,22 +1252,16 @@ impl SessionsRegistry {
                 }
                 None => (false, false),
             };
-            if skip.is_none() {
-                if let (Some(stamp), Some(entry)) = (&stamp, sessions.get_mut(session_id)) {
-                    entry.record_stamp(stamp, origin);
-                }
-            }
-            if let (true, Some(stamp), Some(entry)) = (raced, &stamp, sessions.get_mut(session_id))
-            {
-                entry.confirm_by_socket(&stamp.seq);
-            }
             // A socket `end` is a delivery whether or not the registry still
             // holds the session. A journal `end` for a session it does not hold
             // applied to nothing, and would only inflate `recovered`.
-            self.delivery.record(
+            self.settle_delivery(
+                &mut sessions,
+                session_id,
+                stamp.as_ref(),
                 origin,
+                skip,
                 skip.is_none() && (origin == Origin::Socket || known.0),
-                raced,
             );
             (known, reaped, old_state, outcome)
         };
