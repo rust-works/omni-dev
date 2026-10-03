@@ -1630,7 +1630,8 @@ extension never runs git.
   a complete repository, ancestry is a pure function of the commit ids: a commit,
   fetch or push changes an id and simply misses, with no TTL to tune. A *shallow*
   clone is the exception (deepening it changes the answer without changing an id), so
-  it bypasses the memo. It also answers both questions
+  it bypasses the memo, and its walks go through a handle opened at the common dir,
+  the only kind through which libgit2 applies the shallow cut (#2147). It also answers both questions
   (own-upstream and default-branch divergence) from a single repository handle.
   The memo is shared with the inline `ahead`/`behind` that `list` and
   the tray menu compute. A computation that fails degrades to "no divergence" for
@@ -1667,6 +1668,18 @@ extension never runs git.
   would walk a different history from a fresh open; a repo that is shallow, or
   becomes so, is never served from the pool. A repo with any of these keeps its
   pre-#2121 cost; an unconditional `include` is unaffected.
+
+  The per-worktree open that a shallow repository falls back to is exact for a linked
+  worktree too (#2147), which libgit2's own handle is not. git keeps the `shallow`
+  marker in the common dir, but libgit2 looks only in the gitdir of the handle it
+  opened — `<commondir>/worktrees/<name>` for a linked worktree — so that handle
+  reports a shallow clone as complete and does not apply its cut: the walk runs into
+  the parents a `--depth` clone does not have and fails, which would drop the row's
+  counts. So shallowness is read from `<commondir>/shallow` directly
+  (`divergence::is_shallow`), and a shallow repository's walks go through a handle
+  opened at the common dir. Only a shallow clone's linked worktrees pay for it: up to
+  two extra, transient opens per worktree (one per walk), and libgit2 shares pack
+  file descriptors across handles.
 - **`main_behind` rides the same lazy op (#1457).** `repo_main_behind`
   resolves the repository's remote default branch the same **local-only,
   no-fetch** way `worktrees rebase`'s `--onto` default does
@@ -2140,7 +2153,8 @@ Where:
   `behind`). A path is **omitted** from `results` entirely only when *neither*
   side resolves (not a repo, or a detached/unborn HEAD) — the client renders it
   with no sync indicator. `shallow` (#2120) is `true` — and otherwise omitted —
-  when the worktree's repository is a shallow clone. Everything else in a row is a
+  when the worktree's repository is a shallow clone — for every one of its
+  worktrees, linked ones included (#2147). Everything else in a row is a
   pure function of commit ids (the same fact the daemon's own walk memo rests on),
   so a client may cache a row for as long as its ids hold; a shallow clone is the one
   exception, since deepening it changes the counts without changing any id, so a
