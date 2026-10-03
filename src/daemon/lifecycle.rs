@@ -45,35 +45,63 @@ fn nofile_candidates(
 /// with `EMFILE` the daemon cannot hear heartbeats (#2111). Best-effort: a failure
 /// is logged and the daemon carries on with the limit it has.
 pub fn raise_nofile_limit() {
-    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    raise_nofile_limit_with(read_nofile_limits, write_nofile_limits, NOFILE_CEILING);
+}
 
-    let (soft, hard) = match getrlimit(Resource::RLIMIT_NOFILE) {
+/// The process's current `(soft, hard)` `RLIMIT_NOFILE`.
+fn read_nofile_limits() -> nix::Result<(nix::libc::rlim_t, nix::libc::rlim_t)> {
+    nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+}
+
+/// Sets the process's `RLIMIT_NOFILE` to `(soft, hard)`.
+fn write_nofile_limits(soft: nix::libc::rlim_t, hard: nix::libc::rlim_t) -> nix::Result<()> {
+    nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE, soft, hard)
+}
+
+/// What [`raise_nofile_limit_with`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum NofileOutcome {
+    /// The current limits could not be read, so nothing was changed.
+    Unreadable,
+    /// The soft limit already met every candidate, so nothing was changed.
+    Adequate,
+    /// The soft limit was raised to this value.
+    Raised(nix::libc::rlim_t),
+    /// The host refused every candidate; the soft limit is as it was.
+    Refused,
+}
+
+/// [`raise_nofile_limit`] over injected limit accessors, so the fallback ladder
+/// can be driven without touching the test process's real limit.
+fn raise_nofile_limit_with(
+    get: impl FnOnce() -> nix::Result<(nix::libc::rlim_t, nix::libc::rlim_t)>,
+    mut set: impl FnMut(nix::libc::rlim_t, nix::libc::rlim_t) -> nix::Result<()>,
+    ceiling: nix::libc::rlim_t,
+) -> NofileOutcome {
+    let (soft, hard) = match get() {
         Ok(limits) => limits,
         Err(e) => {
             tracing::warn!("could not read the open-file limit: {e}");
-            return;
+            return NofileOutcome::Unreadable;
         }
     };
-    let candidates = nofile_candidates(soft, hard, NOFILE_CEILING);
+    let candidates = nofile_candidates(soft, hard, ceiling);
     if candidates.is_empty() {
         tracing::debug!("open-file limit {soft} (hard {hard}) needs no raising; leaving it");
-        return;
+        return NofileOutcome::Adequate;
     }
-    let mut last_error = None;
     for target in candidates {
-        match setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
+        match set(target, hard) {
             Ok(()) => {
                 tracing::info!("raised the open-file limit from {soft} to {target}");
-                return;
+                return NofileOutcome::Raised(target);
             }
-            Err(e) => last_error = Some((target, e)),
+            Err(e) => {
+                tracing::warn!("could not raise the open-file limit from {soft} to {target}: {e}");
+            }
         }
     }
-    if let Some((target, e)) = last_error {
-        tracing::warn!(
-            "could not raise the open-file limit from {soft} (last tried {target}): {e}"
-        );
-    }
+    NofileOutcome::Refused
 }
 
 /// Spawns a task that cancels `shutdown` when the process is asked to stop.
@@ -163,6 +191,77 @@ mod tests {
             nofile_candidates(1500, nix::libc::RLIM_INFINITY, 4096),
             vec![4096, 2048]
         );
+    }
+
+    /// Runs [`raise_nofile_limit_with`] over `limits`, with `refuse` deciding which
+    /// targets the "host" rejects, and returns the outcome plus every target it
+    /// was asked to set.
+    fn raise(
+        limits: nix::Result<(nix::libc::rlim_t, nix::libc::rlim_t)>,
+        refuse: impl Fn(nix::libc::rlim_t) -> bool,
+    ) -> (NofileOutcome, Vec<nix::libc::rlim_t>) {
+        let mut attempts = Vec::new();
+        let outcome = raise_nofile_limit_with(
+            || limits,
+            |target, _hard| {
+                attempts.push(target);
+                if refuse(target) {
+                    Err(nix::errno::Errno::EINVAL)
+                } else {
+                    Ok(())
+                }
+            },
+            4096,
+        );
+        (outcome, attempts)
+    }
+
+    #[test]
+    fn an_unreadable_limit_is_left_alone() {
+        let (outcome, attempts) = raise(Err(nix::errno::Errno::EPERM), |_| false);
+        assert_eq!(outcome, NofileOutcome::Unreadable);
+        assert!(attempts.is_empty());
+    }
+
+    #[test]
+    fn an_adequate_limit_is_not_touched() {
+        let (outcome, attempts) = raise(Ok((8192, nix::libc::RLIM_INFINITY)), |_| false);
+        assert_eq!(outcome, NofileOutcome::Adequate);
+        assert!(attempts.is_empty());
+    }
+
+    #[test]
+    fn the_limit_is_raised_to_the_ceiling_when_the_host_allows_it() {
+        let (outcome, attempts) = raise(Ok((256, nix::libc::RLIM_INFINITY)), |_| false);
+        assert_eq!(outcome, NofileOutcome::Raised(4096));
+        assert_eq!(attempts, vec![4096], "no further attempt after a success");
+    }
+
+    #[test]
+    fn a_refused_target_falls_back_to_the_next_smaller_one() {
+        // macOS refuses a soft limit above `kern.maxfilesperproc`.
+        let (outcome, attempts) = raise(Ok((256, nix::libc::RLIM_INFINITY)), |t| t > 1024);
+        assert_eq!(outcome, NofileOutcome::Raised(1024));
+        assert_eq!(attempts, vec![4096, 2048, 1024]);
+    }
+
+    #[test]
+    fn a_host_that_refuses_every_target_leaves_the_limit_as_it_was() {
+        let (outcome, attempts) = raise(Ok((256, nix::libc::RLIM_INFINITY)), |_| true);
+        assert_eq!(outcome, NofileOutcome::Refused);
+        assert_eq!(attempts, vec![4096, 2048, 1024, 512]);
+    }
+
+    /// The real accessors round-trip. Re-applying the limits the process already
+    /// has changes nothing, so this cannot starve a concurrently running test —
+    /// which lowering the soft limit to exercise a real raise would.
+    #[test]
+    fn the_real_limit_accessors_round_trip() {
+        let (soft, hard) = read_nofile_limits().unwrap();
+
+        write_nofile_limits(soft, hard).unwrap();
+
+        assert_eq!(read_nofile_limits().unwrap(), (soft, hard));
     }
 
     #[test]

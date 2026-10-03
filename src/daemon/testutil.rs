@@ -19,17 +19,26 @@ use tokio::task::JoinHandle;
 
 use super::service::{DaemonService, MenuSnapshot, ServiceStatus};
 
-/// A [`DaemonService`] that serves nothing and records every accept outage the
-/// server credits it (#2111), so tests can see what the accept loop reported.
-pub(crate) struct OutageRecorder {
+/// A [`DaemonService`] that serves nothing of substance and records every accept
+/// outage the server credits it (#2111), so tests can see what the accept loop
+/// reported. [`StubService::slow`] makes it take its time answering a request.
+pub(crate) struct StubService {
     name: &'static str,
+    delay: Duration,
     credited: Mutex<Vec<Duration>>,
 }
 
-impl OutageRecorder {
+impl StubService {
+    /// A service that answers every request at once.
     pub(crate) fn new(name: &'static str) -> Self {
+        Self::slow(name, Duration::ZERO)
+    }
+
+    /// A service that takes `delay` to answer every request.
+    pub(crate) fn slow(name: &'static str, delay: Duration) -> Self {
         Self {
             name,
+            delay,
             credited: Mutex::new(Vec::new()),
         }
     }
@@ -41,13 +50,14 @@ impl OutageRecorder {
 }
 
 #[async_trait]
-impl DaemonService for OutageRecorder {
+impl DaemonService for StubService {
     fn name(&self) -> &'static str {
         self.name
     }
 
     async fn handle(&self, _op: &str, _payload: Value) -> Result<Value> {
-        Ok(Value::Null)
+        tokio::time::sleep(self.delay).await;
+        Ok(serde_json::json!({ "done": true }))
     }
 
     fn menu(&self) -> MenuSnapshot {
@@ -181,4 +191,49 @@ pub(crate) fn fake_daemon_stream_hold_open(
         let _ = close_rx.await;
     });
     (dir, sock, close_tx, server)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_stub_service_answers_at_once_and_serves_nothing_else() {
+        let stub = StubService::new("stub");
+
+        assert_eq!(stub.name(), "stub");
+        let reply = stub.handle("anything", Value::Null).await.unwrap();
+        assert_eq!(reply, serde_json::json!({ "done": true }));
+        assert_eq!(stub.menu().title, "stub");
+        assert!(stub.menu().items.is_empty());
+        stub.menu_action("anything").await.unwrap();
+        let status = stub.status().await;
+        assert_eq!(status.name, "stub");
+        assert!(status.healthy);
+        stub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_slow_stub_service_takes_its_delay_to_answer() {
+        let stub = StubService::slow("slow", Duration::from_millis(40));
+
+        let started = std::time::Instant::now();
+        stub.handle("work", Value::Null).await.unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[test]
+    fn a_stub_service_records_each_credited_outage_in_order() {
+        let stub = StubService::new("stub");
+        assert!(stub.credited().is_empty());
+
+        stub.credit_accept_outage(Duration::from_secs(1));
+        stub.credit_accept_outage(Duration::from_secs(2));
+
+        assert_eq!(
+            stub.credited(),
+            vec![Duration::from_secs(1), Duration::from_secs(2)]
+        );
+    }
 }

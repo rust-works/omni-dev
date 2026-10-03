@@ -296,7 +296,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("timed out waiting for a computation to start");
+        panic!("timed out waiting for a computation to start"); // omni-dev: coverage ignore-line reason="only runs if a started computation never sets its flag within 2s, which fails the calling test; a passing run never takes it"
     }
 
     /// Starts a computation for `path` that holds a permit for `hold`, and returns
@@ -429,26 +429,24 @@ mod tests {
         let started = Instant::now();
         let blocker = hold_a_permit(&coordinator, "/blocker", Duration::from_millis(150)).await;
 
-        // Both queue for "/repo/a" behind the blocker, sharing one flight.
-        let leader = {
-            let coordinator = Arc::clone(&coordinator);
-            tokio::spawn(async move {
-                coordinator
-                    .get_or_compute(PathBuf::from("/repo/a"), |_| divergence(1))
-                    .await
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Both queue for "/repo/a" behind the blocker, sharing one flight. The
+        // waiter joins 30ms after the leader and the leader is abandoned at 60ms —
+        // dropped by the timeout, mid-wait, exactly as a cancelled request would be.
         let waiter = {
             let coordinator = Arc::clone(&coordinator);
             tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
                 coordinator
                     .get_or_compute(PathBuf::from("/repo/a"), |_| divergence(2))
                     .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        leader.abort();
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(60),
+            coordinator.get_or_compute(PathBuf::from("/repo/a"), |_| divergence(1)),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the leader should still be queued");
 
         let result = tokio::time::timeout(Duration::from_secs(5), waiter)
             .await
@@ -481,6 +479,42 @@ mod tests {
             started.elapsed() >= Duration::from_millis(150),
             "a second computation ran while the abandoned one held the only permit"
         );
+    }
+
+    /// A closed semaphore is unreachable in production (nothing closes it), but if
+    /// it ever happened the caller must get the empty answer, not a panic or a hang.
+    #[tokio::test]
+    async fn a_closed_semaphore_yields_an_empty_answer_and_leaks_nothing() {
+        let coordinator = AheadBehindCoordinator::with_concurrency(1);
+        coordinator.permits.close();
+
+        let result = coordinator
+            .get_or_compute(PathBuf::from("/repo/a"), |_| divergence(1))
+            .await;
+
+        assert_eq!(result, Divergence::default());
+        assert_eq!(coordinator.in_flight_len(), 0, "an entry leaked");
+    }
+
+    /// A computation that panics degrades to the empty answer — and gives its
+    /// permit back, so the cap is not lowered by every failure.
+    #[tokio::test]
+    async fn a_panicking_computation_yields_an_empty_answer_and_frees_its_permit() {
+        let coordinator = AheadBehindCoordinator::with_concurrency(1);
+
+        let failed = coordinator
+            .get_or_compute(PathBuf::from("/repo/a"), |_| panic!("boom"))
+            .await;
+        assert_eq!(failed, Divergence::default());
+        assert_eq!(coordinator.in_flight_len(), 0, "an entry leaked");
+
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            coordinator.get_or_compute(PathBuf::from("/repo/b"), |_| divergence(2)),
+        )
+        .await
+        .expect("the only permit must have been released");
+        assert_eq!(next, divergence(2));
     }
 
     #[test]

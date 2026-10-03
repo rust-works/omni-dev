@@ -150,10 +150,10 @@ mod tests {
 
     #[test]
     fn credit_accept_outage_reaches_every_service() {
-        use crate::daemon::testutil::OutageRecorder;
+        use crate::daemon::testutil::StubService;
 
-        let first = Arc::new(OutageRecorder::new("first"));
-        let second = Arc::new(OutageRecorder::new("second"));
+        let first = Arc::new(StubService::new("first"));
+        let second = Arc::new(StubService::new("second"));
         let mut registry = ServiceRegistry::new();
         registry.register(first.clone());
         registry.register(second.clone());

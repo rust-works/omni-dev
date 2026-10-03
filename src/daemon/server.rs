@@ -1173,51 +1173,20 @@ mod tests {
             .unwrap();
     }
 
-    /// A service that takes longer than the idle window to answer.
-    struct SlowService;
-
-    #[async_trait::async_trait]
-    impl crate::daemon::service::DaemonService for SlowService {
-        fn name(&self) -> &'static str {
-            "slow"
-        }
-        async fn handle(
-            &self,
-            _op: &str,
-            _payload: serde_json::Value,
-        ) -> Result<serde_json::Value> {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            Ok(json!({ "done": true }))
-        }
-        fn menu(&self) -> crate::daemon::service::MenuSnapshot {
-            crate::daemon::service::MenuSnapshot {
-                title: "slow".to_string(),
-                items: vec![],
-            }
-        }
-        async fn menu_action(&self, _action_id: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn status(&self) -> crate::daemon::service::ServiceStatus {
-            crate::daemon::service::ServiceStatus {
-                name: "slow".to_string(),
-                healthy: true,
-                summary: String::new(),
-                detail: serde_json::Value::Null,
-            }
-        }
-        async fn shutdown(&self) {}
-    }
-
     /// The timeout covers only the wait for a request line: a request being
     /// served is never cut off, however long it takes.
     #[tokio::test]
     async fn handle_connection_never_interrupts_a_request_in_progress() {
+        use crate::daemon::testutil::StubService;
         use tokio::io::AsyncWriteExt;
 
         let (client, server) = UnixStream::pair().unwrap();
         let mut registry = ServiceRegistry::new();
-        registry.register(Arc::new(SlowService));
+        // An answer that takes longer than the idle window.
+        registry.register(Arc::new(StubService::slow(
+            "slow",
+            Duration::from_millis(250),
+        )));
         let task = tokio::spawn(handle_connection(
             server,
             Arc::new(registry),
@@ -1328,10 +1297,10 @@ mod tests {
         assert!(reply.ok, "{reply:?}");
         // Three failures back off 5ms + 10ms + 20ms before the fourth `accept`
         // succeeds; a loop that retried at once would finish in well under that.
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() >= Duration::from_millis(35),
-            "retried too fast: {:?}",
-            started.elapsed()
+            elapsed >= Duration::from_millis(35),
+            "retried too fast: {elapsed:?}"
         );
         // Three failed attempts, the success, and the parked fifth the shutdown
         // interrupted — nothing like the thousands a spinning loop would make.
@@ -1343,7 +1312,7 @@ mod tests {
     /// itself caused (#2111). The credits sum to the whole outage.
     #[tokio::test]
     async fn accept_loop_credits_the_outage_to_the_services() {
-        use crate::daemon::testutil::OutageRecorder;
+        use crate::daemon::testutil::StubService;
         use tokio::io::AsyncWriteExt;
 
         let (client, server) = UnixStream::pair().unwrap();
@@ -1353,7 +1322,7 @@ mod tests {
             Err(emfile()),
             Ok(server),
         ]);
-        let recorder = Arc::new(OutageRecorder::new("recorder"));
+        let recorder = Arc::new(StubService::new("recorder"));
         let mut registry = ServiceRegistry::new();
         registry.register(recorder.clone());
         let registry = Arc::new(registry);
@@ -1389,6 +1358,53 @@ mod tests {
         // A sanity ceiling only: the credits are wall time, so a loaded machine can
         // stretch them, but they cannot be an order of magnitude longer.
         assert!(total < Duration::from_secs(30), "credited {total:?}");
+    }
+
+    /// A burst that follows another within the warning interval logs nothing, so
+    /// its recovery is silent — but the outage is still credited, and the
+    /// connection that ends it is still served.
+    #[tokio::test]
+    async fn accept_loop_recovers_from_an_unlogged_burst_and_still_credits_it() {
+        use crate::daemon::testutil::StubService;
+        use tokio::io::AsyncWriteExt;
+
+        let (client_a, server_a) = UnixStream::pair().unwrap();
+        let (client_b, server_b) = UnixStream::pair().unwrap();
+        // Two single-failure bursts, milliseconds apart: the first logs and the
+        // second falls inside the 30s throttle, so it does not.
+        let source = ScriptedSource::new(vec![
+            Err(emfile()),
+            Ok(server_a),
+            Err(emfile()),
+            Ok(server_b),
+        ]);
+        let recorder = Arc::new(StubService::new("recorder"));
+        let mut registry = ServiceRegistry::new();
+        registry.register(recorder.clone());
+        let registry = Arc::new(registry);
+        let shutdown = CancellationToken::new();
+        let mut conns: JoinSet<()> = JoinSet::new();
+
+        let talking = async {
+            for client in [client_a, client_b] {
+                let (read_half, mut write_half) = client.into_split();
+                let mut reader = BufReader::new(read_half);
+                write_half.write_all(b"{\"op\":\"ping\"}\n").await.unwrap();
+                assert!(read_reply(&mut reader).await.ok);
+            }
+            shutdown.cancel();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                accept_loop(&source, &registry, &shutdown, &mut conns),
+                talking
+            )
+        })
+        .await
+        .expect("the loop should serve both connections");
+
+        // Each burst reports its failure and its recovery.
+        assert_eq!(recorder.credited().len(), 4, "{:?}", recorder.credited());
     }
 
     /// A stop request during a long backoff sleep ends the loop at once, rather
