@@ -31,7 +31,7 @@ Common issues and solutions when using omni-dev.
    # Check Rust version
    rustc --version
    
-   # Update Rust (need 1.80+)
+   # Update Rust (need 1.88+)
    rustup update
    ```
 
