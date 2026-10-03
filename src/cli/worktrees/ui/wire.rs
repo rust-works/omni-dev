@@ -67,6 +67,13 @@ pub struct TreeRepoWire {
     pub root: String,
     #[serde(default)]
     pub polling_enabled: bool,
+    /// The commit the repo's remote default branch points at (#2120) — the third
+    /// input of a worktree's `main_behind`, beside `head_sha`. A fetch that
+    /// advances only that ref moves no worktree's own refs, so the hub needs it to
+    /// know the cached `main_behind` is stale. Absent from an older daemon, or when
+    /// no default branch is locally resolvable.
+    #[serde(default)]
+    pub main_sha: Option<String>,
     #[serde(default)]
     pub worktrees: Vec<TreeWorktreeWire>,
 }
@@ -400,6 +407,21 @@ mod tests {
         assert!(wt.branch.is_none());
         assert!(!wt.open);
         assert!(!wt.pushing);
+    }
+
+    #[test]
+    fn tree_repo_wire_reads_the_default_branch_tip_and_tolerates_its_absence() {
+        // `main_sha` (#2120) is what tells the hub a fetch moved only `origin/main`;
+        // an older daemon, or a repo with no resolvable default branch, omits it.
+        let with: TreeRepoWire = serde_json::from_value(serde_json::json!({
+            "main_repo": "repo", "root": "/repo", "main_sha": "abc123", "worktrees": [],
+        }))
+        .unwrap();
+        assert_eq!(with.main_sha.as_deref(), Some("abc123"));
+        let without: TreeRepoWire =
+            serde_json::from_value(serde_json::json!({ "main_repo": "repo", "root": "/repo" }))
+                .unwrap();
+        assert!(without.main_sha.is_none());
     }
 
     #[test]

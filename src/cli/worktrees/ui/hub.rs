@@ -24,13 +24,20 @@ use crate::daemon::protocol::DaemonEnvelope;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The refs one worktree's ahead/behind is computed from, as the snapshot reports
+/// them: `(head_sha, upstream_sha, main_sha)`. Equal means an equal answer, so a
+/// change in any one is what invalidates a cached entry.
+type SeenOids = (Option<String>, Option<String>, Option<String>);
+
 /// One worktree's identity for the OID-staleness check in
-/// `Hub::on_tree_changed` — just enough of the wire row to detect a commit or
-/// a push without holding the whole `TreeWorktreeWire`.
+/// `Hub::on_tree_changed` — just enough of the wire row to detect a commit, a
+/// push or a default-branch fetch without holding the whole `TreeWorktreeWire`.
 struct WorktreeOids {
     path: PathBuf,
     head_sha: Option<String>,
     upstream_sha: Option<String>,
+    /// The *repo's* default-branch tip, repeated on each of its worktrees.
+    main_sha: Option<String>,
 }
 
 /// Commands the rendering layer sends into the hub.
@@ -114,12 +121,14 @@ struct Hub {
     /// Explicit override from `SetVisibleRows`; `None` means "everything in
     /// the latest tree snapshot" (Phase 1's default, see [`HubCommand`]).
     visible_override: Option<Vec<PathBuf>>,
-    /// The `(head_sha, upstream_sha)` each path's cached ahead/behind entry
-    /// was last computed against, so a commit or a push (which moves one of
-    /// these OIDs — see `TreeWorktreeWire`'s doc comment) invalidates the
-    /// stale cache entry instead of leaving it to show counts for a HEAD the
-    /// worktree has since moved past.
-    last_seen_oids: HashMap<PathBuf, (Option<String>, Option<String>)>,
+    /// The `(head_sha, upstream_sha, main_sha)` each path's cached ahead/behind
+    /// entry was last computed against, so a commit, a push or a fetch of the
+    /// default branch (which moves one of these OIDs — see `TreeWorktreeWire`'s
+    /// doc comment) invalidates the stale cache entry instead of leaving it to
+    /// show counts for a HEAD the worktree has since moved past. `main_sha` is
+    /// the one a fetch of only `origin/main` moves, which is the only way
+    /// `main_behind` changes with nothing else in the row moving (#2120).
+    last_seen_oids: HashMap<PathBuf, SeenOids>,
     cancel: CancellationToken,
 }
 
@@ -162,11 +171,13 @@ impl Hub {
                     snapshot
                         .repos
                         .iter()
-                        .flat_map(|repo| repo.worktrees.iter())
-                        .map(|wt| WorktreeOids {
-                            path: PathBuf::from(&wt.path),
-                            head_sha: wt.head_sha.clone(),
-                            upstream_sha: wt.upstream_sha.clone(),
+                        .flat_map(|repo| {
+                            repo.worktrees.iter().map(|wt| WorktreeOids {
+                                path: PathBuf::from(&wt.path),
+                                head_sha: wt.head_sha.clone(),
+                                upstream_sha: wt.upstream_sha.clone(),
+                                main_sha: repo.main_sha.clone(),
+                            })
                         })
                         .collect(),
                 ),
@@ -175,12 +186,16 @@ impl Hub {
         };
         let Some(rows) = rows else { return };
 
-        // A worktree whose head/upstream OID moved since we last fetched its
-        // ahead/behind (a commit or a push) invalidates that cache entry, so
-        // the next `set_visible` below re-queues a fresh fetch instead of
-        // leaving stale counts on screen.
+        // A worktree whose head/upstream/default-branch OID moved since we last
+        // fetched its ahead/behind (a commit, a push or a default-branch fetch)
+        // invalidates that cache entry, so the next `set_visible` below re-queues
+        // a fresh fetch instead of leaving stale counts on screen.
         for row in &rows {
-            let oids = (row.head_sha.clone(), row.upstream_sha.clone());
+            let oids: SeenOids = (
+                row.head_sha.clone(),
+                row.upstream_sha.clone(),
+                row.main_sha.clone(),
+            );
             if self.last_seen_oids.get(&row.path) != Some(&oids) {
                 self.ahead_behind.invalidate(&row.path);
                 self.last_seen_oids.insert(row.path.clone(), oids);
@@ -313,12 +328,17 @@ mod tests {
     }
 
     fn snapshot(wt: TreeWorktreeWire) -> TreeSnapshotWire {
+        snapshot_with_main_sha(wt, None)
+    }
+
+    fn snapshot_with_main_sha(wt: TreeWorktreeWire, main_sha: Option<&str>) -> TreeSnapshotWire {
         TreeSnapshotWire {
             repos: vec![TreeRepoWire {
                 main_repo: "repo".to_string(),
                 github: None,
                 root: "/repo".to_string(),
                 polling_enabled: false,
+                main_sha: main_sha.map(str::to_string),
                 worktrees: vec![wt],
             }],
             show_closed: false,
@@ -338,7 +358,7 @@ mod tests {
         hub.on_tree_changed();
         assert_eq!(
             hub.last_seen_oids.get(&PathBuf::from("/repo/wt")),
-            Some(&(Some("aaa".to_string()), None))
+            Some(&(Some("aaa".to_string()), None, None))
         );
     }
 
@@ -367,7 +387,53 @@ mod tests {
         hub.on_tree_changed();
         assert_eq!(
             hub.last_seen_oids.get(&path),
-            Some(&(Some("bbb".to_string()), None))
+            Some(&(Some("bbb".to_string()), None, None))
+        );
+    }
+
+    /// Lets the one in-flight fetch (to an unreachable socket) settle, so the
+    /// cache holds an entry rather than a pending marker.
+    async fn settle(hub: &mut Hub) {
+        tokio::time::timeout(Duration::from_secs(5), hub.ahead_behind.changed())
+            .await
+            .expect("the fetch to an unreachable socket should fail promptly");
+    }
+
+    #[tokio::test]
+    async fn on_tree_changed_refetches_when_only_the_default_branch_tip_moves() {
+        // A `git fetch` that advances only `origin/main` moves no worktree's own refs,
+        // but it changes `main_behind` — so the repo's `main_sha` has to be part of
+        // what invalidates a cached entry (#2120). Without it the row kept the count
+        // it was fetched with until a commit or a push happened to move another OID.
+        use super::super::view_model::AheadBehindState;
+        let (mut hub, tree_tx) = test_hub();
+        let path = PathBuf::from("/repo/wt");
+        let send = |main_sha: &str| {
+            tree_tx
+                .send(FeedFrame::Live(snapshot_with_main_sha(
+                    worktree("/repo/wt", Some("aaa")),
+                    Some(main_sha),
+                )))
+                .unwrap();
+        };
+
+        send("m1");
+        hub.on_tree_changed();
+        settle(&mut hub).await;
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Unavailable);
+
+        // The same snapshot again drops nothing: an unchanged refresh stays free.
+        send("m1");
+        hub.on_tree_changed();
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Unavailable);
+
+        // Only the default branch's tip moved: the entry is dropped and re-asked.
+        send("m2");
+        hub.on_tree_changed();
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Loading);
+        assert_eq!(
+            hub.last_seen_oids.get(&path),
+            Some(&(Some("aaa".to_string()), None, Some("m2".to_string())))
         );
     }
 
