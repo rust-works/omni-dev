@@ -4,7 +4,6 @@
 //! single interface boundary between the daemon-facing data layer and the
 //! rendering layer (issue #1585's plan, "Interface boundary" section).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +12,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::ahead_behind::AheadBehindCache;
+use super::ahead_behind::{AheadBehindCache, Inputs};
 use super::client::WorktreesClient;
 use super::local_state::OpenTabs;
 use super::row_colors::{RowColorKey, RowColorStore};
@@ -23,22 +22,6 @@ use super::wire::{SessionsListWire, TreeSnapshotWire};
 use crate::daemon::protocol::DaemonEnvelope;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
-
-/// The refs one worktree's ahead/behind is computed from, as the snapshot reports
-/// them: `(head_sha, upstream_sha, main_sha)`. Equal means an equal answer, so a
-/// change in any one is what invalidates a cached entry.
-type SeenOids = (Option<String>, Option<String>, Option<String>);
-
-/// One worktree's identity for the OID-staleness check in
-/// `Hub::on_tree_changed` — just enough of the wire row to detect a commit, a
-/// push or a default-branch fetch without holding the whole `TreeWorktreeWire`.
-struct WorktreeOids {
-    path: PathBuf,
-    head_sha: Option<String>,
-    upstream_sha: Option<String>,
-    /// The *repo's* default-branch tip, repeated on each of its worktrees.
-    main_sha: Option<String>,
-}
 
 /// Commands the rendering layer sends into the hub.
 ///
@@ -98,7 +81,6 @@ pub fn spawn(socket: PathBuf, cancel: CancellationToken) -> ViewModelHandle {
         out_tx,
         generation: 0,
         visible_override: None,
-        last_seen_oids: HashMap::new(),
         cancel,
     };
     tokio::spawn(hub.run());
@@ -121,14 +103,6 @@ struct Hub {
     /// Explicit override from `SetVisibleRows`; `None` means "everything in
     /// the latest tree snapshot" (Phase 1's default, see [`HubCommand`]).
     visible_override: Option<Vec<PathBuf>>,
-    /// The `(head_sha, upstream_sha, main_sha)` each path's cached ahead/behind
-    /// entry was last computed against, so a commit, a push or a fetch of the
-    /// default branch (which moves one of these OIDs — see `TreeWorktreeWire`'s
-    /// doc comment) invalidates the stale cache entry instead of leaving it to
-    /// show counts for a HEAD the worktree has since moved past. `main_sha` is
-    /// the one a fetch of only `origin/main` moves, which is the only way
-    /// `main_behind` changes with nothing else in the row moving (#2120).
-    last_seen_oids: HashMap<PathBuf, SeenOids>,
     cancel: CancellationToken,
 }
 
@@ -164,7 +138,7 @@ impl Hub {
     }
 
     fn on_tree_changed(&mut self) {
-        let rows: Option<Vec<WorktreeOids>> = {
+        let rows: Option<Vec<(PathBuf, Inputs)>> = {
             let guard = self.tree_rx.borrow_and_update();
             match &*guard {
                 FeedFrame::Live(snapshot) => Some(
@@ -172,11 +146,14 @@ impl Hub {
                         .repos
                         .iter()
                         .flat_map(|repo| {
-                            repo.worktrees.iter().map(|wt| WorktreeOids {
-                                path: PathBuf::from(&wt.path),
-                                head_sha: wt.head_sha.clone(),
-                                upstream_sha: wt.upstream_sha.clone(),
-                                main_sha: repo.main_sha.clone(),
+                            repo.worktrees.iter().map(|wt| {
+                                let inputs = Inputs {
+                                    branch: wt.branch.clone(),
+                                    head_sha: wt.head_sha.clone(),
+                                    upstream_sha: wt.upstream_sha.clone(),
+                                    main_sha: repo.main_sha.clone(),
+                                };
+                                (PathBuf::from(&wt.path), inputs)
                             })
                         })
                         .collect(),
@@ -186,25 +163,12 @@ impl Hub {
         };
         let Some(rows) = rows else { return };
 
-        // A worktree whose head/upstream/default-branch OID moved since we last
-        // fetched its ahead/behind (a commit, a push or a default-branch fetch)
-        // invalidates that cache entry, so the next `set_visible` below re-queues
-        // a fresh fetch instead of leaving stale counts on screen.
-        for row in &rows {
-            let oids: SeenOids = (
-                row.head_sha.clone(),
-                row.upstream_sha.clone(),
-                row.main_sha.clone(),
-            );
-            if self.last_seen_oids.get(&row.path) != Some(&oids) {
-                self.ahead_behind.invalidate(&row.path);
-                self.last_seen_oids.insert(row.path.clone(), oids);
-            }
-        }
-        self.last_seen_oids
-            .retain(|path, _| rows.iter().any(|row| &row.path == path));
-
-        let all_paths: Vec<PathBuf> = rows.into_iter().map(|row| row.path).collect();
+        let all_paths: Vec<PathBuf> = rows.iter().map(|(path, _)| path.clone()).collect();
+        // A worktree whose branch or head/upstream/default-branch commit moved since
+        // its ahead/behind was fetched (a commit, a push, a fetch of the default
+        // branch) has its cached entry dropped, so the `set_visible` below
+        // re-queues a fresh fetch instead of leaving stale counts on screen.
+        self.ahead_behind.observe(rows);
         let visible = self.visible_override.clone().unwrap_or(all_paths);
         self.ahead_behind.set_visible(&visible);
     }
@@ -286,13 +250,10 @@ fn feed_status<T>(frame: &FeedFrame<T>) -> FeedStatus {
 mod tests {
     use serde_json::json;
 
+    use super::super::view_model::AheadBehindState;
     use super::super::wire::{TreeRepoWire, TreeWorktreeWire};
     use super::*;
     use crate::daemon::testutil::fake_daemon_replies;
-
-    fn test_hub() -> (Hub, watch::Sender<FeedFrame<TreeSnapshotWire>>) {
-        test_hub_on("/tmp/nonexistent-omni-dev-hub-test.sock")
-    }
 
     /// A hub whose ahead/behind fetches go to `socket`.
     fn test_hub_on(
@@ -312,7 +273,6 @@ mod tests {
             out_tx,
             generation: 0,
             visible_override: None,
-            last_seen_oids: HashMap::new(),
             cancel: CancellationToken::new(),
         };
         (hub, tree_tx)
@@ -357,48 +317,6 @@ mod tests {
     // fetch task via `tokio::spawn` for a newly-seen path, so these need a
     // runtime context (`#[tokio::test]`) even though nothing here is awaited.
 
-    #[tokio::test]
-    async fn on_tree_changed_records_each_paths_current_oids() {
-        let (mut hub, tree_tx) = test_hub();
-        tree_tx
-            .send(FeedFrame::Live(snapshot(worktree("/repo/wt", Some("aaa")))))
-            .unwrap();
-        hub.on_tree_changed();
-        assert_eq!(
-            hub.last_seen_oids.get(&PathBuf::from("/repo/wt")),
-            Some(&(Some("aaa".to_string()), None, None))
-        );
-    }
-
-    #[tokio::test]
-    async fn on_tree_changed_invalidates_the_ahead_behind_cache_when_head_sha_moves() {
-        let (mut hub, tree_tx) = test_hub();
-        let path = PathBuf::from("/repo/wt");
-        tree_tx
-            .send(FeedFrame::Live(snapshot(worktree("/repo/wt", Some("aaa")))))
-            .unwrap();
-        hub.on_tree_changed();
-        // Fetch is now in flight (or unreachable-socket-failed) for this
-        // path; either way it is no longer Unknown.
-        assert_ne!(
-            hub.ahead_behind.get(&path),
-            super::super::view_model::AheadBehindState::Unknown
-        );
-
-        // A new head_sha (a commit landed) must update the tracked OIDs —
-        // the actual cache-drop behaviour of `invalidate` is covered by
-        // ahead_behind.rs's own tests; this asserts the bookkeeping that
-        // decides *when* to call it.
-        tree_tx
-            .send(FeedFrame::Live(snapshot(worktree("/repo/wt", Some("bbb")))))
-            .unwrap();
-        hub.on_tree_changed();
-        assert_eq!(
-            hub.last_seen_oids.get(&path),
-            Some(&(Some("bbb".to_string()), None, None))
-        );
-    }
-
     /// Lets the one in-flight fetch settle, so the cache holds an entry (or
     /// nothing, if the fetch failed) rather than a pending marker.
     async fn settle(hub: &mut Hub) {
@@ -414,22 +332,51 @@ mod tests {
         }}})
     }
 
+    /// What `counts_reply(ahead, behind)` becomes in the cache.
+    fn known(ahead: usize, behind: usize) -> AheadBehindState {
+        AheadBehindState::Known {
+            ahead,
+            behind,
+            main_behind: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn on_tree_changed_refetches_when_head_sha_moves() {
+        let (_dir, sock, _server) =
+            fake_daemon_replies(vec![counts_reply(1, 0), counts_reply(2, 0)]);
+        let (mut hub, tree_tx) = test_hub_on(sock);
+        let path = PathBuf::from("/repo/wt");
+        let send = |head: &str| {
+            tree_tx
+                .send(FeedFrame::Live(snapshot(worktree("/repo/wt", Some(head)))))
+                .unwrap();
+        };
+
+        send("aaa");
+        hub.on_tree_changed();
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Loading);
+        settle(&mut hub).await;
+        assert_eq!(hub.ahead_behind.get(&path), known(1, 0));
+
+        // A commit landed: the entry is dropped and the path asked again.
+        send("bbb");
+        hub.on_tree_changed();
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Loading);
+        settle(&mut hub).await;
+        assert_eq!(hub.ahead_behind.get(&path), known(2, 0));
+    }
+
     #[tokio::test]
     async fn on_tree_changed_refetches_when_only_the_default_branch_tip_moves() {
         // A `git fetch` that advances only `origin/main` moves no worktree's own refs,
         // but it changes `main_behind` — so the repo's `main_sha` has to be part of
         // what invalidates a cached entry (#2120). Without it the row kept the count
         // it was fetched with until a commit or a push happened to move another OID.
-        use super::super::view_model::AheadBehindState;
         let (_dir, sock, _server) =
             fake_daemon_replies(vec![counts_reply(1, 0), counts_reply(1, 0)]);
         let (mut hub, tree_tx) = test_hub_on(sock);
         let path = PathBuf::from("/repo/wt");
-        let known = AheadBehindState::Known {
-            ahead: 1,
-            behind: 0,
-            main_behind: None,
-        };
         let send = |main_sha: &str| {
             tree_tx
                 .send(FeedFrame::Live(snapshot_with_main_sha(
@@ -442,21 +389,69 @@ mod tests {
         send("m1");
         hub.on_tree_changed();
         settle(&mut hub).await;
-        assert_eq!(hub.ahead_behind.get(&path), known);
+        assert_eq!(hub.ahead_behind.get(&path), known(1, 0));
 
         // The same snapshot again drops nothing: an unchanged refresh stays free.
         send("m1");
         hub.on_tree_changed();
-        assert_eq!(hub.ahead_behind.get(&path), known);
+        assert_eq!(hub.ahead_behind.get(&path), known(1, 0));
 
         // Only the default branch's tip moved: the entry is dropped and re-asked.
         send("m2");
         hub.on_tree_changed();
         assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Loading);
-        assert_eq!(
-            hub.last_seen_oids.get(&path),
-            Some(&(Some("aaa".to_string()), None, Some("m2".to_string())))
-        );
+    }
+
+    #[tokio::test]
+    async fn on_tree_changed_refetches_when_only_the_branch_changes() {
+        // A branch switch can land on the same commit, so nothing a sha says moves.
+        let (_dir, sock, _server) =
+            fake_daemon_replies(vec![counts_reply(1, 0), counts_reply(3, 0)]);
+        let (mut hub, tree_tx) = test_hub_on(sock);
+        let path = PathBuf::from("/repo/wt");
+        let send = |branch: &str| {
+            let mut wt = worktree("/repo/wt", Some("aaa"));
+            wt.branch = Some(branch.to_string());
+            tree_tx.send(FeedFrame::Live(snapshot(wt))).unwrap();
+        };
+
+        send("one");
+        hub.on_tree_changed();
+        settle(&mut hub).await;
+        assert_eq!(hub.ahead_behind.get(&path), known(1, 0));
+
+        send("two");
+        hub.on_tree_changed();
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Loading);
+    }
+
+    #[tokio::test]
+    async fn on_tree_changed_does_not_cache_a_result_for_a_head_that_has_since_moved() {
+        // #2145, end to end: a fetch is in flight for HEAD `aaa`, a commit moves the
+        // worktree to `bbb`, and the reply computed for `aaa` lands. It must not be
+        // cached as current, and the worktree must be asked again without waiting
+        // for another tree frame.
+        let (_dir, sock, _server) =
+            fake_daemon_replies(vec![counts_reply(1, 0), counts_reply(2, 0)]);
+        let (mut hub, tree_tx) = test_hub_on(sock);
+        let path = PathBuf::from("/repo/wt");
+        let send = |head: &str| {
+            tree_tx
+                .send(FeedFrame::Live(snapshot(worktree("/repo/wt", Some(head)))))
+                .unwrap();
+        };
+
+        send("aaa");
+        hub.on_tree_changed();
+        send("bbb");
+        hub.on_tree_changed();
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Loading);
+
+        settle(&mut hub).await;
+        // The reply for `aaa` was discarded; the re-ask for `bbb` is in flight.
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Loading);
+        settle(&mut hub).await;
+        assert_eq!(hub.ahead_behind.get(&path), known(2, 0));
     }
 
     #[tokio::test]
@@ -464,7 +459,6 @@ mod tests {
         // A fetch that failed is not an answer (#2134): the row has to be asked
         // again by the tree feed's next frame, with every OID unchanged, rather
         // than staying blank until a commit, a push or a fetch happens to move one.
-        use super::super::view_model::AheadBehindState;
         let (_dir, sock, _server) = fake_daemon_replies(vec![
             json!({ "ok": false, "error": "busy" }),
             counts_reply(2, 1),
@@ -492,24 +486,22 @@ mod tests {
         hub.on_tree_changed();
         assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Loading);
         settle(&mut hub).await;
-        assert_eq!(
-            hub.ahead_behind.get(&path),
-            AheadBehindState::Known {
-                ahead: 2,
-                behind: 1,
-                main_behind: None
-            }
-        );
+        assert_eq!(hub.ahead_behind.get(&path), known(2, 1));
     }
 
     #[tokio::test]
-    async fn on_tree_changed_forgets_oids_for_worktrees_no_longer_in_the_snapshot() {
-        let (mut hub, tree_tx) = test_hub();
+    async fn on_tree_changed_asks_afresh_about_a_worktree_that_left_and_came_back() {
+        let (_dir, sock, _server) =
+            fake_daemon_replies(vec![counts_reply(1, 0), counts_reply(1, 0)]);
+        let (mut hub, tree_tx) = test_hub_on(sock);
+        let path = PathBuf::from("/repo/wt");
+
         tree_tx
             .send(FeedFrame::Live(snapshot(worktree("/repo/wt", Some("aaa")))))
             .unwrap();
         hub.on_tree_changed();
-        assert!(hub.last_seen_oids.contains_key(&PathBuf::from("/repo/wt")));
+        settle(&mut hub).await;
+        assert_eq!(hub.ahead_behind.get(&path), known(1, 0));
 
         tree_tx
             .send(FeedFrame::Live(snapshot(worktree(
@@ -518,9 +510,12 @@ mod tests {
             ))))
             .unwrap();
         hub.on_tree_changed();
-        assert!(!hub.last_seen_oids.contains_key(&PathBuf::from("/repo/wt")));
-        assert!(hub
-            .last_seen_oids
-            .contains_key(&PathBuf::from("/repo/other-wt")));
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Unknown);
+
+        tree_tx
+            .send(FeedFrame::Live(snapshot(worktree("/repo/wt", Some("aaa")))))
+            .unwrap();
+        hub.on_tree_changed();
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Loading);
     }
 }
