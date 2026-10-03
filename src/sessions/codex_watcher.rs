@@ -41,6 +41,13 @@
 //!   acquiring the lock for that same thread in the same instant.
 //! - On first sight a rollout whose lock is free or gone is recorded but not
 //!   announced — a daemon restart must not list sessions that already ended.
+//! - A rollout that is *not* recent is no evidence the session is gone: a Codex
+//!   left idle at its prompt writes nothing, and one started before hooks were
+//!   installed has no hook to announce it either (#2108). So an unread rollout's
+//!   lock is probed too, by the thread id its file name ends in, on every scan;
+//!   a held lock announces it whatever its mtime. The name is only a prefilter
+//!   (a missing lock file is a cheap `ENOENT`): the head, read once the lock is
+//!   held, stays the authority for the id, `cwd` and the subagent check.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
@@ -342,13 +349,15 @@ fn scan(
         present.insert(path.clone());
         let recent = is_recent(modified, now);
         let tracked = match state.remove(&path) {
-            None if !recent => Tracked::Unread { size },
+            None if !recent => unread_or_held(&path, size, locks, now, probe, &mut actions),
             // First sight of a recent rollout, or growth of one not read yet.
             None => first_read(&path, size, locks, now, probe, &mut actions),
             Some(Tracked::Unread { size: old }) if size != old && recent => {
                 first_read(&path, size, locks, now, probe, &mut actions)
             }
-            Some(Tracked::Unread { .. }) => Tracked::Unread { size },
+            Some(Tracked::Unread { .. }) => {
+                unread_or_held(&path, size, locks, now, probe, &mut actions)
+            }
             Some(Tracked::Skipped) => Tracked::Skipped,
             Some(Tracked::Session(track)) => {
                 Tracked::Session(rescan(track, &path, size, locks, now, probe, &mut actions))
@@ -372,6 +381,43 @@ fn scan(
         false
     });
     actions
+}
+
+/// The thread id a rollout's file name ends in: `rollout-<timestamp>-<id>.jsonl`,
+/// where the id is a UUID. `None` for a name that does not end in one.
+fn thread_id_from_file_name(path: &Path) -> Option<&str> {
+    let stem = path.file_stem()?.to_str()?;
+    let split = stem.len().checked_sub(36)?;
+    let id = stem.get(split..)?;
+    let groups: Vec<&str> = id.split('-').collect();
+    let shaped = groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()));
+    let separated = split
+        .checked_sub(1)
+        .is_some_and(|dash| stem.as_bytes().get(dash) == Some(&b'-'));
+    (shaped && separated).then_some(id)
+}
+
+/// Handles a rollout that is not recent and has not been read: it stays
+/// [`Tracked::Unread`] unless its thread's lock is held, in which case a live
+/// process has it loaded and it is read now, whatever its mtime (#2108).
+fn unread_or_held(
+    path: &Path,
+    size: u64,
+    locks: &Path,
+    now: SystemTime,
+    probe: &dyn Fn(&Path, &str) -> LockState,
+    actions: &mut Vec<Action>,
+) -> Tracked {
+    match thread_id_from_file_name(path) {
+        Some(id) if probe(locks, id) == LockState::Held => {
+            first_read(path, size, locks, now, probe, actions)
+        }
+        _ => Tracked::Unread { size },
+    }
 }
 
 /// Reads a rollout's head for the first time, announcing it when it is a
@@ -669,6 +715,106 @@ mod tests {
             )),
             vec![format!("seen:{ID}")]
         );
+    }
+
+    #[test]
+    fn an_old_rollout_whose_lock_is_held_is_announced_regardless_of_its_age() {
+        // #2108: a Codex started before hooks were installed, idle for hours,
+        // still holds its thread lock while it lives.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_rollout(tmp.path(), ID, &[head(ID, serde_json::json!("cli"))]);
+        let lock = RefCell::new(LockState::Held);
+        let mut state = ScanState::new();
+        let far = SystemTime::now() + RECENT_ACTIVITY_WINDOW * 10;
+        assert_eq!(
+            scan(tmp.path(), tmp.path(), &mut state, far, &scripted(&lock)),
+            vec![Action::Seen {
+                id: ID.to_string(),
+                cwd: Some(PathBuf::from("/work/repo")),
+                transcript_path: path.clone(),
+            }]
+        );
+        assert!(matches!(state[&path], Tracked::Session(_)));
+        // Tracked now: held and not yet due is quiet, and the release ends it.
+        assert!(scan(tmp.path(), tmp.path(), &mut state, far, &scripted(&lock)).is_empty());
+        *lock.borrow_mut() = LockState::Free;
+        assert_eq!(
+            ids(&scan(
+                tmp.path(),
+                tmp.path(),
+                &mut state,
+                far,
+                &scripted(&lock)
+            )),
+            vec![format!("end:{ID}")]
+        );
+    }
+
+    #[test]
+    fn an_old_rollout_is_announced_when_its_lock_becomes_held_later() {
+        // A `codex resume` that has not written yet: still `Unread`, then the
+        // lock appears and the next scan announces it without any growth.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_rollout(tmp.path(), ID, &[head(ID, serde_json::json!("cli"))]);
+        let lock = RefCell::new(LockState::Absent);
+        let mut state = ScanState::new();
+        let far = SystemTime::now() + RECENT_ACTIVITY_WINDOW * 10;
+        assert!(scan(tmp.path(), tmp.path(), &mut state, far, &scripted(&lock)).is_empty());
+        assert!(matches!(state[&path], Tracked::Unread { .. }));
+        *lock.borrow_mut() = LockState::Held;
+        assert_eq!(
+            ids(&scan(
+                tmp.path(),
+                tmp.path(),
+                &mut state,
+                far,
+                &scripted(&lock)
+            )),
+            vec![format!("seen:{ID}")]
+        );
+    }
+
+    #[test]
+    fn an_old_rollout_with_a_free_or_unknown_lock_stays_unread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_rollout(tmp.path(), ID, &[head(ID, serde_json::json!("cli"))]);
+        let far = SystemTime::now() + RECENT_ACTIVITY_WINDOW * 10;
+        for held in [LockState::Free, LockState::Absent, LockState::Unknown] {
+            let lock = RefCell::new(held);
+            let mut state = ScanState::new();
+            assert!(scan(tmp.path(), tmp.path(), &mut state, far, &scripted(&lock)).is_empty());
+            assert!(matches!(state[&path], Tracked::Unread { .. }), "{held:?}");
+        }
+    }
+
+    #[test]
+    fn an_old_subagent_rollout_with_a_held_lock_is_skipped_not_announced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = serde_json::json!({ "subagent": "review" });
+        let path = write_rollout(tmp.path(), ID, &[head(ID, sub)]);
+        let lock = RefCell::new(LockState::Held);
+        let mut state = ScanState::new();
+        let far = SystemTime::now() + RECENT_ACTIVITY_WINDOW * 10;
+        assert!(scan(tmp.path(), tmp.path(), &mut state, far, &scripted(&lock)).is_empty());
+        assert!(matches!(state[&path], Tracked::Skipped));
+    }
+
+    #[test]
+    fn thread_ids_come_only_from_a_uuid_ending_the_file_name() {
+        let named = |name: &str| thread_id_from_file_name(Path::new(name)).map(str::to_string);
+        assert_eq!(
+            named(&format!("rollout-2026-09-25T00-00-00-{ID}.jsonl")),
+            Some(ID.to_string())
+        );
+        // No UUID, a short name, a non-hex group, or no separating dash.
+        assert_eq!(named("rollout-2026-09-25T00-00-00-child.jsonl"), None);
+        assert_eq!(named("x.jsonl"), None);
+        assert_eq!(
+            named("rollout-019a0000-0000-7000-8000-00000000zzzz.jsonl"),
+            None
+        );
+        assert_eq!(named(&format!("rollout{ID}.jsonl")), None);
+        assert_eq!(named(&format!("{ID}.jsonl")), None);
     }
 
     #[test]
