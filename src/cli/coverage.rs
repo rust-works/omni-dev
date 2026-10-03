@@ -61,6 +61,7 @@ mod tests {
                 output: diff::OutputFormatArg::Markdown,
                 format: None,
                 fail_under_patch: None,
+                fail_under_lines: None,
                 strip_prefix: None,
                 ignore_filename_regex: Vec::new(),
                 context_dir: None,

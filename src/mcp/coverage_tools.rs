@@ -98,6 +98,11 @@ pub struct CoverageDiffParams {
     /// (the tool never fails the call; it reports `below_gate` instead).
     #[serde(default)]
     pub fail_under_patch: Option<f64>,
+    /// Report a below-line-gate result when overall line coverage is below this
+    /// percentage, or the report has no executable lines (the tool never fails
+    /// the call; it reports `below_line_gate` instead).
+    #[serde(default)]
+    pub fail_under_lines: Option<f64>,
     /// Override the path prefix stripped from report paths to make them
     /// repo-relative (default: the repository working directory).
     #[serde(default)]
@@ -146,8 +151,9 @@ impl OmniDevServer {
                        `report` is a required filesystem path to the head coverage report \
                        (lcov / llvm-cov-json / cobertura, auto-detected). `format` renders the \
                        report as `markdown` (default), `yaml`, or `json`. Unlike the CLI this \
-                       tool never fails the call on a low `fail_under_patch`; it reports \
-                       `below_gate: true` instead."
+                       tool never fails the call on a low `fail_under_patch` or \
+                       `fail_under_lines`; it reports `below_gate: true` / \
+                       `below_line_gate: true` instead."
     )]
     pub async fn coverage_diff(
         &self,
@@ -167,6 +173,7 @@ impl OmniDevServer {
             output: params.format.into(),
             format: None,
             fail_under_patch: params.fail_under_patch,
+            fail_under_lines: params.fail_under_lines,
             strip_prefix: params.strip_prefix.map(PathBuf::from),
             ignore_filename_regex: params.ignore_filename_regex,
             // Config discovery walks up from `repo_path`; MCP callers get the
@@ -192,12 +199,10 @@ impl OmniDevServer {
     }
 }
 
-/// Formats the [`DiffOutcome`] as a YAML payload: the patch percentage, the
-/// gate result, and the rendered report as a block scalar.
+/// Formats the [`DiffOutcome`] as a YAML payload: the patch and overall line
+/// percentages, both gate results, and the rendered report as a block scalar.
 fn format_coverage_payload(outcome: &DiffOutcome) -> String {
-    let patch = outcome
-        .patch_percent
-        .map_or_else(|| "null".to_string(), |p| format!("{p:.4}"));
+    let percent = |p: Option<f64>| p.map_or_else(|| "null".to_string(), |p| format!("{p:.4}"));
     let rendered = outcome
         .rendered
         .lines()
@@ -205,8 +210,11 @@ fn format_coverage_payload(outcome: &DiffOutcome) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "# coverage_diff outcome\npatch_percent: {patch}\nbelow_gate: {}\nrendered: |\n{rendered}",
+        "# coverage_diff outcome\npatch_percent: {}\nbelow_gate: {}\nline_percent: {}\nbelow_line_gate: {}\nrendered: |\n{rendered}",
+        percent(outcome.patch_percent),
         outcome.below_gate,
+        percent(outcome.line_percent),
+        outcome.below_line_gate,
     )
 }
 
@@ -237,10 +245,14 @@ mod tests {
             rendered: "line1\nline2".to_string(),
             patch_percent: Some(87.5),
             below_gate: false,
+            line_percent: Some(61.25),
+            below_line_gate: true,
         };
         let payload = format_coverage_payload(&outcome);
         assert!(payload.contains("patch_percent: 87.5000"));
         assert!(payload.contains("below_gate: false"));
+        assert!(payload.contains("line_percent: 61.2500"));
+        assert!(payload.contains("below_line_gate: true"));
         assert!(payload.contains("  line1"));
         assert!(payload.contains("  line2"));
     }
@@ -251,10 +263,14 @@ mod tests {
             rendered: "x".to_string(),
             patch_percent: None,
             below_gate: true,
+            line_percent: None,
+            below_line_gate: false,
         };
         let payload = format_coverage_payload(&outcome);
         assert!(payload.contains("patch_percent: null"));
         assert!(payload.contains("below_gate: true"));
+        assert!(payload.contains("line_percent: null"));
+        assert!(payload.contains("below_line_gate: false"));
     }
 
     #[test]
@@ -309,6 +325,7 @@ mod tests {
             baseline_report_format: CoverageReportFormat::Auto,
             format: CoverageOutputFormat::Markdown,
             fail_under_patch: None,
+            fail_under_lines: None,
             strip_prefix: None,
             ignore_filename_regex: Vec::new(),
             collapse_ranges: false,

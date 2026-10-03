@@ -604,6 +604,9 @@ omni-dev coverage diff --report head.lcov
 # Fail if patch coverage is under 80% (a CI gate or a pre-push check)
 omni-dev coverage diff --report head.lcov --fail-under-patch 80
 
+# Fail if overall line coverage is under 70%
+omni-dev coverage diff --report head.lcov --fail-under-lines 70
+
 # Full report with project deltas, as JSON
 omni-dev coverage diff --report head.lcov --baseline-report base.lcov --format json
 ```

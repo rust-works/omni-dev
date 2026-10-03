@@ -62,7 +62,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 ### Coverage
 
-- **[Coverage Diff](coverage.md)** - `omni-dev coverage diff`: patch coverage, uncovered new lines, per-file deltas, and indirect changes from lcov / llvm-cov-json / Cobertura reports; output formats, the `--fail-under-patch` gate, and the PR-comment renderer
+- **[Coverage Diff](coverage.md)** - `omni-dev coverage diff`: patch coverage, uncovered new lines, per-file deltas, and indirect changes from lcov / llvm-cov-json / Cobertura reports; output formats, the `--fail-under-patch` / `--fail-under-lines` gates, and the PR-comment renderer
 
 ### MCP Server
 
