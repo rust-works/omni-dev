@@ -139,6 +139,14 @@ pub struct WorktreesRegistry {
     /// window map: a daemon restart drops any pending directive (the close op
     /// aborts and the user retries — an accepted failure mode). Behind its own
     /// `Mutex`, taken independently of the window map's, so neither nests.
+    ///
+    /// The op that sets a key also withdraws it
+    /// ([`cancel_close_pending`](Self::cancel_close_pending)) when its wait
+    /// *fails*, so a close the caller was told had failed has no later side
+    /// effect (#2139). A successful close leaves its keys alone, and a reap clears
+    /// nothing: a window counted closed only because it was reaped is handed the
+    /// directive if it returns, and closes rather than staying open on a worktree
+    /// the op removed.
     close_pending: Mutex<HashSet<String>>,
     /// Window keys with a pending "reload yourself" directive, set by the
     /// `reload` op (#1417). The second directive of the
@@ -151,6 +159,14 @@ pub struct WorktreesRegistry {
     /// In-memory only: a daemon restart drops any pending directive, and the
     /// user simply reloads again. Behind its **own** `Mutex`, taken
     /// independently of the window map's and of `close_pending`'s, so none nest.
+    ///
+    /// Only `unregister` clears a key; a reap deliberately does not (#2139). A
+    /// window silent past the TTL that returns re-registers off its `known:
+    /// false` heartbeat and is handed the directive there, which is the reload
+    /// the user was told was signalled; clearing on reap would drop it. The cost
+    /// is a UUID string left behind by a window that was signalled and then died
+    /// without unregistering — accepted, since it takes a crash inside the
+    /// signal-to-heartbeat gap and is not a growth path.
     reload_pending: Mutex<HashSet<String>>,
     /// Worktree paths the daemon is **currently rebasing** (#1415) — the
     /// transient half of the tree view's rebase cue.
@@ -446,6 +462,26 @@ impl WorktreesRegistry {
             .remove(key)
     }
 
+    /// Withdraws `key`'s pending close directive without delivering it (#2139):
+    /// the `close` op's counterpart to [`mark_close_pending`](Self::mark_close_pending),
+    /// called when its wait fails so a directive it set cannot outlive an op the
+    /// caller was told had failed. Without it a timed-out close reports failure
+    /// while the window closes itself on its next heartbeat.
+    ///
+    /// Returns whether the directive was still pending. A `false` means the
+    /// window already took it (it is closing, only slowly — a delivered
+    /// directive cannot be recalled) or it was cleared by an `unregister`.
+    ///
+    /// The set holds a key once, not a count, so two concurrent closes whose
+    /// targets share a multi-root window share one entry: whichever gives up
+    /// first withdraws it for both. The ops are fanned out together, so the other
+    /// loses at most the skew between their starts, and only if the window comes
+    /// back inside it after being unresponsive for the whole of the first's wait.
+    /// That is not worth a per-op ticket.
+    pub fn cancel_close_pending(&self, key: &str) -> bool {
+        self.take_close_pending(key)
+    }
+
     /// Records a pending "reload yourself" directive for `key`, to be surfaced
     /// on that window's next `heartbeat` (#1417). Set by the `reload` op for
     /// every target window, which — unlike a close — includes no waiting: the
@@ -675,6 +711,13 @@ impl WorktreesRegistry {
             .into_iter()
             .filter(|(_, expiry)| *expiry > now)
             .collect();
+    }
+
+    /// Test-only: advances the awake clock by `by`, so a test outside this module
+    /// can age a window past the TTL without sleeping for it.
+    #[cfg(test)]
+    pub fn advance_clock(&self, by: Duration) {
+        self.clock.advance(by);
     }
 
     /// Test-only: forces `owner/name`'s lease to `expiry`, so a test can simulate
@@ -1405,6 +1448,57 @@ mod tests {
         // Unregistering the window drops any pending directive with it.
         assert!(reg.unregister("w1"));
         assert!(!reg.take_close_pending("w1"));
+    }
+
+    #[test]
+    fn cancel_close_pending_withdraws_an_undelivered_directive() {
+        let reg = WorktreesRegistry::new();
+        reg.mark_close_pending("w1");
+        assert!(reg.cancel_close_pending("w1"), "it was still pending");
+        assert!(
+            !reg.take_close_pending("w1"),
+            "a withdrawn directive is never delivered"
+        );
+        assert!(!reg.cancel_close_pending("w1"), "nothing left to withdraw");
+    }
+
+    #[test]
+    fn cancel_close_pending_cannot_recall_a_directive_the_window_took() {
+        let reg = WorktreesRegistry::new();
+        reg.mark_close_pending("w1");
+        // The window heartbeated first, so it already holds `close: true`.
+        assert!(reg.take_close_pending("w1"));
+        assert!(!reg.cancel_close_pending("w1"), "already delivered");
+    }
+
+    #[test]
+    fn cancel_close_pending_touches_only_its_own_key_and_set() {
+        let reg = WorktreesRegistry::new();
+        reg.mark_close_pending("w1");
+        reg.mark_close_pending("w2");
+        reg.mark_reload_pending("w1");
+
+        assert!(reg.cancel_close_pending("w1"));
+
+        assert!(reg.take_close_pending("w2"), "another key is untouched");
+        assert!(reg.take_reload_pending("w1"), "the reload set is untouched");
+    }
+
+    #[test]
+    fn a_reap_leaves_pending_directives_for_a_window_that_returns() {
+        // Pins the accepted half of #2139: a reap clears neither directive, so a
+        // window that goes quiet past the TTL and comes back is handed what it
+        // was signalled — on the heartbeat that answers `known: false`.
+        let reg = registry_with_headroom();
+        insert_silent(&reg, "w", Duration::from_secs(40));
+        reg.mark_close_pending("w");
+        reg.mark_reload_pending("w");
+
+        assert!(reg.list().is_empty(), "the window was reaped");
+        assert!(!reg.heartbeat("w"), "it returns unknown");
+
+        assert!(reg.take_close_pending("w"));
+        assert!(reg.take_reload_pending("w"));
     }
 
     // --- Reload-pending directive (#1417) ----------------------------------
