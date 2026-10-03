@@ -9,16 +9,21 @@
 //! descriptor — until its turn. Three mechanisms cut that down, none of which
 //! can serve a stale answer:
 //!
-//! - [`WalkMemo`] remembers `graph_ahead_behind` results by commit ids. Ancestry
-//!   is a pure function of the ids, so a hit is exact, and a commit, fetch or push
-//!   changes an id and so misses by construction — no TTL to tune.
+//! - [`WalkMemo`] remembers `graph_ahead_behind` results by commit ids. In a
+//!   complete repository ancestry is a pure function of the ids, so a hit is exact,
+//!   and a commit, fetch or push changes an id and so misses by construction — no
+//!   TTL to tune. A shallow clone is the exception (deepening it changes the answer
+//!   without changing any id), so it bypasses the memo.
 //! - [`AheadBehindCoordinator`] makes concurrent requests for one worktree share
-//!   one computation (single-flight), so 26 windows asking at once cost one.
+//!   one computation (single-flight) while it is still waiting its turn, so a
+//!   burst of windows asking at once costs one per worktree, and a request never
+//!   gets an answer older than itself.
 //! - It also caps how many computations run at once, bounding blocking-pool use
 //!   and the number of live `Repository` objects (each holds its pack files open).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use git2::{Oid, Repository};
@@ -46,8 +51,10 @@ pub(super) struct Divergence {
 }
 
 /// The identity of one graph walk: the repository's common dir plus both tips.
-/// The common dir keeps repositories apart even though equal ids mean equal
-/// history in a complete clone — a shallow clone sees the same ids differently.
+/// Equal ids mean equal history in a complete clone, so the common dir only keeps
+/// unrelated repositories from sharing entries. (Grafts and `replace` refs can in
+/// principle rewrite ancestry behind an unchanged id; they are not used on the
+/// repositories this daemon watches, and the memo turns over at its capacity.)
 type WalkKey = (PathBuf, Oid, Oid);
 
 /// A bounded memo of `graph_ahead_behind` results, keyed by [`WalkKey`].
@@ -104,24 +111,55 @@ static WALKS: LazyLock<WalkMemo> = LazyLock::new(|| WalkMemo::with_capacity(WALK
 /// Commits `local` is ahead of and behind `upstream` in `repo`, memoized by id.
 ///
 /// `None` when the walk fails (an id with no commit behind it); failures are not
-/// memoized, so a later call retries.
+/// memoized, so a later call retries. A shallow repository is never memoized: its
+/// answer depends on how deep it currently is, which no id records.
 pub(super) fn graph_ahead_behind(
     repo: &Repository,
     local: Oid,
     upstream: Oid,
 ) -> Option<(usize, usize)> {
+    graph_ahead_behind_in(&WALKS, repo, local, upstream)
+}
+
+/// [`graph_ahead_behind`] against an explicit memo, so tests need not share the
+/// process-wide one.
+fn graph_ahead_behind_in(
+    memo: &WalkMemo,
+    repo: &Repository,
+    local: Oid,
+    upstream: Oid,
+) -> Option<(usize, usize)> {
+    let walk = || repo.graph_ahead_behind(local, upstream).ok();
+    if repo.is_shallow() {
+        return walk();
+    }
     let key = (repo.commondir().to_path_buf(), local, upstream);
-    WALKS.get_or_walk(key, || repo.graph_ahead_behind(local, upstream).ok())
+    memo.get_or_walk(key, walk)
+}
+
+/// One computation for one worktree, shared by every request that joins it.
+#[derive(Default)]
+struct Flight {
+    result: OnceCell<Divergence>,
+    /// Set the moment the computation begins reading the repository. A request
+    /// that arrives after this must not join it: its answer would describe the
+    /// repository as it was before the request was made.
+    started: AtomicBool,
 }
 
 /// Runs divergence computations so that concurrent requests for the same
 /// worktree share one, and so that at most a fixed number run at a time.
+///
+/// A request joins a computation only while it is still **waiting for its turn**
+/// (queued behind the cap, or not yet on its thread). That is exactly when sharing
+/// is worth the most — under load, with the cap saturated and the queue deep — and
+/// it keeps every answer exact: a computation that has begun reading the
+/// repository is never joined by a later request, which starts its own instead.
 pub(super) struct AheadBehindCoordinator {
-    /// The computation in flight for each worktree. An entry exists only while a
-    /// request is being served: it is removed when the last interested caller
-    /// finishes, so a later request always computes afresh — nothing here is a
-    /// cache, and a result is never older than the request that joined it.
-    in_flight: Mutex<HashMap<PathBuf, Arc<OnceCell<Divergence>>>>,
+    /// The newest computation per worktree. An entry exists only while a request
+    /// is being served; it is removed when its last interested caller finishes, so
+    /// nothing here is a cache.
+    in_flight: Mutex<HashMap<PathBuf, Arc<Flight>>>,
     permits: Arc<Semaphore>,
 }
 
@@ -137,30 +175,45 @@ impl AheadBehindCoordinator {
         }
     }
 
-    /// The divergence of the worktree at `path`, from the computation already in
-    /// flight for it if there is one, else from `compute` run on a blocking thread.
+    /// The divergence of the worktree at `path`, from a computation that has not
+    /// begun yet if one is queued for it, else from `compute` run on a blocking
+    /// thread.
     ///
-    /// `compute` is only called when this caller is the one to start the work; a
-    /// caller that joins an existing computation drops it unused.
+    /// `compute` is only called when this caller is the one to run the work; a
+    /// caller that joins a queued computation drops it unused.
     pub(super) async fn get_or_compute<F>(&self, path: PathBuf, compute: F) -> Divergence
     where
         F: FnOnce(PathBuf) -> Divergence + Send + 'static,
     {
-        let cell = Arc::clone(self.lock().entry(path.clone()).or_default());
+        let flight = self.join_or_start(&path);
         // Removes the entry on the way out, including when this future is dropped
         // mid-flight, so an abandoned request cannot leave a path stuck.
         let _forget = Forget {
             in_flight: &self.in_flight,
             path: &path,
-            cell: &cell,
+            flight: &flight,
         };
-        *cell
-            .get_or_init(|| self.compute_bounded(path.clone(), compute))
+        *flight
+            .result
+            .get_or_init(|| self.compute_bounded(Arc::clone(&flight), path.clone(), compute))
             .await
     }
 
+    /// The computation queued for `path`, or a fresh one registered in its place.
+    fn join_or_start(&self, path: &PathBuf) -> Arc<Flight> {
+        let mut in_flight = self.lock();
+        if let Some(queued) = in_flight.get(path) {
+            if !queued.started.load(Ordering::SeqCst) {
+                return Arc::clone(queued);
+            }
+        }
+        let fresh = Arc::new(Flight::default());
+        in_flight.insert(path.clone(), Arc::clone(&fresh));
+        fresh
+    }
+
     /// Waits for a permit, then runs `compute` on a blocking thread holding it.
-    async fn compute_bounded<F>(&self, path: PathBuf, compute: F) -> Divergence
+    async fn compute_bounded<F>(&self, flight: Arc<Flight>, path: PathBuf, compute: F) -> Divergence
     where
         F: FnOnce(PathBuf) -> Divergence + Send + 'static,
     {
@@ -173,6 +226,9 @@ impl AheadBehindCoordinator {
         // permit with the future would let more than the cap run at once.
         let joined = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            // Marked before any read, so a request that sees `started == false`
+            // is guaranteed this computation reads the repository after it arrived.
+            flight.started.store(true, Ordering::SeqCst);
             compute(path)
         })
         .await;
@@ -182,7 +238,7 @@ impl AheadBehindCoordinator {
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Arc<OnceCell<Divergence>>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Arc<Flight>>> {
         self.in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -196,9 +252,9 @@ impl AheadBehindCoordinator {
 
 /// Drop guard that removes a path's in-flight entry, if it is still the same one.
 struct Forget<'a> {
-    in_flight: &'a Mutex<HashMap<PathBuf, Arc<OnceCell<Divergence>>>>,
+    in_flight: &'a Mutex<HashMap<PathBuf, Arc<Flight>>>,
     path: &'a PathBuf,
-    cell: &'a Arc<OnceCell<Divergence>>,
+    flight: &'a Arc<Flight>,
 }
 
 impl Drop for Forget<'_> {
@@ -210,7 +266,7 @@ impl Drop for Forget<'_> {
         // A later request may already have replaced the entry; leave that one.
         if in_flight
             .get(self.path)
-            .is_some_and(|current| Arc::ptr_eq(current, self.cell))
+            .is_some_and(|current| Arc::ptr_eq(current, self.flight))
         {
             in_flight.remove(self.path);
         }
@@ -220,8 +276,8 @@ impl Drop for Forget<'_> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -232,32 +288,78 @@ mod tests {
         }
     }
 
-    /// A computation that counts how often it ran and takes long enough for
-    /// concurrent callers to pile up behind it.
-    fn slow_counting(
-        calls: &Arc<AtomicUsize>,
-    ) -> impl FnOnce(PathBuf) -> Divergence + Send + 'static {
-        let calls = Arc::clone(calls);
-        move |_| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(100));
-            divergence(7)
+    /// Waits (briefly, politely) until `flag` is set.
+    async fn wait_until(flag: &AtomicBool) {
+        for _ in 0..400 {
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        panic!("timed out waiting for a computation to start");
     }
 
-    #[tokio::test]
-    async fn concurrent_requests_for_one_path_share_one_computation() {
-        let coordinator = AheadBehindCoordinator::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let path = PathBuf::from("/repo/a");
+    /// Starts a computation for `path` that holds a permit for `hold`, and returns
+    /// once its thread is running, so a test can build a queue behind it.
+    async fn hold_a_permit(
+        coordinator: &Arc<AheadBehindCoordinator>,
+        path: &str,
+        hold: Duration,
+    ) -> tokio::task::JoinHandle<Divergence> {
+        let running = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&running);
+        let coordinator = Arc::clone(coordinator);
+        let path = PathBuf::from(path);
+        let task = tokio::spawn(async move {
+            coordinator
+                .get_or_compute(path, move |_| {
+                    flag.store(true, Ordering::SeqCst);
+                    std::thread::sleep(hold);
+                    divergence(0)
+                })
+                .await
+        });
+        wait_until(&running).await;
+        task
+    }
 
-        let results = futures::future::join_all(
-            (0..8).map(|_| coordinator.get_or_compute(path.clone(), slow_counting(&calls))),
-        )
+    /// While the cap is saturated, a queue forms behind it — and everyone queued for
+    /// one worktree shares a single computation, however many ask.
+    #[tokio::test]
+    async fn requests_queued_for_one_path_share_one_computation() {
+        let coordinator = Arc::new(AheadBehindCoordinator::with_concurrency(1));
+        let blocker = hold_a_permit(&coordinator, "/blocker", Duration::from_millis(150)).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let results = futures::future::join_all((0..8).map(|_| {
+            let calls = Arc::clone(&calls);
+            coordinator.get_or_compute(PathBuf::from("/repo/a"), move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                divergence(7)
+            })
+        }))
         .await;
+        blocker.await.unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 1, "work was duplicated");
         assert!(results.iter().all(|r| *r == divergence(7)));
+        assert_eq!(coordinator.in_flight_len(), 0, "an entry leaked");
+    }
+
+    /// The exactness guarantee: once a computation has begun reading the repository
+    /// a later request does not join it — the repository may have changed since — and
+    /// gets an answer of its own.
+    #[tokio::test]
+    async fn a_request_never_joins_a_computation_that_has_already_started() {
+        let coordinator = Arc::new(AheadBehindCoordinator::with_concurrency(4));
+        let leader = hold_a_permit(&coordinator, "/repo/a", Duration::from_millis(150)).await;
+
+        let later = coordinator
+            .get_or_compute(PathBuf::from("/repo/a"), |_| divergence(2))
+            .await;
+
+        assert_eq!(later, divergence(2), "the later request got a stale answer");
+        assert_eq!(leader.await.unwrap(), divergence(0));
         assert_eq!(coordinator.in_flight_len(), 0, "an entry leaked");
     }
 
@@ -266,10 +368,14 @@ mod tests {
         let coordinator = AheadBehindCoordinator::new();
         let calls = Arc::new(AtomicUsize::new(0));
 
-        futures::future::join_all(
-            ["/a", "/b", "/c"]
-                .map(|p| coordinator.get_or_compute(PathBuf::from(p), slow_counting(&calls))),
-        )
+        futures::future::join_all(["/a", "/b", "/c"].map(|p| {
+            let calls = Arc::clone(&calls);
+            coordinator.get_or_compute(PathBuf::from(p), move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                divergence(7)
+            })
+        }))
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -315,32 +421,31 @@ mod tests {
         assert_eq!(running.load(Ordering::SeqCst), 0);
     }
 
-    /// A caller that gives up must not strand the others, nor free its permit
-    /// while its blocking thread is still working.
+    /// A caller that gives up while others are queued with it must not strand them:
+    /// one of the waiters takes over and runs its own computation.
     #[tokio::test]
-    async fn a_waiter_takes_over_when_the_computing_caller_is_dropped() {
+    async fn a_waiter_takes_over_when_the_queued_caller_is_dropped() {
         let coordinator = Arc::new(AheadBehindCoordinator::with_concurrency(1));
-        let path = PathBuf::from("/repo/a");
-        let started = std::time::Instant::now();
+        let started = Instant::now();
+        let blocker = hold_a_permit(&coordinator, "/blocker", Duration::from_millis(150)).await;
 
+        // Both queue for "/repo/a" behind the blocker, sharing one flight.
         let leader = {
             let coordinator = Arc::clone(&coordinator);
-            let path = path.clone();
             tokio::spawn(async move {
                 coordinator
-                    .get_or_compute(path, |_| {
-                        std::thread::sleep(Duration::from_millis(150));
-                        divergence(1)
-                    })
+                    .get_or_compute(PathBuf::from("/repo/a"), |_| divergence(1))
                     .await
             })
         };
-        // Let the leader take the permit and start its blocking work.
         tokio::time::sleep(Duration::from_millis(30)).await;
         let waiter = {
             let coordinator = Arc::clone(&coordinator);
-            let path = path.clone();
-            tokio::spawn(async move { coordinator.get_or_compute(path, |_| divergence(2)).await })
+            tokio::spawn(async move {
+                coordinator
+                    .get_or_compute(PathBuf::from("/repo/a"), |_| divergence(2))
+                    .await
+            })
         };
         tokio::time::sleep(Duration::from_millis(30)).await;
         leader.abort();
@@ -350,14 +455,32 @@ mod tests {
             .expect("the waiter must not hang")
             .unwrap();
         assert_eq!(result, divergence(2), "the waiter ran its own computation");
-        // The abandoned leader's blocking thread still held the only permit for its
-        // full 150ms, so the waiter could not have started before it finished.
         assert!(
             started.elapsed() >= Duration::from_millis(150),
-            "the waiter ran while the leader's work still held the permit: {:?}",
-            started.elapsed()
+            "the waiter ran before the blocker released the only permit"
         );
+        blocker.await.unwrap();
         assert_eq!(coordinator.in_flight_len(), 0, "an entry leaked");
+    }
+
+    /// A caller that gives up cannot stop its blocking thread, so the permit must
+    /// stay held until that thread finishes — or the cap would not bound anything.
+    #[tokio::test]
+    async fn a_dropped_caller_does_not_free_the_permit_its_thread_still_holds() {
+        let coordinator = Arc::new(AheadBehindCoordinator::with_concurrency(1));
+        let started = Instant::now();
+        let abandoned = hold_a_permit(&coordinator, "/repo/a", Duration::from_millis(150)).await;
+        abandoned.abort();
+
+        let next = coordinator
+            .get_or_compute(PathBuf::from("/repo/b"), |_| divergence(2))
+            .await;
+
+        assert_eq!(next, divergence(2));
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "a second computation ran while the abandoned one held the only permit"
+        );
     }
 
     #[test]
@@ -408,29 +531,64 @@ mod tests {
     /// tip id, so the same worktree is walked again and reports the new count.
     #[test]
     fn graph_ahead_behind_tracks_new_commits_and_matches_libgit2() {
+        let memo = WalkMemo::with_capacity(8);
         let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(dir.path()).unwrap();
+        let (repo, base, first, second) = three_commits(dir.path());
+
+        assert_eq!(
+            graph_ahead_behind_in(&memo, &repo, first, base),
+            Some((1, 0))
+        );
+        assert_eq!(
+            graph_ahead_behind_in(&memo, &repo, first, base),
+            Some((1, 0))
+        );
+        assert_eq!(memo.len(), 1, "the repeat is a hit, not a second entry");
+        // A tip that moved is a different key, so the answer moves with it.
+        assert_eq!(
+            graph_ahead_behind_in(&memo, &repo, second, base),
+            Some((2, 0))
+        );
+        assert_eq!(
+            graph_ahead_behind_in(&memo, &repo, second, base),
+            repo.graph_ahead_behind(second, base).ok()
+        );
+    }
+
+    /// A shallow repository's answer depends on how deep it currently is, which no
+    /// commit id records — so deepening it would leave a memoized count wrong.
+    #[test]
+    fn a_shallow_repository_bypasses_the_memo() {
+        let memo = WalkMemo::with_capacity(8);
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, base, first, _second) = three_commits(dir.path());
+        // `.git/shallow` is what makes git (and libgit2) treat the clone as shallow.
+        std::fs::write(repo.path().join("shallow"), format!("{base}\n")).unwrap();
+        assert!(repo.is_shallow());
+
+        assert!(graph_ahead_behind_in(&memo, &repo, first, base).is_some());
+        assert_eq!(memo.len(), 0, "a shallow repository was memoized");
+    }
+
+    /// base ← first ← second, written into a fresh repository at `dir`.
+    fn three_commits(dir: &std::path::Path) -> (Repository, Oid, Oid, Oid) {
+        let repo = Repository::init(dir).unwrap();
         let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
         let tree = repo
             .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
             .unwrap();
         let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
-        let base_commit = repo.find_commit(base).unwrap();
-        let first = repo
-            .commit(None, &sig, &sig, "one", &tree, &[&base_commit])
-            .unwrap();
-        let first_commit = repo.find_commit(first).unwrap();
-        let second = repo
-            .commit(None, &sig, &sig, "two", &tree, &[&first_commit])
-            .unwrap();
-
-        assert_eq!(graph_ahead_behind(&repo, first, base), Some((1, 0)));
-        assert_eq!(graph_ahead_behind(&repo, first, base), Some((1, 0)));
-        // A tip that moved is a different key, so the answer moves with it.
-        assert_eq!(graph_ahead_behind(&repo, second, base), Some((2, 0)));
-        assert_eq!(
-            graph_ahead_behind(&repo, second, base),
-            repo.graph_ahead_behind(second, base).ok()
-        );
+        let first = {
+            let parent = repo.find_commit(base).unwrap();
+            repo.commit(None, &sig, &sig, "one", &tree, &[&parent])
+                .unwrap()
+        };
+        let second = {
+            let parent = repo.find_commit(first).unwrap();
+            repo.commit(None, &sig, &sig, "two", &tree, &[&parent])
+                .unwrap()
+        };
+        drop(tree);
+        (repo, base, first, second)
     }
 }
