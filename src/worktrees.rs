@@ -359,8 +359,12 @@ impl WorktreesRegistry {
     pub fn credit_outage(&self, outage: Duration) {
         let credit = ChronoDuration::from_std(outage).ok();
         let now = Utc::now();
+        let mut windows = self.lock();
+        // Read under the lock, not before it: every stamp already in the map was
+        // taken before its writer locked, so a reading taken now is at least as
+        // new as any of them and the clamp below can never pull one backwards.
         let awake = self.clock.now();
-        for entry in self.lock().values_mut() {
+        for entry in windows.values_mut() {
             // Saturate rather than overflow on an absurd credit.
             entry.last_active = entry
                 .last_active
@@ -1322,9 +1326,10 @@ mod tests {
 
     #[test]
     fn an_outage_credit_and_a_sleep_compose() {
-        // 20 s of awake silence, a sleep, then a 15 s accept outage: 20 s of
-        // the 35 s is real silence for every window the daemon could hear, so
-        // none is reaped. Without the credit the same awake time is past the TTL.
+        // 35 s of awake time pass across a sleep (which adds none of its own),
+        // and the daemon could not accept for 15 s of it. The window has really
+        // been silent for 20 s, inside the TTL, so it lives; the control shows
+        // the same 35 s with no credit is past it.
         let control = WorktreesRegistry::new();
         control.register(register_request("w", None, "/tmp/a"));
         control.clock.advance(Duration::from_secs(35));
