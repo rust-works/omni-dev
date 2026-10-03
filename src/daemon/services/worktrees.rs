@@ -2642,7 +2642,7 @@ fn upstream_target(branch: &git2::Branch<'_>) -> Option<String> {
 /// repository (#2121). Everything below reads refs and config that every worktree
 /// of a repository shares, so `repo` need not be rooted at the worktree.
 fn head_divergence(repo: &Repository, head: Option<git2::Reference<'_>>) -> Divergence {
-    let shallow = repo.is_shallow();
+    let shallow = divergence::is_shallow(repo);
     let Some(head) = head.filter(git2::Reference::is_branch) else {
         return Divergence {
             shallow,
@@ -7127,13 +7127,14 @@ mod tests {
     /// repo's shallow grafts when it opens it, so a handle opened before the repo
     /// became shallow would walk the full history while a fresh open walks the cut
     /// one. The pool declines the repo, and the answer comes from the per-worktree
-    /// open exactly as before — including for a handle opened while the repo was
-    /// still complete.
+    /// open — including for a handle opened while the repo was still complete.
     ///
-    /// What that open reports is the contract here, not what would be ideal:
-    /// libgit2 looks for the shallow marker in the *worktree's own* gitdir, so only
-    /// the main checkout reports `shallow`, and a linked worktree of a shallow clone
-    /// does not.
+    /// That open reports the repository's shallowness for every worktree (#2147),
+    /// though libgit2 only finds the marker from a handle at the common dir: git
+    /// keeps `shallow` there, so a linked worktree's own handle neither sees it nor
+    /// applies the cut. The marker here cuts the tip's parent, so each count is the
+    /// one against the cut history (`main`'s tip is a root, and the shared base is
+    /// reachable only from `origin/main`), not the one an uncut walk would give.
     #[test]
     fn a_shallow_repository_is_answered_by_the_discover_path() {
         let corpus = shared_corpus();
@@ -7167,8 +7168,31 @@ mod tests {
                 "{case}"
             );
         }
-        // The flag the discover path does give, on the one row it can see it.
-        assert!(folder_divergence_shared(&pool, &corpus.main).shallow);
+        // Every worktree is shallow, the linked ones included, and counted against
+        // the cut history.
+        let shallow = |ahead_behind, main_behind| Divergence {
+            ahead_behind,
+            main_behind,
+            shallow: true,
+        };
+        assert_eq!(
+            folder_divergence_shared(&pool, &corpus.main),
+            shallow(Some((1, 2)), None)
+        );
+        for (name, expected) in [
+            ("tracked", shallow(Some((1, 1)), Some(2))),
+            ("untracked", shallow(None, Some(2))),
+            ("on-default", shallow(Some((0, 1)), None)),
+            ("dangling", shallow(None, Some(2))),
+            ("detached", shallow(None, None)),
+            ("unborn", shallow(None, None)),
+        ] {
+            assert_eq!(
+                folder_divergence_shared(&pool, &corpus.wt(name)),
+                expected,
+                "{name}"
+            );
+        }
         // No handle was opened for it after the marker appeared.
         assert_eq!(pool.opens(), 1);
     }
@@ -7543,6 +7567,33 @@ mod tests {
             "{complete_entry:?}"
         );
         assert_eq!(complete_entry.get("ahead").and_then(Value::as_u64), Some(1));
+    }
+
+    /// libgit2 finds the shallow marker only from a handle at the common dir, so a
+    /// linked worktree of a shallow clone used to go unflagged — and a client that
+    /// memoizes by commit ids would then cache a row that deepening the clone
+    /// changes (#2147). It is flagged now, and still has its counts.
+    #[tokio::test]
+    async fn ahead_behind_op_flags_a_linked_worktree_of_a_shallow_clone() {
+        let svc = WorktreesService::new();
+        let corpus = shared_corpus();
+        std::fs::write(
+            corpus.repo.path().join("shallow"),
+            format!("{}\n", corpus.tip),
+        )
+        .unwrap();
+        let tracked = corpus.wt("tracked").display().to_string();
+
+        let reply = svc
+            .handle("ahead-behind", json!({ "paths": [&tracked] }))
+            .await
+            .unwrap();
+
+        let entry = reply.get("results").unwrap().get(tracked.as_str()).unwrap();
+        assert_eq!(entry.get("shallow"), Some(&json!(true)), "{entry:?}");
+        assert_eq!(entry.get("ahead").and_then(Value::as_u64), Some(1));
+        assert_eq!(entry.get("behind").and_then(Value::as_u64), Some(1));
+        assert_eq!(entry.get("main_behind").and_then(Value::as_u64), Some(2));
     }
 
     #[tokio::test]
