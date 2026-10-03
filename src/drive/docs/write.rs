@@ -1968,7 +1968,7 @@ mod tests {
                         selection.segment_id = Some(id.into());
                         selection.tab_id = Some("child".into());
                     }
-                    _ => unreachable!(),
+                    _ => unreachable!(), // omni-dev: coverage ignore-line reason="anchored_payloads yields only Insert and Delete"
                 }
                 out.push(payload);
             }
@@ -2502,6 +2502,24 @@ mod tests {
         );
         assert!(rendered.contains(", header h1,"), "{rendered}");
         assert!(!rendered.contains("Some("), "{rendered}");
+    }
+
+    #[test]
+    fn describe_labels_each_segment_kind() {
+        for (kind, label) in [
+            (Some(anchor::SegmentKind::Footer), ", footer s1,"),
+            (Some(anchor::SegmentKind::Footnote), ", footnote s1,"),
+            (None, ", segment s1,"),
+        ] {
+            let mut edit = preview_edit();
+            edit.segment_id = Some("s1".into());
+            edit.segment_kind = kind;
+            let rendered = describe(
+                &outcome_with(WriteResult::WouldDelete { edit }),
+                WriteVerb::Delete,
+            );
+            assert!(rendered.contains(label), "{rendered}");
+        }
     }
 
     #[test]
