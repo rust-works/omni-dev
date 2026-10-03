@@ -30,6 +30,7 @@
 //! "is a window open on it?" becomes a per-worktree attribute. All of this is
 //! git disk I/O, so it runs on a blocking thread, never under the registry lock.
 
+mod divergence;
 mod geometry;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -53,6 +54,7 @@ use crate::pr_status::{
     EnqueueOutcome, PrBadge, PrCheckState, PrResolution, PrStatusCache, PrTarget,
 };
 use async_trait::async_trait;
+use divergence::{AheadBehindCoordinator, Divergence};
 use git2::{Repository, RepositoryState, Status, StatusOptions, WorktreeLockStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -496,6 +498,10 @@ pub struct WorktreesService {
     /// A `tokio` mutex rather than a `std` one: it is held across the
     /// `spawn_blocking` join, which is an `.await`.
     prune_lock: tokio::sync::Mutex<()>,
+    /// Shares and bounds the `ahead-behind` op's git work across concurrent
+    /// requests (#2111): N windows asking about the same worktree cost one
+    /// computation, and only a few run at once. See [`divergence`].
+    ahead_behind: AheadBehindCoordinator,
     /// Where the per-repo PR-poll enable set is persisted (#1376), so a user's
     /// choice survives a daemon restart. `None` disables persistence entirely —
     /// the default from [`new`](Self::new), which keeps the bare service cheap
@@ -587,6 +593,7 @@ impl WorktreesService {
             rate_limit_poller: Mutex::new(None),
             tree_cache: Arc::new(TreeSnapshotCache::new(registry, pr_cache)),
             prune_lock: tokio::sync::Mutex::new(()),
+            ahead_behind: AheadBehindCoordinator::new(),
             polling_prefs_path: Mutex::new(None),
             pr_cache_path: Mutex::new(None),
             pr_warm_start: Mutex::new(None),
@@ -1816,7 +1823,7 @@ impl DaemonService for WorktreesService {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                Ok(json!({ "results": ahead_behind_results(paths).await }))
+                Ok(json!({ "results": ahead_behind_results(&self.ahead_behind, paths).await }))
             }
             "set-show-closed" => {
                 // The daemon-backed show/hide-closed toggle (#1301). Setting it
@@ -2571,23 +2578,25 @@ fn upstream_target(branch: &git2::Branch<'_>) -> Option<String> {
     Some(branch.upstream().ok()?.get().target()?.to_string())
 }
 
-/// The ahead/behind divergence of `folder`'s checked-out branch versus its
+/// The ahead/behind divergence of `repo`'s checked-out branch versus its
 /// upstream, computed on demand for the lazy `ahead-behind` op (#1306). Mirrors the
 /// branch resolution in [`git_status_impl`] but does **only** the upstream walk
-/// [`git_status_cheap`] omits. `None` when `folder` is not a repo, is on a detached
-/// or unborn HEAD, or tracks no upstream — every case the tree renders without a
-/// sync indicator.
-fn folder_ahead_behind(folder: &Path) -> Option<(usize, usize)> {
-    let repo = Repository::discover(folder).ok()?;
+/// [`git_status_cheap`] omits. `None` when HEAD is detached or unborn, or the
+/// branch tracks no upstream — every case the tree renders without a sync
+/// indicator.
+///
+/// Takes an open repository so [`folder_divergence`] can answer this and
+/// [`repo_main_behind`] from one `Repository::discover` (#2111).
+fn repo_ahead_behind(repo: &Repository) -> Option<(usize, usize)> {
     let head = repo.head().ok()?;
     if !head.is_branch() {
         return None;
     }
     let branch = git2::Branch::wrap(head);
-    upstream_ahead_behind(&repo, &branch)
+    upstream_ahead_behind(repo, &branch)
 }
 
-/// Commits `folder`'s checked-out branch is behind the repository's remote
+/// Commits `repo`'s checked-out branch is behind the repository's remote
 /// default branch (`origin/<main>`), computed on demand for the lazy
 /// `ahead-behind` op (#1457). Resolves the default branch the same
 /// **local-only, no-fetch** way `worktree_rebase::resolve_onto` resolves its
@@ -2596,13 +2605,11 @@ fn folder_ahead_behind(folder: &Path) -> Option<(usize, usize)> {
 /// passive signal, so an unresolvable default branch means silence (`None`)
 /// rather than a guess.
 ///
-/// `None` when: `folder` is not a repo, HEAD is detached/unborn, no default
-/// branch is locally resolvable, or the branch's own upstream **is** already
-/// that default branch — in which case [`folder_ahead_behind`]'s `behind`
-/// already reports this exact divergence, so repeating it here would just
-/// duplicate the existing sync count.
-fn folder_main_behind(folder: &Path) -> Option<usize> {
-    let repo = Repository::discover(folder).ok()?;
+/// `None` when: HEAD is detached/unborn, no default branch is locally
+/// resolvable, or the branch's own upstream **is** already that default branch —
+/// in which case [`repo_ahead_behind`]'s `behind` already reports this exact
+/// divergence, so repeating it here would just duplicate the existing sync count.
+fn repo_main_behind(repo: &Repository) -> Option<usize> {
     let head = repo.head().ok()?;
     if !head.is_branch() {
         return None;
@@ -2610,7 +2617,7 @@ fn folder_main_behind(folder: &Path) -> Option<usize> {
     let branch = git2::Branch::wrap(head);
 
     let remote = "origin";
-    let default_branch = RemoteInfo::detect_main_branch_local(&repo, remote)?;
+    let default_branch = RemoteInfo::detect_main_branch_local(repo, remote)?;
     let onto_ref = format!("refs/remotes/{remote}/{default_branch}");
 
     // Skip when the branch's own upstream already IS the resolved default
@@ -2630,8 +2637,20 @@ fn folder_main_behind(folder: &Path) -> Option<usize> {
         .peel_to_commit()
         .ok()?
         .id();
-    let (_ahead, behind) = repo.graph_ahead_behind(head_oid, onto_oid).ok()?;
+    let (_ahead, behind) = divergence::graph_ahead_behind(repo, head_oid, onto_oid)?;
     Some(behind)
+}
+
+/// Both lazily-fetched divergences of `folder`, from a single repository open.
+/// What the `ahead-behind` op computes per worktree (#2111).
+fn folder_divergence(folder: &Path) -> Divergence {
+    let Ok(repo) = Repository::discover(folder) else {
+        return Divergence::default();
+    };
+    Divergence {
+        ahead_behind: repo_ahead_behind(&repo),
+        main_behind: repo_main_behind(&repo),
+    }
 }
 
 /// The main repository's directory name from git's common dir. For the usual
@@ -2664,7 +2683,7 @@ fn upstream_ahead_behind(repo: &Repository, branch: &git2::Branch<'_>) -> Option
     let upstream = branch.upstream().ok()?;
     let local_oid = branch.get().target()?;
     let upstream_oid = upstream.get().target()?;
-    repo.graph_ahead_behind(local_oid, upstream_oid).ok()
+    divergence::graph_ahead_behind(repo, local_oid, upstream_oid)
 }
 
 /// The wire shape of an enriched window: the stored entry fields plus the
@@ -3164,32 +3183,39 @@ struct AheadBehindEntry {
 ///
 /// Backs the `ahead-behind` op, which exists precisely so the streamed `tree`
 /// snapshot can stay cheap: a client fetches divergence only for the worktrees it
-/// shows (the extension on expand), not for every worktree on every tick. The git
-/// walks are blocking disk I/O, so they run on a blocking thread; a join failure
-/// degrades to an empty object rather than erroring.
-async fn ahead_behind_results(paths: Vec<PathBuf>) -> Value {
-    tokio::task::spawn_blocking(move || {
-        let mut results = serde_json::Map::new();
-        for path in paths {
-            let (ahead, behind) =
-                folder_ahead_behind(&path).map_or((None, None), |(a, b)| (Some(a), Some(b)));
-            let main_behind = folder_main_behind(&path);
-            if ahead.is_none() && main_behind.is_none() {
-                continue;
-            }
-            results.insert(
-                path.display().to_string(),
-                json!(AheadBehindEntry {
-                    ahead,
-                    behind,
-                    main_behind,
-                }),
-            );
+/// shows (the extension on expand), not for every worktree on every tick.
+///
+/// Every window re-asks for the same worktrees on each pushed delta, so the work
+/// goes through `coordinator` (#2111): concurrent requests for one worktree share a
+/// single computation, at most a few run at once, and each runs on a blocking
+/// thread (the walks are disk I/O). A computation that fails degrades to "no
+/// divergence" for that one worktree, which omits its row, rather than erroring.
+async fn ahead_behind_results(coordinator: &AheadBehindCoordinator, paths: Vec<PathBuf>) -> Value {
+    let divergences = futures::future::join_all(
+        paths
+            .iter()
+            .map(|path| coordinator.get_or_compute(path.clone(), |p| folder_divergence(&p))),
+    )
+    .await;
+    let mut results = serde_json::Map::new();
+    for (path, divergence) in paths.iter().zip(divergences) {
+        let (ahead, behind) = divergence
+            .ahead_behind
+            .map_or((None, None), |(a, b)| (Some(a), Some(b)));
+        let main_behind = divergence.main_behind;
+        if ahead.is_none() && main_behind.is_none() {
+            continue;
         }
-        Value::Object(results)
-    })
-    .await
-    .unwrap_or_else(|_| json!({}))
+        results.insert(
+            path.display().to_string(),
+            json!(AheadBehindEntry {
+                ahead,
+                behind,
+                main_behind,
+            }),
+        );
+    }
+    Value::Object(results)
 }
 
 // --- Push subscription (#1267) -----------------------------------------------
@@ -6504,7 +6530,7 @@ mod tests {
 
     /// Builds a repo whose `main` has **no upstream configured** but is 1 commit
     /// behind a resolvable `origin/main` — the "no own upstream, but behind the
-    /// default branch" case [`folder_main_behind`] exists for (#1457). No
+    /// default branch" case [`repo_main_behind`] exists for (#1457). No
     /// `origin/HEAD` symref is set, so resolution goes through
     /// [`RemoteInfo::detect_main_branch_local`]'s common-names fallback.
     fn behind_main_no_upstream_repo(dir: &Path) -> Repository {
@@ -6716,73 +6742,73 @@ mod tests {
     }
 
     #[test]
-    fn folder_ahead_behind_computes_divergence_and_degrades() {
+    fn folder_divergence_computes_ahead_behind_and_degrades() {
         // A diverging tracking branch → the on-demand walk reports (ahead, behind).
         let dir = tempfile::tempdir().unwrap();
         let _repo = diverging_repo(dir.path());
-        assert_eq!(folder_ahead_behind(dir.path()), Some((1, 1)));
+        assert_eq!(folder_divergence(dir.path()).ahead_behind, Some((1, 1)));
 
         // A branch with no upstream → None (the tree renders no sync indicator).
         let no_up = tempfile::tempdir().unwrap();
         let repo = init_repo(no_up.path());
         empty_commit(&repo, Some("refs/heads/main"), &[], "A");
         repo.set_head("refs/heads/main").unwrap();
-        assert_eq!(folder_ahead_behind(no_up.path()), None);
+        assert_eq!(folder_divergence(no_up.path()).ahead_behind, None);
 
         // A detached HEAD and a plain (non-repo) directory → None.
         let detached = tempfile::tempdir().unwrap();
         let drepo = init_repo(detached.path());
         let a = empty_commit(&drepo, Some("refs/heads/main"), &[], "A");
         drepo.set_head_detached(a).unwrap();
-        assert_eq!(folder_ahead_behind(detached.path()), None);
+        assert_eq!(folder_divergence(detached.path()).ahead_behind, None);
         let plain = tempfile::tempdir().unwrap();
-        assert_eq!(folder_ahead_behind(plain.path()), None);
+        assert_eq!(folder_divergence(plain.path()).ahead_behind, None);
     }
 
     // --- Lazy main-branch behind (#1457) ------------------------------------
 
     #[test]
-    fn folder_main_behind_computes_divergence_and_degrades() {
+    fn folder_divergence_computes_main_behind_and_degrades() {
         // No own upstream, but a resolvable `origin/main` (via the common-names
         // fallback — no `origin/HEAD` symref is set) that the branch is
         // genuinely behind.
         let dir = tempfile::tempdir().unwrap();
         let _repo = behind_main_no_upstream_repo(dir.path());
-        assert_eq!(folder_main_behind(dir.path()), Some(1));
+        assert_eq!(folder_divergence(dir.path()).main_behind, Some(1));
 
         // A detached HEAD and a plain (non-repo) directory → None.
         let detached = tempfile::tempdir().unwrap();
         let drepo = init_repo(detached.path());
         let a = empty_commit(&drepo, Some("refs/heads/main"), &[], "A");
         drepo.set_head_detached(a).unwrap();
-        assert_eq!(folder_main_behind(detached.path()), None);
+        assert_eq!(folder_divergence(detached.path()).main_behind, None);
         let plain = tempfile::tempdir().unwrap();
-        assert_eq!(folder_main_behind(plain.path()), None);
+        assert_eq!(folder_divergence(plain.path()).main_behind, None);
     }
 
     #[test]
-    fn folder_main_behind_skips_when_own_upstream_is_the_default_branch() {
+    fn folder_divergence_skips_main_behind_when_own_upstream_is_the_default_branch() {
         // `diverging_repo` checks out `main` tracking `origin/main` itself — the
-        // common case — so even though it's genuinely 1 behind, `folder_main_behind`
-        // stays silent: `folder_ahead_behind`'s `behind` already reports this
+        // common case — so even though it's genuinely 1 behind, `main_behind`
+        // stays silent: `ahead_behind`'s `behind` already reports this
         // exact divergence.
         let dir = tempfile::tempdir().unwrap();
         let _repo = diverging_repo(dir.path());
-        assert_eq!(folder_main_behind(dir.path()), None);
+        assert_eq!(folder_divergence(dir.path()).main_behind, None);
     }
 
     #[test]
-    fn folder_main_behind_returns_none_without_a_resolvable_default_branch() {
+    fn folder_divergence_has_no_main_behind_without_a_resolvable_default_branch() {
         // No `origin` remote-tracking refs at all (no symref, no common names).
         let dir = tempfile::tempdir().unwrap();
         let repo = init_repo(dir.path());
         empty_commit(&repo, Some("refs/heads/main"), &[], "A");
         repo.set_head("refs/heads/main").unwrap();
-        assert_eq!(folder_main_behind(dir.path()), None);
+        assert_eq!(folder_divergence(dir.path()).main_behind, None);
     }
 
     #[test]
-    fn folder_main_behind_and_folder_ahead_behind_report_independent_counts() {
+    fn folder_divergence_reports_independent_main_behind_and_ahead_behind_counts() {
         let dir = tempfile::tempdir().unwrap();
         let repo = init_repo(dir.path());
         let base = empty_commit(&repo, Some("refs/heads/main"), &[], "base");
@@ -6822,8 +6848,8 @@ mod tests {
         cfg.set_str("branch.feature.merge", "refs/heads/feature")
             .unwrap();
 
-        assert_eq!(folder_ahead_behind(dir.path()), Some((1, 1)));
-        assert_eq!(folder_main_behind(dir.path()), Some(3));
+        assert_eq!(folder_divergence(dir.path()).ahead_behind, Some((1, 1)));
+        assert_eq!(folder_divergence(dir.path()).main_behind, Some(3));
     }
 
     #[tokio::test]
@@ -6861,6 +6887,29 @@ mod tests {
         // A missing/empty `paths` list yields an empty results object, not an error.
         let empty = svc.handle("ahead-behind", json!({})).await.unwrap();
         assert_eq!(empty.get("results"), Some(&json!({})));
+    }
+
+    /// Every window asks about the same worktrees at once (#2111): all of those
+    /// requests must get the right answer, whether they shared a computation or not,
+    /// including a request that names one worktree twice.
+    #[tokio::test]
+    async fn concurrent_ahead_behind_requests_all_get_the_same_correct_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let _repo = diverging_repo(dir.path());
+        let svc = WorktreesService::new();
+        let path = dir.path().display().to_string();
+
+        let replies = futures::future::join_all(
+            (0..16).map(|_| svc.handle("ahead-behind", json!({ "paths": [&path, &path] }))),
+        )
+        .await;
+
+        for reply in replies {
+            let reply = reply.unwrap();
+            let entry = reply.get("results").unwrap().get(path.as_str()).unwrap();
+            assert_eq!(entry.get("ahead").and_then(Value::as_u64), Some(1));
+            assert_eq!(entry.get("behind").and_then(Value::as_u64), Some(1));
+        }
     }
 
     #[tokio::test]
