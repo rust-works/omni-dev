@@ -254,7 +254,7 @@ This skill performs the complete end-to-end release process for omni-dev, from v
     ```bash
     gh release view vX.Y.Z --json assets --jq '.assets[].name'
     ```
-    Expect `omni-dev-linux.tar.gz`, `omni-dev-macos-arm64.tar.gz` and `omni-dev-windows.zip`.
+    Expect `omni-dev-linux.tar.gz`, `omni-dev-linux-arm64.tar.gz`, `omni-dev-macos-arm64.tar.gz` and `omni-dev-windows.zip`. A missing asset means a matrix leg failed, and `publish-crates` is blocked with it. After a transient failure (runner outage, network) `gh run rerun <run_id> --failed` recovers it, after `gh release delete-asset vX.Y.Z <asset-name>` if the upload then reports the asset already exists. A defect in the code or the workflow needs a patch release, because a re-run uses the tag's commit. Do not continue without the asset.
 
 27. **Verify crates.io Publication**
     ```bash
@@ -270,6 +270,7 @@ This skill performs the complete end-to-end release process for omni-dev, from v
     git rev-parse 'vX.Y.Z^{commit}'                # full SHA; it must start with <short sha>
     ```
     The short SHA's length varies with the machine that built the binary, so compare by prefix.
+    Only the host's own asset can be run. Extract each of the others the same way and run `file "$d/omni-dev"` to confirm the architecture its name claims, notably `omni-dev-linux-arm64.tar.gz` (`ELF 64-bit ... ARM aarch64`) against `omni-dev-linux.tar.gz` (`x86-64`).
 
 29. **Verify the Extension**
     The workflow's publish steps are the evidence: both `Publish to VS Code Marketplace` and `Publish to Open VSX` must be green, not skipped. Open VSX can be read back; the Marketplace cannot be relied on, since read APIs lag a publish and `vsce show` can answer `not found` for a live extension:
