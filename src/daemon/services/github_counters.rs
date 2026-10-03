@@ -17,11 +17,23 @@
 //!   the built-in `shutdown` op, since all of them funnel through the one shared
 //!   token that ends the accept loop.
 //!
-//! Every emission is best-effort and bounded (a small local log read, no
-//! network), so it never delays shutdown.
+//! Every emission is best-effort and cheap, however large the request log has
+//! grown (it is unbounded unless rotation or `prune` is opted into). The service
+//! keeps a running [`IncrementalCounts`] from the moment it starts, so each
+//! summary reads only the records appended since the previous one, never the
+//! log's history (#2132). A log that is replaced or truncated underneath it
+//! (`prune`, rotation) is rescanned once, from its first byte.
+//!
+//! Shutdown never waits on a scan beyond `SHUTDOWN_SCAN_BUDGET`. A blocking
+//! thread cannot be cancelled from outside, and the runtime waits for one before
+//! the process may exit, so the scan itself polls a stop condition before every
+//! line: shutdown cancels it for every scan already in flight, and gives the
+//! final summary a deadline. A summary cut short says so rather than reporting a
+//! partial count as complete.
 
-use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -31,29 +43,35 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::daemon::service::{DaemonService, MenuItem, MenuSnapshot, ServiceStatus};
-use crate::github_metrics::{self, GhCounts};
+use crate::github_metrics::{GhCounts, IncrementalCounts};
 use crate::request_log;
 
 /// Delay before the first ("startup") summary, so the pollers have come up.
 const STARTUP_DELAY: Duration = Duration::from_secs(5);
 /// Interval between periodic summaries after the first one.
 const PERIODIC_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// The longest the final summary may spend reading the log. Normally it reads a
+/// few minutes of records and finishes in milliseconds; this only bites when the
+/// log was replaced and has to be rescanned.
+const SHUTDOWN_SCAN_BUDGET: Duration = Duration::from_secs(2);
 
-/// The periodic-summary task and the token that stops it.
-struct LoggerTask {
-    /// Cancelled by [`shutdown`](DaemonService::shutdown) to end the loop.
-    token: CancellationToken,
-    /// The spawned loop, awaited on shutdown so it fully unwinds.
-    handle: JoinHandle<()>,
-}
+/// The running tally, shared by the logger task, `status`, `summary` and
+/// `shutdown`. Locked only on a blocking thread, never across an `.await`.
+type SharedTally = Arc<Mutex<IncrementalCounts>>;
 
 /// Periodically logs, and reports on demand, the GitHub API-call counters.
 pub struct GithubCountersService {
     /// When the daemon started, so every summary reports calls **since boot** —
     /// a clean before/after marker that resets across restarts.
     started_at: DateTime<Utc>,
+    /// Counts of the `gh` records logged since `started_at`; `None` when no log
+    /// path resolves, so there is nothing to count.
+    tally: Option<SharedTally>,
+    /// Cancelled when shutdown begins: ends the logger and abandons every scan in
+    /// flight, so none of them delays the final summary.
+    stopping: CancellationToken,
     /// The periodic-summary task (idempotent start; `None` until started).
-    logger: Mutex<Option<LoggerTask>>,
+    logger: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Default for GithubCountersService {
@@ -64,12 +82,28 @@ impl Default for GithubCountersService {
 
 impl GithubCountersService {
     /// Cheap construction (like the worktrees/sessions services): captures the
-    /// start time and persists nothing. Call [`Self::start_counter_logger`] to
+    /// start time and the request log's current extent, reads none of its
+    /// records, and persists nothing. Call [`Self::start_counter_logger`] to
     /// spawn the periodic task once inside the tokio runtime.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_log_path(request_log::log_file_path())
+    }
+
+    /// [`new`](Self::new) over an explicit request log, so tests do not read the
+    /// developer's real one.
+    fn with_log_path(path: Option<PathBuf>) -> Self {
+        let (started_at, tally) = match path {
+            Some(path) => {
+                let tally = IncrementalCounts::start(path);
+                (tally.since(), Some(Arc::new(Mutex::new(tally))))
+            }
+            None => (Utc::now(), None),
+        };
         Self {
-            started_at: Utc::now(),
+            started_at,
+            tally,
+            stopping: CancellationToken::new(),
             logger: Mutex::new(None),
         }
     }
@@ -91,48 +125,81 @@ impl GithubCountersService {
         if guard.is_some() {
             return;
         }
-        let token = CancellationToken::new();
-        let loop_token = token.clone();
-        let started_at = self.started_at;
-        let handle = tokio::spawn(async move {
+        let stopping = self.stopping.clone();
+        let tally = self.tally.clone();
+        *guard = Some(tokio::spawn(async move {
             // Wait for the baseline delay, but exit immediately if the daemon is
             // already shutting down (shutdown() emits the final summary itself).
             tokio::select! {
-                () = loop_token.cancelled() => return,
+                () = stopping.cancelled() => return,
                 () = tokio::time::sleep(startup_delay) => {}
             }
-            emit(started_at, "startup").await;
+            emit_background(&tally, "startup", &stopping).await;
             loop {
                 tokio::select! {
-                    () = loop_token.cancelled() => break,
-                    () = tokio::time::sleep(interval) => emit(started_at, "periodic").await,
+                    () = stopping.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {
+                        emit_background(&tally, "periodic", &stopping).await;
+                    }
                 }
             }
-        });
-        *guard = Some(LoggerTask { token, handle });
+        }));
     }
 }
 
-/// Reads and tallies the `gh` records logged since `started_at` (all sources).
-/// Best-effort: a missing/unreadable log yields zero counts. Offloaded to a
-/// blocking thread by callers, since it reads a file.
-fn counts_since(started_at: DateTime<Utc>) -> GhCounts {
-    match request_log::log_file_path() {
-        Some(path) => github_metrics::aggregate(&path, Some(started_at), None, None),
-        None => GhCounts::default(),
+/// A [`refresh`](IncrementalCounts::refresh) stop condition that fires once
+/// `token` is cancelled.
+fn cancelled_by(token: &CancellationToken) -> impl FnMut() -> bool + Send + 'static {
+    let token = token.clone();
+    move || token.is_cancelled()
+}
+
+/// Brings the tally up to date and returns the counts since boot, and whether
+/// they are current — `false` when `stop` cut the read short or the log could
+/// not be read. Best-effort: with no tally (no log path) the counts are zero.
+///
+/// The read runs on a blocking thread so it never stalls the async executor.
+async fn counts_since_boot(
+    tally: &Option<SharedTally>,
+    stop: impl FnMut() -> bool + Send + 'static,
+) -> (GhCounts, bool) {
+    let Some(tally) = tally else {
+        return (GhCounts::default(), true);
+    };
+    let tally = Arc::clone(tally);
+    let read = tokio::task::spawn_blocking(move || {
+        let mut tally = tally.lock().unwrap_or_else(PoisonError::into_inner);
+        let current = tally.refresh(stop);
+        (tally.counts().clone(), current)
+    })
+    .await;
+    match read {
+        Ok(counts) => counts,
+        Err(e) => {
+            tracing::warn!("github counters: the log read did not complete: {e}");
+            (GhCounts::default(), false)
+        }
     }
 }
 
-/// Emits one `tracing::info` summary line, aggregating on a blocking thread so
-/// the log read never stalls the async executor.
-async fn emit(started_at: DateTime<Utc>, phase: &str) {
-    let counts = tokio::task::spawn_blocking(move || counts_since(started_at))
-        .await
-        .unwrap_or_default();
+/// Emits one `tracing::info` summary line for `phase`.
+fn log_summary(phase: &str, counts: &GhCounts, current: bool) {
     // Bind before the macro so the summary is computed whenever this runs, not
     // only when an info-level subscriber is installed (the poller idiom).
-    let summary = counts.summary_line();
+    let mut summary = counts.summary_line();
+    if !current {
+        summary.push_str(" (incomplete: the log read was cut short)");
+    }
     tracing::info!("github api calls ({phase}): {summary}");
+}
+
+/// The logger task's emission: a summary of the counters, dropped if shutdown
+/// began while it was reading, since shutdown emits the final summary itself.
+async fn emit_background(tally: &Option<SharedTally>, phase: &str, stopping: &CancellationToken) {
+    let (counts, current) = counts_since_boot(tally, cancelled_by(stopping)).await;
+    if !stopping.is_cancelled() {
+        log_summary(phase, &counts, current);
+    }
 }
 
 #[async_trait]
@@ -145,11 +212,14 @@ impl DaemonService for GithubCountersService {
         match op {
             // A live socket query of the current counters (since daemon start).
             "summary" => {
-                let started_at = self.started_at;
-                let counts = tokio::task::spawn_blocking(move || counts_since(started_at)).await?;
+                let (counts, current) =
+                    counts_since_boot(&self.tally, cancelled_by(&self.stopping)).await;
                 let mut value = counts.to_json();
                 if let Value::Object(map) = &mut value {
-                    map.insert("since".to_string(), json!(started_at.to_rfc3339()));
+                    map.insert("since".to_string(), json!(self.started_at.to_rfc3339()));
+                    if !current {
+                        map.insert("incomplete".to_string(), json!(true));
+                    }
                 }
                 Ok(value)
             }
@@ -173,33 +243,40 @@ impl DaemonService for GithubCountersService {
     }
 
     async fn status(&self) -> ServiceStatus {
-        let started_at = self.started_at;
-        let counts = tokio::task::spawn_blocking(move || counts_since(started_at))
-            .await
-            .unwrap_or_default();
+        let (counts, current) = counts_since_boot(&self.tally, cancelled_by(&self.stopping)).await;
+        let mut summary = format!("{} GitHub API call(s) since start", counts.api_total());
+        if !current {
+            summary.push_str(" (incomplete)");
+        }
         ServiceStatus {
             name: self.name().to_string(),
             healthy: true,
-            summary: format!("{} GitHub API call(s) since start", counts.api_total()),
+            summary,
             detail: counts.to_json(),
         }
     }
 
     async fn shutdown(&self) {
-        // Stop the periodic task (take it from under the lock before awaiting, so
-        // the std::Mutex is never held across the `.await`), then emit the final
-        // summary. This is the deterministic, awaited flush for every termination
-        // path (SIGTERM/SIGINT/SIGHUP + the `shutdown` op).
-        let task = self
+        // Stop first: this ends the logger loop and abandons any scan in flight
+        // (periodic, `status`, `summary`), so nothing ahead of the final summary
+        // holds up the exit. Take the logger from under the lock before awaiting,
+        // so the std::Mutex is never held across the `.await`.
+        self.stopping.cancel();
+        let logger = self
             .logger
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(task) = task {
-            task.token.cancel();
-            let _ = task.handle.await;
+        if let Some(logger) = logger {
+            let _ = logger.await;
         }
-        emit(self.started_at, "shutdown").await;
+        // The deterministic, awaited flush for every termination path
+        // (SIGTERM/SIGINT/SIGHUP + the `shutdown` op), under a deadline of its
+        // own: `stopping` is already cancelled and must not cut it short.
+        let deadline = Instant::now() + SHUTDOWN_SCAN_BUDGET;
+        let (counts, current) =
+            counts_since_boot(&self.tally, move || Instant::now() >= deadline).await;
+        log_summary("shutdown", &counts, current);
     }
 }
 
@@ -207,10 +284,39 @@ impl DaemonService for GithubCountersService {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::github_metrics::aggregate;
+    use chrono::{Duration as ChronoDuration, SecondsFormat};
+    use std::io::Write;
+    use std::path::Path;
+
+    /// A `gh` record line stamped `secs` seconds after `since`.
+    fn gh_line(since: DateTime<Utc>, secs: i64, command: &[&str]) -> String {
+        format!(
+            "{{\"kind\":\"gh\",\"timestamp\":\"{}\",\"command\":{},\"source\":\"daemon\"}}\n",
+            (since + ChronoDuration::seconds(secs)).to_rfc3339_opts(SecondsFormat::Millis, true),
+            serde_json::to_string(command).unwrap(),
+        )
+    }
+
+    fn append(path: &Path, text: &str) {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+
+    /// The tally's total, read straight from the shared state.
+    fn tallied(svc: &GithubCountersService) -> u64 {
+        svc.tally.as_ref().unwrap().lock().unwrap().counts().total()
+    }
 
     #[tokio::test]
     async fn service_reports_status_and_handles_summary() {
-        let svc = GithubCountersService::new();
+        let dir = tempfile::tempdir().unwrap();
+        let svc = GithubCountersService::with_log_path(Some(dir.path().join("log.jsonl")));
         assert_eq!(svc.name(), "github");
 
         // status() reads the log read-only and must be healthy with a well-formed
@@ -224,6 +330,7 @@ mod tests {
         let summary = svc.handle("summary", Value::Null).await.unwrap();
         assert!(summary.get("since").is_some());
         assert!(summary.get("by_source").is_some());
+        assert!(summary.get("incomplete").is_none());
         assert!(svc.handle("bogus", Value::Null).await.is_err());
 
         // menu()/menu_action()/shutdown() are inert but must not panic; shutdown()
@@ -231,5 +338,97 @@ mod tests {
         assert_eq!(svc.menu().title, "GitHub API");
         svc.menu_action("x").await.unwrap();
         svc.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn without_a_log_path_there_is_nothing_to_count() {
+        let svc = GithubCountersService::with_log_path(None);
+        let status = svc.status().await;
+        assert!(status.healthy);
+        assert_eq!(status.summary, "0 GitHub API call(s) since start");
+        svc.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn counts_only_the_records_appended_after_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log.jsonl");
+        // Records already in the log at boot, stamped *inside* the window (the
+        // future): a full scan counts every one, so the service reporting none of
+        // them means it never read them.
+        let future = Utc::now() + ChronoDuration::hours(1);
+        let pre: String = (0..50)
+            .map(|_| gh_line(future, 0, &["pr", "list"]))
+            .collect();
+        append(&log, &pre);
+
+        let svc = GithubCountersService::with_log_path(Some(log.clone()));
+        assert_eq!(
+            aggregate(&log, Some(svc.started_at), None, None).total(),
+            50
+        );
+        assert_eq!(
+            svc.status().await.summary,
+            "0 GitHub API call(s) since start"
+        );
+
+        append(&log, &gh_line(svc.started_at, 1, &["api", "graphql"]));
+        append(&log, &gh_line(svc.started_at, 2, &["pr", "view"]));
+        let status = svc.status().await;
+        assert_eq!(status.summary, "2 GitHub API call(s) since start");
+
+        let summary = svc.handle("summary", Value::Null).await.unwrap();
+        assert_eq!(summary["api_total"], 2);
+        assert_eq!(summary["by_subcommand"]["pr view"], 1);
+        assert_eq!(summary["since"], svc.started_at.to_rfc3339());
+    }
+
+    #[tokio::test]
+    async fn a_scan_is_abandoned_once_shutdown_begins() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log.jsonl");
+        let svc = GithubCountersService::with_log_path(Some(log.clone()));
+        for n in 1..=3 {
+            append(&log, &gh_line(svc.started_at, n, &["pr", "list"]));
+        }
+
+        svc.stopping.cancel();
+        let status = svc.status().await;
+        assert_eq!(
+            status.summary,
+            "0 GitHub API call(s) since start (incomplete)"
+        );
+        let summary = svc.handle("summary", Value::Null).await.unwrap();
+        assert_eq!(summary["incomplete"], true);
+
+        // The abandoned scan lost nothing: the final summary, under its own
+        // deadline, reads what was left and the tally is whole.
+        assert_eq!(tallied(&svc), 0);
+        svc.shutdown().await;
+        assert_eq!(tallied(&svc), 3);
+    }
+
+    #[tokio::test]
+    async fn the_logger_keeps_the_tally_current_and_stops_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log.jsonl");
+        let svc = GithubCountersService::with_log_path(Some(log.clone()));
+        svc.start_counter_logger_with(Duration::from_millis(1), Duration::from_millis(5));
+        // A second start is a no-op.
+        svc.start_counter_logger_with(Duration::from_millis(1), Duration::from_millis(5));
+
+        append(&log, &gh_line(svc.started_at, 1, &["pr", "list"]));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tallied(&svc) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the logger never read the record"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        svc.shutdown().await;
+        assert!(svc.logger.lock().unwrap().is_none());
+        assert!(svc.stopping.is_cancelled());
     }
 }
