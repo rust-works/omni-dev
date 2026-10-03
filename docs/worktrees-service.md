@@ -1835,7 +1835,7 @@ Ops:
 | `unregister`      | `{ key }`                                                             | `{ removed: <bool> }`                                                     |
 | `list`            | `null`                                                                | `{ windows: [entry, …] }`                                                 |
 | `tree`            | `null`                                                                | `{ repos: [repo, …], show_closed }`                                       |
-| `ahead-behind`    | `{ paths: [path, …] }`                                                | `{ results: { "<path>": { ahead?, behind?, main_behind? } } }`            |
+| `ahead-behind`    | `{ paths: [path, …] }`                                                | `{ results: { "<path>": { ahead?, behind?, main_behind?, shallow? } } }`  |
 | `open`            | `{ path }`                                                            | `{ ok: true }`                                                            |
 | `open-prs`        | `{ owner, name }`                                                     | `{ pull_requests: [pr, …] }`                                              |
 | `close`           | `{ path, remove, requester_key?, confirmed? }`                        | *(safety report, or `{ removed/closed }`)*                                |
@@ -2006,7 +2006,7 @@ Where:
   field rides the snapshot.
 - `ahead-behind` (#1306, extended #1457) — the **lazy** per-worktree divergence
   op. Given `{ paths: [<worktree path>, …] }`, it returns
-  `{ results: { "<path>": { ahead?, behind?, main_behind? } } }`, keyed by the
+  `{ results: { "<path>": { ahead?, behind?, main_behind?, shallow? } } }`, keyed by the
   requested path. `ahead`/`behind` (a branch's divergence from its own upstream)
   fold in together or not at all; `main_behind` (its divergence from the
   repository's remote default branch, resolved the same local-only way
@@ -2016,7 +2016,12 @@ Where:
   upstream *is* already the default branch, so it would just duplicate
   `behind`). A path is **omitted** from `results` entirely only when *neither*
   side resolves (not a repo, or a detached/unborn HEAD) — the client renders it
-  with no sync indicator. It exists so the streamed `tree`/`subscribe` snapshot
+  with no sync indicator. `shallow` (#2120) is `true` — and otherwise omitted —
+  when the worktree's repository is a shallow clone. Everything else in a row is a
+  pure function of commit ids (the same fact the daemon's own walk memo rests on),
+  so a client may cache a row for as long as its ids hold; a shallow clone is the one
+  exception, since deepening it changes the counts without changing any id, so a
+  flagged row must not be cached. It exists so the streamed `tree`/`subscribe` snapshot
   can stay cheap: a client fetches divergence only for the worktrees it shows
   (the extension when a repo is expanded; `worktrees tree` once for the whole
   tree), rather than the daemon walking every worktree's commit graph on every
