@@ -601,10 +601,23 @@ pub fn resolve_format(
     whole_paragraphs: bool,
 ) -> Result<EditPreview, AnchorError> {
     let mut edit = resolve_delete(document, from, to, match_case)?;
+    let (paragraphs, _) = paragraphs(document, &SegmentSelection::default())?;
     if !whole_paragraphs {
+        // Google may extend text styling to adjacent newlines. Validate any
+        // suggested newline at either edge even when it is outside the
+        // requested range; its styling must not bypass suggestion refusal.
+        for p in paragraphs.iter().filter(|p| p.tab_id == edit.tab_id) {
+            for run in &p.runs {
+                if run.suggested
+                    && ((run.end == edit.start_index && run.text.ends_with('\n'))
+                        || (run.start == edit.end_index && run.text.starts_with('\n')))
+                {
+                    return Err(AnchorError::SuggestedContent);
+                }
+            }
+        }
         return Ok(edit);
     }
-    let (paragraphs, _) = paragraphs(document, &SegmentSelection::default())?;
     let affected: Vec<_> = paragraphs
         .iter()
         .filter(|p| {
@@ -1296,5 +1309,36 @@ mod tests {
         let p = resolve_format(&document, "anchor", None, true, true).unwrap();
         assert_eq!(p.tab_id.as_deref(), Some("child"));
         assert_eq!((p.start_index, p.end_index), (1, 11));
+    }
+    #[test]
+    fn text_formatting_refuses_suggested_adjacent_newlines() {
+        let mut p = paragraph(1, &["anchor", "\n"]);
+        p["paragraph"]["elements"][1]["textRun"]["suggestedDeletionIds"] = json!(["pending"]);
+        assert_eq!(
+            resolve_format(&doc(vec![p]), "anchor", None, true, false),
+            Err(AnchorError::SuggestedContent)
+        );
+        let mut preceding = paragraph(1, &["before", "\n"]);
+        preceding["paragraph"]["elements"][1]["textRun"]["suggestedInsertionIds"] =
+            json!(["pending"]);
+        assert_eq!(
+            resolve_format(
+                &doc(vec![preceding, paragraph(8, &["anchor\n"])]),
+                "anchor",
+                None,
+                true,
+                false
+            ),
+            Err(AnchorError::SuggestedContent)
+        );
+        // Unsuggested adjacent newlines remain valid.
+        assert!(resolve_format(
+            &doc(vec![paragraph(1, &["anchor", "\n"])]),
+            "anchor",
+            None,
+            true,
+            false
+        )
+        .is_ok());
     }
 }
