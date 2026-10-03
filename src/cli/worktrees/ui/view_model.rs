@@ -101,8 +101,9 @@ pub struct WorktreeRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AheadBehindState {
-    /// Nothing to show: never asked for (not currently visible), or the last
-    /// ask failed. A failure is not an answer, so it is asked again.
+    /// Nothing to show: never asked for (not currently visible), the last ask
+    /// failed, or the daemon omitted a row its snapshot said it should have had
+    /// (#2143). None of those is an answer, so each is asked again.
     Unknown,
     /// A fetch is in flight.
     Loading,

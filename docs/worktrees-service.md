@@ -1752,9 +1752,11 @@ extension never runs git.
   per backoff step. A `shallow` row is shown but re-asked every 30 s, since deepening
   a clone moves no id and so produces no frame; the daemon recomputes it from scratch
   by design, over a truncated history, so the rate is bounded. A row with nothing to
-  compute is settled and never re-asked. The extension's limit carries over: a daemon
-  that predates `shallow`, `upstream_sha` or `main_sha` makes the matching case look
-  settled.
+  compute is settled and never re-asked. Two limits. The extension's carries over: a
+  daemon that predates `shallow`, `upstream_sha` or `main_sha` makes the matching case
+  look settled. And an omission that is *permanent* — a walk that always errors —
+  cannot be told from a transient one, so it is re-asked at the 30 s cap
+  indefinitely; that is the price of not caching a failure as an answer.
 
 ### Tuning the refresh cadence
 
