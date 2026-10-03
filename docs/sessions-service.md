@@ -892,6 +892,37 @@ a terminal session — with no window to focus — is a plain status line.
 (`N session(s): X working, Y waiting, Z idle`) and, under `--json`, the full live
 set.
 
+Once the daemon has applied an event, the summary ends with how events have
+reached it since it started (#2136), and `--json` carries the same numbers under
+`delivery`:
+
+```
+24 session(s): 11 working, 0 waiting, 13 idle · events: 5120 via socket, 0 recovered from journals, 3 replayed
+```
+
+- **`socket`** counts events applied from the control socket, the fast path.
+- **`recovered`** counts events applied from a tailed [journal](#hook-journals-2108)
+  whose socket copy never arrived: the **dropped POSTs**. This is the number to
+  watch. A steady `0` means the socket is keeping up; it moves when the daemon was
+  unreachable or wedged long enough for a hook to give up (a restart, a stall).
+  Every hook delivers each event by both routes, so the journal copy of a normal
+  event is a duplicate and counts for nothing. The journal poll can also read a
+  line in the instant between a hook's journal write and its POST arriving
+  (about 0.02% of events at the 5 s poll); that POST then lands as a duplicate and
+  takes the event back out of `recovered`, so a recovery is briefly counted until
+  its socket copy shows up.
+- **`replayed`** counts events applied by a journal's first-sight replay: a
+  restart, or events fired while the daemon was down.
+
+The counters are monotonic since the daemon started and are not persisted. They
+cannot see a hook that never wrote a journal (a non-UUID id, a daemon-less
+install), and a duplicate whose first copy has left a session's last 32 events is
+not recognised as one.
+
+`log.jsonl` can show only the timeouts: every `sessions hook` run is logged with
+its `duration_ms`, so one at about 2000 ms hit the sink's 2 s limit, but a refused
+connection returns in milliseconds and looks like a delivery.
+
 ## Source tagging (companion)
 
 A session's `source` is resolved on read by joining its `cwd` against the live
@@ -1125,8 +1156,10 @@ The sink logs `session_hook_journal` with outcome `journaled` or
 `ended`, `too_old`, `dead` or `stale`), `session_journal_removed` (`rejected`,
 `orphan`, `too_old`, `unreadable`, `stale_tmp`) and `session_journal_compacted`
 follow a journal through its life, at debug level. `session_observed` and
-`session_end` carry the route (`origin`) and the dedupe outcomes
-`duplicate_ignored` and `journal_stale_ignored`.
+`session_end` carry the route (`origin`: `Socket`, `Journal` for a tail, or
+`Replay` for a first-sight import) and the dedupe outcomes `duplicate_ignored`,
+`journal_stale_ignored` and `socket_reordered_ignored`. The same routes are
+counted in [`daemon status`](#status).
 
 ### Opt-in wrapper metadata file
 
