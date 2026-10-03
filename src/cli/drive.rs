@@ -683,6 +683,89 @@ mod tests {
         }
     }
 
+    fn list_selection(
+        match_text: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> docs::write::ListSelection {
+        docs::write::ListSelection {
+            document_id: "d1".to_string(),
+            match_text: match_text.map(str::to_string),
+            from: from.map(str::to_string),
+            to: to.map(str::to_string),
+            ignore_case: true,
+            dry_run: false,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: OutputFormat::Table,
+        }
+    }
+
+    fn create_bullets_command(selection: docs::write::ListSelection) -> DriveSubcommands {
+        DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::CreateBullets(docs::write::CreateBulletsCommand {
+                selection,
+                preset: docs::write::BulletPresetArg::BulletCheckbox,
+            }),
+        })
+    }
+
+    fn delete_bullets_command(selection: docs::write::ListSelection) -> DriveSubcommands {
+        DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::DeleteBullets(docs::write::DeleteBulletsCommand {
+                selection,
+            }),
+        })
+    }
+
+    /// Both list verbs reach the shared engine for a `--match` selection and
+    /// for a `--from`/`--to` range, and — like every Docs write verb — report
+    /// an unreachable API on the output rather than the exit code (see
+    /// `dispatch_routes_docs_replace`).
+    #[tokio::test]
+    async fn dispatch_routes_docs_create_and_delete_bullets() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        for cmd in [
+            create_bullets_command(list_selection(Some("a"), None, None)),
+            create_bullets_command(list_selection(None, Some("a"), Some("b"))),
+            delete_bullets_command(list_selection(Some("a"), None, None)),
+            delete_bullets_command(list_selection(None, Some("a"), Some("b"))),
+        ] {
+            assert!(cmd.dispatch(&dead_client()).await.is_ok());
+        }
+    }
+
+    /// The engine never runs when the selection is not a match or a full
+    /// range. clap already refuses these, so the check guards commands built
+    /// any other way.
+    #[tokio::test]
+    async fn dispatch_refuses_a_list_verb_that_is_not_a_match_or_a_full_range() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        for (match_text, from, to) in [
+            (None, None, None),
+            (None, Some("a"), None),
+            (None, None, Some("b")),
+            (Some("a"), Some("a"), Some("b")),
+            (Some("a"), Some("a"), None),
+        ] {
+            for cmd in [
+                create_bullets_command(list_selection(match_text, from, to)),
+                delete_bullets_command(list_selection(match_text, from, to)),
+            ] {
+                let err = cmd.dispatch(&dead_client()).await.unwrap_err();
+                assert!(
+                    err.to_string().contains("--match or both --from and --to"),
+                    "{err}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_routes_docs_create() {
         let guard = crate::drive::test_support::EnvGuard::take();

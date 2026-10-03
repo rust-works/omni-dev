@@ -574,7 +574,7 @@ pub fn resolve_list(
             cursor = run.end;
         }
         if cursor != p.end {
-            return Err(AnchorError::UnsafeRange);
+            return Err(AnchorError::UnsafeRange); // omni-dev: coverage ignore-line reason="collect verified every paragraph has a final run ending at p.end, and the loop above leaves cursor at that run's end, so it always matches; kept as defence in depth on the write boundary"
         }
         // Structural elements can occupy no text index space, so contiguity
         // alone is insufficient. The last paragraph is safe to format.
