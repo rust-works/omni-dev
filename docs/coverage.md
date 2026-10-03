@@ -30,10 +30,11 @@ Line coverage only; branch-coverage data in the report is ignored.
 
 ## Inputs
 
-- `--report <PATH>` (**required**) — the head coverage report. Three formats are
-  accepted and **auto-detected** from content: lcov trace files, llvm-cov JSON
-  (`cargo llvm-cov report --json`), and Cobertura XML. Override detection with
-  `--report-format <auto|lcov|llvm-cov-json|cobertura>`.
+- `--report <PATH>` (**required**, repeatable) — the head coverage report. Three
+  formats are accepted and **auto-detected** from content: lcov trace files,
+  llvm-cov JSON (`cargo llvm-cov report --json`), and Cobertura XML. Override
+  detection with `--report-format <auto|lcov|llvm-cov-json|cobertura>`. Pass it
+  once per shard to merge a [sharded run](#sharded-runs).
 - `--base-ref <REV>` / `--head-ref <REV>` — the revisions to diff. Defaults are
   the merge-base of `origin/main` and `HEAD` for the base, and `HEAD` for the
   head (the revision the report was measured at).
@@ -96,8 +97,9 @@ error.
   silently failed coverage run through.
 
 Because the gate needs only the report, it works wherever `coverage diff` does —
-including when the report was produced elsewhere (for example, merged from
-several CI jobs) and the profile data is not on the machine running the gate.
+including when the report was produced elsewhere (for example, from several CI
+jobs, see [Sharded runs](#sharded-runs)) and the profile data is not on the
+machine running the gate.
 
 ## Diff scoping
 
@@ -124,6 +126,63 @@ Report paths are made repo-relative by stripping the repository working-director
 prefix. Override the stripped prefix with `--strip-prefix <PATH>` when the report
 was generated under a different root (for example, a container build path that
 differs from the checkout location).
+
+## Sharded runs
+
+When the instrumented test run is split across several concurrent CI jobs, each
+job produces its own report. Pass them all to one aggregation step, one `--report`
+each, and everything — the patch gate, `--fail-under-lines`, the deltas, the PR
+comment — is computed over the merged result:
+
+```bash
+omni-dev coverage diff \
+  --report shard-1.lcov --report shard-2.lcov --report shard-3.lcov \
+  --baseline-report base.lcov \
+  --fail-under-patch 80 --fail-under-lines 70
+```
+
+**How shards combine.** The merge is a *union*: the files are unioned, and for a
+line present in several shards the larger hit count wins. In practice:
+
+- A line **any** shard covered is covered, which is the point of sharding.
+- A line only **one** shard instrumented is judged by that shard alone — it is
+  neither covered nor uncovered "elsewhere". With a normal run every shard
+  instruments the same code and lists every line, so this only matters when
+  shards are built from different configurations.
+- Hit counts are **maxed, not summed**. Nothing in the line-coverage output reads
+  the count itself, so a total across shards is not available.
+- Shard order never changes the output, and each shard may be in a different
+  format (they are detected independently; an explicit `--report-format` applies
+  to all of them).
+
+**A bad shard cannot lower coverage unnoticed.** Merging ignores a shard that
+contributes nothing, so a shard whose job failed would otherwise just make the
+result look slightly worse. With more than one `--report`:
+
+- a shard that is missing, unparseable, or has **no executable lines** fails the
+  run, naming the shard (checked before `--ignore-filename-regex`, so a shard that
+  only covers excluded files is not mistaken for a failed one);
+- a shard whose absolute paths **all** fall outside the `--strip-prefix` root draws
+  a warning on stderr: it was probably measured under a different workspace root,
+  and its files would key under paths that exist nowhere in the repository. A shard
+  with some in-tree paths is left alone, because reports legitimately name a few
+  out-of-tree files (the standard library, vendored sources).
+
+A single `--report` behaves exactly as it did before sharding existed: neither
+check applies to it.
+
+**Limits.**
+
+- `--strip-prefix` is one value, so every shard has to share a workspace root.
+  Shards from the same CI runner image do; a mix of, say, Linux and macOS runners
+  does not, and the warning above is the signal.
+- `--baseline-report` takes **one** report. A baseline from a sharded run must be
+  a single file. For lcov, concatenating the shards (`cat shard-*.lcov >
+  base.lcov`) is equivalent to merging them, since repeated records for a file are
+  unioned the same way — but, unlike `--report`, it gives no empty-shard check.
+- The merge-base baseline recompute and `codecov.json` /
+  `coverage-summary.txt` come from `cargo llvm-cov` in the reusable action and are
+  not part of this command.
 
 ## Excluding files (CPU-conditional / non-deterministic coverage)
 
@@ -310,8 +369,8 @@ wires it up.
 
 | Flag | Purpose |
 |------|---------|
-| `--report <PATH>` | Head coverage report (required) |
-| `--report-format <FMT>` | `auto` (default) \| `lcov` \| `llvm-cov-json` \| `cobertura` |
+| `--report <PATH>` | Head coverage report (required); repeat once per shard to merge a [sharded run](#sharded-runs) |
+| `--report-format <FMT>` | Format of every `--report`: `auto` (default) \| `lcov` \| `llvm-cov-json` \| `cobertura` |
 | `--base-ref <REV>` | Base revision (default: merge-base of `origin/main` and `HEAD`) |
 | `--head-ref <REV>` | Head revision the report was measured at (default: `HEAD`) |
 | `--baseline-report <PATH>` | Base-side report; enables project deltas + indirect changes |
