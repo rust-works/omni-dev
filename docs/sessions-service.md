@@ -493,12 +493,23 @@ so a crafted payload cannot name a file outside the directory; an id that is not
 a UUID is simply not journaled. `SessionEnd` is journaled too, so one that
 arrives while the daemon is down is kept.
 
+The sink cannot tell whether a daemon is reading, so it **bounds itself**: it does
+not journal at all until the daemon's runtime directory exists (a machine that has
+never run the daemon gets no journals), stops appending to a file past 512 KiB
+(the daemon compacts long before that, so reaching it means nothing is tending
+the journals), and, whenever it starts a new journal, deletes sibling journals
+nobody has written to for 7 days. A hooks-only install with no sessions service
+therefore cannot accumulate journals without limit.
+
 The same `ts` and a per-event `seq` ride the POST as a `stamp`. The registry
 remembers the last 32 `seq`s per session and drops the second copy of an event,
 whichever route it arrived by. An event read from a journal is also dropped when
 it is **older than one the session has already applied**, so a late read can
-never undo a newer state, or end a session that has since been resumed. Socket
-events are never dropped for age, as before.
+never undo a newer state, or end a session that has since been resumed. A
+*socket* event is dropped as out of order only when it is behind the newest
+applied event by less than 10 seconds: the adapter awaits a git lookup before it
+applies an `observe`, so the journal can overtake it, but a wall clock stepped
+back by more than that can never freeze a session.
 
 **What the daemon does with them** (`src/sessions/journal_watcher.rs`, polling
 every 5 s alongside the other watchers; a poll rather than a file watch, because
@@ -509,8 +520,9 @@ the POST remains the fast path):
   replay it into a scratch registry to see what the state machine makes of it.
   A session that has **ended** is dropped, as is one whose last event is more
   than 7 days old. Otherwise it needs **proof of life**:
-  - Codex: the thread's writer lock is **held** (a lock that is free or gone is
-    proof of death);
+  - Codex: the thread's writer lock is **held**. A lock file nobody holds is proof
+    of death; an *absent* one is not (a daemon started by a service manager may
+    resolve a different `CODEX_HOME` from the shell's);
   - otherwise the owning pid is running **and started no later than its first
     journaled event** (a recycled pid started after it). A dead or unreadable pid
     is *not* proof of death, only the absence of proof, because it might have been
@@ -527,15 +539,18 @@ the POST remains the fast path):
 - **Cleanup is the daemon's.** A rejected journal is deleted at once. An accepted
   one is deleted when the registry no longer holds its session live and the file
   has been quiet for 2 minutes, or when it is older than 7 days. A journal over
-  128 KiB is compacted to its last ~64 KiB, cut at a line boundary, by writing a
-  `0600` temp file and renaming it over; the rewrite is abandoned if the file
+  128 KiB is compacted to its last ~64 KiB, cut at a line boundary, plus the
+  newest prompt record the cut drops (so a long turn still replays as prompted),
+  by writing a `0600` temp file and renaming it over; the rewrite is abandoned if the file
   grew since it was read, so the only events it can lose arrive in the instant
   between that check and the rename. Only regular `<uuid>.jsonl` files are read or
   removed; a symlink is never followed.
 
-Known limits: a session with more than ~200 events after its last prompt loses
-its `prompted` flag when compacted, so after a restart the pid watcher won't pin
-it past the TTL until its next prompt. Feeds that are not hooks are **not**
+Known limits: a session with no usable pid and no Codex lock is restored only if
+its last event is within the session TTL, so one left idle for longer than that
+across a restart reappears on its next event. A hook appending in the instant
+between a compaction's last check and its rename loses that one event (the POST has
+normally delivered it). Feeds that are not hooks are **not**
 journaled: the stream wrappers, the pi extension (its 30 s keep-alive already
 re-reports after an outage), the transcript and rollout watchers, and the VS Code
 window reports keep using the socket only.

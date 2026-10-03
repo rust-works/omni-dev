@@ -118,6 +118,30 @@ const MAX_REPLACED_PIDS: usize = 8;
 /// Ceiling on live window-embedding reports, mirroring the worktrees registry cap.
 const MAX_WINDOWS: usize = 256;
 
+/// How far behind the newest applied event a **socket** event may be and still
+/// be recognised as out of order and dropped (#2108). The window exists because a
+/// socket event can be overtaken by its own journal copy: the adapter awaits a
+/// git lookup before applying an `observe`, and the journal watcher can apply a
+/// newer event in that gap. It is short so a wall clock stepped back by more than
+/// this can never freeze a session; the journal route has no such window, since a
+/// stale journal event is only ever redundant.
+const SOCKET_REORDER_WINDOW: chrono::Duration = chrono::Duration::seconds(10);
+
+/// Whether `id` is a canonical hyphenated UUID (8-4-4-4-12 hex digits).
+///
+/// The only shape of id a Codex rollout's thread id or a hook journal is named
+/// for: Claude's session ids are UUID v4 and Codex's v7. Checking the shape, not
+/// just stripping separators, is what keeps a crafted id from naming a path.
+#[must_use]
+pub fn is_session_uuid(id: &str) -> bool {
+    let mut groups = id.split('-');
+    [8, 4, 4, 4, 12].into_iter().all(|len| {
+        groups
+            .next()
+            .is_some_and(|g| g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit()))
+    }) && groups.next().is_none()
+}
+
 /// How many recent event `seq`s a session remembers, to drop the copy of an
 /// event that reaches the registry by a second route (#2108). A hook delivers
 /// each event twice — once on the socket, once through its journal — and only
@@ -611,17 +635,25 @@ pub struct SessionEntry {
 
 impl SessionEntry {
     /// Why a stamped event must not be applied to this session, if so: it is a
-    /// duplicate of one already applied, or (journal route only) older than one.
+    /// duplicate of one already applied, or older than one — any age for the
+    /// journal route, within [`SOCKET_REORDER_WINDOW`] for the socket.
     fn stamp_skip(&self, stamp: Option<&EventStamp>, origin: Origin) -> Option<&'static str> {
         let stamp = stamp?;
         if self.recent_seqs.contains(&stamp.seq) {
             return Some("duplicate_ignored");
         }
-        if origin == Origin::Journal && self.latest_stamp_ts.is_some_and(|latest| stamp.ts < latest)
-        {
-            return Some("journal_stale_ignored");
+        let behind = self.latest_stamp_ts.map(|latest| latest - stamp.ts);
+        match (origin, behind) {
+            (Origin::Journal, Some(behind)) if behind > chrono::Duration::zero() => {
+                Some("journal_stale_ignored")
+            }
+            (Origin::Socket, Some(behind))
+                if behind > chrono::Duration::zero() && behind <= SOCKET_REORDER_WINDOW =>
+            {
+                Some("socket_reordered_ignored")
+            }
+            _ => None,
         }
-        None
     }
 
     /// Remembers an applied event's stamp for [`stamp_skip`](Self::stamp_skip).
@@ -801,13 +833,14 @@ impl SessionsRegistry {
         }
     }
 
-    /// The ids of the sessions that are live — present and not `ended` — so the
-    /// journal watcher can tell a journal that is still wanted from an orphan.
+    /// The ids of the sessions that are live — present and not `ended` — lower-cased
+    /// like the journal file names, so the journal watcher can tell a journal that
+    /// is still wanted from an orphan whatever case the hook sent the id in.
     pub(crate) fn live_session_ids(&self) -> std::collections::HashSet<String> {
         self.lock_sessions()
             .values()
             .filter(|entry| entry.state != SessionState::Ended)
-            .map(|entry| entry.session_id.clone())
+            .map(|entry| entry.session_id.to_ascii_lowercase())
             .collect()
     }
 
@@ -3130,18 +3163,27 @@ mod tests {
     }
 
     #[test]
-    fn a_socket_event_is_never_dropped_for_its_age() {
-        // Concurrent hooks can reach the socket out of order (as ever), and a
-        // wall clock that stepped back must not freeze a session.
+    fn a_socket_event_overtaken_by_a_newer_one_is_dropped_but_never_for_a_clock_step() {
+        // The adapter awaits a git lookup before applying an `observe`, so the
+        // journal route can apply a newer event first; the late socket copy of
+        // the older one must not undo it.
         let reg = SessionsRegistry::new();
         reg.observe_stamped(
             observe_request("s", SessionEvent::Stop, Some("/p")),
             Some(stamp("2026-10-03T03:40:05Z", "1-b")),
-            Origin::Socket,
+            Origin::Journal,
         );
         reg.observe_stamped(
             observe_request("s", SessionEvent::PreToolUse, None),
-            Some(stamp("2026-10-03T03:30:00Z", "1-a")),
+            Some(stamp("2026-10-03T03:40:03Z", "1-a")),
+            Origin::Socket,
+        );
+        assert_eq!(state_of(&reg, "s"), SessionState::Idle);
+        // A wall clock stepped back by minutes must not freeze the session: an
+        // event that far behind is applied, however it arrived.
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::PreToolUse, None),
+            Some(stamp("2026-10-03T03:30:00Z", "1-c")),
             Origin::Socket,
         );
         assert_eq!(state_of(&reg, "s"), SessionState::Working);

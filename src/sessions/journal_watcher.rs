@@ -33,9 +33,11 @@
 //! - otherwise it needs **proof of life**: a Codex writer lock that is held, or
 //!   the owning pid still running *and* having started no later than the first
 //!   event journaled from it (the daemon never saw a token for it, so this is the
-//!   check that stops a recycled pid vouching for a dead session). A held Codex
-//!   lock that is free or gone is proof of death. A dead or unreadable *pid* is
-//!   not: it might be a per-hook shell, so it only withholds the proof, exactly as
+//!   check that stops a recycled pid vouching for a dead session). A Codex lock
+//!   file that nobody holds is proof of death; an *absent* one is not (a daemon
+//!   started by a service manager may resolve another `CODEX_HOME`). A dead or
+//!   unreadable *pid* is not either: it might be a per-hook shell, so it only
+//!   withholds the proof, exactly as
 //!   the [pid watcher](super::pid_watcher) never trusts a pid it has not seen
 //!   alive;
 //! - without proof a session is kept only if its last event is within the session
@@ -81,9 +83,9 @@ use super::{
 const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A journal whose last event is older than this is not replayed, and one whose
-/// file is older is deleted whatever the registry holds. Generous: a session left
-/// open and idle for days is real, and a live pid is cheap proof.
-const MAX_REPLAY_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// file is older is deleted whatever the registry holds. The hook sink applies the
+/// same age when it sweeps, so a daemon-less install stays bounded too.
+const MAX_REPLAY_AGE: Duration = journal::MAX_JOURNAL_AGE;
 
 /// How long a journal of a session the registry does not hold live must have been
 /// quiet before it is deleted: past the ended-linger window, and long enough that
@@ -367,8 +369,11 @@ fn prove(entry: &SessionEntry, records: &[JournalRecord], probes: &dyn Probes) -
     if entry.agent == Agent::Codex {
         match probes.codex_lock(&entry.session_id.to_ascii_lowercase()) {
             LockState::Held => return Proof::Alive,
-            LockState::Free | LockState::Absent => return Proof::Dead,
-            LockState::Unknown => {}
+            // A lock file nobody holds: the thread was loaded under this Codex
+            // home and its process is gone. An *absent* file proves nothing, so
+            // it falls through like `Unknown`.
+            LockState::Free => return Proof::Dead,
+            LockState::Absent | LockState::Unknown => {}
         }
     }
     let Some(pid) = entry.pid else {
@@ -646,8 +651,31 @@ fn compact_if_needed(file: &JournalFile, track: &mut FileTrack) {
     }
 }
 
+/// The last complete `user_prompt_submit` line in `bytes` (with its newline), or
+/// nothing. A substring match on the serialized key, never a parse: `serde`
+/// writes `"event":"user_prompt_submit"` with no spaces.
+fn last_prompt_line(bytes: &[u8]) -> &[u8] {
+    const NEEDLE: &[u8] = b"\"event\":\"user_prompt_submit\"";
+    let mut found: &[u8] = &[];
+    let mut start = 0;
+    while start < bytes.len() {
+        let end = bytes[start..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |i| start + i + 1);
+        let line = &bytes[start..end];
+        if line.ends_with(b"\n") && line.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+            found = line;
+        }
+        start = end;
+    }
+    found
+}
+
 /// Rewrites the journal at `path` to its last [`COMPACT_TO_BYTES`], cut at a line
-/// boundary, through a same-directory `0600` temp file and an atomic rename.
+/// boundary — plus the newest `UserPromptSubmit` record the cut drops, so a replay
+/// of a long turn still knows the session was prompted — through a
+/// same-directory `0600` temp file and an atomic rename.
 /// `len` and `ino` are what the caller saw; the rewrite is abandoned (`None`) if
 /// the file has changed since, so an append is never silently dropped by a stale
 /// read. Returns the new length and inode.
@@ -655,24 +683,33 @@ fn compact(path: &Path, len: u64, ino: u64) -> anyhow::Result<Option<(u64, u64)>
     use anyhow::Context;
 
     let start = len.saturating_sub(COMPACT_TO_BYTES);
+    // The whole file when it is a sane size, so the newest dropped prompt can be
+    // found; otherwise just the tail.
+    let from = if len <= MAX_READ_BYTES { 0 } else { start };
     let mut file = std::fs::File::open(path)?;
-    file.seek(SeekFrom::Start(start))?;
+    file.seek(SeekFrom::Start(from))?;
     let mut buf = Vec::new();
-    file.take(len - start).read_to_end(&mut buf)?;
+    file.take(len - from).read_to_end(&mut buf)?;
+    let cut = usize::try_from(start - from).unwrap_or(0);
     let skip = if start > 0 {
-        buf.iter()
+        buf[cut..]
+            .iter()
             .position(|b| *b == b'\n')
-            .map_or(buf.len(), |i| i + 1)
+            .map_or(buf.len() - cut, |i| i + 1)
     } else {
         0
     };
-    let tail = &buf[skip..];
+    let (dropped, tail) = buf.split_at(cut + skip);
+    let kept_prompt = last_prompt_line(dropped);
+    let mut compacted = Vec::with_capacity(kept_prompt.len() + tail.len());
+    compacted.extend_from_slice(kept_prompt);
+    compacted.extend_from_slice(tail);
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .context("a journal has a file name")?;
     let tmp = path.with_file_name(format!(".{name}.tmp"));
-    crate::daemon::paths::write_file_0600(&tmp, tail)?;
+    crate::daemon::paths::write_file_0600(&tmp, &compacted)?;
     let now = std::fs::metadata(path)?;
     if now.len() != len || now.ino() != ino {
         let _ = std::fs::remove_file(&tmp);
@@ -1148,12 +1185,16 @@ mod tests {
         let held = "019a0000-0000-7000-8000-000000000001";
         let free = "019a0000-0000-7000-8000-000000000002";
         let unknown = "019a0000-0000-7000-8000-000000000003";
+        let absent = "019a0000-0000-7000-8000-000000000004";
         let probes = Fake::default();
         probes.lock(held, LockState::Held);
         probes.lock(free, LockState::Free);
+        // An absent lock file may only mean the daemon resolved another
+        // `CODEX_HOME`, so it is not proof of death.
+        probes.lock(absent, LockState::Absent);
         // Held and a day old: alive. Free and a minute old: gone. No lock
         // information and a minute old: the TTL keeps it.
-        for (id, age) in [(held, 86_400), (free, 60), (unknown, 60)] {
+        for (id, age) in [(held, 86_400), (free, 60), (unknown, 60), (absent, 60)] {
             write(
                 tmp.path(),
                 &[rec(
@@ -1170,7 +1211,10 @@ mod tests {
         run(tmp.path(), &mut JournalState::default(), &registry, &probes);
         let mut ids: Vec<String> = registry.list().into_iter().map(|e| e.session_id).collect();
         ids.sort();
-        assert_eq!(ids, vec![held.to_string(), unknown.to_string()]);
+        assert_eq!(
+            ids,
+            vec![held.to_string(), unknown.to_string(), absent.to_string()]
+        );
         assert!(registry.list().iter().all(|e| e.agent == Agent::Codex));
     }
 
@@ -1789,6 +1833,103 @@ mod tests {
         let chunk = read_chunk(&path, 0, len).unwrap();
         assert!(chunk.records.len() < n && chunk.records.len() > n / 2);
         assert_eq!(chunk.new_offset, len);
+    }
+
+    #[test]
+    fn compaction_keeps_the_newest_dropped_prompt_so_a_replay_still_knows_it_was_prompted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = ago(120);
+        // One early prompt, then a long agentic turn of tool calls.
+        let mut records = vec![rec(
+            ID,
+            Agent::Claude,
+            SessionEvent::UserPromptSubmit,
+            base,
+            "0-prompt",
+            Some(500),
+        )];
+        for i in 0..900_i64 {
+            records.push(rec(
+                ID,
+                Agent::Claude,
+                SessionEvent::PreToolUse,
+                base + chrono::Duration::milliseconds(i + 1),
+                &format!("1-{i:05}"),
+                Some(500),
+            ));
+        }
+        let path = write(tmp.path(), &records);
+        assert!(std::fs::metadata(&path).unwrap().len() > MAX_JOURNAL_BYTES);
+        let probes = Fake::default();
+        probes.running(500, ago(3600));
+        let registry = SessionsRegistry::new();
+        let mut state = JournalState::default();
+        run(tmp.path(), &mut state, &registry, &probes);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.lines().next().unwrap().contains("0-prompt"),
+            "the prompt leads the file"
+        );
+        assert!(!text.contains("1-00000"), "the rest of the head is dropped");
+        assert!(text.contains("1-00899"));
+        // A restart replays the compacted file: the session is still prompted,
+        // so the pid watcher will pin it.
+        let restarted = SessionsRegistry::new();
+        run(
+            tmp.path(),
+            &mut JournalState::default(),
+            &restarted,
+            &probes,
+        );
+        assert!(entry(&restarted, ID).unwrap().prompted);
+        assert_eq!(entry(&restarted, ID).unwrap().state, SessionState::Working);
+    }
+
+    #[test]
+    fn last_prompt_line_finds_only_the_newest_complete_prompt() {
+        let prompt =
+            |n: u32| format!("{{\"v\":1,\"seq\":\"{n}\",\"event\":\"user_prompt_submit\"}}\n");
+        let other = "{\"v\":1,\"event\":\"pre_tool_use\"}\n";
+        let text = format!("{}{other}{}{other}", prompt(1), prompt(2));
+        assert_eq!(last_prompt_line(text.as_bytes()), prompt(2).as_bytes());
+        assert!(last_prompt_line(other.as_bytes()).is_empty());
+        assert!(last_prompt_line(b"").is_empty());
+        // A torn final line is not a record.
+        let torn = format!("{}{{\"event\":\"user_prompt_submit\"", prompt(1));
+        assert_eq!(last_prompt_line(torn.as_bytes()), prompt(1).as_bytes());
+    }
+
+    #[test]
+    fn an_upper_case_session_id_is_matched_to_its_lower_case_journal() {
+        // The registry keys a session by the id as the hook sent it; the journal
+        // file name is lower-cased. The orphan sweep must not mistake the pair.
+        let tmp = tempfile::tempdir().unwrap();
+        let upper = ID.to_uppercase();
+        let path = write(
+            tmp.path(),
+            &[rec(
+                &upper,
+                Agent::Claude,
+                SessionEvent::Stop,
+                ago(30),
+                "1-1",
+                None,
+            )],
+        );
+        assert!(path.ends_with(format!("{ID}.jsonl")));
+        let registry = SessionsRegistry::new();
+        let mut state = JournalState::default();
+        let probes = Fake::default();
+        run(tmp.path(), &mut state, &registry, &probes);
+        assert!(
+            registry.live_session_ids().contains(ID),
+            "{:?}",
+            registry.live_session_ids()
+        );
+        age_file(&path, 3600);
+        run(tmp.path(), &mut state, &registry, &probes);
+        assert!(path.exists(), "a live session's journal is not an orphan");
     }
 
     // --- end to end ---------------------------------------------------------
