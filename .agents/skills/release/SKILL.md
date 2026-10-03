@@ -67,11 +67,10 @@ This skill performs the complete end-to-end release process for omni-dev, from v
 
 8. **Update CHANGELOG.md** (crate)
    - Reconcile `[Unreleased]` against `git log --oneline vPREV..origin/main`; it is routinely incomplete.
-   - Check that nothing landed in the **previous** release's section after its tag was cut (#2129). Any `>` line is a late bullet that belongs in the new section:
+   - Check that nothing landed in an already-released section after its tag was cut (#2129). The `Changelog Check` workflow rejects it on pull requests and queue entries, but only blocks if its context is required, so audit `main`. Any finding is a late bullet that belongs in the new section:
      ```bash
      PREV=A.B.C   # previous crate version
-     diff <(git show "v$PREV:CHANGELOG.md" | sed -n "/^## \[$PREV\]/,/^## \[/p") \
-          <(sed -n "/^## \[$PREV\]/,/^## \[/p" CHANGELOG.md)
+     python3 scripts/check_changelog.py --base "v$PREV" --no-extension-check
      ```
    - Add new version section: `## [X.Y.Z] - YYYY-MM-DD`, and leave an empty `## [Unreleased]` above it
    - Document all changes since last release under appropriate categories:
@@ -92,6 +91,7 @@ This skill performs the complete end-to-end release process for omni-dev, from v
 9. **Update editors/vscode/CHANGELOG.md** (extension)
    - Move `[Unreleased]` into `## [A.B.C] - YYYY-MM-DD`. Both registries render a Changelog tab from it, so every published version needs an entry.
    - Reconcile against `git log --oneline vscode-vPREV..origin/main -- editors/vscode`. This file lags more often than the root one: changes are often recorded only in the root changelog.
+   - Then run `python3 scripts/check_changelog.py --base "vscode-vPREV"`. It is a floor, not the reconciliation: it fails when the extension changed user-visibly since that tag and its changelog gained nothing, or when a bullet sits in an already-released section of either changelog.
 
 ### Phase 3: Version Update
 

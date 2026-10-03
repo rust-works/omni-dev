@@ -1,0 +1,49 @@
+name: Changelog Check
+
+# Rejects a changelog bullet added to an already-released section, and a
+# user-visible VS Code extension change with no entry in the extension's
+# changelog (#2129).
+#
+# The first mistake is made by the merge, not by the pull request: a branch
+# forked before a release adds its bullet under `[Unreleased]`, the release
+# renames that heading, and git applies the branch's hunk inside the section
+# that is now released. So this runs on `pull_request` (the merge ref, against
+# the base as it is now) and on `merge_group` (the queue branch, where the
+# rebase actually happens), not on the pull request's own diff.
+#
+# There is deliberately no `paths:` filter. The job is cheap, and a context that
+# always reports can be made required without a pull request that touches no
+# changelog waiting on a check that never runs (docs/ci-path-split.md).
+#
+# Opt-outs are commit trailers (`Changelog: none <reason>`, `Changelog:
+# amend-released <reason>`); see `python3 scripts/check_changelog.py --help`.
+
+on:
+  pull_request:
+    branches: [ main ]
+  # Merge queue entries; each has its own ref, so the concurrency group below
+  # never cancels one entry for another.
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changelog:
+    name: Changelog
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        # The merge base is found from the history, so a shallow clone fails.
+        fetch-depth: 0
+    - name: Test the checker
+      run: python3 -m unittest discover -s scripts -p 'test_*.py'
+    - name: Check the changelogs
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+      run: python3 scripts/check_changelog.py --base "$BASE_SHA"

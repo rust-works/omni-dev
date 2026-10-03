@@ -113,7 +113,7 @@ across sibling directories.
 
 - Update the README.md if your changes affect usage
 - Add doc comments for new public APIs
-- Update CHANGELOG.md for notable changes
+- Update CHANGELOG.md for notable changes, adding bullets under `[Unreleased]` only. A user-visible change to the VS Code extension also needs a bullet in `editors/vscode/CHANGELOG.md`. The Changelog Check workflow enforces both; see [Changelog Check](docs/RELEASE.md#changelog-check) for the opt-outs
 
 ## Pull Request Process
 

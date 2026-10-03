@@ -1,6 +1,9 @@
 # Rust
 /target
 
+# Python (scripts/)
+__pycache__/
+
 # IDE
 .vscode/
 .idea/

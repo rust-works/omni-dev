@@ -96,13 +96,14 @@ The quality checks below build the crate, which rewrites the `omni-dev` entry in
 
 1. Reconcile `[Unreleased]` against the commit log first. It is routinely incomplete, so compare it with `git log --oneline vPREV..origin/main` and add what is missing.
 
-2. Check that nothing landed in an **already-released** section after its tag was cut. A pull request branched before the previous release can add its bullet under `[Unreleased]`, and when that heading is renamed to the release the bullet merges into the now-released section (see [#2129](https://github.com/rust-works/omni-dev/issues/2129)). Diff the previous release's section against its state at the tag; any `>` line is a bullet added late and belongs in the new section:
+2. Check that nothing landed in an **already-released** section after its tag was cut. A pull request branched before the previous release can add its bullet under `[Unreleased]`, and when that heading is renamed to the release the bullet merges into the now-released section (see [#2129](https://github.com/rust-works/omni-dev/issues/2129)). The `Changelog Check` workflow rejects this on every pull request and merge-queue entry, but it blocks only if its context is required, so audit what is actually on `main`. Any finding is a bullet added late, and belongs in the new section:
 
    ```bash
    PREV=A.B.C   # the previous crate version
-   diff <(git show "v$PREV:CHANGELOG.md" | sed -n "/^## \[$PREV\]/,/^## \[/p") \
-        <(sed -n "/^## \[$PREV\]/,/^## \[/p" CHANGELOG.md)
+   python3 scripts/check_changelog.py --base "v$PREV" --no-extension-check
    ```
+
+   See [Changelog Check](#changelog-check) for what the script judges and how to opt out.
 
 3. Add the new version section with the current date:
    ```markdown
@@ -164,7 +165,10 @@ The subshell keeps your shell at the repository root for the `git add` below. Pr
 
 ```bash
 git log --oneline vscode-vPREV..origin/main -- editors/vscode
+python3 scripts/check_changelog.py --base "vscode-vPREV"
 ```
+
+The script is a floor, not the reconciliation: it fails when the extension changed user-visibly since that tag and its changelog gained nothing, and when a bullet sits in an already-released section of either changelog.
 
 **Checks.** The release workflow re-runs these, so run them first:
 
@@ -452,6 +456,23 @@ The automated release pipeline requires these GitHub secrets:
 - `.github/workflows/vscode-extension.yml` - Extension checks on pull requests and `main`
 - `.github/workflows/vscode-extension-release.yml` - Extension publication (`vscode-v*` tags only)
 - `.github/workflows/commit-lint.yml` - PR commit message validation
+- `.github/workflows/changelog.yml` - Changelog Check on pull requests and merge-queue entries ([below](#changelog-check))
+
+### Changelog Check
+
+`scripts/check_changelog.py` ([#2129](https://github.com/rust-works/omni-dev/issues/2129)) guards both changelogs. It judges a change against the merge base with `--base`, so a pull request is blamed only for what it adds, and the workflow runs it on the pull request's merge ref and on the merge-queue branch. The first mistake is made by the merge rather than by the pull request, so a check of the pull request's own diff could not see it.
+
+- **No bullet added to a released section.** A section is released when the base changelog has it and it is not `[Unreleased]`. The check fails if such a section ends up with more bullets than it had, in `CHANGELOG.md` or `editors/vscode/CHANGELOG.md`. A section that exists only in the change is a release in preparation, so a release-prep pull request passes. Rewording a bullet, or moving one out to `[Unreleased]` (the fix for a failure), does not add one.
+- **A user-visible extension change needs an entry.** A change under `editors/vscode/` that is not a test, the changelog or readme, the lockfile, build configuration or a dotfile must add a bullet under the extension's `[Unreleased]`, or open a release section.
+
+Opt-outs are commit trailers, because commit messages exist on a merge-queue entry and a pull request body does not. Say why after the keyword:
+
+| Trailer                              | Waives                                                                      |
+|--------------------------------------|-----------------------------------------------------------------------------|
+| `Changelog: none <reason>`           | The extension entry, for a change that is not user-visible after all        |
+| `Changelog: amend-released <reason>` | The released-section rule, for a deliberate backfill of a published release |
+
+`python3 scripts/check_changelog.py --help` lists the flags, and `python3 -m unittest discover -s scripts -p 'test_*.py'` runs its tests. The workflow has no `paths:` filter, so its `Changelog` context reports on every pull request and can be made required without deadlocking one that touches no changelog; until it is required, the merge queue does not wait for it.
 
 ## Security Notes
 
