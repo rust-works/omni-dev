@@ -169,8 +169,9 @@ end_of_record
     }
 
     /// Shard files joined with a newline parse as the same union
-    /// `CoverageReport::merge` builds: the docs tell a caller that needs a single
-    /// file (a baseline) that this is equivalent, so that has to stay true.
+    /// `CoverageReport::merge` builds. `coverage merge` is the supported way to a
+    /// single file, but a caller that joined shards by hand before it existed is
+    /// still read correctly, so that has to stay true.
     ///
     /// The shards end like real `cargo llvm-cov` output — **no trailing newline**
     /// after the last `end_of_record`, which is why the join needs its own.

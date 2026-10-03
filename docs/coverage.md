@@ -34,7 +34,8 @@ Line coverage only; branch-coverage data in the report is ignored.
   formats are accepted and **auto-detected** from content: lcov trace files,
   llvm-cov JSON (`cargo llvm-cov report --json`), and Cobertura XML. Override
   detection with `--report-format <auto|lcov|llvm-cov-json|cobertura>`. Pass it
-  once per shard to merge a [sharded run](#sharded-runs).
+  once per shard to merge a [sharded run](#sharded-runs), or merge the shards
+  into one file first with [`coverage merge`](#merging-shards-into-one-file).
 - `--base-ref <REV>` / `--head-ref <REV>` — the revisions to diff. Defaults are
   the merge-base of `origin/main` and `HEAD` for the base, and `HEAD` for the
   head (the revision the report was measured at).
@@ -271,19 +272,72 @@ check applies to it.
   Shards from the same CI runner image do; a mix of, say, Linux and macOS runners
   does not, and the warning above is the signal.
 - `--baseline-report` takes **one** report, so a baseline from a sharded run must
-  be a single file. For lcov, concatenating the shards (`cat shard-*.lcov >
-  base.lcov`) is equivalent to merging them — repeated records for a file are
-  unioned the same way. `cargo llvm-cov` writes no newline after its final
-  `end_of_record`, so `cat` glues it onto the next shard's first line. This
-  command's parser reads that correctly, but earlier releases silently dropped the
-  last file of every shard and misattributed the next one's lines (about 0.14 pp
-  low on this repository's own test suite), and other lcov consumers may do the
-  same. If the file will leave this command, put a newline between shards:
-  `for f in shard-*.lcov; do cat "$f"; echo; done > base.lcov`. Unlike `--report`,
-  joining gives no empty-shard check.
+  be a single file. Make it with [`coverage merge`](#merging-shards-into-one-file).
 - The merge-base baseline recompute and `codecov.json` /
   `coverage-summary.txt` come from `cargo llvm-cov` in the reusable action and are
   not part of this command.
+
+## Merging shards into one file
+
+`coverage diff --report` merges shards on the fly, but a single file is the
+contract in some places: `--baseline-report` takes one report, a baseline publish
+uploads one file, and so does a codecov upload. `coverage merge` writes that file:
+
+```bash
+omni-dev coverage merge shard-1.lcov shard-2.lcov shard-3.lcov -o merged.lcov
+
+# The merged file is an ordinary report, and the baseline a sharded run could not give.
+omni-dev coverage diff --report head.lcov --baseline-report merged.lcov
+```
+
+- **Same merge, same checks.** The files are unioned and, for a line present in
+  several inputs, the larger hit count wins, exactly as for repeated `--report`
+  (see [how shards combine](#sharded-runs)). Each input may be lcov, llvm-cov JSON
+  or Cobertura, detected per file; `--report-format` applies to all of them. An
+  input that is missing, unparseable or has no executable lines fails the run and
+  names it — **including a lone input**, unlike `coverage diff`, because the output
+  is trusted by whatever reads it next. An input whose absolute paths all fall
+  outside the strip prefix draws a warning on stderr.
+- **Same total.** Reading the merged file as a single `--report` gives the same
+  total, patch coverage and rendered output as passing the shards. On three real
+  `cargo llvm-cov` shards of a small crate, the merged file, the shards and the
+  single un-sharded run all reported 90.63%.
+- **Deterministic.** The output is lcov with files sorted by path, each file's
+  `DA` records sorted by line, and a trailing newline, so it is byte-identical
+  for any order of the inputs.
+- **Line coverage only.** The file carries `TN`, `SF`, `DA`, `LF`, `LH` and
+  `end_of_record`. Function (`FN*`) and branch (`BRDA`) records are dropped — the
+  model has no place for them — which is fine for `coverage diff` and for a
+  codecov line view but not for a consumer that wants branches. `LF`/`LH` count the
+  `DA` records, so unlike `llvm-cov`'s own lcov the file agrees with itself (see
+  [why the total differs](#why-the-total-differs-from-llvm-covs-summary)). A file
+  with no executable lines is left out.
+- **Repo-relative paths.** Paths are written with the repository working
+  directory stripped (found from `-C/--repo` or the current directory), or with
+  `--strip-prefix <PATH>` when the shards were measured under another root. The
+  file therefore reads back the same on any runner. A shard measured under
+  another root would otherwise key the same file under a second path and never
+  union with the others, which is what the shard warning under [Sharded runs](#sharded-runs) is for. Outside a
+  repository, and with no `--strip-prefix`, paths are written as the reports have
+  them. A path outside the prefix is normalised as `coverage diff` normalises it
+  (a leading `./` or `/` is dropped).
+- **Atomic.** Every input is read and checked before anything is written, and
+  the file is replaced through a temporary file and a rename: a merge that fails
+  creates nothing and leaves an existing file as it was, and `-o` may name one of
+  the inputs. `-o` is a **path** here, whereas `coverage diff -o` selects an
+  output format.
+- **Not applied: filters.** `--ignore-filename-regex`, `.omni-dev/coverage.yaml`
+  and `ignore` markers are applied by `coverage diff`, to the head and baseline
+  alike, so the merged file stays a complete record.
+
+**Do not join lcov files with `cat`.** It is equivalent to merging for this
+command's parser, which unions repeated records, but `cargo llvm-cov` writes no
+newline after its final `end_of_record`, so `cat shard-*.lcov` glues one shard's
+last record onto the next shard's `SF:`. Earlier releases of this command's parser
+silently dropped that file and misattributed the next one's lines (about 0.14 pp
+low on this repository's own test suite), and other lcov consumers may do the same.
+A join has no empty-shard check either: a failed shard just makes the total look
+slightly worse. `coverage merge` has neither problem.
 
 ## Excluding files (CPU-conditional / non-deterministic coverage)
 
@@ -487,3 +541,13 @@ wires it up.
 | `-C, --repo <PATH>` | Operate as if started in `<PATH>` (like `git -C`) |
 | `--artifact-url` / `--run-url` / `--commit-url` | Markdown-footer CI links |
 | `--base-sha` / `--head-sha` | SHAs shown in the markdown `Comparing` line |
+
+`coverage merge` takes:
+
+| Flag | Purpose |
+|------|---------|
+| `<REPORT>...` | Reports to merge, one per shard (required); lcov, llvm-cov JSON or Cobertura |
+| `--report-format <FMT>` | Format of every report: `auto` (default) \| `lcov` \| `llvm-cov-json` \| `cobertura` |
+| `-o, --output <PATH>` | File to write the merged lcov report to (required); a path, not a format |
+| `--strip-prefix <PATH>` | Prefix stripped from report paths (default: the repository working directory) |
+| `-C, --repo <PATH>` | Operate as if started in `<PATH>`; relative paths and the default prefix follow it |

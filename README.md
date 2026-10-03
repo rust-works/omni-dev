@@ -610,6 +610,9 @@ omni-dev coverage diff --report head.lcov --fail-under-lines 70
 # Merge the reports of a coverage run sharded across CI jobs, then gate as usual
 omni-dev coverage diff --report shard-1.lcov --report shard-2.lcov --fail-under-lines 70
 
+# Merge the shards into one file, for a baseline or an upload that needs a single report
+omni-dev coverage merge shard-1.lcov shard-2.lcov -o merged.lcov
+
 # Full report with project deltas, as JSON
 omni-dev coverage diff --report head.lcov --baseline-report base.lcov --format json
 ```
