@@ -95,29 +95,15 @@ impl DaemonService for StubService {
 /// A short `/tmp` base path keeps the socket under the 104-byte `sockaddr_un`
 /// limit that a long `TMPDIR` would otherwise blow.
 pub(crate) fn fake_daemon_reply(reply: Value) -> (TempDir, PathBuf, JoinHandle<()>) {
-    use futures::{SinkExt, StreamExt};
-    use tokio::net::UnixListener;
-    use tokio_util::codec::{Framed, LinesCodec};
-
-    let dir = tempfile::tempdir_in("/tmp").unwrap();
-    let sock = dir.path().join("d.sock");
-    let listener = UnixListener::bind(&sock).unwrap();
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut framed = Framed::new(stream, LinesCodec::new());
-        let _req = framed.next().await.unwrap().unwrap();
-        framed
-            .send(serde_json::to_string(&reply).unwrap())
-            .await
-            .unwrap();
-    });
-    (dir, sock, server)
+    fake_daemon_replies(vec![reply])
 }
 
 /// Like [`fake_daemon_reply`], but serves one request per entry of `replies`, in
 /// order, each on its own connection — what a client that connects afresh for
 /// every request (`call_service`) sees. For tests that need a request to fail and
-/// a later one to succeed against the same socket path.
+/// a later one to succeed against the same socket path. It serves exactly
+/// `replies.len()` connections, so a test that makes more or fewer asks than it
+/// scripted fails on a refused connection or an unawaited server task.
 pub(crate) fn fake_daemon_replies(replies: Vec<Value>) -> (TempDir, PathBuf, JoinHandle<()>) {
     use futures::{SinkExt, StreamExt};
     use tokio::net::UnixListener;
