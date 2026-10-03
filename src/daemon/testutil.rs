@@ -114,6 +114,32 @@ pub(crate) fn fake_daemon_reply(reply: Value) -> (TempDir, PathBuf, JoinHandle<(
     (dir, sock, server)
 }
 
+/// Like [`fake_daemon_reply`], but serves one request per entry of `replies`, in
+/// order, each on its own connection — what a client that connects afresh for
+/// every request (`call_service`) sees. For tests that need a request to fail and
+/// a later one to succeed against the same socket path.
+pub(crate) fn fake_daemon_replies(replies: Vec<Value>) -> (TempDir, PathBuf, JoinHandle<()>) {
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::UnixListener;
+    use tokio_util::codec::{Framed, LinesCodec};
+
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let sock = dir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let server = tokio::spawn(async move {
+        for reply in replies {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, LinesCodec::new());
+            let _req = framed.next().await.unwrap().unwrap();
+            framed
+                .send(serde_json::to_string(&reply).unwrap())
+                .await
+                .unwrap();
+        }
+    });
+    (dir, sock, server)
+}
+
 /// Spawns a fake daemon that reads one request line, then pushes each value in
 /// `replies` as its own NDJSON line (each a full `DaemonReply`-shaped JSON), and
 /// finally closes the connection — modelling a streaming subscription that ends.
