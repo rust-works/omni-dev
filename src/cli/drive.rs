@@ -564,6 +564,8 @@ mod tests {
     ) -> DriveSubcommands {
         DriveSubcommands::Docs(docs::DocsCommand {
             command: docs::DocsSubcommands::Insert(docs::write::InsertCommand {
+                segment_id: None,
+                tab_id: None,
                 document_id: "d1".to_string(),
                 before: before.map(str::to_string),
                 after: after.map(str::to_string),
@@ -584,6 +586,8 @@ mod tests {
     ) -> DriveSubcommands {
         DriveSubcommands::Docs(docs::DocsCommand {
             command: docs::DocsSubcommands::Delete(docs::write::DeleteCommand {
+                segment_id: None,
+                tab_id: None,
                 document_id: "d1".to_string(),
                 match_text: match_text.map(str::to_string),
                 from: from.map(str::to_string),

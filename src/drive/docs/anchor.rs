@@ -19,7 +19,13 @@ pub enum AnchorError {
     InvalidAnchor,
     /// No characters would remain after the API strips unsupported input.
     InvalidInsertionText,
-    /// No body text matches.
+    /// The segment selector is empty or inconsistent.
+    InvalidSelection,
+    /// No selected segment exists.
+    SegmentNotFound,
+    /// A segment ID identifies more than one segment.
+    AmbiguousSegment,
+    /// No selected text matches.
     NotFound,
     /// More than one occurrence, including overlapping occurrences.
     Ambiguous {
@@ -34,6 +40,42 @@ pub enum AnchorError {
     UnsafeRange,
     /// The second anchor precedes the first or is in another tab/container.
     UnorderedRange,
+}
+
+/// An explicit existing segment, optionally narrowed to one tab.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentSelection {
+    /// Header, footer or footnote map key; absent selects all tab bodies.
+    pub segment_id: Option<String>,
+    /// Optional tab identity; requires a segment ID.
+    pub tab_id: Option<String>,
+}
+
+impl SegmentSelection {
+    /// Reject empty identifiers and a tab without a segment before I/O.
+    pub fn validate(&self) -> Result<(), AnchorError> {
+        if self.segment_id.as_ref().is_some_and(String::is_empty)
+            || self.tab_id.as_ref().is_some_and(String::is_empty)
+        {
+            return Err(AnchorError::InvalidSelection);
+        }
+        if self.tab_id.is_some() && self.segment_id.is_none() {
+            return Err(AnchorError::InvalidSelection);
+        }
+        Ok(())
+    }
+}
+
+/// Kind of an explicitly selected non-body segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SegmentKind {
+    /// Page header.
+    Header,
+    /// Page footer.
+    Footer,
+    /// Footnote content.
+    Footnote,
 }
 
 /// Whether inserted text goes before or after the unique anchor.
@@ -55,6 +97,12 @@ pub struct EditPreview {
     /// The addressed tab; absent only for legacy top-level body responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
+    /// Explicit non-body segment identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
+    /// Selected segment family.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_kind: Option<SegmentKind>,
     /// Number of paragraphs touched.
     pub paragraphs: usize,
     /// Unicode scalar values inserted or removed.
@@ -93,8 +141,13 @@ fn utf16_len(text: &str) -> Result<i64, AnchorError> {
     i64::try_from(text.encode_utf16().count()).map_err(|_| AnchorError::InvalidIndices)
 }
 
-fn paragraphs(document: &Document) -> Result<Vec<Paragraph<'_>>, AnchorError> {
+fn paragraphs<'a>(
+    document: &'a Document,
+    selection: &SegmentSelection,
+) -> Result<Vec<Paragraph<'a>>, AnchorError> {
+    selection.validate()?;
     let mut out = Vec::new();
+    let mut selected = Vec::new();
     let mut container = 0;
     let mut tab_ids = HashSet::new();
     for (tab, resolved) in document.resolved_tabs().iter().enumerate() {
@@ -107,23 +160,75 @@ fn paragraphs(document: &Document) -> Result<Vec<Paragraph<'_>>, AnchorError> {
                 return Err(AnchorError::InvalidIndices);
             }
         }
-        if let Some(body) = resolved.body {
+        if let Some(id) = &selection.segment_id {
+            if selection
+                .tab_id
+                .as_deref()
+                .is_some_and(|tab| Some(tab) != resolved.tab_id)
+            {
+                continue;
+            }
+            for (kind, segments) in [
+                (SegmentKind::Header, resolved.headers()),
+                (SegmentKind::Footer, resolved.footers()),
+                (SegmentKind::Footnote, resolved.footnotes()),
+            ] {
+                for segment in segments {
+                    if segment.segment_id == id {
+                        selected.push((tab, resolved.tab_id, kind, segment));
+                    }
+                }
+            }
+        } else if let Some(body) = resolved.body {
             collect(
                 &body.content,
                 tab,
                 resolved.tab_id,
+                false,
                 &mut container,
                 &mut out,
             )?;
         }
     }
+    if selection.segment_id.is_some() {
+        let (tab, tab_id, _, segment) = match selected.as_slice() {
+            [] => return Err(AnchorError::SegmentNotFound),
+            [one] => *one,
+            _ => return Err(AnchorError::AmbiguousSegment),
+        };
+        collect(segment.content, tab, tab_id, true, &mut container, &mut out)?;
+    }
     Ok(out)
+}
+
+fn selected_kind(document: &Document, selection: &SegmentSelection) -> Option<SegmentKind> {
+    let id = selection.segment_id.as_deref()?;
+    for tab in document.resolved_tabs() {
+        if selection
+            .tab_id
+            .as_deref()
+            .is_some_and(|wanted| Some(wanted) != tab.tab_id)
+        {
+            continue;
+        }
+        for (kind, segments) in [
+            (SegmentKind::Header, tab.headers()),
+            (SegmentKind::Footer, tab.footers()),
+            (SegmentKind::Footnote, tab.footnotes()),
+        ] {
+            if segments.iter().any(|s| s.segment_id == id) {
+                return Some(kind);
+            }
+        }
+    }
+    None
 }
 
 fn collect<'a>(
     elements: &'a [StructuralElement],
     tab: usize,
     tab_id: Option<&str>,
+    segment: bool,
     next_container: &mut usize,
     out: &mut Vec<Paragraph<'a>>,
 ) -> Result<(), AnchorError> {
@@ -131,15 +236,23 @@ fn collect<'a>(
     *next_container += 1;
     for (position, element) in elements.iter().enumerate() {
         if let Some(paragraph) = &element.paragraph {
-            let start = element.start_index.ok_or(AnchorError::InvalidIndices)?;
+            let start = if segment {
+                element.start_index()
+            } else {
+                element.start_index.ok_or(AnchorError::InvalidIndices)?
+            };
             let end = element.end_index.ok_or(AnchorError::InvalidIndices)?;
-            if start < 1 || end <= start {
+            if start < i64::from(!segment) || end <= start {
                 return Err(AnchorError::InvalidIndices);
             }
             let mut runs = Vec::new();
             let mut previous_end = start;
             for inline in &paragraph.elements {
-                let run_start = inline.start_index.ok_or(AnchorError::InvalidIndices)?;
+                let run_start = if segment {
+                    inline.start_index.unwrap_or(0)
+                } else {
+                    inline.start_index.ok_or(AnchorError::InvalidIndices)?
+                };
                 let run_end = inline.end_index.ok_or(AnchorError::InvalidIndices)?;
                 if run_start < previous_end || run_end <= run_start || run_end > end {
                     return Err(AnchorError::InvalidIndices);
@@ -179,11 +292,11 @@ fn collect<'a>(
         } else if let Some(table) = &element.table {
             for row in &table.table_rows {
                 for cell in &row.table_cells {
-                    collect(&cell.content, tab, tab_id, next_container, out)?;
+                    collect(&cell.content, tab, tab_id, segment, next_container, out)?;
                 }
             }
         }
-        // Tables of contents and non-body segments are deliberately not editable.
+        // Tables of contents remain deliberately uneditable.
     }
     Ok(())
 }
@@ -275,11 +388,30 @@ pub fn resolve_insert(
     text: &str,
     match_case: bool,
 ) -> Result<EditPreview, AnchorError> {
+    resolve_insert_in(
+        document,
+        anchor,
+        side,
+        text,
+        match_case,
+        &SegmentSelection::default(),
+    )
+}
+
+/// Resolve an anchored insert within an explicitly selected segment or tab bodies.
+pub fn resolve_insert_in(
+    document: &Document,
+    anchor: &str,
+    side: Side,
+    text: &str,
+    match_case: bool,
+    selection: &SegmentSelection,
+) -> Result<EditPreview, AnchorError> {
     let (chars, bytes) = insertion_counts(text);
     if chars == 0 {
         return Err(AnchorError::InvalidInsertionText);
     }
-    let paragraphs = paragraphs(document)?;
+    let paragraphs = paragraphs(document, selection)?;
     let found = find(&paragraphs, anchor, match_case)?;
     if found.suggested {
         return Err(AnchorError::SuggestedContent);
@@ -296,6 +428,8 @@ pub fn resolve_insert(
         start_index: index,
         end_index: index,
         tab_id: p.tab_id.clone(),
+        segment_id: selection.segment_id.clone(),
+        segment_kind: selected_kind(document, selection),
         paragraphs: 1,
         chars,
         bytes,
@@ -312,7 +446,18 @@ pub fn resolve_delete(
     to: Option<&str>,
     match_case: bool,
 ) -> Result<EditPreview, AnchorError> {
-    let paragraphs = paragraphs(document)?;
+    resolve_delete_in(document, from, to, match_case, &SegmentSelection::default())
+}
+
+/// Resolve an anchored delete within an explicitly selected segment or tab bodies.
+pub fn resolve_delete_in(
+    document: &Document,
+    from: &str,
+    to: Option<&str>,
+    match_case: bool,
+    selection: &SegmentSelection,
+) -> Result<EditPreview, AnchorError> {
+    let paragraphs = paragraphs(document, selection)?;
     let first = find(&paragraphs, from, match_case)?;
     let last = if let Some(to) = to {
         find(&paragraphs, to, match_case)?
@@ -375,6 +520,8 @@ pub fn resolve_delete(
         start_index: start,
         end_index: end,
         tab_id: a.tab_id.clone(),
+        segment_id: selection.segment_id.clone(),
+        segment_kind: selected_kind(document, selection),
         paragraphs: count,
         chars,
         bytes,
@@ -405,6 +552,158 @@ mod tests {
 
     fn doc(content: Vec<Value>) -> Document {
         serde_json::from_value(json!({"body": {"content": content}})).unwrap()
+    }
+
+    fn selection(id: &str) -> SegmentSelection {
+        SegmentSelection {
+            segment_id: Some(id.into()),
+            tab_id: None,
+        }
+    }
+
+    #[test]
+    fn all_segment_families_use_zero_based_utf16_and_ignore_other_content() {
+        for (map, kind) in [
+            ("headers", SegmentKind::Header),
+            ("footers", SegmentKind::Footer),
+            ("footnotes", SegmentKind::Footnote),
+        ] {
+            let mut p = paragraph(0, &["😀 a", "nchor\n"]);
+            p.as_object_mut().unwrap().remove("startIndex");
+            p["paragraph"]["elements"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("startIndex");
+            let document: Document = serde_json::from_value(json!({
+                "body": {"content": [paragraph(1, &["anchor anchor\n"])]},
+                map: {"s": {"content": [p]}, "other": {"content": [{"paragraph": {}}]}}
+            }))
+            .unwrap();
+            let edit = resolve_delete_in(&document, "anchor", None, true, &selection("s")).unwrap();
+            assert_eq!(
+                (edit.start_index, edit.end_index, edit.chars, edit.bytes),
+                (3, 9, 6, 6)
+            );
+            assert_eq!(edit.segment_id.as_deref(), Some("s"));
+            assert_eq!(edit.segment_kind, Some(kind));
+            assert_eq!(
+                resolve_insert_in(&document, "😀", Side::Before, "x", true, &selection("s"))
+                    .unwrap()
+                    .start_index,
+                0
+            );
+            assert_eq!(
+                resolve_delete(&document, "anchor", None, true),
+                Err(AnchorError::Ambiguous { count: 2 })
+            );
+        }
+    }
+
+    #[test]
+    fn segment_identity_is_resolved_before_anchor_uniqueness_in_child_tabs() {
+        let document: Document = serde_json::from_value(json!({"tabs": [{
+            "tabProperties": {"tabId": "parent"},
+            "documentTab": {"headers": {"s": {"content": [paragraph(0, &["other\n"])]}}},
+            "childTabs": [{"tabProperties": {"tabId": "child"}, "documentTab": {"footnotes": {"s": {"content": [paragraph(0, &["anchor\n"])]}}}}]
+        }]})).unwrap();
+        assert_eq!(
+            resolve_delete_in(&document, "anchor", None, true, &selection("s")),
+            Err(AnchorError::AmbiguousSegment)
+        );
+        let mut selected = selection("s");
+        selected.tab_id = Some("child".into());
+        let edit = resolve_delete_in(&document, "anchor", None, true, &selected).unwrap();
+        assert_eq!(edit.tab_id.as_deref(), Some("child"));
+        assert_eq!(edit.segment_kind, Some(SegmentKind::Footnote));
+        selected.tab_id = Some("missing".into());
+        assert_eq!(
+            resolve_delete_in(&document, "anchor", None, true, &selected),
+            Err(AnchorError::SegmentNotFound)
+        );
+        for invalid in [
+            selection(""),
+            SegmentSelection {
+                segment_id: None,
+                tab_id: Some("child".into()),
+            },
+            SegmentSelection {
+                segment_id: Some("s".into()),
+                tab_id: Some(String::new()),
+            },
+        ] {
+            assert_eq!(
+                resolve_delete_in(&document, "anchor", None, true, &invalid),
+                Err(AnchorError::InvalidSelection)
+            );
+        }
+    }
+
+    #[test]
+    fn selected_segments_preserve_suggestion_and_structural_guards() {
+        let mut suggested = paragraph(0, &["anchor\n"]);
+        suggested["paragraph"]["elements"][0]["textRun"]["suggestedDeletionIds"] =
+            json!(["suggestion"]);
+        let document: Document =
+            serde_json::from_value(json!({"headers": {"s": {"content": [suggested]}}})).unwrap();
+        assert_eq!(
+            resolve_delete_in(&document, "anchor", None, true, &selection("s")),
+            Err(AnchorError::SuggestedContent)
+        );
+        assert_eq!(
+            resolve_insert_in(&document, "anchor", Side::After, "x", true, &selection("s")),
+            Err(AnchorError::SuggestedContent)
+        );
+        let document: Document = serde_json::from_value(json!({"footers": {"s": {"content": [
+            paragraph(0, &["first\n"]), {"startIndex": 6, "endIndex": 7, "sectionBreak": {}}, paragraph(7, &["last\n"])
+        ]}}})).unwrap();
+        assert_eq!(
+            resolve_delete_in(&document, "first", Some("last"), true, &selection("s")),
+            Err(AnchorError::UnsafeRange)
+        );
+        assert_eq!(
+            resolve_delete_in(&document, "last\n", None, true, &selection("s")),
+            Err(AnchorError::InvalidAnchor)
+        );
+        let edit = resolve_delete_in(&document, "last", None, true, &selection("s")).unwrap();
+        assert_eq!(edit.end_index, 11); // The final newline at 11 survives.
+    }
+
+    #[test]
+    fn segment_table_cells_and_inline_gaps_cannot_be_crossed() {
+        let gap = json!({"endIndex": 4, "paragraph": {"elements": [
+            {"endIndex": 1, "textRun": {"content": "a"}},
+            {"startIndex": 1, "endIndex": 2, "footnoteReference": {"footnoteId": "note"}},
+            {"startIndex": 2, "endIndex": 4, "textRun": {"content": "b\n"}}
+        ]}});
+        let document: Document =
+            serde_json::from_value(json!({"footnotes": {"s": {"content": [gap]}}})).unwrap();
+        assert_eq!(
+            resolve_delete_in(&document, "ab", None, true, &selection("s")),
+            Err(AnchorError::NotFound)
+        );
+        assert_eq!(
+            resolve_delete_in(&document, "a", Some("b"), true, &selection("s")),
+            Err(AnchorError::UnsafeRange)
+        );
+        let document: Document = serde_json::from_value(json!({"headers": {"s": {"content": [
+            paragraph(0, &["before\n"]), {"startIndex": 7, "endIndex": 30, "table": {"tableRows": [{"tableCells": [
+                {"content": [paragraph(9, &["first\n"])]}, {"content": [paragraph(20, &["last\n"])]}
+            ]}]}}
+        ]}}})).unwrap();
+        assert_eq!(
+            resolve_delete_in(&document, "first", Some("last"), true, &selection("s")),
+            Err(AnchorError::UnorderedRange)
+        );
+        assert_eq!(
+            resolve_delete_in(&document, "before", Some("first"), true, &selection("s")),
+            Err(AnchorError::UnorderedRange)
+        );
+        assert_eq!(
+            resolve_delete_in(&document, "first", None, true, &selection("s"))
+                .unwrap()
+                .end_index,
+            14
+        );
     }
 
     #[test]

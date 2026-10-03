@@ -42,7 +42,7 @@ pub enum DocsSubcommands {
     /// rules (issue #1615).
     /// (mirrors the `drive_docs_append` MCP tool).
     Append(write::AppendCommand),
-    /// Inserts text before or after a unique body anchor, gated by docs-write.
+    /// Inserts text before or after a unique body or segment anchor, gated by docs-write.
     Insert(write::InsertCommand),
     /// Deletes a unique match or inclusive anchor range, gated by docs-delete.
     Delete(write::DeleteCommand),
