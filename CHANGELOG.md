@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- **The release guide and both release skills now describe the merge-queue flow and the VS Code extension** ([#2130](https://github.com/rust-works/omni-dev/issues/2130)): [docs/RELEASE.md](docs/RELEASE.md) and the `release` skill (`.claude/` and `.agents/`) said `git push origin main`, which the protected, rebasing queue rejects, and never mentioned the extension. Release preparation is now a pull request carrying one `chore(release)` commit per artefact, and the `vX.Y.Z` / `vscode-vA.B.C` tags are created **after** the merge on the rebased commits, found by subject, then verified before they are pushed (versions in `Cargo.toml`, `Cargo.lock`, `package.json` and `package-lock.json` at the tag, nothing under `[Unreleased]`, no bullet added to an already-released changelog section — [#2129](https://github.com/rust-works/omni-dev/issues/2129)). The extension gets its own steps (`npm version` for the three version strings, its changelog, and a check of both publish tokens, since a failed Marketplace publish also skips Open VSX), the release is read back by downloading the binary and comparing `--version` with the tagged commit, and the guide notes that the coverage action's `version: latest` makes a release what unblocks a change needing a new flag. Two commands the old text got wrong are fixed: a bare `git describe --tags` picks up the extension's tag as the crate's baseline, and `git rev-parse --short vX.Y.Z` on an annotated tag returns the tag object's hash, not the commit Glama pins (also corrected in [docs/glama-listing.md](docs/glama-listing.md)). The extension README and the extension release workflow's header comment now point at the guide instead of carrying their own copy of the steps.
+
 ## [0.45.0] - 2026-10-03
 
 ### Added

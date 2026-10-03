@@ -1,162 +1,310 @@
 # Release Process
 
-This document outlines the release process for omni-dev, covering version updates, changelog maintenance, and triggering automated release workflows.
+This document outlines the release process for omni-dev: preparing the version and changelog commits, landing them through the merge queue, tagging, and verifying the automated release workflows.
 
 ## Overview
 
-The release process follows semantic versioning with **automated CI/CD**:
+This repository ships two independently versioned artefacts:
+
+| Artefact               | Version lives in                                      | Changelog                     | Tag             | Workflow                       | Published to                         |
+|------------------------|-------------------------------------------------------|-------------------------------|-----------------|--------------------------------|--------------------------------------|
+| **Crate** (`omni-dev`) | `Cargo.toml` and `Cargo.lock`                         | `CHANGELOG.md`                | `vX.Y.Z`        | `release.yml`                  | GitHub release (binaries), crates.io |
+| **VS Code extension**  | `editors/vscode/package.json` and `package-lock.json` | `editors/vscode/CHANGELOG.md` | `vscode-vA.B.C` | `vscode-extension-release.yml` | VS Code Marketplace, Open VSX        |
+
+A release normally cuts both. The versions are unrelated, so an artefact with nothing new since its last tag can be skipped; every step below says which artefact it applies to.
+
+`main` is protected and merges through a **merge queue that rebases**. Two consequences shape the whole process:
+
+- **Release preparation goes through a pull request.** `git push origin main` is rejected.
+- **The commits you write are not the commits that land.** The queue rebases them, so their hashes change. Tags must therefore be created **after** the merge, on the rebased commits on `main`, never on the local ones.
 
 ### Manual Steps (You Do)
-1. Version update in `Cargo.toml`
-2. Changelog update in `CHANGELOG.md`
-3. Code quality checks
-4. Commit and push changes
-5. Create and push git tag
-6. Update the Glama listing (see [Glama Listing Update](#glama-listing-update))
+1. Decide what ships and cut a release branch
+2. Prepare the crate release (version, changelog, quality checks) in one commit
+3. Prepare the extension release (version, changelog) in a second commit
+4. Check the extension's publish tokens
+5. Open one pull request and enqueue it
+6. After it merges, create the annotated tags on the rebased commits
+7. Verify the tagged commits, then push the tags
+8. Monitor and verify the automated releases
+9. Update the Glama listing (see [Glama Listing Update](#glama-listing-update))
 
 ### Automated Steps (CI Does)
-7. GitHub release creation
-8. Cross-platform binary builds (Linux, macOS, Windows)
-9. crates.io publication
+- GitHub release creation and cross-platform binary builds (Linux, macOS, Windows)
+- crates.io publication
+- Extension build, test and publication to both registries
 
 ## Prerequisites
 
 Before starting a release, ensure you have:
-- [ ] Commit access to the main branch
+- [ ] Permission to open a pull request and add it to the merge queue (never `--admin`)
 - [ ] All tests passing locally
-- [ ] Clean working directory
+- [ ] A clean working directory
 - [ ] GitHub repo description and topics still accurately describe the project
   - Check: `gh repo view rust-works/omni-dev --json description,repositoryTopics`
   - Update via `gh repo edit` (description) or `gh api -X PUT repos/rust-works/omni-dev/topics` (topics) if the project's scope has shifted since the last release. See [issue #831](https://github.com/rust-works/omni-dev/issues/831) for the original baseline.
+- [ ] (Extension) Both publish tokens are valid — see [Check the Publish Tokens](#4-check-the-publish-tokens)
 
 ## Release Steps
 
-### 1. Version Update
+### 1. Decide What Ships and Cut a Release Branch
 
-Update the version number in `Cargo.toml`:
+Find the last tag **per artefact**. A bare `git describe --tags` returns whichever tag is nearest, which may be the other artefact's:
+
+```bash
+git fetch origin main
+
+# Crate: `v*` also matches `vscode-v*`, so exclude it
+git describe --tags --abbrev=0 --match 'v*' --exclude 'vscode-*' origin/main
+
+# Extension
+git describe --tags --abbrev=0 --match 'vscode-v*' origin/main
+```
+
+List what changed since each tag:
+
+```bash
+git log --oneline vPREV..origin/main
+git log --oneline vscode-vPREV..origin/main -- editors/vscode
+```
+
+Choose the next version for each artefact following [Semantic Versioning](https://semver.org/):
+- **MAJOR** (X): Breaking changes
+- **MINOR** (Y): New features (backward compatible)
+- **PATCH** (Z): Bug fixes (backward compatible)
+
+Cut a release branch from the current `origin/main`:
+
+```bash
+git switch -c release/vX.Y.Z origin/main
+```
+
+A separate worktree works equally well; what matters is that the branch starts from `origin/main`.
+
+### 2. Prepare the Crate Release
+
+**Version.** Update `Cargo.toml`:
 
 ```toml
 [package]
 version = "X.Y.Z"
 ```
 
-Follow [Semantic Versioning](https://semver.org/):
-- **MAJOR** (X): Breaking changes
-- **MINOR** (Y): New features (backward compatible)
-- **PATCH** (Z): Bug fixes (backward compatible)
+The quality checks below build the crate, which rewrites the `omni-dev` entry in `Cargo.lock`; commit it with the version.
 
-### 2. Changelog Update
+**Changelog.** Update `CHANGELOG.md` following [Keep a Changelog](https://keepachangelog.com/) format.
 
-Update `CHANGELOG.md` following [Keep a Changelog](https://keepachangelog.com/) format:
+1. Reconcile `[Unreleased]` against the commit log first. It is routinely incomplete, so compare it with `git log --oneline vPREV..origin/main` and add what is missing.
 
-1. Add new version section with current date:
+2. Check that nothing landed in an **already-released** section after its tag was cut. A pull request branched before the previous release can add its bullet under `[Unreleased]`, and when that heading is renamed to the release the bullet merges into the now-released section (see [#2129](https://github.com/rust-works/omni-dev/issues/2129)). Diff the previous release's section against its state at the tag; any `>` line is a bullet added late and belongs in the new section:
+
+   ```bash
+   PREV=A.B.C   # the previous crate version
+   diff <(git show "v$PREV:CHANGELOG.md" | sed -n "/^## \[$PREV\]/,/^## \[/p") \
+        <(sed -n "/^## \[$PREV\]/,/^## \[/p" CHANGELOG.md)
+   ```
+
+3. Add the new version section with the current date:
    ```markdown
    ## [X.Y.Z] - YYYY-MM-DD
    ```
 
-2. Move unreleased changes to the new version section under appropriate categories:
+4. Move the unreleased changes into it under the appropriate categories:
    - **Added**: New features
    - **Changed**: Changes in existing functionality
    - **Deprecated**: Soon-to-be removed features
    - **Removed**: Removed features
    - **Fixed**: Bug fixes
    - **Security**: Security improvements
+   - **Documentation**, **CI/CD**: Docs-only and workflow changes
 
-3. Update version links at the bottom of the changelog:
+   Leave an empty `## [Unreleased]` heading above it.
+
+5. Update the version links at the bottom of the changelog:
    ```markdown
    [Unreleased]: https://github.com/rust-works/omni-dev/compare/vX.Y.Z...HEAD
-   [X.Y.Z]: https://github.com/rust-works/omni-dev/compare/vX.Y.Z-1...vX.Y.Z
+   [X.Y.Z]: https://github.com/rust-works/omni-dev/compare/vPREV...vX.Y.Z
    ```
 
-### 3. Code Quality Checks
-
-Run quality checks to ensure the release is ready:
+**Quality checks.** Run them to ensure the release is ready:
 
 ```bash
-# Run tests
 cargo test
-
-# Check code quality with clippy
 cargo clippy -- -D warnings
-
-# Check formatting
 cargo fmt --check
-
-# Build the project
 cargo build --release
 ```
 
-### 4. Commit Changes
-
-Commit the version and changelog updates:
+**Commit.** One commit for the crate, with the conventional-commit scope `release`:
 
 ```bash
-# Stage changes
-git add Cargo.toml CHANGELOG.md
+git add Cargo.toml Cargo.lock CHANGELOG.md
+git commit -m "chore(release): prepare release vX.Y.Z
 
-# Commit with conventional commit format
-git commit -m "chore: prepare release X.Y.Z
-
-- Update version from X.Y.Z-1 to X.Y.Z
-- Update CHANGELOG.md with release notes
-
-🤖 Generated with [Claude Code](https://claude.ai/code)
-
-Co-Authored-By: Claude <noreply@anthropic.com>"
+- Update version from PREV to X.Y.Z
+- Update CHANGELOG.md with release notes"
 ```
 
-### 5. Create Git Tag
+The subject must match this form exactly: step 6 finds the rebased commit by it.
 
-Create an annotated tag for the release:
+### 3. Prepare the Extension Release
+
+The extension's version and notes are independent of the crate's. See [`editors/vscode/README.md`](../editors/vscode/README.md#releasing) for the one-time registry account setup.
+
+**Version.** From `editors/vscode`, bump `package.json` and the two omni-dev entries at the top of `package-lock.json` without touching dependency ranges:
+
+```bash
+cd editors/vscode
+npm version A.B.C --no-git-tag-version --ignore-scripts
+git diff --stat   # expect exactly package.json and package-lock.json, 3 changed lines
+```
+
+Prefer this to a plain `npm install`, which re-resolves the whole lockfile and can pull unrelated dependency changes into the release commit. A feature commit has bumped `package.json` and left `package-lock.json` behind before, so check that all three version strings agree.
+
+**Changelog.** Update [`editors/vscode/CHANGELOG.md`](../editors/vscode/CHANGELOG.md): move `[Unreleased]` into a new `## [A.B.C] - YYYY-MM-DD` section. Both registries render a **Changelog** tab from it, so every published version needs an entry. As with the crate, reconcile it against the log first, and it lags more often because changes are often recorded only in the root changelog:
+
+```bash
+git log --oneline vscode-vPREV..origin/main -- editors/vscode
+```
+
+**Checks.** The release workflow re-runs these, so run them first:
+
+```bash
+cd editors/vscode
+npm ci && npm run typecheck && npm run build && npm test && npm run package
+```
+
+**Commit.**
+
+```bash
+git add editors/vscode/package.json editors/vscode/package-lock.json editors/vscode/CHANGELOG.md
+git commit -m "chore(release): prepare vscode extension release vA.B.C
+
+- Update version from PREV to A.B.C in package.json and package-lock.json
+- Update the extension CHANGELOG.md with release notes"
+```
+
+### 4. Check the Publish Tokens
+
+`vscode-extension-release.yml` publishes to the VS Code Marketplace first and to Open VSX second, and **a failed Marketplace step skips Open VSX**. An expired `VSCE_PAT` therefore stops both registries: `vscode-v0.9.0`, `v0.10.0` and `v0.11.0` all failed this way at the Marketplace step.
+
+Verify the tokens you hold before tagging:
+
+```bash
+VSCE_PAT=<token> npx @vscode/vsce verify-pat rust-works
+OVSX_PAT=<token> npx ovsx verify-pat rust-works
+```
+
+`gh secret list` shows when a repository secret was last **set**, never whether it still works, and a secret cannot be read back. If you rotate a token, update the repository secret too and confirm its timestamp moved. A passing local check only proves the token you hold.
+
+### 5. Open the Pull Request and Enqueue It
+
+One pull request can carry both commits, as in [#2123](https://github.com/rust-works/omni-dev/pull/2123):
+
+```bash
+git push -u origin release/vX.Y.Z
+gh pr create --title "chore(release): prepare release vX.Y.Z and vscode extension vA.B.C" \
+  --body "Release preparation."
+gh pr checks --watch
+gh pr merge <PR>        # enqueues; never --admin
+```
+
+Check the commit messages locally before pushing with `omni-dev git commit message lint origin/main..HEAD`.
+
+The merge queue builds the entry on a `gh-readonly-queue/main/...` branch and rebases it onto `main`. Wait until the pull request reports `MERGED`:
+
+```bash
+gh pr view <PR> --json state,mergeCommit
+```
+
+If `main` moves before the queue reaches your entry and `CHANGELOG.md` now conflicts, rebase the branch onto `origin/main`, resolve it, push and enqueue again.
+
+### 6. Create the Tags on the Rebased Commits
+
+Only now, find the commits **as they landed on `main`**. Look them up by subject, not by the hash you committed locally:
+
+```bash
+git fetch origin main
+CRATE=$(git log origin/main --format=%H -1 --grep='^chore(release): prepare release vX.Y.Z$')
+EXT=$(git log origin/main --format=%H -1 --grep='^chore(release): prepare vscode extension release vA.B.C$')
+echo "crate=$CRATE extension=$EXT"   # both must be non-empty
+```
+
+Create annotated tags on those commits, not on `HEAD` (more commits may have landed on `main` since):
 
 ```bash
 git tag -a vX.Y.Z -m "Release version X.Y.Z
 
-Features:
-- Feature 1
-- Feature 2
+<summary of the key changes>" "$CRATE"
 
-Fixes:
-- Fix 1
-- Fix 2
-"
+git tag -a vscode-vA.B.C -m "VS Code extension A.B.C
+
+<summary of the key changes>" "$EXT"
 ```
 
-### 6. Push Changes and Tag
+### 7. Verify the Tagged Commits, Then Push the Tags
 
-Push the commits and tag to the remote repository:
+`release.yml` does **not** compare the tag with `Cargo.toml`, so a wrong version would be built and published as-is. `vscode-extension-release.yml` fails on a tag/`package.json` mismatch, but only once it is already running. Verify locally, before the push, while a bad tag can still just be deleted.
 
 ```bash
-# Push commits
-git push origin main
+# The tagged commit is on main
+git merge-base --is-ancestor vX.Y.Z origin/main && echo ok
+git merge-base --is-ancestor vscode-vA.B.C origin/main && echo ok
 
-# Push tag (this triggers all automated release steps)
-git push origin vX.Y.Z
+# Crate: version in Cargo.toml and in Cargo.lock at the tag — both must read X.Y.Z
+git show vX.Y.Z:Cargo.toml | grep -m1 '^version = '
+git show vX.Y.Z:Cargo.lock | grep -A1 '^name = "omni-dev"$'
+
+# Extension: package.json and the two lockfile entries — all three must read A.B.C
+git show vscode-vA.B.C:editors/vscode/package.json | jq -r .version
+git show vscode-vA.B.C:editors/vscode/package-lock.json | jq -r '.version, .packages[""].version'
+
+# Nothing left under [Unreleased] at either tag — both commands must print nothing
+git show vX.Y.Z:CHANGELOG.md | awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f && NF'
+git show vscode-vA.B.C:editors/vscode/CHANGELOG.md | awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f && NF'
+```
+
+If anything is wrong, delete the local tag (`git tag -d <tag>`) and fix it with a follow-up pull request. Do not push a bad tag.
+
+Then push the tags (this triggers all automated release steps):
+
+```bash
+git push origin vX.Y.Z vscode-vA.B.C
 ```
 
 ## Automated Release Pipeline
 
-Pushing a `v*` tag triggers the following automated workflows:
+The two tag families trigger separate workflows and never each other's: `release.yml` and `ci.yml` exclude `vscode-*`, and `vscode-extension-release.yml` runs only on `vscode-v*` (or a manual dispatch), never on a push to `main`.
 
-### CI Workflow (`.github/workflows/ci.yml`)
-- Runs tests on stable, beta, and nightly Rust
-- Checks formatting with rustfmt
-- Runs clippy linting
-- Builds documentation
-- Generates code coverage
+### Crate: pushing `vX.Y.Z`
 
-### Release Workflow (`.github/workflows/release.yml`)
+**CI Workflow (`.github/workflows/ci.yml`)**
+- Runs the full suite: tests on stable, beta and nightly Rust, formatting, clippy, documentation, a Windows build, the security audit, the dependency policy and secret scanning
+- **Skips Coverage on tags** ([#1289](https://github.com/rust-works/omni-dev/issues/1289)): the coverage action resolves `version: latest` to the release being published and would 404 on its not-yet-uploaded binary
+
+**Release Workflow (`.github/workflows/release.yml`)**
 - **Creates GitHub Release**: Automatically from the tag
 - **Builds Cross-Platform Binaries** (both `omni-dev` and `omni-dev-mcp` for each target):
   - Linux (x86_64-unknown-linux-gnu)
   - macOS (aarch64-apple-darwin)
   - Windows (x86_64-pc-windows-msvc)
 - **Uploads Release Assets**: Attaches compiled binaries to the GitHub release
-- **Publishes to crates.io**: Automatically using `CARGO_REGISTRY_TOKEN` secret
+- **Publishes to crates.io**: Automatically using the `CARGO_REGISTRY_TOKEN` secret
 
-### 7. Monitor and Verify
+### Extension: pushing `vscode-vA.B.C`
 
-After pushing the tag, monitor the automated release:
+**Extension Release Workflow (`.github/workflows/vscode-extension-release.yml`)**
+- Verifies the tag matches `editors/vscode/package.json`
+- Re-runs typecheck, build, tests and packaging
+- Publishes the **same** `.vsix` to the VS Code Marketplace (`VSCE_PAT`), then to Open VSX (`OVSX_PAT`)
+- A registry whose token is unset is skipped with a notice. The run fails only if neither is set, or if a publish step fails
+- Uploads the `.vsix` as a workflow artefact for provenance
+
+### 8. Monitor and Verify
+
+After pushing the tags, monitor the automated releases.
+
+### Crate
 
 1. **Check GitHub Actions**: Watch the release workflow progress
    ```bash
@@ -164,17 +312,50 @@ After pushing the tag, monitor the automated release:
    gh run watch
    ```
 
-2. **Verify GitHub Release**: Check the releases page
+2. **Verify the GitHub Release** and its three assets:
    ```bash
-   gh release view vX.Y.Z
+   gh release view vX.Y.Z --json assets --jq '.assets[].name'
+   # omni-dev-linux.tar.gz, omni-dev-macos-arm64.tar.gz, omni-dev-windows.zip
    ```
 
 3. **Verify crates.io Publication**:
    ```bash
-   cargo search omni-dev
-   # Or test installation
-   cargo install omni-dev
+   cargo search omni-dev --limit 1
    ```
+
+4. **Download the released binary and confirm it reports the new version**, and the commit you tagged:
+   ```bash
+   d=$(mktemp -d)
+   gh release download vX.Y.Z --pattern 'omni-dev-macos-arm64.tar.gz' --dir "$d"   # pick your platform's asset
+   tar xzf "$d/omni-dev-macos-arm64.tar.gz" -C "$d"
+   "$d/omni-dev" --version                        # omni-dev X.Y.Z (<short sha> <date>)
+   git rev-parse --short=7 'vX.Y.Z^{commit}'      # must equal <short sha>
+   ```
+
+### Extension
+
+1. **Check the workflow run.** Its publish steps are the evidence:
+   ```bash
+   gh run list --workflow=vscode-extension-release.yml --limit 3
+   gh run view <run_id>
+   ```
+   Both `Publish to VS Code Marketplace` and `Publish to Open VSX` must be green, not skipped.
+
+2. **Read Open VSX back.** Its API is reliable:
+   ```bash
+   curl -s https://open-vsx.org/api/rust-works/omni-dev/latest | jq -r .version
+   ```
+
+3. **Do not rely on a Marketplace read-back.** Registry read APIs lag a publish, and `vsce show rust-works.omni-dev` can answer `not found` for an extension that is live. Trust the publish step's output, and check the [Marketplace page](https://marketplace.visualstudio.com/items?itemName=rust-works.omni-dev) later by eye.
+
+4. **If the Marketplace step failed**, Open VSX was skipped too. Fix the secret ([step 4](#4-check-the-publish-tokens)), then re-run the failed job on the **same tag**; nothing reached either registry, so the version is still free:
+   ```bash
+   gh run rerun <run_id> --failed
+   ```
+
+## Ordering with Dependents
+
+The `action-works/omni-dev-coverage-check` action used by `ci.yml` resolves `version: latest`. A change that depends on a **new omni-dev flag** (for example `coverage diff --fail-under-lines`, [#2114](https://github.com/rust-works/omni-dev/issues/2114)) can fail its own Coverage check until that flag exists in a **released** binary. For such changes the release, not the merge, is what unblocks them, so release soon after the change lands, or sequence the pull requests accordingly.
 
 ## Post-Release Tasks
 
@@ -196,7 +377,7 @@ After the GitHub release lands, point the [Glama listing](https://glama.ai/mcp/s
 
 See [Glama Listing](glama-listing.md) for the full procedure, the canonical admin-form values (Build steps, CMD arguments, env-var schema), and troubleshooting. The short version:
 
-1. Run `git rev-parse --short vX.Y.Z` to get the release SHA.
+1. Run `git rev-parse --short 'vX.Y.Z^{commit}'` to get the release SHA. The `^{commit}` matters: the tag is annotated, so `git rev-parse vX.Y.Z` alone returns the tag object's hash, which is not a commit Glama can build.
 2. Paste it into **Pinned commit SHA** at <https://glama.ai/mcp/servers/rust-works/omni-dev/admin/dockerfile> and **Save**.
 3. Trigger a **build**, wait for it to go green, then trigger a **release**.
 
@@ -220,11 +401,16 @@ cargo test -- --nocapture
 ```
 
 **Publication Errors**:
-- Ensure crates.io token is configured
+- Ensure the crates.io token is configured
 - Check for naming conflicts
 - Verify all dependencies are published
+- For the extension, see [Check the Publish Tokens](#4-check-the-publish-tokens) and the re-run instructions under [Monitor and Verify](#8-monitor-and-verify)
 
-**Tag Conflicts**:
+**Merge Queue Entry Ejected**:
+- The queue waits for every required context on its `gh-readonly-queue/main/...` branch; open the failing check from the pull request, fix it on the release branch and re-enqueue
+- Never bypass the queue with `--admin`
+
+**Tag Conflicts** (a tag you pushed in error, before its release finished):
 ```bash
 # Delete local tag
 git tag -d vX.Y.Z
@@ -232,29 +418,34 @@ git tag -d vX.Y.Z
 # Delete remote tag
 git push --delete origin vX.Y.Z
 ```
+Pushing the corrected tag again re-triggers the workflows. Only do this when nothing reached a registry.
 
-### Rollback Procedure
+### Recovery
 
-If a release needs to be rolled back:
+If a release has a problem, **fix forward**:
 
-1. **GitHub Release**: Mark as pre-release or delete
-2. **crates.io**: Cannot delete, but can yank: `cargo yank --vers X.Y.Z`
-3. **Git Tag**: Delete and recreate if needed
-4. **Version**: Create patch release with fixes
+1. **Published versions are kept.** Keep the tag and its commit as the record of what was published. A registry will not take the same version twice, so correct the problem on `main` in a new commit and prepare a **patch release** with this document. Do not blindly revert the branch tip: other commits may have landed since, and a direct `git push origin main` is rejected anyway. A revert is a pull request through the queue.
+2. **GitHub Release**: Mark as pre-release or delete (`gh release delete vX.Y.Z --yes`)
+3. **crates.io**: Cannot delete, but can yank so Cargo stops selecting it: `cargo yank --version X.Y.Z`
+4. **Extension**: publish a patch version; do not reuse the number
 
 ## CI/CD Configuration
 
 The automated release pipeline requires these GitHub secrets:
 
-| Secret                 | Purpose                                                     |
-|------------------------|-------------------------------------------------------------|
+| Secret                 | Purpose                                                       |
+|------------------------|---------------------------------------------------------------|
 | `GITHUB_TOKEN`         | Automatically provided by GitHub Actions for release creation |
-| `CARGO_REGISTRY_TOKEN` | crates.io API token for publishing                          |
+| `CARGO_REGISTRY_TOKEN` | crates.io API token for publishing                            |
+| `VSCE_PAT`             | VS Code Marketplace token for the `rust-works` publisher      |
+| `OVSX_PAT`             | Open VSX token for the `rust-works` namespace                 |
 
 ### Workflow Files
 
-- `.github/workflows/ci.yml` - Quality checks
+- `.github/workflows/ci.yml` - Quality checks (also runs on merge-queue entries)
 - `.github/workflows/release.yml` - Release creation and publishing
+- `.github/workflows/vscode-extension.yml` - Extension checks on pull requests and `main`
+- `.github/workflows/vscode-extension-release.yml` - Extension publication (`vscode-v*` tags only)
 - `.github/workflows/commit-lint.yml` - PR commit message validation
 
 ## Security Notes
@@ -270,3 +461,4 @@ The automated release pipeline requires these GitHub secrets:
 - [Keep a Changelog](https://keepachangelog.com/)
 - [Conventional Commits](https://www.conventionalcommits.org/)
 - [crates.io Publishing Guide](https://doc.rust-lang.org/cargo/reference/publishing.html)
+- [VS Code extension release setup](../editors/vscode/README.md#releasing)

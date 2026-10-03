@@ -193,7 +193,7 @@ This is a manual web-UI step; there is no API or CI integration.
 
 2. Get the release commit SHA:
    ```bash
-   git rev-parse --short vX.Y.Z
+   git rev-parse --short 'vX.Y.Z^{commit}'
    ```
 
 3. Paste it into the **Pinned commit SHA** field and **Save**. Glama re-renders its generated Dockerfile against the new commit.
