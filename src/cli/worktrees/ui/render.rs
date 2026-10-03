@@ -412,6 +412,17 @@ mod tests {
     }
 
     #[test]
+    fn a_main_only_row_level_with_the_default_branch_still_renders_main_0() {
+        // A fresh branch with no upstream, level with the default branch: the
+        // daemon sends `main_behind: 0` and the other surfaces print it too (the
+        // VS Code view's `⇊0`, `worktrees tree`'s `main-0`, this view's `Known`).
+        // Parity with them is the point, so zero is shown rather than suppressed.
+        let mut wt = worktree_row();
+        wt.ahead_behind = AheadBehindState::MainOnly { main_behind: 0 };
+        assert!(line_text(&wt).contains("main-0"));
+    }
+
+    #[test]
     fn a_known_row_still_renders_both_counts_before_main_n() {
         let mut wt = worktree_row();
         wt.ahead_behind = AheadBehindState::Known {
