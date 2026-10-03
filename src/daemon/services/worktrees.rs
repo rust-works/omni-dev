@@ -7050,7 +7050,8 @@ mod tests {
                 folder_divergence_shared(&pool, &corpus.wt(name)),
                 Divergence {
                     ahead_behind,
-                    main_behind
+                    main_behind,
+                    ..Divergence::default()
                 },
                 "{name}"
             );
@@ -7067,7 +7068,8 @@ mod tests {
             folder_divergence_shared(&pool, &corpus.main),
             Divergence {
                 ahead_behind: Some((1, 1)),
-                main_behind: None
+                main_behind: None,
+                ..Divergence::default()
             }
         );
         assert_eq!(
@@ -7075,6 +7077,56 @@ mod tests {
             folder_divergence_shared(&pool, &corpus.wt("tracked"))
         );
         // Every worktree of the repo, and the main checkout, shared one handle.
+        assert_eq!(pool.opens(), 1);
+    }
+
+    /// A shallow repository is never answered from a shared handle: libgit2 reads a
+    /// repo's shallow grafts when it opens it, so a handle opened before the repo
+    /// became shallow would walk the full history while a fresh open walks the cut
+    /// one. The pool declines the repo, and the answer comes from the per-worktree
+    /// open exactly as before — including for a handle opened while the repo was
+    /// still complete.
+    ///
+    /// What that open reports is the contract here, not what would be ideal:
+    /// libgit2 looks for the shallow marker in the *worktree's own* gitdir, so only
+    /// the main checkout reports `shallow`, and a linked worktree of a shallow clone
+    /// does not.
+    #[test]
+    fn a_shallow_repository_is_answered_by_the_discover_path() {
+        let corpus = shared_corpus();
+        let pool = shared_repo::RepoPool::new(4);
+        // Complete so far: the shared path answers, from one handle.
+        assert_eq!(
+            shared_repo::divergence(&pool, &corpus.wt("tracked")),
+            Some(folder_divergence(&corpus.wt("tracked")))
+        );
+        assert!(!folder_divergence_shared(&pool, &corpus.main).shallow);
+        assert_eq!(pool.opens(), 1);
+
+        std::fs::write(
+            corpus.repo.path().join("shallow"),
+            format!("{}\n", corpus.tip),
+        )
+        .unwrap();
+
+        for (case, path) in corpus.cases() {
+            // The repo is shallow now, so the shared path steps aside for every
+            // folder inside it; the folders outside it have nothing to decline.
+            let in_repo = !matches!(case, "deleted directory" | "never existed");
+            assert_eq!(
+                shared_repo::divergence(&pool, &path).is_none(),
+                in_repo,
+                "{case}"
+            );
+            assert_eq!(
+                folder_divergence_shared(&pool, &path),
+                folder_divergence(&path),
+                "{case}"
+            );
+        }
+        // The flag the discover path does give, on the one row it can see it.
+        assert!(folder_divergence_shared(&pool, &corpus.main).shallow);
+        // No handle was opened for it after the marker appeared.
         assert_eq!(pool.opens(), 1);
     }
 

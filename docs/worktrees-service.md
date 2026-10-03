@@ -1641,13 +1641,17 @@ extension never runs git.
 
   Results are identical to opening each worktree. Whenever the shared path cannot be
   sure — a layout or HEAD it cannot read (only a missing commit counts as an empty
-  HEAD), a common dir that will not open, or config that can read differently for a
-  worktree — it falls back to the per-worktree open. Two things make config differ:
-  `extensions.worktreeConfig` (which `git sparse-checkout` turns on), whose
-  per-worktree `config.worktree` can change a branch's upstream, and any `includeIf`
-  conditional include, because libgit2 matches `gitdir:` against the gitdir and
-  `onbranch:` against the HEAD of the repository it loads the config for. Both are
-  seen only by a repository rooted at the worktree. A repo with either keeps its
+  HEAD), a common dir that will not open, a shallow repository, or config that can
+  read differently for a worktree — it falls back to the per-worktree open. Two
+  things make config differ: `extensions.worktreeConfig` (which `git sparse-checkout`
+  turns on), whose per-worktree `config.worktree` can change a branch's upstream,
+  and any `includeIf` conditional include, because libgit2 matches `gitdir:` against
+  the gitdir and `onbranch:` against the HEAD of the repository it loads the config
+  for. Both are seen only by a repository rooted at the worktree. A shallow
+  repository is declined because libgit2 reads a repo's shallow grafts when it opens
+  it, so a pooled handle opened before the repo became shallow (or was deepened)
+  would walk a different history from a fresh open; a repo that is shallow, or
+  becomes so, is never served from the pool. A repo with any of these keeps its
   pre-#2121 cost; an unconditional `include` is unaffected.
 - **`main_behind` rides the same lazy op (#1457).** `repo_main_behind`
   resolves the repository's remote default branch the same **local-only,

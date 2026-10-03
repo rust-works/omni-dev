@@ -21,8 +21,10 @@
 //!
 //! The shared path must give the answer `discover` would, so it answers
 //! [`None`] — "ask the old path" — whenever it cannot be sure: a HEAD it cannot
-//! read, a common dir it cannot open, or a repository whose config can differ
-//! between a worktree and the common dir ([`config_differs_per_worktree`]).
+//! read, a common dir it cannot open, a repository whose config can differ
+//! between a worktree and the common dir ([`config_differs_per_worktree`]), or a
+//! shallow repository, whose commit graph a long-lived handle can see wrongly
+//! ([`RepoPool`]).
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -62,8 +64,11 @@ fn divergence_at(pool: &RepoPool, located: Located) -> Option<Divergence> {
 /// [`divergence`] once a handle at the common dir is in hand.
 fn divergence_in(repo: &Repository, worktree: Option<&str>) -> Option<Divergence> {
     match head_of(repo, worktree) {
-        Head::Ref(head) => Some(super::head_divergence(repo, head)),
-        Head::Unborn => Some(Divergence::default()),
+        Head::Ref(head) => Some(super::head_divergence(repo, Some(head))),
+        // No commit to count from, but the repository's shallow flag still rides
+        // the reply, exactly as it does when the repository is opened at the
+        // worktree.
+        Head::Unborn => Some(super::head_divergence(repo, None)),
         Head::Unreadable => None,
     }
 }
@@ -215,6 +220,13 @@ const MAX_HANDLE_AGE: Duration = Duration::from_secs(30);
 /// coordinator holds it weakly), so handles do not outlive the requests they
 /// served. Because overlapping requests can keep it alive, a handle is also never
 /// reused once it is [`MAX_HANDLE_AGE`] old.
+///
+/// A shallow repository is never served. libgit2 reads a repository's shallow
+/// grafts when it opens it, so a handle opened before the repo became shallow —
+/// or before it was deepened — walks a history that is no longer the repo's, while
+/// a fresh open gets it right. Checking `is_shallow` on each lease catches the
+/// repo becoming shallow; a repo that is shallow from the start is declined at
+/// open. Both fall back to the per-worktree open, which is what happened before.
 pub(super) struct RepoPool {
     limit: usize,
     max_age: Duration,
@@ -238,8 +250,8 @@ struct PoolState {
     /// Handles currently leased, or being opened.
     in_use: usize,
     /// Common dirs this pool failed to open or declined to serve
-    /// ([`config_differs_per_worktree`]), remembered so a repo that cannot be
-    /// served is not reopened once per worktree. Callers fall back to the
+    /// ([`config_differs_per_worktree`], or shallow), remembered so a repo that
+    /// cannot be served is not reopened once per worktree. Callers fall back to the
     /// per-worktree open for these, which is exactly what happened before the pool.
     refused: HashSet<PathBuf>,
 }
@@ -323,7 +335,14 @@ impl RepoPool {
             armed: true,
         };
         let (opened, repo) = match reused {
-            Some(idle) => (idle.opened, idle.repo),
+            Some(idle) if !idle.repo.is_shallow() => (idle.opened, idle.repo),
+            // The repo has become shallow since this handle was opened, so its view
+            // of the history is stale. The handle is dropped here and the slot
+            // released by `Drop`.
+            Some(_) => {
+                self.refuse(commondir);
+                return None;
+            }
             None => (Instant::now(), self.open(commondir)?),
         };
         Some(Lease {
@@ -339,11 +358,15 @@ impl RepoPool {
         self.opens.fetch_add(1, Ordering::Relaxed);
         let opened = Repository::open(commondir)
             .ok()
-            .filter(|repo| !config_differs_per_worktree(repo));
+            .filter(|repo| !config_differs_per_worktree(repo) && !repo.is_shallow());
         if opened.is_none() {
-            self.lock().refused.insert(commondir.to_path_buf());
+            self.refuse(commondir);
         }
         opened
+    }
+
+    fn refuse(&self, commondir: &Path) {
+        self.lock().refused.insert(commondir.to_path_buf());
     }
 
     fn lock(&self) -> MutexGuard<'_, PoolState> {
@@ -745,28 +768,69 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_handle_at_the_common_dir_sees_the_shared_shallow_marker() {
-        // The walk memo is bypassed when the handle reports `is_shallow()`, which
-        // reads `<commondir>/shallow`. A linked worktree shares that file, so the
-        // handle the pool serves for its repo must see it too.
-        let main_dir = tempfile::tempdir().unwrap();
-        let repo = repo_with_commit(main_dir.path());
-        let wt_dir = tempfile::tempdir().unwrap();
-        add_linked(&repo, "feature", &wt_dir.path().join("feature"));
-        let tip = repo.head().unwrap().target().unwrap();
-        let pool = RepoPool::new(4);
-        let commondir = commondir_of(&repo);
+    /// Two commits, `b` a child of `a`, with `main` on `b`. Marking `b` shallow cuts
+    /// its parent away, which changes how `b` and `a` compare.
+    fn two_commits(dir: &Path) -> (Repository, git2::Oid, git2::Oid) {
+        let repo = repo_with_commit(dir);
+        let a = repo.head().unwrap().target().unwrap();
+        let b = {
+            let parent = repo.find_commit(a).unwrap();
+            let tree = repo
+                .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+                .unwrap();
+            let sig = signature();
+            repo.commit(Some("refs/heads/main"), &sig, &sig, "B", &tree, &[&parent])
+                .unwrap()
+        };
+        (repo, a, b)
+    }
 
-        assert_eq!(
-            pool.with_repo(&commondir, Repository::is_shallow),
-            Some(false)
-        );
-        std::fs::write(repo.path().join("shallow"), format!("{tip}\n")).unwrap();
-        assert_eq!(
-            pool.with_repo(&commondir, Repository::is_shallow),
-            Some(true)
-        );
+    /// The premise of declining shallow repos. If libgit2 starts refreshing grafts
+    /// on a live handle this fails, which means the guard has become unnecessary.
+    #[test]
+    fn libgit2_reads_shallow_grafts_when_a_repository_is_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, a, b) = two_commits(dir.path());
+        let opened_before = Repository::open(repo.path()).unwrap();
+        std::fs::write(repo.path().join("shallow"), format!("{b}\n")).unwrap();
+        let opened_after = Repository::open(repo.path()).unwrap();
+
+        // Both agree the repository is now shallow, but only the later open walks
+        // the cut history: `b` is a root there, so `a` is not behind it.
+        assert!(opened_before.is_shallow() && opened_after.is_shallow());
+        assert_eq!(opened_before.graph_ahead_behind(b, a).unwrap(), (1, 0));
+        assert_eq!(opened_after.graph_ahead_behind(b, a).unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn a_shallow_repo_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _, b) = two_commits(dir.path());
+        std::fs::write(repo.path().join("shallow"), format!("{b}\n")).unwrap();
+        let pool = RepoPool::new(4);
+
+        assert!(pool.with_repo(&commondir_of(&repo), |_| ()).is_none());
+        assert!(pool.with_repo(&commondir_of(&repo), |_| ()).is_none());
+
+        // Declined at the first open and remembered.
+        assert_eq!(pool.opens(), 1);
+        assert_eq!(pool.live(), 0);
+    }
+
+    #[test]
+    fn a_repo_that_becomes_shallow_is_no_longer_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _, b) = two_commits(dir.path());
+        let pool = RepoPool::new(4);
+        assert_eq!(pool.with_repo(&commondir_of(&repo), |_| ()), Some(()));
+
+        // The pooled handle was opened before the marker, so it would walk the
+        // full history; it must be dropped, not reused.
+        std::fs::write(repo.path().join("shallow"), format!("{b}\n")).unwrap();
+
+        assert!(pool.with_repo(&commondir_of(&repo), |_| ()).is_none());
+        assert_eq!(pool.live(), 0);
+        assert_eq!(pool.opens(), 1, "declined without reopening");
     }
 
     #[test]
