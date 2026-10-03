@@ -1026,7 +1026,11 @@ always includes it.
 - **Terminal Claude is unwrapped.** Feed 4 covers the VS Code extension's
   stream-json tabs only; a TUI `claude` keeps the inferred feeds. Wrapping it
   would mean interposing on an interactive terminal, which is a different and much
-  riskier proposition.
+  riskier proposition. That includes the `worktrees ui` Claude tab: `claude-wrap`
+  `exec`-replaces itself under a PTY and reports nothing there (#2152). A Claude
+  Code mod can observe a terminal session from inside the process, which is the
+  recommendation of the spike in
+  [docs/plan/claude-mods-feed.md](plan/claude-mods-feed.md) (#2122, built in #2151).
 - **Only new tabs are wrapped.** Coverage is prospective — sessions already
   running when the setting is applied keep the inferred feeds until they restart.
 - **pi sessions are always `terminal`.** Tagging one `vscode` would need the
