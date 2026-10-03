@@ -2620,9 +2620,7 @@ fn repo_main_behind(repo: &Repository) -> Option<usize> {
     }
     let branch = git2::Branch::wrap(head);
 
-    let remote = "origin";
-    let default_branch = RemoteInfo::detect_main_branch_local(repo, remote)?;
-    let onto_ref = format!("refs/remotes/{remote}/{default_branch}");
+    let (onto_ref, onto_oid) = default_branch_tip(repo)?;
 
     // Skip when the branch's own upstream already IS the resolved default
     // branch (the common checked-out-main/master case) — compared by ref name
@@ -2635,14 +2633,31 @@ fn repo_main_behind(repo: &Repository) -> Option<usize> {
     }
 
     let head_oid = branch.get().target()?;
-    let onto_oid = repo
-        .revparse_single(&onto_ref)
-        .ok()?
-        .peel_to_commit()
-        .ok()?
-        .id();
     let (_ahead, behind) = divergence::graph_ahead_behind(repo, head_oid, onto_oid)?;
     Some(behind)
+}
+
+/// The repository's remote default branch as `(ref name, tip commit)`, resolved
+/// local-only like [`repo_main_behind`] has always done it, or `None` when no
+/// default branch is locally resolvable (#2120).
+///
+/// The one resolver for both consumers: [`repo_main_behind`] walks against the tip,
+/// and the streamed snapshot publishes it as [`TreeRepo::main_sha`]. Sharing it is
+/// what keeps the published tip and the answer computed from it from drifting — a
+/// client that memoizes `main_behind` by `main_sha` is only exact because they are
+/// the same ref. Reads refs only (no revwalk, no object lookup), the bar #1306 set
+/// for the every-tick snapshot rebuild.
+fn default_branch_tip(repo: &Repository) -> Option<(String, git2::Oid)> {
+    let remote = "origin";
+    let default_branch = RemoteInfo::detect_main_branch_local(repo, remote)?;
+    let onto_ref = format!("refs/remotes/{remote}/{default_branch}");
+    let oid = repo
+        .find_reference(&onto_ref)
+        .ok()?
+        .resolve()
+        .ok()?
+        .target()?;
+    Some((onto_ref, oid))
 }
 
 /// Both lazily-fetched divergences of `folder`, from a single repository open.
@@ -2875,6 +2890,21 @@ struct TreeRepo {
     /// on it so a not-polled repo issues zero `gh`.
     #[serde(skip_serializing_if = "is_false")]
     polling_enabled: bool,
+    /// The commit the repository's remote default branch (`origin/<default>`)
+    /// points at, or `None` when no default branch is locally resolvable (#2120).
+    ///
+    /// The third input of a worktree's lazy `main_behind` (#1457), alongside its
+    /// `head_sha`, and the reason it rides the snapshot: a fetch that advances only
+    /// `origin/main` moves neither `head_sha` nor `upstream_sha`, so without it the
+    /// snapshot serialised byte-identically, the server's diff dropped the frame and
+    /// `main_behind` stayed stale until something unrelated re-rendered (the #1344
+    /// shape, one ref over). It is also what lets a client memoize `ahead-behind`
+    /// exactly. Per repo, not per worktree, since remote-tracking refs live in the
+    /// shared common dir. Resolved by [`default_branch_tip`], the same resolver
+    /// `main_behind` is computed from. Omitted when unresolvable, keeping an older
+    /// client byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    main_sha: Option<String>,
     /// Every worktree of the repo: the main working tree first, then linked
     /// worktrees sorted by path.
     worktrees: Vec<TreeWorktree>,
@@ -3100,6 +3130,7 @@ fn repo_tree(
         // Defaults off; `stamp_polling` sets it from the registry's enable set
         // once the repo (and thus its GitHub identity) is assembled.
         polling_enabled: false,
+        main_sha: default_branch_tip(&main_repo).map(|(_, oid)| oid.to_string()),
         worktrees,
     })
 }
@@ -7149,6 +7180,132 @@ mod tests {
         assert!(wt.get("upstream_sha").is_none(), "{wt:?}");
         // The head still rides, so this is specifically the upstream degrading.
         assert!(wt.get("head_sha").is_some(), "{wt:?}");
+    }
+
+    // --- Default-branch tip on the snapshot (#2120) ------------------------
+
+    /// Advances `refs/remotes/origin/main` by one commit — what a `git fetch` that
+    /// brings in new default-branch work does, and all of what it does.
+    fn simulate_default_branch_fetch(repo: &Repository) -> git2::Oid {
+        let tip = repo.refname_to_id("refs/remotes/origin/main").unwrap();
+        let parent = repo.find_commit(tip).unwrap();
+        let next = empty_commit(repo, None, &[&parent], "fetched");
+        repo.reference("refs/remotes/origin/main", next, true, "fetch")
+            .unwrap();
+        next
+    }
+
+    #[test]
+    fn default_branch_tip_resolves_the_remote_default_branch_or_nothing() {
+        // Resolved through the common-names fallback: no `origin/HEAD` symref.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = behind_main_no_upstream_repo(dir.path());
+        let tip = repo.refname_to_id("refs/remotes/origin/main").unwrap();
+        assert_eq!(
+            default_branch_tip(&repo),
+            Some(("refs/remotes/origin/main".to_string(), tip))
+        );
+
+        // The `origin/HEAD` symref outranks the common names, so a repo whose
+        // default branch is `develop` publishes *that* tip even though `origin/main`
+        // also exists.
+        let develop = empty_commit(&repo, None, &[], "develop");
+        repo.reference("refs/remotes/origin/develop", develop, true, "develop")
+            .unwrap();
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/develop",
+            true,
+            "set-head",
+        )
+        .unwrap();
+        assert_eq!(
+            default_branch_tip(&repo),
+            Some(("refs/remotes/origin/develop".to_string(), develop))
+        );
+
+        // No remote-tracking refs at all → nothing to publish.
+        let bare = tempfile::tempdir().unwrap();
+        let none = init_repo(bare.path());
+        empty_commit(&none, Some("refs/heads/main"), &[], "A");
+        assert_eq!(default_branch_tip(&none), None);
+    }
+
+    #[test]
+    fn main_behind_is_computed_against_the_published_tip() {
+        // The property the extension's memo leans on: `main_behind` and `main_sha`
+        // come from one resolver, so when the published tip moves the count moves
+        // with it, and never the other way round.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = behind_main_no_upstream_repo(dir.path());
+        assert_eq!(repo_main_behind(&repo), Some(1));
+        let before = default_branch_tip(&repo).unwrap().1;
+
+        let after = simulate_default_branch_fetch(&repo);
+        assert_ne!(before, after);
+        assert_eq!(default_branch_tip(&repo).unwrap().1, after);
+        assert_eq!(repo_main_behind(&repo), Some(2));
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_carries_main_sha_so_a_default_branch_fetch_is_a_real_delta() {
+        // The #1344 shape, one ref over. `main` tracks nothing and is behind
+        // `origin/main`; a fetch that advances only that ref moves neither
+        // `head_sha` nor `upstream_sha` (absent here), so before this field the
+        // snapshot serialised byte-identically, the server's `if snap != last`
+        // dropped the frame, and `main_behind` was never re-asked.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = behind_main_no_upstream_repo(dir.path());
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "x" }),
+        )
+        .await
+        .unwrap();
+
+        let before = svc.handle("tree", Value::Null).await.unwrap();
+        let tip = repo.refname_to_id("refs/remotes/origin/main").unwrap();
+        assert_eq!(
+            repos_of(&before)[0].get("main_sha").and_then(Value::as_str),
+            Some(tip.to_string().as_str())
+        );
+
+        let fetched = simulate_default_branch_fetch(&repo);
+        let after = svc.handle("tree", Value::Null).await.unwrap();
+        assert_eq!(
+            repos_of(&after)[0].get("main_sha").and_then(Value::as_str),
+            Some(fetched.to_string().as_str())
+        );
+        // Nothing a worktree row carries moved, so this delta rests entirely on
+        // `main_sha`.
+        assert_eq!(
+            repos_of(&before)[0]["worktrees"],
+            repos_of(&after)[0]["worktrees"]
+        );
+        assert_ne!(
+            before, after,
+            "a default-branch fetch must be a snapshot delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_snapshot_omits_main_sha_without_a_default_branch() {
+        // Wire-compat: no resolvable default branch sends no key at all rather than
+        // a null, so an older client sees exactly the payload it saw before.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w", "folders": [dir.path()], "repo": "x" }),
+        )
+        .await
+        .unwrap();
+        let tree = svc.handle("tree", Value::Null).await.unwrap();
+        assert!(repos_of(&tree)[0].get("main_sha").is_none(), "{tree:?}");
     }
 
     // --- PR badge poller (#1337) -------------------------------------------
