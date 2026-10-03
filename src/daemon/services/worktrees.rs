@@ -2669,6 +2669,7 @@ fn folder_divergence(folder: &Path) -> Divergence {
     Divergence {
         ahead_behind: repo_ahead_behind(&repo),
         main_behind: repo_main_behind(&repo),
+        shallow: repo.is_shallow(),
     }
 }
 
@@ -3204,6 +3205,14 @@ struct AheadBehindEntry {
     behind: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     main_behind: Option<usize>,
+    /// Set when the worktree's repository is shallow, so these counts depend on
+    /// how deep the clone currently is rather than on commit ids alone (#2120) — the
+    /// one case where an unchanged `head_sha`/`upstream_sha`/`main_sha` does not mean
+    /// an unchanged answer, which a client memoizing by those ids must not cache.
+    /// Omitted (false) for the common complete clone, keeping an older client
+    /// byte-identical.
+    #[serde(skip_serializing_if = "is_false")]
+    shallow: bool,
 }
 
 /// Computes the ahead/behind divergence for a batch of worktree `paths` on demand,
@@ -3247,6 +3256,7 @@ async fn ahead_behind_results(coordinator: &AheadBehindCoordinator, paths: Vec<P
                 ahead,
                 behind,
                 main_behind,
+                shallow: divergence.shallow,
             }),
         );
     }
@@ -6980,6 +6990,51 @@ mod tests {
         // No own upstream at all → no `ahead`/`behind` keys, just `main_behind`.
         assert!(entry.get("ahead").is_none(), "{entry:?}");
         assert!(entry.get("behind").is_none(), "{entry:?}");
+    }
+
+    #[tokio::test]
+    async fn ahead_behind_op_flags_a_shallow_repository_and_only_that() {
+        // A shallow clone's counts depend on how deep it currently is, which no
+        // commit id records, so a client memoizing by ids has to be told (#2120).
+        let svc = WorktreesService::new();
+        let complete = tempfile::tempdir().unwrap();
+        let _repo = diverging_repo(complete.path());
+        let shallow = tempfile::tempdir().unwrap();
+        let shallow_repo = diverging_repo(shallow.path());
+        // `.git/shallow` is what makes git (and libgit2) treat the clone as shallow.
+        let base = shallow_repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent_id(0)
+            .unwrap();
+        std::fs::write(shallow_repo.path().join("shallow"), format!("{base}\n")).unwrap();
+        assert!(shallow_repo.is_shallow());
+
+        let complete_path = complete.path().display().to_string();
+        let shallow_path = shallow.path().display().to_string();
+        let reply = svc
+            .handle(
+                "ahead-behind",
+                json!({ "paths": [&complete_path, &shallow_path] }),
+            )
+            .await
+            .unwrap();
+        let results = reply.get("results").unwrap();
+
+        let shallow_entry = results.get(shallow_path.as_str()).unwrap();
+        assert_eq!(shallow_entry.get("shallow"), Some(&json!(true)));
+        // The counts are still reported — the flag is a caveat, not a refusal.
+        assert_eq!(shallow_entry.get("ahead").and_then(Value::as_u64), Some(1));
+        // Wire-compat: a complete clone sends no key at all, so an older client sees
+        // exactly the row it saw before.
+        let complete_entry = results.get(complete_path.as_str()).unwrap();
+        assert!(
+            complete_entry.get("shallow").is_none(),
+            "{complete_entry:?}"
+        );
+        assert_eq!(complete_entry.get("ahead").and_then(Value::as_u64), Some(1));
     }
 
     #[tokio::test]

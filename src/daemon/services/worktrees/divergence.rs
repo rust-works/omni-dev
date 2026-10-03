@@ -48,6 +48,12 @@ pub(super) struct Divergence {
     pub(super) ahead_behind: Option<(usize, usize)>,
     /// Commits behind the repository's remote default branch (#1457).
     pub(super) main_behind: Option<usize>,
+    /// Whether the repository is shallow, so the counts above depend on how deep
+    /// the clone currently is — which no commit id records (#2120). Reported on the
+    /// wire so a client that memoizes by ids can see that this is the one case where
+    /// equal ids do not mean an equal answer, for the same reason [`WalkMemo`]
+    /// bypasses its own memo here.
+    pub(super) shallow: bool,
 }
 
 /// The identity of one graph walk: the repository's common dir plus both tips.
@@ -284,7 +290,7 @@ mod tests {
     fn divergence(ahead: usize) -> Divergence {
         Divergence {
             ahead_behind: Some((ahead, 0)),
-            main_behind: None,
+            ..Divergence::default()
         }
     }
 
