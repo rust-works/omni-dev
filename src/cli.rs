@@ -120,7 +120,7 @@ pub enum Commands {
     #[cfg(unix)]
     #[command(name = "codex-wrap")]
     CodexWrap(codex_wrap::CodexWrapCommand),
-    /// Coverage: diff/patch coverage analysis for PR comments.
+    /// Coverage: diff/patch coverage analysis for PR comments, and merging sharded reports.
     Coverage(coverage::CoverageCommand),
     /// Transcript and caption fetching from media platforms.
     Transcript(transcript::TranscriptCommand),

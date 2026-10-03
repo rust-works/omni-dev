@@ -24,7 +24,7 @@ Commands:
   sessions     Sessions: track Claude Code sessions running across all terminals and windows
   claude-wrap  Wrap the Claude process, reporting its exact session state to the daemon
   codex-wrap   Run the Codex TUI against a private app-server, reporting its exact session state to the daemon
-  coverage     Coverage: diff/patch coverage analysis for PR comments
+  coverage     Coverage: diff/patch coverage analysis for PR comments, and merging sharded reports
   transcript   Transcript and caption fetching from media platforms
   log          Search the local invocation + HTTP request log
   resources    Embedded reference resources (specs, etc.)
@@ -3200,9 +3200,9 @@ Options:
 
 ================================================================================
 
-omni-dev coverage - Coverage: diff/patch coverage analysis for PR comments
+omni-dev coverage - Coverage: diff/patch coverage analysis for PR comments, and merging sharded reports
 
-Coverage: diff/patch coverage analysis for PR comments
+Coverage: diff/patch coverage analysis for PR comments, and merging sharded reports
 
 Usage: coverage [OPTIONS] <COMMAND>
 
