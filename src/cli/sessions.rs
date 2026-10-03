@@ -40,7 +40,8 @@ use crate::daemon::client::DaemonClient;
 use crate::daemon::paths;
 use crate::daemon::protocol::{DaemonEnvelope, DaemonReply};
 use crate::daemon::server;
-use crate::sessions::{Agent, NotificationKind, ObserveRequest, SessionEvent};
+use crate::sessions::journal::{self, JournalRecord};
+use crate::sessions::{Agent, EventStamp, NotificationKind, ObserveRequest, SessionEvent};
 
 /// The `sessions` service routing key on the daemon control socket.
 const SERVICE: &str = "sessions";
@@ -265,7 +266,7 @@ impl HookCommand {
             tracing::debug!(agent = ?self.agent, outcome = "invalid_json", "session_hook_skipped");
             return;
         };
-        let Some((op, payload)) = hook.to_op(self.agent, pid) else {
+        let Some(hook_op) = hook.to_hook_op(self.agent, pid) else {
             return;
         };
         let Ok(socket) = server::resolve_socket(self.socket.clone()) else {
@@ -273,6 +274,13 @@ impl HookCommand {
             tracing::debug!(agent = ?self.agent, outcome = "socket_resolution_failed", "session_hook_skipped");
             return;
             // omni-dev: coverage end
+        };
+        // Stamped once, so the journal record and the POST name the same event and
+        // the daemon can drop whichever copy it sees second (#2108).
+        let stamp = journal::new_stamp();
+        self.journal(&socket, &hook_op, &stamp);
+        let Some((op, payload)) = hook_op.wire(self.agent, Some(&stamp)) else {
+            return;
         };
         let env = DaemonEnvelope::service(SERVICE, op, payload);
         let outcome =
@@ -284,6 +292,24 @@ impl HookCommand {
                 Ok(Ok(_)) => "delivered",
             };
         tracing::debug!(agent = ?self.agent, session_id = ?hook.session_id, ?pid, op, outcome, "session_hook_report");
+    }
+
+    /// Appends the event to its session's journal beside the socket, so the
+    /// daemon can recover it if the POST is lost (#2108). Fail-open exactly like
+    /// the POST: an error is logged — never with the payload — and swallowed, so
+    /// a journal that cannot be written costs one event's durability, never a
+    /// turn. Written *before* the POST, so a daemon that dies mid-delivery still
+    /// finds the event on disk.
+    fn journal(&self, socket: &Path, op: &HookOp, stamp: &EventStamp) {
+        let dir = paths::sessions_journal_dir_for_socket(socket);
+        match journal::append(&dir, &op.record(stamp)) {
+            Ok(()) => {
+                tracing::debug!(agent = ?self.agent, outcome = "journaled", "session_hook_journal");
+            }
+            Err(error) => {
+                tracing::debug!(agent = ?self.agent, outcome = "journal_failed", %error, "session_hook_journal");
+            }
+        }
     }
 }
 
@@ -338,14 +364,84 @@ struct HookPayload {
     model: Option<String>,
 }
 
+/// What the sink reports for one hook event: the typed value the socket POST and
+/// the journal record are both made from, so the two cannot drift (#2108).
+#[derive(Debug, Clone)]
+enum HookOp {
+    /// An `observe` sighting.
+    Observe(ObserveRequest),
+    /// A `SessionEnd`, which the daemon's `end` op takes without an agent; the
+    /// agent rides only into the journal record, to name its directory.
+    End {
+        agent: Agent,
+        session_id: String,
+        reason: Option<String>,
+        pid: Option<u32>,
+    },
+}
+
+impl HookOp {
+    /// The journal record for this event.
+    fn record(&self, stamp: &EventStamp) -> JournalRecord {
+        match self {
+            Self::Observe(req) => JournalRecord::observe(req, stamp),
+            Self::End {
+                agent,
+                session_id,
+                reason,
+                pid,
+            } => JournalRecord::end(*agent, session_id, reason.as_deref(), *pid, stamp),
+        }
+    }
+
+    /// The `(op, payload)` for the daemon, carrying `stamp` as an additive
+    /// top-level `stamp` object when there is one (an older daemon ignores it).
+    fn wire(&self, agent: HookAgent, stamp: Option<&EventStamp>) -> Option<(&'static str, Value)> {
+        let (op, mut payload) = match self {
+            Self::Observe(request) => {
+                let Ok(payload) = serde_json::to_value(request) else {
+                    // omni-dev: coverage ignore reason="to_value on an ObserveRequest fails only for a non-UTF-8 cwd, and the hook payload's cwd is deserialized from a JSON string, so it is always UTF-8; the arm exists so a future non-string field cannot silently drop the report"
+                    tracing::debug!(
+                        ?agent,
+                        outcome = "serialization_failed",
+                        "session_hook_skipped"
+                    );
+                    return None;
+                    // omni-dev: coverage end
+                };
+                ("observe", payload)
+            }
+            Self::End {
+                session_id,
+                reason,
+                pid,
+                ..
+            } => {
+                let mut payload = json!({ "session_id": session_id });
+                if let Some(reason) = reason {
+                    payload["reason"] = Value::String(reason.clone());
+                }
+                if let Some(pid) = pid {
+                    payload["pid"] = Value::from(*pid);
+                }
+                ("end", payload)
+            }
+        };
+        if let Some(stamp) = stamp {
+            payload["stamp"] = json!({ "ts": stamp.ts, "seq": stamp.seq });
+        }
+        Some((op, payload))
+    }
+}
+
 impl HookPayload {
-    /// Maps this hook payload to a `(op, payload)` for the daemon, or `None` when
-    /// it carries no `session_id` or names an event the tracker ignores. `pid`
-    /// (the [`agent_pid`]) rides along on both ops when known — it is also the
-    /// seed for pid-based liveness (#1916), whose identity-token reading is
-    /// entirely the daemon's own [`pid_watcher`](crate::sessions::pid_watcher)
-    /// work, never this sink's.
-    fn to_op(&self, agent: HookAgent, pid: Option<u32>) -> Option<(&'static str, Value)> {
+    /// Maps this hook payload to the [`HookOp`] to report, or `None` when it
+    /// carries no `session_id` or names an event the tracker ignores. `pid` (the
+    /// [`agent_pid`]) rides along on both ops when known — it is also the seed
+    /// for pid-based liveness (#1916), whose identity-token reading is entirely
+    /// the daemon's own [`pid_watcher`](crate::sessions::pid_watcher) work, never
+    /// this sink's.
+    fn to_hook_op(&self, agent: HookAgent, pid: Option<u32>) -> Option<HookOp> {
         let Some(session_id) = self.session_id.clone().filter(|s| !s.trim().is_empty()) else {
             tracing::debug!(
                 ?agent,
@@ -359,14 +455,12 @@ impl HookPayload {
             return None;
         };
         if event_name == "SessionEnd" {
-            let mut payload = json!({ "session_id": session_id });
-            if let Some(reason) = self.reason.as_ref().or(self.message.as_ref()) {
-                payload["reason"] = Value::String(reason.clone());
-            }
-            if let Some(pid) = pid {
-                payload["pid"] = Value::from(pid);
-            }
-            return Some(("end", payload));
+            return Some(HookOp::End {
+                agent: agent.agent(),
+                session_id,
+                reason: self.reason.clone().or_else(|| self.message.clone()),
+                pid,
+            });
         }
         let mapped = match agent {
             HookAgent::Claude => session_event_for(
@@ -392,7 +486,7 @@ impl HookPayload {
         if agent_id.is_some() && event_name == "SubagentStop" {
             event = SessionEvent::PostToolUse;
         }
-        let request = ObserveRequest {
+        Some(HookOp::Observe(ObserveRequest {
             agent_id,
             agent: agent.agent(),
             session_id,
@@ -402,19 +496,16 @@ impl HookPayload {
             repo: None,
             model: self.model.clone(),
             pid,
-        };
-        if let Ok(payload) = serde_json::to_value(request) {
-            Some(("observe", payload))
-        } else {
-            // omni-dev: coverage ignore reason="to_value on an ObserveRequest fails only for a non-UTF-8 cwd, and the hook payload's cwd is deserialized from a JSON string, so it is always UTF-8; the arm exists so a future non-string field cannot silently drop the report"
-            tracing::debug!(
-                ?agent,
-                outcome = "serialization_failed",
-                "session_hook_skipped"
-            );
-            None
-            // omni-dev: coverage end
-        }
+        }))
+    }
+
+    /// The unstamped `(op, payload)` for the daemon — [`to_hook_op`] and
+    /// [`HookOp::wire`] together, as the sink sent it before the journal.
+    ///
+    /// [`to_hook_op`]: Self::to_hook_op
+    #[cfg(test)]
+    fn to_op(&self, agent: HookAgent, pid: Option<u32>) -> Option<(&'static str, Value)> {
+        self.to_hook_op(agent, pid)?.wire(agent, None)
     }
 }
 
@@ -1819,6 +1910,141 @@ mod tests {
         }
         assert!(logs.contains("session_notification_classified"));
         assert!(!logs.contains("HOOK_CONTENT_SECRET"));
+    }
+
+    const JOURNAL_ID: &str = "0b7e6c1a-2f4d-4a8e-9c3b-5d1e7f9a2b4c";
+
+    fn journal_hook(event: &str) -> String {
+        format!(
+            r#"{{"session_id":"{JOURNAL_ID}","cwd":"/work/repo","hook_event_name":"{event}","prompt":"PROMPT_CONTENT_SECRET","tool_input":{{"command":"TOOL_CONTENT_SECRET"}}}}"#
+        )
+    }
+
+    fn read_journal(dir: &Path, agent: &str) -> Vec<JournalRecord> {
+        let path = dir
+            .join("sessions")
+            .join(agent)
+            .join(format!("{JOURNAL_ID}.jsonl"));
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(!text.contains("CONTENT_SECRET"), "{text}");
+        text.lines()
+            .map(|line| JournalRecord::parse(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_hook_is_journaled_even_when_the_daemon_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = HookCommand {
+            socket: Some(dir.path().join("missing.sock")),
+            agent: HookAgent::Claude,
+        };
+        command
+            .report(&journal_hook("UserPromptSubmit"), Some(77))
+            .await;
+        command.report(&journal_hook("Stop"), Some(77)).await;
+        command.report(&journal_hook("SessionEnd"), Some(77)).await;
+
+        let records = read_journal(dir.path(), "claude");
+        assert_eq!(records.len(), 3);
+        assert!(records
+            .iter()
+            .all(|r| r.agent == Agent::Claude && r.pid() == Some(77)));
+        assert!(matches!(
+            &records[0].body,
+            journal::JournalBody::Observe { event: SessionEvent::UserPromptSubmit, cwd: Some(cwd), .. }
+                if cwd == Path::new("/work/repo")
+        ));
+        assert!(matches!(
+            &records[1].body,
+            journal::JournalBody::Observe {
+                event: SessionEvent::Stop,
+                ..
+            }
+        ));
+        assert!(matches!(&records[2].body, journal::JournalBody::End { .. }));
+        // Each event has its own stamp.
+        let seqs: std::collections::HashSet<_> = records.iter().map(|r| r.seq.clone()).collect();
+        assert_eq!(seqs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_codex_hook_is_journaled_under_its_own_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = HookCommand {
+            socket: Some(dir.path().join("missing.sock")),
+            agent: HookAgent::Codex,
+        };
+        command
+            .report(&journal_hook("PermissionRequest"), None)
+            .await;
+        let records = read_journal(dir.path(), "codex");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].agent, Agent::Codex);
+        assert!(!dir.path().join("sessions/claude").exists());
+    }
+
+    #[tokio::test]
+    async fn events_the_tracker_ignores_and_ids_no_journal_is_named_for_leave_no_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = HookCommand {
+            socket: Some(dir.path().join("missing.sock")),
+            agent: HookAgent::Claude,
+        };
+        command.report(&journal_hook("FutureEvent"), None).await;
+        command
+            .report(
+                r#"{"session_id":"../../escape","hook_event_name":"Stop"}"#,
+                None,
+            )
+            .await;
+        assert!(!dir.path().join("sessions").exists());
+        assert!(!dir.path().join("escape").exists());
+    }
+
+    #[tokio::test]
+    async fn a_journal_write_failure_is_swallowed_and_never_logs_content() {
+        let dir = tempfile::tempdir().unwrap();
+        // The journal root is a file, so no journal can be made.
+        std::fs::write(dir.path().join("sessions"), "").unwrap();
+        let command = HookCommand {
+            socket: Some(dir.path().join("missing.sock")),
+            agent: HookAgent::Claude,
+        };
+        let ((), logs) = crate::test_support::capture_future_at(tracing::Level::DEBUG, async {
+            command.report(&journal_hook("Stop"), None).await;
+        })
+        .await;
+        assert!(logs.contains("journal_failed"), "{logs}");
+        // It went on to report, which is what the fail-open sink is for.
+        assert!(logs.contains("transport_failed"), "{logs}");
+        assert!(!logs.contains("CONTENT_SECRET"), "{logs}");
+    }
+
+    #[test]
+    fn the_wire_payload_carries_the_stamp_only_when_given_one() {
+        let stamp = journal::new_stamp();
+        let hook = |event: &str| serde_json::from_str::<HookPayload>(&journal_hook(event)).unwrap();
+        for (event, op) in [("Stop", "observe"), ("SessionEnd", "end")] {
+            let hook_op = hook(event).to_hook_op(HookAgent::Claude, Some(5)).unwrap();
+            let (name, bare) = hook_op.wire(HookAgent::Claude, None).unwrap();
+            assert_eq!(name, op);
+            assert!(bare.get("stamp").is_none(), "{event}");
+            let (_, stamped) = hook_op.wire(HookAgent::Claude, Some(&stamp)).unwrap();
+            assert_eq!(stamped["stamp"]["seq"], stamp.seq.as_str());
+            assert_eq!(
+                serde_json::from_value::<EventStamp>(stamped["stamp"].clone()).unwrap(),
+                stamp
+            );
+            // The stamp is the only difference from the unstamped payload.
+            let mut without = stamped.clone();
+            without.as_object_mut().unwrap().remove("stamp");
+            assert_eq!(without, bare);
+            // The journal record is made from the same value.
+            let record = hook_op.record(&stamp);
+            assert_eq!(record.stamp(), stamp);
+            assert_eq!(record.session_id, JOURNAL_ID);
+        }
     }
 
     use super::*;
