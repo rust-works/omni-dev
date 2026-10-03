@@ -1,5 +1,7 @@
 //! Compare unchanged stage requests with the added open-question choice on frozen states.
-//! Usage: cargo run --example jev_open_questions_eval -- INPUT.json OUTPUT_DIR [REPEATS]
+//! Usage: cargo run --example jev_open_questions_eval -- INPUT.json OUTPUT_DIR [REPEATS [LADDERS]]
+//! `LADDERS` is a comma-separated provider list (default: all built-ins). `anthropic` alone is
+//! the `ai jev route` default request shape; all three is what the #2053 held-out run measured.
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -21,8 +23,20 @@ async fn main() -> Result<()> {
     let input = PathBuf::from(args.next().context("expected INPUT.json")?);
     let output = PathBuf::from(args.next().context("expected OUTPUT_DIR")?);
     let repeats: usize = args.next().as_deref().unwrap_or("2").parse()?;
-    if repeats == 0 || args.next().is_some() {
-        bail!("expected INPUT.json OUTPUT_DIR [positive REPEATS]");
+    let providers = match args.next() {
+        Some(list) => list
+            .split(',')
+            .map(|name| {
+                Provider::ALL
+                    .into_iter()
+                    .find(|provider| provider.name() == name)
+                    .with_context(|| format!("unknown ladder {name:?}"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => Provider::ALL.to_vec(),
+    };
+    if repeats == 0 || providers.is_empty() || args.next().is_some() {
+        bail!("expected INPUT.json OUTPUT_DIR [positive REPEATS [LADDERS]]");
     }
     let cases: Vec<Case> = serde_json::from_slice(&std::fs::read(&input)?)?;
     if cases.is_empty() || output.exists() {
@@ -32,8 +46,8 @@ async fn main() -> Result<()> {
     let client = JevClient::from_config(&config)?;
     std::fs::create_dir_all(&output)?;
     std::fs::copy(&input, output.join("inputs.json"))?;
-    // Strip effort metadata to isolate the added classifier, across all built-in ladders.
-    let ladders = Provider::ALL
+    // Strip effort metadata to isolate the added classifier, across the chosen built-in ladders.
+    let ladders = providers
         .into_iter()
         .map(|provider| {
             let ladder = Ladder::builtin(provider)?;
