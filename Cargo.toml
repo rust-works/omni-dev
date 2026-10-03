@@ -15,16 +15,20 @@ rust-version = "1.88.0"
 # Keep the published crate under crates.io's 10 MiB upload limit by dropping
 # assets that consumers of the library/binary do not need: the promo website,
 # social-preview images, scratch space, the VS Code companion extension
-# (a Node/TypeScript deliverable published separately to the Marketplace), and
-# the round-4 route evaluation record with the one example that replays it
-# (~0.7 MiB of archived requests; the 0.45.0 crate was already 9.7 MiB).
-# The library's own tests read only the older, smaller evaluation files.
+# (a Node/TypeScript deliverable published separately to the Marketplace), the
+# round-4 route evaluation record with the one example that replays it
+# (~0.7 MiB of archived requests; the 0.45.0 crate was already 9.7 MiB), and the
+# raw default-ladder run for the open-question evaluation (#2053), which took
+# the package over the limit. The library's own tests read only the older,
+# smaller evaluation files, plus
+# `docs/evaluations/jev-route-2053/candidate-v3.json` (one unit test).
 exclude = [
     "website/",
     "assets/",
     "scratch/",
     "editors/",
     "docs/evaluations/jev-route-1871/round4-*",
+    "docs/evaluations/jev-route-2053/heldout-default-shape/",
     "examples/jev_route_signal_eval.rs",
 ]
 
