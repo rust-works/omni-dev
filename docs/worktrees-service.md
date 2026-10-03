@@ -103,7 +103,10 @@ to land after an outage reaped every *other* window that had been quiet for more
 than 30 s — `heartbeat` reaps before it touches the sender — and whole repos
 vanished from the tree for a few seconds. The credit only touches entries still in
 the map: a window that was already reaped stays gone and re-registers through the
-`{ known: false }` path above.
+`{ known: false }` path above. Every live entry is credited equally, since the daemon
+cannot tell which windows died during the outage; one that did is reaped a TTL after
+it ends. The sessions service's window reports (the `vscode`-vs-`terminal` source of a
+session) get the same credit.
 
 The registry is also **capped at 256 windows** (#1140): where the TTL bounds how
 *stale* an entry can get, the cap bounds how *many* can exist, so a misbehaving
@@ -1574,13 +1577,20 @@ extension never runs git.
 - **The lazy op is coalesced, memoized and bounded (#2111).** Every window re-asks
   for every worktree of every expanded repo on each pushed delta, so N windows send
   N identical batches at once. The op therefore (1) **shares one computation per
-  worktree** between concurrent requests (single-flight; nothing is kept once it
-  finishes, so a later request always reads the repository as it is then), (2)
-  **memoizes each commit-graph walk** by `(repository, local tip, upstream tip)` —
-  ancestry is a pure function of the commit ids, so a hit is exact and a commit,
-  fetch or push simply misses, with no TTL to tune — and (3) **runs at most four
-  computations at a time**, so the walks cannot saturate the blocking pool or hold
-  more than a few repositories' pack files open. It also answers both questions
+  worktree** between concurrent requests, (2) **memoizes each commit-graph walk** by
+  `(repository, local tip, upstream tip)`, and (3) **runs at most four computations
+  at a time**, so the walks cannot saturate the blocking pool or hold more than a
+  few repositories' pack files open.
+
+  None of this can serve a stale answer. A request joins a shared computation only
+  while it is still *waiting for its turn* behind the cap — which is when sharing is
+  worth the most, under load — and never one that has begun reading the repository,
+  so a request is always answered from the repository as it was no earlier than the
+  request. Nothing is kept once a computation finishes. The memo is exact because, in
+  a complete repository, ancestry is a pure function of the commit ids: a commit,
+  fetch or push changes an id and simply misses, with no TTL to tune. A *shallow*
+  clone is the exception (deepening it changes the answer without changing an id), so
+  it bypasses the memo. It also answers both questions
   (own-upstream and default-branch divergence) from a single `Repository` open
   per worktree. The memo is shared with the inline `ahead`/`behind` that `list` and
   the tray menu compute. A computation that fails degrades to "no divergence" for
