@@ -11,7 +11,7 @@ use regex::RegexSet;
 use crate::claude::context::{load_config_content, resolve_context_dir_at};
 use crate::coverage::analysis::{analyze_with_markers, Markers};
 use crate::coverage::markers::{self, FileMarkers};
-use crate::coverage::merge::{prefix_mismatch, require_executable_lines};
+use crate::coverage::merge::check_shard;
 use crate::coverage::{
     default_base_ref, parse, render, CoverageReport, DiffModel, DiffScope, Format, OutputFormat,
     RenderOptions,
@@ -533,11 +533,7 @@ impl DiffCommand {
             let path = anchor(path, repo_root);
             let mut report = read_report(&path, self.report_format)?;
             if sharded {
-                let label = path.display().to_string();
-                require_executable_lines(&label, &report)?;
-                if let Some(prefix) = strip_prefix {
-                    warnings.extend(prefix_mismatch(&label, &report, prefix));
-                }
+                check_shard(&path.display().to_string(), &report, strip_prefix, warnings)?;
             }
             normalise_report(&mut report, strip_prefix, ignore);
             merged.merge(report);
