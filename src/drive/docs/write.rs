@@ -1011,10 +1011,35 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
             } else {
                 "Applied"
             };
-            format!("{action} {} in '{name}': {}x{} -> {}x{}, UTF-16 index {}, tab {}, reference row {:?}, column {:?}, insert after {}, preceding newline {}",
+            let cell = match (edit.row_index, edit.column_index) {
+                (Some(row), Some(column)) => format!(", reference cell ({row}, {column})"),
+                _ => String::new(),
+            };
+            let direction = match edit.operation {
+                TableVerb::InsertRow => {
+                    if edit.insert_after {
+                        ", below"
+                    } else {
+                        ", above"
+                    }
+                }
+                TableVerb::InsertColumn => {
+                    if edit.insert_after {
+                        ", right"
+                    } else {
+                        ", left"
+                    }
+                }
+                _ => "",
+            };
+            let newline = if edit.preceding_newline {
+                "; adds preceding newline"
+            } else {
+                ""
+            };
+            format!("{action} {} in '{name}': {}x{} -> {}x{}, UTF-16 index {}, tab {}{cell}{direction}{newline}",
                 edit.operation.label(), edit.rows_before, edit.columns_before, edit.rows_after, edit.columns_after,
-                edit.location.index, edit.location.tab_id.as_deref().unwrap_or("first"), edit.row_index, edit.column_index,
-                edit.insert_after, edit.preceding_newline)
+                edit.location.index, edit.location.tab_id.as_deref().unwrap_or("first"))
         }
         WriteResult::RefusedTable { error } => {
             format!("Refused: unsafe or unresolved table in '{name}': {error:?}")
@@ -3372,7 +3397,7 @@ mod tests {
                         .await;
                     mount_folder("folder-1").mount(&server).await;
                     let mut rule = rule_for(&payload);
-                    rule.allow = [grant].into_iter().collect();
+                    rule.allow = std::iter::once(grant).collect();
                     let mut opts = replace_opts(dry_run);
                     opts.payload = payload.clone();
                     assert!(matches!(
@@ -3478,7 +3503,7 @@ mod tests {
                     .result;
                 match stage {
                     0 => assert!(matches!(result, WriteResult::RefusedNoLease)),
-                    1 => assert!(matches!(result, WriteResult::RefusedLeaseStale { .. })),
+                    1 => assert!(matches!(result, WriteResult::RefusedLeaseStale)),
                     _ => assert!(matches!(result, WriteResult::StaleRevision { .. })),
                 }
                 if stage < 2 {
