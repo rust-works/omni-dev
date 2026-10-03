@@ -85,16 +85,17 @@ the same `Total` the markdown headline prints, so it moves with the
 does. Both gates can be set together, and every gate that fails is named in the
 error.
 
-- **The figure is lcov-derived.** It is covered lines over executable lines as
-  counted from the report's per-line records, so it can differ slightly from
-  `cargo llvm-cov report --summary-only`, which counts from the profile data and
-  the instrumented binaries. Pick a threshold against this command's number, not
-  against that one. Measured on this repository's own unit-test suite (about 97%
-  covered), the lcov-derived figure was **0.16 pp higher** than llvm-cov's summary:
-  the lcov lists about 6% fewer lines (324,274 against 344,949), and the lines it
-  omits are mostly covered ones. The cause was not investigated, and the gap will
-  differ per codebase. `ignore` markers and `--ignore-filename-regex` move the gate
-  figure further, since llvm-cov's summary knows nothing of them.
+- **The figure is per-line, not llvm-cov's summary.** It is covered lines over the
+  distinct executable lines in the report's per-line records (an lcov's `DA:`
+  records, or the JSON export's `segments`), so it differs from
+  `cargo llvm-cov report --summary-only`, which counts per *function record* and
+  so counts some lines more than once. Pick a threshold against this command's
+  number, not against that one. On this repository's own unit-test suite (about
+  97% covered) the per-line figure was **0.17 pp higher**; the cause and its
+  direction in general are in
+  [Why the total differs from llvm-cov's summary](#why-the-total-differs-from-llvm-covs-summary).
+  `ignore` markers and `--ignore-filename-regex` move the gate figure further,
+  since llvm-cov's summary knows nothing of them.
 - **An unmeasurable total fails.** A report with no executable lines — empty, or
   fully excluded by `--ignore-filename-regex` — fails `--fail-under-lines`. This is
   deliberately unlike `--fail-under-patch`, where "no added lines" is a property of
@@ -105,6 +106,94 @@ Because the gate needs only the report, it works wherever `coverage diff` does �
 including when the report was produced elsewhere (for example, from several CI
 jobs, see [Sharded runs](#sharded-runs)) and the profile data is not on the
 machine running the gate.
+
+## Why the total differs from llvm-cov's summary
+
+One `cargo llvm-cov` run yields two different line counts, and the lcov it writes
+contains both:
+
+| Count                                                       |   Lines | Covered | Uncovered |       % |
+|-------------------------------------------------------------|--------:|--------:|----------:|--------:|
+| `llvm-cov report --summary-only` (the `TOTAL` row)          | 331,417 | 321,311 |    10,106 | 96.9507 |
+| lcov `LF:` / `LH:` records, summed over files               | 331,417 | 321,311 |    10,106 | 96.9507 |
+| lcov `DA:` records, counted — **what `coverage diff` uses** | 311,968 | 302,979 |     8,989 | 97.1186 |
+
+(This repository's library suite, 567 files, `cargo-llvm-cov` 0.8.7, rustc 1.98 /
+LLVM 22.1.8.) llvm-cov writes `LF`/`LH` from the summary, so even a single lcov
+disagrees with its own `DA` records. `coverage diff` counts the `DA` records — and,
+for the JSON export, rebuilds lines from `segments` — and never reads `LF`/`LH` or
+the export's `summary`/`totals`, which hold the summary's figure too. The lcov and
+the JSON export of one run give the same gate figure (identical to five decimal
+places on this suite), and tests pin both that and which records are read.
+
+**The summary counts per function record; the per-line view counts per line.** The
+two agree until a line is mapped by more than one function record. Rebuilding the
+summary from each function record's own lines (`llvm-cov show -name=<function>`, all
+36,079 records) reproduces `files[].summary.lines` for every one of the 567 files and
+accounts for the whole gap:
+
+| Effect (summary − per-line)                                   |   Lines | Covered | Uncovered |
+|---------------------------------------------------------------|--------:|--------:|----------:|
+| 1. a line mapped by several function records counts once each | +19,449 | +18,435 |    +1,014 |
+| 2. a generic's instantiations merge by `max`, not by union    |       0 |    −105 |      +105 |
+| 3. a nested record that never ran overrides its enclosing one |       0 |      +2 |        −2 |
+| total                                                         | +19,449 | +18,332 |    +1,117 |
+
+1. **Shared lines.** rustc emits a separate function record for every closure and
+   every `async fn` body, in addition to the enclosing function's, and the enclosing
+   record also maps some of the inner one's lines: the line a closure starts on, an
+   `async fn`'s signature line, and parts of a `#[tokio::test]` body. The summary
+   adds a line once per record that maps it; the per-line view adds it once. This is
+   the whole line-count gap (507 of the 567 files) and about 0.135 pp of the
+   0.168 pp. The lcov is not missing any code: its `DA` list is the same lines
+   without the repeats. Classified by their source text, about 78% of the repeats
+   here are in test code and about two thirds are in `async fn` bodies, chiefly
+   `#[tokio::test]`s, with closures most of the rest.
+2. **Generic instantiations.** The summary merges the instantiations of one generic
+   function by taking the larger *covered* count and the larger *line* count
+   separately; the per-line view calls a line covered if any instantiation ran it.
+   When `f::<u8>` takes one branch and `f::<u16>` the other, the summary reports a
+   missed line that the per-line view does not. 32 files, 105 lines, about 0.034 pp.
+3. **Nested records.** Where an inner record (a closure) never ran but the enclosing
+   function did, the file view takes the inner region's count for the lines they
+   share and the summary takes the enclosing record's. Two lines in this suite
+   (`src/cli/git.rs`), about 0.0006 pp.
+
+**The direction depends on the code.** Effect 2 can only lower the summary relative
+to the per-line figure, and effect 3 can only raise it (and needs a closure that never
+ran inside a function that did). Effect 1 lowers it when the shared lines are covered
+less often than the rest of the code (94.8% against 97.0% here) and raises it when
+they are covered more often. This repository read higher under `coverage diff`, so a
+threshold carried over from `llvm-cov report --fail-under-lines` was lenient; a
+codebase whose closures and async bodies are better covered than the rest could
+read lower. Measure it rather than assume.
+
+**Why the gate does not use the summary.** The summary is a sum over function
+records, and neither an lcov's `DA` records nor the JSON `segments` say which
+records map a line, so it cannot be rebuilt from the per-line report that patch
+coverage, `ignore` markers, `--ignore-filename-regex`, shard merging and baselines
+all work on. The JSON export's `summary` does carry it — per file only — but using
+it would give up those features and count every shared line twice. The per-line
+figure has one more property worth having: each source line counts once, which is
+the unit patch coverage already uses.
+
+**Measuring the gap on your own report.** Both counts are in one llvm-cov lcov:
+
+```bash
+cargo llvm-cov report --lcov --output-path head.lcov
+awk -F'[:,]' '
+  /^DA:/ { da++; if ($3 > 0) dah++ }
+  /^LF:/ { lf += $2 }
+  /^LH:/ { lh += $2 }
+  END {
+    if (!da) { print "no DA records in the report"; exit 1 }
+    printf "summary  (LF/LH): %d of %d lines (%.4f%%)\n", lh, lf, lf ? 100 * lh / lf : 0
+    printf "per-line (DA):    %d of %d lines (%.4f%%)\n", dah, da, 100 * dah / da
+  }' head.lcov
+```
+
+An lcov whose `LF`/`LH` count its own `DA` records, as the lcov format defines
+them, prints the same figure twice, and there is nothing to measure.
 
 ## Diff scoping
 
