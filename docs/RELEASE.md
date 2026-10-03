@@ -154,12 +154,11 @@ The extension's version and notes are independent of the crate's. See [`editors/
 **Version.** From `editors/vscode`, bump `package.json` and the two omni-dev entries at the top of `package-lock.json` without touching dependency ranges:
 
 ```bash
-cd editors/vscode
-npm version A.B.C --no-git-tag-version --ignore-scripts
-git diff --stat   # expect exactly package.json and package-lock.json, 3 changed lines
+(cd editors/vscode && npm version A.B.C --no-git-tag-version --ignore-scripts --allow-same-version)
+git diff --stat -- editors/vscode   # expect only package.json and package-lock.json, at most 3 changed lines
 ```
 
-Prefer this to a plain `npm install`, which re-resolves the whole lockfile and can pull unrelated dependency changes into the release commit. A feature commit has bumped `package.json` and left `package-lock.json` behind before, so check that all three version strings agree.
+The subshell keeps your shell at the repository root for the `git add` below. Prefer this to a plain `npm install`, which re-resolves the whole lockfile and can pull unrelated dependency changes into the release commit. `--allow-same-version` covers a feature commit that already bumped `package.json` and left `package-lock.json` behind (this has happened): without it npm stops at `Version not changed` and never repairs the lockfile. Either way, check that all three version strings agree.
 
 **Changelog.** Update [`editors/vscode/CHANGELOG.md`](../editors/vscode/CHANGELOG.md): move `[Unreleased]` into a new `## [A.B.C] - YYYY-MM-DD` section. Both registries render a **Changelog** tab from it, so every published version needs an entry. As with the crate, reconcile it against the log first, and it lags more often because changes are often recorded only in the root changelog:
 
@@ -170,8 +169,7 @@ git log --oneline vscode-vPREV..origin/main -- editors/vscode
 **Checks.** The release workflow re-runs these, so run them first:
 
 ```bash
-cd editors/vscode
-npm ci && npm run typecheck && npm run build && npm test && npm run package
+(cd editors/vscode && npm ci && npm run typecheck && npm run build && npm test && npm run package)
 ```
 
 **Commit.**
@@ -221,14 +219,18 @@ If `main` moves before the queue reaches your entry and `CHANGELOG.md` now confl
 
 ### 6. Create the Tags on the Rebased Commits
 
-Only now, find the commits **as they landed on `main`**. Look them up by subject, not by the hash you committed locally:
+Steps 6 and 7 each have a crate half and an extension half. Do only the halves for the artefacts you are releasing.
+
+Only now, find the commits **as they landed on `main`**. Look them up by subject, not by the hash you committed locally (the dots in the version are escaped because `--grep` takes a regular expression):
 
 ```bash
 git fetch origin main
-CRATE=$(git log origin/main --format=%H -1 --grep='^chore(release): prepare release vX.Y.Z$')
-EXT=$(git log origin/main --format=%H -1 --grep='^chore(release): prepare vscode extension release vA.B.C$')
-echo "crate=$CRATE extension=$EXT"   # both must be non-empty
+CRATE=$(git log origin/main --format=%H -1 --grep='^chore(release): prepare release vX\.Y\.Z$')
+EXT=$(git log origin/main --format=%H -1 --grep='^chore(release): prepare vscode extension release vA\.B\.C$')
+echo "crate=$CRATE extension=$EXT"   # each one you are releasing must be non-empty
 ```
+
+If a fix had to land after the release commit, tag the fix's hash instead: it is the commit that carries the correct files, and the subject lookup would return the original one.
 
 Create annotated tags on those commits, not on `HEAD` (more commits may have landed on `main` since):
 
@@ -269,7 +271,7 @@ If anything is wrong, delete the local tag (`git tag -d <tag>`) and fix it with 
 Then push the tags (this triggers all automated release steps):
 
 ```bash
-git push origin vX.Y.Z vscode-vA.B.C
+git push origin vX.Y.Z vscode-vA.B.C   # only the tags you created
 ```
 
 ## Automated Release Pipeline
@@ -323,13 +325,13 @@ After pushing the tags, monitor the automated releases.
    cargo search omni-dev --limit 1
    ```
 
-4. **Download the released binary and confirm it reports the new version**, and the commit you tagged:
+4. **Download the released binary and confirm it reports the new version**, and the commit you tagged (the short SHA's length varies with the machine that built it, so compare by prefix):
    ```bash
    d=$(mktemp -d)
    gh release download vX.Y.Z --pattern 'omni-dev-macos-arm64.tar.gz' --dir "$d"   # pick your platform's asset
    tar xzf "$d/omni-dev-macos-arm64.tar.gz" -C "$d"
    "$d/omni-dev" --version                        # omni-dev X.Y.Z (<short sha> <date>)
-   git rev-parse --short=7 'vX.Y.Z^{commit}'      # must equal <short sha>
+   git rev-parse 'vX.Y.Z^{commit}'                # full SHA; it must start with <short sha>
    ```
 
 ### Extension

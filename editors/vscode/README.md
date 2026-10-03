@@ -328,7 +328,8 @@ commit before the tag is pushed and reading the result back from the registries.
 
 What is specific to the extension:
 
-- Bump the version with `npm version X.Y.Z --no-git-tag-version --ignore-scripts`
+- Bump the version with
+  `npm version X.Y.Z --no-git-tag-version --ignore-scripts --allow-same-version`
   in this directory. It changes `package.json` and the two omni-dev entries at the
   top of `package-lock.json`, and nothing else.
 - In [`CHANGELOG.md`](CHANGELOG.md), move the `[Unreleased]` items into a new
