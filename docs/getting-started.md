@@ -16,7 +16,7 @@ where to dig deeper.
 
 ## Prerequisites
 
-- **Rust 1.80+** — install via [rustup.rs](https://rustup.rs/) if you
+- **Rust 1.88+** — install via [rustup.rs](https://rustup.rs/) if you
   don't have it. (`rustc --version` to check.)
 - **Git** — any modern version.
 - **A git repository** with at least one feature-branch commit ahead of
