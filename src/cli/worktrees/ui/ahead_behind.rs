@@ -29,6 +29,16 @@ const RETRY_BASE: Duration = Duration::from_secs(2);
 /// The longest the cache waits between retries of a daemon that keeps failing.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
+/// How often a shallow clone's row is asked about again. Deepening a clone
+/// (`git fetch --deepen`, `--unshallow`) changes its counts without moving any id
+/// the cache keys on, so nothing else would ever say they are stale: not
+/// [`observe`](AheadBehindCache::observe), and not a tree frame, since the daemon
+/// sends one only when the snapshot differs. A steady interval, not the failure
+/// backoff, because the row is healthy; and bounded, because the daemon recomputes
+/// a shallow repository's divergence from scratch (it bypasses the commit-graph
+/// memo by design, #2111) — over a deliberately truncated history.
+const SHALLOW_RECHECK: Duration = Duration::from_secs(30);
+
 /// Everything the daemon computes a worktree's `ahead`/`behind`/`main_behind`
 /// from, as the tree snapshot reports it: the checked-out branch (whose
 /// configured upstream defines the first answer), the commit HEAD is at, the
@@ -123,6 +133,8 @@ pub struct AheadBehindCache {
     retry_at: Option<Instant>,
     /// The delay after the first failure; a field so tests need not wait seconds.
     retry_base: Duration,
+    /// [`SHALLOW_RECHECK`]; a field for the same reason.
+    shallow_recheck: Duration,
 }
 
 /// One completed batch: the paths it was fetched *for*, each with the
@@ -151,6 +163,7 @@ impl AheadBehindCache {
             failures: 0,
             retry_at: None,
             retry_base: RETRY_BASE,
+            shallow_recheck: SHALLOW_RECHECK,
         }
     }
 
@@ -275,17 +288,8 @@ impl AheadBehindCache {
                         &sent,
                         self.entries.get(&path),
                         Instant::now(),
-                        self.retry_base,
+                        (self.retry_base, self.shallow_recheck),
                     );
-                    if let Some(recheck) = entry.recheck {
-                        tracing::debug!(
-                            "worktrees ui: ahead-behind row for {} omitted although its \
-                             refs promise one ({} in a row), asking again in {:?}",
-                            path.display(),
-                            recheck.attempts,
-                            recheck.at.saturating_duration_since(Instant::now()),
-                        );
-                    }
                     self.entries.insert(path, entry);
                 }
                 if superseded {
@@ -385,7 +389,8 @@ async fn wait_until(at: Option<Instant>) {
 }
 
 /// How one requested path's slot in a *successful* reply is held, given the
-/// `inputs` it was asked under and the `previous` entry for it, if any.
+/// `inputs` it was asked under, the `previous` entry for it, if any, and the two
+/// recheck delays `(retry_base, shallow_recheck)`.
 ///
 /// A row the daemon omitted although `inputs` expect one (see
 /// [`Inputs::expects_a_row`]) is a computation that failed for that worktree, not
@@ -395,12 +400,16 @@ async fn wait_until(at: Option<Instant>) {
 /// entry, rather than no entry at all, is what keeps `set_visible` from asking
 /// again on every tree frame, which is the point: a worktree whose computation
 /// fails persistently would otherwise cost one daemon call per frame.
+///
+/// A row from a shallow clone is shown as it is, but is rechecked at a steady
+/// interval: it is the one case where unchanged inputs do not mean an unchanged
+/// answer (#2144).
 fn settle(
     reply: Option<&AheadBehindEntryWire>,
     inputs: &Inputs,
     previous: Option<&Entry>,
     now: Instant,
-    retry_base: Duration,
+    (retry_base, shallow_recheck): (Duration, Duration),
 ) -> Entry {
     let state = state_for(reply);
     if state == AheadBehindState::Unavailable && inputs.expects_a_row() {
@@ -416,6 +425,15 @@ fn settle(
             }),
         };
     }
+    if reply.is_some_and(|row| row.shallow) {
+        return Entry {
+            state,
+            recheck: Some(Recheck {
+                at: now + shallow_recheck,
+                attempts: 0,
+            }),
+        };
+    }
     Entry::settled(state)
 }
 
@@ -427,6 +445,7 @@ fn state_for(entry: Option<&AheadBehindEntryWire>) -> AheadBehindState {
             ahead: Some(ahead),
             behind: Some(behind),
             main_behind,
+            ..
         }) => AheadBehindState::Known {
             ahead,
             behind,
@@ -499,6 +518,7 @@ mod tests {
             ahead,
             behind,
             main_behind,
+            shallow: false,
         }
     }
 
@@ -633,6 +653,7 @@ mod tests {
                 ahead: Some(2),
                 behind: Some(1),
                 main_behind: Some(5),
+                shallow: false,
             },
         );
         cache
@@ -865,6 +886,7 @@ mod tests {
                 ahead: Some(1),
                 behind: Some(0),
                 main_behind: None,
+                shallow: false,
             },
         );
         cache
@@ -1022,6 +1044,7 @@ mod tests {
             ahead: Some(1),
             behind: Some(0),
             main_behind: None,
+            shallow: false,
         };
         cache
             .results_tx
@@ -1250,5 +1273,135 @@ mod tests {
         cache.set_visible(&[PathBuf::from("/repo/elsewhere")]);
         assert!(!cache.entries.contains_key(&path));
         assert_eq!(cache.next_wake(), Some(later));
+    }
+
+    // --- a shallow clone's row (#2144) -------------------------------------
+
+    /// Delivers an `Ok` batch for `path` carrying `row`, asked under `inputs`.
+    async fn deliver_row(
+        cache: &mut AheadBehindCache,
+        path: &Path,
+        inputs: Vec<(PathBuf, Inputs)>,
+        row: AheadBehindEntryWire,
+    ) {
+        cache.pending.insert(path.to_path_buf());
+        cache
+            .results_tx
+            .send(FetchResult {
+                requested: inputs,
+                results: Ok(HashMap::from([(path.to_path_buf(), row)])),
+            })
+            .unwrap();
+        cache.changed().await;
+    }
+
+    fn row(shallow: bool) -> AheadBehindEntryWire {
+        AheadBehindEntryWire {
+            ahead: Some(1),
+            behind: Some(0),
+            main_behind: None,
+            shallow,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_shallow_row_is_shown_but_not_settled() {
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        cache.observe(at_head(&path, "aaa"));
+        deliver_row(&mut cache, &path, at_head(&path, "aaa"), row(true)).await;
+
+        // Shown as it is...
+        assert_eq!(
+            cache.get(&path),
+            AheadBehindState::Known {
+                ahead: 1,
+                behind: 0,
+                main_behind: None
+            }
+        );
+        // ...but held on a clock, not until a ref moves: deepening moves none.
+        let recheck = cache.entries[&path]
+            .recheck
+            .expect("a shallow row rechecks");
+        assert_eq!(recheck.attempts, 0);
+        assert!(recheck.at > Instant::now() + Duration::from_secs(20));
+        assert_eq!(cache.next_wake(), Some(recheck.at));
+
+        // Before the interval, a frame does not re-ask it.
+        cache.set_visible(std::slice::from_ref(&path));
+        assert!(cache.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_complete_clones_row_is_never_re_asked() {
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        cache.observe(at_head(&path, "aaa"));
+        deliver_row(&mut cache, &path, at_head(&path, "aaa"), row(false)).await;
+        assert!(cache.entries[&path].recheck.is_none());
+        assert!(cache.next_wake().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_shallow_row_is_re_asked_on_the_timer_and_keeps_showing_meanwhile() {
+        // Deepened between the two asks: same ids, different counts. No frame
+        // arrives, because nothing in the snapshot moved.
+        let (_dir, sock, _server) = fake_daemon_replies(vec![
+            json!({ "ok": true, "payload": { "results": {
+                "/repo/wt": { "ahead": 1, "behind": 0, "shallow": true }
+            }}}),
+            json!({ "ok": true, "payload": { "results": {
+                "/repo/wt": { "ahead": 5, "behind": 0, "shallow": true }
+            }}}),
+        ]);
+        let mut cache = AheadBehindCache::new(WorktreesClient::new(sock));
+        cache.shallow_recheck = Duration::from_millis(5);
+        let path = PathBuf::from("/repo/wt");
+        let counts = |ahead| AheadBehindState::Known {
+            ahead,
+            behind: 0,
+            main_behind: None,
+        };
+
+        cache.observe(at_head(&path, "aaa"));
+        cache.set_visible(std::slice::from_ref(&path));
+        settle(&mut cache).await;
+        assert_eq!(cache.get(&path), counts(1));
+
+        // The timer re-asks; the old counts stay up rather than flashing `...`.
+        settle(&mut cache).await;
+        assert!(cache.pending.contains(&path));
+        assert_eq!(cache.get(&path), counts(1));
+
+        settle(&mut cache).await;
+        assert_eq!(cache.get(&path), counts(5));
+        // Still shallow, so it keeps being rechecked.
+        assert!(cache.entries[&path].recheck.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_shallow_clone_that_was_unshallowed_becomes_settled() {
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        cache.observe(at_head(&path, "aaa"));
+        deliver_row(&mut cache, &path, at_head(&path, "aaa"), row(true)).await;
+        assert!(cache.entries[&path].recheck.is_some());
+        // The re-ask finds the full history: no `shallow`, so no more rechecks.
+        deliver_row(&mut cache, &path, at_head(&path, "aaa"), row(false)).await;
+        assert!(cache.entries[&path].recheck.is_none());
+        assert!(cache.next_wake().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_moved_input_still_drops_a_shallow_row_at_once() {
+        // The interval is a floor under `observe`, not a substitute for it.
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        cache.observe(at_head(&path, "aaa"));
+        deliver_row(&mut cache, &path, at_head(&path, "aaa"), row(true)).await;
+        cache.observe(at_head(&path, "bbb"));
+        assert!(!cache.entries.contains_key(&path));
+        assert!(cache.next_wake().is_none());
     }
 }

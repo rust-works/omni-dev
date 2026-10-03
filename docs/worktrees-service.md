@@ -1738,6 +1738,23 @@ extension never runs git.
   ref at the same commit changes nothing the key can see, at worst leaving a `⇊N`
   beside an identical `↓N` until a ref next moves. Any other client that caches
   these rows should key and gate the same way.
+- **`worktrees ui` follows the same rules, with a clock (#2143, #2144, #2145).** The
+  TUI's cache (`src/cli/worktrees/ui/ahead_behind.rs`) holds each worktree's row
+  under the same inputs — `branch`, `head_sha`, `upstream_sha` and the repo's
+  `main_sha` — and stamps every request with the inputs it was sent under, so a reply
+  that lands after one of them moved (a commit while the fetch was in flight) is
+  discarded and re-asked rather than cached as current. Where the extension has no
+  TTL, the TUI keeps its own timer, for the two cases a snapshot cannot signal. An
+  *expected* row the daemon omitted — a branch with an `upstream_sha`, or in a repo
+  with a `main_sha` — is a failed computation: it is left blank and re-asked on the
+  failed-fetch backoff (2 s doubling to 30 s, per worktree, restarting when an input
+  moves), never on every frame, so a worktree that fails persistently costs one call
+  per backoff step. A `shallow` row is shown but re-asked every 30 s, since deepening
+  a clone moves no id and so produces no frame; the daemon recomputes it from scratch
+  by design, over a truncated history, so the rate is bounded. A row with nothing to
+  compute is settled and never re-asked. The extension's limit carries over: a daemon
+  that predates `shallow`, `upstream_sha` or `main_sha` makes the matching case look
+  settled.
 
 ### Tuning the refresh cadence
 
