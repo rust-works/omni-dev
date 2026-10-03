@@ -27,6 +27,16 @@ use super::single_instance;
 /// shutdown indefinitely (a service manager would `SIGKILL` us eventually).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a connection may wait, silent, for its next request line before the
+/// daemon closes it (#2111).
+///
+/// Every client opens a connection per operation and sends at once, so a
+/// connection that stays silent this long is abandoned — and until it is closed it
+/// costs a descriptor, the very resource the daemon was running out of. Applies
+/// only while *waiting for a line*: a request being served is never interrupted,
+/// and a subscription ([`run_stream`]) takes the connection over and is exempt.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Environment override for [`stream_tick`] (whole seconds; a blank,
 /// non-numeric, or `0` value falls back to [`DEFAULT_STREAM_TICK`]).
 const ENV_STREAM_TICK: &str = "OMNI_DEV_DAEMON_STREAM_TICK";
@@ -184,6 +194,7 @@ async fn accept_loop<S: ConnectionSource>(
                         stream,
                         registry.clone(),
                         shutdown.clone(),
+                        IDLE_TIMEOUT,
                     ));
                 }
                 Err(e) => {
@@ -325,13 +336,25 @@ async fn drain_connections(conns: &mut JoinSet<()>, timeout: Duration) {
 /// torn down promptly on drain rather than waiting out [`DRAIN_TIMEOUT`].
 /// `shutdown` is threaded through for both (also the built-in `shutdown` op, see
 /// [`handle_builtin`]).
+///
+/// A connection that sends nothing for `idle_timeout` is closed (#2111), so a
+/// client that connected and went away cannot hold a descriptor indefinitely.
 async fn handle_connection(
     stream: UnixStream,
     registry: Arc<ServiceRegistry>,
     shutdown: CancellationToken,
+    idle_timeout: Duration,
 ) {
     let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
-    while let Some(line) = framed.next().await {
+    loop {
+        let line = match tokio::time::timeout(idle_timeout, framed.next()).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(_elapsed) => {
+                tracing::debug!(?idle_timeout, "closing an idle control-socket connection");
+                break;
+            }
+        };
         let line = match line {
             Ok(line) => line,
             Err(e) => {
@@ -912,7 +935,12 @@ mod tests {
             crate::daemon::services::worktrees::WorktreesService::new(),
         ));
         let shutdown = CancellationToken::new();
-        let task = tokio::spawn(handle_connection(server, Arc::new(registry), shutdown));
+        let task = tokio::spawn(handle_connection(
+            server,
+            Arc::new(registry),
+            shutdown,
+            IDLE_TIMEOUT,
+        ));
 
         let (read_half, mut write_half) = client.into_split();
         let mut reader = BufReader::new(read_half);
@@ -963,6 +991,7 @@ mod tests {
             server,
             Arc::new(registry),
             shutdown.clone(),
+            IDLE_TIMEOUT,
         ));
 
         let (read_half, mut write_half) = client.into_split();
@@ -1046,6 +1075,168 @@ mod tests {
         .await
         .expect("run_stream should return promptly when the initial send fails");
     }
+    // --- Idle connections (#2111) --------------------------------------------
+
+    fn ping_line() -> &'static [u8] {
+        b"{\"op\":\"ping\"}\n"
+    }
+
+    /// A client that connects and never sends is dropped after the idle timeout,
+    /// handing its descriptor back, rather than being held until the daemon exits.
+    #[tokio::test]
+    async fn handle_connection_closes_a_connection_that_never_sends() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_connection(
+            server,
+            worktrees_registry(),
+            CancellationToken::new(),
+            Duration::from_millis(50),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("an idle connection should be closed")
+            .unwrap();
+        // The daemon's end is gone, so the client reads EOF rather than blocking.
+        let mut buf = Vec::new();
+        assert_eq!(client.read_to_end(&mut buf).await.unwrap(), 0);
+    }
+
+    /// The timeout is per wait, not per connection: a client that keeps sending
+    /// inside the window stays connected for far longer than the window.
+    #[tokio::test]
+    async fn handle_connection_stays_open_while_requests_keep_arriving() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_connection(
+            server,
+            worktrees_registry(),
+            CancellationToken::new(),
+            Duration::from_millis(300),
+        ));
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        for _ in 0..3 {
+            write_half.write_all(ping_line()).await.unwrap();
+            assert!(read_reply(&mut reader).await.ok);
+            // Each pause is inside the window; together they exceed it.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the connection was closed while active"
+        );
+    }
+
+    /// A subscription takes the connection over, so it may sit silent indefinitely.
+    #[tokio::test]
+    async fn handle_connection_does_not_time_out_a_subscription() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(handle_connection(
+            server,
+            worktrees_registry(),
+            shutdown.clone(),
+            Duration::from_millis(50),
+        ));
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+        let env = serde_json::to_string(&DaemonEnvelope::service(
+            "worktrees",
+            "subscribe",
+            serde_json::Value::Null,
+        ))
+        .unwrap();
+        write_half.write_all(env.as_bytes()).await.unwrap();
+        write_half.write_all(b"\n").await.unwrap();
+        assert!(read_reply(&mut reader).await.ok);
+
+        // Several idle windows pass with nothing sent in either direction.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!task.is_finished(), "the idle timeout cut a subscription");
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown still ends the stream")
+            .unwrap();
+    }
+
+    /// A service that takes longer than the idle window to answer.
+    struct SlowService;
+
+    #[async_trait::async_trait]
+    impl crate::daemon::service::DaemonService for SlowService {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        async fn handle(
+            &self,
+            _op: &str,
+            _payload: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok(json!({ "done": true }))
+        }
+        fn menu(&self) -> crate::daemon::service::MenuSnapshot {
+            crate::daemon::service::MenuSnapshot {
+                title: "slow".to_string(),
+                items: vec![],
+            }
+        }
+        async fn menu_action(&self, _action_id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn status(&self) -> crate::daemon::service::ServiceStatus {
+            crate::daemon::service::ServiceStatus {
+                name: "slow".to_string(),
+                healthy: true,
+                summary: String::new(),
+                detail: serde_json::Value::Null,
+            }
+        }
+        async fn shutdown(&self) {}
+    }
+
+    /// The timeout covers only the wait for a request line: a request being
+    /// served is never cut off, however long it takes.
+    #[tokio::test]
+    async fn handle_connection_never_interrupts_a_request_in_progress() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut registry = ServiceRegistry::new();
+        registry.register(Arc::new(SlowService));
+        let task = tokio::spawn(handle_connection(
+            server,
+            Arc::new(registry),
+            CancellationToken::new(),
+            Duration::from_millis(50),
+        ));
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+        let env = serde_json::to_string(&DaemonEnvelope::service(
+            "slow",
+            "work",
+            serde_json::Value::Null,
+        ))
+        .unwrap();
+        write_half.write_all(env.as_bytes()).await.unwrap();
+        write_half.write_all(b"\n").await.unwrap();
+
+        // The 250ms answer outlasts the 50ms window and still arrives.
+        let reply = read_reply(&mut reader).await;
+        assert!(reply.ok);
+        assert_eq!(reply.payload, json!({ "done": true }));
+        drop(task);
+    }
+
     // --- Accept-error backoff (#2111) ----------------------------------------
 
     /// EMFILE ("Too many open files"), the error the daemon hit in production.
