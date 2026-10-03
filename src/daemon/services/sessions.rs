@@ -399,14 +399,15 @@ fn status_summary(sessions: &[SessionEntry]) -> String {
 
 /// The `status` summary's tail for [`DeliveryStats`] (#2136): how the daemon has
 /// been hearing about events. Empty until the first one, so an idle daemon's
-/// summary is unchanged. A steady `0 recovered` means the socket is keeping up.
+/// summary is unchanged. A steady `0 recovered` and `0 superseded` means the
+/// socket is keeping up.
 fn delivery_summary(delivery: DeliveryStats) -> String {
     if delivery == DeliveryStats::default() {
         return String::new();
     }
     format!(
-        " · events: {} via socket, {} recovered from journals, {} replayed",
-        delivery.socket, delivery.recovered, delivery.replayed
+        " · events: {} via socket, {} recovered from journals, {} superseded, {} replayed",
+        delivery.socket, delivery.recovered, delivery.superseded, delivery.replayed
     )
 }
 
@@ -783,6 +784,7 @@ mod tests {
             streamed: false,
             replaced_pids: VecDeque::new(),
             recent_seqs: VecDeque::new(),
+            superseded_seqs: VecDeque::new(),
             latest_stamp_ts: None,
             agent: crate::sessions::Agent::Claude,
             session_id: "sid-12345678".to_string(),
@@ -842,6 +844,7 @@ mod tests {
             streamed: false,
             replaced_pids: VecDeque::new(),
             recent_seqs: VecDeque::new(),
+            superseded_seqs: VecDeque::new(),
             latest_stamp_ts: None,
             agent: crate::sessions::Agent::Claude,
             session_id: id.to_string(),
@@ -1051,7 +1054,7 @@ mod tests {
         assert!(!quiet.summary.contains("events:"), "{}", quiet.summary);
         assert_eq!(
             quiet.detail["delivery"],
-            json!({ "socket": 0, "recovered": 0, "replayed": 0 })
+            json!({ "socket": 0, "recovered": 0, "superseded": 0, "replayed": 0 })
         );
 
         svc.handle(
@@ -1065,9 +1068,9 @@ mod tests {
             .unwrap();
         let status = svc.status().await;
         assert!(
-            status
-                .summary
-                .contains("events: 2 via socket, 0 recovered from journals, 0 replayed"),
+            status.summary.contains(
+                "events: 2 via socket, 0 recovered from journals, 0 superseded, 0 replayed"
+            ),
             "{}",
             status.summary
         );
@@ -1087,9 +1090,10 @@ mod tests {
             delivery_summary(DeliveryStats {
                 socket: 0,
                 recovered: 1,
+                superseded: 0,
                 replayed: 0
             }),
-            " · events: 0 via socket, 1 recovered from journals, 0 replayed"
+            " · events: 0 via socket, 1 recovered from journals, 0 superseded, 0 replayed"
         );
     }
 
