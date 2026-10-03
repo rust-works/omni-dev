@@ -326,7 +326,7 @@ pub fn resolve(
             }
             if cs <= preview.location.index && preview.location.index < ce {
                 if reference.is_some() {
-                    return Err(TableError::InvalidTable);
+                    return Err(TableError::InvalidTable); // omni-dev: coverage ignore-line reason="rows, cells and paragraphs are each checked above to start at or after the previous one's end, so the half-open cell ranges are pairwise disjoint and at most one contains the index; kept as defence in depth on the write boundary"
                 }
                 reference = Some((r as i64, c as i64));
             }
@@ -346,7 +346,7 @@ pub fn resolve(
         column_index: column,
     };
     let TableEdit::Dimension { after, .. } = edit else {
-        return Err(TableError::InvalidIntent);
+        return Err(TableError::InvalidIntent); // omni-dev: coverage ignore-line reason="an Insert edit returned from the branch above, so only a Dimension edit reaches here; the else-arm exists only to destructure the already-known variant"
     };
     let request = match verb {
         TableVerb::InsertRow => {
@@ -383,7 +383,7 @@ pub fn resolve(
                 table_cell_location: cell,
             })
         }
-        TableVerb::InsertTable => return Err(TableError::InvalidIntent),
+        TableVerb::InsertTable => return Err(TableError::InvalidIntent), // omni-dev: coverage ignore-line reason="validate already refuses a Dimension edit carrying InsertTable before resolve reads the document, so this arm exists solely for exhaustiveness over TableVerb"
     };
     Ok((request, preview))
 }
@@ -618,6 +618,192 @@ mod tests {
             }
         );
     }
+
+    fn insert(anchor: &str, rows: i64, columns: i64) -> TableEdit {
+        TableEdit::Insert {
+            anchor: anchor.into(),
+            side: Side::After,
+            rows,
+            columns,
+            match_case: true,
+        }
+    }
+
+    /// Each verb's CLI, audit-log and permission spelling is pinned, so a
+    /// transposed arm cannot send a delete through the additive gate.
+    #[test]
+    fn every_verb_has_its_own_label_log_name_and_permission() {
+        for (verb, label, log, gate) in [
+            (
+                TableVerb::InsertTable,
+                "insert-table",
+                "docs-insert-table",
+                DriveOperation::DocsStructure,
+            ),
+            (
+                TableVerb::InsertRow,
+                "insert-table-row",
+                "docs-insert-table-row",
+                DriveOperation::DocsStructure,
+            ),
+            (
+                TableVerb::InsertColumn,
+                "insert-table-column",
+                "docs-insert-table-column",
+                DriveOperation::DocsStructure,
+            ),
+            (
+                TableVerb::DeleteRow,
+                "delete-table-row",
+                "docs-delete-table-row",
+                DriveOperation::DocsTableDelete,
+            ),
+            (
+                TableVerb::DeleteColumn,
+                "delete-table-column",
+                "docs-delete-table-column",
+                DriveOperation::DocsTableDelete,
+            ),
+        ] {
+            assert_eq!(verb.label(), label);
+            assert_eq!(verb.log_operation(), log);
+            assert_eq!(verb.gate_operation(), gate);
+        }
+    }
+
+    #[test]
+    fn an_edit_reports_the_verb_it_describes() {
+        assert_eq!(insert("Intro", 1, 1).verb(), TableVerb::InsertTable);
+        for verb in [TableVerb::InsertRow, TableVerb::DeleteColumn] {
+            assert_eq!(dimension(verb).verb(), verb);
+        }
+    }
+
+    /// The allocation bound is on the product, checked without overflow, and
+    /// a rejected intent never reads the document.
+    #[test]
+    fn insertion_refuses_non_positive_oversized_and_overflowing_grids() {
+        for (rows, columns) in [
+            (0, 1),
+            (1, 0),
+            (-1, 5),
+            (5, -1),
+            (1, 10_001),
+            (10_001, 1),
+            (101, 100),
+            (i64::MAX, 2),
+        ] {
+            assert_eq!(
+                resolve(&doc(fixture()), &insert("Intro", rows, columns)).unwrap_err(),
+                TableError::InvalidIntent,
+                "{rows}x{columns}"
+            );
+        }
+        for (rows, columns) in [(1, 1), (1, 10_000), (10_000, 1), (100, 100)] {
+            assert!(
+                resolve(&doc(fixture()), &insert("Intro", rows, columns)).is_ok(),
+                "{rows}x{columns}"
+            );
+        }
+    }
+
+    #[test]
+    fn insertion_and_dimension_edits_refuse_an_anchor_that_spans_paragraphs() {
+        for anchor in ["a\nb", "a\rb", ""] {
+            assert_eq!(
+                resolve(&doc(fixture()), &insert(anchor, 1, 1)).unwrap_err(),
+                TableError::InvalidIntent,
+                "{anchor:?}"
+            );
+            let edit = TableEdit::Dimension {
+                verb: TableVerb::DeleteRow,
+                cell: anchor.into(),
+                after: false,
+                match_case: true,
+            };
+            assert_eq!(
+                resolve(&doc(fixture()), &edit).unwrap_err(),
+                TableError::InvalidIntent,
+                "{anchor:?}"
+            );
+        }
+    }
+
+    /// `InsertTable` needs dimensions and a body anchor, which a `Dimension`
+    /// edit cannot carry, so it is refused before the document is read.
+    #[test]
+    fn a_dimension_edit_cannot_insert_a_table() {
+        assert_eq!(
+            resolve(&doc(fixture()), &dimension(TableVerb::InsertTable)).unwrap_err(),
+            TableError::InvalidIntent
+        );
+    }
+
+    /// Two structural elements claiming the anchor's index leave nothing to
+    /// pick between, so the edit is refused rather than guessing a container.
+    #[test]
+    fn an_anchor_inside_overlapping_body_elements_is_an_unsafe_boundary() {
+        let mut value = fixture();
+        value["tabs"][0]["documentTab"]["body"]["content"][1]["startIndex"] = json!(1);
+        assert_eq!(
+            resolve(&doc(value), &insert("Intro", 1, 1)).unwrap_err(),
+            TableError::UnsafeBoundary
+        );
+    }
+
+    /// The table's declared shape and each row, cell and paragraph's indices
+    /// must tile the table exactly; any gap, overlap or overrun fails closed.
+    #[test]
+    fn inconsistent_table_dimensions_and_index_ranges_fail_closed() {
+        type Corrupt = fn(&mut serde_json::Value);
+        let cases: [(&str, Corrupt); 8] = [
+            ("declared rows disagree with the row list", |value| {
+                table(value)["rows"] = json!(3);
+            }),
+            ("no declared rows", |value| {
+                table(value)["rows"] = json!(0);
+            }),
+            ("no declared columns", |value| {
+                table(value)["columns"] = json!(0);
+            }),
+            ("row overruns the table", |value| {
+                table(value)["tableRows"][0]["endIndex"] = json!(1000);
+            }),
+            ("row has no end", |value| {
+                table(value)["tableRows"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("endIndex");
+            }),
+            ("cell has no start", |value| {
+                table(value)["tableRows"][1]["tableCells"][1]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("startIndex");
+            }),
+            (
+                "cell's first paragraph does not follow its start",
+                |value| {
+                    table(value)["tableRows"][1]["tableCells"][1]["startIndex"] = json!(37);
+                },
+            ),
+            ("cell's paragraphs stop short of its end", |value| {
+                value["tabs"][0]["documentTab"]["body"]["content"][1]["endIndex"] = json!(44);
+                table(value)["tableRows"][1]["endIndex"] = json!(44);
+                table(value)["tableRows"][1]["tableCells"][1]["endIndex"] = json!(44);
+            }),
+        ];
+        for (name, corrupt) in cases {
+            let mut value = fixture();
+            corrupt(&mut value);
+            assert_eq!(
+                resolve(&doc(value), &dimension(TableVerb::DeleteRow)).unwrap_err(),
+                TableError::InvalidTable,
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn unmodelled_inline_suggestions_and_bad_cell_paragraph_bounds_fail_closed() {
         let mut value = fixture();

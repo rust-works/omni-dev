@@ -271,6 +271,17 @@ impl WriteVerb {
             Self::Table(verb) => verb.label(),
         }
     }
+
+    /// The permission this verb is gated by; the same mapping as
+    /// [`WritePayload::gate_operation`], for messages that only hold a verb.
+    const fn gate_operation(self) -> DriveOperation {
+        match self {
+            Self::Table(verb) => verb.gate_operation(),
+            Self::Delete => DriveOperation::DocsDelete,
+            Self::TextStyle | Self::ParagraphStyle => DriveOperation::DocsFormat,
+            _ => DriveOperation::DocsWrite,
+        }
+    }
 }
 
 /// Per-call options.
@@ -858,9 +869,11 @@ async fn write_inner(
         Ok(response) => match &opts.payload {
             WritePayload::Table(_) => match preview {
                 WriteResult::WouldEditTable { edit } => WriteResult::EditedTable { edit },
+                // omni-dev: coverage ignore reason="`preview` is built by the payload match above, so a Table payload always carries a WouldEditTable preview; this arm exists solely for exhaustiveness over the shared WriteResult enum"
                 _ => WriteResult::Failed {
                     detail: "missing resolved table preview".into(),
                 },
+                // omni-dev: coverage end
             },
             WritePayload::Replace { .. } => WriteResult::Replaced {
                 occurrences_changed: response.occurrences_changed_for_replace(),
@@ -1129,28 +1142,8 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
              Grant it by id instead: add {{\"file_id\": \"<document id>\", \"allow\": \
              [\"{}\"]}} to write_permissions.rules. (Adding it to a folder in your \
              own Drive and granting that folder `{}` also works.)",
-            match verb {
-                WriteVerb::Table(v) =>
-                    if v.gate_operation() == DriveOperation::DocsStructure {
-                        "docs-structure"
-                    } else {
-                        "docs-table-delete"
-                    },
-                WriteVerb::Delete => "docs-delete",
-                WriteVerb::TextStyle | WriteVerb::ParagraphStyle => "docs-format",
-                _ => "docs-write",
-            },
-            match verb {
-                WriteVerb::Table(v) =>
-                    if v.gate_operation() == DriveOperation::DocsStructure {
-                        "docs-structure"
-                    } else {
-                        "docs-table-delete"
-                    },
-                WriteVerb::Delete => "docs-delete",
-                WriteVerb::TextStyle | WriteVerb::ParagraphStyle => "docs-format",
-                _ => "docs-write",
-            }
+            verb.gate_operation(),
+            verb.gate_operation()
         ),
         WriteResult::RefusedNoRevisionId => format!(
             "Refused: '{name}' returned no revision id, which Google sends only to callers \
@@ -3515,6 +3508,260 @@ mod tests {
                         .all(|r| !r.url.path().ends_with(":batchUpdate")));
                 }
             }
+        }
+    }
+
+    fn table_preview() -> TablePreview {
+        TablePreview {
+            operation: TableVerb::InsertRow,
+            location: super::super::write_types::Location {
+                index: 10,
+                tab_id: Some("child".into()),
+                segment_id: None,
+            },
+            row_index: Some(0),
+            column_index: Some(1),
+            rows_before: 2,
+            columns_before: 2,
+            rows_after: 3,
+            columns_after: 2,
+            insert_after: true,
+            preceding_newline: false,
+        }
+    }
+
+    /// The same one-line summary serves the preview and the applied write,
+    /// naming the direction only where one exists and the reference cell only
+    /// when the edit has one.
+    #[test]
+    fn describe_renders_each_table_effect_with_its_direction_and_reference_cell() {
+        let text = |applied: bool, edit: TablePreview| {
+            let verb = WriteVerb::Table(edit.operation);
+            let result = if applied {
+                WriteResult::EditedTable { edit }
+            } else {
+                WriteResult::WouldEditTable { edit }
+            };
+            describe(&outcome_with(result), verb)
+        };
+        let with = |operation, insert_after, rows_after, columns_after| TablePreview {
+            operation,
+            rows_after,
+            columns_after,
+            insert_after,
+            ..table_preview()
+        };
+        for (applied, edit, expected) in [
+            (
+                false,
+                with(TableVerb::InsertRow, true, 3, 2),
+                "Would apply insert-table-row in 'Budget': 2x2 -> 3x2, UTF-16 index 10, \
+                 tab child, reference cell (0, 1), below",
+            ),
+            (
+                true,
+                with(TableVerb::InsertRow, false, 3, 2),
+                "Applied insert-table-row in 'Budget': 2x2 -> 3x2, UTF-16 index 10, \
+                 tab child, reference cell (0, 1), above",
+            ),
+            (
+                false,
+                with(TableVerb::InsertColumn, true, 2, 3),
+                "Would apply insert-table-column in 'Budget': 2x2 -> 2x3, UTF-16 index 10, \
+                 tab child, reference cell (0, 1), right",
+            ),
+            (
+                true,
+                with(TableVerb::InsertColumn, false, 2, 3),
+                "Applied insert-table-column in 'Budget': 2x2 -> 2x3, UTF-16 index 10, \
+                 tab child, reference cell (0, 1), left",
+            ),
+            (
+                true,
+                with(TableVerb::DeleteRow, false, 1, 2),
+                "Applied delete-table-row in 'Budget': 2x2 -> 1x2, UTF-16 index 10, \
+                 tab child, reference cell (0, 1)",
+            ),
+            (
+                false,
+                with(TableVerb::DeleteColumn, false, 2, 1),
+                "Would apply delete-table-column in 'Budget': 2x2 -> 2x1, UTF-16 index 10, \
+                 tab child, reference cell (0, 1)",
+            ),
+            (
+                false,
+                TablePreview {
+                    operation: TableVerb::InsertTable,
+                    location: super::super::write_types::Location {
+                        index: 4,
+                        tab_id: None,
+                        segment_id: None,
+                    },
+                    row_index: None,
+                    column_index: None,
+                    rows_before: 0,
+                    columns_before: 0,
+                    rows_after: 2,
+                    columns_after: 3,
+                    insert_after: false,
+                    preceding_newline: true,
+                },
+                "Would apply insert-table in 'Budget': 0x0 -> 2x3, UTF-16 index 4, \
+                 tab first; adds preceding newline",
+            ),
+        ] {
+            assert_eq!(text(applied, edit), expected);
+        }
+    }
+
+    #[test]
+    fn describe_names_the_refused_table_reason_without_quoting_document_text() {
+        assert_eq!(
+            describe(
+                &outcome_with(WriteResult::RefusedTable {
+                    error: TableError::LastDimension,
+                }),
+                WriteVerb::Table(TableVerb::DeleteRow),
+            ),
+            "Refused: unsafe or unresolved table in 'Budget': LastDimension"
+        );
+    }
+
+    /// The log status is the wire `status` tag, so a log reader and an API
+    /// consumer see the same word for the same outcome.
+    #[test]
+    fn table_statuses_are_named_for_the_log_and_match_the_wire_tag() {
+        for (result, status) in [
+            (
+                WriteResult::WouldEditTable {
+                    edit: table_preview(),
+                },
+                "would-edit-table",
+            ),
+            (
+                WriteResult::EditedTable {
+                    edit: table_preview(),
+                },
+                "edited-table",
+            ),
+            (
+                WriteResult::RefusedTable {
+                    error: TableError::UnsafeBoundary,
+                },
+                "refused-table",
+            ),
+        ] {
+            assert_eq!(result.log_status(), status);
+            assert_eq!(serde_json::to_value(&result).unwrap()["status"], status);
+        }
+    }
+
+    /// A verb on its own (as `describe` holds it) names the same CLI spelling,
+    /// log operation and permission as the table verb it wraps, and as the
+    /// payload that produced it.
+    #[test]
+    fn a_table_verb_agrees_with_its_payload_on_label_log_name_and_permission() {
+        for table_verb in [
+            TableVerb::InsertTable,
+            TableVerb::InsertRow,
+            TableVerb::InsertColumn,
+            TableVerb::DeleteRow,
+            TableVerb::DeleteColumn,
+        ] {
+            let verb = WriteVerb::Table(table_verb);
+            assert_eq!(verb.label(), table_verb.label());
+            assert_eq!(verb.log_operation(), table_verb.log_operation());
+            assert_eq!(verb.gate_operation(), table_verb.gate_operation());
+        }
+        for payload in table_payloads().into_iter().chain(formatting_payloads()) {
+            assert_eq!(payload.verb().gate_operation(), payload.gate_operation());
+        }
+    }
+
+    #[test]
+    fn every_verb_is_gated_by_the_permission_its_payload_is() {
+        for (verb, gate) in [
+            (WriteVerb::Replace, DriveOperation::DocsWrite),
+            (WriteVerb::Append, DriveOperation::DocsWrite),
+            (WriteVerb::Insert, DriveOperation::DocsWrite),
+            (WriteVerb::Delete, DriveOperation::DocsDelete),
+            (WriteVerb::TextStyle, DriveOperation::DocsFormat),
+            (WriteVerb::ParagraphStyle, DriveOperation::DocsFormat),
+            (WriteVerb::CreateBullets, DriveOperation::DocsWrite),
+            (WriteVerb::DeleteBullets, DriveOperation::DocsWrite),
+            (
+                WriteVerb::Table(TableVerb::InsertRow),
+                DriveOperation::DocsStructure,
+            ),
+            (
+                WriteVerb::Table(TableVerb::DeleteRow),
+                DriveOperation::DocsTableDelete,
+            ),
+        ] {
+            assert_eq!(verb.gate_operation(), gate, "{verb:?}");
+        }
+    }
+
+    /// The grant hint names the permission the verb is really gated by, in
+    /// both places it appears, so a table edit is not told to grant
+    /// `docs-write`.
+    #[test]
+    fn describe_names_the_permission_each_verb_needs_when_no_parent_is_visible() {
+        for (verb, operation) in [
+            (WriteVerb::Replace, "docs-write"),
+            (WriteVerb::Delete, "docs-delete"),
+            (WriteVerb::TextStyle, "docs-format"),
+            (WriteVerb::ParagraphStyle, "docs-format"),
+            (WriteVerb::Table(TableVerb::InsertTable), "docs-structure"),
+            (WriteVerb::Table(TableVerb::InsertColumn), "docs-structure"),
+            (
+                WriteVerb::Table(TableVerb::DeleteColumn),
+                "docs-table-delete",
+            ),
+        ] {
+            let text = describe(&outcome_with(WriteResult::RefusedNoVisibleParents), verb);
+            assert!(text.contains(&format!("[\"{operation}\"]")), "{text}");
+            assert!(
+                text.contains(&format!("granting that folder `{operation}`")),
+                "{text}"
+            );
+        }
+    }
+
+    /// An anchor that does not resolve is a typed refusal, decided before the
+    /// lease or the mutation, so a preview and a real run agree and neither
+    /// sends anything.
+    #[tokio::test]
+    async fn a_table_edit_that_does_not_resolve_is_refused_before_any_mutation() {
+        for dry_run in [true, false] {
+            let server = MockServer::start().await;
+            let (drive, docs) = table_setup(&server).await;
+            let payload = WritePayload::Table(TableEdit::Dimension {
+                verb: TableVerb::DeleteRow,
+                cell: "missing".into(),
+                after: false,
+                match_case: true,
+            });
+            let rule = rule_for(&payload);
+            let mut opts = replace_opts(dry_run);
+            opts.payload = payload;
+            let outcome = write(&drive, &docs, &opts, &[rule]).await;
+            assert_eq!(
+                outcome.result,
+                WriteResult::RefusedTable {
+                    error: TableError::Anchor {
+                        error: AnchorError::NotFound
+                    }
+                },
+                "dry_run {dry_run}"
+            );
+            assert_eq!(outcome.required_revision_id.as_deref(), Some("rev-table"));
+            assert!(server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| !r.url.path().ends_with(":batchUpdate")));
         }
     }
 }
