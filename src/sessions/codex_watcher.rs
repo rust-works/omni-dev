@@ -224,7 +224,12 @@ fn probe_lock(_locks: &Path, _id: &str) -> LockState {
 /// loaded, a free or absent one that it is gone. [`LockState::Unknown`] when no
 /// Codex home resolves.
 pub(crate) fn probe_thread_lock(id: &str) -> LockState {
-    match codex_home() {
+    probe_thread_lock_in(codex_home().as_deref(), id)
+}
+
+/// [`probe_thread_lock`] under an already-resolved Codex home.
+fn probe_thread_lock_in(home: Option<&Path>, id: &str) -> LockState {
+    match home {
         Some(home) => probe_lock(&home.join("thread-writer-locks"), id),
         None => LockState::Unknown,
     }
@@ -1105,6 +1110,26 @@ mod tests {
         assert_eq!(probe_lock(tmp.path(), ID), LockState::Held);
         drop(holder);
         assert_eq!(probe_lock(tmp.path(), ID), LockState::Free);
+    }
+
+    #[test]
+    fn the_thread_lock_probe_reads_the_resolved_homes_lock_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No home resolves at all: no information.
+        assert_eq!(probe_thread_lock_in(None, ID), LockState::Unknown);
+        // A home without a lock directory is a Codex that keeps no locks.
+        assert_eq!(
+            probe_thread_lock_in(Some(tmp.path()), ID),
+            LockState::Unknown
+        );
+        let locks = tmp.path().join("thread-writer-locks");
+        std::fs::create_dir(&locks).unwrap();
+        assert_eq!(
+            probe_thread_lock_in(Some(tmp.path()), ID),
+            LockState::Absent
+        );
+        std::fs::write(locks.join(format!("{ID}.lock")), "").unwrap();
+        assert_eq!(probe_thread_lock_in(Some(tmp.path()), ID), LockState::Free);
     }
 
     #[test]

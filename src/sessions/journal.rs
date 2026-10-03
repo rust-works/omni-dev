@@ -314,15 +314,16 @@ fn sweep_stale(agent_dir: &Path, keep: &Path) {
         if path == keep || !is_journal {
             continue;
         }
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        let stale = meta.is_file()
-            && meta
-                .modified()
-                .ok()
-                .and_then(|m| m.elapsed().ok())
-                .is_some_and(|age| age > MAX_JOURNAL_AGE);
+        // `symlink_metadata`, so a link is never followed; an entry that vanished
+        // since the listing is simply not stale.
+        let stale = std::fs::symlink_metadata(&path).is_ok_and(|meta| {
+            meta.is_file()
+                && meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age > MAX_JOURNAL_AGE)
+        });
         if stale {
             // Best-effort housekeeping: a failure only leaves the file for the
             // daemon's sweep.
@@ -702,5 +703,32 @@ mod tests {
         age_file(&fresh, 8 * 24 * 3600);
         append(&dir, &record).unwrap();
         assert!(fresh.exists());
+    }
+
+    #[test]
+    fn sweeping_a_directory_that_is_not_there_does_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("claude");
+        sweep_stale(&missing, &missing.join(format!("{ID}.jsonl")));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn a_stale_journal_that_cannot_be_deleted_is_left_for_the_daemons_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("claude");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let stale = agent_dir.join("1c8f7d2b-3a5e-4b9f-8d4c-6e2f8a0b3c5d.jsonl");
+        let keep = agent_dir.join("2d9a8e3c-4b6f-4c0a-9e5d-7f3a9b1c4d6e.jsonl");
+        std::fs::write(&stale, "x\n").unwrap();
+        age_file(&stale, 8 * 24 * 3600);
+
+        // A directory nobody may write to refuses the unlink.
+        std::fs::set_permissions(&agent_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Root ignores directory permissions, so only then is the unlink allowed.
+        let privileged = std::fs::write(agent_dir.join("probe"), "").is_ok();
+        sweep_stale(&agent_dir, &keep);
+        std::fs::set_permissions(&agent_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(stale.exists(), !privileged, "privileged: {privileged}");
     }
 }
