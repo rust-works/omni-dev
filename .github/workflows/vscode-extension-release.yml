@@ -6,9 +6,13 @@ name: VS Code extension release
 # runs on a dedicated `vscode-v*` tag or a manual dispatch — NEVER on a `main`
 # push — so a routine merge can never publish.
 #
-# Release flow (extension version is independent of the Rust crate):
-#   1. bump `version` in editors/vscode/package.json (and package-lock.json)
-#   2. commit, then tag the merge commit `vscode-v<version>` (e.g. vscode-v0.2.1)
+# Release flow (extension version is independent of the Rust crate; the full
+# procedure is docs/RELEASE.md):
+#   1. bump `version` in editors/vscode/package.json (and package-lock.json),
+#      update editors/vscode/CHANGELOG.md, and land it through a pull request —
+#      `main` merges by rebase through a merge queue, so the commit's hash changes
+#   2. after the merge, tag that rebased commit `vscode-v<version>`
+#      (e.g. vscode-v0.2.1) — never the local pre-merge commit
 #   3. push the tag — this workflow verifies tag == package.json version,
 #      re-runs typecheck/build/test/package, then publishes the same .vsix to
 #      both registries.
