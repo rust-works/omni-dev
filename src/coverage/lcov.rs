@@ -110,18 +110,21 @@ end_of_record
         assert_eq!(report.hits("src/b.rs", 2), Some(2));
     }
 
-    /// Concatenated shard files parse as the same union `CoverageReport::merge`
-    /// builds: the docs tell a caller that needs a single file (a baseline) that
-    /// `cat shard-*.lcov` is equivalent, so that has to stay true.
+    /// Shard files joined with a newline parse as the same union
+    /// `CoverageReport::merge` builds: the docs tell a caller that needs a single
+    /// file (a baseline) that this is equivalent, so that has to stay true.
+    ///
+    /// The shards end like real `cargo llvm-cov` output — **no trailing newline**
+    /// after the last `end_of_record`, which is why the join needs its own.
     #[test]
-    fn concatenated_shards_parse_as_their_merge() {
-        let shard_a = "TN:\nSF:src/a.rs\nDA:1,3\nDA:2,0\nend_of_record\n";
+    fn newline_joined_shards_parse_as_their_merge() {
+        let shard_a = "TN:\nSF:src/a.rs\nDA:1,3\nDA:2,0\nend_of_record";
         let shard_b = "TN:\nSF:src/a.rs\nDA:1,0\nDA:2,2\nDA:3,0\nend_of_record\n\
-                       SF:src/b.rs\nDA:1,1\nend_of_record\n";
+                       SF:src/b.rs\nDA:1,1\nend_of_record";
 
         let mut merged = parse(shard_a).unwrap();
         merged.merge(parse(shard_b).unwrap());
-        let concatenated = parse(&format!("{shard_a}{shard_b}")).unwrap();
+        let concatenated = parse(&format!("{shard_a}\n{shard_b}")).unwrap();
 
         assert_eq!(concatenated, merged);
         assert_eq!(concatenated.hits("src/a.rs", 1), Some(3));

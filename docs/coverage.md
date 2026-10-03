@@ -89,7 +89,12 @@ error.
   counted from the report's per-line records, so it can differ slightly from
   `cargo llvm-cov report --summary-only`, which counts from the profile data and
   the instrumented binaries. Pick a threshold against this command's number, not
-  against that one.
+  against that one. Measured on this repository's own unit-test suite (about 97%
+  covered), the lcov-derived figure was **0.16 pp higher** than llvm-cov's summary:
+  the lcov lists about 6% fewer lines (324,274 against 344,949), and the lines it
+  omits are mostly covered ones. The cause was not investigated, and the gap will
+  differ per codebase. `ignore` markers and `--ignore-filename-regex` move the gate
+  figure further, since llvm-cov's summary knows nothing of them.
 - **An unmeasurable total fails.** A report with no executable lines — empty, or
   fully excluded by `--ignore-filename-regex` — fails `--fail-under-lines`. This is
   deliberately unlike `--fail-under-patch`, where "no added lines" is a property of
@@ -176,10 +181,15 @@ check applies to it.
 - `--strip-prefix` is one value, so every shard has to share a workspace root.
   Shards from the same CI runner image do; a mix of, say, Linux and macOS runners
   does not, and the warning above is the signal.
-- `--baseline-report` takes **one** report. A baseline from a sharded run must be
-  a single file. For lcov, concatenating the shards (`cat shard-*.lcov >
-  base.lcov`) is equivalent to merging them, since repeated records for a file are
-  unioned the same way — but, unlike `--report`, it gives no empty-shard check.
+- `--baseline-report` takes **one** report, so a baseline from a sharded run must
+  be a single file. For lcov, joining the shards is equivalent to merging them —
+  repeated records for a file are unioned the same way — but join them **with a
+  newline between files**. `cargo llvm-cov` writes no newline after its final
+  `end_of_record`, so a plain `cat shard-*.lcov > base.lcov` glues one shard's last
+  record onto the next shard's first line, and the parser then silently drops that
+  next file's header and understates coverage (about 0.14 pp on this repository's
+  own test suite). Use `for f in shard-*.lcov; do cat "$f"; echo; done > base.lcov`.
+  Unlike `--report`, joining gives no empty-shard check.
 - The merge-base baseline recompute and `codecov.json` /
   `coverage-summary.txt` come from `cargo llvm-cov` in the reusable action and are
   not part of this command.
