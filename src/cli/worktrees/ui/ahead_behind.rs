@@ -82,7 +82,10 @@ impl Inputs {
     }
 }
 
-/// The inputs of a path the tree has not reported (yet).
+/// The inputs of a path the tree has not reported (yet). Deliberately equal to
+/// `Inputs::default()`, which is also what a detached worktree in a repo with no
+/// default branch reports: equal inputs mean an equal answer, so a fetch stamped
+/// with either is as current as the other.
 static NO_INPUTS: Inputs = Inputs {
     branch: None,
     head_sha: None,
@@ -236,8 +239,8 @@ impl AheadBehindCache {
     }
 
     /// Resolves once a fetch batch's results land, merging them into the
-    /// cache, or once a failed batch's retry falls due and has re-queued what
-    /// is missing. Intended as a `tokio::select!` branch alongside a hub's other
+    /// cache, or once a failed batch's retry — or an unsettled row's recheck —
+    /// falls due and has re-queued what is missing. Intended as a `tokio::select!` branch alongside a hub's other
     /// feeds; never resolves if nothing has ever been queued.
     ///
     /// A failed batch stores nothing: its paths stop being pending and read as
@@ -290,6 +293,16 @@ impl AheadBehindCache {
                         Instant::now(),
                         (self.retry_base, self.shallow_recheck),
                     );
+                    // Attempts count only unsettled *omissions*; a shallow row's is 0.
+                    if let Some(recheck) = entry.recheck.filter(|r| r.attempts > 0) {
+                        tracing::debug!(
+                            "worktrees ui: ahead-behind row for {} omitted although its \
+                             refs promise one ({} in a row), asking again in {:?}",
+                            path.display(),
+                            recheck.attempts,
+                            recheck.at.saturating_duration_since(Instant::now()),
+                        );
+                    }
                     self.entries.insert(path, entry);
                 }
                 if superseded {
@@ -312,6 +325,17 @@ impl AheadBehindCache {
                 );
                 for (path, _) in &requested {
                     self.pending.remove(path);
+                    // An unsettled row stays cached while it is re-asked, and its
+                    // recheck is already due. Left so, `next_wake` would be in the
+                    // past and the timer would fire again at once — a tight loop
+                    // against a daemon that is down. Hold it to the backoff.
+                    if let Some(recheck) = self
+                        .entries
+                        .get_mut(path)
+                        .and_then(|entry| entry.recheck.as_mut())
+                    {
+                        recheck.at = recheck.at.max(due);
+                    }
                 }
             }
         }
@@ -1403,5 +1427,51 @@ mod tests {
         cache.observe(at_head(&path, "bbb"));
         assert!(!cache.entries.contains_key(&path));
         assert!(cache.next_wake().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_re_ask_of_an_unsettled_row_waits_out_the_backoff_instead_of_spinning() {
+        // An unsettled row stays cached while it is re-asked, and its recheck is
+        // already due. If the re-ask fails (the daemon is down) and the entry is
+        // left as it was, `next_wake` is in the past: the timer fires at once, the
+        // row is due again, and it is asked again as fast as the connect fails.
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        let overdue = Instant::now();
+        cache.entries.insert(
+            path.clone(),
+            Entry {
+                state: AheadBehindState::Unknown,
+                recheck: Some(Recheck {
+                    at: overdue,
+                    attempts: 1,
+                }),
+            },
+        );
+        cache.pending.insert(path.clone());
+        cache
+            .results_tx
+            .send(FetchResult {
+                requested: asked(&path),
+                results: Err(anyhow::anyhow!("daemon unreachable")),
+            })
+            .unwrap();
+        cache.changed().await;
+
+        let wake = cache.next_wake().expect("a retry is scheduled");
+        assert!(wake > Instant::now(), "the timer would fire at once");
+        let held = cache.entries[&path].recheck.unwrap();
+        assert!(held.at > overdue, "the recheck was held to the backoff");
+        assert_eq!(held.attempts, 1, "a failed fetch is not another omission");
+        // And `changed` really does wait rather than resolve straight away.
+        let waited = tokio::time::timeout(Duration::from_millis(30), cache.changed()).await;
+        assert!(waited.is_err());
+    }
+
+    #[test]
+    fn a_path_the_tree_has_not_reported_has_the_default_inputs() {
+        // `NO_INPUTS` stands in for `Inputs::default()` without allocating; they
+        // must never drift apart.
+        assert_eq!(NO_INPUTS, Inputs::default());
     }
 }
