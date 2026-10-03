@@ -93,6 +93,18 @@ started, or that survives a daemon restart, will heartbeat against an empty map.
 The daemon answers `{ known: false }`, which is the companion's signal to
 re-`register`. No state is persisted to make this work.
 
+The TTL clock **pauses while the daemon cannot hear its windows** (#2111). If the
+control socket's `accept` is failing — in practice descriptor exhaustion, `Too many
+open files` — heartbeats cannot arrive, so a window's silence says nothing about
+whether it is alive. The server credits the time it spent failing to every service
+(`DaemonService::credit_accept_outage`), and the registry advances each live
+entry's `last_seen` by that long (never past now). Without it, the first heartbeat
+to land after an outage reaped every *other* window that had been quiet for more
+than 30 s — `heartbeat` reaps before it touches the sender — and whole repos
+vanished from the tree for a few seconds. The credit only touches entries still in
+the map: a window that was already reaped stays gone and re-registers through the
+`{ known: false }` path above.
+
 The registry is also **capped at 256 windows** (#1140): where the TTL bounds how
 *stale* an entry can get, the cap bounds how *many* can exist, so a misbehaving
 client flooding `register` with distinct keys cannot grow daemon memory faster
@@ -1559,7 +1571,21 @@ extension never runs git.
   once for the whole tree). The bounded, non-streamed surfaces — `list`/`status`
   (the primary folder of each open window) and the tray `menu` (open windows only)
   — still compute `ahead`/`behind` inline, since the walk cost there is negligible.
-- **`main_behind` rides the same lazy op (#1457).** `folder_main_behind`
+- **The lazy op is coalesced, memoized and bounded (#2111).** Every window re-asks
+  for every worktree of every expanded repo on each pushed delta, so N windows send
+  N identical batches at once. The op therefore (1) **shares one computation per
+  worktree** between concurrent requests (single-flight; nothing is kept once it
+  finishes, so a later request always reads the repository as it is then), (2)
+  **memoizes each commit-graph walk** by `(repository, local tip, upstream tip)` —
+  ancestry is a pure function of the commit ids, so a hit is exact and a commit,
+  fetch or push simply misses, with no TTL to tune — and (3) **runs at most four
+  computations at a time**, so the walks cannot saturate the blocking pool or hold
+  more than a few repositories' pack files open. It also answers both questions
+  (own-upstream and default-branch divergence) from a single `Repository` open
+  per worktree. The memo is shared with the inline `ahead`/`behind` that `list` and
+  the tray menu compute. A computation that fails degrades to "no divergence" for
+  that worktree, which omits its row.
+- **`main_behind` rides the same lazy op (#1457).** `repo_main_behind`
   resolves the repository's remote default branch the same **local-only,
   no-fetch** way `worktrees rebase`'s `--onto` default does
   (`RemoteInfo::detect_main_branch_local`), then reuses the same
