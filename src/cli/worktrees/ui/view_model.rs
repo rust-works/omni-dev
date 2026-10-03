@@ -111,8 +111,14 @@ pub enum AheadBehindState {
         behind: usize,
         main_behind: Option<usize>,
     },
+    /// A branch with no upstream that is behind the repo's default branch: the
+    /// daemon sends `main_behind` with no `ahead`/`behind` (#1457), since that is
+    /// exactly the case the count exists to surface. There is no `+a -b` to
+    /// show, so it is not a [`Known`](Self::Known) with the counts zeroed.
+    MainOnly { main_behind: usize },
     /// Asked for, and the daemon *answered* that it has nothing to report (no
-    /// upstream). Settled until a ref moves, unlike [`Unknown`](Self::Unknown).
+    /// upstream and no default branch to compare with). Settled until a ref
+    /// moves, unlike [`Unknown`](Self::Unknown).
     Unavailable,
 }
 

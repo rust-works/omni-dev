@@ -141,6 +141,9 @@ fn worktree_line(wt: &WorktreeRow, glyphs: GlyphMode, branch_width: usize) -> Li
             }
             fields.push(s);
         }
+        // No upstream to count against, so no `+a -b` — only the default-branch gap,
+        // as `worktrees tree` prints it.
+        AheadBehindState::MainOnly { main_behind } => fields.push(format!("main-{main_behind}")),
         AheadBehindState::Loading => fields.push("...".to_string()),
         AheadBehindState::Unknown | AheadBehindState::Unavailable => {}
     }
@@ -386,6 +389,47 @@ mod tests {
             url: String::new(),
         });
         assert_eq!(line_color(&wt), Color::Yellow);
+    }
+
+    fn line_text(wt: &WorktreeRow) -> String {
+        worktree_line(wt, GlyphMode::Unicode, 24)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn a_main_only_row_renders_main_n_without_the_counts() {
+        // A branch with no upstream that is behind the default branch (#1457):
+        // the `main-N` the VS Code view shows as `⇊N`, with no `+a -b` beside it.
+        let mut wt = worktree_row();
+        wt.ahead_behind = AheadBehindState::MainOnly { main_behind: 4 };
+        let text = line_text(&wt);
+        assert!(text.contains("main-4"), "{text}");
+        assert!(!text.contains('+'), "{text}");
+        assert!(!text.contains(" -"), "{text}");
+    }
+
+    #[test]
+    fn a_known_row_still_renders_both_counts_before_main_n() {
+        let mut wt = worktree_row();
+        wt.ahead_behind = AheadBehindState::Known {
+            ahead: 2,
+            behind: 1,
+            main_behind: Some(3),
+        };
+        assert!(line_text(&wt).contains("+2 -1 main-3"));
+    }
+
+    #[test]
+    fn unknown_and_unavailable_rows_render_no_divergence_field() {
+        for state in [AheadBehindState::Unknown, AheadBehindState::Unavailable] {
+            let mut wt = worktree_row();
+            wt.ahead_behind = state;
+            let text = line_text(&wt);
+            assert!(!text.contains("main-") && !text.contains('+'), "{text}");
+        }
     }
 
     #[test]
