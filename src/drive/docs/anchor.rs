@@ -144,7 +144,7 @@ fn utf16_len(text: &str) -> Result<i64, AnchorError> {
 fn paragraphs<'a>(
     document: &'a Document,
     selection: &SegmentSelection,
-) -> Result<Vec<Paragraph<'a>>, AnchorError> {
+) -> Result<(Vec<Paragraph<'a>>, Option<SegmentKind>), AnchorError> {
     selection.validate()?;
     let mut out = Vec::new();
     let mut selected = Vec::new();
@@ -190,38 +190,17 @@ fn paragraphs<'a>(
             )?;
         }
     }
+    let mut segment_kind = None;
     if selection.segment_id.is_some() {
-        let (tab, tab_id, _, segment) = match selected.as_slice() {
+        let (tab, tab_id, kind, segment) = match selected.as_slice() {
             [] => return Err(AnchorError::SegmentNotFound),
             [one] => *one,
             _ => return Err(AnchorError::AmbiguousSegment),
         };
+        segment_kind = Some(kind);
         collect(segment.content, tab, tab_id, true, &mut container, &mut out)?;
     }
-    Ok(out)
-}
-
-fn selected_kind(document: &Document, selection: &SegmentSelection) -> Option<SegmentKind> {
-    let id = selection.segment_id.as_deref()?;
-    for tab in document.resolved_tabs() {
-        if selection
-            .tab_id
-            .as_deref()
-            .is_some_and(|wanted| Some(wanted) != tab.tab_id)
-        {
-            continue;
-        }
-        for (kind, segments) in [
-            (SegmentKind::Header, tab.headers()),
-            (SegmentKind::Footer, tab.footers()),
-            (SegmentKind::Footnote, tab.footnotes()),
-        ] {
-            if segments.iter().any(|s| s.segment_id == id) {
-                return Some(kind);
-            }
-        }
-    }
-    None
+    Ok((out, segment_kind))
 }
 
 fn collect<'a>(
@@ -411,7 +390,7 @@ pub fn resolve_insert_in(
     if chars == 0 {
         return Err(AnchorError::InvalidInsertionText);
     }
-    let paragraphs = paragraphs(document, selection)?;
+    let (paragraphs, segment_kind) = paragraphs(document, selection)?;
     let found = find(&paragraphs, anchor, match_case)?;
     if found.suggested {
         return Err(AnchorError::SuggestedContent);
@@ -429,7 +408,7 @@ pub fn resolve_insert_in(
         end_index: index,
         tab_id: p.tab_id.clone(),
         segment_id: selection.segment_id.clone(),
-        segment_kind: selected_kind(document, selection),
+        segment_kind,
         paragraphs: 1,
         chars,
         bytes,
@@ -457,7 +436,7 @@ pub fn resolve_delete_in(
     match_case: bool,
     selection: &SegmentSelection,
 ) -> Result<EditPreview, AnchorError> {
-    let paragraphs = paragraphs(document, selection)?;
+    let (paragraphs, segment_kind) = paragraphs(document, selection)?;
     let first = find(&paragraphs, from, match_case)?;
     let last = if let Some(to) = to {
         find(&paragraphs, to, match_case)?
@@ -521,7 +500,7 @@ pub fn resolve_delete_in(
         end_index: end,
         tab_id: a.tab_id.clone(),
         segment_id: selection.segment_id.clone(),
-        segment_kind: selected_kind(document, selection),
+        segment_kind,
         paragraphs: count,
         chars,
         bytes,
