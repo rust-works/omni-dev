@@ -46,13 +46,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build: [linux, macos, win-msvc]
+        build: [linux, linux-arm64, macos, win-msvc]
         include:
         - build: linux
           os: ubuntu-latest
           rust: stable
           target: x86_64-unknown-linux-gnu
           archive-name: omni-dev-linux.tar.gz
+        # Built natively on GitHub's hosted ARM64 runner (free for public
+        # repos) rather than cross-compiled, so the C dependencies need no
+        # cross linker or sysroot. `omni-dev-linux.tar.gz` stays x86_64.
+        - build: linux-arm64
+          os: ubuntu-24.04-arm
+          rust: stable
+          target: aarch64-unknown-linux-gnu
+          archive-name: omni-dev-linux-arm64.tar.gz
         - build: macos
           os: macos-latest
           rust: stable
@@ -77,8 +85,8 @@ jobs:
     - name: Build release binaries
       run: cargo build --verbose --release --target ${{ matrix.target }} --features mcp --bin omni-dev --bin omni-dev-mcp
 
-    - name: Strip release binaries (linux and macos)
-      if: matrix.build == 'linux' || matrix.build == 'macos'
+    - name: Strip release binaries (everything but windows)
+      if: matrix.build != 'win-msvc'
       run: |
         strip "target/${{ matrix.target }}/release/omni-dev"
         strip "target/${{ matrix.target }}/release/omni-dev-mcp"

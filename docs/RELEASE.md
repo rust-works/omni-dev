@@ -287,7 +287,8 @@ The two tag families trigger separate workflows and never each other's: `release
 **Release Workflow (`.github/workflows/release.yml`)**
 - **Creates GitHub Release**: Automatically from the tag
 - **Builds Cross-Platform Binaries** (both `omni-dev` and `omni-dev-mcp` for each target):
-  - Linux (x86_64-unknown-linux-gnu)
+  - Linux (x86_64-unknown-linux-gnu), as `omni-dev-linux.tar.gz`
+  - Linux ARM64 (aarch64-unknown-linux-gnu), as `omni-dev-linux-arm64.tar.gz`, built natively on GitHub's `ubuntu-24.04-arm` runner ([#2116](https://github.com/rust-works/omni-dev/issues/2116))
   - macOS (aarch64-apple-darwin)
   - Windows (x86_64-pc-windows-msvc)
 - **Uploads Release Assets**: Attaches compiled binaries to the GitHub release
@@ -314,11 +315,12 @@ After pushing the tags, monitor the automated releases.
    gh run watch
    ```
 
-2. **Verify the GitHub Release** and its three assets:
+2. **Verify the GitHub Release** and its four assets:
    ```bash
    gh release view vX.Y.Z --json assets --jq '.assets[].name'
-   # omni-dev-linux.tar.gz, omni-dev-macos-arm64.tar.gz, omni-dev-windows.zip
+   # omni-dev-linux.tar.gz, omni-dev-linux-arm64.tar.gz, omni-dev-macos-arm64.tar.gz, omni-dev-windows.zip
    ```
+   A leg that fails to build leaves its asset out of the release, and because `publish-crates` waits on every leg it also holds back the crates.io publish. After a transient failure (a runner outage, a network error) re-run the failed jobs with `gh run rerun <run_id> --failed`; if the upload then fails because the asset already exists, delete the stale one first with `gh release delete-asset vX.Y.Z <asset-name>`. A defect in the code or the workflow is not fixed by a re-run, which uses the tag's commit: it needs a patch release. Do not carry on without the asset, since the coverage action and other consumers download these by exact name.
 
 3. **Verify crates.io Publication**:
    ```bash
@@ -333,6 +335,7 @@ After pushing the tags, monitor the automated releases.
    "$d/omni-dev" --version                        # omni-dev X.Y.Z (<short sha> <date>)
    git rev-parse 'vX.Y.Z^{commit}'                # full SHA; it must start with <short sha>
    ```
+   Only the host's own asset can be run. Confirm that each of the others, notably `omni-dev-linux-arm64.tar.gz`, holds the architecture its name claims by extracting it the same way and running `file "$d/omni-dev"` (`ELF 64-bit ... ARM aarch64` for the ARM64 Linux asset, `ELF 64-bit ... x86-64` for `omni-dev-linux.tar.gz`).
 
 ### Extension
 
