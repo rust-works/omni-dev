@@ -899,27 +899,44 @@ reached it since it started (#2136), and `--json` carries the same numbers under
 `delivery`:
 
 ```
-24 session(s): 11 working, 0 waiting, 13 idle · events: 5120 via socket, 0 recovered from journals, 3 replayed
+24 session(s): 11 working, 0 waiting, 13 idle · events: 5120 via socket, 0 recovered from journals, 0 superseded, 3 replayed
 ```
 
-- **`socket`** counts events applied from the control socket, the fast path.
+- **`socket`** counts events applied from the control socket, the fast path, from
+  whichever feed posted them: the hooks, but also the stream wrappers and the
+  pi.dev extension, so it is not a count of hook events alone. The daemon's own
+  watchers (transcript growth, Codex rollouts, pid liveness) call the registry
+  in-process and are not counted anywhere.
 - **`recovered`** counts events applied from a tailed [journal](#hook-journals-2108)
-  whose socket copy never arrived: the **dropped POSTs**. This is the number to
-  watch. A steady `0` means the socket is keeping up; it moves when the daemon was
-  unreachable or wedged long enough for a hook to give up (a restart, a stall).
-  Every hook delivers each event by both routes, so the journal copy of a normal
-  event is a duplicate and counts for nothing. The journal poll can also read a
-  line in the instant between a hook's journal write and its POST arriving
-  (about 0.02% of events at the 5 s poll); that POST then lands as a duplicate and
-  takes the event back out of `recovered`, so a recovery is briefly counted until
-  its socket copy shows up.
+  whose socket copy never arrived: **dropped POSTs** that the journal rescued.
+- **`superseded`** counts events read from a tailed journal whose socket copy never
+  arrived but which the registry ignored, because a newer event of the session
+  had already been applied. These are **dropped POSTs** too, the ones the journal
+  could not rescue: applying one would undo the newer event. In an active session
+  the next hook event can reach the socket before the 5 s poll reads a dropped
+  one, so a drop there may land here rather than in `recovered`.
 - **`replayed`** counts events applied by the startup replay of the journals: a
   restart, or events fired while the daemon was down. A journal a *running* daemon
   first sees (a new session's) is a tail, so its dropped POSTs count as
   `recovered`.
 
+`recovered` plus `superseded` is the number to watch: every POST that never
+arrived. A steady `0` for both means the socket is keeping up; they move when the
+daemon was unreachable or wedged long enough for a hook to give up (a restart, a
+stall). Every hook delivers each event by both routes, so the journal copy of a
+normal event is a duplicate and counts for nothing.
+
+The journal poll can also read a line in the instant between a hook's journal
+write and its POST arriving (about 0.02% of events at the 5 s poll). That POST
+then lands as a duplicate, or is ignored as out of order, and takes the event back
+out of `recovered` or `superseded`, so a drop is briefly counted until its socket
+copy shows up. A socket event the registry ignored as out of order is remembered,
+so its later journal copy is not mistaken for a POST that never came.
+
 These count deliveries, not state changes: an event the socket missed is a drop
-even when the state machine then ignores it (a late event for an ended session).
+even when the state machine then ignores it (a late event for an ended session, or
+one a newer event overtook). The one exception is an event found by the startup
+replay: a replay is not a recovery, so a stale one is counted as nothing.
 
 The counters are monotonic since the daemon started and are not persisted. They
 cannot see a hook that never wrote a journal (a non-UUID id, a daemon-less
@@ -1167,10 +1184,11 @@ The sink logs `session_hook_journal` with outcome `journaled` or
 `ended`, `too_old`, `dead` or `stale`), `session_journal_removed` (`rejected`,
 `orphan`, `too_old`, `unreadable`, `stale_tmp`) and `session_journal_compacted`
 follow a journal through its life, at debug level. `session_observed` and
-`session_end` carry the route (`origin`: `Socket`, `Journal` for a tail, or
-`Replay` for a first-sight import) and the dedupe outcomes `duplicate_ignored`,
-`journal_stale_ignored` and `socket_reordered_ignored`. The same routes are
-counted in [`daemon status`](#status).
+`session_end` carry the route (`origin`: `Socket`, `Journal` for a tail,
+`Replay` for a first-sight import, or `Local` for the daemon's own watchers) and
+the dedupe outcomes `duplicate_ignored`, `journal_stale_ignored` and
+`socket_reordered_ignored`. All but `Local` are counted in
+[`daemon status`](#status).
 
 ### Opt-in wrapper metadata file
 
