@@ -139,12 +139,12 @@ pub enum InsertLocation {
     /// Append to the first tab's body.
     #[serde(rename = "endOfSegmentLocation")]
     EndOfSegment(EndOfSegmentLocation),
-    /// Anchor-resolved UTF-16 index in a tab body.
+    /// Anchor-resolved UTF-16 index relative to a body or explicit segment.
     #[serde(rename = "location")]
     At(Location),
 }
 
-/// A body insertion point.
+/// A segment-relative insertion point.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Location {
     /// Server UTF-16 index.
@@ -152,9 +152,12 @@ pub struct Location {
     /// Omitted only for legacy top-level bodies.
     #[serde(rename = "tabId", skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
+    /// Explicit header, footer or footnote identity; absent for bodies.
+    #[serde(rename = "segmentId", skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
 }
 
-/// A body content range with explicit tab identity.
+/// A segment-relative content range with explicit tab identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContentRange {
     /// Inclusive server UTF-16 start.
@@ -166,12 +169,15 @@ pub struct ContentRange {
     /// Omitted only for legacy top-level bodies.
     #[serde(rename = "tabId", skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
+    /// Explicit header, footer or footnote identity; absent for bodies.
+    #[serde(rename = "segmentId", skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
 }
 
 /// A single typed deletion request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeleteContentRangeRequest {
-    /// Anchor-resolved range, with no segment id (body only).
+    /// Anchor-resolved range with segment and tab identity.
     pub range: ContentRange,
 }
 
@@ -214,6 +220,7 @@ impl DocsRequest {
             location: InsertLocation::At(Location {
                 index: edit.start_index,
                 tab_id: edit.tab_id.clone(),
+                segment_id: edit.segment_id.clone(),
             }),
         })
     }
@@ -226,6 +233,7 @@ impl DocsRequest {
                 start_index: edit.start_index,
                 end_index: edit.end_index,
                 tab_id: edit.tab_id.clone(),
+                segment_id: edit.segment_id.clone(),
             },
         })
     }
@@ -414,6 +422,8 @@ mod tests {
     #[test]
     fn anchored_wire_shapes_include_tab_identity_and_exactly_one_leased_request() {
         let edit = super::super::anchor::EditPreview {
+            segment_id: None,
+            segment_kind: None,
             start_index: 4,
             end_index: 10,
             tab_id: Some("child-tab".into()),

@@ -77,7 +77,7 @@ pub struct AppendCommand {
     pub output: OutputFormat,
 }
 
-/// Inserts text next to one unique body anchor, under docs-write.
+/// Inserts text next to one unique anchor in tab bodies or a selected segment, under docs-write.
 #[derive(Parser)]
 #[command(group(ArgGroup::new("anchor").required(true).args(["before", "after"])))]
 pub struct InsertCommand {
@@ -99,6 +99,12 @@ pub struct InsertCommand {
     /// Read insertion text from a file, or `-` for stdin.
     #[arg(long, value_name = "PATH")]
     pub text_file: Option<String>,
+    /// Existing header, footer or footnote ID (from docs read); omit for tab bodies.
+    #[arg(long)]
+    pub segment_id: Option<String>,
+    /// Narrow a segment ID to this tab when it occurs in more than one tab.
+    #[arg(long, requires = "segment_id")]
+    pub tab_id: Option<String>,
     /// Match anchors case-insensitively using Unicode simple case folding.
     #[arg(long)]
     pub ignore_case: bool,
@@ -127,6 +133,12 @@ pub struct DeleteCommand {
     /// Remove through the end of this unique anchor, inclusively.
     #[arg(long, requires = "from")]
     pub to: Option<String>,
+    /// Existing header, footer or footnote ID (from docs read); omit for tab bodies.
+    #[arg(long)]
+    pub segment_id: Option<String>,
+    /// Narrow a segment ID to this tab when it occurs in more than one tab.
+    #[arg(long, requires = "segment_id")]
+    pub tab_id: Option<String>,
     /// Match anchors case-insensitively using Unicode simple case folding.
     #[arg(long)]
     pub ignore_case: bool,
@@ -161,6 +173,10 @@ impl InsertCommand {
                 side,
                 text,
                 match_case: !self.ignore_case,
+                selection: crate::drive::docs::anchor::SegmentSelection {
+                    segment_id: self.segment_id,
+                    tab_id: self.tab_id,
+                },
             },
             dry_run: self.dry_run,
             lease_token: self.lease.lease,
@@ -192,6 +208,10 @@ impl DeleteCommand {
                 from,
                 to,
                 match_case: !self.ignore_case,
+                selection: crate::drive::docs::anchor::SegmentSelection {
+                    segment_id: self.segment_id,
+                    tab_id: self.tab_id,
+                },
             },
             dry_run: self.dry_run,
             lease_token: self.lease.lease,
@@ -311,6 +331,43 @@ async fn run_write(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segment_selectors_parse_and_tab_requires_segment() {
+        let insert = InsertCommand::try_parse_from([
+            "insert",
+            "doc",
+            "--after",
+            "anchor",
+            "--text",
+            "x",
+            "--segment-id",
+            "header",
+            "--tab-id",
+            "child",
+        ])
+        .unwrap();
+        assert_eq!(insert.segment_id.as_deref(), Some("header"));
+        assert_eq!(insert.tab_id.as_deref(), Some("child"));
+        let delete = DeleteCommand::try_parse_from([
+            "delete",
+            "doc",
+            "--match",
+            "anchor",
+            "--segment-id",
+            "note",
+        ])
+        .unwrap();
+        assert_eq!(delete.segment_id.as_deref(), Some("note"));
+        assert!(InsertCommand::try_parse_from([
+            "insert", "doc", "--after", "anchor", "--text", "x", "--tab-id", "child"
+        ])
+        .is_err());
+        assert!(DeleteCommand::try_parse_from([
+            "delete", "doc", "--match", "anchor", "--tab-id", "child"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn read_text_reads_a_file() {

@@ -4116,8 +4116,8 @@ entirely, and the edit is refused up front rather than attempted unleased.
 
 #### drive docs insert / delete
 
-Insert text next to one unique body anchor, or delete a unique match or inclusive
-anchor range. Insertion uses `docs-write`; deletion requires a separate
+Insert text next to one unique anchor in tab bodies or an existing segment,
+or delete a unique match or inclusive anchor range. Insertion uses `docs-write`; deletion requires a separate
 `docs-delete` grant. Each defaults to requiring `--lease` unless the deciding
 rule opts out; both support the same output formats and `--dry-run`.
 
@@ -4126,28 +4126,39 @@ omni-dev drive docs insert <ID> --after 'Summary' --text ' (updated)' --dry-run
 omni-dev drive docs insert <ID> --before 'Conclusion' --text-file note.txt --lease <TOKEN>
 omni-dev drive docs delete <ID> --match 'obsolete sentence' --dry-run
 omni-dev drive docs delete <ID> --from 'Start marker' --to 'End marker' --lease <TOKEN>
+omni-dev drive docs insert <ID> --segment-id <HEADER_ID> --after 'Title' --text ' (updated)' --dry-run
+omni-dev drive docs delete <ID> --segment-id <FOOTNOTE_ID> --tab-id <TAB_ID> --match 'obsolete' --lease <TOKEN>
 ```
 
 `--from`/`--to` removes from the start of the first anchor through the end of
 the second, including both anchors. Each must be unique and ordered in the same
-tab and body or table cell. Anchors are literal, case-sensitive by default;
+tab and segment or table cell. Anchors are literal, case-sensitive by default;
 `--ignore-case` uses Unicode simple case folding. Overlapping matches count
 separately, so `aa` in `aaa` is ambiguous and refused. `--text-file -` reads
 insertion text from stdin.
 
-The resolver searches all tab bodies and table cells, including child tabs.
+Without selectors, the resolver searches all tab bodies and table cells, including
+child tabs. `--segment-id` selects an existing header, footer or footnote by its
+map key (shown by `docs read`); it never creates a segment. The ID must identify
+exactly one segment across tabs and all three families. Use `--tab-id` to
+narrow a repeated ID to one tab; this flag requires `--segment-id`. Empty IDs,
+missing segments and ambiguous identities are refused before anchor matching.
+Within the selected segment, each anchor must be unique, including matches in
+its table cells. Unselected content does not participate in matching or index
+validation. Legacy top-level segments are supported without `--tab-id`.
 An anchor may span adjacent formatting runs within one paragraph, but cannot
 span paragraph breaks, images or other inline objects. A deletion range may
 span ordinary paragraphs, but cannot cross table/cell boundaries, structural
 elements, non-text inline content or pending insertion/deletion suggestions.
-The last newline of a body or cell, and newlines immediately before structural elements,
-are preserved. Headers, footers, footnotes and tables of contents are outside
-this surface; their text does not participate in uniqueness checks. As the Docs
-API merges paragraphs, a cross-paragraph deletion can also affect paragraph
+The last newline of a body, header, footer, footnote or cell, and newlines
+immediately before structural elements, are preserved. Tables of contents
+remain outside this surface. As the Docs API merges paragraphs, a cross-paragraph deletion can also affect paragraph
 styles, lists, positioned objects and bookmarks attached to those paragraphs.
 
 Dry runs and successful outcomes report the same resolved UTF-16 range (empty
-for insertion), tab, paragraph count, Unicode scalar count and UTF-8 byte count.
+for insertion), tab, selected segment ID and kind (when present), paragraph
+count, Unicode scalar count and UTF-8 byte count. Segment indices are relative
+to that segment and may begin at zero.
 Insertion counts exclude the control and BMP private-use characters that the
 Docs API strips; input with nothing remaining is refused before any request.
 Indices come from the invocation's own inline document snapshot, whose revision

@@ -72,7 +72,7 @@ pub enum WritePayload {
         /// The text to insert.
         text: String,
     },
-    /// Insert next to a unique body anchor.
+    /// Insert next to a unique anchor in tab bodies or an existing segment.
     Insert {
         /// Literal text to locate in the snapshot.
         anchor: String,
@@ -82,6 +82,8 @@ pub enum WritePayload {
         text: String,
         /// Case-sensitive by default.
         match_case: bool,
+        /// Existing non-body segment selector; default addresses tab bodies.
+        selection: anchor::SegmentSelection,
     },
     /// Delete a unique match or an inclusive pair of anchors.
     Delete {
@@ -91,6 +93,8 @@ pub enum WritePayload {
         to: Option<String>,
         /// Case-sensitive by default.
         match_case: bool,
+        /// Existing non-body segment selector; default addresses tab bodies.
+        selection: anchor::SegmentSelection,
     },
 }
 
@@ -125,6 +129,11 @@ impl WritePayload {
     /// The API rejects an empty `containsText.text`, and an empty append is
     /// a no-op worth naming rather than a round-trip worth spending.
     fn validate(&self) -> Result<(), String> {
+        if let Self::Insert { selection, .. } | Self::Delete { selection, .. } = self {
+            selection
+                .validate()
+                .map_err(|_| "invalid segment selection".to_owned())?;
+        }
         match self {
             Self::Replace { search, .. } if search.is_empty() => {
                 Err("--search cannot be empty".to_string())
@@ -597,24 +606,36 @@ async fn write_inner(
             side,
             text,
             match_case,
-        } => match anchor::resolve_insert(&document, anchor, *side, text, *match_case) {
-            Ok(edit) => (
-                DocsRequest::insert_text_at(text, &edit),
-                WriteResult::WouldInsert { edit },
-            ),
-            Err(error) => return gated(WriteResult::RefusedAnchor { error }, Some(revision_id)),
-        },
+            selection,
+        } => {
+            match anchor::resolve_insert_in(&document, anchor, *side, text, *match_case, selection)
+            {
+                Ok(edit) => (
+                    DocsRequest::insert_text_at(text, &edit),
+                    WriteResult::WouldInsert { edit },
+                ),
+                Err(error) => {
+                    return gated(WriteResult::RefusedAnchor { error }, Some(revision_id))
+                }
+            }
+        }
         WritePayload::Delete {
             from,
             to,
             match_case,
-        } => match anchor::resolve_delete(&document, from, to.as_deref(), *match_case) {
-            Ok(edit) => (
-                DocsRequest::delete_range(&edit),
-                WriteResult::WouldDelete { edit },
-            ),
-            Err(error) => return gated(WriteResult::RefusedAnchor { error }, Some(revision_id)),
-        },
+            selection,
+        } => {
+            match anchor::resolve_delete_in(&document, from, to.as_deref(), *match_case, selection)
+            {
+                Ok(edit) => (
+                    DocsRequest::delete_range(&edit),
+                    WriteResult::WouldDelete { edit },
+                ),
+                Err(error) => {
+                    return gated(WriteResult::RefusedAnchor { error }, Some(revision_id))
+                }
+            }
+        }
     };
 
     if opts.dry_run {
@@ -814,9 +835,12 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
                 WriteResult::WouldDelete { .. } => "Would delete",
                 _ => "Deleted",
             };
-            format!("{action}: {} char(s) / {} byte(s) in '{name}' at [{}, {}) UTF-16 code units, tab {}, {} paragraph(s)",
+            let segment = edit.segment_id.as_ref().map_or_else(String::new, |id| {
+                format!(", segment {id} ({:?})", edit.segment_kind)
+            });
+            format!("{action}: {} char(s) / {} byte(s) in '{name}' at [{}, {}) UTF-16 code units, tab {}{}, {} paragraph(s)",
                 edit.chars, edit.bytes, edit.start_index, edit.end_index,
-                edit.tab_id.as_deref().unwrap_or("first"), edit.paragraphs)
+                edit.tab_id.as_deref().unwrap_or("first"), segment, edit.paragraphs)
         }
         WriteResult::RefusedAnchor { error } => {
             format!("Refused: unsafe or unresolved anchor in '{name}': {error:?}")
@@ -1917,13 +1941,128 @@ mod tests {
                 side: Side::After,
                 text: "😀".into(),
                 match_case: true,
+                selection: anchor::SegmentSelection::default(),
             },
             WritePayload::Delete {
                 from: "Q3".into(),
                 to: None,
                 match_case: true,
+                selection: anchor::SegmentSelection::default(),
             },
         ]
+    }
+
+    fn segment_payloads() -> Vec<WritePayload> {
+        let mut out = Vec::new();
+        for id in ["header", "footer", "footnote"] {
+            for mut payload in anchored_payloads() {
+                match &mut payload {
+                    WritePayload::Insert { selection, .. }
+                    | WritePayload::Delete { selection, .. } => {
+                        selection.segment_id = Some(id.into());
+                        selection.tab_id = Some("child".into());
+                    }
+                    _ => unreachable!(),
+                }
+                out.push(payload);
+            }
+        }
+        out
+    }
+
+    async fn mount_segments(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/v1/documents/doc-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(segment_document()))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    fn segment_document() -> serde_json::Value {
+        let content = serde_json::json!([{"endIndex": 13, "paragraph": {"elements": [{"endIndex": 13, "textRun": {"content": "😀 Q3 report\n"}}]}}]);
+        serde_json::json!({"revisionId": "rev-anchor", "body": {}, "tabs": [{
+            "tabProperties": {"tabId": "parent"}, "childTabs": [{
+                "tabProperties": {"tabId": "child"}, "documentTab": {
+                    "headers": {"header": {"content": content}},
+                    "footers": {"footer": {"content": content}},
+                    "footnotes": {"footnote": {"content": content}}
+                }
+            }]
+        }]})
+    }
+
+    #[tokio::test]
+    async fn missing_segments_refuse_without_mutation() {
+        let server = MockServer::start().await;
+        let (drive, docs) = anchored_setup(&server).await;
+        let payload = segment_payloads().remove(0);
+        let rule = rule_for(&payload);
+        let mut opts = replace_opts(false);
+        opts.payload = payload;
+        assert_eq!(
+            write(&drive, &docs, &opts, &[rule]).await.result,
+            WriteResult::RefusedAnchor {
+                error: AnchorError::SegmentNotFound
+            }
+        );
+        assert!(!server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path().ends_with(":batchUpdate")));
+    }
+
+    #[tokio::test]
+    async fn selected_segment_previews_and_writes_share_identity_indices_and_revision() {
+        for payload in segment_payloads() {
+            let server = MockServer::start().await;
+            let (drive, docs) = anchored_setup(&server).await;
+            mount_segments(&server).await;
+            let mut opts = replace_opts(true);
+            opts.payload = payload.clone();
+            let rule = rule_for(&payload);
+            let edit = match write(&drive, &docs, &opts, std::slice::from_ref(&rule))
+                .await
+                .result
+            {
+                WriteResult::WouldInsert { edit } | WriteResult::WouldDelete { edit } => edit,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(edit.tab_id.as_deref(), Some("child"));
+            assert!(edit.segment_kind.is_some());
+            mount_batch_update(serde_json::json!({"replies": [{}]}))
+                .expect(1)
+                .mount(&server)
+                .await;
+            opts.dry_run = false;
+            let applied = match write(&drive, &docs, &opts, &[rule]).await.result {
+                WriteResult::Inserted { edit } | WriteResult::Deleted { edit } => edit,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(edit, applied);
+            let requests = server.received_requests().await.unwrap();
+            let batch = requests
+                .iter()
+                .find(|r| r.url.path().ends_with(":batchUpdate"))
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+            assert_eq!(
+                body["writeControl"],
+                serde_json::json!({"requiredRevisionId": "rev-anchor"})
+            );
+            assert_eq!(body["requests"].as_array().unwrap().len(), 1);
+            let location = if payload.verb() == WriteVerb::Insert {
+                assert_eq!((edit.start_index, edit.end_index), (5, 5));
+                &body["requests"][0]["insertText"]["location"]
+            } else {
+                assert_eq!((edit.start_index, edit.end_index), (3, 5));
+                &body["requests"][0]["deleteContentRange"]["range"]
+            };
+            assert_eq!(location["segmentId"], edit.segment_id.unwrap());
+            assert_eq!(location["tabId"], "child");
+        }
     }
 
     async fn anchored_setup(server: &MockServer) -> (DriveClient, DocsClient) {
@@ -1935,6 +2074,7 @@ mod tests {
         mount_document(Some("rev-anchor"), "😀 Q3 report")
             .mount(server)
             .await;
+
         clients
     }
 
@@ -2032,6 +2172,7 @@ mod tests {
     #[tokio::test]
     async fn a_docs_write_grant_does_not_allow_delete_and_delete_does_not_allow_other_verbs() {
         let mut payloads = anchored_payloads();
+        payloads.extend(segment_payloads());
         payloads.push(replace_opts(false).payload);
         payloads.push(append_opts(false).payload);
         for payload in payloads {
@@ -2105,7 +2246,7 @@ mod tests {
 
     #[tokio::test]
     async fn anchored_edits_preserve_every_lease_refusal() {
-        for payload in anchored_payloads() {
+        for payload in anchored_payloads().into_iter().chain(segment_payloads()) {
             for expected in [
                 WriteResult::RefusedNoLease,
                 WriteResult::RefusedLeaseExpired,
@@ -2114,6 +2255,10 @@ mod tests {
             ] {
                 let server = MockServer::start().await;
                 let (drive, docs) = anchored_setup(&server).await;
+                if matches!(&payload, WritePayload::Insert { selection, .. } | WritePayload::Delete { selection, .. } if selection.segment_id.is_some())
+                {
+                    mount_segments(&server).await;
+                }
                 let mut opts = replace_opts(false);
                 opts.payload = payload.clone();
                 opts.lease_token = match expected {
@@ -2142,9 +2287,13 @@ mod tests {
 
     #[tokio::test]
     async fn anchored_edits_refuse_stale_docs_revisions() {
-        for payload in anchored_payloads() {
+        for payload in anchored_payloads().into_iter().chain(segment_payloads()) {
             let server = MockServer::start().await;
             let (drive, docs) = anchored_setup(&server).await;
+            if matches!(&payload, WritePayload::Insert { selection, .. } | WritePayload::Delete { selection, .. } if selection.segment_id.is_some())
+            {
+                mount_segments(&server).await;
+            }
             Mock::given(method("POST")).and(path("/v1/documents/doc-1:batchUpdate"))
                 .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": {"code": 400, "message": "The required revision ID 'rev-anchor' does not match the latest revision."}})))
                 .expect(1).mount(&server).await;
@@ -2166,11 +2315,13 @@ mod tests {
                 side: Side::After,
                 text: "text".into(),
                 match_case: true,
+                selection: anchor::SegmentSelection::default(),
             },
             WritePayload::Delete {
                 from: "first".into(),
                 to: Some("needle".into()),
                 match_case: true,
+                selection: anchor::SegmentSelection::default(),
             },
         ] {
             let server = MockServer::start().await;
@@ -2231,6 +2382,7 @@ mod tests {
             side: Side::After,
             text: text.into(),
             match_case: true,
+            selection: anchor::SegmentSelection::default(),
         }
     }
 
@@ -2239,6 +2391,7 @@ mod tests {
             from: from.into(),
             to: to.map(Into::into),
             match_case: true,
+            selection: anchor::SegmentSelection::default(),
         }
     }
 
@@ -2274,7 +2427,17 @@ mod tests {
     /// anchor never costs a round-trip or touches the lease.
     #[tokio::test]
     async fn an_unaddressable_anchored_payload_fails_before_any_network_call() {
+        let mut invalid_segment = insert_payload("a", "x");
+        if let WritePayload::Insert { selection, .. } = &mut invalid_segment {
+            selection.segment_id = Some(String::new());
+        }
+        let mut invalid_tab = delete_payload("a", None);
+        if let WritePayload::Delete { selection, .. } = &mut invalid_tab {
+            selection.tab_id = Some("child".into());
+        }
         for payload in [
+            invalid_segment,
+            invalid_tab,
             insert_payload("", "x"),
             insert_payload("a", "\0"),
             delete_payload("", None),
@@ -2301,6 +2464,8 @@ mod tests {
 
     fn preview_edit() -> EditPreview {
         EditPreview {
+            segment_id: None,
+            segment_kind: None,
             start_index: 4,
             end_index: 6,
             tab_id: None,

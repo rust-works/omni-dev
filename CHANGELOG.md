@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Docs segment writes** ([#2091](https://github.com/rust-works/omni-dev/issues/2091)): `drive docs insert` and `delete` accept `--segment-id` and optional `--tab-id` for anchored edits in existing headers, footers and footnotes. Previews report segment identity and segment-relative UTF-16 indices; protected terminators, suggestion refusals, separate write/delete permissions and revision/backup leases remain enforced.
 
 - **Gated Docs/Sheets writes over MCP** ([#1641](https://github.com/rust-works/omni-dev/issues/1641)): expose Docs replace/append, Sheets write/append/clear and file lease acquisition with the existing operator rules, consent, backups, freshness checks and audit engines. Return complete tagged YAML with MCP error signals for refusals. Per-call account overrides select credentials, write rules and backup folders together. Shared values parsing now supports TSV, including `.tsv` inference, alongside CSV and JSON.
 - **Jev MCP tools** ([#1779](https://github.com/rust-works/omni-dev/issues/1779)): `jev_route` routes issues by stage and `jev_verify_decision` checks decision comments against cited sources, sharing the CLI engines and JSON/YAML reports with request-local model overrides. See [docs/jev.md](docs/jev.md#mcp-tools).
