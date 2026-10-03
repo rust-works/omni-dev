@@ -182,14 +182,16 @@ check applies to it.
   Shards from the same CI runner image do; a mix of, say, Linux and macOS runners
   does not, and the warning above is the signal.
 - `--baseline-report` takes **one** report, so a baseline from a sharded run must
-  be a single file. For lcov, joining the shards is equivalent to merging them —
-  repeated records for a file are unioned the same way — but join them **with a
-  newline between files**. `cargo llvm-cov` writes no newline after its final
-  `end_of_record`, so a plain `cat shard-*.lcov > base.lcov` glues one shard's last
-  record onto the next shard's first line, and the parser then silently drops that
-  next file's header and understates coverage (about 0.14 pp on this repository's
-  own test suite). Use `for f in shard-*.lcov; do cat "$f"; echo; done > base.lcov`.
-  Unlike `--report`, joining gives no empty-shard check.
+  be a single file. For lcov, concatenating the shards (`cat shard-*.lcov >
+  base.lcov`) is equivalent to merging them — repeated records for a file are
+  unioned the same way. `cargo llvm-cov` writes no newline after its final
+  `end_of_record`, so `cat` glues it onto the next shard's first line. This
+  command's parser reads that correctly, but earlier releases silently dropped the
+  last file of every shard and misattributed the next one's lines (about 0.14 pp
+  low on this repository's own test suite), and other lcov consumers may do the
+  same. If the file will leave this command, put a newline between shards:
+  `for f in shard-*.lcov; do cat "$f"; echo; done > base.lcov`. Unlike `--report`,
+  joining gives no empty-shard check.
 - The merge-base baseline recompute and `codecov.json` /
   `coverage-summary.txt` come from `cargo llvm-cov` in the reusable action and are
   not part of this command.

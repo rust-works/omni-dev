@@ -17,13 +17,28 @@ pub fn parse(content: &str) -> Result<CoverageReport> {
     let mut current: Option<FileCoverage> = None;
 
     for (lineno, raw) in content.lines().enumerate() {
-        let line = raw.trim();
+        let mut line = raw.trim();
+
+        // `cargo llvm-cov` writes no newline after its final `end_of_record`, so
+        // two reports concatenated with `cat` put the next file's `SF:` on the
+        // same line. What follows the terminator is an ordinary record, not
+        // noise: dropping it loses a whole file's coverage without an error.
+        while let Some(rest) = line.strip_prefix("end_of_record") {
+            if let Some(file) = current.take() {
+                report.insert(file);
+            }
+            line = rest.trim_start();
+        }
         if line.is_empty() {
             continue;
         }
 
         if let Some(path) = line.strip_prefix("SF:") {
-            current = Some(FileCoverage::new(path.trim()));
+            // A block that never saw its `end_of_record` (a truncated report
+            // followed by another) is kept, not silently replaced.
+            if let Some(unfinished) = current.replace(FileCoverage::new(path.trim())) {
+                report.insert(unfinished);
+            }
         } else if let Some(rest) = line.strip_prefix("DA:") {
             let file = current.as_mut().with_context(|| {
                 format!("lcov line {}: DA record outside of an SF block", lineno + 1)
@@ -31,10 +46,6 @@ pub fn parse(content: &str) -> Result<CoverageReport> {
             let (number, hits) = parse_da(rest)
                 .with_context(|| format!("lcov line {}: malformed DA record", lineno + 1))?;
             file.record(number, hits);
-        } else if line == "end_of_record" {
-            if let Some(file) = current.take() {
-                report.insert(file);
-            }
         }
         // All other records (TN, BRDA, FN, FNDA, LF, LH, …) are ignored.
     }
@@ -130,6 +141,45 @@ end_of_record
         assert_eq!(concatenated.hits("src/a.rs", 1), Some(3));
         assert_eq!(concatenated.hits("src/a.rs", 2), Some(2));
         assert_eq!(concatenated.hits("src/a.rs", 3), Some(0));
+    }
+
+    /// Plain `cat` of real `cargo llvm-cov` shards (no trailing newline) glues
+    /// `end_of_record` onto the next `SF:`. Both files must survive with their
+    /// own lines: before this was handled the last file of each shard vanished
+    /// and the next file's lines landed on it, understating coverage silently.
+    #[test]
+    fn a_glued_end_of_record_does_not_lose_the_next_file() {
+        let lcov = "SF:src/a.rs\nDA:1,1\nend_of_recordSF:src/b.rs\nDA:1,0\nDA:2,3\nend_of_record";
+        let report = parse(lcov).unwrap();
+        assert_eq!(report.files.len(), 2);
+        assert_eq!(report.hits("src/a.rs", 1), Some(1));
+        assert_eq!(report.hits("src/a.rs", 2), None);
+        assert_eq!(report.hits("src/b.rs", 1), Some(0));
+        assert_eq!(report.hits("src/b.rs", 2), Some(3));
+    }
+
+    #[test]
+    fn plainly_concatenated_shards_parse_as_their_merge() {
+        let shard_a =
+            "TN:\nSF:src/a.rs\nDA:1,3\nDA:2,0\nend_of_record\nSF:src/c.rs\nDA:1,0\nend_of_record";
+        let shard_b =
+            "TN:\nSF:src/a.rs\nDA:1,0\nDA:2,2\nend_of_record\nSF:src/c.rs\nDA:1,1\nend_of_record";
+
+        let mut merged = parse(shard_a).unwrap();
+        merged.merge(parse(shard_b).unwrap());
+        // No separator at all: exactly what `cat shard-*.lcov` produces.
+        let catted = parse(&format!("{shard_a}{shard_b}")).unwrap();
+
+        assert_eq!(catted, merged);
+        assert_eq!(catted.hits("src/c.rs", 1), Some(1));
+    }
+
+    #[test]
+    fn a_block_without_end_of_record_is_kept_when_another_file_follows() {
+        let lcov = "SF:src/a.rs\nDA:1,1\nSF:src/b.rs\nDA:1,0\nend_of_record\n";
+        let report = parse(lcov).unwrap();
+        assert_eq!(report.hits("src/a.rs", 1), Some(1));
+        assert_eq!(report.hits("src/b.rs", 1), Some(0));
     }
 
     #[test]
