@@ -107,6 +107,18 @@ pub struct DiffCommand {
     #[arg(long, value_name = "PCT")]
     pub fail_under_patch: Option<f64>,
 
+    /// Fail (non-zero exit) when overall line coverage is below this percentage.
+    ///
+    /// Gates on the headline `Total` — covered over executable lines across the
+    /// head report after `--ignore-filename-regex` and `ignore` markers — so it
+    /// moves with the same exclusions the patch gate sees. The figure is derived
+    /// from the report's per-line records, so it can differ slightly from
+    /// `cargo llvm-cov report --summary-only`. A report with no executable lines
+    /// fails the gate: there is nothing to measure, and passing would let an
+    /// empty report slip through.
+    #[arg(long, value_name = "PCT")]
+    pub fail_under_lines: Option<f64>,
+
     /// Override the path prefix stripped from report file paths to make them
     /// repo-relative (default: the repository working directory).
     #[arg(long, value_name = "PATH")]
@@ -283,10 +295,16 @@ pub struct DiffOutcome {
     pub patch_percent: Option<f64>,
     /// Whether `--fail-under-patch` was set and patch coverage fell below it.
     pub below_gate: bool,
+    /// Overall line coverage percentage of the head report (`None` when it has
+    /// no executable lines).
+    pub line_percent: Option<f64>,
+    /// Whether `--fail-under-lines` was set and overall line coverage fell below
+    /// it — or could not be measured at all.
+    pub below_line_gate: bool,
 }
 
 impl DiffCommand {
-    /// Executes the command: prints the report and applies the patch gate.
+    /// Executes the command: prints the report and applies the coverage gates.
     ///
     /// `repo` is the repository location resolved at the CLI boundary
     /// (`None` = current working directory).
@@ -297,14 +315,37 @@ impl DiffCommand {
         }
         let outcome = self.run(repo)?;
         println!("{}", outcome.rendered);
-        if outcome.below_gate {
-            let pct = outcome.patch_percent.unwrap_or(0.0);
-            anyhow::bail!(
-                "patch coverage {pct:.2}% is below the --fail-under-patch threshold of {:.2}%",
-                self.fail_under_patch.unwrap_or_default()
-            );
+        let failures = self.gate_failures(&outcome);
+        if !failures.is_empty() {
+            anyhow::bail!(failures.join("; "));
         }
         Ok(())
+    }
+
+    /// One message per coverage gate `outcome` failed, empty when all pass.
+    ///
+    /// Every failed gate is reported, so fixing one does not just reveal the next.
+    fn gate_failures(&self, outcome: &DiffOutcome) -> Vec<String> {
+        let mut failures = Vec::new();
+        if outcome.below_gate {
+            failures.push(format!(
+                "patch coverage {:.2}% is below the --fail-under-patch threshold of {:.2}%",
+                outcome.patch_percent.unwrap_or(0.0),
+                self.fail_under_patch.unwrap_or_default()
+            ));
+        }
+        if outcome.below_line_gate {
+            let threshold = self.fail_under_lines.unwrap_or_default();
+            failures.push(match outcome.line_percent {
+                Some(pct) => format!(
+                    "line coverage {pct:.2}% is below the --fail-under-lines threshold of {threshold:.2}%"
+                ),
+                None => format!(
+                    "the report has no executable lines, so the --fail-under-lines threshold of {threshold:.2}% cannot be met"
+                ),
+            });
+        }
+        failures
     }
 
     /// Runs the analysis and renders the output without printing.
@@ -394,10 +435,21 @@ impl DiffCommand {
             None => false,
         };
 
+        // `total_after` is the headline total, so the gate and the rendered
+        // `Total` can never disagree. Unlike the patch gate, an unmeasurable
+        // total fails: "no added lines" is a property of the change, but "no
+        // executable lines" means the report is empty or fully excluded.
+        let line_percent = result.total_after;
+        let below_line_gate = self
+            .fail_under_lines
+            .is_some_and(|threshold| line_percent.is_none_or(|p| p < threshold));
+
         Ok(DiffOutcome {
             rendered,
             patch_percent,
             below_gate,
+            line_percent,
+            below_line_gate,
         })
     }
 
@@ -607,6 +659,7 @@ mod tests {
             output: OutputFormatArg::Markdown,
             format: None,
             fail_under_patch: None,
+            fail_under_lines: None,
             strip_prefix: None,
             ignore_filename_regex: Vec::new(),
             context_dir: None,
@@ -918,6 +971,119 @@ mod tests {
             !cmd.run(Some(&repo)).unwrap().below_gate,
             "66.7% >= 50% should pass"
         );
+    }
+
+    /// Writes a head report covering `b.rs` (2 of 3 lines) and `a.rs` (0 of 2),
+    /// so overall line coverage is 2/5 = 40% and 2/3 once `a.rs` is excluded.
+    fn write_two_file_head_lcov(repo: &Path) -> PathBuf {
+        let lcov = format!(
+            "SF:{a}\nDA:1,0\nDA:2,0\nend_of_record\nSF:{b}\nDA:1,1\nDA:2,0\nDA:3,4\nend_of_record\n",
+            a = repo.join("a.rs").display(),
+            b = repo.join("b.rs").display(),
+        );
+        let report = repo.join("head.lcov");
+        fs::write(&report, lcov).unwrap();
+        report
+    }
+
+    #[test]
+    fn fail_under_lines_gate() {
+        let (_dir, repo, base) = repo_with_added_file();
+        // Overall line coverage is 40%.
+        let report = write_two_file_head_lcov(&repo);
+        let mut cmd = command(report.clone(), &base);
+        cmd.fail_under_lines = Some(50.0);
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        assert!(outcome.below_line_gate, "40% < 50% should fail");
+        assert_eq!(outcome.line_percent, Some(40.0));
+        assert!(!outcome.below_gate, "the patch gate is independent");
+
+        let mut cmd = command(report, &base);
+        cmd.fail_under_lines = Some(40.0);
+        assert!(
+            !cmd.run(Some(&repo)).unwrap().below_line_gate,
+            "a total exactly at the threshold passes"
+        );
+    }
+
+    #[test]
+    fn line_gate_is_off_unless_requested() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_two_file_head_lcov(&repo);
+        let outcome = command(report, &base).run(Some(&repo)).unwrap();
+        assert_eq!(outcome.line_percent, Some(40.0));
+        assert!(!outcome.below_line_gate);
+    }
+
+    #[test]
+    fn fail_under_lines_sees_the_post_ignore_total() {
+        // The gate reads the same total the report prints, so excluding the
+        // uncovered `a.rs` lifts 40% to 66.7% and turns a failing gate into a pass.
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_two_file_head_lcov(&repo);
+        let mut cmd = command(report, &base);
+        cmd.fail_under_lines = Some(50.0);
+        cmd.ignore_filename_regex = vec![r"a\.rs".to_string()];
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        assert_eq!(outcome.line_percent, Some(2.0 / 3.0 * 100.0));
+        assert!(!outcome.below_line_gate);
+    }
+
+    #[test]
+    fn fail_under_lines_fails_when_nothing_is_measurable() {
+        // Excluding every file leaves no executable lines. Passing vacuously
+        // would let an empty (or fully excluded) report through the gate.
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        let mut cmd = command(report, &base);
+        cmd.fail_under_lines = Some(1.0);
+        cmd.ignore_filename_regex = vec![r"b\.rs".to_string()];
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        assert_eq!(outcome.line_percent, None);
+        assert!(outcome.below_line_gate);
+        let failures = cmd.gate_failures(&outcome);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("no executable lines"), "{failures:?}");
+    }
+
+    #[test]
+    fn gate_failures_reports_every_failed_gate() {
+        let (_dir, repo, base) = repo_with_added_file();
+        // Patch coverage is 66.7% and overall line coverage is 40%.
+        let report = write_two_file_head_lcov(&repo);
+        let mut cmd = command(report, &base);
+        cmd.fail_under_patch = Some(90.0);
+        cmd.fail_under_lines = Some(90.0);
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        let failures = cmd.gate_failures(&outcome);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures[0].contains("patch coverage 66.67%"),
+            "{failures:?}"
+        );
+        assert!(failures[1].contains("line coverage 40.00%"), "{failures:?}");
+        assert!(failures[1].contains("--fail-under-lines threshold of 90.00%"));
+    }
+
+    #[test]
+    fn execute_bails_on_the_line_gate_only() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_two_file_head_lcov(&repo);
+        let mut cmd = command(report, &base);
+        cmd.fail_under_lines = Some(90.0);
+        let message = cmd.execute(Some(&repo)).unwrap_err().to_string();
+        assert!(message.contains("--fail-under-lines"), "{message}");
+        assert!(!message.contains("--fail-under-patch"), "{message}");
+    }
+
+    #[test]
+    fn fail_under_lines_parses() {
+        use clap::Parser;
+        let cmd =
+            DiffCommand::try_parse_from(["diff", "--report", "r.lcov", "--fail-under-lines", "80"])
+                .unwrap();
+        assert_eq!(cmd.fail_under_lines, Some(80.0));
+        assert_eq!(cmd.fail_under_patch, None);
     }
 
     #[test]

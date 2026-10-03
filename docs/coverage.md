@@ -16,6 +16,8 @@ Given a coverage report and a diff, it produces:
 
 - **Patch coverage** — fraction of *added* lines that are covered (the headline
   number, and what `--fail-under-patch` gates on).
+- **Overall line coverage** — the project-wide total (what `--fail-under-lines`
+  gates on).
 - **Uncovered new lines** — an actionable `file:line` list of added lines with no
   coverage (optionally collapsed into ranges, e.g. `9-11`, with
   `--collapse-ranges`).
@@ -50,8 +52,9 @@ cargo llvm-cov report --lcov --output-path head.lcov
 # 2. Attribute it to the diff against the default merge-base.
 omni-dev coverage diff --report head.lcov
 
-# 3. Gate a branch locally: fail if patch coverage is under 80%.
-omni-dev coverage diff --report head.lcov --fail-under-patch 80
+# 3. Gate a branch locally: fail if patch coverage is under 80%, or overall
+#    line coverage is under 70%.
+omni-dev coverage diff --report head.lcov --fail-under-patch 80 --fail-under-lines 70
 
 # 4. Full report with project deltas, as JSON for tooling.
 omni-dev coverage diff \
@@ -73,6 +76,28 @@ omni-dev coverage diff \
 `--fail-under-patch <PCT>` makes the command exit non-zero when patch coverage is
 below `<PCT>` percent, so it can fail a CI step or a local pre-push check. Without
 it the command only reports and always exits zero.
+
+`--fail-under-lines <PCT>` is the overall counterpart: it exits non-zero when
+line coverage across the whole head report is below `<PCT>` percent. It gates on
+the same `Total` the markdown headline prints, so it moves with the
+`--ignore-filename-regex` list and `ignore` markers, exactly as the patch gate
+does. Both gates can be set together, and every gate that fails is named in the
+error.
+
+- **The figure is lcov-derived.** It is covered lines over executable lines as
+  counted from the report's per-line records, so it can differ slightly from
+  `cargo llvm-cov report --summary-only`, which counts from the profile data and
+  the instrumented binaries. Pick a threshold against this command's number, not
+  against that one.
+- **An unmeasurable total fails.** A report with no executable lines — empty, or
+  fully excluded by `--ignore-filename-regex` — fails `--fail-under-lines`. This is
+  deliberately unlike `--fail-under-patch`, where "no added lines" is a property of
+  the change and passes. A gate that passed on an empty report would let a
+  silently failed coverage run through.
+
+Because the gate needs only the report, it works wherever `coverage diff` does —
+including when the report was produced elsewhere (for example, merged from
+several CI jobs) and the profile data is not on the machine running the gate.
 
 ## Diff scoping
 
@@ -293,6 +318,7 @@ wires it up.
 | `--baseline-report-format <FMT>` | Format of `--baseline-report` (auto-detected by default) |
 | `-o, --output <FMT>` | `markdown` (default) \| `yaml` \| `json` |
 | `--fail-under-patch <PCT>` | Exit non-zero when patch coverage is below `<PCT>` |
+| `--fail-under-lines <PCT>` | Exit non-zero when overall line coverage is below `<PCT>`, or the report has no executable lines |
 | `--collapse-ranges` | Collapse consecutive uncovered new lines into ranges |
 | `--all-files` | Report deltas/indirect changes for all files, not just touched ones |
 | `--strip-prefix <PATH>` | Prefix stripped from report paths to make them repo-relative |
