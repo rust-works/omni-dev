@@ -97,9 +97,27 @@ test("aheadBehindKey cannot confuse an absent input with a present one", () => {
 
 test("isMemoizable accepts a row whose key carries every input it evidences", () => {
   assert.equal(isMemoizable(target("/w/a"), { ahead: 1, behind: 2, main_behind: 3 }), true);
-  // "Nothing to show" is a real answer: the daemon omits a row that resolves to
-  // nothing, and that is as cacheable as any other.
-  assert.equal(isMemoizable(target("/w/a"), {}), true);
+  assert.equal(isMemoizable(target("/w/a"), { ahead: 0, behind: 0 }), true);
+});
+
+test("isMemoizable keeps an empty row only when the key shows nothing to compute", () => {
+  // "Nothing to show" is a real answer, and the daemon omits a row that resolves to
+  // nothing: a detached HEAD, or a branch with no upstream and no default branch.
+  assert.equal(isMemoizable(target("/w/a", { branch: undefined }), {}), true);
+  assert.equal(isMemoizable(target("/w/a", { upstream_sha: undefined }, null), {}), true);
+});
+
+test("isMemoizable re-asks an empty row the key says should have had counts", () => {
+  // The daemon sends the very same empty row when a computation fails (a repository
+  // it could not open, a walk that errored). A branch with an upstream — or a repo
+  // with a default branch — must have yielded counts, so this is a failure, and
+  // keeping it would blank the indicator until a ref next moved.
+  assert.equal(isMemoizable(target("/w/a"), {}), false);
+  assert.equal(isMemoizable(target("/w/a", { upstream_sha: undefined }), {}), false);
+  assert.equal(isMemoizable(target("/w/a", {}, null), {}), false);
+  // A detached HEAD has no branch, so there is nothing it could have failed to compute
+  // even when the repo does have an upstream elsewhere.
+  assert.equal(isMemoizable(target("/w/a", { branch: undefined }), {}), true);
 });
 
 test("isMemoizable refuses what an older daemon's key could not have invalidated", () => {
@@ -235,16 +253,40 @@ test("a fetcher that throws is a failure, not an unhandled rejection", async () 
 });
 
 test("a successful reply with no row is remembered as nothing to show", async () => {
-  // The daemon omits a row that resolves to nothing (no upstream, detached HEAD); that
-  // is an answer, unlike the failure above, and re-asking for it every refresh would
-  // be exactly the waste this removes.
+  // The daemon omits a row that resolves to nothing (no upstream, no default branch;
+  // a detached HEAD); that is an answer, unlike the failure above, and re-asking for
+  // it every refresh would be exactly the waste this removes.
   const { fetch, calls } = fakeFetcher({});
   const memo = new AheadBehindMemo(fetch);
-  const targets = [target("/w/a", { upstream_sha: undefined })];
+  const targets = [
+    target("/w/a", { upstream_sha: undefined }, null),
+    target("/w/b", { branch: undefined }),
+  ];
+
+  assert.deepEqual(await memo.resolve(targets), { "/w/a": {}, "/w/b": {} });
+  assert.deepEqual(await memo.resolve(targets), { "/w/a": {}, "/w/b": {} });
+  assert.equal(calls.length, 1);
+});
+
+test("an empty row for a worktree that has an upstream is a failed computation, re-asked", async () => {
+  // The daemon degrades a computation it could not finish to "no divergence", which
+  // omits the row — the same shape as a genuinely empty answer. The snapshot says this
+  // one had an upstream, so it was a failure and must not be kept.
+  const rows: AheadBehindMap = {};
+  const calls: string[][] = [];
+  const memo = new AheadBehindMemo(async (paths) => {
+    calls.push(paths);
+    return rows;
+  });
+  const targets = [target("/w/a")];
 
   assert.deepEqual(await memo.resolve(targets), { "/w/a": {} });
-  assert.deepEqual(await memo.resolve(targets), { "/w/a": {} });
-  assert.equal(calls.length, 1);
+  assert.equal(memo.size, 0, "a failed computation was kept");
+
+  rows["/w/a"] = { ahead: 1, behind: 0 };
+  assert.deepEqual(await memo.resolve(targets), { "/w/a": { ahead: 1, behind: 0 } });
+  assert.equal(calls.length, 2);
+  assert.equal(memo.size, 1);
 });
 
 test("concurrent refreshes share one in-flight batch", async () => {

@@ -46,6 +46,12 @@ export interface AheadBehindTarget {
  * must update. The key is a JSON array, so an absent part cannot collide with a
  * present one (`[a, null, b]` vs `[null, a, b]`). The worktree's path is not part of
  * it: the memo is keyed by path already.
+ *
+ * What it cannot see is the branch's configured upstream *ref*, only the commit it
+ * is at: `git branch --set-upstream-to` to a ref at the very same commit leaves the
+ * key unchanged. The answer is the same except that `main_behind` is omitted when the
+ * upstream *is* the default branch, so the worst case is a `⇊N` that lingers next to
+ * an identical `↓N` until a ref next moves. Not worth a daemon field to close.
  */
 export function aheadBehindKey(target: AheadBehindTarget): string {
   const { wt, repo } = target;
@@ -73,8 +79,16 @@ export function aheadBehindKey(target: AheadBehindTarget): string {
  *   daemon omits it, which left a push invisible);
  * - `main_behind` implies a resolved default branch, so it needs `main_sha` (a
  *   pre-#2120 daemon omits it, which left a default-branch fetch invisible);
+ * - an *empty* row is trusted only when the key shows there was nothing to compute.
+ *   The daemon sends the same empty row for "no upstream, no default branch" as for
+ *   a computation that failed (a repository it could not open, a walk that errored),
+ *   and the snapshot says which it must have been: a branch whose `upstream_sha` or
+ *   whose repo's `main_sha` is present always yields counts when it succeeds, so an
+ *   empty row there is a failure and is re-asked rather than kept until a ref moves;
  * - a `shallow` row never qualifies, since deepening a clone changes the counts
- *   without moving any id.
+ *   without moving any id. Only a daemon that reports `shallow` (#2120) can be told
+ *   apart, so this is the one guard that does *not* degrade safely against an older
+ *   daemon: its shallow clones look like any other.
  */
 export function isMemoizable(target: AheadBehindTarget, result: AheadBehind): boolean {
   const { wt, repo } = target;
@@ -84,7 +98,13 @@ export function isMemoizable(target: AheadBehindTarget, result: AheadBehind): bo
   if ((result.ahead !== undefined || result.behind !== undefined) && wt.upstream_sha === undefined) {
     return false;
   }
-  return result.main_behind === undefined || repo.main_sha !== undefined;
+  if (result.main_behind !== undefined && repo.main_sha === undefined) {
+    return false;
+  }
+  const empty =
+    result.ahead === undefined && result.behind === undefined && result.main_behind === undefined;
+  const couldHaveCounts = wt.upstream_sha !== undefined || repo.main_sha !== undefined;
+  return !(empty && wt.branch !== undefined && couldHaveCounts);
 }
 
 /**
