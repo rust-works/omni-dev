@@ -33,22 +33,21 @@ pub struct ScopedArgs {
 }
 
 impl ScopedArgs {
+    /// Maps the spellings `legacy` and `body` to the absent tab and segment.
+    fn scope(&self) -> Scope {
+        Scope {
+            tab_id: (self.tab != "legacy").then(|| self.tab.clone()),
+            segment_id: (self.segment != "body").then(|| self.segment.clone()),
+        }
+    }
+
     async fn execute(self, client: &DriveClient, mutation: Mutation) -> Result<()> {
-        let scope = Scope {
-            tab_id: if self.tab == "legacy" {
-                None
-            } else {
-                Some(self.tab)
-            },
-            segment_id: if self.segment == "body" {
-                None
-            } else {
-                Some(self.segment)
-            },
-        };
         let opts = WriteOptions {
+            payload: WritePayload::NamedRange {
+                scope: self.scope(),
+                mutation,
+            },
             document_id: self.document_id,
-            payload: WritePayload::NamedRange { scope, mutation },
             dry_run: self.dry_run,
             lease_token: self.lease.lease,
             ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
@@ -153,6 +152,37 @@ impl ReplaceNamedRangeContentCommand {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn scoped(tab: &str, segment: &str) -> ScopedArgs {
+        ScopedArgs {
+            document_id: "d".into(),
+            tab: tab.into(),
+            segment: segment.into(),
+            dry_run: false,
+            lease: helpers::LeaseTokenArg { lease: None },
+            output: OutputFormat::Table,
+        }
+    }
+
+    /// `legacy` and `body` are the only spellings for an absent tab and
+    /// segment; anything else — including their near-misses — is an ID.
+    #[test]
+    fn legacy_and_body_name_the_absent_tab_and_segment() {
+        for (tab, segment, expected) in [
+            ("legacy", "body", (None, None)),
+            ("t.1", "body", (Some("t.1"), None)),
+            ("legacy", "kix.h1", (None, Some("kix.h1"))),
+            ("t.1", "kix.h1", (Some("t.1"), Some("kix.h1"))),
+            ("Legacy", "Body", (Some("Legacy"), Some("Body"))),
+        ] {
+            let scope = scoped(tab, segment).scope();
+            assert_eq!(
+                (scope.tab_id.as_deref(), scope.segment_id.as_deref()),
+                expected,
+                "{tab}/{segment}"
+            );
+        }
+    }
 
     #[test]
     fn scope_and_stable_id_are_required_and_text_sources_are_exclusive() {
