@@ -53,6 +53,8 @@ use tokio::sync::watch;
 #[cfg(unix)]
 pub mod codex_app_server;
 pub mod codex_watcher;
+#[cfg(unix)]
+pub mod journal;
 pub(crate) mod pid_liveness;
 pub(crate) mod pid_watcher;
 pub mod relocate;
@@ -113,6 +115,40 @@ const MAX_REPLACED_PIDS: usize = 8;
 
 /// Ceiling on live window-embedding reports, mirroring the worktrees registry cap.
 const MAX_WINDOWS: usize = 256;
+
+/// How many recent event `seq`s a session remembers, to drop the copy of an
+/// event that reaches the registry by a second route (#2108). A hook delivers
+/// each event twice — once on the socket, once through its journal — and only
+/// the first may count.
+const MAX_RECENT_SEQS: usize = 32;
+
+/// The identity of one hook event: when it fired and a per-event nonce.
+///
+/// Stamped by the hook sink, written into the event's journal record and sent
+/// again on the socket POST, so the daemon can tell a copy it already applied
+/// from one it has not (#2108). `seq` is unique per event across processes
+/// (`<hook pid>-<unix nanos>`); `ts` is the sink's wall clock at the moment the
+/// event arrived, which orders a journal replay against newer events that
+/// already got through.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventStamp {
+    /// When the hook fired, by the sink's wall clock.
+    pub ts: DateTime<Utc>,
+    /// The event's nonce.
+    pub seq: String,
+}
+
+/// Which route an event reached the registry by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The control socket: the fast path, and what every feed but the journal
+    /// uses. Always applied, as before — only an exact duplicate is dropped.
+    Socket,
+    /// A hook's durable journal, read late: replayed at startup, or caught up
+    /// after a dropped POST. Also dropped when older than what the session has
+    /// already applied, so a late-read event can never undo a newer one.
+    Journal,
+}
 
 /// A monotonic clock that stands still while the machine sleeps, so a TTL
 /// measured on it counts only the time the daemon could actually have heard
@@ -560,6 +596,53 @@ pub struct SessionEntry {
     /// `end` from one of them is ignored (#1948).
     #[serde(skip)]
     pub(crate) replaced_pids: VecDeque<u32>,
+    /// The `seq`s of the most recent stamped events applied, newest last and
+    /// capped at [`MAX_RECENT_SEQS`], so the second copy of an event (socket and
+    /// journal both deliver every hook) is dropped (#2108).
+    #[serde(skip)]
+    pub(crate) recent_seqs: VecDeque<String>,
+    /// The newest `ts` among the stamped events applied: a journal event older
+    /// than this is stale and dropped (#2108).
+    #[serde(skip)]
+    pub(crate) latest_stamp_ts: Option<DateTime<Utc>>,
+}
+
+impl SessionEntry {
+    /// Why a stamped event must not be applied to this session, if so: it is a
+    /// duplicate of one already applied, or (journal route only) older than one.
+    fn stamp_skip(&self, stamp: Option<&EventStamp>, origin: Origin) -> Option<&'static str> {
+        let stamp = stamp?;
+        if self.recent_seqs.contains(&stamp.seq) {
+            return Some("duplicate_ignored");
+        }
+        if origin == Origin::Journal && self.latest_stamp_ts.is_some_and(|latest| stamp.ts < latest)
+        {
+            return Some("journal_stale_ignored");
+        }
+        None
+    }
+
+    /// Remembers an applied event's stamp for [`stamp_skip`](Self::stamp_skip).
+    fn record_stamp(&mut self, stamp: &EventStamp) {
+        if self.recent_seqs.len() >= MAX_RECENT_SEQS {
+            self.recent_seqs.pop_front();
+        }
+        self.recent_seqs.push_back(stamp.seq.clone());
+        // The newest, not the latest to arrive: events from concurrent hooks can
+        // reach the socket out of order, and a journal event older than any of
+        // them is stale either way.
+        self.latest_stamp_ts = Some(self.latest_stamp_ts.map_or(stamp.ts, |t| t.max(stamp.ts)));
+    }
+}
+
+/// When an event is taken to have been seen, for the wall-clock `last_seen`: now
+/// for the socket, and the event's own `ts` for a journal event (never in the
+/// future), so a replayed history cannot look fresh (#2108).
+fn seen_at(stamp: Option<&EventStamp>, origin: Origin, now: DateTime<Utc>) -> DateTime<Utc> {
+    match (origin, stamp) {
+        (Origin::Journal, Some(stamp)) => stamp.ts.min(now),
+        _ => now,
+    }
 }
 
 /// Subagent activity shares the parent's session id but does not run its turn.
@@ -760,6 +843,21 @@ impl SessionsRegistry {
     /// fire on every tool call (the `heartbeat` precedent in
     /// [`WorktreesRegistry`](crate::worktrees::WorktreesRegistry)).
     pub fn observe(&self, req: ObserveRequest) {
+        self.observe_stamped(req, None, Origin::Socket);
+    }
+
+    /// [`observe`](Self::observe) for an event that carries an [`EventStamp`] and
+    /// arrived by `origin` (#2108). A duplicate of an event already applied is
+    /// dropped whatever its route, and a [`Journal`](Origin::Journal) event older
+    /// than one already applied is dropped too; everything else behaves exactly as
+    /// `observe`, except that a journal event's wall-clock `last_seen` is the
+    /// event's own timestamp rather than now.
+    pub(crate) fn observe_stamped(
+        &self,
+        req: ObserveRequest,
+        stamp: Option<EventStamp>,
+        origin: Origin,
+    ) {
         let agent_id = req
             .agent_id
             .as_deref()
@@ -769,13 +867,23 @@ impl SessionsRegistry {
         let agent = req.agent;
         let pid = req.pid;
         let now = Utc::now();
+        let seen = seen_at(stamp.as_ref(), origin, now);
         let awake = self.clock.now();
         let (changed, old_state, new_state, outcome, reaped) = {
             let mut sessions = self.lock_sessions();
             let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, awake);
             let old_state = sessions.get(&session_id).map(|entry| entry.state);
+            let skip = sessions
+                .get(&session_id)
+                .and_then(|entry| entry.stamp_skip(stamp.as_ref(), origin));
             let mut outcome = "created";
             let mutated = match sessions.get_mut(&req.session_id) {
+                // The second copy of an event already applied, or a journal
+                // event older than one that was (#2108).
+                Some(_) if skip.is_some() => {
+                    outcome = skip.unwrap_or("skipped");
+                    false
+                }
                 // A passive re-sighting (the Codex rollout watcher's heartbeat)
                 // must not refresh an ended session, or it would outlive its
                 // short ended-linger window (#1909).
@@ -808,7 +916,11 @@ impl SessionsRegistry {
                     let state_changed = next != entry.state;
                     entry.state = next;
                     entry.last_event = req.event;
-                    entry.last_seen = now;
+                    entry.last_seen = if origin == Origin::Journal {
+                        entry.last_seen.max(seen)
+                    } else {
+                        now
+                    };
                     entry.last_active = awake;
                     // Bound to locals rather than folded into the `||` below: every
                     // field must be filled, and short-circuiting would skip the rest.
@@ -851,20 +963,27 @@ impl SessionsRegistry {
                         state,
                         source: Source::Terminal,
                         last_event: req.event,
-                        started_at: now,
-                        last_seen: now,
+                        started_at: seen,
+                        last_seen: seen,
                         last_active: awake,
                         pid: req.pid,
                         pid_start: None,
                         prompted,
                         streamed,
                         replaced_pids: VecDeque::new(),
+                        recent_seqs: VecDeque::new(),
+                        latest_stamp_ts: None,
                     };
                     entry.state = subagent_state(&mut entry, req.event, agent_id);
                     sessions.insert(session_id, entry);
                     true
                 }
             };
+            if skip.is_none() {
+                if let (Some(stamp), Some(entry)) = (&stamp, sessions.get_mut(&session_id)) {
+                    entry.record_stamp(stamp);
+                }
+            }
             (
                 mutated || reaped > 0,
                 old_state,
@@ -877,7 +996,7 @@ impl SessionsRegistry {
             self.bump();
         }
         tracing::debug!(%session_id, ?agent, ?pid, ?agent_id, ?event, ?old_state, ?new_state, outcome,
-            reaped, bumped = changed, "session_observed");
+            ?origin, reaped, bumped = changed, "session_observed");
     }
 
     /// Marks a session ended (`SessionEnd`), so `list` shows it as `ended` for a
@@ -893,15 +1012,37 @@ impl SessionsRegistry {
     /// (a wrapped hook command whose parent is a per-hook shell) — ends the
     /// session, so the rule can only ever keep a session the old process no
     /// longer owns.
-    pub fn end(&self, session_id: &str, _reason: Option<&str>, pid: Option<u32>) -> bool {
+    pub fn end(&self, session_id: &str, reason: Option<&str>, pid: Option<u32>) -> bool {
+        self.end_stamped(session_id, reason, pid, None, Origin::Socket)
+    }
+
+    /// [`end`](Self::end) for an event that carries an [`EventStamp`] and arrived
+    /// by `origin` (#2108): a duplicate, or a journal `SessionEnd` older than an
+    /// event the session has since applied (a resume), is ignored.
+    pub(crate) fn end_stamped(
+        &self,
+        session_id: &str,
+        _reason: Option<&str>,
+        pid: Option<u32>,
+        stamp: Option<EventStamp>,
+        origin: Origin,
+    ) -> bool {
         let now = Utc::now();
+        let seen = seen_at(stamp.as_ref(), origin, now);
         let awake = self.clock.now();
         let (known, reaped, old_state, outcome) = {
             let mut sessions = self.lock_sessions();
             let reaped = reap_sessions(&mut sessions, self.session_ttl, self.ended_ttl, awake);
             let old_state = sessions.get(session_id).map(|entry| entry.state);
+            let skip = sessions
+                .get(session_id)
+                .and_then(|entry| entry.stamp_skip(stamp.as_ref(), origin));
             let mut outcome = "unknown";
             let known = match sessions.get_mut(session_id) {
+                Some(_) if skip.is_some() => {
+                    outcome = skip.unwrap_or("skipped");
+                    (true, false)
+                }
                 // Already ended (a hook and a watcher can both end it): leave the
                 // linger window alone rather than restart it.
                 Some(entry) if entry.state == SessionState::Ended => {
@@ -918,12 +1059,21 @@ impl SessionsRegistry {
                     outcome = "ended";
                     entry.state = SessionState::Ended;
                     entry.last_event = SessionEvent::Stop;
-                    entry.last_seen = now;
+                    entry.last_seen = if origin == Origin::Journal {
+                        entry.last_seen.max(seen)
+                    } else {
+                        now
+                    };
                     entry.last_active = awake;
                     (true, true)
                 }
                 None => (false, false),
             };
+            if skip.is_none() {
+                if let (Some(stamp), Some(entry)) = (&stamp, sessions.get_mut(session_id)) {
+                    entry.record_stamp(stamp);
+                }
+            }
             (known, reaped, old_state, outcome)
         };
         let (known, flipped) = known;
@@ -938,6 +1088,7 @@ impl SessionsRegistry {
             ?pid,
             ?old_state,
             outcome,
+            ?origin,
             reaped,
             bumped,
             "session_end"
@@ -2051,6 +2202,8 @@ mod tests {
                     prompted: false,
                     streamed: false,
                     replaced_pids: VecDeque::new(),
+                    recent_seqs: VecDeque::new(),
+                    latest_stamp_ts: None,
                     agent: Agent::Claude,
                     session_id: id.to_string(),
                     cwd: None,
@@ -2303,6 +2456,8 @@ mod tests {
                         prompted: false,
                         streamed: false,
                         replaced_pids: VecDeque::new(),
+                        recent_seqs: VecDeque::new(),
+                        latest_stamp_ts: None,
                         agent: Agent::Claude,
                         session_id: id.clone(),
                         cwd: None,
@@ -2878,5 +3033,225 @@ mod tests {
         reg.observe(observe_request("s1", SessionEvent::PostToolUse, None));
         reg.clock.advance(just_inside_the_ttl());
         assert_eq!(reg.list().len(), 1);
+    }
+
+    // --- Stamped events: dedupe and ordering across socket and journal (#2108) --
+
+    fn at(ts: &str) -> DateTime<Utc> {
+        ts.parse().unwrap()
+    }
+
+    fn stamp(ts: &str, seq: &str) -> EventStamp {
+        EventStamp {
+            ts: at(ts),
+            seq: seq.to_string(),
+        }
+    }
+
+    fn state_of(reg: &SessionsRegistry, id: &str) -> SessionState {
+        reg.lock_sessions()[id].state
+    }
+
+    #[test]
+    fn the_second_copy_of_a_stamped_event_is_dropped_whatever_its_route() {
+        let reg = SessionsRegistry::new();
+        let work = stamp("2026-10-03T03:40:00Z", "1-a");
+        let stop = stamp("2026-10-03T03:40:05Z", "1-b");
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::PreToolUse, Some("/p")),
+            Some(work.clone()),
+            Origin::Socket,
+        );
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::Stop, None),
+            Some(stop),
+            Origin::Socket,
+        );
+        assert_eq!(state_of(&reg, "s"), SessionState::Idle);
+        // The journal then hands over the working event again, and so would a
+        // retried POST: neither may undo the `Stop`.
+        for origin in [Origin::Journal, Origin::Socket] {
+            reg.observe_stamped(
+                observe_request("s", SessionEvent::PreToolUse, None),
+                Some(work.clone()),
+                origin,
+            );
+            assert_eq!(state_of(&reg, "s"), SessionState::Idle, "{origin:?}");
+        }
+    }
+
+    #[test]
+    fn a_journal_event_older_than_one_already_applied_is_stale() {
+        let reg = SessionsRegistry::new();
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::Stop, Some("/p")),
+            Some(stamp("2026-10-03T03:40:05Z", "1-b")),
+            Origin::Socket,
+        );
+        // A `PreToolUse` whose POST was dropped, read from the journal late.
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::PreToolUse, None),
+            Some(stamp("2026-10-03T03:40:00Z", "1-a")),
+            Origin::Journal,
+        );
+        assert_eq!(state_of(&reg, "s"), SessionState::Idle);
+        // A newer journal event is applied.
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::PreToolUse, None),
+            Some(stamp("2026-10-03T03:41:00Z", "1-c")),
+            Origin::Journal,
+        );
+        assert_eq!(state_of(&reg, "s"), SessionState::Working);
+    }
+
+    #[test]
+    fn a_socket_event_is_never_dropped_for_its_age() {
+        // Concurrent hooks can reach the socket out of order (as ever), and a
+        // wall clock that stepped back must not freeze a session.
+        let reg = SessionsRegistry::new();
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::Stop, Some("/p")),
+            Some(stamp("2026-10-03T03:40:05Z", "1-b")),
+            Origin::Socket,
+        );
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::PreToolUse, None),
+            Some(stamp("2026-10-03T03:30:00Z", "1-a")),
+            Origin::Socket,
+        );
+        assert_eq!(state_of(&reg, "s"), SessionState::Working);
+    }
+
+    #[test]
+    fn unstamped_events_are_never_skipped() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request("s", SessionEvent::Stop, Some("/p")));
+        reg.observe(observe_request("s", SessionEvent::PreToolUse, None));
+        assert_eq!(state_of(&reg, "s"), SessionState::Working);
+        reg.observe(observe_request("s", SessionEvent::Stop, None));
+        assert_eq!(state_of(&reg, "s"), SessionState::Idle);
+    }
+
+    #[test]
+    fn a_journal_end_older_than_a_resume_does_not_end_the_resumed_session() {
+        let reg = SessionsRegistry::new();
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::SessionStart, Some("/p")),
+            Some(stamp("2026-10-03T03:40:00Z", "1-a")),
+            Origin::Socket,
+        );
+        // `/clear`: the end was journaled at 03:41, but the resumed session's
+        // own start (posted fine) is at 03:42.
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::SessionStart, None),
+            Some(stamp("2026-10-03T03:42:00Z", "1-c")),
+            Origin::Socket,
+        );
+        let ended = reg.end_stamped(
+            "s",
+            Some("clear"),
+            None,
+            Some(stamp("2026-10-03T03:41:00Z", "1-b")),
+            Origin::Journal,
+        );
+        assert!(ended, "the session is known");
+        assert_eq!(state_of(&reg, "s"), SessionState::Starting);
+        // The same end, newer than everything applied, does end it...
+        reg.end_stamped(
+            "s",
+            None,
+            None,
+            Some(stamp("2026-10-03T03:43:00Z", "1-d")),
+            Origin::Journal,
+        );
+        assert_eq!(state_of(&reg, "s"), SessionState::Ended);
+        // ...once, and a duplicate of it is dropped.
+        let ended_at = reg.lock_sessions()["s"].last_seen;
+        reg.end_stamped(
+            "s",
+            None,
+            None,
+            Some(stamp("2026-10-03T03:43:00Z", "1-d")),
+            Origin::Socket,
+        );
+        assert_eq!(reg.lock_sessions()["s"].last_seen, ended_at);
+    }
+
+    #[test]
+    fn a_journal_event_keeps_its_own_timestamp_but_not_its_own_age() {
+        let reg = SessionsRegistry::new();
+        let long_ago = Utc::now() - chrono::Duration::hours(2);
+        let st = EventStamp {
+            ts: long_ago,
+            seq: "1-a".to_string(),
+        };
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::UserPromptSubmit, Some("/p")),
+            Some(st),
+            Origin::Journal,
+        );
+        let listed = reg.list();
+        assert_eq!(listed.len(), 1, "replay is not reaped on arrival");
+        assert_eq!(listed[0].last_seen, long_ago, "history must not look fresh");
+        assert_eq!(listed[0].started_at, long_ago);
+        // Its TTL runs from now, in awake time.
+        reg.clock.advance(just_inside_the_ttl());
+        assert_eq!(reg.list().len(), 1);
+        reg.clock.advance(Duration::from_secs(2));
+        assert!(reg.list().is_empty());
+    }
+
+    #[test]
+    fn a_journal_timestamp_in_the_future_is_clamped_to_now() {
+        let reg = SessionsRegistry::new();
+        let future = Utc::now() + chrono::Duration::hours(1);
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::Stop, Some("/p")),
+            Some(EventStamp {
+                ts: future,
+                seq: "1-a".to_string(),
+            }),
+            Origin::Journal,
+        );
+        assert!(reg.list()[0].last_seen <= Utc::now());
+    }
+
+    #[test]
+    fn only_the_newest_seqs_are_remembered() {
+        let reg = SessionsRegistry::new();
+        for i in 0..=MAX_RECENT_SEQS {
+            reg.observe_stamped(
+                observe_request("s", SessionEvent::PreToolUse, Some("/p")),
+                Some(stamp("2026-10-03T03:40:00Z", &format!("1-{i}"))),
+                Origin::Socket,
+            );
+        }
+        let guard = reg.lock_sessions();
+        assert_eq!(guard["s"].recent_seqs.len(), MAX_RECENT_SEQS);
+        assert!(!guard["s"].recent_seqs.contains(&"1-0".to_string()));
+        assert!(guard["s"]
+            .recent_seqs
+            .contains(&format!("1-{MAX_RECENT_SEQS}")));
+    }
+
+    #[test]
+    fn a_duplicate_does_not_bump_and_does_not_refresh_liveness() {
+        let reg = SessionsRegistry::new();
+        let st = stamp("2026-10-03T03:40:00Z", "1-a");
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::PreToolUse, Some("/p")),
+            Some(st.clone()),
+            Origin::Socket,
+        );
+        let active = reg.lock_sessions()["s"].last_active;
+        let rx = reg.subscribe_changes();
+        reg.clock.advance(Duration::from_secs(10));
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::PreToolUse, Some("/p")),
+            Some(st),
+            Origin::Journal,
+        );
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(reg.lock_sessions()["s"].last_active, active);
     }
 }

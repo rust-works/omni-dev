@@ -75,6 +75,18 @@ pub fn log_path_for_socket(socket: &Path) -> PathBuf {
         .map_or_else(|| PathBuf::from("daemon.log"), |dir| dir.join("daemon.log"))
 }
 
+/// The per-session hook journal directory beside a control socket
+/// (`<socket dir>/sessions`).
+///
+/// The hook sink and the daemon resolve the same one by construction, and a
+/// custom `--socket` keeps its journals beside it (#2108). For the default
+/// socket it is `<runtime_dir>/sessions`.
+pub fn sessions_journal_dir_for_socket(socket: &Path) -> PathBuf {
+    socket
+        .parent()
+        .map_or_else(|| PathBuf::from("sessions"), |dir| dir.join("sessions"))
+}
+
 /// Creates `dir` (and ancestors) if absent and tightens it to owner-only
 /// (`0700`) on Unix.
 ///
@@ -438,6 +450,24 @@ mod tests {
         assert_eq!(
             log_path_for_socket(Path::new("daemon.sock")),
             Path::new("daemon.log")
+        );
+    }
+
+    #[test]
+    fn journals_sit_beside_their_socket() {
+        assert_eq!(
+            sessions_journal_dir_for_socket(Path::new("/tmp/x/daemon.sock")),
+            Path::new("/tmp/x/sessions")
+        );
+        assert_eq!(
+            sessions_journal_dir_for_socket(Path::new("daemon.sock")),
+            Path::new("sessions")
+        );
+        // The default socket's journals are under the runtime dir.
+        let socket = socket_path().unwrap();
+        assert_eq!(
+            sessions_journal_dir_for_socket(&socket),
+            runtime_dir().unwrap().join("sessions")
         );
     }
 

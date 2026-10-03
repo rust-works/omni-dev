@@ -35,7 +35,9 @@ use crate::daemon::service::{
     DaemonService, MenuAction, MenuItem, MenuSnapshot, ServiceStatus, ServiceStream,
 };
 use crate::daemon::services::worktrees::focus_window;
-use crate::sessions::{ObserveRequest, SessionEntry, SessionState, SessionsRegistry, WindowReport};
+use crate::sessions::{
+    EventStamp, ObserveRequest, Origin, SessionEntry, SessionState, SessionsRegistry, WindowReport,
+};
 
 /// The sessions service name (the control-socket routing key).
 pub const SERVICE_NAME: &str = "sessions";
@@ -124,6 +126,10 @@ impl DaemonService for SessionsService {
     async fn handle(&self, op: &str, payload: Value) -> Result<Value> {
         match op {
             "observe" => {
+                // The hook sink's additive `stamp` (#2108): read apart from the
+                // request, which an older sink's payload and every other feed
+                // lack. A malformed one is as good as none.
+                let stamp = stamp_of(&payload);
                 let mut req: ObserveRequest =
                     serde_json::from_value(payload).context("invalid `observe` payload")?;
                 if req.session_id.trim().is_empty() {
@@ -146,7 +152,7 @@ impl DaemonService for SessionsService {
                         };
                     }
                 }
-                self.registry.observe(req);
+                self.registry.observe_stamped(req, stamp, Origin::Socket);
                 Ok(json!({ "ok": true }))
             }
             "end" => {
@@ -158,7 +164,14 @@ impl DaemonService for SessionsService {
                     .get("pid")
                     .and_then(Value::as_u64)
                     .and_then(|pid| u32::try_from(pid).ok());
-                Ok(json!({ "ended": self.registry.end(session_id, reason, pid) }))
+                let ended = self.registry.end_stamped(
+                    session_id,
+                    reason,
+                    pid,
+                    stamp_of(&payload),
+                    Origin::Socket,
+                );
+                Ok(json!({ "ended": ended }))
             }
             "window" => {
                 let req: WindowReport =
@@ -287,6 +300,12 @@ impl ServiceStream for SessionsStream {
     async fn snapshot(&self) -> Value {
         sessions_payload(&self.registry)
     }
+}
+
+/// The [`EventStamp`] a hook sink attached to an `observe` or `end` payload, if
+/// any and well-formed (#2108).
+fn stamp_of(payload: &Value) -> Option<EventStamp> {
+    serde_json::from_value(payload.get("stamp")?.clone()).ok()
 }
 
 /// Extracts a required string `field` from an op payload, erroring with the op
@@ -486,6 +505,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stamped_event_delivered_twice_is_applied_once() {
+        // #2108: the hook sink posts every event it also journaled, and an event
+        // re-delivered with the same stamp must not undo a later one.
+        let svc = service();
+        let working = json!({
+            "ts": "2026-10-03T03:40:00Z", "seq": "9-1",
+        });
+        let stopped = json!({
+            "ts": "2026-10-03T03:40:05Z", "seq": "9-2",
+        });
+        for (event, stamp) in [
+            ("pre_tool_use", &working),
+            ("stop", &stopped),
+            ("pre_tool_use", &working),
+        ] {
+            svc.handle(
+                "observe",
+                json!({ "session_id": "s1", "event": event, "stamp": stamp }),
+            )
+            .await
+            .unwrap();
+        }
+        let listed = svc.handle("list", Value::Null).await.unwrap();
+        assert_eq!(listed["sessions"][0]["state"], "idle");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_stamp_is_ignored_not_an_error() {
+        let svc = service();
+        for stamp in [
+            json!("nope"),
+            json!({ "ts": "yesterday", "seq": 3 }),
+            Value::Null,
+        ] {
+            svc.handle(
+                "observe",
+                json!({ "session_id": "s1", "event": "pre_tool_use", "stamp": stamp }),
+            )
+            .await
+            .unwrap();
+            svc.handle("end", json!({ "session_id": "s1", "stamp": stamp }))
+                .await
+                .unwrap();
+        }
+        assert_eq!(svc.registry().list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stamped_end_is_deduplicated_too() {
+        let svc = service();
+        svc.handle(
+            "observe",
+            json!({ "session_id": "s1", "event": "session_start",
+                    "stamp": { "ts": "2026-10-03T03:40:00Z", "seq": "9-1" } }),
+        )
+        .await
+        .unwrap();
+        let end =
+            json!({ "session_id": "s1", "stamp": { "ts": "2026-10-03T03:41:00Z", "seq": "9-2" } });
+        assert_eq!(
+            svc.handle("end", end.clone()).await.unwrap(),
+            json!({ "ended": true })
+        );
+        // The re-delivered end is dropped, and the session stays ended once.
+        assert_eq!(
+            svc.handle("end", end).await.unwrap(),
+            json!({ "ended": true })
+        );
+        let listed = svc.handle("list", Value::Null).await.unwrap();
+        assert_eq!(listed["sessions"][0]["state"], "ended");
+    }
+
+    #[tokio::test]
     async fn window_report_tags_source_and_unregister_removes() {
         let svc = service();
         svc.handle(
@@ -599,6 +691,8 @@ mod tests {
             prompted: false,
             streamed: false,
             replaced_pids: VecDeque::new(),
+            recent_seqs: VecDeque::new(),
+            latest_stamp_ts: None,
             agent: crate::sessions::Agent::Claude,
             session_id: "sid-12345678".to_string(),
             cwd: Some(PathBuf::from("/p")),
@@ -656,6 +750,8 @@ mod tests {
             prompted: false,
             streamed: false,
             replaced_pids: VecDeque::new(),
+            recent_seqs: VecDeque::new(),
+            latest_stamp_ts: None,
             agent: crate::sessions::Agent::Claude,
             session_id: id.to_string(),
             cwd: cwd.map(PathBuf::from),
