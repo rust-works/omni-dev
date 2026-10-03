@@ -489,8 +489,9 @@ pub struct DependencyEntry {
     pub relation: CitationRelation,
     /// The probability, per stage, that resolving this citation would leave
     /// less of that stage's work remaining than the text implies. Only
-    /// `"design"` is populated for v1 — `"implement"` is deferred pending
-    /// the same kind of live validation `design` got (see #1812).
+    /// `"design"` is populated. An implementation-worded twin scored within
+    /// 0.05 of it on every one of 15 cited issues, so it is not asked
+    /// separately (see #1812 and the #1871 round-4 evaluation).
     pub could_be_cheaper: BTreeMap<String, f64>,
 }
 
@@ -1179,9 +1180,10 @@ pub fn could_be_cheaper_key(i: usize) -> String {
 
 /// Builds the `could_be_cheaper` question for one open citation (#1812).
 ///
-/// Design-stage only for v1 — the exact wording validated live against
-/// `jev-1.13.0`, 2026-09-20; see docs/jev.md for the evidence. Do not reword
-/// without re-validating (pinned by
+/// Asked for the design stage only — the exact wording validated live against
+/// `jev-1.13.0`, 2026-09-20; see docs/jev.md for the evidence. An
+/// implementation-worded twin duplicated its score (r = 0.99 over 15 pairs, #1871)
+/// and is not asked. Do not reword without re-validating (pinned by
 /// `could_be_cheaper_question_is_the_tested_wording`).
 pub fn could_be_cheaper_question(citation: &str) -> Question {
     Question::Noul {

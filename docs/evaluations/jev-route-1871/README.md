@@ -2,7 +2,12 @@
 
 Status: relation labeling is supported for conservative explicit phrases.
 The proposed implementation-stage `could_be_cheaper` and bounded-spike
-questions remain unshipped.
+questions remain unshipped. Round 4 ([below](#round-4-2026-10-04)) closes the
+three gaps the previous round named: it finds why implementation cases above
+the bottom tier were missing, shows the implementation question duplicates the
+shipped design question, and finds no spike threshold that separates the
+labelled cases. It also shows adding either question does not move stage or
+class answers beyond repeat noise.
 
 ## Historical baseline mismatch
 
@@ -172,3 +177,147 @@ or reduce after a dependency lands, and independent pending checks with explicit
 own-text actions for every outcome. Expand the batching comparison to production
 effort-aware requests before shipping either signal. The malformed historical
 results cannot establish baseline drift for those questions.
+
+## Round 4 (2026-10-04)
+
+Everything below was frozen and labelled before any live request. The inputs,
+the author's labels, an independent blind labeller's labels and the decision
+rules (posted on #1871) are in the commit that precedes the results.
+
+### What was run
+
+- **Screening, offline.** The #2052 census baseline (`../jev-route-2052/baseline.json.gz`,
+  214 routed issues, `jev-1.13.0`) routed `implement` to `sonnet` for 209 issues
+  and to `opus` for 5. The five, plus the four next closest by `P(opus)`, are
+  the implementation set (`round4-inputs.json`, `freeze_round4.py`). Eight use
+  the archived text that baseline saw. succinctly#2839 has no triage comment, so
+  it is not archived and was fetched live; the script requires its last edit to
+  predate the census collection, which checks the timestamp but does not recover
+  the exact revision. All six explicit `blocker` citations
+  in the census sit on issues with `P(opus) <= 0.17`, so no census issue is both
+  above the floor and an explicit blocker.
+- **Labels** (`round4-labels.json`, `round4-rubric.md`). The author labelled
+  every open citation and every spike candidate; a separate model (`claude-opus-5-5`),
+  given only the rubric and the frozen text, did the same blind. The author's
+  file was hashed before the blind file was opened. Implementation bearing
+  agrees **9/9** (every pair is `no`); spike labels agree 17/19 exactly and
+  19/19 once `negative_conditional` counts as a negative. Nothing was relabelled
+  after a score was seen.
+- **Spike candidates** (`round4-spike-inputs.json`): 19 issues from a recorded
+  keyword scan of the census and the open omni-dev research issues, plus a
+  `re-measure` search of open succinctly issues after the first scan found one
+  clear positive. omni-dev#2122 is frozen as labelled, before its plan comment.
+  The eleven earlier comparators are reused from `corrected-results.json.gz`.
+- **Variants** (`round4-variant-inputs.json`, `derive_round4_variants.py`): each
+  census case with the triage `**Class:**` paragraph removed (`-noclass`), and
+  two edited simulations that state an explicit hard prerequisite or its landing
+  (`-inject-open` / `-inject-resolved`). A third kind, `-absorb-*`
+  (`round4-posthoc-inputs.json`), was written **after** the first scores were
+  read, because the prerequisite edit turned out to test ordering rather than
+  work reduction. It is exploratory and enters no decision.
+- **Runs** (`round4-*-results.json.gz`, `summarize_round4.py` ->
+  `round4-summary.json`): 254 requests on `jev-1.13.0` (1,660,537 input and
+  128,929 output tokens). Three repeats for the implementation set and variants,
+  two for the spike set and the production-shaped subset. Baseline/candidate
+  order is fixed per case and repeat by a recorded seed (61 baseline-first, 60
+  candidate-first). D1 and D2 use the production request shape: all three
+  built-in ladders with `--effort-advice`.
+
+[`run_round4.sh`](run_round4.sh) holds the exact command for every archive (A
+asis, B variants, C spike, D1/D2 production-shaped, E post hoc) and rebuilds the
+summary; the archived requests are checked against the harness's own builders by a
+test in the example. Live answers vary run to run, so a replay reproduces the
+requests exactly and the answers approximately.
+
+```bash
+run_round4.sh /absolute/path/to/omni-dev/worktree /private/tmp/empty-output-dir
+```
+
+The committed summary is reproducible byte for byte from the committed archives:
+
+```bash
+D=docs/evaluations/jev-route-1871
+python3 $D/summarize_round4.py /tmp/summary.json A=$D/round4-A-asis-results.json.gz \
+  B=$D/round4-B-variant-results.json.gz C=$D/round4-C-spike-results.json.gz \
+  D1=$D/round4-D1-production-impl-results.json.gz D2=$D/round4-D2-production-spike-results.json.gz \
+  E=$D/round4-E-posthoc-absorb-results.json.gz
+```
+
+### Results
+
+- **Most of the room above the floor is a class paragraph.** Four of the five
+  census issues routed above the bottom tier, and eight of the nine cases here,
+  carry a triage paragraph beginning `**Class:** Opus —` that states the class
+  and why. Removing only that paragraph lowers `P(implement above floor)` by
+  0.31 to 0.54 in every one of the eight cases that have it (mean 0.50 to 0.10),
+  leaves no case above the floor in a majority of repeats (3 of 8 before), and no
+  repeat chooses `opus` (10 of 24 did). The paragraph is not sufficient: five of
+  those eight sit at the floor with it, and succinctly#2839, which has none, is
+  just under the line (0.46-0.49). So the room above the floor the earlier
+  rounds lacked comes largely from text that announces its own class, and a stage
+  answer anchored by that sentence is a poor instrument for checking whether a
+  cited issue lowers the tier.
+- **No natural pair can test the question.** All nine open citations on those
+  cases are `no` (independent, sibling, coordinate, or the dependency runs the
+  other way). The implementation scores on those `no` pairs span 0.31-0.61;
+  #1183 and #1076, which the plan only says cap fidelity, score 0.55-0.61.
+- **The implementation question duplicates the design one.** Over 15 open
+  citations (the nine here and six from the corrected set), the implementation
+  score and the shipped `could_be_cheaper.design` score from a separate request
+  correlate at r = 0.99, with a mean absolute difference of 0.024 and a maximum
+  of 0.047. The model reads both as "would resolving this leave less work", so the
+  implementation wording adds no signal the design one does not already carry.
+- **Edited simulations (weakest evidence).** Stating a hard prerequisite moved
+  neither score (0.33 -> 0.32 on #2800, 0.49 -> 0.47 on #2799), which is the right
+  answer: a prerequisite orders work without shrinking it. Stating that the cited
+  issue delivers part of the implementation (post hoc) raised the implementation
+  score to 0.79 and 0.66 and the design score to 0.76 and 0.64, together. Declaring the
+  overlapping work landed lowered `P(implement above floor)` by only 0.03 and 0.01,
+  inside repeat noise, with the class paragraph still in the text.
+- **Spike: no separating threshold.** Five labelled positives (three
+  independently double-labelled: #2663, #3685, #1993; plus the reconstructed #1845
+  pre-probe and #2640, whose label was corrected after its scores were seen)
+  scored 0.89, 0.80, 0.64, 0.56 and 0.45 (case means). Twenty negatives, three of
+  them conditional plans, include succinctly#2607 at 0.68 and #2705 at 0.46, above
+  three of the five positives. Minimum positive minus maximum negative is **-0.27**
+  (the rule needed +0.15); 94 of 100 positive/negative pairs rank correctly but
+  no cut-off keeps all positives and drops all negatives. Repeat spread reached
+  0.07. The baseline `open_questions` answer for the three new positives was
+  `design`, `factual`, `design`, so it does not stand in for the spike score
+  either. #2607's plan contains an A/B contingency (take the single-pass scanner if
+  the two-pass form regresses) and scoring as a bounded probe is the clearest false positive.
+- **Batching does not move the answers.** Class-only single-ladder requests:
+  15 of 285 stage choices changed between baseline and candidate (5.3%), against
+  14 of 246 between baseline repeats (5.7%). Production-shaped requests (three
+  ladders, effort advice, 10 cases, two repeats): 8 of 180 (4.4%) against 4 of 90
+  (4.4%). Class changed in 2 of 95 and 3 of 60 comparisons, every one inside a
+  baseline close call. The set is small, so this bounds the effect rather than
+  proving harmlessness.
+
+### Decision against the pre-registered rules
+
+| Gate | Rule | Outcome |
+|---|---|---|
+| I1 | at least 4 issues above the floor in a majority of repeats | not met: 3, and 0 without the class paragraph |
+| I2 | at least 2 `yes` and 2 `no` natural pairs | untestable: 0 `yes`, 9 `no` |
+| I3, I4 | `yes` pairs score and shift above `no` pairs | untestable on natural data |
+| Spike | gap at least 0.15, spread at most 0.07 | not met: gap -0.27 |
+| Batching | change rate within repeat noise + 0.02 | met on this set |
+
+Neither question ships. The evidence favours retiring the implementation
+question rather than re-running it: it is not just unvalidated, it is redundant
+with `could_be_cheaper.design`, which [docs/jev.md](../../jev.md) now describes as
+a work-reduction score in general. The spike question stays out. A future attempt
+needs more positives that are not conditional-plan lookalikes and a wording that
+scores contingencies like #2607's low, which a repeat spread of 0.07 leaves little
+room for.
+
+### Limits
+
+Labels are two readers' judgements on public text. Three positives are
+independent and double-labelled; the other two are the earlier author-only labels,
+one reconstructed and one corrected after its scores were seen. Nine
+implementation cases, all from one repository and one triage style. The
+class-paragraph removal is an edit, not a recovered historical input. The
+`-inject` and `-absorb` texts are synthetic. omni-dev#2122 and the other omni-dev
+issues are frozen as fetched on 2026-10-04.
