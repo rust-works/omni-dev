@@ -176,9 +176,11 @@ pub(crate) enum Origin {
     /// dropped when older than what the session has already applied, so a
     /// late-read event can never undo a newer one.
     Journal,
-    /// A hook's journal replayed on first sight — at startup, or a file that
-    /// appears later. The same rules as [`Journal`](Self::Journal); a separate
-    /// origin only so [`DeliveryStats`] can tell a replay from a recovery.
+    /// A hook's journal replayed by the daemon's **startup** scan: what a restart
+    /// found, or events fired while the daemon was down. The same rules as
+    /// [`Journal`](Self::Journal); a separate origin only so [`DeliveryStats`] can
+    /// tell a replay from a recovery. A journal a running daemon first sees later
+    /// is a [`Journal`](Self::Journal) tail.
     Replay,
 }
 
@@ -203,7 +205,7 @@ pub struct DeliveryStats {
     /// dropped POSTs. A copy that arrived a moment after the journal poll read the
     /// line is not counted, since the poll can win that race.
     pub recovered: u64,
-    /// Events applied by a journal's first-sight replay: a restart, or events
+    /// Events applied by the startup replay of the journals: a restart, or events
     /// fired while the daemon was down.
     pub replayed: u64,
 }
@@ -212,29 +214,31 @@ pub struct DeliveryStats {
 #[derive(Debug, Default)]
 struct DeliveryCounters {
     socket: std::sync::atomic::AtomicU64,
-    /// Tailed-journal events applied, including those whose socket copy was only
-    /// slower than the poll.
-    journal: std::sync::atomic::AtomicU64,
+    /// Tailed-journal events applied, less those whose socket copy turned out to
+    /// be only slower than the poll. One counter, so a snapshot is never a
+    /// difference of two values read at different instants.
+    recovered: std::sync::atomic::AtomicU64,
     replayed: std::sync::atomic::AtomicU64,
-    /// Socket events that turned out to be the late copy of a journal event
-    /// already applied: the poll winning a race, not a drop.
-    socket_after_journal: std::sync::atomic::AtomicU64,
 }
 
 impl DeliveryCounters {
     /// Records how one event fared: applied by `origin`, or skipped (`applied`
-    /// false) — in which case only a socket duplicate of a journal event, `raced`,
-    /// is worth counting.
+    /// false) — in which case only the socket copy of an event a tailed journal
+    /// had already applied, `raced`, is worth counting: the poll won a race, so
+    /// that event was not a dropped POST after all.
     fn record(&self, origin: Origin, applied: bool, raced: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         if applied {
             match origin {
                 Origin::Socket => self.socket.fetch_add(1, Relaxed),
-                Origin::Journal => self.journal.fetch_add(1, Relaxed),
+                Origin::Journal => self.recovered.fetch_add(1, Relaxed),
                 Origin::Replay => self.replayed.fetch_add(1, Relaxed),
             };
         } else if raced {
-            self.socket_after_journal.fetch_add(1, Relaxed);
+            // Saturating: never below the recoveries actually counted.
+            let _ = self
+                .recovered
+                .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_sub(1)));
         }
     }
 
@@ -242,10 +246,7 @@ impl DeliveryCounters {
         use std::sync::atomic::Ordering::Relaxed;
         DeliveryStats {
             socket: self.socket.load(Relaxed),
-            recovered: self
-                .journal
-                .load(Relaxed)
-                .saturating_sub(self.socket_after_journal.load(Relaxed)),
+            recovered: self.recovered.load(Relaxed),
             replayed: self.replayed.load(Relaxed),
         }
     }
@@ -690,13 +691,21 @@ impl SessionEntry {
             .map(|(_, origin)| *origin)
     }
 
-    /// Whether `stamp` is the socket copy of an event a journal already applied:
-    /// the poll beat the POST (#2136).
+    /// Whether `stamp` is the socket copy of an event a *tailed* journal already
+    /// applied: the poll beat the POST (#2136). Not of a replayed one — a replay
+    /// is not counted as a recovery, so its socket copy has nothing to take back —
+    /// and not of one a socket copy has already confirmed.
     fn raced_by_journal(&self, stamp: Option<&EventStamp>, origin: Origin) -> bool {
         origin == Origin::Socket
-            && stamp
-                .and_then(|stamp| self.seq_origin(&stamp.seq))
-                .is_some_and(Origin::is_journal)
+            && stamp.and_then(|stamp| self.seq_origin(&stamp.seq)) == Some(Origin::Journal)
+    }
+
+    /// Marks the event with this `seq` as confirmed by the socket, so a further
+    /// copy of it is not counted as another lost race.
+    fn confirm_by_socket(&mut self, seq: &str) {
+        if let Some((_, origin)) = self.recent_seqs.iter_mut().find(|(s, _)| s == seq) {
+            *origin = Origin::Socket;
+        }
     }
 
     /// Remembers an applied event's stamp for [`stamp_skip`](Self::stamp_skip).
@@ -1097,6 +1106,10 @@ impl SessionsRegistry {
                     entry.record_stamp(stamp, origin);
                 }
             }
+            if let (true, Some(stamp), Some(entry)) = (raced, &stamp, sessions.get_mut(&session_id))
+            {
+                entry.confirm_by_socket(&stamp.seq);
+            }
             self.delivery.record(origin, skip.is_none(), raced);
             (
                 mutated || reaped > 0,
@@ -1191,10 +1204,18 @@ impl SessionsRegistry {
                     entry.record_stamp(stamp, origin);
                 }
             }
-            // An `end` for a session the registry no longer holds applied to
-            // nothing, so it is not a delivery worth counting.
-            self.delivery
-                .record(origin, skip.is_none() && known.0, raced);
+            if let (true, Some(stamp), Some(entry)) = (raced, &stamp, sessions.get_mut(session_id))
+            {
+                entry.confirm_by_socket(&stamp.seq);
+            }
+            // A socket `end` is a delivery whether or not the registry still
+            // holds the session. A journal `end` for a session it does not hold
+            // applied to nothing, and would only inflate `recovered`.
+            self.delivery.record(
+                origin,
+                skip.is_none() && (origin == Origin::Socket || known.0),
+                raced,
+            );
             (known, reaped, old_state, outcome)
         };
         let (known, flipped) = known;
@@ -3541,5 +3562,75 @@ mod tests {
             value,
             serde_json::json!({ "socket": 5, "recovered": 2, "replayed": 1 })
         );
+    }
+
+    #[test]
+    fn the_socket_copy_of_a_replayed_event_takes_nothing_back_from_recoveries() {
+        let reg = SessionsRegistry::new();
+        let replayed = stamp("2026-10-03T03:40:00Z", "1-a");
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::SessionStart, Some("/p")),
+            Some(replayed.clone()),
+            Origin::Replay,
+        );
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::PreToolUse, None),
+            Some(stamp("2026-10-03T03:40:05Z", "1-b")),
+            Origin::Journal,
+        );
+        // A POST that was queued while the daemon started lands after the replay.
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::SessionStart, None),
+            Some(replayed),
+            Origin::Socket,
+        );
+        assert_eq!(
+            reg.delivery(),
+            DeliveryStats {
+                socket: 0,
+                recovered: 1,
+                replayed: 1
+            },
+            "the real recovery is not masked"
+        );
+    }
+
+    #[test]
+    fn repeated_socket_copies_of_one_raced_event_take_it_back_only_once() {
+        let reg = SessionsRegistry::new();
+        let raced = stamp("2026-10-03T03:40:00Z", "1-a");
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::PreToolUse, Some("/p")),
+            Some(raced.clone()),
+            Origin::Journal,
+        );
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::PostToolUse, None),
+            Some(stamp("2026-10-03T03:40:05Z", "1-b")),
+            Origin::Journal,
+        );
+        assert_eq!(reg.delivery().recovered, 2);
+        // A client retry delivers the first event's POST twice.
+        for _ in 0..2 {
+            reg.observe_stamped(
+                observe_request("s", SessionEvent::PreToolUse, None),
+                Some(raced.clone()),
+                Origin::Socket,
+            );
+        }
+        assert_eq!(reg.delivery().recovered, 1, "the other recovery stands");
+    }
+
+    #[test]
+    fn a_socket_end_counts_even_for_a_session_the_registry_does_not_hold() {
+        let reg = SessionsRegistry::new();
+        reg.end_stamped(
+            "ghost",
+            None,
+            None,
+            Some(stamp("2026-10-03T03:41:00Z", "9-a")),
+            Origin::Socket,
+        );
+        assert_eq!(reg.delivery().socket, 1);
     }
 }

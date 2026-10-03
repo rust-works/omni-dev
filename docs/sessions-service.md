@@ -913,8 +913,13 @@ reached it since it started (#2136), and `--json` carries the same numbers under
   (about 0.02% of events at the 5 s poll); that POST then lands as a duplicate and
   takes the event back out of `recovered`, so a recovery is briefly counted until
   its socket copy shows up.
-- **`replayed`** counts events applied by a journal's first-sight replay: a
-  restart, or events fired while the daemon was down.
+- **`replayed`** counts events applied by the startup replay of the journals: a
+  restart, or events fired while the daemon was down. A journal a *running* daemon
+  first sees (a new session's) is a tail, so its dropped POSTs count as
+  `recovered`.
+
+These count deliveries, not state changes: an event the socket missed is a drop
+even when the state machine then ignores it (a late event for an ended session).
 
 The counters are monotonic since the daemon started and are not persisted. They
 cannot see a hook that never wrote a journal (a non-UUID id, a daemon-less
