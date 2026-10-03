@@ -1,6 +1,7 @@
 //! The [`ServiceRegistry`]: the daemon's set of hosted services, plus routing.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -96,6 +97,14 @@ impl ServiceRegistry {
         out
     }
 
+    /// Tells every service the control socket could not accept connections for
+    /// `outage` (see [`DaemonService::credit_accept_outage`]).
+    pub fn credit_accept_outage(&self, outage: Duration) {
+        for svc in &self.services {
+            svc.credit_accept_outage(outage);
+        }
+    }
+
     /// Gracefully shuts down every service, in registration order.
     pub async fn shutdown_all(&self) {
         for svc in &self.services {
@@ -137,6 +146,30 @@ mod tests {
         // Aggregation iterates every registered service.
         assert_eq!(registry.statuses().await.len(), 1);
         registry.shutdown_all().await;
+    }
+
+    #[test]
+    fn credit_accept_outage_reaches_every_service() {
+        use crate::daemon::testutil::OutageRecorder;
+
+        let first = Arc::new(OutageRecorder::new("first"));
+        let second = Arc::new(OutageRecorder::new("second"));
+        let mut registry = ServiceRegistry::new();
+        registry.register(first.clone());
+        registry.register(second.clone());
+
+        registry.credit_accept_outage(Duration::from_secs(7));
+
+        assert_eq!(first.credited(), vec![Duration::from_secs(7)]);
+        assert_eq!(second.credited(), vec![Duration::from_secs(7)]);
+    }
+
+    #[test]
+    fn credit_accept_outage_is_a_no_op_for_a_service_that_ignores_it() {
+        // `EchoService` keeps the trait's default, which must simply do nothing.
+        let mut registry = ServiceRegistry::new();
+        registry.register(Arc::new(EchoService));
+        registry.credit_accept_outage(Duration::from_secs(7));
     }
 
     #[test]

@@ -173,6 +173,7 @@ async fn accept_loop<S: ConnectionSource>(
             accepted = source.accept() => match accepted {
                 Ok(stream) => {
                     if let Some(recovery) = backoff.on_success(Instant::now()) {
+                        registry.credit_accept_outage(recovery.outage);
                         tracing::info!(
                             failures = recovery.failures,
                             outage = ?recovery.duration,
@@ -187,6 +188,10 @@ async fn accept_loop<S: ConnectionSource>(
                 }
                 Err(e) => {
                     let step = backoff.on_failure(Instant::now());
+                    // Credited as it happens, not just on recovery, because the
+                    // tray and `status` read (and so reap) the registries
+                    // throughout an outage that may never end.
+                    registry.credit_accept_outage(step.outage);
                     if step.log {
                         tracing::warn!(
                             "daemon accept error: {e} (backing off; further errors are summarised)"
@@ -1135,6 +1140,57 @@ mod tests {
         // Three failed attempts, the success, and the parked fifth the shutdown
         // interrupted — nothing like the thousands a spinning loop would make.
         assert!(source.calls() <= 5, "spun: {} accept calls", source.calls());
+    }
+
+    /// The time the daemon spent unable to accept is credited to its services as
+    /// it passes, so a registry does not age clients out for silence the daemon
+    /// itself caused (#2111). The credits sum to the whole outage.
+    #[tokio::test]
+    async fn accept_loop_credits_the_outage_to_the_services() {
+        use crate::daemon::testutil::OutageRecorder;
+        use tokio::io::AsyncWriteExt;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let source = ScriptedSource::new(vec![
+            Err(emfile()),
+            Err(emfile()),
+            Err(emfile()),
+            Ok(server),
+        ]);
+        let recorder = Arc::new(OutageRecorder::new("recorder"));
+        let mut registry = ServiceRegistry::new();
+        registry.register(recorder.clone());
+        let registry = Arc::new(registry);
+        let shutdown = CancellationToken::new();
+        let mut conns: JoinSet<()> = JoinSet::new();
+
+        let talking = async {
+            // Serving the connection proves the loop got past the failures.
+            let (read_half, mut write_half) = client.into_split();
+            let mut reader = BufReader::new(read_half);
+            write_half.write_all(b"{\"op\":\"ping\"}\n").await.unwrap();
+            read_reply(&mut reader).await;
+            shutdown.cancel();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                accept_loop(&source, &registry, &shutdown, &mut conns),
+                talking
+            )
+        })
+        .await
+        .expect("the loop should recover and serve");
+
+        let credited = recorder.credited();
+        // Three failures and the recovery each report once; the first failure has
+        // nothing to credit yet.
+        assert_eq!(credited.len(), 4, "{credited:?}");
+        assert_eq!(credited[0], Duration::ZERO);
+        // The sleeps between the attempts (5 + 10 + 20 ms) are the outage, and a
+        // sleep never ends early.
+        let total: Duration = credited.iter().sum();
+        assert!(total >= Duration::from_millis(35), "credited {total:?}");
+        assert!(total < Duration::from_secs(2), "credited {total:?}");
     }
 
     /// A stop request during a long backoff sleep ends the loop at once, rather

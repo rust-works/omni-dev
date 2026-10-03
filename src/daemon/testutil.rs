@@ -8,10 +8,74 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::Duration;
 
+use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
+
+use super::service::{DaemonService, MenuSnapshot, ServiceStatus};
+
+/// A [`DaemonService`] that serves nothing and records every accept outage the
+/// server credits it (#2111), so tests can see what the accept loop reported.
+pub(crate) struct OutageRecorder {
+    name: &'static str,
+    credited: Mutex<Vec<Duration>>,
+}
+
+impl OutageRecorder {
+    pub(crate) fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            credited: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Every outage credited so far, in order.
+    pub(crate) fn credited(&self) -> Vec<Duration> {
+        self.credited.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl DaemonService for OutageRecorder {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    async fn handle(&self, _op: &str, _payload: Value) -> Result<Value> {
+        Ok(Value::Null)
+    }
+
+    fn menu(&self) -> MenuSnapshot {
+        MenuSnapshot {
+            title: self.name.to_string(),
+            items: vec![],
+        }
+    }
+
+    async fn menu_action(&self, _action_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn status(&self) -> ServiceStatus {
+        ServiceStatus {
+            name: self.name.to_string(),
+            healthy: true,
+            summary: String::new(),
+            detail: Value::Null,
+        }
+    }
+
+    async fn shutdown(&self) {}
+
+    fn credit_accept_outage(&self, outage: Duration) {
+        self.credited.lock().unwrap().push(outage);
+    }
+}
 
 /// Spawns a one-shot fake daemon on a short-path Unix socket that reads exactly
 /// one request line and replies with `reply` (a full `DaemonReply`-shaped JSON
