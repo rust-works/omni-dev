@@ -123,7 +123,7 @@ This skill performs the complete end-to-end release process for omni-dev, from v
     Abort if any check fails.
 
 14. **Check the Extension's Publish Tokens**
-    A failed Marketplace publish also skips Open VSX, so one expired `VSCE_PAT` stops both registries (`vscode-v0.9.0`, `v0.10.0`, `v0.11.0` all failed this way). If a token is available in the environment, verify it; never print it and never read credential files to find one:
+    The Marketplace and Open VSX are published independently, so an expired token fails the run without keeping the release from the other registry (`vscode-v0.9.0`, `v0.10.0` and `v0.11.0` all failed at the Marketplace step with an expired `VSCE_PAT`). If a token is available in the environment, verify it; never print it and never read credential files to find one:
     ```bash
     VSCE_PAT=<token> npx @vscode/vsce verify-pat rust-works
     OVSX_PAT=<token> npx ovsx verify-pat rust-works
@@ -243,7 +243,7 @@ This skill performs the complete end-to-end release process for omni-dev, from v
     ```bash
     gh run view <run_id> --log-failed
     ```
-    For an extension run that failed at *Publish to VS Code Marketplace* (typically an expired `VSCE_PAT`), Open VSX was skipped too. Tell the user to renew the secret, then re-run on the same tag; nothing reached either registry:
+    For an extension run that failed at a publish step (typically an expired `VSCE_PAT`), the other registry was still attempted. Tell the user to renew the secret, then re-run on the same tag; `--skip-duplicate` leaves a registry that already has the version alone:
     ```bash
     gh run rerun <run_id> --failed
     ```
@@ -299,16 +299,16 @@ This skill performs the complete end-to-end release process for omni-dev, from v
 
 ## Error Handling
 
-| Error                          | Action                                                              |
-|--------------------------------|---------------------------------------------------------------------|
-| Dirty working directory        | Abort with message to commit/stash changes                          |
-| Quality check fails            | Abort with specific failure details                                 |
-| Direct push to `main` rejected | Expected: `main` is protected. Use the pull request and merge queue |
-| Queue ejects the entry         | Show the failing check, fix on the release branch, re-enqueue       |
-| Tag verification fails         | Delete the local tag, fix via a follow-up PR; never push a bad tag  |
-| CI workflow fails              | Show failed job logs, suggest fixes                                 |
-| Marketplace publish fails      | Open VSX is skipped too; renew `VSCE_PAT`, `gh run rerun --failed`  |
-| Timeout (>15 min)              | Provide manual verification commands                                |
+| Error                          | Action                                                                   |
+|--------------------------------|--------------------------------------------------------------------------|
+| Dirty working directory        | Abort with message to commit/stash changes                               |
+| Quality check fails            | Abort with specific failure details                                      |
+| Direct push to `main` rejected | Expected: `main` is protected. Use the pull request and merge queue      |
+| Queue ejects the entry         | Show the failing check, fix on the release branch, re-enqueue            |
+| Tag verification fails         | Delete the local tag, fix via a follow-up PR; never push a bad tag       |
+| CI workflow fails              | Show failed job logs, suggest fixes                                      |
+| Registry publish fails         | Other registry still attempted; renew the token, `gh run rerun --failed` |
+| Timeout (>15 min)              | Provide manual verification commands                                     |
 
 ## Polling Configuration
 

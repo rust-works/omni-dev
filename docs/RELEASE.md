@@ -184,7 +184,7 @@ git commit -m "chore(release): prepare vscode extension release vA.B.C
 
 ### 4. Check the Publish Tokens
 
-`vscode-extension-release.yml` publishes to the VS Code Marketplace first and to Open VSX second, and **a failed Marketplace step skips Open VSX**. An expired `VSCE_PAT` therefore stops both registries: `vscode-v0.9.0`, `v0.10.0` and `v0.11.0` all failed this way at the Marketplace step.
+`vscode-extension-release.yml` publishes to the VS Code Marketplace and to Open VSX **independently**: a failure at one does not skip the other, but the run still ends red. Both tokens expire. `vscode-v0.9.0`, `v0.10.0` and `v0.11.0` all failed at the Marketplace step with an expired `VSCE_PAT`; those runs predate the independent publish, so each also skipped Open VSX, which is why Open VSX is still at 0.8.0.
 
 Verify the tokens you hold before tagging:
 
@@ -298,8 +298,8 @@ The two tag families trigger separate workflows and never each other's: `release
 **Extension Release Workflow (`.github/workflows/vscode-extension-release.yml`)**
 - Verifies the tag matches `editors/vscode/package.json`
 - Re-runs typecheck, build, tests and packaging
-- Publishes the **same** `.vsix` to the VS Code Marketplace (`VSCE_PAT`), then to Open VSX (`OVSX_PAT`)
-- A registry whose token is unset is skipped with a notice. The run fails only if neither is set, or if a publish step fails
+- Publishes the **same** `.vsix` to the VS Code Marketplace (`VSCE_PAT`) and to Open VSX (`OVSX_PAT`), independently: a failure publishing to one does not skip the other. Both publishes pass `--skip-duplicate`, so a re-run leaves a registry that already has the version alone
+- A registry whose token is unset is skipped with a notice. The run fails if neither is set, or if either publish fails
 - Uploads the `.vsix` as a workflow artefact for provenance
 
 ### 8. Monitor and Verify
@@ -350,7 +350,7 @@ After pushing the tags, monitor the automated releases.
 
 3. **Do not rely on a Marketplace read-back.** Registry read APIs lag a publish, and `vsce show rust-works.omni-dev` can answer `not found` for an extension that is live. Trust the publish step's output, and check the [Marketplace page](https://marketplace.visualstudio.com/items?itemName=rust-works.omni-dev) later by eye.
 
-4. **If the Marketplace step failed**, Open VSX was skipped too. Fix the secret ([step 4](#4-check-the-publish-tokens)), then re-run the failed job on the **same tag**; nothing reached either registry, so the version is still free:
+4. **If a publish step failed**, the run is red but the other registry was still attempted. Fix the secret ([step 4](#4-check-the-publish-tokens)), then re-run the failed job on the **same tag**; `--skip-duplicate` leaves a registry that already has the version alone, and the version is still free on the one that failed. A re-run uses the workflow file as of the tag's commit:
    ```bash
    gh run rerun <run_id> --failed
    ```

@@ -25,6 +25,13 @@ name: VS Code extension release
 # not a failure) — so Marketplace-only, Open-VSX-only, and both are all valid,
 # green outcomes. The run fails only if neither token is set. See
 # editors/vscode/README.md.
+#
+# The two registries are published independently: a failure publishing to one
+# (typically an expired PAT) does not skip the other, though the run still ends
+# red. Both publishes pass --skip-duplicate, so re-running a failed run
+# (`gh run rerun <id> --failed`) after renewing a token leaves the registry that
+# already has the version alone. A re-run uses the workflow as of the tag's
+# commit, so a change to this file applies from the next tag.
 on:
   push:
     tags:
@@ -128,16 +135,21 @@ jobs:
         if: steps.secrets.outputs.has_vsce == 'true'
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
-        run: npm run publish:vsce -- --packagePath "${{ steps.vsix.outputs.path }}"
+        run: npm run publish:vsce -- --packagePath "${{ steps.vsix.outputs.path }}" --skip-duplicate
 
+      # `!cancelled()` lets this run after a failed Marketplace publish, so one
+      # registry's expired token cannot keep the other from receiving the release;
+      # the `steps.vsix.outcome` guard still skips it when there is no .vsix.
       - name: Publish to Open VSX
-        if: steps.secrets.outputs.has_ovsx == 'true'
+        if: ${{ !cancelled() && steps.vsix.outcome == 'success' && steps.secrets.outputs.has_ovsx == 'true' }}
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
-        run: npm run publish:ovsx -- "${{ steps.vsix.outputs.path }}"
+        run: npm run publish:ovsx -- "${{ steps.vsix.outputs.path }}" --skip-duplicate
 
-      # Keep the exact published artifact for provenance / manual re-install.
+      # Keep the exact packaged artifact for provenance / manual re-install, even
+      # when a registry rejected it.
       - name: Upload published .vsix artifact
+        if: ${{ !cancelled() && steps.vsix.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: omni-dev-vsix-${{ github.ref_name }}
