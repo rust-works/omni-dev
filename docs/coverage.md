@@ -297,7 +297,9 @@ omni-dev coverage diff --report head.lcov --baseline-report merged.lcov
   input that is missing, unparseable or has no executable lines fails the run and
   names it — **including a lone input**, unlike `coverage diff`, because the output
   is trusted by whatever reads it next. An input whose absolute paths all fall
-  outside the strip prefix draws a warning on stderr.
+  outside the strip prefix draws a warning on stderr; the file is still written,
+  so check stderr when the merged file is published unattended. Both commands
+  judge a shard with the same function, so the checks cannot drift apart.
 - **Same total.** Reading the merged file as a single `--report` gives the same
   total, patch coverage and rendered output as passing the shards. On three real
   `cargo llvm-cov` shards of a small crate, the merged file, the shards and the
@@ -311,7 +313,9 @@ omni-dev coverage diff --report head.lcov --baseline-report merged.lcov
   codecov line view but not for a consumer that wants branches. `LF`/`LH` count the
   `DA` records, so unlike `llvm-cov`'s own lcov the file agrees with itself (see
   [why the total differs](#why-the-total-differs-from-llvm-covs-summary)). A file
-  with no executable lines is left out.
+  with no executable lines is kept as an empty record, so the text reads back as
+  exactly the merged report. A path with a line break or leading or trailing
+  whitespace, which lcov cannot carry, fails the merge.
 - **Repo-relative paths.** Paths are written with the repository working
   directory stripped (found from `-C/--repo` or the current directory), or with
   `--strip-prefix <PATH>` when the shards were measured under another root. The
@@ -320,12 +324,17 @@ omni-dev coverage diff --report head.lcov --baseline-report merged.lcov
   union with the others, which is what the shard warning under [Sharded runs](#sharded-runs) is for. Outside a
   repository, and with no `--strip-prefix`, paths are written as the reports have
   them. A path outside the prefix is normalised as `coverage diff` normalises it
-  (a leading `./` or `/` is dropped).
+  (a leading `./` or `/` is dropped), so a standard-library path such as
+  `/rustc/<hash>/library/…` comes out without its leading `/`. If the repository
+  exists but cannot be opened (say, a checkout owned by another user), the merge
+  fails and asks for `--strip-prefix` rather than writing absolute paths.
 - **Atomic.** Every input is read and checked before anything is written, and
-  the file is replaced through a temporary file and a rename: a merge that fails
+  the file is replaced through a temporary file and a rename, through a symlink
+  if the path is one and keeping an existing file's mode: a merge that fails
   creates nothing and leaves an existing file as it was, and `-o` may name one of
   the inputs. `-o` is a **path** here, whereas `coverage diff -o` selects an
-  output format.
+  output format, so a bare `markdown`, `yaml`, `json` or `lcov` is refused as a
+  probable slip (write `./json` for a file of that name).
 - **Not applied: filters.** `--ignore-filename-regex`, `.omni-dev/coverage.yaml`
   and `ignore` markers are applied by `coverage diff`, to the head and baseline
   alike, so the merged file stays a complete record.
