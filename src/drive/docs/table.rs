@@ -528,7 +528,7 @@ mod tests {
                 3 => t["tableRows"][0]["tableCells"][0]["endIndex"] = json!(1000),
                 4 => {
                     t["tableRows"][1]["tableCells"][1]["content"][0]["paragraph"]["elements"][0]
-                        ["textRun"]["suggestedInsertionIds"] = json!(["s"])
+                        ["textRun"]["suggestedInsertionIds"] = json!(["s"]);
                 }
                 _ => {
                     t["tableRows"][1]["tableCells"]
