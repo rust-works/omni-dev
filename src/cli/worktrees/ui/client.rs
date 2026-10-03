@@ -38,10 +38,12 @@ impl WorktreesClient {
 
     /// Batches the daemon's lazy `ahead-behind` op over `paths`.
     ///
-    /// A path the daemon has no upstream/divergence to report for is omitted
-    /// from the returned map entirely — the daemon reports absence, not zero
-    /// (`src/daemon/services/worktrees.rs::ahead_behind_results`) — so callers
-    /// must treat a missing key as "unavailable", never as `0`/`0`.
+    /// A path the daemon has no divergence to report for — no upstream *and*
+    /// nothing to compare with the default branch — is omitted from the returned
+    /// map entirely; the daemon reports absence, not zero
+    /// (`src/daemon/services/worktrees.rs::ahead_behind_results`). Callers must
+    /// treat a missing key as "unavailable", never as `0`/`0`. An `Err` is a
+    /// failed fetch, which is *not* the same answer.
     pub async fn fetch_ahead_behind(
         &self,
         paths: &[PathBuf],

@@ -146,9 +146,15 @@ fn state_for(entry: Option<&AheadBehindEntryWire>) -> AheadBehindState {
             behind,
             main_behind,
         },
-        // The daemon omits a path entirely when it has no upstream to compare
-        // against: it answered, and it had nothing. That is settled, unlike a
-        // fetch that failed.
+        // A branch with no upstream still gets a row when it is behind the
+        // default branch (#1457): `main_behind` alone, which `Known` cannot hold.
+        Some(AheadBehindEntryWire {
+            main_behind: Some(main_behind),
+            ..
+        }) => AheadBehindState::MainOnly { main_behind },
+        // The daemon omits a path entirely when it has neither to report: it
+        // answered, and it had nothing. That is settled, unlike a fetch that
+        // failed.
         _ => AheadBehindState::Unavailable,
     }
 }
@@ -213,6 +219,35 @@ mod tests {
     }
 
     #[test]
+    fn state_for_a_row_with_only_main_behind_is_main_only() {
+        // A branch with no upstream that is behind the default branch (#1457):
+        // the daemon sends `main_behind` with no `ahead`/`behind`. It must not
+        // be dropped, and it must not read as `0`/`0`.
+        assert_eq!(
+            state_for(Some(&wire(None, None, Some(7)))),
+            AheadBehindState::MainOnly { main_behind: 7 }
+        );
+        // Zero behind the default branch is still an answer, not an absence.
+        assert_eq!(
+            state_for(Some(&wire(None, None, Some(0)))),
+            AheadBehindState::MainOnly { main_behind: 0 }
+        );
+    }
+
+    #[test]
+    fn state_for_a_row_with_counts_keeps_main_behind_inside_known() {
+        // `MainOnly` is for a row with *no* counts; with them, `main_behind` rides
+        // along in `Known` so both render on one row.
+        assert!(matches!(
+            state_for(Some(&wire(Some(1), Some(0), Some(4)))),
+            AheadBehindState::Known {
+                main_behind: Some(4),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn state_for_half_a_pair_is_not_known() {
         // The daemon derives `ahead` and `behind` from one tuple, so a lone one
         // is a malformed row, not a count of zero for the other.
@@ -223,6 +258,11 @@ mod tests {
         assert_eq!(
             state_for(Some(&wire(None, Some(1), None))),
             AheadBehindState::Unavailable
+        );
+        // Its `main_behind`, if any, is still a whole answer.
+        assert_eq!(
+            state_for(Some(&wire(Some(2), None, Some(4)))),
+            AheadBehindState::MainOnly { main_behind: 4 }
         );
     }
 
@@ -303,6 +343,23 @@ mod tests {
             }
         );
         assert!(!cache.pending.contains(&path));
+    }
+
+    #[tokio::test]
+    async fn changed_keeps_a_row_that_carries_only_main_behind() {
+        // Through the real wire shape: a reply row with just `main_behind`.
+        let (_dir, sock, _server) = fake_daemon_replies(vec![json!({
+            "ok": true,
+            "payload": { "results": { "/repo/no-upstream": { "main_behind": 3 } } }
+        })]);
+        let mut cache = AheadBehindCache::new(WorktreesClient::new(sock));
+        let path = PathBuf::from("/repo/no-upstream");
+        cache.set_visible(std::slice::from_ref(&path));
+        settle(&mut cache).await;
+        assert_eq!(
+            cache.get(&path),
+            AheadBehindState::MainOnly { main_behind: 3 }
+        );
     }
 
     #[tokio::test]

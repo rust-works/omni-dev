@@ -172,9 +172,11 @@ fn default_source() -> Source {
     Source::Terminal
 }
 
-/// One entry of the `ahead-behind` op's `results` map. A path the daemon
-/// omits entirely (no upstream to compare against) is *not* represented here
-/// — see [`super::client::WorktreesClient::fetch_ahead_behind`].
+/// One entry of the `ahead-behind` op's `results` map. `ahead` and `behind`
+/// come as a pair, and are both absent for a branch with no upstream; such a
+/// branch still gets a row when it is behind the default branch (`main_behind`
+/// alone, #1457). A path the daemon omits entirely (neither to report) is *not*
+/// represented here — see [`super::client::WorktreesClient::fetch_ahead_behind`].
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 pub struct AheadBehindEntryWire {
     #[serde(default)]
