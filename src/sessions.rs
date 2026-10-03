@@ -169,9 +169,15 @@ pub struct EventStamp {
 /// Which route an event reached the registry by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Origin {
-    /// The control socket: the fast path, and what every feed but the journal
-    /// uses. Always applied, as before — only an exact duplicate is dropped.
+    /// The control socket: the fast path, and what every feed that posts to the
+    /// daemon uses — the hooks, the stream wrappers, the pi.dev extension. Always
+    /// applied, as before — only an exact duplicate is dropped.
     Socket,
+    /// The daemon's own watchers (transcript growth, Codex rollouts, pid
+    /// liveness), which call the registry in-process. Applied exactly as the
+    /// socket's are, but never counted by [`DeliveryStats`]: nothing was
+    /// delivered.
+    Local,
     /// A hook's durable journal, tailed: caught up after a dropped POST. Also
     /// dropped when older than what the session has already applied, so a
     /// late-read event can never undo a newer one.
@@ -199,7 +205,9 @@ impl Origin {
 /// of an event the socket already applied.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct DeliveryStats {
-    /// Events applied from the control socket.
+    /// Events applied from the control socket, whichever feed posted them: the
+    /// hooks, but also the stream wrappers and the pi.dev extension. Not the
+    /// daemon's own watchers, which never touch the socket.
     pub socket: u64,
     /// Events applied from a tailed journal whose socket copy never arrived: the
     /// dropped POSTs. A copy that arrived a moment after the journal poll read the
@@ -229,11 +237,13 @@ impl DeliveryCounters {
     fn record(&self, origin: Origin, applied: bool, raced: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         if applied {
-            match origin {
-                Origin::Socket => self.socket.fetch_add(1, Relaxed),
-                Origin::Journal => self.recovered.fetch_add(1, Relaxed),
-                Origin::Replay => self.replayed.fetch_add(1, Relaxed),
+            let counter = match origin {
+                Origin::Socket => &self.socket,
+                Origin::Journal => &self.recovered,
+                Origin::Replay => &self.replayed,
+                Origin::Local => return,
             };
+            counter.fetch_add(1, Relaxed);
         } else if raced {
             // Never below the recoveries actually counted.
             saturating_decrement(&self.recovered);
@@ -1022,8 +1032,12 @@ impl SessionsRegistry {
     /// A repeat sighting that merely refreshes liveness does not, since hooks
     /// fire on every tool call (the `heartbeat` precedent in
     /// [`WorktreesRegistry`](crate::worktrees::WorktreesRegistry)).
+    ///
+    /// For the daemon's own in-process feeds: it is [`Origin::Local`], which
+    /// [`DeliveryStats`] does not count. The control socket's feed goes through
+    /// [`observe_stamped`](Self::observe_stamped) as [`Origin::Socket`].
     pub fn observe(&self, req: ObserveRequest) {
-        self.observe_stamped(req, None, Origin::Socket);
+        self.observe_stamped(req, None, Origin::Local);
     }
 
     /// [`observe`](Self::observe) for an event that carries an [`EventStamp`] and
@@ -1195,8 +1209,11 @@ impl SessionsRegistry {
     /// (a wrapped hook command whose parent is a per-hook shell) — ends the
     /// session, so the rule can only ever keep a session the old process no
     /// longer owns.
+    ///
+    /// For the daemon's own in-process feeds, as [`observe`](Self::observe) is
+    /// ([`Origin::Local`]).
     pub fn end(&self, session_id: &str, reason: Option<&str>, pid: Option<u32>) -> bool {
-        self.end_stamped(session_id, reason, pid, None, Origin::Socket)
+        self.end_stamped(session_id, reason, pid, None, Origin::Local)
     }
 
     /// [`end`](Self::end) for an event that carries an [`EventStamp`] and arrived
@@ -3459,13 +3476,17 @@ mod tests {
     #[test]
     fn socket_events_are_counted_stamped_or_not() {
         let reg = SessionsRegistry::new();
-        reg.observe(observe_request("s", SessionEvent::PreToolUse, Some("/p")));
+        reg.observe_stamped(
+            observe_request("s", SessionEvent::PreToolUse, Some("/p")),
+            None,
+            Origin::Socket,
+        );
         reg.observe_stamped(
             observe_request("s", SessionEvent::Stop, None),
             Some(stamp("2026-10-03T03:40:00Z", "1-a")),
             Origin::Socket,
         );
-        reg.end("s", None, None);
+        reg.end_stamped("s", None, None, None, Origin::Socket);
         assert_eq!(
             reg.delivery(),
             DeliveryStats {
@@ -3474,6 +3495,19 @@ mod tests {
                 replayed: 0
             }
         );
+    }
+
+    #[test]
+    fn the_daemons_own_feeds_are_applied_but_not_counted_as_deliveries() {
+        // The watchers call `observe`/`end` in-process: nothing came over the
+        // socket, so counting them would swamp the hooks' real numbers.
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request("s", SessionEvent::PreToolUse, Some("/p")));
+        reg.observe(observe_request("s", SessionEvent::TranscriptGrew, None));
+        assert_eq!(reg.lock_sessions()["s"].state, SessionState::Working);
+        assert!(reg.end("s", None, None));
+        assert_eq!(reg.lock_sessions()["s"].state, SessionState::Ended);
+        assert_eq!(reg.delivery(), DeliveryStats::default());
     }
 
     #[test]
