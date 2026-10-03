@@ -836,7 +836,13 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
                 _ => "Deleted",
             };
             let segment = edit.segment_id.as_ref().map_or_else(String::new, |id| {
-                format!(", segment {id} ({:?})", edit.segment_kind)
+                let kind = match edit.segment_kind {
+                    Some(anchor::SegmentKind::Header) => "header",
+                    Some(anchor::SegmentKind::Footer) => "footer",
+                    Some(anchor::SegmentKind::Footnote) => "footnote",
+                    None => "segment",
+                };
+                format!(", {kind} {id}")
             });
             format!("{action}: {} char(s) / {} byte(s) in '{name}' at [{}, {}) UTF-16 code units, tab {}{}, {} paragraph(s)",
                 edit.chars, edit.bytes, edit.start_index, edit.end_index,
@@ -2483,6 +2489,19 @@ mod tests {
             required_revision_id: None,
             result,
         }
+    }
+
+    #[test]
+    fn describe_reports_selected_segment_identity_without_debug_types() {
+        let mut edit = preview_edit();
+        edit.segment_id = Some("h1".into());
+        edit.segment_kind = Some(anchor::SegmentKind::Header);
+        let rendered = describe(
+            &outcome_with(WriteResult::WouldInsert { edit }),
+            WriteVerb::Insert,
+        );
+        assert!(rendered.contains(", header h1,"), "{rendered}");
+        assert!(!rendered.contains("Some("), "{rendered}");
     }
 
     #[test]
