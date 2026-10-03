@@ -47,7 +47,7 @@ pub enum OperationArg {
     DocsDelete,
     /// Anchor-addressed text and paragraph styling.
     DocsFormat,
-    /// Add empty Docs tables, rows or columns.
+    /// Add empty Docs tables, rows or columns, or change named-range metadata.
     DocsStructure,
     /// Remove Docs table rows or columns.
     DocsTableDelete,

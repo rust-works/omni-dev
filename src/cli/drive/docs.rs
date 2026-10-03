@@ -8,6 +8,7 @@
 
 pub(crate) mod create;
 pub(crate) mod info;
+pub(crate) mod named_range;
 pub(crate) mod read;
 pub(crate) mod style;
 pub(crate) mod table;
@@ -69,6 +70,12 @@ pub enum DocsSubcommands {
     /// Creates a new Google Doc, optionally seeded with text. Gated by the
     /// write-permission rules' `create` operation (issue #1615).
     Create(create::CreateCommand),
+    /// Creates a scoped named-range label, gated by docs-structure.
+    CreateNamedRange(named_range::CreateNamedRangeCommand),
+    /// Deletes a scoped label by ID, leaving text intact; gated by docs-structure.
+    DeleteNamedRange(named_range::DeleteNamedRangeCommand),
+    /// Replaces a single named span by ID; docs-write, or docs-delete for empty text.
+    ReplaceNamedRangeContent(named_range::ReplaceNamedRangeContentCommand),
 }
 
 impl DocsCommand {
@@ -108,6 +115,9 @@ impl DocsCommand {
                     .await
             }
             DocsSubcommands::Create(cmd) => cmd.execute(client).await,
+            DocsSubcommands::CreateNamedRange(cmd) => cmd.execute(client).await,
+            DocsSubcommands::DeleteNamedRange(cmd) => cmd.execute(client).await,
+            DocsSubcommands::ReplaceNamedRangeContent(cmd) => cmd.execute(client).await,
         }
     }
 }

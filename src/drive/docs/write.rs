@@ -99,6 +99,13 @@ pub enum WritePayload {
         /// Explicit style values.
         style: super::style::StylePatch,
     },
+    /// A scoped named-range metadata or content mutation.
+    NamedRange {
+        /// Explicit tab and segment address.
+        scope: super::named_range::Scope,
+        /// Typed operation and its data.
+        mutation: super::named_range::Mutation,
+    },
     /// Delete a unique match or an inclusive pair of anchors.
     Delete {
         /// First anchor (or the entire single match).
@@ -142,6 +149,11 @@ impl WritePayload {
             } => WriteVerb::TextStyle,
             Self::Format { .. } => WriteVerb::ParagraphStyle,
             Self::Table(edit) => WriteVerb::Table(edit.verb()),
+            Self::NamedRange { mutation, .. } => match mutation {
+                super::named_range::Mutation::Create { .. } => WriteVerb::CreateNamedRange,
+                super::named_range::Mutation::Delete { .. } => WriteVerb::DeleteNamedRange,
+                super::named_range::Mutation::Replace { .. } => WriteVerb::ReplaceNamedRangeContent,
+            },
         }
     }
 
@@ -154,6 +166,14 @@ impl WritePayload {
             Self::Delete { .. } => DriveOperation::DocsDelete,
             Self::Format { .. } => DriveOperation::DocsFormat,
             Self::Table(edit) => edit.verb().gate_operation(),
+            Self::NamedRange { mutation, .. } => match mutation {
+                super::named_range::Mutation::Create { .. }
+                | super::named_range::Mutation::Delete { .. } => DriveOperation::DocsStructure,
+                super::named_range::Mutation::Replace { text, .. } if text.is_empty() => {
+                    DriveOperation::DocsDelete
+                }
+                super::named_range::Mutation::Replace { .. } => DriveOperation::DocsWrite,
+            },
             _ => DriveOperation::DocsWrite,
         }
     }
@@ -166,6 +186,7 @@ impl WritePayload {
                 | Self::List { .. }
                 | Self::Format { .. }
                 | Self::Table(_)
+                | Self::NamedRange { .. }
         )
     }
 
@@ -209,6 +230,7 @@ impl WritePayload {
             {
                 Err("anchors must be nonempty and within one paragraph".to_owned())
             }
+            Self::NamedRange { scope, mutation } => mutation.validate(scope),
             _ => Ok(()),
         }
     }
@@ -235,6 +257,12 @@ pub enum WriteVerb {
     TextStyle,
     /// Paragraph formatting.
     ParagraphStyle,
+    /// Add named-range metadata.
+    CreateNamedRange,
+    /// Remove named-range metadata.
+    DeleteNamedRange,
+    /// Replace a named range's content.
+    ReplaceNamedRangeContent,
 }
 
 impl WriteVerb {
@@ -254,6 +282,9 @@ impl WriteVerb {
             Self::TextStyle => "docs-text-style",
             Self::ParagraphStyle => "docs-paragraph-style",
             Self::Table(verb) => verb.log_operation(),
+            Self::CreateNamedRange => "docs-create-named-range",
+            Self::DeleteNamedRange => "docs-delete-named-range",
+            Self::ReplaceNamedRangeContent => "docs-replace-named-range-content",
         }
     }
 
@@ -269,6 +300,9 @@ impl WriteVerb {
             Self::TextStyle => "text-style",
             Self::ParagraphStyle => "paragraph-style",
             Self::Table(verb) => verb.label(),
+            Self::CreateNamedRange => "create-named-range",
+            Self::DeleteNamedRange => "delete-named-range",
+            Self::ReplaceNamedRangeContent => "replace-named-range-content",
         }
     }
 
@@ -279,6 +313,7 @@ impl WriteVerb {
             Self::Table(verb) => verb.gate_operation(),
             Self::Delete => DriveOperation::DocsDelete,
             Self::TextStyle | Self::ParagraphStyle => DriveOperation::DocsFormat,
+            Self::CreateNamedRange | Self::DeleteNamedRange => DriveOperation::DocsStructure,
             _ => DriveOperation::DocsWrite,
         }
     }
@@ -322,6 +357,21 @@ pub enum WriteResult {
     RefusedTable {
         /// Typed refusal, without user prose.
         error: TableError,
+    },
+    /// Preview of one named-range mutation. Counts contain no prose.
+    WouldMutateNamedRange {
+        /// Complete resolved effect.
+        preview: super::named_range::Preview,
+    },
+    /// One named-range request succeeded.
+    MutatedNamedRange {
+        /// Complete effect, including the server-assigned create ID when returned.
+        preview: super::named_range::Preview,
+    },
+    /// Scope or named-range content cannot safely identify the requested effect.
+    RefusedNamedRange {
+        /// Typed refusal without document text or range names.
+        error: super::named_range::Error,
     },
     /// A dry run of a replace: how many occurrences the *snapshot* held.
     WouldReplace {
@@ -485,6 +535,9 @@ impl WriteResult {
         match self {
             Self::WouldFormat { .. } => "would-format",
             Self::Formatted { .. } => "formatted",
+            Self::WouldMutateNamedRange { .. } => "would-mutate-named-range",
+            Self::MutatedNamedRange { .. } => "mutated-named-range",
+            Self::RefusedNamedRange { .. } => "refused-named-range",
             Self::WouldReplace { .. } => "would-replace",
             Self::WouldAppend { .. } => "would-append",
             Self::WouldEditTable { .. } => "would-edit-table",
@@ -719,6 +772,14 @@ async fn write_inner(
             Ok((request, edit)) => (request, WriteResult::WouldEditTable { edit }),
             Err(error) => return gated(WriteResult::RefusedTable { error }, Some(revision_id)),
         },
+        WritePayload::NamedRange { scope, mutation } => {
+            match super::named_range::resolve(&document, scope, mutation) {
+                Ok((request, preview)) => (request, WriteResult::WouldMutateNamedRange { preview }),
+                Err(error) => {
+                    return gated(WriteResult::RefusedNamedRange { error }, Some(revision_id))
+                }
+            }
+        }
         WritePayload::Replace {
             search,
             replace,
@@ -875,6 +936,22 @@ async fn write_inner(
                 },
                 // omni-dev: coverage end
             },
+            WritePayload::NamedRange { .. } => match preview {
+                WriteResult::WouldMutateNamedRange { mut preview } => {
+                    if let Some(id) = response
+                        .replies
+                        .first()
+                        .and_then(|reply| reply.create_named_range.as_ref())
+                        .and_then(|reply| reply.named_range_id.clone())
+                    {
+                        preview.named_range_id = Some(id);
+                    }
+                    WriteResult::MutatedNamedRange { preview }
+                }
+                _ => WriteResult::Failed {
+                    detail: "missing named-range preview".into(),
+                },
+            },
             WritePayload::Replace { .. } => WriteResult::Replaced {
                 occurrences_changed: response.occurrences_changed_for_replace(),
             },
@@ -989,6 +1066,7 @@ fn record_attempt(outcome: &WriteOutcome, opts: &WriteOptions, duration: Duratio
     let inserted_chars = match &outcome.result {
         WriteResult::Appended { chars, .. } => Some(*chars as i64),
         WriteResult::Inserted { edit } => Some(edit.chars as i64),
+        WriteResult::MutatedNamedRange { preview } => Some(preview.inserted_chars as i64),
         _ => None,
     };
 
@@ -1003,6 +1081,10 @@ fn record_attempt(outcome: &WriteOutcome, opts: &WriteOptions, duration: Duratio
         decided_by_file_id: decided_by.file_id,
         occurrences_changed,
         inserted_chars,
+        named_range_id: match &outcome.result {
+            WriteResult::MutatedNamedRange { preview } => preview.named_range_id.clone(),
+            _ => None,
+        },
         required_revision_id: outcome.required_revision_id.clone(),
         error,
         duration,
@@ -1056,6 +1138,18 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
         }
         WriteResult::RefusedTable { error } => {
             format!("Refused: unsafe or unresolved table in '{name}': {error:?}")
+        }
+        WriteResult::WouldMutateNamedRange { preview }
+        | WriteResult::MutatedNamedRange { preview } => {
+            let action = if matches!(&outcome.result, WriteResult::WouldMutateNamedRange { .. }) {
+                "Would apply"
+            } else {
+                "Applied"
+            };
+            format!("{action} {} in '{name}': ID {}, {} span(s), removed {} char(s) / {} byte(s), inserted {} char(s) / {} byte(s)", verb.label(), preview.named_range_id.as_deref().unwrap_or("pending"), preview.ranges.len(), preview.removed_chars, preview.removed_bytes, preview.inserted_chars, preview.inserted_bytes)
+        }
+        WriteResult::RefusedNamedRange { error } => {
+            format!("Refused: unsafe or unresolved named range in '{name}': {error:?}")
         }
         WriteResult::WouldReplace { occurrences } => format!(
             "Would replace: {occurrences} occurrence(s) in '{name}' \
@@ -1204,7 +1298,7 @@ mod tests {
     use crate::drive::types::GOOGLE_SHEET_MIME_TYPE;
     use crate::test_support::env::MapEnv;
     use crate::utils::secret::Secret;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_credentials() -> DriveCredentials {
@@ -3763,5 +3857,254 @@ mod tests {
                 .iter()
                 .all(|r| !r.url.path().ends_with(":batchUpdate")));
         }
+    }
+
+    fn named_payloads() -> Vec<WritePayload> {
+        use super::super::named_range::{Mutation, Scope};
+        [
+            Mutation::Create {
+                name: "label".into(),
+                start_index: 1,
+                end_index: 3,
+            },
+            Mutation::Delete { id: "nr".into() },
+            Mutation::Replace {
+                id: "nr".into(),
+                text: "new".into(),
+            },
+            Mutation::Replace {
+                id: "nr".into(),
+                text: String::new(),
+            },
+        ]
+        .into_iter()
+        .map(|mutation| WritePayload::NamedRange {
+            scope: Scope {
+                tab_id: Some("t".into()),
+                segment_id: None,
+            },
+            mutation,
+        })
+        .collect()
+    }
+
+    async fn named_setup(server: &MockServer, revision: Option<&str>) -> (DriveClient, DocsClient) {
+        let pair = clients(server).await;
+        mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+            .mount(server)
+            .await;
+        mount_folder("folder-1").mount(server).await;
+        Mock::given(method("GET")).and(path("/v1/documents/doc-1"))
+            .and(query_param("suggestionsViewMode", "SUGGESTIONS_INLINE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "revisionId": revision, "tabs": [{"tabProperties": {"tabId": "t"}, "documentTab": {
+                    "body": {"content": [{"startIndex": 1, "endIndex": 10, "paragraph": {"elements": [
+                        {"startIndex": 1, "endIndex": 10, "textRun": {"content": "😀 label\n"}}
+                    ]}}]},
+                    "namedRanges": {"label": {"namedRanges": [{"namedRangeId": "nr", "ranges": [{"startIndex": 1, "endIndex": 3}]}]}}
+                }}]
+            }))).mount(server).await;
+        pair
+    }
+
+    #[tokio::test]
+    async fn named_range_preview_and_apply_share_scope_counts_revision_and_created_id() {
+        for payload in named_payloads() {
+            let server = MockServer::start().await;
+            let (drive, docs) = named_setup(&server, Some("r-named")).await;
+            let mut opts = replace_opts(true);
+            opts.payload = payload;
+            opts.lease_token = None;
+            let rule = rule_for(&opts.payload);
+            let expected = match write(&drive, &docs, &opts, std::slice::from_ref(&rule))
+                .await
+                .result
+            {
+                WriteResult::WouldMutateNamedRange { preview } => preview,
+                other => panic!("{other:?}"),
+            };
+            assert!(!server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.url.path().ends_with(":batchUpdate")));
+            let create = opts.payload.verb() == WriteVerb::CreateNamedRange;
+            mount_batch_update(if create { serde_json::json!({"replies": [{"createNamedRange": {"namedRangeId": "created-id"}}]}) }
+                else { serde_json::json!({"replies": [{}]}) }).expect(1).mount(&server).await;
+            opts.dry_run = false;
+            opts.lease_token = Some(seed_lease(&opts.ledger_path, "doc-1", "1"));
+            let actual = match write(&drive, &docs, &opts, &[rule]).await.result {
+                WriteResult::MutatedNamedRange { preview } => preview,
+                other => panic!("{other:?}"),
+            };
+            let mut expected = expected;
+            if create {
+                expected.named_range_id = Some("created-id".into());
+            }
+            assert_eq!(actual, expected);
+            let requests = server.received_requests().await.unwrap();
+            let batch = requests
+                .iter()
+                .find(|r| r.url.path().ends_with(":batchUpdate"))
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+            assert_eq!(
+                body["writeControl"],
+                serde_json::json!({"requiredRevisionId": "r-named"})
+            );
+            assert_eq!(body["requests"].as_array().unwrap().len(), 1);
+            if !create {
+                let operation = if opts.payload.verb() == WriteVerb::DeleteNamedRange {
+                    "deleteNamedRange"
+                } else {
+                    "replaceNamedRangeContent"
+                };
+                assert_eq!(
+                    body["requests"][0][operation]["tabsCriteria"],
+                    serde_json::json!({"tabIds": ["t"]})
+                );
+                assert_eq!(body["requests"][0][operation]["namedRangeId"], "nr");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn named_range_gates_are_isolated_before_any_docs_read() {
+        for payload in named_payloads() {
+            for grant in [
+                DriveOperation::DocsWrite,
+                DriveOperation::DocsDelete,
+                DriveOperation::DocsStructure,
+                DriveOperation::Edit,
+                DriveOperation::SheetsStructure,
+            ] {
+                if grant == payload.gate_operation() {
+                    continue;
+                }
+                let server = MockServer::start().await;
+                let (drive, docs) = clients(&server).await;
+                mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+                    .mount(&server)
+                    .await;
+                mount_folder("folder-1").mount(&server).await;
+                let mut rule = allow_rule("folder-1");
+                rule.allow = std::iter::once(grant).collect();
+                let mut opts = replace_opts(false);
+                opts.payload = payload.clone();
+                assert!(matches!(
+                    write(&drive, &docs, &opts, &[rule]).await.result,
+                    WriteResult::Blocked { .. }
+                ));
+                assert!(!server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.url.path().starts_with("/v1/documents")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn named_range_mutations_preserve_all_lease_refusals_and_stale_revision() {
+        for payload in named_payloads() {
+            for expected in [
+                WriteResult::RefusedNoLease,
+                WriteResult::RefusedLeaseExpired,
+                WriteResult::RefusedLeaseWrongFile,
+                WriteResult::RefusedLeaseStale,
+            ] {
+                let server = MockServer::start().await;
+                let (drive, docs) = named_setup(&server, Some("r-named")).await;
+                let mut opts = replace_opts(false);
+                opts.payload = payload.clone();
+                opts.lease_token = match expected {
+                    WriteResult::RefusedNoLease => None,
+                    WriteResult::RefusedLeaseExpired => Some("unknown".into()),
+                    WriteResult::RefusedLeaseWrongFile => {
+                        Some(seed_lease(&opts.ledger_path, "other", "1"))
+                    }
+                    _ => Some(seed_lease(&opts.ledger_path, "doc-1", "0")),
+                };
+                assert_eq!(
+                    write(&drive, &docs, &opts, &[rule_for(&payload)])
+                        .await
+                        .result,
+                    expected
+                );
+                assert!(!server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.url.path().ends_with(":batchUpdate")));
+            }
+            let server = MockServer::start().await;
+            let (drive, docs) = named_setup(&server, Some("r-named")).await;
+            Mock::given(method("POST")).and(path("/v1/documents/doc-1:batchUpdate"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": {"code": 400, "message": "The required revision ID 'r-named' does not match the latest revision."}})))
+                .expect(1).mount(&server).await;
+            let mut opts = replace_opts(false);
+            opts.payload = payload.clone();
+            assert!(matches!(
+                write(&drive, &docs, &opts, &[rule_for(&payload)])
+                    .await
+                    .result,
+                WriteResult::StaleRevision { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn named_range_missing_revision_and_unsafe_scope_never_mutate() {
+        for payload in named_payloads() {
+            for revision in [None, Some("r-named")] {
+                let server = MockServer::start().await;
+                let (drive, docs) = named_setup(&server, revision).await;
+                let mut opts = replace_opts(false);
+                opts.payload = payload.clone();
+                if revision.is_some() {
+                    if let WritePayload::NamedRange { scope, .. } = &mut opts.payload {
+                        scope.segment_id = Some("missing".into());
+                    }
+                }
+                let result = write(&drive, &docs, &opts, &[rule_for(&payload)])
+                    .await
+                    .result;
+                if revision.is_none() {
+                    assert_eq!(result, WriteResult::RefusedNoRevisionId);
+                } else {
+                    assert!(matches!(result, WriteResult::RefusedNamedRange { .. }));
+                }
+                assert!(!server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.url.path().ends_with(":batchUpdate")));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn named_range_ids_and_spans_are_available_in_structured_reads() {
+        let server = MockServer::start().await;
+        let (_, docs) = named_setup(&server, Some("r-named")).await;
+        let outcome = super::super::read::read(
+            &DocsApi::new(&docs),
+            &super::super::read::ReadOptions {
+                document_id: "doc-1".into(),
+                tab: Some("t".into()),
+                suggestions: SuggestionsViewMode::Inline,
+            },
+        )
+        .await
+        .unwrap();
+        let named = &outcome.tabs[0].named_ranges["label"].named_ranges[0];
+        assert_eq!(named.named_range_id.as_deref(), Some("nr"));
+        assert_eq!(named.ranges[0].end_index, Some(3));
+        assert!(serde_json::to_value(outcome).unwrap()["tabs"][0]
+            .get("named_ranges")
+            .is_some());
     }
 }

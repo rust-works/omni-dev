@@ -284,6 +284,7 @@ mod tests {
 
     fn tab(id: Option<&str>, title: Option<&str>, elements: Vec<DocElement>) -> TabContent {
         TabContent {
+            named_ranges: Default::default(),
             tab_id: id.map(str::to_string),
             title: title.map(str::to_string),
             nesting_level: 0,

@@ -27,6 +27,7 @@ pub mod anchor;
 pub mod api;
 pub mod client;
 pub mod create;
+pub mod named_range;
 pub mod read;
 pub mod structure;
 pub mod style;
