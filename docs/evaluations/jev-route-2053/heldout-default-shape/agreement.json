@@ -1,0 +1,93 @@
+{
+  "accuracy": 0.456,
+  "accuracy_wilson_95": [
+    0.302,
+    0.619
+  ],
+  "cohen_kappa": 0.253,
+  "correct_issues": 15.5,
+  "existing_answer_changes_[changed,compared]": {
+    "classes": {
+      "added_question_vs_baseline": [
+        3,
+        68
+      ],
+      "augmented_repeat_to_repeat": [
+        1,
+        34
+      ],
+      "baseline_repeat_to_repeat": [
+        0,
+        34
+      ],
+      "fisher_p_effect_vs_baseline_noise": 0.5489
+    },
+    "stage_choices": {
+      "added_question_vs_baseline": [
+        4,
+        204
+      ],
+      "augmented_repeat_to_repeat": [
+        1,
+        102
+      ],
+      "baseline_repeat_to_repeat": [
+        1,
+        102
+      ],
+      "fisher_p_effect_vs_baseline_noise": 0.6681
+    }
+  },
+  "issues": 34,
+  "issues_with_identical_repeats": 31,
+  "majority_baseline": [
+    14,
+    34
+  ],
+  "majority_label": "factual",
+  "p_accuracy_at_least_this_given_majority_rate": 0.298,
+  "per_class": {
+    "both": {
+      "correct": 0,
+      "expected": 4,
+      "predicted": 5.5
+    },
+    "design": {
+      "correct": 5,
+      "expected": 9,
+      "predicted": 11
+    },
+    "factual": {
+      "correct": 6,
+      "expected": 14,
+      "predicted": 10
+    },
+    "none": {
+      "correct": 4.5,
+      "expected": 7,
+      "predicted": 7.5
+    }
+  },
+  "retrieval_gate": {
+    "accuracy": [
+      20.5,
+      34
+    ],
+    "always_no_accuracy": [
+      16,
+      34
+    ],
+    "always_yes_accuracy": [
+      18,
+      34
+    ],
+    "false_negative": 8,
+    "false_positive": 5.5,
+    "needs_retrieval": [
+      18,
+      34
+    ],
+    "true_negative": 10.5,
+    "true_positive": 10
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "date": "2026-10-04",
+  "purpose": "Measure the open_questions classifier on the `ai jev route` default ladder (anthropic only). The earlier held-out runs sent all three built-in ladders.",
+  "command": "cargo run --example jev_open_questions_eval -- heldout-inputs.json OUTPUT_DIR 2 anthropic",
+  "inputs": "heldout-inputs.json, byte-identical (the frozen 34 held-out states, labels unchanged)",
+  "ladders": ["anthropic"],
+  "requested_model": "jev-latest",
+  "returned_model": "jev-1.13.0",
+  "repeats": 2,
+  "calls": 136,
+  "failures": 0,
+  "usage": {"input_tokens": 632508, "output_tokens": 18303},
+  "monetary_cost": null,
+  "cost_note": "No billing receipt available. Raw usage and exact requests are retained; no dollar amount invented.",
+  "crate_version": "omni-dev 0.45.0, built from this branch with the example's LADDERS argument",
+  "wording": "production `open_questions` question, byte-identical to candidate-v3.json",
+  "not_measured": "Per-citation could_be_cheaper noul questions (production adds one per open cited issue; all 34 held-out states cite other issues) and --effort-advice questions. Both are left out of baseline and augmented alike."
+}
