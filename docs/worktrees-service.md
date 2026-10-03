@@ -1650,14 +1650,22 @@ extension never runs git.
   answer under a key of everything the daemon computes it from — the checked-out
   `branch`, `head_sha`, `upstream_sha`, and the repo's `main_sha` — and re-asks only
   the worktrees whose key moved, in one batch; a request already in flight for the
-  same key is joined rather than repeated. Three rules keep it exact, and there is
+  same key is joined rather than repeated. A few rules keep it exact, and there is
   deliberately **no TTL** (the snapshot, not a clock, is what says a refresh is
   due): a failed request is never cached; a row is cached only if the key carries
   every input the row evidences (`ahead`/`behind` need `upstream_sha`, `main_behind`
   needs `main_sha`, and `head_sha` is always needed), so a daemon that predates a
-  field degrades to re-asking rather than serving a stale answer; and a `shallow` row
-  is never cached. Any other client that caches these rows should key and gate the
-  same way.
+  field degrades to re-asking rather than serving a stale answer; an *empty* row is
+  kept only when the snapshot shows there was nothing to compute, because the daemon
+  omits a row both for "no upstream, no default branch" and for a computation that
+  failed, and a branch whose `upstream_sha` (or whose repo's `main_sha`) is present
+  must have yielded counts; and a `shallow` row is never cached. Two limits remain.
+  Only a daemon that reports `shallow` can be told apart, so against an older one a
+  shallow clone is cached like any other. And the key sees the branch's upstream
+  *commit*, not the configured upstream *ref*: `git branch --set-upstream-to` to a
+  ref at the same commit changes nothing the key can see, at worst leaving a `⇊N`
+  beside an identical `↓N` until a ref next moves. Any other client that caches
+  these rows should key and gate the same way.
 
 ### Tuning the refresh cadence
 
