@@ -584,7 +584,7 @@ pub struct InlineObjectElement {
 }
 
 /// A table.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct Table {
     /// Row count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -595,6 +595,51 @@ pub struct Table {
     /// The table's rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "tableRows")]
     pub table_rows: Vec<TableRow>,
+    /// Whether the original table contains any pending suggestion, including
+    /// unmodelled nested fields. Captured before narrowing the read model;
+    /// no duplicate document prose is retained or emitted.
+    #[serde(skip)]
+    pub has_pending_suggestions: bool,
+}
+
+pub(super) fn has_suggestions(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+            (key.starts_with("suggested")
+                && match value {
+                    serde_json::Value::Array(v) => !v.is_empty(),
+                    serde_json::Value::Object(v) => !v.is_empty(),
+                    serde_json::Value::Null => false,
+                    _ => true,
+                })
+                || has_suggestions(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(has_suggestions),
+        _ => false,
+    }
+}
+
+impl<'de> Deserialize<'de> for Table {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireTable {
+            #[serde(default)]
+            rows: Option<i64>,
+            #[serde(default)]
+            columns: Option<i64>,
+            #[serde(default, rename = "tableRows")]
+            table_rows: Vec<TableRow>,
+        }
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let has_pending_suggestions = has_suggestions(&raw);
+        let wire: WireTable = serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            rows: wire.rows,
+            columns: wire.columns,
+            table_rows: wire.table_rows,
+            has_pending_suggestions,
+        })
+    }
 }
 
 /// One row of a table.
@@ -632,6 +677,28 @@ pub struct TableCell {
     /// a cell may contain another table.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<StructuralElement>,
+    /// Read-only spans used to reject merged-cell structural edits.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "tableCellStyle"
+    )]
+    pub table_cell_style: Option<TableCellStyle>,
+}
+
+/// Read-only cell spans; other formatting remains outside the edit model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TableCellStyle {
+    /// Number of rows spanned by this cell.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "rowSpan")]
+    pub row_span: Option<i64>,
+    /// Number of columns spanned by this cell.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "columnSpan"
+    )]
+    pub column_span: Option<i64>,
 }
 
 /// A table of contents.

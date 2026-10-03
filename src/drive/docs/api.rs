@@ -441,6 +441,11 @@ mod tests {
                 "cli/style.rs",
                 include_str!("../../cli/drive/docs/style.rs"),
             ),
+            ("table.rs", include_str!("table.rs")),
+            (
+                "cli/table.rs",
+                include_str!("../../cli/drive/docs/table.rs"),
+            ),
             ("create.rs", include_str!("create.rs")),
             ("client.rs", include_str!("client.rs")),
             ("types.rs", include_str!("types.rs")),
@@ -455,6 +460,7 @@ mod tests {
         let mut deletion_renames = 0;
         let mut list_renames = 0;
         let mut formatting_renames = 0;
+        let mut table_deletion_renames = 0;
         for (name, source) in sources {
             // Production code only: the tests and docs below deliberately
             // name the things they assert the absence of.
@@ -492,9 +498,16 @@ mod tests {
                         formatting_renames += 1;
                     }
                 }
-                let destroys = code.contains("deletePositionedObject")
-                    || code.contains("deleteTableRow")
-                    || code.contains("deleteTableColumn");
+                if code.contains("deleteTableRow") || code.contains("deleteTableColumn") {
+                    assert_eq!(name, "write_types.rs");
+                    assert!(matches!(
+                        code,
+                        "#[serde(rename = \"deleteTableRow\")]"
+                            | "#[serde(rename = \"deleteTableColumn\")]"
+                    ));
+                    table_deletion_renames += 1;
+                }
+                let destroys = code.contains("deletePositionedObject");
                 assert!(
                     !destroys,
                     "{name}:{}: no destructive Docs request may be constructible: {line}",
@@ -507,6 +520,10 @@ mod tests {
         assert_eq!(
             formatting_renames, 2,
             "exactly two typed formatting operations"
+        );
+        assert_eq!(
+            table_deletion_renames, 2,
+            "exactly two typed dimension deletion requests"
         );
     }
 }

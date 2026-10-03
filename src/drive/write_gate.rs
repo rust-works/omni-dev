@@ -400,6 +400,11 @@ pub enum DriveOperation {
     DocsDelete,
     /// Anchor-addressed styling; never implied by text-write or deletion grants.
     DocsFormat,
+    /// Add empty tables, rows or columns. Never authorizes content removal.
+    DocsStructure,
+    /// Remove table rows/columns under new explicit destructive consent.
+    /// Neither DocsWrite nor the anchor-only DocsDelete grant authorizes this.
+    DocsTableDelete,
 }
 
 impl std::fmt::Display for DriveOperation {
@@ -420,6 +425,8 @@ impl std::fmt::Display for DriveOperation {
             Self::SlidesWrite => "slides-write",
             Self::DocsDelete => "docs-delete",
             Self::DocsFormat => "docs-format",
+            Self::DocsStructure => "docs-structure",
+            Self::DocsTableDelete => "docs-table-delete",
         };
         write!(f, "{s}")
     }
@@ -444,6 +451,8 @@ impl DriveOperation {
             | Self::DocsWrite
             | Self::Trash
             | Self::SlidesWrite
+            | Self::DocsStructure
+            | Self::DocsTableDelete
             | Self::DocsDelete
             | Self::DocsFormat => Verdict::Deny,
         }
@@ -475,6 +484,8 @@ impl DriveOperation {
             | Self::SheetsProtection
             | Self::DocsWrite
             | Self::SlidesWrite
+            | Self::DocsStructure
+            | Self::DocsTableDelete
             | Self::DocsDelete
             | Self::DocsFormat => true,
         }
@@ -1097,6 +1108,8 @@ mod tests {
             DriveOperation::SheetsProtection,
             DriveOperation::DocsWrite,
             DriveOperation::DocsDelete,
+            DriveOperation::DocsStructure,
+            DriveOperation::DocsTableDelete,
         ] {
             assert!(op.ever_requires_lease(), "{op:?} should be lease-eligible");
         }
@@ -1225,6 +1238,8 @@ mod tests {
             DriveOperation::DocsWrite,
             DriveOperation::Trash,
             DriveOperation::DocsDelete,
+            DriveOperation::DocsStructure,
+            DriveOperation::DocsTableDelete,
         ] {
             let wire = serde_json::to_string(&op).unwrap();
             assert_eq!(

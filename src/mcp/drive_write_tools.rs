@@ -367,6 +367,8 @@ fn docs_is_error(result: &docs_write::WriteResult) -> bool {
     match result {
         WouldReplace { .. }
         | WouldAppend { .. }
+        | docs_write::WriteResult::WouldEditTable { .. }
+        | docs_write::WriteResult::EditedTable { .. }
         | WouldInsert { .. }
         | WouldDelete { .. }
         | WouldFormat { .. }
@@ -378,6 +380,7 @@ fn docs_is_error(result: &docs_write::WriteResult) -> bool {
         | ListFormatted { .. }
         | Formatted { .. } => false,
         RefusedNotADocument { .. }
+        | docs_write::WriteResult::RefusedTable { .. }
         | RefusedAnchor { .. }
         | RefusedShortcut
         | RefusedNoVisibleParents
