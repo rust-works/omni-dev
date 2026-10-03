@@ -4152,7 +4152,8 @@ suggestions, inline objects, and index gaps anywhere in an affected paragraph
 are refused. Styling a body's final newline is safe; deleting it is prohibited.
 Text styling addresses the anchored character range. Google may extend it to
 adjacent newlines and apply matching text style to bullets for fully contained
-list paragraphs; these are API effects, not separate bullet-edit requests. Dry runs and successful
+list paragraphs; these are API effects, not separate bullet-edit requests.
+Pending content suggestions on adjacent newlines are refused too. Dry runs and successful
 results report the range, tab, affected paragraph/scalar/byte counts, explicit
 style values and derived field mask, without document prose. These counts
 represent affected content, not inserted or removed text. Google can apply
