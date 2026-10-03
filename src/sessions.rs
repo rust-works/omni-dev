@@ -235,10 +235,8 @@ impl DeliveryCounters {
                 Origin::Replay => self.replayed.fetch_add(1, Relaxed),
             };
         } else if raced {
-            // Saturating: never below the recoveries actually counted.
-            let _ = self
-                .recovered
-                .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_sub(1)));
+            // Never below the recoveries actually counted.
+            saturating_decrement(&self.recovered);
         }
     }
 
@@ -248,6 +246,22 @@ impl DeliveryCounters {
             socket: self.socket.load(Relaxed),
             recovered: self.recovered.load(Relaxed),
             replayed: self.replayed.load(Relaxed),
+        }
+    }
+}
+
+/// Takes one off `counter`, stopping at zero.
+///
+/// A `compare_exchange` loop rather than `fetch_update`, which newer toolchains
+/// deprecate in favour of `try_update`, which is newer than the minimum
+/// supported Rust version.
+fn saturating_decrement(counter: &std::sync::atomic::AtomicU64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut current = counter.load(Relaxed);
+    while current > 0 {
+        match counter.compare_exchange_weak(current, current - 1, Relaxed, Relaxed) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
         }
     }
 }
