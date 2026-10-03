@@ -64,10 +64,10 @@ pub struct GithubIdentity {
 pub struct WorktreeRow {
     pub path: PathBuf,
     pub branch: Option<String>,
-    /// Not rendered by Phase 1 (the hub tracks these itself, off the wire
-    /// snapshot directly, to invalidate stale `ahead_behind` cache entries —
-    /// see `Hub::on_tree_changed`); carried through here as part of a
-    /// complete mirror of the daemon's row, for a later phase's detail view.
+    /// Not rendered by Phase 1 (the hub hands these to the `ahead_behind` cache
+    /// straight off the wire snapshot, to invalidate stale entries — see
+    /// `Hub::on_tree_changed`); carried through here as part of a complete
+    /// mirror of the daemon's row, for a later phase's detail view.
     #[allow(dead_code)]
     pub head_sha: Option<String>,
     #[allow(dead_code)]

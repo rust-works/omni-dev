@@ -7,7 +7,8 @@
 //! precedent (`src/cli/worktrees.rs::enrich_ahead_behind`) re-fetches *every*
 //! visible worktree on *every* frame; this cache is the explicit improvement
 //! the plan calls for — it only fetches a path once, and only re-fetches it
-//! when [`invalidate`](AheadBehindCache::invalidate) says its OIDs moved.
+//! when [`observe`](AheadBehindCache::observe) sees that something its answer is
+//! computed from — its [`Inputs`] — has moved.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -28,8 +29,41 @@ const RETRY_BASE: Duration = Duration::from_secs(2);
 /// The longest the cache waits between retries of a daemon that keeps failing.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
+/// Everything the daemon computes a worktree's `ahead`/`behind`/`main_behind`
+/// from, as the tree snapshot reports it: the checked-out branch (whose
+/// configured upstream defines the first answer), the commit HEAD is at, the
+/// commit that upstream is at, and the tip of the repo's remote default branch.
+/// Equal inputs mean an equal answer.
+///
+/// This is the key of the extension's memo (`editors/vscode/src/aheadBehindMemo.ts`,
+/// `aheadBehindKey`). The branch name is in it because the commit ids only
+/// *proxy* "which upstream": a branch switch can land on the same commit.
+/// `main_sha` is the one a fetch of only `origin/<default>` moves, which is the
+/// only way `main_behind` changes with nothing else in the row moving (#2120).
+///
+/// The cache holds the inputs a fetch was *sent* under and compares them on
+/// arrival, so a result is only ever stored if it is still current (#2145).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Inputs {
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
+    pub upstream_sha: Option<String>,
+    /// The *repo's* default-branch tip, repeated on each of its worktrees.
+    pub main_sha: Option<String>,
+}
+
+/// The inputs of a path the tree has not reported (yet).
+static NO_INPUTS: Inputs = Inputs {
+    branch: None,
+    head_sha: None,
+    upstream_sha: None,
+    main_sha: None,
+};
+
 pub struct AheadBehindCache {
     client: WorktreesClient,
+    /// What each worktree's answer is computed from, per the latest tree frame.
+    inputs: HashMap<PathBuf, Inputs>,
     entries: HashMap<PathBuf, AheadBehindState>,
     pending: HashSet<PathBuf>,
     results_tx: mpsc::UnboundedSender<FetchResult>,
@@ -45,14 +79,15 @@ pub struct AheadBehindCache {
     retry_base: Duration,
 }
 
-/// One completed batch: the paths it was fetched *for* (so results are
-/// merged in scope — a path absent from a stale, still-in-flight batch's
-/// result set is never confused with one from a newer batch) and what the
-/// daemon reported, or why the fetch failed. A failure is carried as an `Err`
-/// rather than flattened to an empty map, since an empty map reads as "the
-/// daemon answered and had nothing for any of them".
+/// One completed batch: the paths it was fetched *for*, each with the
+/// [`Inputs`] it was asked under (so results are merged in scope — a path absent
+/// from a stale, still-in-flight batch's result set is never confused with one
+/// from a newer batch — and a result is stored only if its inputs have not moved
+/// since), and what the daemon reported, or why the fetch failed. A failure is
+/// carried as an `Err` rather than flattened to an empty map, since an empty map
+/// reads as "the daemon answered and had nothing for any of them".
 struct FetchResult {
-    requested: Vec<PathBuf>,
+    requested: Vec<(PathBuf, Inputs)>,
     results: Result<HashMap<PathBuf, AheadBehindEntryWire>>,
 }
 
@@ -61,6 +96,7 @@ impl AheadBehindCache {
         let (results_tx, results_rx) = mpsc::unbounded_channel();
         Self {
             client,
+            inputs: HashMap::new(),
             entries: HashMap::new(),
             pending: HashSet::new(),
             results_tx,
@@ -89,11 +125,27 @@ impl AheadBehindCache {
         }
     }
 
-    /// Drops a cached entry so a later `set_visible` call re-fetches it.
-    /// Called by the hub actor when a worktree's `head_sha`/`upstream_sha`
-    /// moves (a commit or a push) since its ahead/behind was last computed.
-    pub fn invalidate(&mut self, path: &Path) {
-        self.entries.remove(path);
+    /// Records what each worktree's answer is now computed from, per the latest
+    /// tree frame, and drops the cached entry of any worktree whose [`Inputs`]
+    /// differ from the last observed (a commit, a push, a fetch of the default
+    /// branch, a branch switch) so a later [`set_visible`](Self::set_visible)
+    /// re-fetches it. A worktree absent from `rows` is forgotten.
+    ///
+    /// An in-flight fetch is deliberately left alone: it is validated against
+    /// these inputs when it lands (see [`merge`](Self::merge)), which is what
+    /// stops it caching counts for refs that moved after it was sent (#2145).
+    pub fn observe(&mut self, rows: impl IntoIterator<Item = (PathBuf, Inputs)>) {
+        let observed: HashMap<PathBuf, Inputs> = rows.into_iter().collect();
+        for (path, inputs) in &observed {
+            if self.inputs.get(path) != Some(inputs) {
+                self.entries.remove(path);
+            }
+        }
+        self.inputs = observed;
+    }
+
+    fn inputs_of(&self, path: &Path) -> &Inputs {
+        self.inputs.get(path).unwrap_or(&NO_INPUTS)
     }
 
     fn spawn_fetch(&mut self, paths: Vec<PathBuf>) {
@@ -102,7 +154,10 @@ impl AheadBehindCache {
         }
         let client = self.client.clone();
         let tx = self.results_tx.clone();
-        let requested = paths.clone();
+        let requested: Vec<(PathBuf, Inputs)> = paths
+            .iter()
+            .map(|path| (path.clone(), self.inputs_of(path).clone()))
+            .collect();
         tokio::spawn(async move {
             let results = client.fetch_ahead_behind(&paths).await;
             // The receiver is gone only when the hub is shutting down.
@@ -139,10 +194,29 @@ impl AheadBehindCache {
         match results {
             Ok(results) => {
                 self.failures = 0;
-                for path in requested {
-                    let state = state_for(results.get(&path));
-                    self.entries.insert(path.clone(), state);
+                let mut superseded = false;
+                for (path, sent) in requested {
                     self.pending.remove(&path);
+                    // The refs moved after this fetch was sent, so the daemon
+                    // computed against refs the row no longer has. Storing it
+                    // would hold stale counts until an input next moved (#2145).
+                    if *self.inputs_of(&path) != sent {
+                        tracing::debug!(
+                            "worktrees ui: discarding ahead-behind result for {}: \
+                             its refs moved while the fetch was in flight",
+                            path.display()
+                        );
+                        superseded = true;
+                        continue;
+                    }
+                    let state = state_for(results.get(&path));
+                    self.entries.insert(path, state);
+                }
+                if superseded {
+                    // Ask again now: the frame that moved the refs found the path
+                    // pending and skipped it, and on a quiet repo no further frame
+                    // may come.
+                    self.requeue();
                 }
             }
             Err(e) => {
@@ -156,7 +230,7 @@ impl AheadBehindCache {
                     self.failures,
                     self.retry_delay(),
                 );
-                for path in &requested {
+                for (path, _) in &requested {
                     self.pending.remove(path);
                 }
             }
@@ -167,6 +241,11 @@ impl AheadBehindCache {
     /// anything cached or already in flight.
     fn retry(&mut self) {
         self.retry_at = None;
+        self.requeue();
+    }
+
+    /// Runs [`set_visible`](Self::set_visible) again over the last visible set.
+    fn requeue(&mut self) {
         let wanted = std::mem::take(&mut self.wanted);
         self.set_visible(&wanted);
     }
@@ -247,6 +326,29 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), cache.changed())
             .await
             .expect("a fetch batch should have landed");
+    }
+
+    /// A batch's `requested` for `path`, asked under no particular inputs.
+    fn asked(path: &Path) -> Vec<(PathBuf, Inputs)> {
+        vec![(path.to_path_buf(), Inputs::default())]
+    }
+
+    /// The tree frame's inputs for one worktree at `head`, with no upstream.
+    fn at_head(path: &Path, head: &str) -> Vec<(PathBuf, Inputs)> {
+        vec![(
+            path.to_path_buf(),
+            Inputs {
+                head_sha: Some(head.to_string()),
+                ..Inputs::default()
+            },
+        )]
+    }
+
+    /// A daemon reply carrying `ahead`/`behind` for `/repo/wt`.
+    fn counts_reply(ahead: usize, behind: usize) -> serde_json::Value {
+        json!({ "ok": true, "payload": { "results": {
+            "/repo/wt": { "ahead": ahead, "behind": behind }
+        }}})
     }
 
     fn wire(
@@ -397,7 +499,7 @@ mod tests {
         cache
             .results_tx
             .send(FetchResult {
-                requested: vec![path.clone()],
+                requested: asked(&path),
                 results: Ok(results),
             })
             .unwrap();
@@ -438,7 +540,7 @@ mod tests {
         cache
             .results_tx
             .send(FetchResult {
-                requested: vec![path.clone()],
+                requested: asked(&path),
                 results: Ok(HashMap::new()),
             })
             .unwrap();
@@ -467,7 +569,7 @@ mod tests {
         cache
             .results_tx
             .send(FetchResult {
-                requested: vec![failed.clone()],
+                requested: asked(&failed),
                 results: Err(anyhow::anyhow!("daemon unreachable")),
             })
             .unwrap();
@@ -562,7 +664,7 @@ mod tests {
             cache
                 .results_tx
                 .send(FetchResult {
-                    requested: vec![path.clone()],
+                    requested: asked(&path),
                     results,
                 })
                 .unwrap();
@@ -629,7 +731,7 @@ mod tests {
         cache
             .results_tx
             .send(FetchResult {
-                requested: vec![a.clone()],
+                requested: asked(&a),
                 results: Ok(results),
             })
             .unwrap();
@@ -639,17 +741,165 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_drops_a_cached_entry() {
+    fn observe_drops_the_entry_of_a_worktree_whose_inputs_moved() {
         let mut cache = cache();
-        cache.entries.insert(
-            PathBuf::from("/repo/wt"),
+        let path = PathBuf::from("/repo/wt");
+        let known = AheadBehindState::Known {
+            ahead: 1,
+            behind: 0,
+            main_behind: None,
+        };
+        cache.observe(at_head(&path, "aaa"));
+        cache.entries.insert(path.clone(), known);
+
+        // The same frame again drops nothing: an unchanged refresh stays free.
+        cache.observe(at_head(&path, "aaa"));
+        assert_eq!(cache.get(&path), known);
+
+        // A commit moved HEAD.
+        cache.observe(at_head(&path, "bbb"));
+        assert_eq!(cache.get(&path), AheadBehindState::Unknown);
+    }
+
+    #[test]
+    fn observe_drops_the_entry_when_only_the_branch_changed() {
+        // A branch switch can land on the same commit, so no id moves — the branch
+        // is part of what the answer is computed from, as it is in the extension.
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        let on = |branch: &str| {
+            vec![(
+                path.clone(),
+                Inputs {
+                    branch: Some(branch.to_string()),
+                    head_sha: Some("aaa".to_string()),
+                    ..Inputs::default()
+                },
+            )]
+        };
+        cache.observe(on("one"));
+        cache
+            .entries
+            .insert(path.clone(), AheadBehindState::Unavailable);
+        cache.observe(on("one"));
+        assert_eq!(cache.get(&path), AheadBehindState::Unavailable);
+        cache.observe(on("two"));
+        assert_eq!(cache.get(&path), AheadBehindState::Unknown);
+    }
+
+    #[test]
+    fn observe_drops_an_entry_for_a_worktree_it_had_not_seen() {
+        // Fetched before the tree reported it (a visible-rows report can arrive
+        // first): nothing says what that answer was computed from, so it is re-asked.
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        cache
+            .entries
+            .insert(path.clone(), AheadBehindState::Unavailable);
+        cache.observe(at_head(&path, "aaa"));
+        assert_eq!(cache.get(&path), AheadBehindState::Unknown);
+    }
+
+    #[test]
+    fn observe_forgets_a_worktree_that_left_the_snapshot() {
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        cache.observe(at_head(&path, "aaa"));
+        assert!(cache.inputs.contains_key(&path));
+        cache.observe(at_head(Path::new("/repo/other"), "ccc"));
+        assert!(!cache.inputs.contains_key(&path));
+        assert!(cache.inputs.contains_key(Path::new("/repo/other")));
+    }
+
+    #[tokio::test]
+    async fn a_result_for_refs_that_moved_in_flight_is_discarded_and_re_asked() {
+        // #2145: a fetch is sent, a commit moves HEAD while it is in flight, and the
+        // old reply lands. It was computed against the old HEAD, so it must not be
+        // cached as current — and the path has to be asked again at once, since the
+        // frame that moved HEAD found it pending and skipped it.
+        let (_dir, sock, _server) =
+            fake_daemon_replies(vec![counts_reply(1, 0), counts_reply(2, 0)]);
+        let mut cache = AheadBehindCache::new(WorktreesClient::new(sock));
+        let path = PathBuf::from("/repo/wt");
+
+        cache.observe(at_head(&path, "aaa"));
+        cache.set_visible(std::slice::from_ref(&path));
+        assert_eq!(cache.get(&path), AheadBehindState::Loading);
+
+        // A commit lands. The hub's frame observes it and re-runs `set_visible`,
+        // which skips the path because it is still pending.
+        cache.observe(at_head(&path, "bbb"));
+        cache.set_visible(std::slice::from_ref(&path));
+        assert_eq!(cache.pending.len(), 1);
+
+        // The reply for the old HEAD lands: not stored, and re-queued.
+        settle(&mut cache).await;
+        assert!(!cache.entries.contains_key(&path));
+        assert_eq!(cache.get(&path), AheadBehindState::Loading);
+
+        // The reply for the new HEAD is what ends up cached.
+        settle(&mut cache).await;
+        assert_eq!(
+            cache.get(&path),
             AheadBehindState::Known {
-                ahead: 1,
+                ahead: 2,
                 behind: 0,
-                main_behind: None,
-            },
+                main_behind: None
+            }
         );
-        cache.invalidate(Path::new("/repo/wt"));
-        assert_eq!(cache.get(Path::new("/repo/wt")), AheadBehindState::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_result_whose_inputs_did_not_move_is_stored_and_one_that_did_is_not() {
+        // Per path, not per batch: one worktree's commit must not cost the others
+        // in the same batch their answers.
+        let mut cache = cache();
+        let moved = PathBuf::from("/repo/moved");
+        let steady = PathBuf::from("/repo/steady");
+        let both = |moved_head: &str| {
+            vec![
+                (
+                    moved.clone(),
+                    Inputs {
+                        head_sha: Some(moved_head.to_string()),
+                        ..Inputs::default()
+                    },
+                ),
+                (
+                    steady.clone(),
+                    Inputs {
+                        head_sha: Some("s".to_string()),
+                        ..Inputs::default()
+                    },
+                ),
+            ]
+        };
+        cache.observe(both("old"));
+        let requested = both("old");
+        cache.pending.extend([moved.clone(), steady.clone()]);
+        cache.observe(both("new"));
+
+        let counts = AheadBehindEntryWire {
+            ahead: Some(1),
+            behind: Some(0),
+            main_behind: None,
+        };
+        cache
+            .results_tx
+            .send(FetchResult {
+                requested,
+                results: Ok(HashMap::from([
+                    (moved.clone(), counts),
+                    (steady.clone(), counts),
+                ])),
+            })
+            .unwrap();
+        // `observe` kept `steady`'s entry (nothing moved), so only `moved` re-asks.
+        cache.wanted = vec![moved.clone(), steady.clone()];
+        cache.changed().await;
+
+        assert!(matches!(cache.get(&steady), AheadBehindState::Known { .. }));
+        assert!(!cache.entries.contains_key(&moved));
+        assert_eq!(cache.get(&moved), AheadBehindState::Loading);
     }
 }
