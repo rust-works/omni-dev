@@ -787,6 +787,7 @@ operation anywhere in a target's ancestor chain:
 | `slides-write`      | deny    | `slides replace`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `trash`             | deny    | `trash`, `untrash` (individual files only)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `docs-delete`       | deny    | `docs delete` — anchor-addressed content removal                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `docs-format`       | deny    | `docs text-style` / `docs paragraph-style` — anchor-addressed formatting                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
 There is no "enabled: true" flag — an absent or empty rule list already
 means "deny every write everywhere," via this table alone, which *is* the
@@ -938,7 +939,7 @@ the one Drive it came from. A rule keys on **either** a `folder_id` or a
   `file_id` is a configuration error rather than a no-op.
 - `allow`/`deny` — any of `read`, `create`, `upload`, `edit`,
   `sheets-write`, `sheets-structure`, `sheets-delete`, `sheets-protection`,
-  `docs-write`, `trash`, `docs-delete`, `slides-write`. A `deny`
+  `docs-write`, `trash`, `docs-delete`, `docs-format`, `slides-write`. A `deny`
   entry for `read` is schema-ready today for a future `search`/`read`/
   `dedupe` enforcement fast-follow (not wired up yet — see
   [ADR-0071](adrs/adr-0071.md) §11); the write operations are enforced now.
@@ -4109,10 +4110,56 @@ entirely, and the edit is refused up front rather than attempted unleased.
   counts across all tabs.
 - **`append` adds no separator.** Appending `hello` to a document ending
   `world` gives `worldhello`. Include a leading newline if you want one.
-- **Deletion is not supported**, and not merely unimplemented: no delete
-  request is constructible anywhere in this codebase, enforced by a test.
-  Replacing text *with nothing* (`--replace ""`) is the supported way to
-  remove it.
+- **Content deletion has separate consent.** `docs delete` requires
+  `docs-delete`; replacing text with nothing (`--replace ""`) retains its
+  existing `docs-write` semantics.
+
+#### drive docs text-style / paragraph-style
+
+Apply bounded formatting to a unique `--match TEXT`, or an inclusive
+`--from TEXT --to TEXT` range. Both commands require the separate `docs-format`
+permission; `docs-write`, `docs-delete`, and `edit` grants do not permit them.
+The operation defaults to deny and requires a Drive lease unless the deciding
+rule explicitly sets `require_lease: false`. Preview with `--dry-run` first.
+
+```bash
+omni-dev drive docs text-style <ID> --match 'Important' --bold true --dry-run
+omni-dev drive docs text-style <ID> --from 'Start' --to 'End' --italic false --underline true --lease <TOKEN>
+omni-dev drive docs paragraph-style <ID> --match 'Summary' --named-style heading1 --dry-run
+omni-dev drive docs paragraph-style <ID> --match 'Summary' --alignment center --lease <TOKEN>
+```
+
+Text properties are `--bold`, `--italic`, `--underline`, and `--strikethrough`,
+each taking an explicit `true` or `false`. Paragraph properties are
+`--alignment start|center|end|justified` and `--named-style
+normal-text|title|subtitle|heading1|heading2|heading3|heading4|heading5|heading6`.
+At least one property is required. The field mask contains exactly the supplied
+properties; omitted properties are not reset. There is no arbitrary JSON,
+user-provided mask, numeric range, or wildcard reset surface.
+
+Anchors use the same uniqueness, case sensitivity (`--ignore-case` opts into
+Unicode simple folding), UTF-16 indices, tab identity, and conservative structural
+boundaries as insertion/deletion. The permission gate runs before fetching the
+Doc. Each call resolves against its own `SUGGESTIONS_INLINE` snapshot and sends
+one typed request with that response's mandatory `requiredRevisionId`. The
+existing Drive lease checks also apply. Missing revisions, ambiguity, unsafe
+ranges, and stale revisions refuse the operation without retry.
+
+Paragraph styling affects every whole paragraph overlapping the anchors.
+Its preview expands to those full paragraph boundaries, including trailing
+newlines, and validates content outside the anchor text too: pending content
+suggestions, inline objects, and index gaps anywhere in an affected paragraph
+are refused. Styling a body's final newline is safe; deleting it is prohibited.
+Text styling addresses the anchored character range. Google may extend it to
+adjacent newlines and apply matching text style to bullets for fully contained
+list paragraphs; these are API effects, not separate bullet-edit requests. Dry runs and successful
+results report the range, tab, affected paragraph/scalar/byte counts, explicit
+style values and derived field mask, without document prose. These counts
+represent affected content, not inserted or removed text. Google can apply
+related/inherited formatting changes, especially when setting a named paragraph
+style; previews describe the requested range and properties rather than a
+rendered before/after document. As with other Docs writes, inspect structured
+`status` (`would-format`, `formatted`, or a refusal) rather than exit code alone.
 
 #### drive docs insert / delete
 

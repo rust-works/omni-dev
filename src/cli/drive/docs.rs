@@ -9,6 +9,7 @@
 pub(crate) mod create;
 pub(crate) mod info;
 pub(crate) mod read;
+pub(crate) mod style;
 pub(crate) mod write;
 
 use anyhow::Result;
@@ -50,6 +51,10 @@ pub enum DocsSubcommands {
     CreateBullets(write::CreateBulletsCommand),
     /// Removes bullets while preserving prose and indentation, under docs-write.
     DeleteBullets(write::DeleteBulletsCommand),
+    /// Sets explicit character formatting on an anchored range under docs-format.
+    TextStyle(style::TextStyleCommand),
+    /// Styles whole paragraphs overlapping an anchored range under docs-format.
+    ParagraphStyle(style::ParagraphStyleCommand),
     /// Creates a new Google Doc, optionally seeded with text. Gated by the
     /// write-permission rules' `create` operation (issue #1615).
     Create(create::CreateCommand),
@@ -72,6 +77,8 @@ impl DocsCommand {
             DocsSubcommands::Delete(cmd) => cmd.execute(client).await,
             DocsSubcommands::CreateBullets(cmd) => cmd.execute(client).await,
             DocsSubcommands::DeleteBullets(cmd) => cmd.execute(client).await,
+            DocsSubcommands::TextStyle(cmd) => cmd.execute(client).await,
+            DocsSubcommands::ParagraphStyle(cmd) => cmd.execute(client).await,
             DocsSubcommands::Create(cmd) => cmd.execute(client).await,
         }
     }

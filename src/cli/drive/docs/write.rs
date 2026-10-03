@@ -481,7 +481,7 @@ pub(crate) fn read_text(source: &str) -> Result<String> {
 /// and logging cannot drift between them. Split from each `execute` so tests
 /// can inject wiremock clients and pre-built options without touching the
 /// filesystem or the credential-loading path.
-async fn run_write(
+pub(super) async fn run_write(
     drive: &DriveClient,
     docs: &DocsClient,
     opts: &WriteOptions,
