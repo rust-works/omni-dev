@@ -1606,7 +1606,7 @@ extension never runs git.
   worktree** between concurrent requests, (2) **memoizes each commit-graph walk** by
   `(repository, local tip, upstream tip)`, and (3) **runs at most four computations
   at a time**, so the walks cannot saturate the blocking pool or hold more than a
-  few repositories' pack files open.
+  few repositories open.
 
   None of this can serve a stale answer. A request joins a shared computation only
   while it is still *waiting for its turn* behind the cap — which is when sharing is
@@ -1617,10 +1617,32 @@ extension never runs git.
   fetch or push changes an id and simply misses, with no TTL to tune. A *shallow*
   clone is the exception (deepening it changes the answer without changing an id), so
   it bypasses the memo. It also answers both questions
-  (own-upstream and default-branch divergence) from a single `Repository` open
-  per worktree. The memo is shared with the inline `ahead`/`behind` that `list` and
+  (own-upstream and default-branch divergence) from a single repository handle.
+  The memo is shared with the inline `ahead`/`behind` that `list` and
   the tray menu compute. A computation that fails degrades to "no divergence" for
   that worktree, which omits its row.
+- **One `Repository` per repo, not per worktree (#2121).** A batch over N linked
+  worktrees used to open a fresh `Repository` per worktree — parsing the repo's
+  config and building its ref and object databases N times — though everything the
+  walk reads belongs to the shared common dir and is the same from each. The op now
+  opens the common dir and reads each linked worktree's HEAD through it, via the
+  `worktrees/<name>/HEAD` pseudo-reference libgit2 resolves in the main repository's
+  ref database (`git2` does not bind `git_repository_head_for_worktree`). The
+  handles come from a pool that keeps **at most as many live handles as there are
+  concurrent computations** (four), so the bound on open repositories above is
+  unchanged, and that exists only while `ahead-behind` work is outstanding, so no
+  handle outlives the requests it served or ages into a stale view.
+
+  This roughly halves the CPU of a batch (a 41-worktree repo went from a median of
+  about 37 ms to about 20 ms). It does **not** change descriptor use: libgit2 already
+  shares a repository's open pack files across handles, so descriptors never grew
+  with the number of worktrees.
+
+  Results are identical to opening each worktree. Whenever the shared path cannot be
+  sure — a layout or HEAD it cannot read, a common dir that will not open, or
+  `extensions.worktreeConfig` (which `git sparse-checkout` turns on), whose
+  per-worktree `config.worktree` can change a branch's upstream and is seen only by
+  a repository rooted at the worktree — it falls back to the per-worktree open.
 - **`main_behind` rides the same lazy op (#1457).** `repo_main_behind`
   resolves the repository's remote default branch the same **local-only,
   no-fetch** way `worktrees rebase`'s `--onto` default does
