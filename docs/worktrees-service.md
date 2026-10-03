@@ -1630,8 +1630,9 @@ extension never runs git.
   ref database (`git2` does not bind `git_repository_head_for_worktree`). The
   handles come from a pool that keeps **at most as many live handles as there are
   concurrent computations** (four), so the bound on open repositories above is
-  unchanged, and that exists only while `ahead-behind` work is outstanding, so no
-  handle outlives the requests it served or ages into a stale view.
+  unchanged, and that exists only while `ahead-behind` work is outstanding, so
+  handles do not outlive the requests they served. Overlapping requests can keep a
+  pool alive, so a handle is also never reused once it is 30 seconds old.
 
   This roughly halves the CPU of a batch (a 41-worktree repo went from a median of
   about 37 ms to about 20 ms). It does **not** change descriptor use: libgit2 already
@@ -1639,10 +1640,15 @@ extension never runs git.
   with the number of worktrees.
 
   Results are identical to opening each worktree. Whenever the shared path cannot be
-  sure — a layout or HEAD it cannot read, a common dir that will not open, or
+  sure — a layout or HEAD it cannot read (only a missing commit counts as an empty
+  HEAD), a common dir that will not open, or config that can read differently for a
+  worktree — it falls back to the per-worktree open. Two things make config differ:
   `extensions.worktreeConfig` (which `git sparse-checkout` turns on), whose
-  per-worktree `config.worktree` can change a branch's upstream and is seen only by
-  a repository rooted at the worktree — it falls back to the per-worktree open.
+  per-worktree `config.worktree` can change a branch's upstream, and any `includeIf`
+  conditional include, because libgit2 matches `gitdir:` against the gitdir and
+  `onbranch:` against the HEAD of the repository it loads the config for. Both are
+  seen only by a repository rooted at the worktree. A repo with either keeps its
+  pre-#2121 cost; an unconditional `include` is unaffected.
 - **`main_behind` rides the same lazy op (#1457).** `repo_main_behind`
   resolves the repository's remote default branch the same **local-only,
   no-fetch** way `worktrees rebase`'s `--onto` default does

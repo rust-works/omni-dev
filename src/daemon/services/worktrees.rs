@@ -7137,6 +7137,57 @@ mod tests {
         assert_eq!(folder_divergence_shared(&pool, &wt), folder_divergence(&wt));
     }
 
+    /// A conditional include is evaluated against the repository it is loaded for:
+    /// libgit2 matches `onbranch:` against that repository's HEAD and `gitdir:`
+    /// against its gitdir. A handle at the common dir would match both against the
+    /// main working tree and the common dir instead, so the shared path must step
+    /// aside for a repo that has one.
+    #[test]
+    fn shared_path_defers_to_discover_when_a_conditional_include_exists() {
+        let corpus = shared_corpus();
+        let common = std::fs::canonicalize(corpus.repo.path()).unwrap();
+        // Gives `untracked` an upstream, but only while its own HEAD is `untracked`.
+        std::fs::write(
+            common.join("onbranch.cfg"),
+            "[branch \"untracked\"]\n\tremote = origin\n\tmerge = refs/heads/main\n",
+        )
+        .unwrap();
+        // Re-points `tracked`, but only for a repository whose gitdir is a
+        // worktree's, under `<common>/worktrees/`.
+        std::fs::write(
+            common.join("gitdir.cfg"),
+            "[branch \"tracked\"]\n\tmerge = refs/heads/elsewhere\n",
+        )
+        .unwrap();
+        let mut cfg = corpus.repo.config().unwrap();
+        cfg.set_str("includeIf.onbranch:untracked.path", "onbranch.cfg")
+            .unwrap();
+        cfg.set_str(
+            &format!("includeIf.gitdir:{}/worktrees/.path", common.display()),
+            "gitdir.cfg",
+        )
+        .unwrap();
+
+        // Both includes really change what a repository rooted at the worktree
+        // reports, so this test is not vacuous.
+        assert_eq!(
+            folder_divergence(&corpus.wt("untracked")).ahead_behind,
+            Some((1, 1))
+        );
+        assert_eq!(folder_divergence(&corpus.wt("tracked")).ahead_behind, None);
+
+        let pool = shared_repo::RepoPool::new(4);
+        for name in ["untracked", "tracked"] {
+            let wt = corpus.wt(name);
+            assert_eq!(shared_repo::divergence(&pool, &wt), None, "{name}");
+            assert_eq!(
+                folder_divergence_shared(&pool, &wt),
+                folder_divergence(&wt),
+                "{name}"
+            );
+        }
+    }
+
     /// A handle reused across computations must still see the repository as it is
     /// now: refs, the branch itself, and config can all change between two uses of
     /// one pooled handle, and the answer must follow.

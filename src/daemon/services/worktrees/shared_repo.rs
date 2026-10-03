@@ -21,8 +21,8 @@
 //!
 //! The shared path must give the answer `discover` would, so it answers
 //! [`None`] — "ask the old path" — whenever it cannot be sure: a HEAD it cannot
-//! read, a common dir it cannot open, or a repository whose config differs per
-//! worktree ([`has_per_worktree_config`]).
+//! read, a common dir it cannot open, or a repository whose config can differ
+//! between a worktree and the common dir ([`config_differs_per_worktree`]).
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -31,8 +31,9 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
-use git2::{Reference, Repository};
+use git2::{ErrorCode, Reference, Repository};
 
 use super::divergence::Divergence;
 
@@ -131,8 +132,20 @@ enum Head<'r> {
     Ref(Reference<'r>),
     /// HEAD names a branch that has no commit yet. `repo.head()` errors here too.
     Unborn,
-    /// The HEAD could not be read at all, so nothing can be said about it.
+    /// The HEAD could not be read, so nothing can be said about it.
     Unreadable,
+}
+
+/// Classifies the outcome of resolving a HEAD. Only the two errors that mean "no
+/// commit there" are an answer; any other failure (an I/O or lock error, an
+/// unusual layout) is left to the per-worktree open rather than guessed to be an
+/// empty result.
+fn head_from(resolved: Result<Reference<'_>, git2::Error>) -> Head<'_> {
+    match resolved {
+        Ok(head) => Head::Ref(head),
+        Err(e) if matches!(e.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => Head::Unborn,
+        Err(_) => Head::Unreadable,
+    }
 }
 
 /// Reads the HEAD of `worktree` (the main working tree when `None`) through
@@ -145,26 +158,50 @@ enum Head<'r> {
 /// worktree.
 fn head_of<'r>(repo: &'r Repository, worktree: Option<&str>) -> Head<'r> {
     let Some(name) = worktree else {
-        return repo.head().map_or(Head::Unborn, Head::Ref);
+        return head_from(repo.head());
     };
     match repo.find_reference(&format!("worktrees/{name}/HEAD")) {
-        Ok(pseudo) => pseudo.resolve().map_or(Head::Unborn, Head::Ref),
+        Ok(pseudo) => head_from(pseudo.resolve()),
         Err(_) => Head::Unreadable,
     }
 }
 
-/// Whether the repository keeps config per worktree (`extensions.worktreeConfig`,
-/// which `git sparse-checkout` turns on). A worktree's own `config.worktree` can
-/// then override `branch.<name>.*` or `remote.*` and change its upstream, and a
-/// handle at the common dir would not see that, so such a repo is not served
-/// from a shared handle. An unreadable config counts as per-worktree.
-fn has_per_worktree_config(repo: &Repository) -> bool {
-    repo.config().map_or(true, |config| {
-        config
-            .get_bool("extensions.worktreeConfig")
-            .unwrap_or(false)
-    })
+/// Whether `repo`'s config can read differently for one of its worktrees than for
+/// the common dir this handle is rooted at. If so the handle cannot stand in for
+/// the worktree, and the repo is not served from a shared handle.
+///
+/// Two things do that. `extensions.worktreeConfig` (which `git sparse-checkout`
+/// turns on) lets a worktree's own `config.worktree` override `branch.<name>.*` or
+/// `remote.*`. And a conditional include (`includeIf`) is evaluated against the
+/// repository it is loaded for — libgit2 matches `gitdir:` against its gitdir and
+/// `onbranch:` against that gitdir's HEAD — so a handle at the common dir would
+/// match them against the common dir and the main working tree instead. An
+/// unreadable config counts as differing.
+fn config_differs_per_worktree(repo: &Repository) -> bool {
+    let Ok(config) = repo.config() else {
+        return true;
+    };
+    if config
+        .get_bool("extensions.worktreeConfig")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let mut conditional = false;
+    let walked = config
+        .entries(Some(r"^includeif\."))
+        .and_then(|entries| entries.for_each(|_| conditional = true));
+    walked.is_err() || conditional
 }
+
+/// How long a pooled handle may be reused after it was opened.
+///
+/// A pool lives only while `ahead-behind` work is outstanding, which on its own is
+/// no bound: windows that keep asking in overlapping batches would keep one alive
+/// indefinitely. So this is the bound, on how old a view of a repository a request
+/// can be answered from. It is far longer than a batch takes, so a batch still
+/// shares one handle throughout.
+const MAX_HANDLE_AGE: Duration = Duration::from_secs(30);
 
 /// A bounded pool of `Repository` handles opened at common dirs.
 ///
@@ -175,23 +212,35 @@ fn has_per_worktree_config(repo: &Repository) -> bool {
 /// handle rather than waiting.
 ///
 /// The pool is meant to live only while `ahead-behind` work is outstanding (the
-/// coordinator holds it weakly), so no handle outlives the requests it served and
-/// none can age into a stale view of the repository.
+/// coordinator holds it weakly), so handles do not outlive the requests they
+/// served. Because overlapping requests can keep it alive, a handle is also never
+/// reused once it is [`MAX_HANDLE_AGE`] old.
 pub(super) struct RepoPool {
     limit: usize,
+    max_age: Duration,
     state: Mutex<PoolState>,
     opens: AtomicUsize,
+}
+
+/// A handle waiting for its next computation.
+struct Idle {
+    commondir: PathBuf,
+    /// When the handle was opened. Reuse does not renew it: it bounds how stale a
+    /// view of the repository the handle can give.
+    opened: Instant,
+    repo: Repository,
 }
 
 #[derive(Default)]
 struct PoolState {
     /// Handles waiting for their next computation, oldest first.
-    idle: Vec<(PathBuf, Repository)>,
+    idle: Vec<Idle>,
     /// Handles currently leased, or being opened.
     in_use: usize,
-    /// Common dirs this pool declined to open ([`has_per_worktree_config`]),
-    /// remembered so a repo that will never be served is not reopened per
-    /// worktree.
+    /// Common dirs this pool failed to open or declined to serve
+    /// ([`config_differs_per_worktree`]), remembered so a repo that cannot be
+    /// served is not reopened once per worktree. Callers fall back to the
+    /// per-worktree open for these, which is exactly what happened before the pool.
     refused: HashSet<PathBuf>,
 }
 
@@ -202,14 +251,29 @@ impl PoolState {
         let excess = (self.in_use + self.idle.len())
             .saturating_sub(limit)
             .min(self.idle.len());
-        self.idle.drain(..excess).map(|(_, repo)| repo).collect()
+        self.idle.drain(..excess).map(|idle| idle.repo).collect()
+    }
+
+    /// Removes the idle handles that have reached `max_age`, for the caller to drop
+    /// after releasing the lock.
+    fn drain_aged(&mut self, max_age: Duration) -> Vec<Repository> {
+        let (aged, fresh): (Vec<_>, Vec<_>) = std::mem::take(&mut self.idle)
+            .into_iter()
+            .partition(|idle| idle.opened.elapsed() >= max_age);
+        self.idle = fresh;
+        aged.into_iter().map(|idle| idle.repo).collect()
     }
 }
 
 impl RepoPool {
     pub(super) fn new(limit: usize) -> Self {
+        Self::with_max_age(limit, MAX_HANDLE_AGE)
+    }
+
+    fn with_max_age(limit: usize, max_age: Duration) -> Self {
         Self {
             limit,
+            max_age,
             state: Mutex::new(PoolState::default()),
             opens: AtomicUsize::new(0),
         }
@@ -218,8 +282,8 @@ impl RepoPool {
     /// Runs `f` on a handle opened at `commondir` — an idle one if the pool has
     /// it, else a fresh open — then keeps the handle for the next caller.
     ///
-    /// `None` when no usable handle can be had: the open failed, or the repo
-    /// keeps per-worktree config.
+    /// `None` when no usable handle can be had: the open failed, or the repo's
+    /// config can differ per worktree.
     pub(super) fn with_repo<R>(
         &self,
         commondir: &Path,
@@ -238,18 +302,17 @@ impl RepoPool {
                 return None;
             }
             state.in_use += 1;
+            let mut evicted = state.drain_aged(self.max_age);
             let reused = state
                 .idle
                 .iter()
-                .position(|(dir, _)| dir == commondir)
-                .map(|at| state.idle.remove(at).1);
+                .position(|idle| idle.commondir == commondir)
+                .map(|at| state.idle.remove(at));
             // A miss adds a handle, so make room for it first. A hit swaps an
             // idle handle for a leased one and the total is unchanged.
-            let evicted = if reused.is_none() {
-                state.evict_to_fit(self.limit)
-            } else {
-                Vec::new()
-            };
+            if reused.is_none() {
+                evicted.extend(state.evict_to_fit(self.limit));
+            }
             (reused, evicted)
         };
         drop(evicted);
@@ -259,25 +322,28 @@ impl RepoPool {
             pool: self,
             armed: true,
         };
-        let repo = match reused {
-            Some(repo) => repo,
-            None => self.open(commondir)?,
+        let (opened, repo) = match reused {
+            Some(idle) => (idle.opened, idle.repo),
+            None => (Instant::now(), self.open(commondir)?),
         };
         Some(Lease {
             slot,
             commondir: commondir.to_path_buf(),
+            opened,
             repo,
         })
     }
 
+    /// Opens a handle at `commondir`, or remembers that it cannot be served.
     fn open(&self, commondir: &Path) -> Option<Repository> {
         self.opens.fetch_add(1, Ordering::Relaxed);
-        let repo = Repository::open(commondir).ok()?;
-        if has_per_worktree_config(&repo) {
+        let opened = Repository::open(commondir)
+            .ok()
+            .filter(|repo| !config_differs_per_worktree(repo));
+        if opened.is_none() {
             self.lock().refused.insert(commondir.to_path_buf());
-            return None;
         }
-        Some(repo)
+        opened
     }
 
     fn lock(&self) -> MutexGuard<'_, PoolState> {
@@ -327,6 +393,8 @@ impl Drop for Slot<'_> {
 struct Lease<'p> {
     slot: Slot<'p>,
     commondir: PathBuf,
+    /// When the handle was first opened, carried through reuse.
+    opened: Instant,
     repo: Repository,
 }
 
@@ -345,12 +413,17 @@ impl Lease<'_> {
         let Lease {
             slot,
             commondir,
+            opened,
             repo,
         } = self;
         let evicted = {
             let mut state = slot.pool.lock();
             state.in_use = state.in_use.saturating_sub(1);
-            state.idle.push((commondir, repo));
+            state.idle.push(Idle {
+                commondir,
+                opened,
+                repo,
+            });
             state.evict_to_fit(slot.pool.limit)
         };
         slot.disarm();
@@ -545,15 +618,19 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_open_frees_its_capacity() {
+    fn a_failed_open_frees_its_capacity_and_is_not_retried() {
         let dir = tempfile::tempdir().unwrap();
         let pool = RepoPool::new(1);
 
         assert!(pool
             .with_repo(&dir.path().join("missing"), |_| ())
             .is_none());
+        assert!(pool
+            .with_repo(&dir.path().join("missing"), |_| ())
+            .is_none());
 
         assert_eq!(pool.live(), 0);
+        // Remembered after the first failure, so the second call never reopens.
         assert_eq!(pool.opens(), 1);
     }
 
@@ -574,21 +651,98 @@ mod tests {
     }
 
     #[test]
-    fn a_repo_with_per_worktree_config_is_refused_once() {
+    fn a_repo_whose_config_can_differ_per_worktree_is_refused_once() {
+        // Each of these can make a worktree read config the common dir does not.
+        for (key, value) in [
+            ("extensions.worktreeConfig", "true"),
+            ("includeIf.onbranch:feature/**.path", "extra.cfg"),
+            ("includeIf.gitdir:/somewhere/.path", "extra.cfg"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = repo_with_commit(dir.path());
+            repo.config().unwrap().set_str(key, value).unwrap();
+            let pool = RepoPool::new(4);
+
+            assert!(
+                pool.with_repo(&commondir_of(&repo), |_| ()).is_none(),
+                "{key}"
+            );
+            assert!(
+                pool.with_repo(&commondir_of(&repo), |_| ()).is_none(),
+                "{key}"
+            );
+
+            // Declined on the first open and remembered, not reopened per worktree.
+            assert_eq!(pool.opens(), 1, "{key}");
+            assert_eq!(pool.live(), 0, "{key}");
+        }
+    }
+
+    #[test]
+    fn an_unconditional_include_does_not_stop_a_repo_being_shared() {
+        // Evaluated the same way whichever repository loads it.
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_commit(dir.path());
         repo.config()
             .unwrap()
-            .set_bool("extensions.worktreeConfig", true)
+            .set_str("include.path", "extra.cfg")
             .unwrap();
         let pool = RepoPool::new(4);
 
-        assert!(pool.with_repo(&commondir_of(&repo), |_| ()).is_none());
-        assert!(pool.with_repo(&commondir_of(&repo), |_| ()).is_none());
+        assert_eq!(pool.with_repo(&commondir_of(&repo), |_| ()), Some(()));
+    }
 
-        // Declined on the first open and remembered, not reopened per worktree.
+    #[test]
+    fn a_handle_is_not_reused_once_it_reaches_its_age_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo_with_commit(dir.path());
+        // A zero limit means every handle is already too old to reuse.
+        let pool = RepoPool::with_max_age(4, Duration::ZERO);
+
+        for _ in 0..3 {
+            assert_eq!(pool.with_repo(&commondir_of(&repo), |_| ()), Some(()));
+        }
+
+        assert_eq!(pool.opens(), 3);
+        // The aged handle is dropped when the next lease finds it, so the pool
+        // never holds more than the one just returned.
+        assert_eq!(pool.live(), 1);
+    }
+
+    #[test]
+    fn reuse_does_not_renew_a_handles_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo_with_commit(dir.path());
+        let pool = RepoPool::new(4);
+        let commondir = commondir_of(&repo);
+        pool.with_repo(&commondir, |_| ()).unwrap();
+        let opened = pool.lock().idle[0].opened;
+
+        pool.with_repo(&commondir, |_| ()).unwrap();
+
         assert_eq!(pool.opens(), 1);
-        assert_eq!(pool.live(), 0);
+        assert_eq!(pool.lock().idle[0].opened, opened);
+    }
+
+    #[test]
+    fn only_a_missing_commit_is_an_empty_head() {
+        let error = |code| git2::Error::new(code, git2::ErrorClass::Reference, "test");
+        assert!(matches!(
+            head_from(Err(error(ErrorCode::UnbornBranch))),
+            Head::Unborn
+        ));
+        assert!(matches!(
+            head_from(Err(error(ErrorCode::NotFound))),
+            Head::Unborn
+        ));
+        // Anything else is unknown, and left to the per-worktree open.
+        for code in [
+            ErrorCode::GenericError,
+            ErrorCode::Locked,
+            ErrorCode::Invalid,
+        ] {
+            assert!(matches!(head_from(Err(error(code))), Head::Unreadable));
+        }
     }
 
     #[test]
