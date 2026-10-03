@@ -16,7 +16,8 @@
 //! secret persisted. The registry lives behind a [`std::sync::Mutex`] that is
 //! **never held across an `.await`** (the Snowflake rule); every op is pure CPU
 //! under the lock, so liveness reaping happens inline on each read rather than
-//! from a background task.
+//! from a background task. The liveness TTL is measured on an `AwakeClock`, so
+//! a system sleep ages nothing (#2126).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -28,10 +29,16 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+use crate::utils::awake_clock::AwakeClock;
+
 /// How long a window may go silent before it ages out of the registry. Three
 /// missed ~10s heartbeats; a window that crashed without firing `unregister`
 /// disappears on the next read. The resident process is what makes this
 /// liveness correct — a flat shared file could not reap stale entries.
+///
+/// Measured in *awake* time (#2126): see [`AwakeClock`]. A window cannot
+/// heartbeat while the machine sleeps, so a system sleep of any length ages no
+/// window, and the first read after a wake-up no longer reaps every one.
 const DEFAULT_TTL: Duration = Duration::from_secs(30);
 
 /// How long a per-repository PR-poll lease lasts before it auto-expires (#1376).
@@ -89,8 +96,15 @@ pub struct WindowEntry {
     /// Reporting extension-host pid, if reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
-    /// When the registry last heard from this window (register or heartbeat).
+    /// When the registry last heard from this window (register or heartbeat), by
+    /// the wall clock. For display only: liveness is measured on `last_active`.
     pub last_seen: DateTime<Utc>,
+    /// The registry's [`AwakeClock`] reading when this window was last heard
+    /// from. [`reap`] and [`evict_oldest`] compare it, so a system sleep ages no
+    /// window (#2126). Never serialized: a reading means nothing outside the
+    /// registry that took it.
+    #[serde(skip)]
+    pub(crate) last_active: Duration,
 }
 
 /// The cross-window worktree registry: the in-memory, TTL-reaped set of open
@@ -99,8 +113,10 @@ pub struct WindowEntry {
 pub struct WorktreesRegistry {
     /// Open windows keyed by their companion-owned `key`.
     windows: Mutex<HashMap<String, WindowEntry>>,
-    /// How long an entry survives without a heartbeat.
+    /// How long an entry survives without a heartbeat, in awake time.
     ttl: Duration,
+    /// The clock the liveness TTL is measured on; see [`AwakeClock`].
+    clock: AwakeClock,
     /// A monotonically-bumped version counter, incremented whenever the visible
     /// set of windows changes (a `register`, a removing `unregister`, or a
     /// mutation-driven reap that drops a stale entry). A push-subscription
@@ -219,6 +235,7 @@ impl WorktreesRegistry {
         Self {
             windows: Mutex::new(HashMap::new()),
             ttl: DEFAULT_TTL,
+            clock: AwakeClock::new(),
             changes: watch::channel(0).0,
             close_pending: Mutex::new(HashSet::new()),
             reload_pending: Mutex::new(HashSet::new()),
@@ -293,9 +310,10 @@ impl WorktreesRegistry {
     /// callers validate the `key` before reaching here.
     pub fn register(&self, req: RegisterRequest) {
         let now = Utc::now();
+        let awake = self.clock.now();
         {
             let mut windows = self.lock();
-            reap(&mut windows, self.ttl, now);
+            reap(&mut windows, self.ttl, awake);
             // Upserts never evict; only a genuinely new key can grow the map, and
             // never past MAX_WINDOWS.
             if !windows.contains_key(&req.key) && windows.len() >= MAX_WINDOWS {
@@ -310,6 +328,7 @@ impl WorktreesRegistry {
                     title: req.title,
                     pid: req.pid,
                     last_seen: now,
+                    last_active: awake,
                 },
             );
         }
@@ -321,7 +340,7 @@ impl WorktreesRegistry {
     }
 
     /// Pauses the liveness clock for `outage`: advances every live entry's
-    /// `last_seen` by that long, never past now.
+    /// `last_active` (and its display `last_seen`) by that long, never past now.
     ///
     /// For a stretch when the daemon could not hear its windows — its `accept`
     /// loop was failing (#2111) — so their silence says nothing about whether they
@@ -332,16 +351,23 @@ impl WorktreesRegistry {
     /// already reaped stays gone, and one that was already stale before the outage
     /// began is credited no more than its neighbours. Not a visible change, so it
     /// does not bump the change-notify.
+    ///
+    /// `outage` is measured on a monotonic [`Instant`](std::time::Instant), the
+    /// same awake time as the `AwakeClock` the entries are stamped on, so the
+    /// two compose: the credit shifts a stamp by time the daemon was awake but
+    /// deaf, and a system sleep still ages nothing (#2126).
     pub fn credit_outage(&self, outage: Duration) {
-        let Ok(credit) = ChronoDuration::from_std(outage) else {
-            return;
-        };
+        let credit = ChronoDuration::from_std(outage).ok();
         let now = Utc::now();
+        let awake = self.clock.now();
         for entry in self.lock().values_mut() {
             // Saturate rather than overflow on an absurd credit.
-            entry.last_seen = entry
-                .last_seen
-                .checked_add_signed(credit)
+            entry.last_active = entry
+                .last_active
+                .checked_add(outage)
+                .map_or(awake, |credited| credited.min(awake));
+            entry.last_seen = credit
+                .and_then(|credit| entry.last_seen.checked_add_signed(credit))
                 .map_or(now, |credited| credited.min(now));
         }
     }
@@ -352,12 +378,14 @@ impl WorktreesRegistry {
     /// has no record of it.
     pub fn heartbeat(&self, key: &str) -> bool {
         let now = Utc::now();
+        let awake = self.clock.now();
         let (known, reaped) = {
             let mut windows = self.lock();
-            let reaped = reap(&mut windows, self.ttl, now);
+            let reaped = reap(&mut windows, self.ttl, awake);
             let known = match windows.get_mut(key) {
                 Some(entry) => {
                     entry.last_seen = now;
+                    entry.last_active = awake;
                     true
                 }
                 None => false,
@@ -375,11 +403,11 @@ impl WorktreesRegistry {
 
     /// Drops a window's registration. Returns whether an entry was present.
     pub fn unregister(&self, key: &str) -> bool {
-        let now = Utc::now();
+        let awake = self.clock.now();
         let (removed, reaped) = {
             let mut windows = self.lock();
             let removed = windows.remove(key).is_some();
-            let reaped = reap(&mut windows, self.ttl, now);
+            let reaped = reap(&mut windows, self.ttl, awake);
             (removed, reaped)
         };
         // The window is gone; any directive for it is fulfilled or moot.
@@ -662,9 +690,9 @@ impl WorktreesRegistry {
     /// subscription's periodic tick already re-samples read-only staleness — so
     /// bumping here would only make the subscription wake itself (#1267).
     pub fn list(&self) -> Vec<WindowEntry> {
-        let now = Utc::now();
+        let awake = self.clock.now();
         let mut windows = self.lock();
-        reap(&mut windows, self.ttl, now);
+        reap(&mut windows, self.ttl, awake);
         sorted_entries(&windows)
     }
 
@@ -687,9 +715,9 @@ impl WorktreesRegistry {
     /// stays in the adapter, off the registry lock, honouring the
     /// `Mutex`-never-across-`.await` invariant.
     pub fn open_folders(&self) -> Vec<PathBuf> {
-        let now = Utc::now();
+        let awake = self.clock.now();
         let mut windows = self.lock();
-        reap(&mut windows, self.ttl, now);
+        reap(&mut windows, self.ttl, awake);
         let mut folders: Vec<PathBuf> = windows
             .values()
             .flat_map(|e| e.folders.iter().cloned())
@@ -706,20 +734,20 @@ impl Default for WorktreesRegistry {
     }
 }
 
-/// Removes entries last seen longer than `ttl` ago, returning how many were
-/// dropped. Pure CPU; the caller holds the registry lock but never `.await`s
-/// while holding it. The count lets a *mutation* path
-/// ([`register`](WorktreesRegistry::register) et al.) decide whether to
-/// [`bump`](WorktreesRegistry::bump) the change-notify; read paths ignore it (see
-/// [`list`](WorktreesRegistry::list)).
-fn reap(windows: &mut HashMap<String, WindowEntry>, ttl: Duration, now: DateTime<Utc>) -> usize {
-    let max_age = ttl.as_secs() as i64;
+/// Removes entries last heard from longer than `ttl` ago on the awake clock,
+/// returning how many were dropped. `awake` is the registry's [`AwakeClock`]
+/// reading, so time spent asleep never counts (#2126). Pure CPU; the caller holds
+/// the registry lock but never `.await`s while holding it. The count lets a
+/// *mutation* path ([`register`](WorktreesRegistry::register) et al.) decide
+/// whether to [`bump`](WorktreesRegistry::bump) the change-notify; read paths
+/// ignore it (see [`list`](WorktreesRegistry::list)).
+fn reap(windows: &mut HashMap<String, WindowEntry>, ttl: Duration, awake: Duration) -> usize {
     let before = windows.len();
-    windows.retain(|_, e| (now - e.last_seen).num_seconds() <= max_age);
+    windows.retain(|_, e| awake.saturating_sub(e.last_active) <= ttl);
     before - windows.len()
 }
 
-/// Removes the entry with the oldest `last_seen` (ties broken by lowest key
+/// Removes the entry with the oldest `last_active` (ties broken by lowest key
 /// for determinism). Called when a `register` of a new key would grow the
 /// registry past [`MAX_WINDOWS`]. Pure CPU under the registry lock, like
 /// [`reap`].
@@ -727,8 +755,8 @@ fn evict_oldest(windows: &mut HashMap<String, WindowEntry>) {
     let oldest = windows
         .values()
         .min_by(|a, b| {
-            a.last_seen
-                .cmp(&b.last_seen)
+            a.last_active
+                .cmp(&b.last_active)
                 .then_with(|| a.key.cmp(&b.key))
         })
         .map(|e| e.key.clone());
@@ -857,97 +885,98 @@ mod tests {
 
     #[test]
     fn open_folders_reaps_stale_windows() {
-        let reg = WorktreesRegistry::new();
-        {
-            let mut windows = reg.lock();
-            windows.insert(
-                "fresh".to_string(),
-                WindowEntry {
-                    key: "fresh".to_string(),
-                    folders: vec![PathBuf::from("/tmp/fresh")],
-                    repo: None,
-                    title: None,
-                    pid: None,
-                    last_seen: Utc::now(),
-                },
-            );
-            windows.insert(
-                "stale".to_string(),
-                WindowEntry {
-                    key: "stale".to_string(),
-                    folders: vec![PathBuf::from("/tmp/stale")],
-                    repo: None,
-                    title: None,
-                    pid: None,
-                    last_seen: Utc::now() - chrono::Duration::seconds(120),
-                },
-            );
-        }
+        let reg = registry_with_headroom();
+        insert_silent(&reg, "fresh", Duration::ZERO);
+        insert_silent(&reg, "stale", Duration::from_secs(120));
         // The stale window's folder is reaped out of the snapshot.
+        reg.lock().get_mut("fresh").unwrap().folders = vec![PathBuf::from("/tmp/fresh")];
+        reg.lock().get_mut("stale").unwrap().folders = vec![PathBuf::from("/tmp/stale")];
         assert_eq!(reg.open_folders(), vec![PathBuf::from("/tmp/fresh")]);
     }
 
     #[test]
     fn reap_evicts_only_stale_entries() {
-        let now = Utc::now();
+        let awake = Duration::from_secs(1000);
         let mut windows = HashMap::new();
         windows.insert(
             "fresh".to_string(),
-            WindowEntry {
-                key: "fresh".to_string(),
-                folders: vec![],
-                repo: None,
-                title: None,
-                pid: None,
-                last_seen: now - chrono::Duration::seconds(5),
-            },
+            entry_at("fresh", awake.saturating_sub(Duration::from_secs(5))),
         );
         windows.insert(
             "stale".to_string(),
-            WindowEntry {
-                key: "stale".to_string(),
-                folders: vec![],
-                repo: None,
-                title: None,
-                pid: None,
-                last_seen: now - chrono::Duration::seconds(120),
-            },
+            entry_at("stale", awake.saturating_sub(Duration::from_secs(120))),
         );
-        reap(&mut windows, DEFAULT_TTL, now);
+        assert_eq!(reap(&mut windows, DEFAULT_TTL, awake), 1);
         assert!(windows.contains_key("fresh"));
         assert!(!windows.contains_key("stale"));
     }
 
+    #[test]
+    fn reap_keeps_an_entry_exactly_at_the_ttl() {
+        let awake = Duration::from_secs(1000);
+        let mut windows = HashMap::new();
+        windows.insert(
+            "edge".to_string(),
+            entry_at("edge", awake.saturating_sub(DEFAULT_TTL)),
+        );
+        // A stamp ahead of the reading (a credit never produces one, but a
+        // saturating subtraction must not wrap if it ever did) is simply fresh.
+        windows.insert(
+            "ahead".to_string(),
+            entry_at("ahead", awake + Duration::from_secs(5)),
+        );
+        assert_eq!(reap(&mut windows, DEFAULT_TTL, awake), 0);
+        assert_eq!(
+            reap(&mut windows, DEFAULT_TTL, awake + Duration::from_millis(1)),
+            1,
+            "a hair past the TTL reaps the edge entry only"
+        );
+        assert!(windows.contains_key("ahead"));
+    }
+
     // --- Outage credit (#2111) ----------------------------------------------
 
-    fn insert_aged(reg: &WorktreesRegistry, key: &str, age_secs: i64) {
-        reg.lock().insert(
-            key.to_string(),
-            entry_at(key, Utc::now() - ChronoDuration::seconds(age_secs)),
-        );
+    /// A registry whose awake clock has room to back-date a stamp by minutes (a
+    /// fresh clock reads ~0, and a stamp cannot be set before it started).
+    fn registry_with_headroom() -> WorktreesRegistry {
+        let reg = WorktreesRegistry::new();
+        reg.clock.advance(Duration::from_secs(1000));
+        reg
+    }
+
+    /// Inserts `key` straight into the map, last heard from `silent_for` ago on
+    /// the registry's awake clock.
+    fn insert_silent(reg: &WorktreesRegistry, key: &str, silent_for: Duration) {
+        let last_active = reg
+            .clock
+            .now()
+            .checked_sub(silent_for)
+            .expect("a registry built with `registry_with_headroom` has room");
+        reg.lock()
+            .insert(key.to_string(), entry_at(key, last_active));
     }
 
     #[test]
     fn credit_outage_keeps_a_window_the_outage_alone_would_have_expired() {
-        let reg = WorktreesRegistry::new();
+        let reg = registry_with_headroom();
         // 40 s silent is past the 30 s TTL, but 25 s of it was the daemon's own
         // outage, so it has really been silent for 15 s.
-        insert_aged(&reg, "w", 40);
+        insert_silent(&reg, "w", Duration::from_secs(40));
         reg.credit_outage(Duration::from_secs(25));
         assert_eq!(reg.list().len(), 1, "an outage must not age a window out");
     }
 
     #[test]
     fn without_a_credit_the_same_window_is_reaped() {
-        let reg = WorktreesRegistry::new();
-        insert_aged(&reg, "w", 40);
+        let reg = registry_with_headroom();
+        insert_silent(&reg, "w", Duration::from_secs(40));
         assert!(reg.list().is_empty(), "the control for the test above");
     }
 
     #[test]
     fn credit_outage_does_not_resurrect_a_window_that_was_already_gone() {
-        let reg = WorktreesRegistry::new();
-        insert_aged(&reg, "dead", 120);
+        let reg = registry_with_headroom();
+        insert_silent(&reg, "dead", Duration::from_secs(120));
         // Reaped before the credit lands (any read does this).
         assert!(reg.list().is_empty());
         reg.credit_outage(Duration::from_secs(300));
@@ -955,21 +984,45 @@ mod tests {
     }
 
     #[test]
-    fn credit_outage_never_moves_last_seen_into_the_future() {
-        let reg = WorktreesRegistry::new();
-        insert_aged(&reg, "w", 1);
+    fn credit_outage_never_moves_a_stamp_into_the_future() {
+        let reg = registry_with_headroom();
+        insert_silent(&reg, "w", Duration::from_secs(1));
         reg.credit_outage(Duration::from_secs(3600));
-        let after = reg.lock()["w"].last_seen;
-        assert!(after <= Utc::now(), "last_seen is ahead of the clock");
-        // Even a duration chrono cannot represent is harmless.
-        reg.credit_outage(Duration::MAX);
+        assert!(reg.lock()["w"].last_active <= reg.clock.now());
         assert!(reg.lock()["w"].last_seen <= Utc::now());
+        // Even a duration neither clock can add is saturated, not a panic and
+        // not skipped: the awake stamp still moves up to now.
+        insert_silent(&reg, "x", Duration::from_secs(20));
+        reg.credit_outage(Duration::MAX);
+        assert!(reg.lock()["x"].last_active <= reg.clock.now());
+        assert!(
+            reg.lock()["x"].last_active > reg.clock.now().saturating_sub(Duration::from_secs(1))
+        );
+        assert!(reg.lock()["x"].last_seen <= Utc::now());
+    }
+
+    #[test]
+    fn credit_outage_advances_the_display_stamp_with_the_liveness_stamp() {
+        let reg = registry_with_headroom();
+        insert_silent(&reg, "w", Duration::from_secs(40));
+        let active = reg.lock()["w"].last_active;
+        reg.lock().get_mut("w").unwrap().last_seen = Utc::now() - ChronoDuration::seconds(40);
+
+        reg.credit_outage(Duration::from_secs(25));
+
+        let guard = reg.lock();
+        assert_eq!(guard["w"].last_active, active + Duration::from_secs(25));
+        let shown_age = (Utc::now() - guard["w"].last_seen).num_seconds();
+        assert!(
+            (14..=16).contains(&shown_age),
+            "40 s silent less the 25 s credit reads ~15 s, got {shown_age}"
+        );
     }
 
     #[test]
     fn credit_outage_is_not_a_visible_change() {
-        let reg = WorktreesRegistry::new();
-        insert_aged(&reg, "w", 10);
+        let reg = registry_with_headroom();
+        insert_silent(&reg, "w", Duration::from_secs(10));
         let rx = reg.subscribe_changes();
         reg.credit_outage(Duration::from_secs(5));
         assert!(
@@ -978,33 +1031,34 @@ mod tests {
         );
     }
 
-    /// A minimal entry for cap/eviction tests; only `key` and `last_seen`
-    /// participate in eviction order.
-    fn entry_at(key: &str, last_seen: DateTime<Utc>) -> WindowEntry {
+    /// A minimal entry for reap/cap/eviction tests; only `key` and `last_active`
+    /// participate in liveness and eviction order.
+    fn entry_at(key: &str, last_active: Duration) -> WindowEntry {
         WindowEntry {
             key: key.to_string(),
             folders: vec![],
             repo: None,
             title: None,
             pid: None,
-            last_seen,
+            last_seen: Utc::now(),
+            last_active,
         }
     }
 
     #[test]
     fn evict_oldest_removes_oldest_with_key_tiebreak() {
-        let now = Utc::now();
+        let now = Duration::from_secs(1000);
         let mut windows = HashMap::new();
         windows.insert("young".to_string(), entry_at("young", now));
         windows.insert(
             "old-b".to_string(),
-            entry_at("old-b", now - chrono::Duration::seconds(10)),
+            entry_at("old-b", now.saturating_sub(Duration::from_secs(10))),
         );
         windows.insert(
             "old-a".to_string(),
-            entry_at("old-a", now - chrono::Duration::seconds(10)),
+            entry_at("old-a", now.saturating_sub(Duration::from_secs(10))),
         );
-        // Oldest `last_seen` is shared by two entries; the lowest key loses.
+        // Oldest `last_active` is shared by two entries; the lowest key loses.
         evict_oldest(&mut windows);
         assert!(!windows.contains_key("old-a"));
         assert!(windows.contains_key("old-b"));
@@ -1019,16 +1073,16 @@ mod tests {
     fn register_at_cap_evicts_only_the_oldest() {
         let reg = WorktreesRegistry::new();
         // Seed a full registry directly (registering 256 times would work too,
-        // but sub-second timestamps may tie; explicit timestamps make the
+        // but sub-millisecond stamps may tie; explicit stamps make the
         // highest-numbered key unambiguously the oldest).
         {
             let mut windows = reg.lock();
-            let base = Utc::now();
+            let base = Duration::from_secs(1000);
             for i in 0..MAX_WINDOWS {
                 let key = format!("w{i:03}");
                 windows.insert(
                     key.clone(),
-                    entry_at(&key, base - chrono::Duration::milliseconds(i as i64)),
+                    entry_at(&key, base.saturating_sub(Duration::from_millis(i as u64))),
                 );
             }
         }
@@ -1046,12 +1100,12 @@ mod tests {
         let reg = WorktreesRegistry::new();
         {
             let mut windows = reg.lock();
-            let base = Utc::now();
+            let base = Duration::from_secs(1000);
             for i in 0..MAX_WINDOWS {
                 let key = format!("w{i:03}");
                 windows.insert(
                     key.clone(),
-                    entry_at(&key, base - chrono::Duration::milliseconds(i as i64)),
+                    entry_at(&key, base.saturating_sub(Duration::from_millis(i as u64))),
                 );
             }
         }
@@ -1067,18 +1121,13 @@ mod tests {
 
     #[test]
     fn sorted_entries_orders_by_repo_then_key() {
-        let now = Utc::now();
         let mut windows = HashMap::new();
         for (key, repo) in [("z", "repo-a"), ("a", "repo-b"), ("m", "repo-a")] {
             windows.insert(
                 key.to_string(),
                 WindowEntry {
-                    key: key.to_string(),
-                    folders: vec![],
                     repo: Some(repo.to_string()),
-                    title: None,
-                    pid: None,
-                    last_seen: now,
+                    ..entry_at(key, Duration::ZERO)
                 },
             );
         }
@@ -1158,25 +1207,176 @@ mod tests {
 
     #[test]
     fn heartbeat_bumps_only_when_it_reaps() {
-        let reg = WorktreesRegistry::new();
+        let reg = registry_with_headroom();
         reg.register(register_request("w1", None, "/tmp/a"));
         let rx = reg.subscribe_changes();
         // A plain heartbeat refreshes liveness but changes no visible state.
         assert!(reg.heartbeat("w1"));
         assert!(!rx.has_changed().unwrap(), "a pure heartbeat must not bump");
         // Seed a stale sibling directly; a heartbeat that reaps it *does* bump.
-        {
-            let mut windows = reg.lock();
-            windows.insert(
-                "stale".to_string(),
-                entry_at("stale", Utc::now() - chrono::Duration::seconds(120)),
-            );
-        }
+        insert_silent(&reg, "stale", Duration::from_secs(120));
         assert!(reg.heartbeat("w1"));
         assert!(
             rx.has_changed().unwrap(),
             "a heartbeat that reaps a stale sibling should bump"
         );
+    }
+
+    // --- Sleep-safe TTL (#2126) --------------------------------------------
+
+    /// A hair under the window TTL, still inside it.
+    fn just_inside_the_ttl() -> Duration {
+        DEFAULT_TTL.checked_sub(Duration::from_secs(1)).unwrap()
+    }
+
+    /// Moves every wall-clock stamp back by `by`, as a laptop sleeping that long
+    /// would, without any awake time passing.
+    fn jump_wall_clock_forward(reg: &WorktreesRegistry, by: ChronoDuration) {
+        for entry in reg.lock().values_mut() {
+            entry.last_seen -= by;
+        }
+    }
+
+    #[test]
+    fn a_wall_clock_jump_with_no_awake_time_reaps_nothing() {
+        // The #2108 regression, for windows: the first read after a sleep longer
+        // than the TTL used to reap every window, emptying the tree and the tray
+        // until each one re-registered off its next heartbeat.
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", Some("repo-a"), "/tmp/a"));
+        reg.register(register_request("w2", Some("repo-b"), "/tmp/b"));
+        reg.register(register_request("w3", None, "/tmp/c"));
+
+        jump_wall_clock_forward(&reg, ChronoDuration::days(3));
+
+        // Every reading path, and the mutating one that reaps first.
+        assert_eq!(reg.list().len(), 3, "list");
+        assert_eq!(reg.open_folders().len(), 3, "open_folders");
+        assert!(
+            reg.heartbeat("w1"),
+            "a heartbeat after the wake-up is known"
+        );
+        assert!(reg.unregister("w3"));
+        assert_eq!(reg.list().len(), 2, "unregister reaped nothing else");
+        // Display still reads the wall clock: the stale `last_seen` is shown.
+        assert!(reg.list()[1].last_seen < Utc::now() - ChronoDuration::days(2));
+    }
+
+    #[test]
+    fn a_wall_clock_jump_does_not_bump_the_change_notify() {
+        // Nothing was reaped, so nothing visible changed.
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", None, "/tmp/a"));
+        let rx = reg.subscribe_changes();
+        jump_wall_clock_forward(&reg, ChronoDuration::hours(8));
+        assert!(reg.heartbeat("w1"));
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn awake_time_past_the_ttl_still_reaps() {
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", None, "/tmp/a"));
+        reg.clock.advance(just_inside_the_ttl());
+        assert_eq!(reg.list().len(), 1, "inside the TTL it survives");
+        reg.clock.advance(Duration::from_secs(2));
+        assert!(
+            reg.list().is_empty(),
+            "past the TTL of awake silence it reaps"
+        );
+        // And the reaped window learns it must re-register.
+        assert!(!reg.heartbeat("w1"));
+    }
+
+    #[test]
+    fn a_heartbeat_restarts_the_awake_ttl() {
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", None, "/tmp/a"));
+        reg.clock.advance(just_inside_the_ttl());
+        assert!(reg.heartbeat("w1"));
+        reg.clock.advance(just_inside_the_ttl());
+        assert_eq!(reg.list().len(), 1, "the heartbeat restarted the clock");
+    }
+
+    #[test]
+    fn activity_after_a_sleep_restarts_the_awake_ttl() {
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", None, "/tmp/a"));
+        reg.clock.advance(just_inside_the_ttl());
+        jump_wall_clock_forward(&reg, ChronoDuration::hours(8));
+        // A heartbeat after the wake-up refreshes the awake stamp as well.
+        assert!(reg.heartbeat("w1"));
+        reg.clock.advance(just_inside_the_ttl());
+        assert_eq!(reg.list().len(), 1);
+    }
+
+    #[test]
+    fn re_registering_restarts_the_awake_ttl() {
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", None, "/tmp/a"));
+        reg.clock.advance(just_inside_the_ttl());
+        reg.register(register_request("w1", Some("repo"), "/tmp/a"));
+        reg.clock.advance(just_inside_the_ttl());
+        assert_eq!(reg.list().len(), 1);
+    }
+
+    #[test]
+    fn an_outage_credit_and_a_sleep_compose() {
+        // 20 s of awake silence, a sleep, then a 15 s accept outage: 20 s of
+        // the 35 s is real silence for every window the daemon could hear, so
+        // none is reaped. Without the credit the same awake time is past the TTL.
+        let control = WorktreesRegistry::new();
+        control.register(register_request("w", None, "/tmp/a"));
+        control.clock.advance(Duration::from_secs(35));
+        jump_wall_clock_forward(&control, ChronoDuration::hours(8));
+        assert!(control.list().is_empty(), "the control for the test");
+
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w", None, "/tmp/a"));
+        reg.clock.advance(Duration::from_secs(35));
+        jump_wall_clock_forward(&reg, ChronoDuration::hours(8));
+        reg.credit_outage(Duration::from_secs(15));
+        assert_eq!(reg.list().len(), 1);
+    }
+
+    #[test]
+    fn eviction_at_the_cap_goes_by_awake_silence_not_the_wall_clock() {
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("quiet", None, "/tmp/q"));
+        reg.clock.advance(Duration::from_secs(5));
+        for i in 0..MAX_WINDOWS - 1 {
+            reg.register(register_request(&format!("w{i:03}"), None, "/tmp/w"));
+        }
+        // Make the *newest* registrations look oldest by the wall clock; only the
+        // awake stamp may decide who is the longest-silent.
+        for entry in reg.lock().values_mut() {
+            if entry.key != "quiet" {
+                entry.last_seen -= ChronoDuration::days(1);
+            }
+        }
+        reg.register(register_request("fresh", None, "/tmp/f"));
+        let windows = reg.lock();
+        assert_eq!(windows.len(), MAX_WINDOWS);
+        assert!(!windows.contains_key("quiet"), "longest awake silence goes");
+        assert!(windows.contains_key("fresh"));
+    }
+
+    #[test]
+    fn a_pending_directive_survives_a_sleep_and_is_delivered() {
+        // Neither directive set is touched by a reap, and a sleep no longer
+        // reaps: the window is still known on its next heartbeat, so a close or
+        // reload signalled just before the lid shut is still taken, exactly once.
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", None, "/tmp/a"));
+        reg.mark_close_pending("w1");
+        reg.mark_reload_pending("w1");
+
+        jump_wall_clock_forward(&reg, ChronoDuration::hours(8));
+
+        assert!(reg.heartbeat("w1"), "the window is known after the wake-up");
+        assert!(reg.take_close_pending("w1"));
+        assert!(reg.take_reload_pending("w1"));
+        assert!(!reg.take_close_pending("w1"), "fires exactly once");
     }
 
     // --- Close-pending directive (#1277) -----------------------------------

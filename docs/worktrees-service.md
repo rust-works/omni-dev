@@ -82,11 +82,36 @@ VS Code window C ─┘                          │ (worktrees service)     ├
 
 ### Liveness
 
-Each entry carries a `last_seen` timestamp, refreshed by `register`/`heartbeat`.
-An entry is evicted once it has been silent longer than the **30 s TTL** (three
-missed ~10 s heartbeats). Reaping runs inline on every read — there is no
-background task — so a window that crashed without a clean `unregister`
-disappears the next time anything reads the registry.
+Each entry carries a `last_seen` timestamp, refreshed by `register`/`heartbeat`,
+and is evicted once it has been silent longer than the **30 s TTL** (three missed
+~10 s heartbeats). Reaping runs inline on every read — there is no background
+task — so a window that crashed without a clean `unregister` disappears the next
+time anything reads the registry.
+
+The TTL is measured in **awake time** (#2126). While the machine sleeps no window
+can heartbeat, so measuring against the wall clock made the first read after a
+wake-up find every window silent for longer than 30 s and reap the lot, leaving
+the tree and the tray submenu empty until each window re-registered off its next
+heartbeat. Each entry therefore carries, besides the wall-clock `last_seen` shown
+in `list`, a stamp from a monotonic clock that does not advance across system
+sleep (`Instant`: `CLOCK_UPTIME_RAW` on macOS, `CLOCK_MONOTONIC` on Linux), and the
+TTL and the cap's longest-silent eviction compare against that. `last_seen` is for
+display only and never decides liveness. A sleep of any length ages no window; a
+window that really is silent for 30 s of awake time is still reaped. The sessions
+registry shares the same clock (`crate::utils::awake_clock`), so its window-report
+TTL behaves the same way ([#2108](https://github.com/rust-works/omni-dev/issues/2108)).
+
+A reap does not clear a window's pending `close`/`reload` directive (only
+`unregister` does), and `heartbeat` hands over whichever are pending whether or not
+the key is `known`. So a directive for a window that goes quiet and comes back is
+delivered on the heartbeat that answers `{ known: false }`, not lost.
+
+The wall clock used to make this matter. A cross-window `close` waits for its
+target windows to unregister (`await_windows_closed`) and counts a reaped window as
+closed, so a sleep during that wait reaped every window, ended the wait, and let
+the worktree be removed while its window was still open. On the awake clock a
+sleep reaps nothing, and the wait ends only when each window has really gone or
+the 20 s wait gives up.
 
 Because the registry is in-memory, a window that was open *before* the daemon
 started, or that survives a daemon restart, will heartbeat against an empty map.
@@ -98,15 +123,16 @@ control socket's `accept` is failing — in practice descriptor exhaustion, `Too
 open files` — heartbeats cannot arrive, so a window's silence says nothing about
 whether it is alive. The server credits the time it spent failing to every service
 (`DaemonService::credit_accept_outage`), and the registry advances each live
-entry's `last_seen` by that long (never past now). Without it, the first heartbeat
-to land after an outage reaped every *other* window that had been quiet for more
-than 30 s — `heartbeat` reaps before it touches the sender — and whole repos
-vanished from the tree for a few seconds. The credit only touches entries still in
-the map: a window that was already reaped stays gone and re-registers through the
-`{ known: false }` path above. Every live entry is credited equally, since the daemon
-cannot tell which windows died during the outage; one that did is reaped a TTL after
-it ends. The sessions service's window reports (the `vscode`-vs-`terminal` source of a
-session) get the same credit.
+entry's awake stamp (and its display `last_seen`) by that long (never past now). The
+outage is measured in awake time too, so it composes with the sleep rule above.
+Without it, the first heartbeat to land after an outage reaped every *other* window
+that had been quiet for more than 30 s — `heartbeat` reaps before it touches the
+sender — and whole repos vanished from the tree for a few seconds. The credit only
+touches entries still in the map: a window that was already reaped stays gone and
+re-registers through the `{ known: false }` path above. Every live entry is credited
+equally, since the daemon cannot tell which windows died during the outage; one that
+did is reaped a TTL after it ends. The sessions service's window reports (the
+`vscode`-vs-`terminal` source of a session) get the same credit.
 
 The registry is also **capped at 256 windows** (#1140): where the TTL bounds how
 *stale* an entry can get, the cap bounds how *many* can exist, so a misbehaving
