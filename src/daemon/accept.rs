@@ -20,9 +20,10 @@ const INITIAL_DELAY: Duration = Duration::from_millis(5);
 /// the retry rate from unbounded to one per second.
 const MAX_DELAY: Duration = Duration::from_secs(1);
 
-/// The minimum gap between two warnings in one error burst. The first error of a
-/// burst is always logged; the rest are throttled so a sustained outage reads as
-/// a handful of lines instead of one per retry.
+/// The minimum gap between two warnings, across bursts as well as within one.
+/// Under load the daemon can flicker in and out of exhaustion many times a minute,
+/// and each flicker is a burst of its own; throttling by time rather than by burst
+/// keeps that to a line or two every half minute instead of a pair per flicker.
 const LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Where the server loop gets its connections from.
@@ -50,7 +51,7 @@ impl ConnectionSource for UnixListener {
 pub(crate) struct FailureStep {
     /// How long to wait before the next `accept`.
     pub delay: Duration,
-    /// Whether this failure should be logged.
+    /// Whether this failure should be logged: at most one per [`LOG_INTERVAL`].
     pub log: bool,
     /// How long the daemon has been unable to accept since the last time this was
     /// reported (zero on the burst's first failure). The loop credits it to the
@@ -68,12 +69,17 @@ pub(crate) struct Recovery {
     pub duration: Duration,
     /// The stretch since the last [`FailureStep::outage`] report.
     pub outage: Duration,
+    /// Whether a warning was logged during this burst, so that a recovery line
+    /// closes it out. A burst that logged nothing recovers silently.
+    pub announce: bool,
 }
 
 /// Paces `accept` retries and tracks one error burst at a time.
 #[derive(Debug, Default)]
 pub(crate) struct AcceptBackoff {
     burst: Option<Burst>,
+    /// When a warning was last logged. Outlives the burst: see [`LOG_INTERVAL`].
+    last_logged: Option<Instant>,
 }
 
 /// State for the burst in progress.
@@ -82,7 +88,8 @@ struct Burst {
     started: Instant,
     failures: u32,
     next_delay: Duration,
-    last_logged: Option<Instant>,
+    /// Whether this burst has logged a warning.
+    announced: bool,
     /// The instant up to which the outage has already been reported.
     reported_to: Instant,
 }
@@ -100,17 +107,18 @@ impl AcceptBackoff {
             started: now,
             failures: 0,
             next_delay: INITIAL_DELAY,
-            last_logged: None,
+            announced: false,
             reported_to: now,
         });
         burst.failures += 1;
         let delay = burst.next_delay;
         burst.next_delay = (delay * 2).min(MAX_DELAY);
-        let log = burst
+        let log = self
             .last_logged
             .is_none_or(|at| now.saturating_duration_since(at) >= LOG_INTERVAL);
         if log {
-            burst.last_logged = Some(now);
+            self.last_logged = Some(now);
+            burst.announced = true;
         }
         let outage = now.saturating_duration_since(burst.reported_to);
         burst.reported_to = now;
@@ -125,6 +133,7 @@ impl AcceptBackoff {
             failures: burst.failures,
             duration: now.saturating_duration_since(burst.started),
             outage: now.saturating_duration_since(burst.reported_to),
+            announce: burst.announced,
         })
     }
 }
@@ -179,7 +188,24 @@ mod tests {
         assert!(backoff.on_success(at(base, 100)).is_some());
         let step = backoff.on_failure(at(base, 200));
         assert_eq!(step.delay, INITIAL_DELAY);
-        assert!(step.log, "a new burst logs its first failure again");
+    }
+
+    /// Under load the daemon flickers in and out of exhaustion; the throttle must
+    /// span those short bursts, or each flicker logs a warning and a recovery.
+    #[test]
+    fn the_log_throttle_spans_bursts() {
+        let base = Instant::now();
+        let mut backoff = AcceptBackoff::new();
+        assert!(backoff.on_failure(at(base, 0)).log);
+        assert!(backoff.on_success(at(base, 10)).unwrap().announce);
+
+        // A second burst a moment later is silent, warning and recovery both.
+        assert!(!backoff.on_failure(at(base, 1_000)).log);
+        assert!(!backoff.on_success(at(base, 1_010)).unwrap().announce);
+
+        // Once the interval has passed, the next burst announces itself again.
+        assert!(backoff.on_failure(at(base, 30_000)).log);
+        assert!(backoff.on_success(at(base, 30_010)).unwrap().announce);
     }
 
     #[test]

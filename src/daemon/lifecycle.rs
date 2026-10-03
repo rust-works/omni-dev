@@ -44,7 +44,7 @@ pub fn raise_nofile_limit() {
         }
     };
     let Some(target) = nofile_target(soft, hard, NOFILE_CEILING) else {
-        tracing::debug!("open-file limit {soft} already at or above the ceiling; leaving it");
+        tracing::debug!("open-file limit {soft} (hard {hard}) needs no raising; leaving it");
         return;
     };
     match setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
