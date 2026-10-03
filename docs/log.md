@@ -544,6 +544,18 @@ to its own log (`daemon.log` / the journal) ~5 seconds after startup, every 10
 minutes, and once on shutdown — a periodic, restart-delimited footprint without
 anyone running a command; `daemon status` surfaces the current count too.
 
+Those daemon figures count calls **since the daemon started**. It reads no part of
+the log that was already there when it started, and each summary reads only the
+records appended since the previous one, so what a summary costs does not grow with
+the size of the log — a multi-gigabyte `log.jsonl` no longer delays startup,
+`daemon status` or shutdown. If the log is replaced or truncated underneath it
+(`log prune`, size-capped rotation), the daemon rebuilds its count once from what
+the live file holds, which is what `omni-dev log count --kind gh --since <daemon
+start>` reports at that point, so records rotated into `log.jsonl.1` stop being
+counted. A summary that shutdown cut short, or that could not read the log, is
+marked `incomplete`: in the summary line, and as `"incomplete": true` in the
+`summary` op's reply.
+
 **Not yet counted:** the VS Code companion extension's `gh pr list` runs in a
 separate process and does not write to the log (a planned follow-up).
 

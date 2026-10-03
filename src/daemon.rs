@@ -189,9 +189,11 @@ pub async fn build_default_registry(
         registry.register(Arc::new(sessions));
     }
     // Periodically log a summary of the GitHub API-call counters (#1387): once
-    // ~5s after boot, every 10 minutes, and once on shutdown. Best-effort and
-    // bounded (a small local log read, no network); never blocks shutdown. Not one
-    // of the selectable services (#1318) — a daemon-wide observability concern that
+    // ~5s after boot, every 10 minutes, and once on shutdown. Best-effort, no
+    // network: each summary reads only the request-log records appended since the
+    // previous one, so it stays cheap however large the log has grown, and the
+    // final one is cut short rather than hold up shutdown (#2132). Not one of the
+    // selectable services (#1318) — a daemon-wide observability concern that
     // stays on for any subset.
     let github_counters = GithubCountersService::new();
     github_counters.start_counter_logger();
