@@ -687,10 +687,13 @@ fn open_questions_answer(answers: &BTreeMap<String, Answer>) -> Result<OpenQuest
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum RouteOutcome {
-    /// Jev answered every stage for every ladder and the issue-level question.
+    /// Jev answered every stage for every ladder.
     Routed {
         /// Independent issue-level question kind; never changes the class.
-        open_questions: OpenQuestions,
+        /// Absent when Jev returned no usable answer to this experimental
+        /// question: it is advisory, so that never fails the routing.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        open_questions: Option<OpenQuestions>,
         /// Each requested ladder's routing, keyed by provider name.
         providers: BTreeMap<String, ProviderRoute>,
         /// Open issues/PRs this issue's text cites (#1812). About the issue,
@@ -779,7 +782,8 @@ pub struct RouteOptions {
 /// Every ladder in `ladders` is routed in that same call: Jev takes a map of
 /// questions over one state, so the three stage questions are keyed per
 /// provider and share the issue text (#1820). One independent `open_questions`
-/// choice is shared across all providers and never changes class derivation.
+/// choice is shared across all providers. It never changes class derivation, and
+/// an unusable answer to it is dropped with a warning rather than failing the issue.
 ///
 /// Refuses closed issues unless [`RouteOptions::allow_closed`]: their comments
 /// often describe how the work was actually done, which leaks the answer.
@@ -885,18 +889,25 @@ pub async fn run_route_with_reference_fetch_failures(
                 models.insert(response.model);
                 usage.input_tokens += response.usage.input_tokens;
                 usage.output_tokens += response.usage.output_tokens;
-                match open_questions_answer(&response.answers).and_then(|open_questions| {
-                    provider_routes(
-                        &response.answers,
-                        ladders,
-                        opts.close_call,
-                        opts.close_call_margin,
-                        opts.effort_advice,
-                    )
-                    .map(|providers| (open_questions, providers))
-                }) {
-                    Ok((open_questions, providers)) => RouteOutcome::Routed {
-                        open_questions,
+                match provider_routes(
+                    &response.answers,
+                    ladders,
+                    opts.close_call,
+                    opts.close_call_margin,
+                    opts.effort_advice,
+                ) {
+                    Ok(providers) => RouteOutcome::Routed {
+                        // Experimental and advisory (held-out agreement is no better
+                        // than always answering `factual`): losing it must not discard
+                        // the validated stage answers Jev gave in the same response.
+                        open_questions: open_questions_answer(&response.answers)
+                            .map_err(|err| {
+                                warn!(
+                                    "Ignoring open_questions for {item_ref}: {err:#}; \
+                                     routing is unaffected"
+                                );
+                            })
+                            .ok(),
                         providers,
                         depends_on: dependency_entries(
                             &item_ref,
@@ -1467,11 +1478,13 @@ fn render_issue_block(
             reference_fetch_failures,
             open_questions,
         } => {
-            lines.push(format!(
-                "  open_questions: {} ({:.2})",
-                open_questions.choice.label(),
-                open_questions.confidence
-            ));
+            if let Some(open_questions) = open_questions {
+                lines.push(format!(
+                    "  open_questions: {} ({:.2})",
+                    open_questions.choice.label(),
+                    open_questions.confidence
+                ));
+            }
             for (provider, route) in providers {
                 let ladder = ladders.iter().find(|ladder| ladder.name == *provider);
                 lines.extend(render_provider_line(
@@ -2432,7 +2445,7 @@ mod tests {
         for outcome in [
             issue.outcome.clone(),
             RouteOutcome::Routed {
-                open_questions: test_open_questions(),
+                open_questions: Some(test_open_questions()),
                 providers: BTreeMap::new(),
                 depends_on: vec![],
                 reference_fetch_failures: vec![],
@@ -3236,7 +3249,7 @@ mod tests {
                 state: ItemState::Open,
                 truncated: false,
                 outcome: RouteOutcome::Routed {
-                    open_questions: answer,
+                    open_questions: Some(answer),
                     providers: routes,
                     depends_on: vec![],
                     reference_fetch_failures: vec![],
@@ -3285,16 +3298,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_open_questions_fails_one_issue_and_batch_continues() {
+    async fn unusable_open_questions_never_fail_routing() {
         let server = wiremock::MockServer::start().await;
-        for number in [7, 8] {
+        for number in [7, 8, 9] {
             let mut answers = serde_json::json!({
                 "anthropic.stage_design": choice_json("none", 0.9),
                 "anthropic.stage_implement": choice_json("sonnet", 0.9),
                 "anthropic.stage_review": choice_json("opus", 0.9),
             });
-            if number == 8 {
-                answers["open_questions"] = choice_json("both", 0.7);
+            match number {
+                // 7 omits the answer; 9 returns a label that was never offered.
+                8 => answers["open_questions"] = choice_json("both", 0.7),
+                9 => answers["open_questions"] = choice_json("maybe", 0.7),
+                _ => {}
             }
             wiremock::Mock::given(wiremock::matchers::body_partial_json(serde_json::json!({"state": format!("# #{number} Route issues\n\nThe body.\n")})))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"model": "jev-test", "answers": answers, "usage": {"input_tokens": 10, "output_tokens": 5}})))
@@ -3303,19 +3319,34 @@ mod tests {
         let client = JevClient::new(&server.uri(), "key").unwrap();
         let report = run_route(
             &client,
-            &[doc(7, ItemState::Open), doc(8, ItemState::Open)],
+            &[
+                doc(7, ItemState::Open),
+                doc(8, ItemState::Open),
+                doc(9, ItemState::Open),
+            ],
             &anthropic(),
             &opts(),
             &OpenDependencies::new(),
         )
         .await
         .unwrap();
-        assert!(report.issues[0].failed());
-        assert!(!report.issues[1].failed());
-        assert_eq!(report.usage.input_tokens, 20);
+        assert!(report.issues.iter().all(|issue| !issue.failed()));
+        assert_eq!(report.usage.input_tokens, 30);
         let json = serde_json::to_value(&report).unwrap();
-        assert!(json["issues"][0].get("open_questions").is_none());
+        for index in [0, 2] {
+            let issue = &json["issues"][index];
+            assert!(issue.get("open_questions").is_none(), "{issue}");
+            assert_eq!(issue["providers"]["anthropic"]["class"], "sonnet");
+            assert!(issue.get("error").is_none(), "{issue}");
+            let text =
+                render_issue_block(&report.issues[index], 1000, &[], TerminalStyle::default());
+            assert!(!text.contains("open_questions"), "{text}");
+        }
         assert_eq!(json["issues"][1]["open_questions"]["choice"], "both");
+        assert_eq!(
+            json["issues"][1]["providers"]["anthropic"]["class"],
+            "sonnet"
+        );
     }
 
     fn test_open_questions() -> OpenQuestions {
@@ -3876,7 +3907,7 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
                         ProviderRoute {
@@ -3941,7 +3972,7 @@ mod tests {
                 title: "Some issue title".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
                         ProviderRoute {
@@ -3995,7 +4026,7 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
                         ProviderRoute {
@@ -4083,7 +4114,7 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([
                         ("anthropic".to_string(), route("sonnet")),
                         ("openai".to_string(), route("terra")),
@@ -4198,7 +4229,7 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
                         ProviderRoute {
@@ -4234,7 +4265,7 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
                         ProviderRoute {
@@ -4272,7 +4303,7 @@ mod tests {
             title: "t".to_string(),
             state: ItemState::Open,
             outcome: RouteOutcome::Routed {
-                open_questions: test_open_questions(),
+                open_questions: Some(test_open_questions()),
                 providers: BTreeMap::from([(
                     "anthropic".to_string(),
                     ProviderRoute {
@@ -4313,7 +4344,7 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
                         ProviderRoute {
@@ -4350,7 +4381,7 @@ mod tests {
                 title: "feat(drive): banded ranges for drive sheets (#1830)".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
                         ProviderRoute {
@@ -4407,7 +4438,7 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
                         ProviderRoute {
@@ -4459,7 +4490,7 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([
                         ("anthropic".to_string(), route("a,b")),
                         ("openai".to_string(), route("c,d")),
@@ -4515,7 +4546,7 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([
                         ("anthropic".to_string(), multi_route),
                         ("openai".to_string(), compact_route),
@@ -4554,7 +4585,7 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
                         ProviderRoute {
@@ -4742,7 +4773,7 @@ mod tests {
             title: "t".to_string(),
             state: ItemState::Open,
             outcome: RouteOutcome::Routed {
-                open_questions: test_open_questions(),
+                open_questions: Some(test_open_questions()),
                 providers: BTreeMap::from([(
                     "anthropic".to_string(),
                     ProviderRoute {
@@ -4840,7 +4871,7 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([(
                         "custom".to_string(),
                         ProviderRoute {
@@ -4890,7 +4921,7 @@ mod tests {
                 title: "t".to_string(),
                 state: ItemState::Open,
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([
                         (
                             "anthropic".to_string(),
@@ -4959,7 +4990,7 @@ mod tests {
         let report = RouteReport {
             issues: vec![IssueRoute {
                 outcome: RouteOutcome::Routed {
-                    open_questions: test_open_questions(),
+                    open_questions: Some(test_open_questions()),
                     providers: BTreeMap::from([(
                         "anthropic".to_string(),
                         ProviderRoute {
