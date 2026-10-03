@@ -185,6 +185,13 @@ pub struct AheadBehindEntryWire {
     pub behind: Option<usize>,
     #[serde(default)]
     pub main_behind: Option<usize>,
+    /// The worktree's repository is a shallow clone (#2120), so these counts
+    /// depend on how deep it currently is rather than on commit ids alone:
+    /// deepening it changes them without moving any id a client keys on. Such a row
+    /// is shown but must not be held as settled. Absent from a complete clone and
+    /// from an older daemon, which reads as `false`.
+    #[serde(default)]
+    pub shallow: bool,
 }
 
 /// The `close` op's phase-1 safety report (`{ path, remove: true }`,
@@ -424,6 +431,21 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "main_repo": "repo", "root": "/repo" }))
                 .unwrap();
         assert!(without.main_sha.is_none());
+    }
+
+    #[test]
+    fn ahead_behind_entry_wire_reads_the_shallow_flag_and_defaults_it_to_false() {
+        // The daemon marks a row from a shallow clone `shallow: true` (#2120) and
+        // omits the key for a complete one, as an older daemon always does.
+        let shallow: AheadBehindEntryWire = serde_json::from_value(serde_json::json!({
+            "ahead": 1, "behind": 0, "shallow": true,
+        }))
+        .unwrap();
+        assert!(shallow.shallow);
+        assert_eq!((shallow.ahead, shallow.behind), (Some(1), Some(0)));
+        let complete: AheadBehindEntryWire =
+            serde_json::from_value(serde_json::json!({ "ahead": 1, "behind": 0 })).unwrap();
+        assert!(!complete.shallow);
     }
 
     #[test]
