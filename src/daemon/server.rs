@@ -210,6 +210,9 @@ async fn accept_loop<S: ConnectionSource>(
                             "daemon accept error: {e} (backing off; further errors are not logged for 30s)"
                         );
                     }
+                    // Finished handlers give their descriptor back when their task
+                    // completes, not when `join_next` reaps it, so not reaping
+                    // during this pause costs bookkeeping only.
                     tokio::select! {
                         () = shutdown.cancelled() => break,
                         () = tokio::time::sleep(step.delay) => {}
@@ -1117,7 +1120,7 @@ mod tests {
             server,
             worktrees_registry(),
             CancellationToken::new(),
-            Duration::from_millis(300),
+            Duration::from_millis(600),
         ));
         let (read_half, mut write_half) = client.into_split();
         let mut reader = BufReader::new(read_half);
@@ -1125,8 +1128,8 @@ mod tests {
         for _ in 0..3 {
             write_half.write_all(ping_line()).await.unwrap();
             assert!(read_reply(&mut reader).await.ok);
-            // Each pause is inside the window; together they exceed it.
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            // Each pause is well inside the window; together they exceed it.
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
         assert!(
             !task.is_finished(),
@@ -1383,7 +1386,9 @@ mod tests {
         // sleep never ends early.
         let total: Duration = credited.iter().sum();
         assert!(total >= Duration::from_millis(35), "credited {total:?}");
-        assert!(total < Duration::from_secs(2), "credited {total:?}");
+        // A sanity ceiling only: the credits are wall time, so a loaded machine can
+        // stretch them, but they cannot be an order of magnitude longer.
+        assert!(total < Duration::from_secs(30), "credited {total:?}");
     }
 
     /// A stop request during a long backoff sleep ends the loop at once, rather
@@ -1398,8 +1403,10 @@ mod tests {
 
         let stopper = shutdown.clone();
         let stop_later = async move {
-            // By now the delay has grown well past this, so the loop is asleep.
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Eight failures take 5+10+…+640 = 1275ms; the ninth sleeps the full
+            // 1s ceiling from there until 2275ms, so at 1400ms the loop is
+            // mid-sleep with most of that second still to go.
+            tokio::time::sleep(Duration::from_millis(1400)).await;
             stopper.cancel();
         };
         let started = Instant::now();
@@ -1411,8 +1418,10 @@ mod tests {
         })
         .await
         .expect("shutdown must interrupt the backoff sleep");
+        // Interrupted, the loop ends right after the 1400ms stop; waiting the sleep
+        // out would take until 2275ms.
         assert!(
-            started.elapsed() < Duration::from_millis(900),
+            started.elapsed() < Duration::from_millis(1900),
             "shutdown waited out a backoff sleep: {:?}",
             started.elapsed()
         );

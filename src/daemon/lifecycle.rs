@@ -14,20 +14,31 @@ use tokio_util::sync::CancellationToken;
 /// wrong.
 const NOFILE_CEILING: nix::libc::rlim_t = 4096;
 
-/// The soft `RLIMIT_NOFILE` to raise to, or `None` when it should be left alone.
+/// Smaller soft limits to fall back to when the first choice is refused.
+const NOFILE_FALLBACKS: [nix::libc::rlim_t; 3] = [2048, 1024, 512];
+
+/// The soft `RLIMIT_NOFILE` values to try raising to, best first; empty when the
+/// limit should be left alone.
 ///
-/// Aims for the lower of the hard limit and `ceiling`. A soft limit already at or
-/// above that is never lowered — an operator who set a higher one meant it.
-fn nofile_target(
+/// Aims for the lower of the hard limit and `ceiling`, then the
+/// [`NOFILE_FALLBACKS`] below it — some hosts cap the soft limit under the hard one
+/// (macOS's `kern.maxfilesperproc`), and a partial raise still beats none. A soft
+/// limit already at or above a candidate never gets it, so nothing is ever lowered:
+/// an operator who set a higher one meant it.
+fn nofile_candidates(
     soft: nix::libc::rlim_t,
     hard: nix::libc::rlim_t,
     ceiling: nix::libc::rlim_t,
-) -> Option<nix::libc::rlim_t> {
-    let target = hard.min(ceiling);
-    (target > soft).then_some(target)
+) -> Vec<nix::libc::rlim_t> {
+    let top = hard.min(ceiling);
+    let mut candidates = vec![top];
+    candidates.extend(NOFILE_FALLBACKS.iter().copied().filter(|&c| c < top));
+    candidates.retain(|&c| c > soft);
+    candidates
 }
 
-/// Raises the soft `RLIMIT_NOFILE` toward the hard limit, up to [`NOFILE_CEILING`].
+/// Raises the soft `RLIMIT_NOFILE` toward the hard limit, up to `NOFILE_CEILING`
+/// (4096), settling for a smaller value if the host refuses that one.
 ///
 /// launchd starts the daemon with macOS's default soft limit of 256, which a busy
 /// day of open windows and in-flight requests crosses — and once `accept` fails
@@ -43,15 +54,25 @@ pub fn raise_nofile_limit() {
             return;
         }
     };
-    let Some(target) = nofile_target(soft, hard, NOFILE_CEILING) else {
+    let candidates = nofile_candidates(soft, hard, NOFILE_CEILING);
+    if candidates.is_empty() {
         tracing::debug!("open-file limit {soft} (hard {hard}) needs no raising; leaving it");
         return;
-    };
-    match setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
-        Ok(()) => tracing::info!("raised the open-file limit from {soft} to {target}"),
-        Err(e) => {
-            tracing::warn!("could not raise the open-file limit from {soft} to {target}: {e}");
+    }
+    let mut last_error = None;
+    for target in candidates {
+        match setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
+            Ok(()) => {
+                tracing::info!("raised the open-file limit from {soft} to {target}");
+                return;
+            }
+            Err(e) => last_error = Some((target, e)),
         }
+    }
+    if let Some((target, e)) = last_error {
+        tracing::warn!(
+            "could not raise the open-file limit from {soft} (last tried {target}): {e}"
+        );
     }
 }
 
@@ -114,25 +135,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nofile_target_raises_a_low_soft_limit_to_the_ceiling() {
+    fn candidates_lead_with_the_ceiling_then_fall_back_to_smaller_values() {
         // macOS under launchd: soft 256, hard unlimited.
         assert_eq!(
-            nofile_target(256, nix::libc::RLIM_INFINITY, 4096),
-            Some(4096)
+            nofile_candidates(256, nix::libc::RLIM_INFINITY, 4096),
+            vec![4096, 2048, 1024, 512]
         );
     }
 
     #[test]
-    fn nofile_target_never_exceeds_the_hard_limit() {
-        assert_eq!(nofile_target(256, 1024, 4096), Some(1024));
+    fn candidates_never_exceed_the_hard_limit() {
+        assert_eq!(nofile_candidates(256, 1024, 4096), vec![1024, 512]);
+        assert_eq!(nofile_candidates(256, 300, 4096), vec![300]);
     }
 
     #[test]
-    fn nofile_target_never_lowers_or_rewrites_an_adequate_limit() {
-        assert_eq!(nofile_target(4096, nix::libc::RLIM_INFINITY, 4096), None);
-        assert_eq!(nofile_target(65536, nix::libc::RLIM_INFINITY, 4096), None);
+    fn candidates_never_lower_or_rewrite_an_adequate_limit() {
+        assert!(nofile_candidates(4096, nix::libc::RLIM_INFINITY, 4096).is_empty());
+        assert!(nofile_candidates(65536, nix::libc::RLIM_INFINITY, 4096).is_empty());
         // Already at the hard limit: nothing to gain.
-        assert_eq!(nofile_target(1024, 1024, 4096), None);
+        assert!(nofile_candidates(1024, 1024, 4096).is_empty());
+    }
+
+    #[test]
+    fn candidates_skip_values_at_or_below_the_current_soft_limit() {
+        assert_eq!(
+            nofile_candidates(1500, nix::libc::RLIM_INFINITY, 4096),
+            vec![4096, 2048]
+        );
     }
 
     #[test]
