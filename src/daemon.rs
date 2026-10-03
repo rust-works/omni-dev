@@ -24,6 +24,8 @@
 pub mod paths;
 
 #[cfg(unix)]
+pub(crate) mod accept;
+#[cfg(unix)]
 pub mod client;
 #[cfg(unix)]
 pub mod lifecycle;
