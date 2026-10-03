@@ -284,10 +284,20 @@ fn feed_status<T>(frame: &FeedFrame<T>) -> FeedStatus {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use serde_json::json;
+
     use super::super::wire::{TreeRepoWire, TreeWorktreeWire};
     use super::*;
+    use crate::daemon::testutil::fake_daemon_replies;
 
     fn test_hub() -> (Hub, watch::Sender<FeedFrame<TreeSnapshotWire>>) {
+        test_hub_on("/tmp/nonexistent-omni-dev-hub-test.sock")
+    }
+
+    /// A hub whose ahead/behind fetches go to `socket`.
+    fn test_hub_on(
+        socket: impl Into<PathBuf>,
+    ) -> (Hub, watch::Sender<FeedFrame<TreeSnapshotWire>>) {
         let (tree_tx, tree_rx) = watch::channel(FeedFrame::Connecting);
         let (_sessions_tx, sessions_rx) = watch::channel(FeedFrame::Connecting);
         let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -295,9 +305,7 @@ mod tests {
         let hub = Hub {
             tree_rx,
             sessions_rx,
-            ahead_behind: AheadBehindCache::new(WorktreesClient::new(
-                "/tmp/nonexistent-omni-dev-hub-test.sock",
-            )),
+            ahead_behind: AheadBehindCache::new(WorktreesClient::new(socket)),
             row_colors: RowColorStore::default(),
             open_tabs: OpenTabs::default(),
             cmd_rx,
@@ -391,12 +399,19 @@ mod tests {
         );
     }
 
-    /// Lets the one in-flight fetch (to an unreachable socket) settle, so the
-    /// cache holds an entry rather than a pending marker.
+    /// Lets the one in-flight fetch settle, so the cache holds an entry (or
+    /// nothing, if the fetch failed) rather than a pending marker.
     async fn settle(hub: &mut Hub) {
         tokio::time::timeout(Duration::from_secs(5), hub.ahead_behind.changed())
             .await
-            .expect("the fetch to an unreachable socket should fail promptly");
+            .expect("the in-flight fetch should land promptly");
+    }
+
+    /// A daemon reply carrying `ahead`/`behind` for `/repo/wt`.
+    fn counts_reply(ahead: usize, behind: usize) -> Value {
+        json!({ "ok": true, "payload": { "results": {
+            "/repo/wt": { "ahead": ahead, "behind": behind }
+        }}})
     }
 
     #[tokio::test]
@@ -406,8 +421,15 @@ mod tests {
         // what invalidates a cached entry (#2120). Without it the row kept the count
         // it was fetched with until a commit or a push happened to move another OID.
         use super::super::view_model::AheadBehindState;
-        let (mut hub, tree_tx) = test_hub();
+        let (_dir, sock, _server) =
+            fake_daemon_replies(vec![counts_reply(1, 0), counts_reply(1, 0)]);
+        let (mut hub, tree_tx) = test_hub_on(sock);
         let path = PathBuf::from("/repo/wt");
+        let known = AheadBehindState::Known {
+            ahead: 1,
+            behind: 0,
+            main_behind: None,
+        };
         let send = |main_sha: &str| {
             tree_tx
                 .send(FeedFrame::Live(snapshot_with_main_sha(
@@ -420,12 +442,12 @@ mod tests {
         send("m1");
         hub.on_tree_changed();
         settle(&mut hub).await;
-        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Unavailable);
+        assert_eq!(hub.ahead_behind.get(&path), known);
 
         // The same snapshot again drops nothing: an unchanged refresh stays free.
         send("m1");
         hub.on_tree_changed();
-        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Unavailable);
+        assert_eq!(hub.ahead_behind.get(&path), known);
 
         // Only the default branch's tip moved: the entry is dropped and re-asked.
         send("m2");
@@ -434,6 +456,49 @@ mod tests {
         assert_eq!(
             hub.last_seen_oids.get(&path),
             Some(&(Some("aaa".to_string()), None, Some("m2".to_string())))
+        );
+    }
+
+    #[tokio::test]
+    async fn on_tree_changed_re_asks_a_failed_fetch_on_the_next_frame_without_a_ref_moving() {
+        // A fetch that failed is not an answer (#2134): the row has to be asked
+        // again by the tree feed's next frame, with every OID unchanged, rather
+        // than staying blank until a commit, a push or a fetch happens to move one.
+        use super::super::view_model::AheadBehindState;
+        let (_dir, sock, _server) = fake_daemon_replies(vec![
+            json!({ "ok": false, "error": "busy" }),
+            counts_reply(2, 1),
+        ]);
+        let (mut hub, tree_tx) = test_hub_on(sock);
+        let path = PathBuf::from("/repo/wt");
+        let send = || {
+            tree_tx
+                .send(FeedFrame::Live(snapshot_with_main_sha(
+                    worktree("/repo/wt", Some("aaa")),
+                    Some("m1"),
+                )))
+                .unwrap();
+        };
+
+        send();
+        hub.on_tree_changed();
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Loading);
+        settle(&mut hub).await;
+        // Nothing is cached for the failure: not a count, and not `Unavailable`.
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Unknown);
+
+        // The daemon is back and the snapshot is byte-identical.
+        send();
+        hub.on_tree_changed();
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Loading);
+        settle(&mut hub).await;
+        assert_eq!(
+            hub.ahead_behind.get(&path),
+            AheadBehindState::Known {
+                ahead: 2,
+                behind: 1,
+                main_behind: None
+            }
         );
     }
 

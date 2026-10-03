@@ -101,7 +101,8 @@ pub struct WorktreeRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AheadBehindState {
-    /// Never asked for (not currently visible).
+    /// Nothing to show: never asked for (not currently visible), or the last
+    /// ask failed. A failure is not an answer, so it is asked again.
     Unknown,
     /// A fetch is in flight.
     Loading,
@@ -110,7 +111,8 @@ pub enum AheadBehindState {
         behind: usize,
         main_behind: Option<usize>,
     },
-    /// Asked for, and the daemon has nothing to report (no upstream).
+    /// Asked for, and the daemon *answered* that it has nothing to report (no
+    /// upstream). Settled until a ref moves, unlike [`Unknown`](Self::Unknown).
     Unavailable,
 }
 
