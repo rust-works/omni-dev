@@ -74,21 +74,24 @@ pub fn parse(content: &str) -> Result<CoverageReport> {
 /// file is consistent with itself; `llvm-cov` writes them from its own summary
 /// instead, which counts some lines more than once (#2131).
 ///
-/// A file with no executable lines is omitted: it has no coverage to report, and
-/// [`CoverageReport::retain_lines`] already treats one as absent.
+/// A file with no executable lines is written as an empty record (`LF:0`,
+/// `LH:0`), the way [`parse`] reads one: leaving it out would make the text read
+/// back as a different report, and a consumer that ranks a missing file against
+/// an empty one would answer differently.
 ///
 /// # Errors
 ///
-/// Fails when a path contains a line break, which lcov has no way to carry: the
-/// file would parse back as different records.
+/// Fails when a path has a line break or leading or trailing whitespace. lcov has
+/// no way to carry either — [`parse`] trims the `SF:` value and splits on lines —
+/// so the text would read back keyed under a different path.
 pub fn write(report: &CoverageReport) -> Result<String> {
     let mut out = String::new();
     for (path, file) in &report.files {
-        if file.total_lines() == 0 {
-            continue;
-        }
-        if path.contains(['\n', '\r']) {
-            bail!("cannot write {path:?} to lcov: the path contains a line break");
+        if path.contains(['\n', '\r']) || path.trim() != path {
+            bail!(
+                "cannot write {path:?} to lcov: a path with a line break or surrounding \
+                 whitespace would read back as a different path"
+            );
         }
         // Writing to a `String` cannot fail.
         let _ = writeln!(out, "TN:\nSF:{path}");
@@ -318,11 +321,14 @@ end_of_record
     }
 
     #[test]
-    fn write_omits_a_file_with_no_executable_lines() {
+    fn write_keeps_a_file_with_no_executable_lines_as_an_empty_record() {
         let report = report(&[("src/empty.rs", &[]), ("src/a.rs", &[(1, 0)])]);
         let text = write(&report).unwrap();
-        assert!(!text.contains("empty.rs"), "{text}");
-        assert!(text.contains("SF:src/a.rs"), "{text}");
+        assert!(
+            text.contains("SF:src/empty.rs\nLF:0\nLH:0\nend_of_record\n"),
+            "{text}"
+        );
+        assert_eq!(parse(&text).unwrap(), report);
     }
 
     #[test]
@@ -330,6 +336,7 @@ end_of_record
         let original = report(&[
             ("src/a.rs", &[(1, 0), (2, 7), (40, 1)]),
             ("/abs/b.rs", &[(3, 2)]),
+            ("src/empty.rs", &[]),
         ]);
         assert_eq!(parse(&write(&original).unwrap()).unwrap(), original);
     }
@@ -363,12 +370,20 @@ end_of_record
     }
 
     #[test]
-    fn write_rejects_a_path_with_a_line_break() {
-        for path in ["src/a\nSF:evil.rs", "src/a\rb.rs"] {
+    fn write_rejects_a_path_that_would_not_read_back() {
+        for path in [
+            "src/a\nSF:evil.rs",
+            "src/a\rb.rs",
+            " src/a.rs",
+            "src/a.rs\t",
+        ] {
             let message = write(&report(&[(path, &[(1, 1)])]))
                 .unwrap_err()
                 .to_string();
-            assert!(message.contains("line break"), "{message}");
+            assert!(
+                message.contains("read back as a different path"),
+                "{message}"
+            );
         }
     }
 }
