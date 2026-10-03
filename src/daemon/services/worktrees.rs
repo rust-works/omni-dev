@@ -1282,18 +1282,16 @@ impl WorktreesService {
             self_close,
             others.len(),
         );
-        for key in &others {
-            self.registry.mark_close_pending(key);
-        }
         if !others.is_empty() {
-            if let Err(err) = await_windows_closed(
-                &self.registry,
-                &req.path,
-                req.requester_key.as_deref(),
-                CLOSE_WAIT_TIMEOUT,
-                CLOSE_WAIT_POLL,
-            )
-            .await
+            if let Err(err) = self
+                .signal_and_await_close(
+                    &req.path,
+                    req.requester_key.as_deref(),
+                    &others,
+                    CLOSE_WAIT_TIMEOUT,
+                    CLOSE_WAIT_POLL,
+                )
+                .await
             {
                 log_close_abort(&req.path, &err);
                 return Err(err);
@@ -1325,6 +1323,51 @@ impl WorktreesService {
             log_window_closed(&req.path);
             Ok(json!({ "closed": true }))
         }
+    }
+
+    /// Signals each of `others` to close itself and waits for every window other
+    /// than `requester` that has `path` open to unregister.
+    ///
+    /// When the wait fails the directives are withdrawn before the error is
+    /// propagated (#2139). The caller is told "window(s) did not close in time"
+    /// and the worktree is left intact, so a window that was merely slow must not
+    /// then close itself on a later heartbeat, after the user was told the close
+    /// failed. Every key is withdrawn, including one for a window that has since
+    /// been reaped: it too would otherwise close itself if it came back.
+    ///
+    /// On success the directives are left alone. A window that unregistered
+    /// cleared its own, and one counted closed because it was *reaped* keeps its
+    /// key on purpose: the op is about to remove the worktree it had open (or was
+    /// asked to close that window), so a hung window that later returns should be
+    /// handed `close: true` on its `known: false` heartbeat rather than stay open
+    /// on a deleted folder.
+    ///
+    /// A directive the window already took cannot be recalled, so a window that
+    /// received `close: true` and is closing slowly still closes — that is the
+    /// action the user asked for. There is deliberately no drop guard: a
+    /// connection handler runs a one-reply op to completion (a client that
+    /// disconnects does not cancel it), so the only cancellation is a daemon
+    /// shutdown, which takes the in-memory set with it. `timeout`/`poll` are
+    /// parameters (as in [`await_windows_closed`]) so a test can drive the
+    /// timeout without a 20 s wait.
+    async fn signal_and_await_close(
+        &self,
+        path: &Path,
+        requester: Option<&str>,
+        others: &[String],
+        timeout: Duration,
+        poll: Duration,
+    ) -> Result<()> {
+        for key in others {
+            self.registry.mark_close_pending(key);
+        }
+        let waited = await_windows_closed(&self.registry, path, requester, timeout, poll).await;
+        if waited.is_err() {
+            for key in others {
+                self.registry.cancel_close_pending(key);
+            }
+        }
+        waited
     }
 
     /// Handles the `reload` op (#1417): signal each target window to reload
@@ -12254,6 +12297,180 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // --- A close's directives do not outlive it (#2139) --------------------
+
+    /// A service with window `key` registered on `folder`, plus the keys list
+    /// `signal_and_await_close` takes.
+    async fn service_with_window(key: &str, folder: &Path) -> (WorktreesService, Vec<String>) {
+        let svc = WorktreesService::new();
+        svc.handle("register", json!({ "key": key, "folders": [folder] }))
+            .await
+            .unwrap();
+        (svc, vec![key.to_string()])
+    }
+
+    /// What `key`'s next heartbeat reply carries.
+    async fn heartbeat_reply(svc: &WorktreesService, key: &str) -> Value {
+        svc.handle("heartbeat", json!({ "key": key }))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_close_leaves_no_directive_for_the_slow_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let (svc, others) = service_with_window("w2", dir.path()).await;
+
+        // The owning window never unregisters, so the wait gives up.
+        let err = svc
+            .signal_and_await_close(
+                dir.path(),
+                Some("w1"),
+                &others,
+                Duration::from_millis(150),
+                Duration::from_millis(25),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("w2"), "names the window: {err}");
+
+        // The user was told the close failed, so when the slow window finally
+        // heartbeats it must not be told to close itself.
+        assert_eq!(
+            heartbeat_reply(&svc, "w2").await,
+            json!({ "known": true }),
+            "a failed close must have no later side effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_close_leaves_a_reload_directive_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (svc, others) = service_with_window("w2", dir.path()).await;
+        // An unrelated reload signalled to the same window beforehand.
+        svc.registry.mark_reload_pending("w2");
+
+        svc.signal_and_await_close(
+            dir.path(),
+            Some("w1"),
+            &others,
+            Duration::from_millis(100),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            heartbeat_reply(&svc, "w2").await,
+            json!({ "known": true, "reload": true }),
+            "only the close directive is withdrawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_close_whose_window_is_reaped_still_closes_it_if_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (svc, others) = service_with_window("w2", dir.path()).await;
+        // The window goes silent past the TTL (in awake time), so `list()` reaps
+        // it and the wait counts it closed — the op then goes on to remove the
+        // worktree. A hung window that comes back must not be left open on a
+        // folder that is gone, so a successful close keeps its directive.
+        svc.registry.advance_clock(Duration::from_secs(3600));
+
+        svc.signal_and_await_close(
+            dir.path(),
+            Some("w1"),
+            &others,
+            Duration::from_secs(5),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            heartbeat_reply(&svc, "w2").await,
+            json!({ "known": false, "close": true }),
+            "it is told to close on the heartbeat that answers `known: false`"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_close_also_withdraws_the_directive_of_a_window_reaped_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (svc, _) = service_with_window("w2", dir.path()).await;
+        // `w2` ages out, then `w3` registers: the wait counts `w2` closed and
+        // times out on `w3`. Both were signalled, and the op failed, so neither
+        // may close itself later — including the reaped one if it returns.
+        svc.registry.advance_clock(Duration::from_secs(3600));
+        svc.handle("register", json!({ "key": "w3", "folders": [dir.path()] }))
+            .await
+            .unwrap();
+
+        let err = svc
+            .signal_and_await_close(
+                dir.path(),
+                Some("w1"),
+                &["w2".to_string(), "w3".to_string()],
+                Duration::from_millis(100),
+                Duration::from_millis(25),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("w3"),
+            "names the live window: {err}"
+        );
+
+        assert_eq!(heartbeat_reply(&svc, "w3").await, json!({ "known": true }));
+        assert_eq!(heartbeat_reply(&svc, "w2").await, json!({ "known": false }));
+    }
+
+    #[tokio::test]
+    async fn a_successful_close_still_signals_the_window_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = Arc::new(WorktreesService::new());
+        svc.handle("register", json!({ "key": "w2", "folders": [dir.path()] }))
+            .await
+            .unwrap();
+
+        let path = dir.path().to_path_buf();
+        let waiter = {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                svc.signal_and_await_close(
+                    &path,
+                    Some("w1"),
+                    &["w2".to_string()],
+                    Duration::from_secs(10),
+                    Duration::from_millis(10),
+                )
+                .await
+            })
+        };
+
+        // The window's heartbeat is handed the directive while the op waits, then
+        // it closes and unregisters.
+        let mut saw_close = false;
+        for _ in 0..400 {
+            if heartbeat_reply(&svc, "w2").await.get("close") == Some(&Value::Bool(true)) {
+                saw_close = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(saw_close, "w2 should have been told to close");
+        svc.handle("unregister", json!({ "key": "w2" }))
+            .await
+            .unwrap();
+
+        waiter.await.unwrap().unwrap();
+        // Delivered exactly once: nothing is left for a window that re-registers.
+        svc.handle("register", json!({ "key": "w2", "folders": [dir.path()] }))
+            .await
+            .unwrap();
+        assert_eq!(heartbeat_reply(&svc, "w2").await, json!({ "known": true }));
     }
 
     #[tokio::test]

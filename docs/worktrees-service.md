@@ -106,6 +106,20 @@ A reap does not clear a window's pending `close`/`reload` directive (only
 the key is `known`. So a directive for a window that goes quiet and comes back is
 delivered on the heartbeat that answers `{ known: false }`, not lost.
 
+That is deliberate. For `reload`, whose reply already told the caller the window was
+*signalled*, dropping the directive on a reap would silently lose a reload for a
+window that was only briefly unresponsive. For `close`, a window counted closed
+because it was reaped is one the op then removes the worktree from, and a hung
+window that comes back should be told to close rather than stay open on a deleted
+folder. The price is a UUID string left in the set by a window that was signalled
+and then died without unregistering — it takes a crash inside the signal-to-heartbeat
+gap, and the keys are per-`activate()`, so it is accepted rather than plumbed
+([#2139](https://github.com/rust-works/omni-dev/issues/2139)).
+
+The one place a directive is withdrawn is a `close` whose wait **fails**: it removes
+the directives it set, so a close the caller was told had failed has no later side
+effect. A successful close leaves its keys alone.
+
 The wall clock used to make this matter. A cross-window `close` waits for its
 target windows to unregister (`await_windows_closed`) and counts a reaped window as
 closed, so a sleep during that wait reaped every window, ended the wait, and let
@@ -1953,7 +1967,13 @@ Where:
   [Security](#security)). `requester_key` is the calling window's `key`, so a
   self-close (the requester owns the target) removes-then-replies and lets the
   extension close its own window, while a cross-window close signals the *other*
-  window(s) and waits for them to `unregister` first.
+  window(s) and waits for them to `unregister` first. The wait is bounded (20 s); if
+  a signalled window has not closed by then the op fails with `window(s) did not
+  close in time`, leaves the worktree intact, and **withdraws the close directives
+  it set** (#2139), so a window that was merely slow does not then close itself on a
+  later heartbeat after the caller was told the close failed. A directive the window
+  had already taken cannot be recalled: a window that received `close: true` and is
+  closing slowly still closes.
   Every close is **auditable** in `omni-dev daemon logs` (the journal on Linux,
   #1364): the handler emits INFO `tracing` lines for the phase-1 verdict (target,
   owning window key, open, `removable`/`is_main`, blocking risk kinds) and the
@@ -1993,7 +2013,9 @@ Where:
   They are set and consumed **independently**, so both can ride one reply; the
   companion checks `close` first, since closing subsumes reloading. A daemon restart
   drops any pending directive — the registry is in-memory — after which the user
-  simply retries.
+  simply retries. A `close` that gives up waiting withdraws the directives it set that
+  no window has taken yet (#2139), so a window that never heartbeated in time is not
+  told to close afterwards; one that already took `close: true` still closes.
 - A `tree` `repo` is
   `{ main_repo, github?, root, main_sha?, worktrees: [worktree, …] }`, where `github` is
   `{ owner, name }` present only when `origin` (or the first `github.com` remote)
