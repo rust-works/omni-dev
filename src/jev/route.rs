@@ -293,7 +293,11 @@ pub fn build_route_questions(ladders: &[Ladder]) -> Result<BTreeMap<String, Ques
     build_route_questions_for_mode(ladders, true)
 }
 
-fn build_route_questions_for_mode(
+/// [`build_route_questions`] with effort advice chosen explicitly: `route`
+/// calls this with `--effort-advice`, so `false` is its default request.
+///
+/// Public so an evaluation harness builds the same request `route` sends.
+pub fn build_route_questions_for_mode(
     ladders: &[Ladder],
     effort_advice: bool,
 ) -> Result<BTreeMap<String, Question>> {
@@ -1166,7 +1170,10 @@ fn close_calls(stages: &StageAnswers, tiers: &Tiers, threshold: f64, margin: f64
 }
 
 /// The request key for the `i`th open citation's `could_be_cheaper` question.
-fn could_be_cheaper_key(i: usize) -> String {
+///
+/// Public so an evaluation harness builds the same request `route` sends
+/// rather than a copy that can drift.
+pub fn could_be_cheaper_key(i: usize) -> String {
     format!("could_be_cheaper_{i}")
 }
 
