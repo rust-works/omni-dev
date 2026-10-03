@@ -52,6 +52,26 @@ pub struct Inputs {
     pub main_sha: Option<String>,
 }
 
+impl Inputs {
+    /// Whether the daemon must have counts for these inputs when its computation
+    /// succeeds, so that an *omitted* row means the computation failed (#2143).
+    ///
+    /// The daemon omits a row both when nothing resolves for the worktree (no
+    /// branch, or no upstream and no default branch) and when the computation for
+    /// that one worktree failed — a repository it could not open, a walk that
+    /// errored (`ahead_behind_results` degrades the second to the first). The
+    /// snapshot says which it must have been: a branch whose `upstream_sha`, or
+    /// whose repo's `main_sha`, is present always yields counts when it succeeds. A
+    /// detached or unborn HEAD has no `branch`, so it is never expected to.
+    ///
+    /// This is the extension's rule (`isMemoizable`'s empty-row clause). Against an
+    /// older daemon that omits `upstream_sha` or `main_sha` it expects less, which
+    /// reads a failure as settled — the behaviour before this was checked at all.
+    fn expects_a_row(&self) -> bool {
+        self.branch.is_some() && (self.upstream_sha.is_some() || self.main_sha.is_some())
+    }
+}
+
 /// The inputs of a path the tree has not reported (yet).
 static NO_INPUTS: Inputs = Inputs {
     branch: None,
@@ -60,11 +80,37 @@ static NO_INPUTS: Inputs = Inputs {
     main_sha: None,
 };
 
+/// One path's cached row and whether it is settled.
+struct Entry {
+    state: AheadBehindState,
+    /// `None` for a settled row, held until [`observe`](AheadBehindCache::observe)
+    /// sees an input move. `Some` for one that is not: asked again once it falls
+    /// due, whether or not anything moved.
+    recheck: Option<Recheck>,
+}
+
+impl Entry {
+    fn settled(state: AheadBehindState) -> Self {
+        Self {
+            state,
+            recheck: None,
+        }
+    }
+}
+
+/// When to ask about an unsettled row again, and how many times it has come back
+/// unsettled in a row under the same inputs (which sets the backoff).
+#[derive(Debug, Clone, Copy)]
+struct Recheck {
+    at: Instant,
+    attempts: u32,
+}
+
 pub struct AheadBehindCache {
     client: WorktreesClient,
     /// What each worktree's answer is computed from, per the latest tree frame.
     inputs: HashMap<PathBuf, Inputs>,
-    entries: HashMap<PathBuf, AheadBehindState>,
+    entries: HashMap<PathBuf, Entry>,
     pending: HashSet<PathBuf>,
     results_tx: mpsc::UnboundedSender<FetchResult>,
     results_rx: mpsc::UnboundedReceiver<FetchResult>,
@@ -109,20 +155,31 @@ impl AheadBehindCache {
     }
 
     /// Narrows the cache to `paths`: drops entries for paths no longer of
-    /// interest, and queues a batched fetch for any newly-of-interest path
-    /// with no cached (or already in-flight) entry.
+    /// interest, and queues a batched fetch for any of them that is due — one with
+    /// no cached entry, or whose entry is not settled and has reached its recheck
+    /// time — unless a fetch for it is already in flight.
     pub fn set_visible(&mut self, paths: &[PathBuf]) {
         self.wanted = paths.to_vec();
         let visible: HashSet<&PathBuf> = paths.iter().collect();
         self.entries.retain(|path, _| visible.contains(path));
+        let now = Instant::now();
         let to_fetch: Vec<PathBuf> = paths
             .iter()
-            .filter(|p| !self.entries.contains_key(*p) && !self.pending.contains(*p))
+            .filter(|p| !self.pending.contains(*p) && self.is_due(p, now))
             .cloned()
             .collect();
         if !to_fetch.is_empty() {
             self.spawn_fetch(to_fetch);
         }
+    }
+
+    /// Whether `path` is to be asked about at `now` (if no fetch for it is in
+    /// flight): it has no entry yet, or its entry is not settled and its recheck
+    /// has fallen due. A settled entry is never due; it waits for `observe`.
+    fn is_due(&self, path: &Path, now: Instant) -> bool {
+        self.entries
+            .get(path)
+            .is_none_or(|entry| entry.recheck.is_some_and(|recheck| recheck.at <= now))
     }
 
     /// Records what each worktree's answer is now computed from, per the latest
@@ -179,14 +236,18 @@ impl AheadBehindCache {
     /// covers that: it backs off from [`RETRY_BASE`] to [`MAX_RETRY_DELAY`]
     /// while the failures last, so a daemon that keeps failing is asked at that
     /// pace and never in a loop.
+    ///
+    /// A row that is not settled (see [`Recheck`]) is asked again on the same
+    /// timer when it falls due, so nothing waits on a frame that may never come.
     pub async fn changed(&mut self) {
+        let wake = self.next_wake();
         tokio::select! {
             batch = self.results_rx.recv() => {
                 if let Some(batch) = batch {
                     self.merge(batch);
                 }
             }
-            () = wait_until(self.retry_at) => self.retry(),
+            () = wait_until(wake) => self.retry(),
         }
     }
 
@@ -209,8 +270,23 @@ impl AheadBehindCache {
                         superseded = true;
                         continue;
                     }
-                    let state = state_for(results.get(&path));
-                    self.entries.insert(path, state);
+                    let entry = settle(
+                        results.get(&path),
+                        &sent,
+                        self.entries.get(&path),
+                        Instant::now(),
+                        self.retry_base,
+                    );
+                    if let Some(recheck) = entry.recheck {
+                        tracing::debug!(
+                            "worktrees ui: ahead-behind row for {} omitted although its \
+                             refs promise one ({} in a row), asking again in {:?}",
+                            path.display(),
+                            recheck.attempts,
+                            recheck.at.saturating_duration_since(Instant::now()),
+                        );
+                    }
+                    self.entries.insert(path, entry);
                 }
                 if superseded {
                     // Ask again now: the frame that moved the refs found the path
@@ -240,8 +316,32 @@ impl AheadBehindCache {
     /// Re-asks for whatever the last visible set is still missing: a no-op for
     /// anything cached or already in flight.
     fn retry(&mut self) {
-        self.retry_at = None;
+        // The wake may be an unsettled row's recheck rather than the batch retry; a
+        // batch retry that is not due yet must survive it.
+        if self.retry_at.is_some_and(|at| at <= Instant::now()) {
+            self.retry_at = None;
+        }
         self.requeue();
+    }
+
+    /// When [`changed`](Self::changed) next has something to do on its own: the
+    /// failed-batch retry, or the earliest recheck of a row not already being
+    /// re-asked. A pending row is left out, or an overdue one would wake this
+    /// every time until its reply landed.
+    fn next_wake(&self) -> Option<Instant> {
+        let rechecks = self
+            .entries
+            .iter()
+            .filter(|(path, _)| !self.pending.contains(*path))
+            .filter_map(|(_, entry)| entry.recheck.map(|recheck| recheck.at));
+        self.retry_at.into_iter().chain(rechecks).min()
+    }
+
+    /// Whether a fetch for `path` is in flight — which [`get`](Self::get) cannot
+    /// say for a path that still has an (unsettled) entry.
+    #[cfg(test)]
+    pub(super) fn is_pending(&self, path: &Path) -> bool {
+        self.pending.contains(path)
     }
 
     /// Runs [`set_visible`](Self::set_visible) again over the last visible set.
@@ -253,15 +353,12 @@ impl AheadBehindCache {
     /// The wait after the current run of failures: `retry_base`, doubled per
     /// failure beyond the first, capped at [`MAX_RETRY_DELAY`].
     fn retry_delay(&self) -> Duration {
-        let doublings = self.failures.saturating_sub(1).min(16);
-        self.retry_base
-            .saturating_mul(1 << doublings)
-            .min(MAX_RETRY_DELAY)
+        backoff(self.retry_base, self.failures)
     }
 
     pub fn get(&self, path: &Path) -> AheadBehindState {
-        if let Some(state) = self.entries.get(path) {
-            return *state;
+        if let Some(entry) = self.entries.get(path) {
+            return entry.state;
         }
         if self.pending.contains(path) {
             AheadBehindState::Loading
@@ -271,6 +368,13 @@ impl AheadBehindCache {
     }
 }
 
+/// The wait after `failures` consecutive failures (or unsettled answers): `base`,
+/// doubled per failure beyond the first, capped at [`MAX_RETRY_DELAY`].
+fn backoff(base: Duration, failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    base.saturating_mul(1 << doublings).min(MAX_RETRY_DELAY)
+}
+
 /// Sleeps until `at`, or forever when there is no deadline — a `select!` arm
 /// that stays quiet until something is scheduled.
 async fn wait_until(at: Option<Instant>) {
@@ -278,6 +382,41 @@ async fn wait_until(at: Option<Instant>) {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
     }
+}
+
+/// How one requested path's slot in a *successful* reply is held, given the
+/// `inputs` it was asked under and the `previous` entry for it, if any.
+///
+/// A row the daemon omitted although `inputs` expect one (see
+/// [`Inputs::expects_a_row`]) is a computation that failed for that worktree, not
+/// an answer, so it is not recorded as [`Unavailable`](AheadBehindState::Unavailable).
+/// It is held as [`Unknown`](AheadBehindState::Unknown) — the same blank a failed
+/// fetch leaves — with a recheck that backs off per consecutive such answer. The
+/// entry, rather than no entry at all, is what keeps `set_visible` from asking
+/// again on every tree frame, which is the point: a worktree whose computation
+/// fails persistently would otherwise cost one daemon call per frame.
+fn settle(
+    reply: Option<&AheadBehindEntryWire>,
+    inputs: &Inputs,
+    previous: Option<&Entry>,
+    now: Instant,
+    retry_base: Duration,
+) -> Entry {
+    let state = state_for(reply);
+    if state == AheadBehindState::Unavailable && inputs.expects_a_row() {
+        let attempts = previous
+            .and_then(|entry| entry.recheck)
+            .map_or(0, |recheck| recheck.attempts)
+            .saturating_add(1);
+        return Entry {
+            state: AheadBehindState::Unknown,
+            recheck: Some(Recheck {
+                at: now + backoff(retry_base, attempts),
+                attempts,
+            }),
+        };
+    }
+    Entry::settled(state)
 }
 
 /// What one requested path's slot in a *successful* reply means. A failed fetch
@@ -458,11 +597,11 @@ mod tests {
         let mut cache = cache();
         cache.entries.insert(
             PathBuf::from("/repo/gone"),
-            AheadBehindState::Known {
+            Entry::settled(AheadBehindState::Known {
                 ahead: 1,
                 behind: 0,
                 main_behind: None,
-            },
+            }),
         );
         cache.set_visible(&[PathBuf::from("/repo/still-here")]);
         assert_eq!(
@@ -564,7 +703,7 @@ mod tests {
             behind: 0,
             main_behind: None,
         };
-        cache.entries.insert(settled.clone(), known);
+        cache.entries.insert(settled.clone(), Entry::settled(known));
         cache.pending.insert(failed.clone());
         cache
             .results_tx
@@ -750,7 +889,7 @@ mod tests {
             main_behind: None,
         };
         cache.observe(at_head(&path, "aaa"));
-        cache.entries.insert(path.clone(), known);
+        cache.entries.insert(path.clone(), Entry::settled(known));
 
         // The same frame again drops nothing: an unchanged refresh stays free.
         cache.observe(at_head(&path, "aaa"));
@@ -780,7 +919,7 @@ mod tests {
         cache.observe(on("one"));
         cache
             .entries
-            .insert(path.clone(), AheadBehindState::Unavailable);
+            .insert(path.clone(), Entry::settled(AheadBehindState::Unavailable));
         cache.observe(on("one"));
         assert_eq!(cache.get(&path), AheadBehindState::Unavailable);
         cache.observe(on("two"));
@@ -795,7 +934,7 @@ mod tests {
         let path = PathBuf::from("/repo/wt");
         cache
             .entries
-            .insert(path.clone(), AheadBehindState::Unavailable);
+            .insert(path.clone(), Entry::settled(AheadBehindState::Unavailable));
         cache.observe(at_head(&path, "aaa"));
         assert_eq!(cache.get(&path), AheadBehindState::Unknown);
     }
@@ -901,5 +1040,215 @@ mod tests {
         assert!(matches!(cache.get(&steady), AheadBehindState::Known { .. }));
         assert!(!cache.entries.contains_key(&moved));
         assert_eq!(cache.get(&moved), AheadBehindState::Loading);
+    }
+
+    // --- an omitted row the snapshot expected (#2143) ----------------------
+
+    /// Inputs that promise a row: a branch with a resolved upstream.
+    fn expecting(path: &Path) -> Vec<(PathBuf, Inputs)> {
+        vec![(
+            path.to_path_buf(),
+            Inputs {
+                branch: Some("main".to_string()),
+                head_sha: Some("aaa".to_string()),
+                upstream_sha: Some("bbb".to_string()),
+                main_sha: None,
+            },
+        )]
+    }
+
+    /// Delivers an `Ok` batch for `path`, asked under `inputs`, that carries no row.
+    async fn deliver_omitted(
+        cache: &mut AheadBehindCache,
+        path: &Path,
+        inputs: Vec<(PathBuf, Inputs)>,
+    ) {
+        cache.pending.insert(path.to_path_buf());
+        cache
+            .results_tx
+            .send(FetchResult {
+                requested: inputs,
+                results: Ok(HashMap::new()),
+            })
+            .unwrap();
+        cache.changed().await;
+    }
+
+    #[test]
+    fn a_row_is_expected_only_for_a_branch_with_something_to_compare_against() {
+        let inputs = |branch: Option<&str>, upstream: Option<&str>, main: Option<&str>| Inputs {
+            branch: branch.map(str::to_string),
+            head_sha: Some("h".to_string()),
+            upstream_sha: upstream.map(str::to_string),
+            main_sha: main.map(str::to_string),
+        };
+        // A resolved upstream, or a resolvable default branch, each promise counts.
+        assert!(inputs(Some("b"), Some("u"), None).expects_a_row());
+        assert!(inputs(Some("b"), None, Some("m")).expects_a_row());
+        assert!(inputs(Some("b"), Some("u"), Some("m")).expects_a_row());
+        // Nothing to compare with: the daemon has nothing to say, and says so.
+        assert!(!inputs(Some("b"), None, None).expects_a_row());
+        // A detached or unborn HEAD has no branch, whatever the repo has.
+        assert!(!inputs(None, Some("u"), Some("m")).expects_a_row());
+        assert!(!Inputs::default().expects_a_row());
+    }
+
+    #[tokio::test]
+    async fn an_omitted_row_the_snapshot_expected_is_not_settled() {
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        cache.observe(expecting(&path));
+        deliver_omitted(&mut cache, &path, expecting(&path)).await;
+
+        // Blank, like a failed fetch — and not `Unavailable`, which says "settled".
+        assert_eq!(cache.get(&path), AheadBehindState::Unknown);
+        assert!(!cache.pending.contains(&path));
+        let recheck = cache.entries[&path].recheck.expect("an unsettled entry");
+        assert_eq!(recheck.attempts, 1);
+
+        // The next tree frame must not re-ask it: that is the whole reason the
+        // entry exists. (The #2134 criterion for a row that is *settled* still
+        // holds; see the next test.)
+        cache.set_visible(std::slice::from_ref(&path));
+        assert!(cache.pending.is_empty(), "re-asked on a frame");
+        assert_eq!(cache.get(&path), AheadBehindState::Unknown);
+    }
+
+    #[tokio::test]
+    async fn an_omitted_row_with_nothing_expected_stays_settled_and_schedules_nothing() {
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        // A branch with no upstream and a repo with no default branch.
+        let inputs = vec![(
+            path.clone(),
+            Inputs {
+                branch: Some("topic".to_string()),
+                head_sha: Some("aaa".to_string()),
+                ..Inputs::default()
+            },
+        )];
+        cache.observe(inputs.clone());
+        deliver_omitted(&mut cache, &path, inputs).await;
+
+        assert_eq!(cache.get(&path), AheadBehindState::Unavailable);
+        assert!(cache.entries[&path].recheck.is_none());
+        assert!(
+            cache.next_wake().is_none(),
+            "a settled row is never re-asked"
+        );
+        cache.set_visible(std::slice::from_ref(&path));
+        assert!(cache.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_expected_row_that_stayed_omitted_is_re_asked_on_the_timer_alone() {
+        // The first answer omits the row although the snapshot promised one; the
+        // second, over the same socket, carries it. No frame arrives in between.
+        let (_dir, sock, _server) = fake_daemon_replies(vec![
+            json!({ "ok": true, "payload": { "results": {} } }),
+            counts_reply(2, 1),
+        ]);
+        let mut cache = AheadBehindCache::new(WorktreesClient::new(sock));
+        cache.retry_base = Duration::from_millis(5);
+        let path = PathBuf::from("/repo/wt");
+
+        cache.observe(expecting(&path));
+        cache.set_visible(std::slice::from_ref(&path));
+        settle(&mut cache).await;
+        assert_eq!(cache.get(&path), AheadBehindState::Unknown);
+
+        // The timer re-queues it; the old (blank) entry stays until the reply.
+        settle(&mut cache).await;
+        assert!(cache.pending.contains(&path));
+        assert_eq!(cache.get(&path), AheadBehindState::Unknown);
+
+        settle(&mut cache).await;
+        assert_eq!(
+            cache.get(&path),
+            AheadBehindState::Known {
+                ahead: 2,
+                behind: 1,
+                main_behind: None
+            }
+        );
+        assert!(cache.entries[&path].recheck.is_none(), "now settled");
+    }
+
+    #[tokio::test]
+    async fn a_persistently_omitted_row_backs_off_per_path_and_a_moved_input_restarts_it() {
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        let other = PathBuf::from("/repo/other");
+        cache.observe(expecting(&path));
+
+        for expected in 1..=4 {
+            deliver_omitted(&mut cache, &path, expecting(&path)).await;
+            assert_eq!(cache.entries[&path].recheck.unwrap().attempts, expected);
+        }
+        // The schedule is the failure backoff's, 2 s doubling to the 30 s cap.
+        let delays: Vec<Duration> = (1..=6).map(|n| backoff(RETRY_BASE, n)).collect();
+        assert_eq!(delays, [2, 4, 8, 16, 30, 30].map(Duration::from_secs));
+
+        // An unrelated path's good batch neither resets nor advances it.
+        cache.pending.insert(other.clone());
+        cache
+            .results_tx
+            .send(FetchResult {
+                requested: asked(&other),
+                results: Ok(HashMap::new()),
+            })
+            .unwrap();
+        cache.changed().await;
+        assert_eq!(cache.entries[&path].recheck.unwrap().attempts, 4);
+
+        // A commit is a new situation: the entry goes, and the count starts over.
+        let mut moved = expecting(&path);
+        moved[0].1.head_sha = Some("ccc".to_string());
+        cache.observe(moved.clone());
+        assert!(!cache.entries.contains_key(&path));
+        deliver_omitted(&mut cache, &path, moved).await;
+        assert_eq!(cache.entries[&path].recheck.unwrap().attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn the_wake_ignores_pending_and_invisible_rows_and_keeps_a_batch_retry() {
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        let due = Instant::now();
+        let unsettled = |at| Entry {
+            state: AheadBehindState::Unknown,
+            recheck: Some(Recheck { at, attempts: 1 }),
+        };
+        assert!(cache.next_wake().is_none());
+
+        cache.entries.insert(path.clone(), unsettled(due));
+        assert_eq!(cache.next_wake(), Some(due));
+
+        // A row already being re-asked would wake `changed` on every poll until its
+        // reply landed.
+        cache.pending.insert(path.clone());
+        assert!(cache.next_wake().is_none());
+        cache.pending.clear();
+
+        // The failed-batch retry and a recheck share the one timer: earliest wins.
+        let later = due + Duration::from_secs(60);
+        cache.retry_at = Some(later);
+        assert_eq!(cache.next_wake(), Some(due));
+
+        // A recheck waking the cache does not cancel a batch retry not yet due.
+        cache.wanted = vec![path.clone()];
+        cache.retry();
+        assert_eq!(cache.retry_at, Some(later));
+        assert!(
+            cache.pending.contains(&path),
+            "the due recheck was re-asked"
+        );
+
+        // A row that left the visible set is dropped, not woken for forever.
+        cache.pending.clear();
+        cache.entries.insert(path.clone(), unsettled(due));
+        cache.set_visible(&[PathBuf::from("/repo/elsewhere")]);
+        assert!(!cache.entries.contains_key(&path));
+        assert_eq!(cache.next_wake(), Some(later));
     }
 }
