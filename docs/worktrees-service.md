@@ -1634,7 +1634,14 @@ extension never runs git.
   the remote-tracking ref**, which is why `upstream_sha` rides too. Both are refs
   reads, so they clear the same every-worktree-every-tick bar the revwalk failed.
   Without `upstream_sha` a fully-pushed worktree kept reporting `↑1 ↓0` indefinitely,
-  correctable only by collapsing and re-expanding the repo.
+  correctable only by collapsing and re-expanding the repo. `main_behind` has a third
+  input that neither of those covers: a fetch that advances only `origin/<default>`
+  moves no worktree's `head_sha` or `upstream_sha`, so it was equally invisible and
+  left `⇊N` stale. The repo therefore carries **`main_sha`** (#2120), the tip of that
+  ref, resolved by the same `default_branch_tip` that `main_behind` walks against so
+  the two cannot drift. It is per repo rather than per worktree, since
+  remote-tracking refs live in the shared common dir, and omitted when no default
+  branch is locally resolvable.
 
 ### Tuning the refresh cadence
 
@@ -1938,9 +1945,11 @@ Where:
   drops any pending directive — the registry is in-memory — after which the user
   simply retries.
 - A `tree` `repo` is
-  `{ main_repo, github?, root, worktrees: [worktree, …] }`, where `github` is
+  `{ main_repo, github?, root, main_sha?, worktrees: [worktree, …] }`, where `github` is
   `{ owner, name }` present only when `origin` (or the first `github.com` remote)
-  is a GitHub URL, and `root` is the absolute path of the main working tree. Repos
+  is a GitHub URL, `main_sha` is the commit the repo's remote default branch
+  (`origin/<default>`) points at — absent when none is locally resolvable (#2120;
+  see [Git enrichment](#git-enrichment)) — and `root` is the absolute path of the main working tree. Repos
   are **derived from the open windows** (each open folder → its git common dir →
   repo root) and deduped, so a repo appears only while at least one of its windows
   is open (the v1 model — [ADR-0048](adrs/adr-0048.md)).
