@@ -217,8 +217,8 @@ before it. See [the stream wrapper](#the-stream-wrapper-feed-4).
 
 ### Liveness
 
-Like worktrees: `last_seen` + TTL, reaped **inline on every read** — no background
-task. The maps are capped (512 sessions, 256 window reports); at the cap a new
+Like worktrees: a last-activity stamp + TTL, reaped **inline on every read** — no
+background task. The maps are capped (512 sessions, 256 window reports); at the cap a new
 entry evicts the longest-silent one, so ingest never fails.
 
 Sessions differ from windows in one way: a session emits nothing while idle at the
@@ -244,6 +244,17 @@ covers a hook command wrapped in a shell, where each hook's parent is a fresh
 shell. That keeps the rule fail-open: it can only keep a session that has since
 been taken over. A replaced pid never becomes the owner again, so a straggling
 hook from the old process cannot take the session back.
+
+The TTL is measured in **awake time** (#2108). While the machine sleeps nothing
+refreshes a session or a window — no hooks, no Codex lock heartbeat, no pid
+watcher — so measuring against the wall clock made the first read after a
+wake-up find every entry stale and reap the lot. Each entry now carries, besides
+the wall-clock `last_seen` shown in `list`, a stamp from a monotonic clock that
+does not advance across system sleep (`Instant`: `CLOCK_UPTIME_RAW` on macOS,
+`CLOCK_MONOTONIC` on Linux), and the TTLs compare against that. A session alive
+at sleep survives until its feeds get a chance to report after the wake-up; a
+dead one is still ended promptly by the lock probe or the pid watcher, or by the
+TTL in awake time. The same applies to the 30 s window-report TTL.
 
 #### Pid-based liveness (#1916)
 
@@ -428,11 +439,106 @@ binary.
 
 The `hook` subcommand is the **feed sink** — Claude Code runs it, not you. It
 reads one hook event's JSON on stdin, maps it to an `observe`/`end` op, and
-fire-and-forgets it to the socket. It is **infallible by design**: a missing
+fire-and-forgets it to the socket, after appending it to the session's
+[journal](#hook-journals-2108). It is **infallible by design**: a missing
 daemon, a malformed payload, or any other error is swallowed and it **always
 exits 0**, so it can never block or fail a Claude turn.
 
 Once installed, restart is not required — the next Claude turn starts reporting.
+
+### Hook journals (#2108)
+
+The registry is in memory, and the hook sink is fail-open: it gives up after two
+seconds when the daemon is unreachable. So an event fired while the daemon was
+restarting, or before a cold socket-activated daemon answered, used to be lost,
+and a restart forgot every session. The sink now **appends each event to a
+per-session journal before it POSTs it**, and the daemon replays and tails those
+journals.
+
+**Hooks own the events; the daemon owns the state.** A hook never computes a
+state. `SessionState::for_event` depends on the current state, subagent waits
+roll up per session, a replaced process's stragglers are filtered (#1948), and
+two hooks racing a read-modify-write would lose one. So a journal holds raw
+events and the daemon runs them through the same state machine as a socket
+event. The socket stays the fast path.
+
+| Platform | Journal                                                                                    |
+|----------|--------------------------------------------------------------------------------------------|
+| macOS    | `~/Library/Application Support/omni-dev/sessions/<agent>/<session_id>.jsonl`               |
+| Linux    | `$XDG_DATA_HOME/omni-dev/sessions/<agent>/<session_id>.jsonl` (default `~/.local/share/…`) |
+
+The journals sit **beside the control socket**, so the hook and the daemon
+resolve the same directory by construction, and a `--socket` override in the hook
+command moves them with it. `<agent>` is `claude` or `codex`. Directories are
+`0700` and files `0600`. `$XDG_STATE_HOME` and `$XDG_RUNTIME_DIR` are not used
+(the first is often missing from the systemd user manager's environment, the
+second has no macOS equivalent), nor are `~/Library/Caches` or `$TMPDIR`, which
+the system may purge.
+
+One record per line, appended with `O_APPEND` in a single write, so concurrent
+hook processes need no lock:
+
+```json
+{"v":1,"ts":"2026-10-03T03:40:23.186123456Z","seq":"48213-1759462823186123456","agent":"codex","session_id":"…","op":"observe","event":"post_tool_use","pid":12345,"cwd":"…"}
+{"v":1,"ts":"…","seq":"…","agent":"claude","session_id":"…","op":"end","reason":"clear","pid":12345}
+```
+
+A record holds only what the sink already sends over the socket: the ids, `cwd`,
+the transcript *path*, the model id, the pid and the event kind. **Never** a
+prompt, a tool input or any transcript content. The write is **fail-open** exactly
+like the POST: an error is swallowed (logged at debug, never with the payload) and
+never blocks a turn, changes the exit code or prints. `session_id` must be a
+canonical hyphenated UUID and the agent a known hook agent before a path is built,
+so a crafted payload cannot name a file outside the directory; an id that is not
+a UUID is simply not journaled. `SessionEnd` is journaled too, so one that
+arrives while the daemon is down is kept.
+
+The same `ts` and a per-event `seq` ride the POST as a `stamp`. The registry
+remembers the last 32 `seq`s per session and drops the second copy of an event,
+whichever route it arrived by. An event read from a journal is also dropped when
+it is **older than one the session has already applied**, so a late read can
+never undo a newer state, or end a session that has since been resumed. Socket
+events are never dropped for age, as before.
+
+**What the daemon does with them** (`src/sessions/journal_watcher.rs`, polling
+every 5 s alongside the other watchers; a poll rather than a file watch, because
+there is no notification dependency, it behaves the same on macOS and Linux, and
+the POST remains the fast path):
+
+- **First sight of a journal** (every file at startup, or one that appears later):
+  replay it into a scratch registry to see what the state machine makes of it.
+  A session that has **ended** is dropped, as is one whose last event is more
+  than 7 days old. Otherwise it needs **proof of life**:
+  - Codex: the thread's writer lock is **held** (a lock that is free or gone is
+    proof of death);
+  - otherwise the owning pid is running **and started no later than its first
+    journaled event** (a recycled pid started after it). A dead or unreadable pid
+    is *not* proof of death, only the absence of proof, because it might have been
+    a per-hook shell.
+  
+  A session with no proof is kept only if its last event is within the session
+  TTL (5 min), which is what a hook-fed session with no pid always had.
+- An **accepted** session is replayed in order with each event's own timestamp as
+  its `last_seen`, so replayed history cannot look fresh. Its TTL clock starts
+  now, in awake time, which holds it until the pid watcher or the Codex lock
+  heartbeat confirms it.
+- **Afterwards** only appended bytes are read (a partial last line waits for the
+  next poll), so a dropped POST is caught within one interval.
+- **Cleanup is the daemon's.** A rejected journal is deleted at once. An accepted
+  one is deleted when the registry no longer holds its session live and the file
+  has been quiet for 2 minutes, or when it is older than 7 days. A journal over
+  128 KiB is compacted to its last ~64 KiB, cut at a line boundary, by writing a
+  `0600` temp file and renaming it over; the rewrite is abandoned if the file
+  grew since it was read, so the only events it can lose arrive in the instant
+  between that check and the rename. Only regular `<uuid>.jsonl` files are read or
+  removed; a symlink is never followed.
+
+Known limits: a session with more than ~200 events after its last prompt loses
+its `prompted` flag when compacted, so after a restart the pid watcher won't pin
+it past the TTL until its next prompt. Feeds that are not hooks are **not**
+journaled: the stream wrappers, the pi extension (its 30 s keep-alive already
+re-reports after an outage), the transcript and rollout watchers, and the VS Code
+window reports keep using the socket only.
 
 ### The stream wrapper (Feed 4)
 
@@ -803,12 +909,17 @@ resolves its window by the same rule.
 - Ops ride the daemon's existing `0600` Unix socket in its `0700` directory. The
   `subscribe` stream (#1414) adds no capability: it is read-only and carries
   exactly what `list` already serves, just pushed rather than polled.
-- **No secret is persisted** — the registry is in-memory only.
+- **No secret is persisted.** The registry is in-memory only. The one thing the
+  service keeps on disk is the [hook journals](#hook-journals-2108): session ids,
+  `cwd`s, transcript paths, pids and event kinds, in a `0700` tree of `0600`
+  files, inside the same owning-user boundary as the `0600` socket. They hold no
+  prompt, tool or transcript content, and the daemon deletes them.
 - Residual exposure, stated plainly: anything that can read the socket can
   enumerate your open session **cwds/repos and coarse state**; anything that can
   write it can inject fake sessions — but both already require being the owning
   local user.
-- Hooks are **opt-in** user config; `sessions hook` writes nothing except the
+- Hooks are **opt-in** user config; `sessions hook` writes nothing to stdout, and
+  nothing to disk except its session's [journal](#hook-journals-2108), besides the
   fire-and-forget socket POST. That holds for the Codex hooks too, which also
   need Codex's own `/hooks` trust before they run.
 - The pi extension is **opt-in** (written only by `install-hooks`, and only when
@@ -909,6 +1020,8 @@ always includes it.
   `~/.pi/agent/sessions/` and a Feed 4 analogue over `pi --mode rpc` would each
   cover pi processes that do not load global extensions, but the extension
   already reports exact state for the ones that do.
+- **The worktrees registry still reaps on the wall clock.** Its window TTL has
+  the same sleep flaw the sessions registry had before #2108.
 - **Windows** support waits on the broader daemon Windows work (#1363); the hook
   sink and transcript scheme are already portable, only the socket transport is
   Unix-only.
@@ -987,6 +1100,18 @@ to stderr, never stdout, and do not change exit 0 or the report timeout.
 daemon rejection. Notification diagnostics contain the classification and
 presence of type/message fields, never the raw notification text. Claude and
 Codex sightings are tagged separately by the shared hook sink.
+
+### Journal diagnostics
+
+The sink logs `session_hook_journal` with outcome `journaled` or
+`journal_failed` (with the error, never the payload) next to
+`session_hook_report`. In the daemon, `session_journal_replayed` (with
+`proven` and the record count), `session_journal_rejected` (with the reason:
+`ended`, `too_old`, `dead` or `stale`), `session_journal_removed` (`rejected`,
+`orphan`, `too_old`, `unreadable`, `stale_tmp`) and `session_journal_compacted`
+follow a journal through its life, at debug level. `session_observed` and
+`session_end` carry the route (`origin`) and the dedupe outcomes
+`duplicate_ignored` and `journal_stale_ignored`.
 
 ### Opt-in wrapper metadata file
 
