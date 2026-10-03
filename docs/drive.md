@@ -4172,6 +4172,56 @@ For removing every occurrence, `docs replace --search TEXT --replace ''` retains
 its existing `docs-write` semantics. Granting `docs-write` does not grant the new
 `docs delete` verb. See [ADR-0094](adrs/adr-0094.md).
 
+#### drive docs create-bullets / delete-bullets
+
+Apply bullets or numbering, or remove list formatting, on complete paragraphs
+selected by unique body anchors. Both verbs require `docs-write`; a `docs-delete`
+grant alone cannot authorize them. Removing bullets preserves prose and retains
+visual nesting as paragraph indentation. Creation converts leading tab characters
+into nesting levels and removes those tabs as part of the formatting operation.
+
+```bash
+omni-dev drive docs create-bullets <ID> --match 'Action items' --preset bullet-disc-circle-square --dry-run
+omni-dev drive docs create-bullets <ID> --from 'First item' --to 'Last item' --preset numbered-decimal-alpha-roman --lease <TOKEN>
+omni-dev drive docs delete-bullets <ID> --match 'Action items' --dry-run
+omni-dev drive docs delete-bullets <ID> --from 'First item' --to 'Last item' --lease <TOKEN>
+```
+
+`--match` selects its containing paragraph, including text outside the match.
+`--from` / `--to` select every paragraph from the first anchor's paragraph through
+the last anchor's paragraph, inclusively. Anchors must be unique across all tab
+bodies, including nested tabs and table cells. Matching defaults to case-sensitive;
+`--ignore-case` uses Unicode simple case folding. Ranges must stay in one body or
+table cell and contain contiguous, fully indexed plain text. Objects, structural
+gaps, reversed anchors and pending content suggestions anywhere in a selected
+paragraph are refused. Formatting may include a body's or cell's final newline,
+which remains intact. Headers, footers, footnotes and tables of contents are
+outside this selection surface.
+
+Creation requires `--preset`, one of the 15 concrete Google bullet and numbering
+presets listed in `create-bullets --help`. There is no unspecified preset, custom
+glyph, raw request or numeric index option. Google may join the selected paragraphs
+to the immediately preceding list when its preset matches. Removing formatting
+does not restore tabs previously removed by creation or reset indentation.
+
+Dry runs return `would-format-list`; successful writes return `list-formatted`.
+Both contain `edit` with the **pre-write** UTF-16 range, tab identity, paragraph
+count and `leading_tabs_removed`; `preset` is the Google preset for creation and
+null for removal. Tab counts are zero for removal. Creation shifts later indices
+by the number of tabs removed; returned indices are not reusable write addresses.
+The preview does not reconstruct list IDs, numbering or resulting indentation.
+No anchors or paragraph prose appear in these metadata fields.
+
+Each verb sends exactly one typed request under the same inline snapshot's
+mandatory revision check and the existing optional Drive ledger lease. No secondary
+request, rebasing or automatic retry is used. The permission gate runs before any
+Docs read. Existing `--dry-run`, `--lease` and output formats apply; inspect the
+structured `status` for refusals, as for other Docs writes. Mutation logs retain
+only existing decision/revision/status metadata under `docs-create-bullets` or
+`docs-delete-bullets`.
+
+These effects follow the [Google Docs list request reference](https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#CreateParagraphBulletsRequest).
+
 #### `drive docs create`
 
 Creates a Google Doc, optionally seeded with text. Gated by the `create`

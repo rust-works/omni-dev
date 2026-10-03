@@ -507,6 +507,90 @@ pub fn resolve_delete_in(
     })
 }
 
+/// Whole-paragraph formatting metadata. Indices describe the pre-write snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListPreview {
+    /// Inclusive start in server UTF-16 units.
+    pub start_index: i64,
+    /// Exclusive end, including the last selected paragraph's newline.
+    pub end_index: i64,
+    /// Absent only for legacy top-level body responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+    /// Number of complete paragraphs selected.
+    pub paragraphs: usize,
+    /// Leading tabs Google removes on creation; zero for removal.
+    pub leading_tabs_removed: usize,
+}
+
+/// Resolve whole paragraphs for list formatting, within one body or table cell.
+/// Unlike deletion, this range may include a container's final newline.
+pub fn resolve_list(
+    document: &Document,
+    from: &str,
+    to: Option<&str>,
+    match_case: bool,
+    creating: bool,
+) -> Result<ListPreview, AnchorError> {
+    // List formatting is body-only: it never selects a header, footer or footnote.
+    let (paragraphs, _) = paragraphs(document, &SegmentSelection::default())?;
+    let first = find(&paragraphs, from, match_case)?;
+    let last = if let Some(to) = to {
+        find(&paragraphs, to, match_case)?
+    } else {
+        first
+    };
+    let a = &paragraphs[first.paragraph];
+    let b = &paragraphs[last.paragraph];
+    if first.paragraph > last.paragraph
+        || a.tab != b.tab
+        || a.container != b.container
+        || first.start > last.start
+        || first.end > last.end
+    {
+        return Err(AnchorError::UnorderedRange);
+    }
+    let mut cursor = a.start;
+    let mut leading_tabs_removed = 0;
+    for p in &paragraphs[first.paragraph..=last.paragraph] {
+        if p.tab != a.tab || p.container != a.container || p.start != cursor {
+            return Err(AnchorError::UnsafeRange);
+        }
+        let mut leading = creating;
+        for run in &p.runs {
+            if run.start != cursor {
+                return Err(AnchorError::UnsafeRange);
+            }
+            if run.suggested {
+                return Err(AnchorError::SuggestedContent);
+            }
+            for ch in run.text.chars() {
+                if leading && ch == '\t' {
+                    leading_tabs_removed += 1;
+                } else {
+                    leading = false;
+                }
+            }
+            cursor = run.end;
+        }
+        if cursor != p.end {
+            return Err(AnchorError::UnsafeRange);
+        }
+        // Structural elements can occupy no text index space, so contiguity
+        // alone is insufficient. The last paragraph is safe to format.
+        if p.protected_newline && p.end != b.end {
+            return Err(AnchorError::UnsafeRange);
+        }
+    }
+    Ok(ListPreview {
+        start_index: a.start,
+        end_index: b.end,
+        tab_id: a.tab_id.clone(),
+        paragraphs: last.paragraph - first.paragraph + 1,
+        leading_tabs_removed,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -923,6 +1007,137 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lists_expand_unicode_anchors_to_whole_paragraphs_and_count_split_leading_tabs() {
+        let document = doc(vec![
+            paragraph(1, &["\t", "\t😀 K", "elvin\n"]),
+            paragraph(13, &["\tlast\n"]),
+            paragraph(19, &["untouched\n"]),
+        ]);
+        let edit = resolve_list(&document, "kelvin", Some("last"), false, true).unwrap();
+        assert_eq!(
+            (
+                edit.start_index,
+                edit.end_index,
+                edit.paragraphs,
+                edit.leading_tabs_removed
+            ),
+            (1, 19, 2, 3)
+        );
+        let single = resolve_list(&document, "last", None, true, false).unwrap();
+        assert_eq!(
+            (
+                single.start_index,
+                single.end_index,
+                single.leading_tabs_removed
+            ),
+            (13, 19, 0)
+        );
+        assert_eq!(
+            resolve_list(&document, "last", Some("Kelvin"), true, true),
+            Err(AnchorError::UnorderedRange)
+        );
+        assert_eq!(
+            resolve_list(&document, "Kelvin", None, false, true)
+                .unwrap()
+                .end_index,
+            13
+        );
+    }
+
+    #[test]
+    fn list_formatting_refuses_objects_gaps_structures_and_suggestions_outside_anchor() {
+        let object = json!({"startIndex": 1, "endIndex": 5, "paragraph": {"elements": [
+            {"startIndex": 1, "endIndex": 2, "inlineObjectElement": {"inlineObjectId": "img"}},
+            {"startIndex": 2, "endIndex": 5, "textRun": {"content": "ok\n"}}
+        ]}});
+        assert_eq!(
+            resolve_list(&doc(vec![object]), "ok", None, true, true),
+            Err(AnchorError::UnsafeRange)
+        );
+        let gap = doc(vec![paragraph(1, &["first\n"]), paragraph(8, &["last\n"])]);
+        assert_eq!(
+            resolve_list(&gap, "first", Some("last"), true, true),
+            Err(AnchorError::UnsafeRange)
+        );
+        // Even a structural break occupying no additional index must refuse.
+        let structure = doc(vec![
+            paragraph(1, &["first\n"]),
+            json!({"sectionBreak": {}}),
+            paragraph(7, &["last\n"]),
+        ]);
+        assert_eq!(
+            resolve_list(&structure, "first", Some("last"), true, true),
+            Err(AnchorError::UnsafeRange)
+        );
+        for creating in [true, false] {
+            for field in ["suggestedInsertionIds", "suggestedDeletionIds"] {
+                let mut p = paragraph(1, &["\t", "anchor", " pending\n"]);
+                p["paragraph"]["elements"][0]["textRun"][field] = json!(["s"]);
+                assert_eq!(
+                    resolve_list(&doc(vec![p]), "anchor", None, true, creating),
+                    Err(AnchorError::SuggestedContent)
+                );
+            }
+        }
+        let out_of_order = doc(vec![
+            paragraph(10, &["later\n"]),
+            paragraph(1, &["earlier\n"]),
+        ]);
+        assert_eq!(
+            resolve_list(&out_of_order, "earlier", Some("later"), true, true),
+            Err(AnchorError::UnorderedRange)
+        );
+        let mut invalid = paragraph(1, &["anchor\n"]);
+        invalid["endIndex"] = json!(9);
+        assert_eq!(
+            resolve_list(&doc(vec![invalid]), "anchor", None, true, true),
+            Err(AnchorError::InvalidIndices)
+        );
+    }
+
+    #[test]
+    fn lists_respect_table_cells_and_nested_tab_identity_and_final_newlines() {
+        let table = json!({"table": {"tableRows": [{"tableCells": [
+            {"content": [paragraph(11, &["cell\n"])]},
+            {"content": [paragraph(18, &["other\n"])]}
+        ]}]}});
+        let document = doc(vec![
+            paragraph(1, &["before\n"]),
+            table,
+            paragraph(30, &["after\n"]),
+        ]);
+        assert_eq!(
+            resolve_list(&document, "cell", None, true, true)
+                .unwrap()
+                .end_index,
+            16
+        );
+        assert_eq!(
+            resolve_list(&document, "cell", Some("other"), true, false),
+            Err(AnchorError::UnorderedRange)
+        );
+        assert_eq!(
+            resolve_list(&document, "before", Some("after"), true, true),
+            Err(AnchorError::UnsafeRange)
+        );
+        let tabbed: Document = serde_json::from_value(json!({"tabs": [
+            {"tabProperties": {"tabId": "t1"}, "documentTab": {"body": {"content": [paragraph(1, &["first\n"])]}},
+             "childTabs": [{"tabProperties": {"tabId": "t2"}, "documentTab": {"body": {"content": [paragraph(1, &["last\n"])]}}}]}
+        ]})).unwrap();
+        let edit = resolve_list(&tabbed, "last", None, true, true).unwrap();
+        assert_eq!(edit.tab_id.as_deref(), Some("t2"));
+        assert_eq!((edit.start_index, edit.end_index), (1, 6));
+        assert_eq!(
+            resolve_list(&tabbed, "first", Some("last"), true, true),
+            Err(AnchorError::UnorderedRange)
+        );
+        assert_eq!(
+            resolve_list(&doc(vec![paragraph(1, &["aaa\n"])]), "aa", None, true, true),
+            Err(AnchorError::Ambiguous { count: 2 })
+        );
+    }
+
     proptest! {
         #[test]
         fn random_unicode_prefixes_and_run_splits_preserve_utf16_offsets(
@@ -938,6 +1153,10 @@ mod tests {
             let edit = resolve_delete(&document, "ANCHOR", None, true).unwrap();
             prop_assert_eq!(edit.start_index, 1 + prefix.encode_utf16().count() as i64);
             prop_assert_eq!(edit.end_index, edit.start_index + 6);
+            let list = resolve_list(&document, "ANCHOR", None, true, true).unwrap();
+            prop_assert_eq!(list.start_index, 1);
+            prop_assert_eq!(list.end_index, 1 + text.encode_utf16().count() as i64);
+            prop_assert_eq!(list.paragraphs, 1);
         }
     }
     #[test]
@@ -961,6 +1180,10 @@ mod tests {
             let document: Document = serde_json::from_value(json!({"tabs": tabs})).unwrap();
             assert_eq!(
                 resolve_insert(&document, "anchor", Side::Before, "x", true),
+                Err(AnchorError::InvalidIndices)
+            );
+            assert_eq!(
+                resolve_list(&document, "anchor", None, true, true),
                 Err(AnchorError::InvalidIndices)
             );
         }
