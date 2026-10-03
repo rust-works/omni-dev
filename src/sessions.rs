@@ -992,21 +992,6 @@ impl SessionsRegistry {
         removed
     }
 
-    /// Reaps stale sessions and windows, then returns the live sessions with
-    /// each [`Source`] resolved and sorted for deterministic output.
-    ///
-    /// Two independent locks, each held only for pure-CPU work and never
-    /// nested: the sessions snapshot is taken and the lock dropped, then the
-    /// windows snapshot, then the join runs lock-free. Path matching is a pure
-    /// prefix compare (no canonicalization / disk I/O), honouring the
-    /// `Mutex`-never-across-`.await` and no-I/O-under-lock invariants.
-    ///
-    /// Deliberately does **not** [`bump`](Self::bump), even when its inline reap
-    /// drops an entry: this is the body of every subscription's `snapshot()`, so
-    /// bumping here would feed the stream loop back into itself. A read-path reap
-    /// reaches other subscribers on the server's next periodic re-sample, whose
-    /// diff sees the shrunken list — the [`WorktreesRegistry::list`] arrangement.
-    ///
     /// Pauses the window-report liveness clock for `outage`: advances every live
     /// report's `last_seen` by that long, never past now (#2111).
     ///
@@ -1037,6 +1022,21 @@ impl SessionsRegistry {
         }
     }
 
+    /// Reaps stale sessions and windows, then returns the live sessions with
+    /// each [`Source`] resolved and sorted for deterministic output.
+    ///
+    /// Two independent locks, each held only for pure-CPU work and never
+    /// nested: the sessions snapshot is taken and the lock dropped, then the
+    /// windows snapshot, then the join runs lock-free. Path matching is a pure
+    /// prefix compare (no canonicalization / disk I/O), honouring the
+    /// `Mutex`-never-across-`.await` and no-I/O-under-lock invariants.
+    ///
+    /// Deliberately does **not** [`bump`](Self::bump), even when its inline reap
+    /// drops an entry: this is the body of every subscription's `snapshot()`, so
+    /// bumping here would feed the stream loop back into itself. A read-path reap
+    /// reaches other subscribers on the server's next periodic re-sample, whose
+    /// diff sees the shrunken list — the [`WorktreesRegistry::list`] arrangement.
+    ///
     /// [`WorktreesRegistry::list`]: crate::worktrees::WorktreesRegistry::list
     pub fn list(&self) -> Vec<SessionEntry> {
         let now = Utc::now();
