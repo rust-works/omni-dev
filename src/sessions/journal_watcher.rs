@@ -583,7 +583,15 @@ fn import(scan: &mut Scan<'_>, agent: Agent, file: &JournalFile) -> Option<FileT
         }
         Verdict::Accept { proven } => {
             tracing::debug!(session_id = %file.id, proven, records = records.len(), "session_journal_replayed");
-            scan.emit(records, Origin::Replay);
+            // Only the startup scan is a replay. A journal a *running* daemon sees
+            // for the first time — a new session's — is caught up like any tail,
+            // so its dropped POSTs count as recoveries.
+            let origin = if scan.state.scan == 1 {
+                Origin::Replay
+            } else {
+                Origin::Journal
+            };
+            scan.emit(records, origin);
             Some(FileTrack {
                 session_id: file.id.clone(),
                 ino: file.ino,
@@ -2190,6 +2198,47 @@ mod tests {
             Origin::Socket,
         );
         assert_eq!(registry.delivery().recovered, 0);
+    }
+
+    #[test]
+    fn a_journal_first_seen_by_a_running_daemon_is_a_recovery_not_a_replay() {
+        // The daemon is up and a new session's POSTs were dropped: only the
+        // journal has the events, and that is exactly what `recovered` is for.
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = SessionsRegistry::new();
+        let mut state = JournalState::default();
+        let probes = Fake::default();
+        run(tmp.path(), &mut state, &registry, &probes); // the startup scan: nothing
+        write(
+            tmp.path(),
+            &[
+                rec(
+                    ID,
+                    Agent::Claude,
+                    SessionEvent::SessionStart,
+                    ago(5),
+                    "1-1",
+                    None,
+                ),
+                rec(
+                    ID,
+                    Agent::Claude,
+                    SessionEvent::UserPromptSubmit,
+                    ago(4),
+                    "1-2",
+                    None,
+                ),
+            ],
+        );
+        run(tmp.path(), &mut state, &registry, &probes);
+        assert_eq!(
+            registry.delivery(),
+            crate::sessions::DeliveryStats {
+                socket: 0,
+                recovered: 2,
+                replayed: 0
+            }
+        );
     }
 
     // --- end to end ---------------------------------------------------------
