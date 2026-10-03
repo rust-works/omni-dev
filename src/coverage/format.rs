@@ -266,6 +266,24 @@ end_of_record";
         assert_eq!(report.covered_lines(), 13);
     }
 
+    /// An lcov written from the per-line view carries the same total on the way
+    /// back in, and its `LF`/`LH` agree with its `DA` records — where the real
+    /// output above disagrees with itself. This is what lets `coverage merge`
+    /// promise the total `coverage diff` computes (#2118).
+    #[test]
+    fn written_lcov_keeps_the_per_line_total() {
+        let report = parse(LLVM_COV_GAP_LCOV, Some(Format::Lcov)).unwrap();
+
+        let written = lcov::write(&report).unwrap();
+        let reread = parse(&written, Some(Format::Lcov)).unwrap();
+
+        assert_eq!(reread, report);
+        assert_eq!(reread.total_lines(), 13);
+        assert_eq!(reread.covered_lines(), 13);
+        assert!(written.contains("\nLF:13\nLH:13\n"), "{written}");
+        assert!(!written.contains("LF:14"), "{written}");
+    }
+
     /// Both real-world formats yield the same per-line view — the same
     /// executable lines with the same hit counts — which is what lets a sharded
     /// run mix them and a baseline in one format be compared with a head in the

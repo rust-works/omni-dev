@@ -1,4 +1,4 @@
-//! lcov trace-file parser (line coverage only).
+//! lcov trace-file parser and writer (line coverage only).
 //!
 //! lcov records one source file per `SF:`…`end_of_record` block. Within a block,
 //! `DA:<line>,<hits>[,<checksum>]` gives the hit count for an instrumented line.
@@ -7,7 +7,9 @@
 //!
 //! Reference: <https://manpages.debian.org/unstable/lcov/geninfo.1.en.html>
 
-use anyhow::{Context, Result};
+use std::fmt::Write as _;
+
+use anyhow::{bail, Context, Result};
 
 use super::model::{CoverageReport, FileCoverage};
 
@@ -56,6 +58,51 @@ pub fn parse(content: &str) -> Result<CoverageReport> {
     }
 
     Ok(report)
+}
+
+/// Renders `report` as lcov trace text.
+///
+/// The output is a function of the report alone: files come out in path order
+/// and each file's `DA` records in line order, so two reports that compare equal
+/// write byte-identical text, whatever order their inputs were merged in. Every
+/// record ends in a newline — the last `end_of_record` included, which
+/// `cargo llvm-cov` omits and which makes its files unsafe to join with `cat`.
+///
+/// Only what the line model holds is written: `TN`, `SF`, `DA`, `LF`, `LH` and
+/// `end_of_record`. Function (`FN*`) and branch (`BRDA`) records are not part of
+/// the model and are dropped. `LF`/`LH` count the `DA` records written, so a
+/// file is consistent with itself; `llvm-cov` writes them from its own summary
+/// instead, which counts some lines more than once (#2131).
+///
+/// A file with no executable lines is omitted: it has no coverage to report, and
+/// [`CoverageReport::retain_lines`] already treats one as absent.
+///
+/// # Errors
+///
+/// Fails when a path contains a line break, which lcov has no way to carry: the
+/// file would parse back as different records.
+pub fn write(report: &CoverageReport) -> Result<String> {
+    let mut out = String::new();
+    for (path, file) in &report.files {
+        if file.total_lines() == 0 {
+            continue;
+        }
+        if path.contains(['\n', '\r']) {
+            bail!("cannot write {path:?} to lcov: the path contains a line break");
+        }
+        // Writing to a `String` cannot fail.
+        let _ = writeln!(out, "TN:\nSF:{path}");
+        for (line, hits) in &file.lines {
+            let _ = writeln!(out, "DA:{line},{hits}");
+        }
+        let _ = writeln!(
+            out,
+            "LF:{}\nLH:{}\nend_of_record",
+            file.total_lines(),
+            file.covered_lines()
+        );
+    }
+    Ok(out)
 }
 
 /// Parses the payload of a `DA:` record (`<line>,<hits>[,<checksum>]`).
@@ -229,5 +276,98 @@ end_of_record
     fn negative_hit_count_saturates_to_zero() {
         let report = parse("SF:a.rs\nDA:1,-5\nend_of_record\n").unwrap();
         assert_eq!(report.hits("a.rs", 1), Some(0));
+    }
+
+    // ── write (#2118) ────────────────────────────────────────────────────
+
+    fn report(files: &[(&str, &[(u32, u64)])]) -> CoverageReport {
+        let mut report = CoverageReport::new();
+        for (path, lines) in files {
+            let mut file = FileCoverage::new(*path);
+            for &(line, hits) in *lines {
+                file.record(line, hits);
+            }
+            report.insert(file);
+        }
+        report
+    }
+
+    #[test]
+    fn write_emits_one_sorted_record_per_file() {
+        // Inserted out of order on purpose: the output must not depend on it.
+        let report = report(&[("src/b.rs", &[(2, 0), (1, 3)]), ("src/a.rs", &[(5, 1)])]);
+        assert_eq!(
+            write(&report).unwrap(),
+            "TN:\nSF:src/a.rs\nDA:5,1\nLF:1\nLH:1\nend_of_record\n\
+             TN:\nSF:src/b.rs\nDA:1,3\nDA:2,0\nLF:2\nLH:1\nend_of_record\n"
+        );
+    }
+
+    /// `cargo llvm-cov` omits the newline after its last `end_of_record`, so a
+    /// file that stops there cannot be concatenated safely. Ours must not.
+    #[test]
+    fn write_ends_every_record_with_a_newline() {
+        let text = write(&report(&[("src/a.rs", &[(1, 1)])])).unwrap();
+        assert!(text.ends_with("end_of_record\n"), "{text:?}");
+    }
+
+    #[test]
+    fn write_of_an_empty_report_is_empty() {
+        assert_eq!(write(&CoverageReport::new()).unwrap(), "");
+    }
+
+    #[test]
+    fn write_omits_a_file_with_no_executable_lines() {
+        let report = report(&[("src/empty.rs", &[]), ("src/a.rs", &[(1, 0)])]);
+        let text = write(&report).unwrap();
+        assert!(!text.contains("empty.rs"), "{text}");
+        assert!(text.contains("SF:src/a.rs"), "{text}");
+    }
+
+    #[test]
+    fn write_reads_back_as_the_same_report() {
+        let original = report(&[
+            ("src/a.rs", &[(1, 0), (2, 7), (40, 1)]),
+            ("/abs/b.rs", &[(3, 2)]),
+        ]);
+        assert_eq!(parse(&write(&original).unwrap()).unwrap(), original);
+    }
+
+    /// `LF`/`LH` are written from the `DA` records, so the totals agree with the
+    /// lines listed — unlike `llvm-cov`'s own lcov (#2131).
+    #[test]
+    fn write_counts_lf_and_lh_from_its_own_da_records() {
+        let text = write(&report(&[("a.rs", &[(1, 0), (2, 5), (3, 9)])])).unwrap();
+        assert!(text.contains("\nLF:3\nLH:2\n"), "{text}");
+    }
+
+    #[test]
+    fn write_is_independent_of_the_order_shards_were_merged_in() {
+        let shards = [
+            "SF:src/a.rs\nDA:1,3\nDA:2,0\nend_of_record\nSF:src/c.rs\nDA:1,0\nend_of_record",
+            "SF:src/a.rs\nDA:1,0\nDA:2,2\nend_of_record\nSF:src/b.rs\nDA:9,1\nend_of_record",
+            "SF:src/c.rs\nDA:1,4\nDA:7,0\nend_of_record",
+        ];
+        let merged_in = |order: [usize; 3]| {
+            let mut merged = CoverageReport::new();
+            for index in order {
+                merged.merge(parse(shards[index]).unwrap());
+            }
+            write(&merged).unwrap()
+        };
+        let reference = merged_in([0, 1, 2]);
+        for order in [[0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            assert_eq!(merged_in(order), reference, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn write_rejects_a_path_with_a_line_break() {
+        for path in ["src/a\nSF:evil.rs", "src/a\rb.rs"] {
+            let message = write(&report(&[(path, &[(1, 1)])]))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("line break"), "{message}");
+        }
     }
 }
