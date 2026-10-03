@@ -315,18 +315,26 @@ changelog](../../CHANGELOG.md), which tracks the crate). Both registries render 
 **Changelog** tab from that file in the packaged `.vsix`, so every published
 version needs an entry.
 
-To cut a release:
+The full procedure lives in the repository's release guide,
+[`docs/RELEASE.md`](../../docs/RELEASE.md#3-prepare-the-extension-release). In
+short, `main` merges through a rebasing merge queue, so the release is prepared in
+a pull request (the version bump and the changelog, one `chore(release): prepare
+vscode extension release vX.Y.Z` commit) and the `vscode-v<version>` tag
+(e.g. `vscode-v0.2.1`) is created **after** the merge, on the rebased commit — the
+hash you committed locally does not survive it. The release workflow verifies the
+tag matches `package.json`, re-runs typecheck/build/test/package, then publishes
+the same `.vsix` to both registries. The guide also covers verifying the tagged
+commit before the tag is pushed and reading the result back from the registries.
 
-1. Bump `version` in [`package.json`](package.json) and run `npm install` to
-   refresh `package-lock.json`; commit both.
-2. In [`CHANGELOG.md`](CHANGELOG.md), move the `[Unreleased]` items into a new
-   `## [X.Y.Z] - YYYY-MM-DD` section (add one if `[Unreleased]` is empty), grouped
-   under Keep a Changelog headings (Added / Changed / Fixed / …). Add entries to
-   `[Unreleased]` as changes land, not all at once here.
-3. Tag the merge commit `vscode-v<version>` (e.g. `vscode-v0.2.1`) and push the
-   tag. The release workflow verifies the tag matches `package.json`, re-runs
-   typecheck/build/test/package, then publishes the same `.vsix` to both
-   registries (Open VSX is skipped when `OVSX_PAT` is unset — see below).
+What is specific to the extension:
+
+- Bump the version with `npm version X.Y.Z --no-git-tag-version --ignore-scripts`
+  in this directory. It changes `package.json` and the two omni-dev entries at the
+  top of `package-lock.json`, and nothing else.
+- In [`CHANGELOG.md`](CHANGELOG.md), move the `[Unreleased]` items into a new
+  `## [X.Y.Z] - YYYY-MM-DD` section (add one if `[Unreleased]` is empty), grouped
+  under Keep a Changelog headings (Added / Changed / Fixed / …). Add entries to
+  `[Unreleased]` as changes land, not all at once here.
 
 A one-time account + secrets setup is required before the first publish:
 
@@ -335,5 +343,10 @@ A one-time account + secrets setup is required before the first publish:
 - **Open VSX (optional):** the `rust-works` Open VSX namespace and the repo secret
   `OVSX_PAT`. If `OVSX_PAT` is unset the workflow publishes to the Marketplace only
   and skips Open VSX (rather than failing), so you can add it later.
+
+Both tokens expire. The Marketplace is published first and a failed publish there
+also skips Open VSX, so an expired `VSCE_PAT` stops both registries; check them
+with `vsce verify-pat rust-works` / `ovsx verify-pat rust-works` before tagging
+(see the release guide).
 
 See [#1279](https://github.com/rust-works/omni-dev/issues/1279).
