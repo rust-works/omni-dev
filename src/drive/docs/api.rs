@@ -436,6 +436,11 @@ mod tests {
             ("write_types.rs", include_str!("write_types.rs")),
             ("write.rs", include_str!("write.rs")),
             ("anchor.rs", include_str!("anchor.rs")),
+            ("style.rs", include_str!("style.rs")),
+            (
+                "cli/style.rs",
+                include_str!("../../cli/drive/docs/style.rs"),
+            ),
             ("create.rs", include_str!("create.rs")),
             ("client.rs", include_str!("client.rs")),
             ("types.rs", include_str!("types.rs")),
@@ -449,6 +454,7 @@ mod tests {
         ];
         let mut deletion_renames = 0;
         let mut list_renames = 0;
+        let mut formatting_renames = 0;
         for (name, source) in sources {
             // Production code only: the tests and docs below deliberately
             // name the things they assert the absence of.
@@ -479,6 +485,13 @@ mod tests {
                         list_renames += 1;
                     }
                 }
+                for operation in ["updateTextStyle", "updateParagraphStyle"] {
+                    if code.contains(operation) {
+                        assert_eq!(name, "write_types.rs");
+                        assert_eq!(code, format!("#[serde(rename = \"{operation}\")]"));
+                        formatting_renames += 1;
+                    }
+                }
                 let destroys = code.contains("deletePositionedObject")
                     || code.contains("deleteTableRow")
                     || code.contains("deleteTableColumn");
@@ -491,5 +504,9 @@ mod tests {
         }
         assert_eq!(list_renames, 2, "exactly two typed list requests");
         assert_eq!(deletion_renames, 1, "exactly one typed deletion request");
+        assert_eq!(
+            formatting_renames, 2,
+            "exactly two typed formatting operations"
+        );
     }
 }

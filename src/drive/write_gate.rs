@@ -398,6 +398,8 @@ pub enum DriveOperation {
     /// an existing text-write grant must never silently widen to deletion.
     /// Future structural/object deletion verbs need their own explicit decision.
     DocsDelete,
+    /// Anchor-addressed styling; never implied by text-write or deletion grants.
+    DocsFormat,
 }
 
 impl std::fmt::Display for DriveOperation {
@@ -417,6 +419,7 @@ impl std::fmt::Display for DriveOperation {
             Self::Trash => "trash",
             Self::SlidesWrite => "slides-write",
             Self::DocsDelete => "docs-delete",
+            Self::DocsFormat => "docs-format",
         };
         write!(f, "{s}")
     }
@@ -441,7 +444,8 @@ impl DriveOperation {
             | Self::DocsWrite
             | Self::Trash
             | Self::SlidesWrite
-            | Self::DocsDelete => Verdict::Deny,
+            | Self::DocsDelete
+            | Self::DocsFormat => Verdict::Deny,
         }
     }
 
@@ -471,7 +475,8 @@ impl DriveOperation {
             | Self::SheetsProtection
             | Self::DocsWrite
             | Self::SlidesWrite
-            | Self::DocsDelete => true,
+            | Self::DocsDelete
+            | Self::DocsFormat => true,
         }
     }
 }
@@ -1808,5 +1813,48 @@ mod tests {
         assert_eq!(file.id(), "x1");
         assert_eq!(file.kind_label(), "file");
         assert_eq!(file.depth_suffix(), "");
+    }
+    #[test]
+    fn docs_format_is_default_denied_lease_eligible_and_isolated() {
+        let format: DriveOperation = serde_json::from_str("\"docs-format\"").unwrap();
+        assert_eq!(format, DriveOperation::DocsFormat);
+        assert_eq!(format.to_string(), "docs-format");
+        assert_eq!(format.default_policy(), Verdict::Deny);
+        assert!(format.ever_requires_lease());
+        for other in [
+            DriveOperation::DocsWrite,
+            DriveOperation::DocsDelete,
+            DriveOperation::Edit,
+            DriveOperation::SheetsWrite,
+            DriveOperation::SlidesWrite,
+        ] {
+            assert_eq!(
+                resolve(
+                    &chain(&["target"]),
+                    format,
+                    &[rule("target", true, &[other], &[])]
+                )
+                .verdict,
+                Verdict::Deny
+            );
+            assert_eq!(
+                resolve(
+                    &chain(&["target"]),
+                    other,
+                    &[rule("target", true, &[format], &[])]
+                )
+                .verdict,
+                Verdict::Deny
+            );
+        }
+        assert_eq!(
+            resolve(
+                &chain(&["target"]),
+                format,
+                &[rule("target", true, &[format], &[])]
+            )
+            .verdict,
+            Verdict::Allow
+        );
     }
 }

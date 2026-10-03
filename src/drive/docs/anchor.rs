@@ -591,6 +591,56 @@ pub fn resolve_list(
     })
 }
 
+/// Resolve formatting against the leased snapshot. Paragraph styling affects
+/// whole paragraphs, so validate and count their complete contents as well.
+pub fn resolve_format(
+    document: &Document,
+    from: &str,
+    to: Option<&str>,
+    match_case: bool,
+    whole_paragraphs: bool,
+) -> Result<EditPreview, AnchorError> {
+    let mut edit = resolve_delete(document, from, to, match_case)?;
+    if !whole_paragraphs {
+        return Ok(edit);
+    }
+    let (paragraphs, _) = paragraphs(document, &SegmentSelection::default())?;
+    let affected: Vec<_> = paragraphs
+        .iter()
+        .filter(|p| {
+            p.tab_id == edit.tab_id && p.start.max(edit.start_index) < p.end.min(edit.end_index)
+        })
+        .collect();
+    let first = affected.first().ok_or(AnchorError::InvalidIndices)?;
+    let last = affected.last().ok_or(AnchorError::InvalidIndices)?;
+    let mut cursor = first.start;
+    edit.chars = 0;
+    edit.bytes = 0;
+    for p in &affected {
+        if p.container != first.container || p.start != cursor {
+            return Err(AnchorError::UnsafeRange);
+        }
+        for run in &p.runs {
+            if run.start != cursor {
+                return Err(AnchorError::UnsafeRange);
+            }
+            if run.suggested {
+                return Err(AnchorError::SuggestedContent);
+            }
+            edit.chars += run.text.chars().count();
+            edit.bytes += run.text.len();
+            cursor = run.end;
+        }
+        if cursor != p.end {
+            return Err(AnchorError::UnsafeRange);
+        }
+    }
+    edit.start_index = first.start;
+    edit.end_index = last.end;
+    edit.paragraphs = affected.len();
+    Ok(edit)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1187,5 +1237,64 @@ mod tests {
                 Err(AnchorError::InvalidIndices)
             );
         }
+    }
+    #[test]
+    fn formatting_resolves_utf16_and_expands_whole_paragraph_effects() {
+        let document = doc(vec![
+            paragraph(1, &["😀 pre ", "anchor tail\n"]),
+            paragraph(21, &["end\n"]),
+        ]);
+        let text = resolve_format(&document, "anchor", None, true, false).unwrap();
+        assert_eq!(
+            (text.start_index, text.end_index, text.chars, text.bytes),
+            (8, 14, 6, 6)
+        );
+        let p = resolve_format(&document, "anchor", None, true, true).unwrap();
+        assert_eq!(
+            (p.start_index, p.end_index, p.chars, p.bytes, p.paragraphs),
+            (1, 20, 18, 21, 1)
+        );
+        // A gap between paragraphs remains unsafe.
+        assert!(resolve_format(&document, "anchor", Some("end"), true, true).is_err());
+        let document = doc(vec![
+            paragraph(1, &["😀 pre ", "anchor tail\n"]),
+            paragraph(20, &["end\n"]),
+        ]);
+        let p = resolve_format(&document, "anchor", Some("end"), true, true).unwrap();
+        assert_eq!(
+            (p.start_index, p.end_index, p.paragraphs, p.chars, p.bytes),
+            (1, 24, 2, 22, 25)
+        );
+    }
+
+    #[test]
+    fn paragraph_formatting_refuses_suggestions_and_objects_outside_anchors() {
+        let mut p = paragraph(1, &["prefix ", "anchor\n"]);
+        p["paragraph"]["elements"][0]["textRun"]["suggestedInsertionIds"] = json!(["pending"]);
+        let document = doc(vec![p]);
+        assert!(resolve_format(&document, "anchor", None, true, false).is_ok());
+        assert_eq!(
+            resolve_format(&document, "anchor", None, true, true),
+            Err(AnchorError::SuggestedContent)
+        );
+        let document = doc(vec![
+            json!({"startIndex": 1, "endIndex": 9, "paragraph": {"elements": [
+                {"startIndex": 1, "endIndex": 2, "inlineObjectElement": {"inlineObjectId": "img"}},
+                {"startIndex": 2, "endIndex": 9, "textRun": {"content": "anchor\n"}}
+            ]}}),
+        ]);
+        assert!(resolve_format(&document, "anchor", None, true, false).is_ok());
+        assert_eq!(
+            resolve_format(&document, "anchor", None, true, true),
+            Err(AnchorError::UnsafeRange)
+        );
+    }
+
+    #[test]
+    fn paragraph_formatting_preserves_nested_tab_identity() {
+        let document: Document = serde_json::from_value(json!({"tabs": [{"tabProperties": {"tabId": "parent"}, "childTabs": [{"tabProperties": {"tabId": "child"}, "documentTab": {"body": {"content": [paragraph(1, &["😀 anchor\n"])]}}}]}]})).unwrap();
+        let p = resolve_format(&document, "anchor", None, true, true).unwrap();
+        assert_eq!(p.tab_id.as_deref(), Some("child"));
+        assert_eq!((p.start_index, p.end_index), (1, 11));
     }
 }

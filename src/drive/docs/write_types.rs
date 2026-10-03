@@ -95,6 +95,12 @@ pub enum DocsRequest {
     /// Remove list formatting, preserving prose, under DocsWrite.
     #[serde(rename = "deleteParagraphBullets")]
     DeleteParagraphBullets(DeleteParagraphBulletsRequest),
+    /// Explicit character formatting under DocsFormat.
+    #[serde(rename = "updateTextStyle")]
+    UpdateTextStyle(UpdateTextStyleRequest),
+    /// Explicit paragraph formatting under DocsFormat.
+    #[serde(rename = "updateParagraphStyle")]
+    UpdateParagraphStyle(UpdateParagraphStyleRequest),
 }
 
 /// A `replaceAllText` request.
@@ -254,6 +260,30 @@ pub struct DeleteParagraphBulletsRequest {
     pub range: ContentRange,
 }
 
+/// One bounded character formatting request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpdateTextStyleRequest {
+    /// Snapshot-resolved body range.
+    pub range: ContentRange,
+    /// Explicit property values.
+    #[serde(rename = "textStyle")]
+    pub text_style: super::style::TextStyle,
+    /// Derived property mask.
+    pub fields: String,
+}
+
+/// One bounded paragraph formatting request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpdateParagraphStyleRequest {
+    /// Snapshot-resolved whole-paragraph range.
+    pub range: ContentRange,
+    /// Explicit property values.
+    #[serde(rename = "paragraphStyle")]
+    pub paragraph_style: super::style::ParagraphStyle,
+    /// Derived property mask.
+    pub fields: String,
+}
+
 /// The end of a segment.
 ///
 /// Serialises as `{}`. An absent `segmentId` means the document body, and an
@@ -296,6 +326,37 @@ impl DocsRequest {
                 segment_id: edit.segment_id.clone(),
             }),
         })
+    }
+
+    /// Format the range resolved from this invocation's snapshot.
+    #[must_use]
+    pub(in crate::drive) fn format_range(
+        edit: &super::anchor::EditPreview,
+        style: &super::style::StylePatch,
+    ) -> Self {
+        let range = ContentRange {
+            start_index: edit.start_index,
+            end_index: edit.end_index,
+            tab_id: edit.tab_id.clone(),
+            segment_id: edit.segment_id.clone(),
+        };
+        let fields = style.fields();
+        match style {
+            super::style::StylePatch::Text(style) => {
+                Self::UpdateTextStyle(UpdateTextStyleRequest {
+                    range,
+                    text_style: style.clone(),
+                    fields,
+                })
+            }
+            super::style::StylePatch::Paragraph(style) => {
+                Self::UpdateParagraphStyle(UpdateParagraphStyleRequest {
+                    range,
+                    paragraph_style: style.clone(),
+                    fields,
+                })
+            }
+        }
     }
 
     /// Delete the range resolved from this invocation's snapshot.

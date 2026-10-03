@@ -85,6 +85,17 @@ pub enum WritePayload {
         /// Existing non-body segment selector; default addresses tab bodies.
         selection: anchor::SegmentSelection,
     },
+    /// Apply a bounded style patch to a unique anchored range.
+    Format {
+        /// First anchor or complete match.
+        from: String,
+        /// Inclusive final anchor.
+        to: Option<String>,
+        /// Literal matching case sensitivity.
+        match_case: bool,
+        /// Explicit style values.
+        style: super::style::StylePatch,
+    },
     /// Delete a unique match or an inclusive pair of anchors.
     Delete {
         /// First anchor (or the entire single match).
@@ -122,6 +133,11 @@ impl WritePayload {
                 preset: Some(_), ..
             } => WriteVerb::CreateBullets,
             Self::List { preset: None, .. } => WriteVerb::DeleteBullets,
+            Self::Format {
+                style: super::style::StylePatch::Text(_),
+                ..
+            } => WriteVerb::TextStyle,
+            Self::Format { .. } => WriteVerb::ParagraphStyle,
         }
     }
 
@@ -132,6 +148,7 @@ impl WritePayload {
     pub const fn gate_operation(&self) -> DriveOperation {
         match self {
             Self::Delete { .. } => DriveOperation::DocsDelete,
+            Self::Format { .. } => DriveOperation::DocsFormat,
             _ => DriveOperation::DocsWrite,
         }
     }
@@ -139,7 +156,7 @@ impl WritePayload {
     const fn index_addressed(&self) -> bool {
         matches!(
             self,
-            Self::Insert { .. } | Self::Delete { .. } | Self::List { .. }
+            Self::Insert { .. } | Self::Delete { .. } | Self::List { .. } | Self::Format { .. }
         )
     }
 
@@ -168,7 +185,12 @@ impl WritePayload {
             Self::Insert { anchor, .. } if anchor.is_empty() || anchor.contains(['\n', '\r']) => {
                 Err("anchor must be nonempty and within one paragraph".to_owned())
             }
-            Self::Delete { from, to, .. } | Self::List { from, to, .. }
+            Self::Format { style, .. } if style.fields().is_empty() => {
+                Err("at least one style property is required".to_owned())
+            }
+            Self::Delete { from, to, .. }
+            | Self::List { from, to, .. }
+            | Self::Format { from, to, .. }
                 if from.is_empty()
                     || from.contains(['\n', '\r'])
                     || to
@@ -197,6 +219,10 @@ pub enum WriteVerb {
     CreateBullets,
     /// Remove paragraph bullets or numbering.
     DeleteBullets,
+    /// Character formatting.
+    TextStyle,
+    /// Paragraph formatting.
+    ParagraphStyle,
 }
 
 impl WriteVerb {
@@ -213,6 +239,8 @@ impl WriteVerb {
             Self::Delete => "docs-delete",
             Self::CreateBullets => "docs-create-bullets",
             Self::DeleteBullets => "docs-delete-bullets",
+            Self::TextStyle => "docs-text-style",
+            Self::ParagraphStyle => "docs-paragraph-style",
         }
     }
 
@@ -225,6 +253,8 @@ impl WriteVerb {
             Self::Delete => "delete",
             Self::CreateBullets => "create-bullets",
             Self::DeleteBullets => "delete-bullets",
+            Self::TextStyle => "text-style",
+            Self::ParagraphStyle => "paragraph-style",
         }
     }
 }
@@ -302,6 +332,24 @@ pub enum WriteResult {
         edit: ListPreview,
         /// Some for creation, None for removal.
         preset: Option<BulletPreset>,
+    },
+    /// Exact requested formatting effect before mutation.
+    WouldFormat {
+        /// Affected range and character/paragraph counts (no text mutation).
+        edit: EditPreview,
+        /// Explicit style properties.
+        style: super::style::StylePatch,
+        /// Derived property mask.
+        fields: String,
+    },
+    /// The same requested formatting effect after a successful mutation.
+    Formatted {
+        /// Affected range and counts.
+        edit: EditPreview,
+        /// Explicit style properties.
+        style: super::style::StylePatch,
+        /// Derived property mask.
+        fields: String,
     },
     /// An anchor could not safely identify a unique effect.
     RefusedAnchor {
@@ -395,6 +443,8 @@ impl WriteResult {
     /// The kebab-case status for the request log.
     fn log_status(&self) -> &'static str {
         match self {
+            Self::WouldFormat { .. } => "would-format",
+            Self::Formatted { .. } => "formatted",
             Self::WouldReplace { .. } => "would-replace",
             Self::WouldAppend { .. } => "would-append",
             Self::WouldInsert { .. } => "would-insert",
@@ -663,6 +713,28 @@ async fn write_inner(
                 }
             }
         }
+        WritePayload::Format {
+            from,
+            to,
+            match_case,
+            style,
+        } => match anchor::resolve_format(
+            &document,
+            from,
+            to.as_deref(),
+            *match_case,
+            matches!(style, super::style::StylePatch::Paragraph(_)),
+        ) {
+            Ok(edit) => (
+                DocsRequest::format_range(&edit, style),
+                WriteResult::WouldFormat {
+                    edit,
+                    style: style.clone(),
+                    fields: style.fields(),
+                },
+            ),
+            Err(error) => return gated(WriteResult::RefusedAnchor { error }, Some(revision_id)),
+        },
         WritePayload::Delete {
             from,
             to,
@@ -757,10 +829,20 @@ async fn write_inner(
             },
             WritePayload::Insert { .. }
             | WritePayload::Delete { .. }
-            | WritePayload::List { .. } => match preview {
+            | WritePayload::List { .. }
+            | WritePayload::Format { .. } => match preview {
                 WriteResult::WouldFormatList { edit, preset } => {
                     WriteResult::ListFormatted { edit, preset }
                 }
+                WriteResult::WouldFormat {
+                    edit,
+                    style,
+                    fields,
+                } => WriteResult::Formatted {
+                    edit,
+                    style,
+                    fields,
+                },
                 WriteResult::WouldInsert { edit } => WriteResult::Inserted { edit },
                 WriteResult::WouldDelete { edit } => WriteResult::Deleted { edit },
                 // omni-dev: coverage ignore reason="`preview` is built by the payload match above, so an Insert/Delete/List payload always carries its matching edit preview; this arm exists solely for exhaustiveness over the shared WriteResult enum"
@@ -895,6 +977,23 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
                 .unwrap_or_default();
             format!("Would append: {chars} char(s) / {bytes} byte(s) to '{name}'{where_}")
         }
+        WriteResult::WouldFormat {
+            edit,
+            style,
+            fields,
+        }
+        | WriteResult::Formatted {
+            edit,
+            style,
+            fields,
+        } => {
+            let action = if matches!(outcome.result, WriteResult::WouldFormat { .. }) {
+                "Would format"
+            } else {
+                "Formatted"
+            };
+            format!("{action}: '{}' tab {:?} UTF-16 [{}, {}) / {} paragraph(s) / {} char(s) / {} byte(s); fields={fields}; style={style:?}", name, edit.tab_id, edit.start_index, edit.end_index, edit.paragraphs, edit.chars, edit.bytes)
+        }
         WriteResult::WouldInsert { edit }
         | WriteResult::Inserted { edit }
         | WriteResult::WouldDelete { edit }
@@ -949,15 +1048,15 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
              Grant it by id instead: add {{\"file_id\": \"<document id>\", \"allow\": \
              [\"{}\"]}} to write_permissions.rules. (Adding it to a folder in your \
              own Drive and granting that folder `{}` also works.)",
-            if verb == WriteVerb::Delete {
-                "docs-delete"
-            } else {
-                "docs-write"
+            match verb {
+                WriteVerb::Delete => "docs-delete",
+                WriteVerb::TextStyle | WriteVerb::ParagraphStyle => "docs-format",
+                _ => "docs-write",
             },
-            if verb == WriteVerb::Delete {
-                "docs-delete"
-            } else {
-                "docs-write"
+            match verb {
+                WriteVerb::Delete => "docs-delete",
+                WriteVerb::TextStyle | WriteVerb::ParagraphStyle => "docs-format",
+                _ => "docs-write",
             }
         ),
         WriteResult::RefusedNoRevisionId => format!(
@@ -2380,7 +2479,11 @@ mod tests {
 
     #[tokio::test]
     async fn unresolved_anchors_and_missing_revisions_never_mutate() {
-        for payload in anchored_payloads().into_iter().chain(list_payloads()) {
+        for payload in anchored_payloads()
+            .into_iter()
+            .chain(list_payloads())
+            .chain(formatting_payloads())
+        {
             for (text, revision, expected) in [
                 ("nothing", Some("r"), "missing"),
                 ("Q3 Q3", Some("r"), "ambiguous"),
@@ -2427,6 +2530,7 @@ mod tests {
             .into_iter()
             .chain(segment_payloads())
             .chain(list_payloads())
+            .chain(formatting_payloads())
         {
             for expected in [
                 WriteResult::RefusedNoLease,
@@ -2472,6 +2576,7 @@ mod tests {
             .into_iter()
             .chain(segment_payloads())
             .chain(list_payloads())
+            .chain(formatting_payloads())
         {
             let server = MockServer::start().await;
             let (drive, docs) = anchored_setup(&server).await;
@@ -2908,6 +3013,158 @@ mod tests {
             ),
         ] {
             assert_eq!(result.log_status(), status);
+        }
+    }
+    fn formatting_payloads() -> Vec<WritePayload> {
+        use super::super::style::*;
+        [
+            StylePatch::Text(TextStyle {
+                bold: Some(false),
+                italic: Some(true),
+                ..TextStyle::default()
+            }),
+            StylePatch::Paragraph(ParagraphStyle {
+                alignment: Some(Alignment::Center),
+                named_style_type: Some(NamedStyle::Heading1),
+            }),
+        ]
+        .into_iter()
+        .map(|style| WritePayload::Format {
+            from: "Q3".into(),
+            to: None,
+            match_case: true,
+            style,
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn formatting_previews_and_writes_share_exact_wire_effects() {
+        for payload in formatting_payloads() {
+            let server = MockServer::start().await;
+            let (drive, docs) = anchored_setup(&server).await;
+            let rule = rule_for(&payload);
+            let mut opts = replace_opts(true);
+            opts.payload = payload;
+            let preview = write(&drive, &docs, &opts, std::slice::from_ref(&rule)).await;
+            let (edit, style, fields) = match preview.result {
+                WriteResult::WouldFormat {
+                    edit,
+                    style,
+                    fields,
+                } => (edit, style, fields),
+                other => panic!("{other:?}"),
+            };
+            assert!(!server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.url.path().ends_with(":batchUpdate")));
+            mount_batch_update(serde_json::json!({"replies": [{}]}))
+                .expect(1)
+                .mount(&server)
+                .await;
+            opts.dry_run = false;
+            let actual = write(&drive, &docs, &opts, &[rule]).await;
+            assert_eq!(
+                actual.result,
+                WriteResult::Formatted {
+                    edit: edit.clone(),
+                    style: style.clone(),
+                    fields: fields.clone()
+                }
+            );
+            let requests = server.received_requests().await.unwrap();
+            for read in requests
+                .iter()
+                .filter(|r| r.url.path() == "/v1/documents/doc-1")
+            {
+                assert!(read
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "suggestionsViewMode" && v == "SUGGESTIONS_INLINE"));
+            }
+            let batch = requests
+                .iter()
+                .find(|r| r.url.path().ends_with(":batchUpdate"))
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+            assert_eq!(
+                body["writeControl"],
+                serde_json::json!({"requiredRevisionId": "rev-anchor"})
+            );
+            assert_eq!(body["requests"].as_array().unwrap().len(), 1);
+            let (verb, properties, expected_style, expected_range) = match style {
+                super::super::style::StylePatch::Text(_) => (
+                    "updateTextStyle",
+                    "textStyle",
+                    serde_json::json!({"bold": false, "italic": true}),
+                    (4, 6),
+                ),
+                super::super::style::StylePatch::Paragraph(_) => (
+                    "updateParagraphStyle",
+                    "paragraphStyle",
+                    serde_json::json!({"alignment": "CENTER", "namedStyleType": "HEADING_1"}),
+                    (1, 14),
+                ),
+            };
+            assert_eq!((edit.start_index, edit.end_index), expected_range);
+            assert_eq!(
+                body["requests"][0][verb],
+                serde_json::json!({"range": {"startIndex": edit.start_index, "endIndex": edit.end_index}, properties: expected_style, "fields": fields})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn formatting_is_blocked_before_content_reads_by_other_grants() {
+        for payload in formatting_payloads() {
+            for grant in [
+                DriveOperation::DocsWrite,
+                DriveOperation::DocsDelete,
+                DriveOperation::Edit,
+                DriveOperation::SheetsWrite,
+                DriveOperation::SlidesWrite,
+            ] {
+                let server = MockServer::start().await;
+                let (drive, docs) = clients(&server).await;
+                mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+                    .mount(&server)
+                    .await;
+                mount_folder("folder-1").mount(&server).await;
+                let mut rule = rule_for(&payload);
+                rule.allow = std::iter::once(grant).collect();
+                let mut opts = replace_opts(true);
+                opts.payload = payload.clone();
+                assert!(matches!(
+                    write(&drive, &docs, &opts, &[rule]).await.result,
+                    WriteResult::Blocked { .. }
+                ));
+                assert!(!server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.url.path().starts_with("/v1/documents")));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_style_and_invalid_anchors_fail_before_network() {
+        let mut payload = formatting_payloads().remove(0);
+        if let WritePayload::Format { style, .. } = &mut payload {
+            *style =
+                super::super::style::StylePatch::Text(super::super::style::TextStyle::default());
+        }
+        assert!(payload.validate().is_err());
+        for anchor in ["", "a\nb"] {
+            let mut payload = formatting_payloads().remove(0);
+            if let WritePayload::Format { from, .. } = &mut payload {
+                *from = anchor.into();
+            }
+            assert!(payload.validate().is_err());
         }
     }
 }

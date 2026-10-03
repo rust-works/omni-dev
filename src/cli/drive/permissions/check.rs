@@ -45,6 +45,8 @@ pub enum OperationArg {
     SlidesWrite,
     /// Anchor-addressed content deletion; separate from docs-write.
     DocsDelete,
+    /// Anchor-addressed text and paragraph styling.
+    DocsFormat,
 }
 
 impl From<OperationArg> for DriveOperation {
@@ -62,6 +64,7 @@ impl From<OperationArg> for DriveOperation {
             OperationArg::Trash => Self::Trash,
             OperationArg::SlidesWrite => Self::SlidesWrite,
             OperationArg::DocsDelete => Self::DocsDelete,
+            OperationArg::DocsFormat => Self::DocsFormat,
         }
     }
 }

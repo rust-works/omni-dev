@@ -29,6 +29,7 @@ pub mod client;
 pub mod create;
 pub mod read;
 pub mod structure;
+pub mod style;
 pub mod target;
 pub mod types;
 pub mod write;
