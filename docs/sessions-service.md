@@ -254,7 +254,9 @@ does not advance across system sleep (`Instant`: `CLOCK_UPTIME_RAW` on macOS,
 `CLOCK_MONOTONIC` on Linux), and the TTLs compare against that. A session alive
 at sleep survives until its feeds get a chance to report after the wake-up; a
 dead one is still ended promptly by the lock probe or the pid watcher, or by the
-TTL in awake time. The same applies to the 30 s window-report TTL.
+TTL in awake time. The same applies to the 30 s window-report TTL, and to the
+worktrees registry's own window TTL (#2126), which shares the clock
+(`crate::utils::awake_clock`).
 
 #### Pid-based liveness (#1916)
 
@@ -1035,8 +1037,6 @@ always includes it.
   `~/.pi/agent/sessions/` and a Feed 4 analogue over `pi --mode rpc` would each
   cover pi processes that do not load global extensions, but the extension
   already reports exact state for the ones that do.
-- **The worktrees registry still reaps on the wall clock.** Its window TTL has
-  the same sleep flaw the sessions registry had before #2108.
 - **Windows** support waits on the broader daemon Windows work (#1363); the hook
   sink and transcript scheme are already portable, only the socket transport is
   Unix-only.

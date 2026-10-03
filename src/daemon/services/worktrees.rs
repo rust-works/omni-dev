@@ -4696,10 +4696,11 @@ const CLOSE_WAIT_POLL: Duration = Duration::from_millis(250);
 
 /// Waits up to `timeout` for every window *other than* `requester` that has
 /// `path` open to unregister (close), polling the live registry every `poll`.
-/// A window whose `last_seen` has already gone stale is reaped by `list()` and
-/// so counts as closed. Returns an error naming the still-open windows on
-/// timeout, so the caller can surface "window did not close" and leave the
-/// worktree untouched (failure modes #4/#5).
+/// A window silent past the registry's TTL (in awake time, so a system sleep
+/// does not count) is reaped by `list()` and so counts as closed. Returns an
+/// error naming the still-open windows on timeout, so the caller can surface
+/// "window did not close" and leave the worktree untouched (failure modes
+/// #4/#5).
 async fn await_windows_closed(
     registry: &WorktreesRegistry,
     path: &Path,
@@ -5661,6 +5662,7 @@ mod tests {
             title: None,
             pid: None,
             last_seen: Utc::now(),
+            last_active: Duration::ZERO,
         };
         assert_eq!(display_name(&base), "my-repo");
 
@@ -5702,6 +5704,7 @@ mod tests {
                 title: Some("solo".to_string()),
                 pid: None,
                 last_seen: now,
+                last_active: Duration::ZERO,
             },
             // A folder-bearing, non-repo window: one clickable Action whose label
             // is the stats line ("name · title", since /tmp is not a git repo).
@@ -5712,6 +5715,7 @@ mod tests {
                 title: Some("a branch".to_string()),
                 pid: None,
                 last_seen: now,
+                last_active: Duration::ZERO,
             },
         ];
         let items = window_menu_items(&entries);
@@ -9333,6 +9337,7 @@ mod tests {
             title: Some("ignored title".to_string()),
             pid: None,
             last_seen: Utc::now(),
+            last_active: Duration::ZERO,
         };
         // Main checkout: `repo · branch`, and with no upstream there is no sync.
         assert_eq!(window_label(&entry), format!("{repo_name} · main"));
@@ -9373,6 +9378,7 @@ mod tests {
             title: None,
             pid: None,
             last_seen: Utc::now(),
+            last_active: Duration::ZERO,
         };
         // A tracking branch appends the `(+ahead -behind)` sync indicator.
         assert_eq!(window_label(&entry), format!("{repo_name} · main (+1 -1)"));
@@ -9438,6 +9444,7 @@ mod tests {
             title: None,
             pid: None,
             last_seen: Utc::now(),
+            last_active: Duration::ZERO,
         };
         // A worktree line: parent repo, the fork glyph, then the branch (no
         // upstream here, so no sync suffix).
@@ -11393,6 +11400,7 @@ mod tests {
             title: None,
             pid: None,
             last_seen: Utc::now(),
+            last_active: Duration::ZERO,
         }
     }
 
