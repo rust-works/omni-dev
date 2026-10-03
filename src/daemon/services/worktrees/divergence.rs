@@ -160,6 +160,7 @@ fn graph_ahead_behind_in(
 /// `<commondir>/worktrees/<name>`, while git keeps `shallow` in the common dir that
 /// every worktree shares. So that handle reports a shallow clone as complete
 /// (#2147). The two agree for a main checkout, whose gitdir is the common dir.
+/// The marker rule is libgit2's — a non-empty file — applied to the common dir.
 pub(super) fn is_shallow(repo: &Repository) -> bool {
     repo.is_shallow()
         || std::fs::metadata(repo.commondir().join("shallow"))
@@ -174,15 +175,22 @@ pub(super) fn is_shallow(repo: &Repository) -> bool {
 /// does not have: it fails with "object not found", and the row would lose its
 /// counts (#2147). A handle opened at the common dir reads the marker, and so
 /// does what git does. A failed open is `None` — no counts — rather than counts
-/// from the uncut history.
+/// from the uncut history, and is logged at `debug` (not `warn`: a shallow row is
+/// never cached by clients, so a persistent failure would repeat on every ask).
 fn walk_shallow(repo: &Repository, local: Oid, upstream: Oid) -> Option<(usize, usize)> {
     if !repo.is_worktree() {
         return repo.graph_ahead_behind(local, upstream).ok();
     }
-    Repository::open(repo.commondir())
-        .ok()?
-        .graph_ahead_behind(local, upstream)
-        .ok()
+    match Repository::open(repo.commondir()) {
+        Ok(common) => common.graph_ahead_behind(local, upstream).ok(),
+        Err(e) => {
+            tracing::debug!(
+                "cannot open {} to walk a shallow repository: {e}",
+                repo.commondir().display()
+            );
+            None
+        }
+    }
 }
 
 /// One computation for one worktree, shared by every request that joins it.
@@ -722,12 +730,35 @@ mod tests {
 
         assert!(is_shallow(&repo));
         assert!(is_shallow(&linked));
-        // The premise: the handle's own answer is the wrong one for a linked worktree.
-        assert!(!linked.is_shallow());
 
-        // An empty marker is not shallow, for git and libgit2 alike.
+        // An empty marker is not shallow: libgit2's rule for a main checkout, which
+        // the common-dir check follows so the two cannot disagree. (git removes the
+        // file when it unshallows, so an empty one is not a state git leaves.)
         std::fs::write(repo.commondir().join("shallow"), "").unwrap();
         assert!(!is_shallow(&repo) && !is_shallow(&linked));
+    }
+
+    /// The premise of [`is_shallow`] and [`walk_shallow`], pinned the way
+    /// `shared_repo`'s `libgit2_reads_shallow_grafts_when_a_repository_is_opened`
+    /// pins its own: a handle opened at a linked worktree neither reports the common
+    /// dir's marker nor applies its cut, while one at the common dir does both. If
+    /// libgit2 starts looking in the common dir this fails, which means the
+    /// workaround has become unnecessary, not that it regressed.
+    #[test]
+    fn libgit2_ignores_the_common_dirs_shallow_marker_from_a_linked_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        let (repo, base, first, second) = three_commits(dir.path());
+        let path = add_linked_worktree(&repo, base, wts.path(), "feature");
+        mark_shallow(&repo, first);
+        forget_object(&repo, base);
+        let linked = Repository::open(path).unwrap();
+        let common = Repository::open(repo.commondir()).unwrap();
+
+        assert!(!linked.is_shallow());
+        assert!(linked.graph_ahead_behind(second, first).is_err());
+        assert!(common.is_shallow());
+        assert_eq!(common.graph_ahead_behind(second, first).unwrap(), (1, 0));
     }
 
     #[test]
@@ -779,15 +810,30 @@ mod tests {
         mark_shallow(&repo, first);
         forget_object(&repo, base);
         let linked = Repository::open(path).unwrap();
-        assert!(
-            linked.graph_ahead_behind(second, first).is_err(),
-            "the premise: a handle that ignores the cut cannot walk this"
-        );
 
         assert_eq!(
             graph_ahead_behind_in(&memo, &linked, second, first),
             Some((1, 0))
         );
+    }
+
+    /// A common dir that will not open leaves the row without counts, not with
+    /// counts from a handle that ignores the cut.
+    #[test]
+    fn a_common_dir_that_will_not_open_leaves_a_shallow_worktree_without_counts() {
+        let memo = WalkMemo::with_capacity(8);
+        let dir = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        let (repo, base, first, second) = three_commits(dir.path());
+        let linked =
+            Repository::open(add_linked_worktree(&repo, base, wts.path(), "feature")).unwrap();
+        mark_shallow(&repo, first);
+        // Without `HEAD` the directory is no longer a repository to libgit2.
+        std::fs::remove_file(repo.commondir().join("HEAD")).unwrap();
+        assert!(Repository::open(repo.commondir()).is_err());
+
+        assert_eq!(graph_ahead_behind_in(&memo, &linked, second, first), None);
+        assert_eq!(memo.len(), 0);
     }
 
     /// base ← first ← second, written into a fresh repository at `dir`.
