@@ -52,7 +52,7 @@ mod tests {
     fn dispatches_to_diff() {
         let cmd = CoverageCommand {
             command: CoverageSubcommands::Diff(Box::new(diff::DiffCommand {
-                report: std::path::PathBuf::from("/nonexistent/report.lcov"),
+                report: vec![std::path::PathBuf::from("/nonexistent/report.lcov")],
                 report_format: diff::ReportFormat::Auto,
                 base_ref: Some("HEAD".to_string()),
                 head_ref: None,

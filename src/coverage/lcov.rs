@@ -110,6 +110,25 @@ end_of_record
         assert_eq!(report.hits("src/b.rs", 2), Some(2));
     }
 
+    /// Concatenated shard files parse as the same union `CoverageReport::merge`
+    /// builds: the docs tell a caller that needs a single file (a baseline) that
+    /// `cat shard-*.lcov` is equivalent, so that has to stay true.
+    #[test]
+    fn concatenated_shards_parse_as_their_merge() {
+        let shard_a = "TN:\nSF:src/a.rs\nDA:1,3\nDA:2,0\nend_of_record\n";
+        let shard_b = "TN:\nSF:src/a.rs\nDA:1,0\nDA:2,2\nDA:3,0\nend_of_record\n\
+                       SF:src/b.rs\nDA:1,1\nend_of_record\n";
+
+        let mut merged = parse(shard_a).unwrap();
+        merged.merge(parse(shard_b).unwrap());
+        let concatenated = parse(&format!("{shard_a}{shard_b}")).unwrap();
+
+        assert_eq!(concatenated, merged);
+        assert_eq!(concatenated.hits("src/a.rs", 1), Some(3));
+        assert_eq!(concatenated.hits("src/a.rs", 2), Some(2));
+        assert_eq!(concatenated.hits("src/a.rs", 3), Some(0));
+    }
+
     #[test]
     fn ignores_branch_and_function_records() {
         let lcov = "\

@@ -3226,9 +3226,9 @@ Usage: diff [OPTIONS] --report <PATH>
 
 Options:
       --report <PATH>
-          Head coverage report (lcov / llvm-cov-json / cobertura)
+          Head coverage report (lcov / llvm-cov-json / cobertura); repeat once per shard to merge a sharded run
       --report-format <REPORT_FORMAT>
-          Format of `--report` (auto-detected by default) [default: auto] [possible values: auto, lcov, llvm-cov-json, cobertura]
+          Format of every `--report` (auto-detected by default) [default: auto] [possible values: auto, lcov, llvm-cov-json, cobertura]
       --base-ref <REV>
           Base revision to diff against (default: merge-base of `origin/main` and `HEAD`)
       --head-ref <REV>
