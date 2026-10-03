@@ -345,9 +345,9 @@ A one-time account + secrets setup is required before the first publish:
   `OVSX_PAT`. If `OVSX_PAT` is unset the workflow publishes to the Marketplace only
   and skips Open VSX (rather than failing), so you can add it later.
 
-Both tokens expire. The Marketplace is published first and a failed publish there
-also skips Open VSX, so an expired `VSCE_PAT` stops both registries; check them
-with `vsce verify-pat rust-works` / `ovsx verify-pat rust-works` before tagging
-(see the release guide).
+Both tokens expire. The two registries are published independently, so an expired
+token turns the run red without keeping the release from the other registry; check
+them with `vsce verify-pat rust-works` / `ovsx verify-pat rust-works` before
+tagging (see the release guide).
 
 See [#1279](https://github.com/rust-works/omni-dev/issues/1279).
