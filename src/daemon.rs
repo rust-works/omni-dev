@@ -121,6 +121,9 @@ pub struct DaemonRunConfig {
 /// are likewise cheap (in-memory only); they fill as VS Code windows register and
 /// as Claude Code hooks/transcripts report.
 ///
+/// `socket_path` is the control socket; the sessions service reads the hook
+/// journals beside it (#2108).
+///
 /// `services` selects which of the four to host. A service outside the selection
 /// is never constructed, so its startup work is skipped entirely — no bridge TCP
 /// planes, no worktrees pollers, no sessions watcher (#1318). The default
@@ -130,6 +133,7 @@ pub async fn build_default_registry(
     bridge_config: BridgeConfig,
     bridge_token_file: Option<&Path>,
     bridge_token_path: PathBuf,
+    socket_path: &Path,
     services: &ServiceSelection,
 ) -> Result<ServiceRegistry> {
     let mut registry = ServiceRegistry::new();
@@ -177,8 +181,10 @@ pub async fn build_default_registry(
     if services.includes(DaemonServiceKind::Sessions) {
         // The cross-window Claude Code sessions tracker; start its transcript watcher
         // (Feed 2) so sessions predating the daemon — and the hook-silent thinking
-        // window — are still tracked (#1210).
-        let sessions = SessionsService::new();
+        // window — are still tracked (#1210). It also replays and tails the hook
+        // journals the sink writes beside the control socket (#2108).
+        let sessions = SessionsService::new()
+            .with_journal_dir(paths::sessions_journal_dir_for_socket(socket_path));
         sessions.start_watcher();
         registry.register(Arc::new(sessions));
     }
@@ -204,6 +210,7 @@ pub async fn run_headless(cfg: DaemonRunConfig) -> Result<()> {
         cfg.bridge_config,
         cfg.bridge_token_file.as_deref(),
         cfg.bridge_token_path,
+        &cfg.socket_path,
         &cfg.services,
     )
     .await?;
@@ -232,6 +239,7 @@ mod tests {
             BridgeConfig::default(),
             None,
             PathBuf::from("/nonexistent/bridge.token"),
+            Path::new("/nonexistent/daemon.sock"),
             &selection,
         )
         .await

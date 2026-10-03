@@ -172,7 +172,7 @@ fn read_head(path: &Path) -> Head {
 
 /// The state of a thread's writer lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LockState {
+pub(crate) enum LockState {
     /// Codex holds it: the thread is loaded in a live process.
     Held,
     /// The file exists and nobody holds it: the holder exited or was killed.
@@ -210,6 +210,17 @@ fn probe_lock(locks: &Path, id: &str) -> LockState {
 #[cfg(not(unix))]
 fn probe_lock(_locks: &Path, _id: &str) -> LockState {
     LockState::Unknown
+}
+
+/// The state of thread `id`'s writer lock under the resolved Codex home, for the
+/// journal replay (#2108): a held lock is proof a live process has the thread
+/// loaded, a free or absent one that it is gone. [`LockState::Unknown`] when no
+/// Codex home resolves.
+pub(crate) fn probe_thread_lock(id: &str) -> LockState {
+    match codex_home() {
+        Some(home) => probe_lock(&home.join("thread-writer-locks"), id),
+        None => LockState::Unknown,
+    }
 }
 
 /// The watcher's record of one rollout file.
