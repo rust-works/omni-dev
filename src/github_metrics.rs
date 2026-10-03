@@ -23,6 +23,9 @@ use chrono::{DateTime, Utc};
 use crate::request_log::{self, GhOutcome, LogRecord, RecordKind, Source};
 
 mod app_auth;
+mod incremental;
+
+pub use incremental::IncrementalCounts;
 
 /// Whether a `gh` invocation hit the GitHub API, and how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -219,6 +222,11 @@ pub fn aggregate(
     let Ok(file) = std::fs::File::open(path) else {
         return counts; // no log yet → zero counts
     };
+    let filter = Filter {
+        since,
+        until,
+        source,
+    };
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else { break };
         if line.is_empty() {
@@ -227,26 +235,44 @@ pub fn aggregate(
         let Ok(rec) = serde_json::from_str::<LogRecord>(&line) else {
             continue; // skip malformed/partial lines, as the stream reader does
         };
+        filter.tally(&mut counts, &rec);
+    }
+    counts
+}
+
+/// What a record must be to be tallied: a `gh` record, optionally from one
+/// `source`, optionally inside a `[since, until]` window.
+///
+/// Shared by [`aggregate`] (an arbitrary window over the whole log) and
+/// [`IncrementalCounts`] (one fixed window over the records appended since it
+/// started), so the two cannot disagree about what counts.
+#[derive(Debug, Clone, Copy)]
+struct Filter {
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    source: Option<Source>,
+}
+
+impl Filter {
+    /// Tallies `rec` into `counts` when it passes the filter.
+    fn tally(&self, counts: &mut GhCounts, rec: &LogRecord) {
         if rec.kind != RecordKind::Gh {
-            continue;
+            return;
         }
         let rec_source = rec.source.unwrap_or(Source::Unknown);
-        if let Some(want) = source {
-            if rec_source != want {
-                continue;
-            }
+        if self.source.is_some_and(|want| rec_source != want) {
+            return;
         }
-        if since.is_some() || until.is_some() {
+        if self.since.is_some() || self.until.is_some() {
             let Some(ts) = parse_timestamp(&rec.timestamp) else {
-                continue; // undateable record can't be windowed → drop it
+                return; // undateable record can't be windowed → drop it
             };
-            if since.is_some_and(|s| ts < s) || until.is_some_and(|u| ts > u) {
-                continue;
+            if self.since.is_some_and(|s| ts < s) || self.until.is_some_and(|u| ts > u) {
+                return;
             }
         }
         counts.tally(&rec.command, rec_source);
     }
-    counts
 }
 
 /// Parses a record's RFC3339 timestamp to UTC, or `None` when unparseable.
