@@ -2163,6 +2163,7 @@ mod tests {
             crate::sessions::DeliveryStats {
                 socket: 0,
                 recovered: 0,
+                superseded: 0,
                 replayed: 2
             }
         );
@@ -2187,6 +2188,7 @@ mod tests {
             crate::sessions::DeliveryStats {
                 socket: 0,
                 recovered: 1,
+                superseded: 0,
                 replayed: 2
             }
         );
@@ -2236,6 +2238,7 @@ mod tests {
             crate::sessions::DeliveryStats {
                 socket: 0,
                 recovered: 2,
+                superseded: 0,
                 replayed: 0
             }
         );
