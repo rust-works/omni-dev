@@ -2933,6 +2933,8 @@ mod tests {
             (WriteVerb::Delete, "delete"),
             (WriteVerb::CreateBullets, "create-bullets"),
             (WriteVerb::DeleteBullets, "delete-bullets"),
+            (WriteVerb::TextStyle, "text-style"),
+            (WriteVerb::ParagraphStyle, "paragraph-style"),
         ] {
             let text = describe(&outcome_with(not_a_doc.clone()), verb);
             assert!(text.contains(&format!("`drive docs {label}`")), "{text}");
@@ -2943,6 +2945,8 @@ mod tests {
             (WriteVerb::Delete, "docs-delete"),
             (WriteVerb::CreateBullets, "docs-write"),
             (WriteVerb::DeleteBullets, "docs-write"),
+            (WriteVerb::TextStyle, "docs-format"),
+            (WriteVerb::ParagraphStyle, "docs-format"),
         ] {
             let text = describe(&outcome_with(WriteResult::RefusedNoVisibleParents), verb);
             assert!(text.contains(&format!("[\"{grant}\"]")), "{text}");
@@ -3011,10 +3015,80 @@ mod tests {
                 },
                 "deleted",
             ),
+            (
+                WriteResult::WouldFormat {
+                    edit: preview_edit(),
+                    style: formatting_style(),
+                    fields: "bold".to_string(),
+                },
+                "would-format",
+            ),
+            (
+                WriteResult::Formatted {
+                    edit: preview_edit(),
+                    style: formatting_style(),
+                    fields: "bold".to_string(),
+                },
+                "formatted",
+            ),
         ] {
             assert_eq!(result.log_status(), status);
         }
     }
+
+    fn formatting_style() -> super::super::style::StylePatch {
+        super::super::style::StylePatch::Text(super::super::style::TextStyle {
+            bold: Some(true),
+            ..super::super::style::TextStyle::default()
+        })
+    }
+
+    /// A preview and the write it predicts differ only in the leading verb;
+    /// the range, counts, property mask and explicit style are reported
+    /// identically so the two can be diffed by eye.
+    #[test]
+    fn describe_renders_a_formatting_outcome_with_its_range_mask_and_style() {
+        for (result, expected) in [
+            (
+                WriteResult::WouldFormat {
+                    edit: preview_edit(),
+                    style: formatting_style(),
+                    fields: "bold".to_string(),
+                },
+                "Would format",
+            ),
+            (
+                WriteResult::Formatted {
+                    edit: preview_edit(),
+                    style: formatting_style(),
+                    fields: "bold".to_string(),
+                },
+                "Formatted",
+            ),
+        ] {
+            let text = describe(&outcome_with(result), WriteVerb::TextStyle);
+            assert!(
+                text.starts_with(&format!(
+                    "{expected}: 'Budget' tab None UTF-16 [4, 6) / 1 paragraph(s) / 1 char(s) / 4 byte(s); fields=bold; style="
+                )),
+                "{text}"
+            );
+            assert!(text.contains("bold: Some(true)"), "{text}");
+        }
+
+        let mut edit = preview_edit();
+        edit.tab_id = Some("t.1".to_string());
+        let text = describe(
+            &outcome_with(WriteResult::Formatted {
+                edit,
+                style: formatting_style(),
+                fields: "bold".to_string(),
+            }),
+            WriteVerb::TextStyle,
+        );
+        assert!(text.contains("tab Some(\"t.1\")"), "{text}");
+    }
+
     fn formatting_payloads() -> Vec<WritePayload> {
         use super::super::style::*;
         [

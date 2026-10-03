@@ -766,6 +766,102 @@ mod tests {
         }
     }
 
+    fn style_selection(
+        match_text: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> docs::style::Selection {
+        docs::style::Selection {
+            document_id: "d1".to_string(),
+            match_text: match_text.map(str::to_string),
+            from: from.map(str::to_string),
+            to: to.map(str::to_string),
+            ignore_case: true,
+            dry_run: false,
+            lease: crate::cli::drive::helpers::LeaseTokenArg { lease: None },
+            output: OutputFormat::Table,
+        }
+    }
+
+    fn text_style_command(
+        match_text: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> DriveSubcommands {
+        DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::TextStyle(docs::style::TextStyleCommand {
+                selection: style_selection(match_text, from, to),
+                bold: Some(true),
+                italic: None,
+                underline: None,
+                strikethrough: None,
+            }),
+        })
+    }
+
+    fn paragraph_style_command(
+        match_text: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> DriveSubcommands {
+        use crate::drive::docs::style::{Alignment, NamedStyle};
+        DriveSubcommands::Docs(docs::DocsCommand {
+            command: docs::DocsSubcommands::ParagraphStyle(docs::style::ParagraphStyleCommand {
+                selection: style_selection(match_text, from, to),
+                alignment: Some(Alignment::Center),
+                named_style: Some(NamedStyle::Title),
+            }),
+        })
+    }
+
+    /// Both formatting verbs reach the engine for a single match and for an
+    /// inclusive range, and — like every Docs write verb — report an
+    /// unreachable API on the output rather than the exit code (see
+    /// `dispatch_routes_docs_replace`).
+    #[tokio::test]
+    async fn dispatch_routes_docs_text_style_and_paragraph_style_for_a_match_and_for_a_range() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        for cmd in [
+            text_style_command(Some("a"), None, None),
+            text_style_command(None, Some("a"), Some("b")),
+            paragraph_style_command(Some("a"), None, None),
+            paragraph_style_command(None, Some("a"), Some("b")),
+        ] {
+            assert!(cmd.dispatch(&dead_client()).await.is_ok());
+        }
+    }
+
+    /// The engine never runs when the selection is ambiguous. clap already
+    /// refuses these, so the check guards commands built any other way.
+    #[tokio::test]
+    async fn dispatch_refuses_a_format_that_is_not_a_match_or_a_full_range() {
+        let guard = crate::drive::test_support::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        guard.redirect_api_hosts_to_a_dead_port();
+
+        for (match_text, from, to) in [
+            (None, None, None),
+            (None, Some("a"), None),
+            (None, None, Some("b")),
+            (Some("a"), Some("a"), Some("b")),
+            (Some("a"), Some("a"), None),
+        ] {
+            for cmd in [
+                text_style_command(match_text, from, to),
+                paragraph_style_command(match_text, from, to),
+            ] {
+                let err = cmd.dispatch(&dead_client()).await.unwrap_err();
+                assert!(
+                    err.to_string().contains("--match or both --from and --to"),
+                    "{err}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_routes_docs_create() {
         let guard = crate::drive::test_support::EnvGuard::take();

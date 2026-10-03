@@ -645,7 +645,7 @@ pub fn resolve_format(
             cursor = run.end;
         }
         if cursor != p.end {
-            return Err(AnchorError::UnsafeRange);
+            return Err(AnchorError::UnsafeRange); // omni-dev: coverage ignore-line reason="collect refuses a paragraph whose last run does not end at the paragraph's end, and the loop above leaves cursor on the last run's end, so cursor always equals p.end here; kept as defence in depth on the write boundary"
         }
     }
     edit.start_index = first.start;
@@ -1299,6 +1299,23 @@ mod tests {
         assert!(resolve_format(&document, "anchor", None, true, false).is_ok());
         assert_eq!(
             resolve_format(&document, "anchor", None, true, true),
+            Err(AnchorError::UnsafeRange)
+        );
+    }
+
+    /// `resolve_delete` only walks the runs under the anchors, so paragraph
+    /// styling re-checks that the whole paragraphs it widens to tile the range
+    /// without overlapping — a server-side inconsistency must not be styled.
+    #[test]
+    fn paragraph_formatting_refuses_paragraphs_whose_indices_overlap() {
+        let document = doc(vec![
+            paragraph(1, &["aaaaaa\n"]),
+            paragraph(5, &["bbbbbb\n"]),
+        ]);
+        assert!(resolve_delete(&document, "aaaaaa", Some("bbbbbb"), true).is_ok());
+        assert!(resolve_format(&document, "aaaaaa", Some("bbbbbb"), true, false).is_ok());
+        assert_eq!(
+            resolve_format(&document, "aaaaaa", Some("bbbbbb"), true, true),
             Err(AnchorError::UnsafeRange)
         );
     }
