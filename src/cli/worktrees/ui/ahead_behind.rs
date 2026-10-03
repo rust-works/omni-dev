@@ -11,13 +11,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use super::client::WorktreesClient;
 use super::view_model::AheadBehindState;
 use super::wire::AheadBehindEntryWire;
+
+/// How long to wait before re-asking after the first failed batch. Each further
+/// consecutive failure doubles it, up to [`MAX_RETRY_DELAY`].
+const RETRY_BASE: Duration = Duration::from_secs(2);
+
+/// The longest the cache waits between retries of a daemon that keeps failing.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 pub struct AheadBehindCache {
     client: WorktreesClient,
@@ -25,6 +34,15 @@ pub struct AheadBehindCache {
     pending: HashSet<PathBuf>,
     results_tx: mpsc::UnboundedSender<FetchResult>,
     results_rx: mpsc::UnboundedReceiver<FetchResult>,
+    /// The set the last [`set_visible`](Self::set_visible) was given, so a
+    /// timed retry knows what to re-ask.
+    wanted: Vec<PathBuf>,
+    /// Consecutive failed batches since a batch last succeeded; sets the delay.
+    failures: u32,
+    /// When the next timed retry is due. `None` while nothing has failed.
+    retry_at: Option<Instant>,
+    /// The delay after the first failure; a field so tests need not wait seconds.
+    retry_base: Duration,
 }
 
 /// One completed batch: the paths it was fetched *for* (so results are
@@ -47,6 +65,10 @@ impl AheadBehindCache {
             pending: HashSet::new(),
             results_tx,
             results_rx,
+            wanted: Vec::new(),
+            failures: 0,
+            retry_at: None,
+            retry_base: RETRY_BASE,
         }
     }
 
@@ -54,6 +76,7 @@ impl AheadBehindCache {
     /// interest, and queues a batched fetch for any newly-of-interest path
     /// with no cached (or already in-flight) entry.
     pub fn set_visible(&mut self, paths: &[PathBuf]) {
+        self.wanted = paths.to_vec();
         let visible: HashSet<&PathBuf> = paths.iter().collect();
         self.entries.retain(|path, _| visible.contains(path));
         let to_fetch: Vec<PathBuf> = paths
@@ -88,21 +111,34 @@ impl AheadBehindCache {
     }
 
     /// Resolves once a fetch batch's results land, merging them into the
-    /// cache. Intended as a `tokio::select!` branch alongside a hub's other
+    /// cache, or once a failed batch's retry falls due and has re-queued what
+    /// is missing. Intended as a `tokio::select!` branch alongside a hub's other
     /// feeds; never resolves if nothing has ever been queued.
     ///
     /// A failed batch stores nothing: its paths stop being pending and read as
     /// [`Unknown`](AheadBehindState::Unknown) again, so the next
-    /// [`set_visible`](Self::set_visible) re-queues them. That call rides the
-    /// tree feed's own cadence (the hub makes it per `Live` frame, and the
-    /// renderer only re-reports the visible rows when they change), so a daemon
-    /// that keeps failing is retried at the feed's pace, never in a loop.
+    /// [`set_visible`](Self::set_visible) re-queues them. The hub makes that
+    /// call per `Live` tree frame, and the renderer re-reports the visible rows
+    /// only when they change — but the daemon sends a frame only when the
+    /// snapshot differs, so on a quiet repo nothing would call it. A timed retry
+    /// covers that: it backs off from [`RETRY_BASE`] to [`MAX_RETRY_DELAY`]
+    /// while the failures last, so a daemon that keeps failing is asked at that
+    /// pace and never in a loop.
     pub async fn changed(&mut self) {
-        let Some(FetchResult { requested, results }) = self.results_rx.recv().await else {
-            return;
-        };
+        tokio::select! {
+            batch = self.results_rx.recv() => {
+                if let Some(batch) = batch {
+                    self.merge(batch);
+                }
+            }
+            () = wait_until(self.retry_at) => self.retry(),
+        }
+    }
+
+    fn merge(&mut self, FetchResult { requested, results }: FetchResult) {
         match results {
             Ok(results) => {
+                self.failures = 0;
                 for path in requested {
                     let state = state_for(results.get(&path));
                     self.entries.insert(path.clone(), state);
@@ -110,15 +146,38 @@ impl AheadBehindCache {
                 }
             }
             Err(e) => {
+                self.failures = self.failures.saturating_add(1);
+                let due = Instant::now() + self.retry_delay();
+                self.retry_at = Some(self.retry_at.map_or(due, |at| at.min(due)));
                 tracing::debug!(
-                    "worktrees ui: ahead-behind fetch for {} path(s) failed, will retry: {e:#}",
-                    requested.len()
+                    "worktrees ui: ahead-behind fetch for {} path(s) failed \
+                     ({} in a row), retrying in {:?}: {e:#}",
+                    requested.len(),
+                    self.failures,
+                    self.retry_delay(),
                 );
                 for path in &requested {
                     self.pending.remove(path);
                 }
             }
         }
+    }
+
+    /// Re-asks for whatever the last visible set is still missing: a no-op for
+    /// anything cached or already in flight.
+    fn retry(&mut self) {
+        self.retry_at = None;
+        let wanted = std::mem::take(&mut self.wanted);
+        self.set_visible(&wanted);
+    }
+
+    /// The wait after the current run of failures: `retry_base`, doubled per
+    /// failure beyond the first, capped at [`MAX_RETRY_DELAY`].
+    fn retry_delay(&self) -> Duration {
+        let doublings = self.failures.saturating_sub(1).min(16);
+        self.retry_base
+            .saturating_mul(1 << doublings)
+            .min(MAX_RETRY_DELAY)
     }
 
     pub fn get(&self, path: &Path) -> AheadBehindState {
@@ -130,6 +189,15 @@ impl AheadBehindCache {
         } else {
             AheadBehindState::Unknown
         }
+    }
+}
+
+/// Sleeps until `at`, or forever when there is no deadline — a `select!` arm
+/// that stays quiet until something is scheduled.
+async fn wait_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -447,6 +515,96 @@ mod tests {
                 main_behind: None
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_is_retried_without_another_set_visible_call() {
+        // The daemon pushes a tree frame only when the snapshot differs, so on a
+        // quiet repo nothing re-runs `set_visible` after a failure. The cache has
+        // to ask again on its own.
+        let (_dir, sock, _server) = fake_daemon_replies(vec![
+            json!({ "ok": false, "error": "busy" }),
+            json!({ "ok": true, "payload": { "results": {
+                "/repo/wt": { "ahead": 2, "behind": 1 }
+            }}}),
+        ]);
+        let mut cache = AheadBehindCache::new(WorktreesClient::new(sock));
+        cache.retry_base = Duration::from_millis(5);
+        let path = PathBuf::from("/repo/wt");
+
+        cache.set_visible(std::slice::from_ref(&path));
+        settle(&mut cache).await;
+        assert_eq!(cache.get(&path), AheadBehindState::Unknown);
+        assert!(cache.retry_at.is_some(), "a failure schedules a retry");
+
+        // No `set_visible` here: the timer alone re-queues the path.
+        settle(&mut cache).await;
+        assert_eq!(cache.get(&path), AheadBehindState::Loading);
+        assert!(cache.retry_at.is_none(), "the retry was consumed");
+
+        settle(&mut cache).await;
+        assert_eq!(
+            cache.get(&path),
+            AheadBehindState::Known {
+                ahead: 2,
+                behind: 1,
+                main_behind: None
+            }
+        );
+        assert_eq!(cache.failures, 0, "a good batch ends the run of failures");
+    }
+
+    #[tokio::test]
+    async fn a_run_of_failures_backs_off_and_a_success_ends_it() {
+        let mut cache = cache();
+        let path = PathBuf::from("/repo/wt");
+        let send = |cache: &AheadBehindCache, results| {
+            cache
+                .results_tx
+                .send(FetchResult {
+                    requested: vec![path.clone()],
+                    results,
+                })
+                .unwrap();
+        };
+
+        send(&cache, Err(anyhow::anyhow!("busy")));
+        cache.changed().await;
+        let first = cache.retry_at.unwrap();
+        send(&cache, Err(anyhow::anyhow!("busy")));
+        cache.changed().await;
+        assert_eq!(cache.failures, 2);
+        // The earlier deadline stands: a later failure never postpones a retry.
+        assert_eq!(cache.retry_at, Some(first));
+
+        send(&cache, Ok(HashMap::new()));
+        cache.changed().await;
+        assert_eq!(cache.failures, 0);
+    }
+
+    #[test]
+    fn retry_delay_doubles_per_consecutive_failure_up_to_the_cap() {
+        let mut cache = cache();
+        let delays: Vec<Duration> = (1..=6)
+            .map(|failures| {
+                cache.failures = failures;
+                cache.retry_delay()
+            })
+            .collect();
+        assert_eq!(delays, [2, 4, 8, 16, 30, 30].map(Duration::from_secs));
+        // A daemon that has failed for a very long time never overflows.
+        cache.failures = u32::MAX;
+        assert_eq!(cache.retry_delay(), MAX_RETRY_DELAY);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_scheduled_until_a_fetch_fails() {
+        let mut cache = cache();
+        assert!(cache.retry_at.is_none());
+        // With nothing queued and nothing failed, `changed` never resolves, so a
+        // hub's `select!` arm on it stays quiet.
+        let waited = tokio::time::timeout(Duration::from_millis(30), cache.changed()).await;
+        assert!(waited.is_err());
     }
 
     #[tokio::test]
