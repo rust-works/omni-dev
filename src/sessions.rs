@@ -1116,9 +1116,9 @@ impl SessionsRegistry {
     /// fire on every tool call (the `heartbeat` precedent in
     /// [`WorktreesRegistry`](crate::worktrees::WorktreesRegistry)).
     ///
-    /// For the daemon's own in-process feeds: it is [`Origin::Local`], which
+    /// For the daemon's own in-process feeds: it is the `Local` origin, which
     /// [`DeliveryStats`] does not count. The control socket's feed goes through
-    /// [`observe_stamped`](Self::observe_stamped) as [`Origin::Socket`].
+    /// `observe_stamped` as the `Socket` origin.
     pub fn observe(&self, req: ObserveRequest) {
         self.observe_stamped(req, None, Origin::Local);
     }
@@ -1295,7 +1295,7 @@ impl SessionsRegistry {
     /// longer owns.
     ///
     /// For the daemon's own in-process feeds, as [`observe`](Self::observe) is
-    /// ([`Origin::Local`]).
+    /// (the `Local` origin).
     pub fn end(&self, session_id: &str, reason: Option<&str>, pid: Option<u32>) -> bool {
         self.end_stamped(session_id, reason, pid, None, Origin::Local)
     }
