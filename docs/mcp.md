@@ -373,7 +373,7 @@ Read-only YouTube content fetch. The mutating `sync` subcommand has no MCP form.
 
 | Tool | Purpose | CLI equivalent |
 |------|---------|----------------|
-| `coverage_diff` | Diff/patch coverage from a report path + git diff; returns the rendered report, patch and overall line percentages, and both gate results. Never fails the call — reports `below_gate` / `below_line_gate` instead | `omni-dev coverage diff` |
+| `coverage_diff` | Diff/patch coverage from a report path + git diff; returns the rendered report, patch and overall line percentages, and both gate results. `additional_reports` merges further shard reports with `report`. Never fails the call — reports `below_gate` / `below_line_gate` instead | `omni-dev coverage diff` |
 
 ### Browser bridge (1 tool)
 
