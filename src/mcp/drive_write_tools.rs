@@ -1209,6 +1209,71 @@ mod tests {
             .any(|r| r.url.path().ends_with(":batchUpdate")));
     }
 
+    /// Formatting outcomes — previews and applied writes alike — are successes,
+    /// not refusals, so the MCP result must not carry `is_error`.
+    #[test]
+    fn docs_formatting_outcomes_are_not_errors() {
+        use crate::drive::docs::anchor::{EditPreview, ListPreview};
+        use crate::drive::docs::style::{StylePatch, TextStyle};
+        use crate::drive::docs::write_types::BulletPreset;
+
+        let edit = EditPreview {
+            start_index: 1,
+            end_index: 4,
+            tab_id: None,
+            segment_id: None,
+            segment_kind: None,
+            paragraphs: 1,
+            chars: 3,
+            bytes: 3,
+        };
+        let list = ListPreview {
+            start_index: 1,
+            end_index: 5,
+            tab_id: None,
+            paragraphs: 1,
+            leading_tabs_removed: 0,
+        };
+        let style = StylePatch::Text(TextStyle {
+            bold: Some(true),
+            ..TextStyle::default()
+        });
+        let preset = Some(BulletPreset::BulletDiscCircleSquare);
+
+        for (result, is_error) in [
+            (
+                docs_write::WriteResult::WouldFormat {
+                    edit: edit.clone(),
+                    style: style.clone(),
+                    fields: "bold".into(),
+                },
+                false,
+            ),
+            (
+                docs_write::WriteResult::Formatted {
+                    edit: edit.clone(),
+                    style,
+                    fields: "bold".into(),
+                },
+                false,
+            ),
+            (
+                docs_write::WriteResult::WouldFormatList {
+                    edit: list.clone(),
+                    preset,
+                },
+                false,
+            ),
+            (
+                docs_write::WriteResult::ListFormatted { edit: list, preset },
+                false,
+            ),
+            (docs_write::WriteResult::RefusedNoLease, true),
+        ] {
+            assert_eq!(docs_is_error(&result), is_error, "{result:?}");
+        }
+    }
+
     #[test]
     fn expiry_is_bounded_and_acquisition_has_no_policy_override() {
         let guard = EnvGuard::take();
