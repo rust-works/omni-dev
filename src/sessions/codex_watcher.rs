@@ -23,17 +23,42 @@
 //!    on the TTL while its process lives on. A held lock is re-reported as a
 //!    state-preserving heartbeat.
 //!
+//! 4. **A hook-less session's turn state** (#2135). A session with no hook feed —
+//!    started before the hooks were installed and trusted — would otherwise read
+//!    `idle` for good. While its thread lock is held, the rollout's last turn
+//!    marker says whether a turn is running (below).
+//!
 //! What it reads, and what it never does:
 //!
-//! - Only the **first line** of a rollout (`session_meta`, bounded to
-//!   [`MAX_HEAD_BYTES`]), and from it only `id`/`session_id`, `cwd` and `source`;
-//!   never a conversation line. Growth is size/mtime only. Nothing is logged.
+//! - The **first line** of a rollout (`session_meta`, bounded to
+//!   [`MAX_HEAD_BYTES`]), and from it only `id`/`session_id`, `cwd` and `source`.
+//! - A **bounded tail** (starting at [`TURN_TAIL_START`], widened to at most
+//!   [`TURN_TAIL_MAX`]), for the turn marker closest to the end. That is the
+//!   version-sensitive part of the file, so the read is schema-tolerant: a line
+//!   counts only if it parses as an `event_msg` whose `payload.type` is
+//!   `task_started`, `task_complete` or `turn_aborted`, and anything else — a
+//!   truncated or unknown tail, a line that merely quotes a marker name — is
+//!   ignored and changes nothing. Only an [`RolloutTurn`] leaves the read; no
+//!   conversation content is kept or logged.
+//! - Growth is otherwise size/mtime only. Nothing is logged.
 //! - **Subagent threads are skipped**: their `source` is an object
 //!   (`{"subagent": …}`), and their hook events already carry the parent's id.
-//! - It never reports a *state*: growth is a heartbeat, not `working`, because a
-//!   rollout keeps being written around the turn's `Stop` and would otherwise
-//!   hold an idle session at `working`. So a session only this watcher sees reads
-//!   `idle`. It can never report an approval either — the rollout records none.
+//! - Growth is a heartbeat, not `working`: a rollout keeps being written around
+//!   the turn's `Stop`, so it would hold an idle session at `working`. The state
+//!   comes from the **last turn marker** alone, never from counts or growth, and
+//!   only while the thread lock is *held* — a free lock means the session is gone
+//!   whatever the marker says, and a Codex without locks makes no claim.
+//! - A marker is reported on a **change**, not every scan. A level re-asserted
+//!   each scan would race a hook (`UserPromptSubmit` lands before Codex flushes
+//!   `task_started`, and the still-closed marker would read it back to `idle`).
+//!   The first read of a session claims `working` for an open turn, but never
+//!   `idle` for a closed one, so it cannot override what a hook reported; and an
+//!   open turn in a rollout that has not been written to lately is not claimed,
+//!   since a crash leaves one open for good.
+//! - The report is passive ([`SessionEvent::RolloutTurn`]): a `waiting_for_*`
+//!   state a hook reported is held, and an authoritative `StreamState` from the
+//!   wrapper, re-asserted on every poll, has the last word. It can never report
+//!   an approval either — the rollout records none.
 //! - The lock probe is a non-blocking **shared** `flock` taken and dropped at
 //!   once: on a session's first sight, then once per scan while it is tracked
 //!   and not ended (an ended session is left alone until its rollout grows).
@@ -50,7 +75,7 @@
 //!   held, stays the authority for the id, `cwd` and the subagent check.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -59,7 +84,7 @@ use serde::Deserialize;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{is_session_uuid, Agent, ObserveRequest, SessionEvent, SessionsRegistry};
+use super::{is_session_uuid, Agent, ObserveRequest, RolloutTurn, SessionEvent, SessionsRegistry};
 
 /// How often the lock of a rollout that has not been read is probed (#2108). A
 /// Codex home accumulates thousands of old rollouts, so probing each of them on
@@ -87,6 +112,26 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// embeds Codex's base instructions (~20 KiB today); a head without a newline
 /// within this bound is treated as unreadable.
 const MAX_HEAD_BYTES: u64 = 1024 * 1024;
+
+/// How much of a rollout's end is read first when looking for its last turn
+/// marker (#2135). A turn's markers sit among the conversation's own lines, so a
+/// busy turn pushes `task_started` far from the end; most rollouts hold theirs
+/// well inside this.
+const TURN_TAIL_START: u64 = 256 * 1024;
+
+/// The most of a rollout's end read to find a turn marker. A single line of tool
+/// output can run to several MiB, so a window inside one holds no marker at all;
+/// the window is widened [`TURN_TAIL_GROWTH`]-fold up to this before the marker
+/// is called unknown, which changes nothing.
+const TURN_TAIL_MAX: u64 = 4 * 1024 * 1024;
+
+/// How much wider the tail window gets each time it holds no marker.
+const TURN_TAIL_GROWTH: u64 = 4;
+
+/// The `event_msg` payload types that mark a turn's edges. A line is parsed only
+/// if it contains one of these, so nearly every line of a rollout is skipped
+/// without being decoded.
+const TURN_MARKER_NAMES: [&str; 3] = ["task_started", "task_complete", "turn_aborted"];
 
 /// Where Codex keeps its state: `$CODEX_HOME`, else `~/.codex`.
 fn codex_home() -> Option<PathBuf> {
@@ -177,6 +222,82 @@ fn read_head(path: &Path) -> Head {
     }
 }
 
+/// The fields of a rollout line the turn reader looks at. Everything else,
+/// including the conversation itself, is skipped by serde.
+#[derive(Debug, Deserialize)]
+struct EventLine {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    payload: Option<EventPayload>,
+}
+
+/// The one `event_msg` payload field that names the event.
+#[derive(Debug, Deserialize)]
+struct EventPayload {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+}
+
+/// What one rollout line says about a turn: `Some` only for an `event_msg`
+/// whose `payload.type` is a turn marker. A line that merely mentions a marker
+/// name (a `response_item` quoting one, say), or that does not parse, is `None`.
+fn parse_turn_marker(line: &str) -> Option<RolloutTurn> {
+    if !TURN_MARKER_NAMES.iter().any(|name| line.contains(name)) {
+        return None;
+    }
+    let event = serde_json::from_str::<EventLine>(line).ok()?;
+    if event.kind != "event_msg" {
+        return None;
+    }
+    match event.payload?.kind?.as_str() {
+        "task_started" => Some(RolloutTurn::Open),
+        "task_complete" | "turn_aborted" => Some(RolloutTurn::Closed),
+        _ => None,
+    }
+}
+
+/// The last turn marker in `window`, a stretch of a rollout ending at its end.
+/// `starts_mid_line` is whether the stretch begins past the start of the file, in
+/// which case its first line is a fragment and is dropped. A final line Codex has
+/// not finished writing fails to parse and is passed over, so the marker before
+/// it stands until the next scan.
+fn last_turn_marker(window: &[u8], starts_mid_line: bool) -> Option<RolloutTurn> {
+    let lines = if starts_mid_line {
+        let newline = window.iter().position(|byte| *byte == b'\n')?;
+        window.get(newline + 1..)?
+    } else {
+        window
+    };
+    lines
+        .rsplit(|byte| *byte == b'\n')
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .find_map(parse_turn_marker)
+}
+
+/// Reads the turn marker closest to the end of the rollout at `path`: the last
+/// [`TURN_TAIL_START`] bytes, widened [`TURN_TAIL_GROWTH`]-fold up to
+/// [`TURN_TAIL_MAX`] while they hold none. `None` when the file is unreadable or
+/// no marker lies within that reach, which callers treat as "no information".
+fn read_turn(path: &Path) -> Option<RolloutTurn> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut window = TURN_TAIL_START;
+    loop {
+        let start = len.saturating_sub(window);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut bytes = Vec::new();
+        (&mut file).take(len - start).read_to_end(&mut bytes).ok()?;
+        if let Some(turn) = last_turn_marker(&bytes, start > 0) {
+            return Some(turn);
+        }
+        if start == 0 || window >= TURN_TAIL_MAX {
+            return None;
+        }
+        window = window.saturating_mul(TURN_TAIL_GROWTH).min(TURN_TAIL_MAX);
+    }
+}
+
 /// The state of a thread's writer lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LockState {
@@ -263,6 +384,69 @@ struct SessionTrack {
     ended: bool,
     /// When the session was last reported.
     last_report: SystemTime,
+    /// The turn marker last established from the rollout's tail while the lock
+    /// was held, if any (#2135). A change from it is what gets reported.
+    turn: Option<RolloutTurn>,
+    /// The rollout size the tail was last read at, so an idle session whose
+    /// rollout has not changed costs no read.
+    turn_read_at: Option<u64>,
+}
+
+impl SessionTrack {
+    /// Forgets what was learned of the rollout's turns, for a session that was
+    /// ended and written to again (`codex resume`): it is established afresh.
+    fn forget_turn(&mut self) {
+        self.turn = None;
+        self.turn_read_at = None;
+    }
+
+    /// Reads the rollout's last turn marker when `lock` is held and the rollout
+    /// has changed since it was last read, returning the turn to report, if any
+    /// (#2135).
+    ///
+    /// The first marker established is handled with care, because a hook may
+    /// already have said more than the rollout can:
+    ///
+    /// - a closed turn is recorded but not reported, so it can never override a
+    ///   state a hook reported (a new session still defaults to `idle`);
+    /// - an open turn is reported only if the rollout was written to recently. A
+    ///   crash leaves a turn open for good, and `codex resume` of that holds the
+    ///   lock again, so an old open turn is no evidence one is running. Further
+    ///   growth reads it again, and then it counts.
+    ///
+    /// After that only a change is reported.
+    fn read_turn(
+        &mut self,
+        rollout: Rollout<'_>,
+        lock: LockState,
+        now: SystemTime,
+    ) -> Option<RolloutTurn> {
+        if lock != LockState::Held || self.turn_read_at == Some(rollout.size) {
+            return None;
+        }
+        self.turn_read_at = Some(rollout.size);
+        let read = read_turn(rollout.path)?;
+        match (self.turn, read) {
+            (None, RolloutTurn::Closed) => {
+                self.turn = Some(read);
+                None
+            }
+            (None, RolloutTurn::Open) if !is_recent(rollout.modified, now) => None,
+            (Some(known), _) if known == read => None,
+            _ => {
+                self.turn = Some(read);
+                Some(read)
+            }
+        }
+    }
+}
+
+/// A rollout file as a scan found it.
+#[derive(Debug, Clone, Copy)]
+struct Rollout<'a> {
+    path: &'a Path,
+    size: u64,
+    modified: SystemTime,
 }
 
 /// The watcher's state across scans, keyed by rollout path.
@@ -271,11 +455,13 @@ type ScanState = HashMap<PathBuf, Tracked>;
 /// One thing a scan asks the registry to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
-    /// Report the session as present, keeping its current state.
+    /// Report the session as present: keeping its current state, unless `turn`
+    /// carries a change in the rollout's last turn marker (#2135).
     Seen {
         id: String,
         cwd: Option<PathBuf>,
         transcript_path: PathBuf,
+        turn: Option<RolloutTurn>,
     },
     /// End the session.
     End { id: String },
@@ -288,6 +474,7 @@ impl Action {
                 id,
                 cwd,
                 transcript_path,
+                turn,
             } => registry.observe(ObserveRequest {
                 agent_id: None,
                 pid: None,
@@ -295,9 +482,13 @@ impl Action {
                 session_id: id,
                 cwd,
                 transcript_path: Some(transcript_path),
-                // Keeps the current state (a new session starts idle), so the
-                // watcher never overrides what the hooks reported.
-                event: SessionEvent::TranscriptDiscovered,
+                // Keeps the current state (a new session starts idle) unless a
+                // turn marker changed, and even that is passive evidence, so
+                // the watcher never overrides what the hooks reported.
+                event: turn.map_or(
+                    SessionEvent::TranscriptDiscovered,
+                    SessionEvent::RolloutTurn,
+                ),
                 repo: None,
                 model: None,
             }),
@@ -372,19 +563,24 @@ fn scan(
     for (path, size, modified) in list_rollouts(sessions) {
         present.insert(path.clone());
         let recent = is_recent(modified, now);
+        let rollout = Rollout {
+            path: &path,
+            size,
+            modified,
+        };
         let tracked = match state.remove(&path) {
-            None if !recent => unread_or_held(&path, size, None, locks, now, probe, &mut actions),
+            None if !recent => unread_or_held(rollout, None, locks, now, probe, &mut actions),
             // First sight of a recent rollout, or growth of one not read yet.
-            None => first_read(&path, size, locks, now, probe, &mut actions),
+            None => first_read(rollout, locks, now, probe, &mut actions),
             Some(Tracked::Unread { size: old, .. }) if size != old && recent => {
-                first_read(&path, size, locks, now, probe, &mut actions)
+                first_read(rollout, locks, now, probe, &mut actions)
             }
             Some(Tracked::Unread { probed, .. }) => {
-                unread_or_held(&path, size, Some(probed), locks, now, probe, &mut actions)
+                unread_or_held(rollout, Some(probed), locks, now, probe, &mut actions)
             }
             Some(Tracked::Skipped) => Tracked::Skipped,
             Some(Tracked::Session(track)) => {
-                Tracked::Session(rescan(track, &path, size, locks, now, probe, &mut actions))
+                Tracked::Session(rescan(track, rollout, locks, now, probe, &mut actions))
             }
         };
         state.insert(path, tracked);
@@ -425,76 +621,86 @@ fn thread_id_from_file_name(path: &Path) -> Option<&str> {
 /// is when the lock was last looked at, if it has been: it is not looked at again
 /// before [`UNREAD_PROBE_INTERVAL`] has passed.
 fn unread_or_held(
-    path: &Path,
-    size: u64,
+    rollout: Rollout<'_>,
     probed: Option<SystemTime>,
     locks: &Path,
     now: SystemTime,
     probe: &dyn Fn(&Path, &str) -> LockState,
     actions: &mut Vec<Action>,
 ) -> Tracked {
+    let size = rollout.size;
     if let Some(last) = probed {
         if now.duration_since(last).unwrap_or_default() < UNREAD_PROBE_INTERVAL {
             return Tracked::Unread { size, probed: last };
         }
     }
-    match thread_id_from_file_name(path) {
+    match thread_id_from_file_name(rollout.path) {
         Some(id) if probe(locks, id) == LockState::Held => {
-            first_read(path, size, locks, now, probe, actions)
+            first_read(rollout, locks, now, probe, actions)
         }
         _ => Tracked::Unread { size, probed: now },
     }
 }
 
 /// Reads a rollout's head for the first time, announcing it when it is a
-/// session whose thread is not known to be gone.
+/// session whose thread is not known to be gone. A thread whose lock is held also
+/// has its last turn marker read (#2135).
 fn first_read(
-    path: &Path,
-    size: u64,
+    rollout: Rollout<'_>,
     locks: &Path,
     now: SystemTime,
     probe: &dyn Fn(&Path, &str) -> LockState,
     actions: &mut Vec<Action>,
 ) -> Tracked {
-    let (id, cwd) = match read_head(path) {
+    let (id, cwd) = match read_head(rollout.path) {
         Head::Skip => return Tracked::Skipped,
-        Head::Incomplete => return Tracked::Unread { size, probed: now },
+        Head::Incomplete => {
+            return Tracked::Unread {
+                size: rollout.size,
+                probed: now,
+            }
+        }
         Head::Session { id, cwd } => (id, cwd),
     };
     let lock = probe(locks, &id);
     // A free or missing lock means the thread already ended (the daemon started
     // after it did): record it, so later growth revives it, but do not list it.
     let gone = matches!(lock, LockState::Free | LockState::Absent);
-    if !gone {
-        actions.push(Action::Seen {
-            id: id.clone(),
-            cwd: cwd.clone(),
-            transcript_path: path.to_path_buf(),
-        });
-    }
-    Tracked::Session(SessionTrack {
+    let mut track = SessionTrack {
         id,
         cwd,
-        size,
+        size: rollout.size,
         lock_seen: lock == LockState::Held,
         ended: gone,
         last_report: now,
-    })
+        turn: None,
+        turn_read_at: None,
+    };
+    if !gone {
+        let turn = track.read_turn(rollout, lock, now);
+        actions.push(Action::Seen {
+            id: track.id.clone(),
+            cwd: track.cwd.clone(),
+            transcript_path: rollout.path.to_path_buf(),
+            turn,
+        });
+    }
+    Tracked::Session(track)
 }
 
 /// Re-examines a known session: growth revives an ended one, a lock seen held
-/// and now released ends it, and a live one is heartbeated.
+/// and now released ends it, a change in the rollout's last turn marker is
+/// reported at once, and a live one is heartbeated.
 fn rescan(
     mut track: SessionTrack,
-    path: &Path,
-    size: u64,
+    rollout: Rollout<'_>,
     locks: &Path,
     now: SystemTime,
     probe: &dyn Fn(&Path, &str) -> LockState,
     actions: &mut Vec<Action>,
 ) -> SessionTrack {
-    let grew = size > track.size;
-    track.size = size;
+    let grew = rollout.size > track.size;
+    track.size = rollout.size;
     if track.ended {
         if !grew {
             return track;
@@ -504,6 +710,7 @@ fn rescan(
         track.ended = false;
         track.lock_seen = false;
         track.last_report = SystemTime::UNIX_EPOCH;
+        track.forget_turn();
     }
     let lock = probe(locks, &track.id);
     if lock == LockState::Held {
@@ -516,16 +723,20 @@ fn rescan(
         });
         return track;
     }
+    let turn = track.read_turn(rollout, lock, now);
     let alive = grew || lock == LockState::Held;
     let due = now
         .duration_since(track.last_report)
         .is_ok_and(|since| since >= HEARTBEAT_INTERVAL);
-    if alive && due {
+    // A turn change is reported when it is read, not a heartbeat interval later,
+    // and it counts as the heartbeat.
+    if turn.is_some() || (alive && due) {
         track.last_report = now;
         actions.push(Action::Seen {
             id: track.id.clone(),
             cwd: track.cwd.clone(),
-            transcript_path: path.to_path_buf(),
+            transcript_path: rollout.path.to_path_buf(),
+            turn,
         });
     }
     track
@@ -696,6 +907,7 @@ mod tests {
                 id: ID.to_string(),
                 cwd: Some(PathBuf::from("/work/repo")),
                 transcript_path: path,
+                turn: None,
             }]
         );
         // Nothing new, nothing due: silence.
@@ -758,6 +970,7 @@ mod tests {
                 id: ID.to_string(),
                 cwd: Some(PathBuf::from("/work/repo")),
                 transcript_path: path.clone(),
+                turn: None,
             }]
         );
         assert!(matches!(state[&path], Tracked::Session(_)));
@@ -1139,6 +1352,7 @@ mod tests {
             id: ID.to_string(),
             cwd: Some(PathBuf::from("/work/repo")),
             transcript_path: PathBuf::from("/r.jsonl"),
+            turn: None,
         }
         .apply(&registry);
         let listed = registry.list();
@@ -1148,5 +1362,514 @@ mod tests {
         assert_eq!(listed[0].cwd.as_deref(), Some(Path::new("/work/repo")));
         Action::End { id: ID.to_string() }.apply(&registry);
         assert_eq!(registry.list()[0].state, SessionState::Ended);
+    }
+
+    // ── Turn markers (#2135) ─────────────────────────────────────────────────
+
+    /// An `event_msg` line with the given payload type, as Codex writes them.
+    fn marker(kind: &str) -> String {
+        serde_json::json!({
+            "timestamp": "2026-09-25T00:00:01Z",
+            "type": "event_msg",
+            "payload": { "type": kind, "turn_id": "turn-1" },
+        })
+        .to_string()
+    }
+
+    fn started() -> String {
+        marker("task_started")
+    }
+
+    fn complete() -> String {
+        marker("task_complete")
+    }
+
+    fn aborted() -> String {
+        marker("turn_aborted")
+    }
+
+    /// A conversation line of about `bytes` bytes that is not a turn marker.
+    fn chatter(bytes: usize) -> String {
+        serde_json::json!({
+            "timestamp": "2026-09-25T00:00:02Z",
+            "type": "response_item",
+            "payload": { "type": "message", "role": "assistant", "content": "x".repeat(bytes) },
+        })
+        .to_string()
+    }
+
+    /// A conversation line whose text names every marker.
+    fn quoting() -> String {
+        serde_json::json!({
+            "type": "response_item",
+            "payload": { "type": "message", "content": "task_started task_complete turn_aborted" },
+        })
+        .to_string()
+    }
+
+    /// The marker `read_turn` finds in a rollout holding a head and `lines`.
+    fn turn_of(lines: &[String]) -> Option<RolloutTurn> {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut all = vec![head(ID, serde_json::json!("cli"))];
+        all.extend_from_slice(lines);
+        read_turn(&write_rollout(tmp.path(), ID, &all))
+    }
+
+    fn turns(actions: &[Action]) -> Vec<Option<RolloutTurn>> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Seen { turn, .. } => Some(*turn),
+                Action::End { .. } => None,
+            })
+            .collect()
+    }
+
+    fn track_of<'a>(state: &'a ScanState, path: &Path) -> &'a SessionTrack {
+        match &state[path] {
+            Tracked::Session(track) => track,
+            other => panic!("not a session: {other:?}"),
+        }
+    }
+
+    /// Applies `actions` to `registry` and returns the one session's state.
+    fn state_after(registry: &SessionsRegistry, actions: Vec<Action>) -> SessionState {
+        for action in actions {
+            action.apply(registry);
+        }
+        registry.list()[0].state
+    }
+
+    #[test]
+    fn only_an_event_msg_marker_counts_as_a_turn_marker() {
+        assert_eq!(parse_turn_marker(&started()), Some(RolloutTurn::Open));
+        assert_eq!(parse_turn_marker(&complete()), Some(RolloutTurn::Closed));
+        assert_eq!(parse_turn_marker(&aborted()), Some(RolloutTurn::Closed));
+        // A conversation line that quotes the names is not a marker, nor is an
+        // `event_msg` of another kind that mentions one.
+        assert_eq!(parse_turn_marker(&quoting()), None);
+        let other = serde_json::json!({
+            "type": "event_msg",
+            "payload": { "type": "agent_message", "message": "task_started" },
+        });
+        assert_eq!(parse_turn_marker(&other.to_string()), None);
+        // Nothing here is the schema the reader understands.
+        for line in [
+            "task_started",
+            "",
+            r#"{"type":"event_msg"}"#,
+            r#"{"type":"event_msg","payload":"task_started"}"#,
+            r#"{"type":"event_msg","payload":{"n":"task_started"}}"#,
+            r#"{"type":"event_msg","payload":{"type":7,"n":"task_started"}}"#,
+            r#"{"type":5,"payload":{"type":"task_started"}}"#,
+        ] {
+            assert_eq!(parse_turn_marker(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn the_last_marker_wins_whatever_the_counts() {
+        let cases: Vec<(Vec<String>, Option<RolloutTurn>)> = vec![
+            (vec![started()], Some(RolloutTurn::Open)),
+            (vec![started(), complete()], Some(RolloutTurn::Closed)),
+            (vec![started(), aborted()], Some(RolloutTurn::Closed)),
+            (
+                vec![started(), complete(), started()],
+                Some(RolloutTurn::Open),
+            ),
+            // Seven corpus files carry one completion too many.
+            (
+                vec![started(), complete(), complete()],
+                Some(RolloutTurn::Closed),
+            ),
+            // Conversation after the marker, quoting markers, changes nothing.
+            (
+                vec![started(), chatter(10), quoting(), chatter(10)],
+                Some(RolloutTurn::Open),
+            ),
+            (vec![chatter(10), quoting()], None),
+            (vec![], None),
+        ];
+        for (lines, expected) in cases {
+            assert_eq!(turn_of(&lines), expected, "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_rollout_has_no_turn() {
+        assert_eq!(read_turn(Path::new("/nonexistent/rollout.jsonl")), None);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("r.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(read_turn(&path), None);
+        std::fs::write(&path, b"\xff\xfe\x00 not a rollout \n\xc3\x28\n").unwrap();
+        assert_eq!(read_turn(&path), None);
+    }
+
+    #[test]
+    fn a_final_line_still_being_written_is_passed_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("r.jsonl");
+        let head_line = head(ID, serde_json::json!("cli"));
+        // A whole marker whose newline has not landed yet still counts.
+        std::fs::write(&path, format!("{head_line}\n{}\n{}", started(), complete())).unwrap();
+        assert_eq!(read_turn(&path), Some(RolloutTurn::Closed));
+        // Half of one does not, so the marker before it stands.
+        let done = complete();
+        let half = &done[..done.len() / 2];
+        std::fs::write(&path, format!("{head_line}\n{}\n{half}", started())).unwrap();
+        assert_eq!(read_turn(&path), Some(RolloutTurn::Open));
+    }
+
+    #[test]
+    fn a_window_starting_mid_line_drops_its_first_fragment() {
+        let window = format!("{}\n{}\n", complete(), chatter(10));
+        assert_eq!(
+            last_turn_marker(window.as_bytes(), false),
+            Some(RolloutTurn::Closed)
+        );
+        // Past the start of the file, the first line is the tail of some other.
+        assert_eq!(last_turn_marker(window.as_bytes(), true), None);
+        assert_eq!(
+            last_turn_marker(b"no newline at all task_started", true),
+            None
+        );
+        // A line that is not UTF-8 is skipped, not fatal.
+        let mut bytes = b"\xff\xfe\n".to_vec();
+        bytes.extend_from_slice(started().as_bytes());
+        assert_eq!(last_turn_marker(&bytes, false), Some(RolloutTurn::Open));
+    }
+
+    #[test]
+    fn the_tail_window_widens_to_find_a_distant_marker() {
+        // 400 KiB of conversation after the marker: past the first 256 KiB
+        // window, inside the second.
+        let mut lines = vec![started()];
+        lines.extend((0..4).map(|_| chatter(100 * 1024)));
+        assert_eq!(turn_of(&lines), Some(RolloutTurn::Open));
+        // One 3 MiB line of tool output after it: the first two windows lie
+        // wholly inside that line and see no marker at all.
+        assert_eq!(
+            turn_of(&[complete(), chatter(3 * 1024 * 1024)]),
+            Some(RolloutTurn::Closed)
+        );
+    }
+
+    #[test]
+    fn a_marker_beyond_the_widest_window_is_unknown() {
+        let mut lines = vec![started()];
+        lines.extend((0..50).map(|_| chatter(100 * 1024)));
+        assert_eq!(turn_of(&lines), None);
+    }
+
+    #[test]
+    fn a_hookless_session_reads_working_mid_turn_and_idle_after_it() {
+        // The acceptance criterion of #2135, end to end through the registry.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_rollout(
+            tmp.path(),
+            ID,
+            &[head(ID, serde_json::json!("cli")), started()],
+        );
+        let lock = RefCell::new(LockState::Held);
+        let registry = SessionsRegistry::new();
+        let mut state = ScanState::new();
+        let t0 = SystemTime::now();
+        let scan_at = |state: &mut ScanState, n: u32| {
+            scan(
+                tmp.path(),
+                tmp.path(),
+                state,
+                t0 + WATCH_INTERVAL * n,
+                &scripted(&lock),
+            )
+        };
+
+        let first = scan_at(&mut state, 0);
+        assert_eq!(turns(&first), vec![Some(RolloutTurn::Open)]);
+        assert_eq!(state_after(&registry, first), SessionState::Working);
+
+        // The turn goes on writing; nothing about it has changed.
+        append(&path, &chatter(64));
+        assert!(scan_at(&mut state, 1).is_empty());
+
+        append(&path, &complete());
+        let done = scan_at(&mut state, 2);
+        assert_eq!(turns(&done), vec![Some(RolloutTurn::Closed)]);
+        assert_eq!(state_after(&registry, done), SessionState::Idle);
+
+        // The next turn, and one that is interrupted.
+        append(&path, &started());
+        let next = scan_at(&mut state, 3);
+        assert_eq!(state_after(&registry, next), SessionState::Working);
+        append(&path, &aborted());
+        let interrupted = scan_at(&mut state, 4);
+        assert_eq!(turns(&interrupted), vec![Some(RolloutTurn::Closed)]);
+        assert_eq!(state_after(&registry, interrupted), SessionState::Idle);
+    }
+
+    #[test]
+    fn a_closed_turn_on_first_sight_claims_nothing() {
+        // The first read must not say `idle` over what a hook already reported.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_rollout(
+            tmp.path(),
+            ID,
+            &[head(ID, serde_json::json!("cli")), started(), complete()],
+        );
+        let lock = RefCell::new(LockState::Held);
+        let mut state = ScanState::new();
+        let t0 = SystemTime::now();
+        let first = scan(tmp.path(), tmp.path(), &mut state, t0, &scripted(&lock));
+        assert_eq!(turns(&first), vec![None]);
+        assert_eq!(track_of(&state, &path).turn, Some(RolloutTurn::Closed));
+
+        let registry = SessionsRegistry::new();
+        registry.observe(ObserveRequest {
+            agent_id: None,
+            pid: None,
+            agent: Agent::Codex,
+            session_id: ID.to_string(),
+            cwd: None,
+            transcript_path: None,
+            event: SessionEvent::PreToolUse,
+            repo: None,
+            model: None,
+        });
+        assert_eq!(state_after(&registry, first), SessionState::Working);
+
+        // The next turn is a change, and is reported.
+        append(&path, &started());
+        let next = scan(
+            tmp.path(),
+            tmp.path(),
+            &mut state,
+            t0 + WATCH_INTERVAL,
+            &scripted(&lock),
+        );
+        assert_eq!(turns(&next), vec![Some(RolloutTurn::Open)]);
+    }
+
+    #[test]
+    fn an_open_turn_in_a_stale_rollout_is_claimed_only_once_it_is_written_to() {
+        // A crash leaves a turn open for good, and `codex resume` of it holds the
+        // lock again: an old open marker is no evidence a turn is running.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_rollout(
+            tmp.path(),
+            ID,
+            &[head(ID, serde_json::json!("cli")), started()],
+        );
+        let lock = RefCell::new(LockState::Held);
+        let mut state = ScanState::new();
+        let far = SystemTime::now() + RECENT_ACTIVITY_WINDOW * 10;
+        let first = scan(tmp.path(), tmp.path(), &mut state, far, &scripted(&lock));
+        // Listed (its lock is held), but with no claim about its turn.
+        assert_eq!(turns(&first), vec![None]);
+        assert_eq!(track_of(&state, &path).turn, None);
+        // Written to: now it is evidence.
+        append(&path, &chatter(64));
+        let grown = scan(
+            tmp.path(),
+            tmp.path(),
+            &mut state,
+            SystemTime::now(),
+            &scripted(&lock),
+        );
+        assert_eq!(turns(&grown), vec![Some(RolloutTurn::Open)]);
+    }
+
+    #[test]
+    fn no_turn_is_read_unless_the_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_rollout(
+            tmp.path(),
+            ID,
+            &[head(ID, serde_json::json!("cli")), started()],
+        );
+        // A Codex without locks makes no claim about the thread.
+        let lock = RefCell::new(LockState::Unknown);
+        let mut state = ScanState::new();
+        let t0 = SystemTime::now();
+        let first = scan(tmp.path(), tmp.path(), &mut state, t0, &scripted(&lock));
+        assert_eq!(turns(&first), vec![None]);
+        assert_eq!(track_of(&state, &path).turn_read_at, None);
+        // Once the lock is held it is read at once, with no growth needed.
+        *lock.borrow_mut() = LockState::Held;
+        let held = scan(
+            tmp.path(),
+            tmp.path(),
+            &mut state,
+            t0 + WATCH_INTERVAL,
+            &scripted(&lock),
+        );
+        assert_eq!(turns(&held), vec![Some(RolloutTurn::Open)]);
+        // A thread whose lock is already free or gone is not listed at all, so
+        // its marker is not read.
+        for gone in [LockState::Free, LockState::Absent] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = write_rollout(
+                tmp.path(),
+                ID,
+                &[head(ID, serde_json::json!("cli")), started()],
+            );
+            let lock = RefCell::new(gone);
+            let mut state = ScanState::new();
+            assert!(scan(tmp.path(), tmp.path(), &mut state, t0, &scripted(&lock)).is_empty());
+            assert_eq!(track_of(&state, &path).turn_read_at, None, "{gone:?}");
+        }
+    }
+
+    #[test]
+    fn an_unchanged_rollout_is_not_read_again() {
+        assert_eq!(
+            started().len(),
+            aborted().len(),
+            "the rewrite below keeps the size"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let head_line = head(ID, serde_json::json!("cli"));
+        let path = write_rollout(tmp.path(), ID, &[head_line.clone(), started()]);
+        let lock = RefCell::new(LockState::Held);
+        let mut state = ScanState::new();
+        let t0 = SystemTime::now();
+        let first = scan(tmp.path(), tmp.path(), &mut state, t0, &scripted(&lock));
+        assert_eq!(turns(&first), vec![Some(RolloutTurn::Open)]);
+        // Rewrite the marker in place at the same size: a re-read would see it
+        // closed, so silence shows the tail was not read.
+        std::fs::write(&path, format!("{head_line}\n{}\n", aborted())).unwrap();
+        let again = scan(
+            tmp.path(),
+            tmp.path(),
+            &mut state,
+            t0 + WATCH_INTERVAL,
+            &scripted(&lock),
+        );
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn a_turn_change_is_reported_at_once_and_counts_as_the_heartbeat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_rollout(
+            tmp.path(),
+            ID,
+            &[head(ID, serde_json::json!("cli")), started()],
+        );
+        let lock = RefCell::new(LockState::Held);
+        let mut state = ScanState::new();
+        let t0 = SystemTime::now();
+        scan(tmp.path(), tmp.path(), &mut state, t0, &scripted(&lock));
+        append(&path, &complete());
+        let t1 = t0 + WATCH_INTERVAL;
+        assert_eq!(
+            turns(&scan(
+                tmp.path(),
+                tmp.path(),
+                &mut state,
+                t1,
+                &scripted(&lock)
+            )),
+            vec![Some(RolloutTurn::Closed)],
+            "not held back for a heartbeat"
+        );
+        // A heartbeat from the first report would be due now; from this one it
+        // is not, because the change was a report.
+        assert!(scan(
+            tmp.path(),
+            tmp.path(),
+            &mut state,
+            t0 + HEARTBEAT_INTERVAL,
+            &scripted(&lock)
+        )
+        .is_empty());
+        let later = scan(
+            tmp.path(),
+            tmp.path(),
+            &mut state,
+            t1 + HEARTBEAT_INTERVAL,
+            &scripted(&lock),
+        );
+        assert_eq!(turns(&later), vec![None]);
+    }
+
+    #[test]
+    fn a_marker_out_of_reach_leaves_the_established_turn_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_rollout(
+            tmp.path(),
+            ID,
+            &[head(ID, serde_json::json!("cli")), started()],
+        );
+        let lock = RefCell::new(LockState::Held);
+        let mut state = ScanState::new();
+        let t0 = SystemTime::now();
+        scan(tmp.path(), tmp.path(), &mut state, t0, &scripted(&lock));
+        // The turn runs long enough to push its marker beyond the widest window.
+        for _ in 0..50 {
+            append(&path, &chatter(100 * 1024));
+        }
+        let grown = scan(
+            tmp.path(),
+            tmp.path(),
+            &mut state,
+            t0 + WATCH_INTERVAL,
+            &scripted(&lock),
+        );
+        assert!(turns(&grown).is_empty(), "unknown changes nothing");
+        assert_eq!(track_of(&state, &path).turn, Some(RolloutTurn::Open));
+    }
+
+    #[test]
+    fn a_resumed_session_establishes_its_turn_afresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_rollout(
+            tmp.path(),
+            ID,
+            &[head(ID, serde_json::json!("cli")), started()],
+        );
+        let lock = RefCell::new(LockState::Held);
+        let mut state = ScanState::new();
+        let t0 = SystemTime::now();
+        scan(tmp.path(), tmp.path(), &mut state, t0, &scripted(&lock));
+        *lock.borrow_mut() = LockState::Absent;
+        let ended = scan(tmp.path(), tmp.path(), &mut state, t0, &scripted(&lock));
+        assert_eq!(ids(&ended), vec![format!("end:{ID}")]);
+        // `codex resume`: the same open marker is what the new run starts from,
+        // and it is established again rather than assumed already reported.
+        *lock.borrow_mut() = LockState::Held;
+        append(&path, &chatter(64));
+        let resumed = scan(
+            tmp.path(),
+            tmp.path(),
+            &mut state,
+            t0 + WATCH_INTERVAL,
+            &scripted(&lock),
+        );
+        assert_eq!(turns(&resumed), vec![Some(RolloutTurn::Open)]);
+    }
+
+    #[test]
+    fn a_turn_action_applies_as_passive_evidence() {
+        let registry = SessionsRegistry::new();
+        let seen = |turn| Action::Seen {
+            id: ID.to_string(),
+            cwd: Some(PathBuf::from("/work/repo")),
+            transcript_path: PathBuf::from("/r.jsonl"),
+            turn,
+        };
+        seen(Some(RolloutTurn::Open)).apply(&registry);
+        let listed = registry.list();
+        assert_eq!(listed[0].agent, Agent::Codex);
+        assert_eq!(listed[0].state, SessionState::Working);
+        assert_eq!(
+            listed[0].last_event,
+            SessionEvent::RolloutTurn(RolloutTurn::Open)
+        );
+        // A plain sighting keeps the state; a closed turn ends it.
+        seen(None).apply(&registry);
+        assert_eq!(registry.list()[0].state, SessionState::Working);
+        seen(Some(RolloutTurn::Closed)).apply(&registry);
+        assert_eq!(registry.list()[0].state, SessionState::Idle);
     }
 }

@@ -786,7 +786,7 @@ trust that hook again.
 **The rollout watcher** (#1909) runs in the daemon beside the Claude transcript
 watcher (Feed 2), with nothing to install. Every 5 seconds it scans
 `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (default `~/.codex`) and
-supplements the hooks in three ways:
+supplements the hooks in four ways:
 
 - **Discovery.** A rollout modified in the last 5 minutes is read once, and only
   its first line, Codex's `session_meta` record. That gives the session's id and
@@ -810,13 +810,59 @@ supplements the hooks in three ways:
   re-reported once a minute, keeping the state it has, so an idle Codex session no
   longer ages out on the TTL while its process lives. A thread Codex unloads
   releases its lock, and so ends too.
+- **Turn state for a session with no hooks** (#2135). A Codex session started
+  before the hooks were installed and trusted has no hook to say it is mid-turn,
+  and would read `idle` until its next hook, which for such a session never comes.
+  While its thread lock is held, the watcher reads the rollout's **last turn
+  marker**: `task_started` means a turn is running (`working`), and
+  `task_complete` or `turn_aborted` means it is not (`idle`). See below for what
+  that does and does not claim.
 
-It never reports a state of its own: a session only the watcher knows about reads
-`idle`, since rollout growth continues around a turn's end and cannot say
-`working`, and the rollout records no approval requests. It reads no conversation
-line and logs nothing. The lock probe is a non-blocking *shared* `flock`, taken
-and released at once: on a session's first sight, then once per scan while the
-session is tracked and not ended. Against a live holder it simply fails, so the
+Rollout growth is never read as `working`: it continues around a turn's end, so it
+would hold an idle session busy. The state comes from the turn marker alone, and
+the rollout records no approval requests, so the watcher never reports a
+`waiting_for_*` state.
+
+**The turn marker.** Besides the first line, the watcher reads a *bounded tail* of
+the rollout: its last 256 KiB, widened fourfold up to 4 MiB while that holds no
+marker (a single line of tool output can run to several MiB, so a window inside
+one sees none). A line counts only if it parses as an `event_msg` whose
+`payload.type` is one of the three marker names; a conversation line that merely
+quotes one, an unparseable or truncated tail, and a marker beyond the widest
+window all change nothing. Only the *last* marker is evidence, never the counts: a
+turn can be left open by a crash, and some rollouts carry a stray extra
+`task_complete`. On the corpus of 784 rollouts this was written against, the
+reader agreed with a full-file scan on every one (773 closed, 2 open, 9 with no
+marker) and read the lot in about half a second. It keeps only the marker's kind
+and logs nothing.
+
+The marker is **evidence only while the thread lock is held**: a free lock means
+the session is gone whatever the marker says, and a Codex with no
+`thread-writer-locks` directory makes no claim at all. It is reported on a
+*change*, not on every scan, because a level re-asserted each scan would race a
+hook: `UserPromptSubmit` lands before Codex has flushed `task_started`, and the
+still-closed marker would read the session straight back to `idle`. For the same
+reason the first read of a session is asymmetric. An open turn is reported as
+`working`, but a closed one is only recorded, so the first read can never say
+`idle` over a state a hook reported; and an open turn in a rollout that has not
+been written to within five minutes is not claimed until it is, because a crash
+leaves one open for good and `codex resume` of that holds the lock again.
+
+It is **passive** evidence, with `transcript_grew`'s rules (ADR-0052): a
+`waiting_for_*`, `starting` or `ended` state is held, a closed turn moves
+`working` to `idle` and nothing else, and the wrapper's authoritative
+`stream_state`, re-asserted on every poll, has the last word. The limits:
+
+- A turn shorter than the 5-second scan, or one whose marker is beyond the 4 MiB
+  tail, is missed, and the session stays `idle`, as before.
+- A turn left open by a crash and then resumed can read `working` until the next
+  turn ends, if the resume writes anything but a marker.
+- It is separate from the hooks: a session that has them is still driven by them,
+  and the two agree because both follow the turn.
+
+The lock probe is a non-blocking *shared* `flock`, taken and released at once: on
+a session's first sight, then once per scan while the session is tracked and not
+ended. Against a live holder it simply fails, so the
 only possible collision is Codex acquiring that same thread's lock in the same
 instant. A watcher heartbeat never refreshes a session that has already ended.
 
@@ -998,10 +1044,13 @@ resolves its window by the same rule.
   pi is installed). It runs with pi's own permissions, as every pi extension
   does, and sends only state and identifiers, over the same fire-and-forget socket
   POST.
-- The Codex rollout watcher reads only the first line of each recent rollout
-  file (Codex's session metadata, never a conversation line) plus file sizes, and
-  probes Codex's thread-lock files with a non-blocking shared `flock`. It writes
-  nothing outside the daemon's memory.
+- The Codex rollout watcher reads the first line of each recent rollout file
+  (Codex's session metadata) plus file sizes, and probes Codex's thread-lock files
+  with a non-blocking shared `flock`. For a thread whose lock is held it also
+  reads a bounded tail of the rollout (at most 4 MiB, usually 256 KiB) to find the
+  last turn marker (#2135). That tail holds conversation lines, so the reader
+  parses only a line that names a turn marker, keeps nothing but the marker's
+  kind, and logs nothing. It writes nothing outside the daemon's memory.
 - The Codex wrapper is **opt-in** (it runs only when you launch through it). It
   starts a Codex app-server of its own on a socket in the `0700` runtime
   directory and only ever polls it: it never subscribes to a thread or answers a
@@ -1060,9 +1109,11 @@ The hook `observe`/`end` ops (for reference; the sink builds these, not you):
 
 where `event` is one of `session_start`, `user_prompt_submit`, `pre_tool_use`,
 `post_tool_use`, `stop`, `{ "notification": "permission_prompt" \| "idle_prompt" \|
-"agent_needs_input" \| "other" }`, `transcript_grew`, `transcript_discovered`, or
-`{ "stream_state": "<state>" }` — the authoritative Feed 4 form, applied verbatim
-rather than inferred. `agent` is `claude` (the default, omitted by every Claude
+"agent_needs_input" \| "other" }`, `transcript_grew`, `transcript_discovered`,
+`{ "rollout_turn": "open" \| "closed" }` — the Codex rollout watcher's passive
+report of a rollout's last turn marker, held by a reported wait like
+`transcript_grew` (#2135) — or `{ "stream_state": "<state>" }` — the
+authoritative Feed 4 form, applied verbatim rather than inferred. `agent` is `claude` (the default, omitted by every Claude
 feed), `pi` or `codex`. It is fixed by a session's first sighting, and `list`
 always includes it.
 

@@ -359,6 +359,11 @@ impl SessionState {
     /// - `TranscriptDiscovered` → the current state if known, else
     ///   [`Idle`](Self::Idle) (a passively-discovered session's activity is
     ///   unknown; a later hook or growth upgrades it)
+    /// - `RolloutTurn(Open)` → as `TranscriptGrew`: [`Working`](Self::Working),
+    ///   unless a state a hook reported directly is held
+    /// - `RolloutTurn(Closed)` → [`Idle`](Self::Idle) from
+    ///   [`Working`](Self::Working) only; every other known state is
+    ///   **unchanged** (#2135)
     /// - `StreamState(s)` → `s` verbatim (an authoritative stream-json report;
     ///   the only non-inferred variant — see ADR-0057)
     #[must_use]
@@ -393,14 +398,26 @@ impl SessionState {
             // That is ADR-0052's reliable-over-inferred ordering, and the rule
             // `stream.rs`'s `state` already applies to a permission prompt. Each
             // is released by any later hook, which is inference-free.
-            SessionEvent::TranscriptGrew => match current {
-                Some(
-                    held @ (Self::Starting
-                    | Self::WaitingForInput
-                    | Self::WaitingForPermission
-                    | Self::Ended),
-                ) => held,
-                _ => Self::Working,
+            //
+            // A rollout whose last turn marker is open is the same evidence from
+            // the Codex side (#2135), so it follows the same rule.
+            SessionEvent::TranscriptGrew | SessionEvent::RolloutTurn(RolloutTurn::Open) => {
+                match current {
+                    Some(
+                        held @ (Self::Starting
+                        | Self::WaitingForInput
+                        | Self::WaitingForPermission
+                        | Self::Ended),
+                    ) => held,
+                    _ => Self::Working,
+                }
+            }
+            // A closed turn can end a `working` turn and nothing else: it is
+            // passive, so it cannot release a wait (ADR-0052), and `idle`,
+            // `starting` and `ended` are already as quiet as it says.
+            SessionEvent::RolloutTurn(RolloutTurn::Closed) => match current {
+                Some(Self::Working) | None => Self::Idle,
+                Some(other) => other,
             },
             SessionEvent::Stop => Self::Idle,
             // An authoritative state from a stream-json observer wins outright,
@@ -441,6 +458,21 @@ pub enum NotificationKind {
     Other,
 }
 
+/// What a Codex rollout's last turn marker says about its thread (#2135).
+///
+/// Read off the rollout's `event_msg` records by `type` alone: `task_started`
+/// opens a turn, and `task_complete` or `turn_aborted` closes it. Only the *last*
+/// marker is evidence — the counts are not (a rollout can carry a turn left open
+/// by a crash, or a stray extra completion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutTurn {
+    /// The last marker is `task_started`: a turn is running.
+    Open,
+    /// The last marker is `task_complete` or `turn_aborted`: no turn is running.
+    Closed,
+}
+
 /// A sighting of a session, from a hook event or the transcript watcher.
 ///
 /// Drives the [`SessionState::for_event`] inference and refreshes liveness.
@@ -467,6 +499,12 @@ pub enum SessionEvent {
     /// The transcript watcher discovered a session's `.jsonl` it had not seen —
     /// a session that started before the daemon, or before hooks were installed.
     TranscriptDiscovered,
+    /// The Codex rollout watcher read the turn marker closest to the end of a
+    /// session's rollout, while the thread's lock was held — the one place a
+    /// Codex session with no hooks says whether a turn is running (#2135). Passive
+    /// evidence like [`TranscriptGrew`](Self::TranscriptGrew): it never overrides a
+    /// state a hook reported directly. Serialized as `{"rollout_turn":"open"}`.
+    RolloutTurn(RolloutTurn),
     /// An **authoritative** state reported directly by a stream-json observer —
     /// the `omni-dev claude-wrap` wrapper reading Claude's `--output-format
     /// stream-json` stdout, where the exact state is first-class (`init` →
@@ -908,6 +946,7 @@ fn subagent_state(
         event,
         SessionEvent::TranscriptDiscovered
             | SessionEvent::TranscriptGrew
+            | SessionEvent::RolloutTurn(_)
             | SessionEvent::Notification(NotificationKind::Other)
     ) {
         entry.subagent_waits.clear();
@@ -1161,13 +1200,15 @@ impl SessionsRegistry {
                     outcome = skip.map_or("skipped", Skip::outcome);
                     false
                 }
-                // A passive re-sighting (the Codex rollout watcher's heartbeat)
-                // must not refresh an ended session, or it would outlive its
-                // short ended-linger window (#1909).
+                // A passive re-sighting (the Codex rollout watcher's heartbeat, or
+                // a turn marker it read) must not refresh an ended session, or it
+                // would outlive its short ended-linger window (#1909, #2135).
                 Some(entry)
                     if entry.state == SessionState::Ended
-                        && (req.event == SessionEvent::TranscriptDiscovered
-                            || agent_id.is_some()) =>
+                        && (matches!(
+                            req.event,
+                            SessionEvent::TranscriptDiscovered | SessionEvent::RolloutTurn(_)
+                        ) || agent_id.is_some()) =>
                 {
                     outcome = "ended_passive_ignored";
                     false
@@ -1954,6 +1995,9 @@ mod tests {
             (Notification(AgentNeedsInput), SessionState::WaitingForInput),
             (TranscriptGrew, SessionState::Working),
             (TranscriptDiscovered, SessionState::Idle),
+            // A rollout's last turn marker, on a session not seen before (#2135).
+            (RolloutTurn(super::RolloutTurn::Open), SessionState::Working),
+            (RolloutTurn(super::RolloutTurn::Closed), SessionState::Idle),
             // An authoritative stream-json report is returned verbatim.
             (
                 StreamState(SessionState::WaitingForPermission),
@@ -2965,6 +3009,122 @@ mod tests {
             !rx.has_changed().unwrap(),
             "state did not change, so nothing a consumer renders did either (#1414)"
         );
+    }
+
+    #[test]
+    fn a_rollout_turn_marker_moves_working_and_idle_and_nothing_else() {
+        // #2135: an open turn is `transcript_grew`'s evidence from the Codex
+        // side, so it is held by exactly the states growth is held by; a closed
+        // turn ends a `working` turn and leaves every other known state alone.
+        let open = SessionEvent::RolloutTurn(RolloutTurn::Open);
+        let closed = SessionEvent::RolloutTurn(RolloutTurn::Closed);
+        for held in [
+            SessionState::Starting,
+            SessionState::WaitingForInput,
+            SessionState::WaitingForPermission,
+            SessionState::Ended,
+        ] {
+            assert_eq!(SessionState::for_event(&open, Some(held)), held, "{held:?}");
+            assert_eq!(
+                SessionState::for_event(&closed, Some(held)),
+                held,
+                "{held:?}"
+            );
+        }
+        for other in [SessionState::Working, SessionState::Idle] {
+            assert_eq!(
+                SessionState::for_event(&open, Some(other)),
+                SessionState::Working,
+                "open from {other:?}"
+            );
+            assert_eq!(
+                SessionState::for_event(&closed, Some(other)),
+                SessionState::Idle,
+                "closed from {other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hookless_codex_session_follows_its_rollouts_turns() {
+        let reg = SessionsRegistry::new();
+        let turn = |turn| ObserveRequest {
+            agent: Agent::Codex,
+            ..observe_request(
+                "019a0000-0000-7000-8000-00000000c0de",
+                SessionEvent::RolloutTurn(turn),
+                Some("/work/repo"),
+            )
+        };
+        // First sighted mid-turn: working, with no hook ever having spoken.
+        reg.observe(turn(RolloutTurn::Open));
+        assert_eq!(reg.list()[0].state, SessionState::Working);
+        reg.observe(turn(RolloutTurn::Closed));
+        assert_eq!(reg.list()[0].state, SessionState::Idle);
+        reg.observe(turn(RolloutTurn::Open));
+        assert_eq!(reg.list()[0].state, SessionState::Working);
+    }
+
+    #[test]
+    fn a_rollout_turn_marker_neither_overrides_nor_releases_a_reported_wait() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::Notification(NotificationKind::PermissionPrompt),
+            Some("/tmp/a"),
+        ));
+        let rx = reg.subscribe_changes();
+        for turn in [RolloutTurn::Open, RolloutTurn::Closed] {
+            reg.observe(observe_request(
+                "s1",
+                SessionEvent::RolloutTurn(turn),
+                Some("/tmp/a"),
+            ));
+            assert_eq!(reg.list()[0].state, SessionState::WaitingForPermission);
+        }
+        assert!(
+            !rx.has_changed().unwrap(),
+            "state did not change, so nothing a consumer renders did either (#1414)"
+        );
+        // The authoritative report still has the last word, as it always does.
+        reg.observe(observe_request(
+            "s1",
+            SessionEvent::StreamState(SessionState::Idle),
+            None,
+        ));
+        assert_eq!(reg.list()[0].state, SessionState::Idle);
+    }
+
+    #[test]
+    fn a_rollout_turn_marker_does_not_revive_an_ended_session() {
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request("s", SessionEvent::Stop, None));
+        assert!(reg.end("s", None, None));
+        let ended_at = reg.list()[0].last_seen;
+        let rx = reg.subscribe_changes();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        reg.observe(observe_request(
+            "s",
+            SessionEvent::RolloutTurn(RolloutTurn::Open),
+            None,
+        ));
+        let listed = reg.list();
+        assert_eq!(listed[0].state, SessionState::Ended);
+        assert_eq!(
+            listed[0].last_seen, ended_at,
+            "the linger window did not restart"
+        );
+        assert!(!rx.has_changed().unwrap(), "no consumer-visible change");
+    }
+
+    #[test]
+    fn a_rollout_turn_marker_is_a_wire_event() {
+        for (turn, name) in [(RolloutTurn::Open, "open"), (RolloutTurn::Closed, "closed")] {
+            let event = SessionEvent::RolloutTurn(turn);
+            let json = serde_json::to_value(event).unwrap();
+            assert_eq!(json, serde_json::json!({ "rollout_turn": name }));
+            assert_eq!(serde_json::from_value::<SessionEvent>(json).unwrap(), event);
+        }
     }
 
     #[test]
