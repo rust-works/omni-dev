@@ -503,7 +503,9 @@ pub enum SessionEvent {
     /// session's rollout, while the thread's lock was held — the one place a
     /// Codex session with no hooks says whether a turn is running (#2135). Passive
     /// evidence like [`TranscriptGrew`](Self::TranscriptGrew): it never overrides a
-    /// state a hook reported directly. Serialized as `{"rollout_turn":"open"}`.
+    /// state a hook reported directly, and an open turn does not start `working`
+    /// over an `idle` that was reported (see [`SessionEntry::reported`]).
+    /// Serialized as `{"rollout_turn":"open"}`.
     RolloutTurn(RolloutTurn),
     /// An **authoritative** state reported directly by a stream-json observer —
     /// the `omni-dev claude-wrap` wrapper reading Claude's `--output-format
@@ -756,6 +758,14 @@ pub struct SessionEntry {
     /// than this is stale and dropped (#2108).
     #[serde(skip)]
     pub(crate) latest_stamp_ts: Option<DateTime<Utc>>,
+    /// Whether the current `state` was asserted directly — by a hook or an
+    /// authoritative stream report — rather than defaulted or inferred from
+    /// passive evidence (growth, a discovered transcript, a rollout's turn
+    /// marker). `last_event` cannot say: the Codex watcher's heartbeat overwrites
+    /// it without touching the state. An open rollout turn does not start
+    /// `working` from an `idle` that was reported (#2135).
+    #[serde(skip)]
+    pub(crate) reported: bool,
 }
 
 /// Why a stamped event is not applied to its session (#2108).
@@ -902,6 +912,31 @@ fn seen_at(stamp: Option<&EventStamp>, origin: Origin, now: DateTime<Utc>) -> Da
         (Origin::Journal | Origin::Replay, Some(stamp)) => stamp.ts.min(now),
         _ => now,
     }
+}
+
+/// Whether `event` asserts a state directly (a hook, or an authoritative stream
+/// report), as opposed to passive evidence about the session: a watcher's
+/// discovery, transcript growth or a rollout's turn marker.
+fn asserts_state(event: SessionEvent) -> bool {
+    !matches!(
+        event,
+        SessionEvent::TranscriptDiscovered
+            | SessionEvent::TranscriptGrew
+            | SessionEvent::RolloutTurn(_)
+    )
+}
+
+/// Whether `event` is an open rollout turn arriving at an `idle` that was
+/// reported directly. The turn marker is read off a file Codex flushes on its own
+/// schedule, so it can trail a `Stop` hook (or the wrapper's `idle`) by a scan and
+/// would start `working` again over it: a reported state stands, and the next hook
+/// or poll restarts the row if a turn really is running. An `idle` that was only
+/// defaulted or inferred has nothing to defend, which is the hook-less session
+/// this event exists for (#2135).
+fn open_turn_over_reported_idle(entry: &SessionEntry, event: SessionEvent) -> bool {
+    event == SessionEvent::RolloutTurn(RolloutTurn::Open)
+        && entry.state == SessionState::Idle
+        && entry.reported
 }
 
 /// Subagent activity shares the parent's session id but does not run its turn.
@@ -1230,8 +1265,19 @@ impl SessionsRegistry {
                     track_pid(entry, req.pid);
                     entry.prompted |= req.event == SessionEvent::UserPromptSubmit;
                     entry.streamed |= is_claude_stream_report(&req);
-                    let next = subagent_state(entry, req.event, agent_id);
+                    let next = if open_turn_over_reported_idle(entry, req.event) {
+                        entry.state
+                    } else {
+                        subagent_state(entry, req.event, agent_id)
+                    };
                     let state_changed = next != entry.state;
+                    // A direct assertion makes the state reported; passive
+                    // evidence only unmakes it by changing the state itself.
+                    if asserts_state(req.event) {
+                        entry.reported = true;
+                    } else if state_changed {
+                        entry.reported = false;
+                    }
                     entry.state = next;
                     entry.last_event = req.event;
                     entry.last_seen = if origin.is_journal() {
@@ -1292,6 +1338,7 @@ impl SessionsRegistry {
                         recent_seqs: VecDeque::new(),
                         superseded_seqs: VecDeque::new(),
                         latest_stamp_ts: None,
+                        reported: asserts_state(req.event),
                     };
                     entry.state = subagent_state(&mut entry, req.event, agent_id);
                     sessions.insert(session_id, entry);
@@ -2539,6 +2586,7 @@ mod tests {
                     recent_seqs: VecDeque::new(),
                     superseded_seqs: VecDeque::new(),
                     latest_stamp_ts: None,
+                    reported: false,
                     agent: Agent::Claude,
                     session_id: id.to_string(),
                     cwd: None,
@@ -2794,6 +2842,7 @@ mod tests {
                         recent_seqs: VecDeque::new(),
                         superseded_seqs: VecDeque::new(),
                         latest_stamp_ts: None,
+                        reported: false,
                         agent: Agent::Claude,
                         session_id: id.clone(),
                         cwd: None,
@@ -3093,6 +3142,63 @@ mod tests {
             None,
         ));
         assert_eq!(reg.list()[0].state, SessionState::Idle);
+    }
+
+    #[test]
+    fn an_open_rollout_turn_does_not_start_working_over_a_reported_idle() {
+        // A `Stop` hook (or the wrapper's `idle`) can beat Codex flushing
+        // `task_complete`, so an open marker read in between would start the row
+        // again; what was reported stands, and the next hook restarts it (#2135).
+        let open = SessionEvent::RolloutTurn(RolloutTurn::Open);
+        let closed = SessionEvent::RolloutTurn(RolloutTurn::Closed);
+        for reported in [
+            SessionEvent::Stop,
+            SessionEvent::StreamState(SessionState::Idle),
+        ] {
+            let reg = SessionsRegistry::new();
+            reg.observe(observe_request("s", reported, None));
+            assert_eq!(reg.list()[0].state, SessionState::Idle);
+            // The watcher's own heartbeat overwrites `last_event` without
+            // touching the state, so it must not make the idle look unreported.
+            reg.observe(observe_request(
+                "s",
+                SessionEvent::TranscriptDiscovered,
+                None,
+            ));
+            reg.observe(observe_request("s", open, None));
+            assert_eq!(reg.list()[0].state, SessionState::Idle, "{reported:?}");
+            // A hook that really starts a turn still does.
+            reg.observe(observe_request("s", SessionEvent::UserPromptSubmit, None));
+            assert_eq!(reg.list()[0].state, SessionState::Working);
+        }
+        // A closed turn still ends a `working` turn a hook reported (the heal for
+        // a `Stop` that never arrives), and the idle it leaves is the rollout's
+        // own, not a reported one, so the next open turn starts it again.
+        let reg = SessionsRegistry::new();
+        reg.observe(observe_request("s", SessionEvent::UserPromptSubmit, None));
+        reg.observe(observe_request("s", closed, None));
+        assert_eq!(reg.list()[0].state, SessionState::Idle);
+        reg.observe(observe_request("s", open, None));
+        assert_eq!(reg.list()[0].state, SessionState::Working);
+    }
+
+    #[test]
+    fn a_session_first_seen_from_its_rollout_has_no_reported_state_to_defend() {
+        // The hook-less session this event exists for: `idle` is only a default.
+        for first in [
+            SessionEvent::TranscriptDiscovered,
+            SessionEvent::RolloutTurn(RolloutTurn::Closed),
+        ] {
+            let reg = SessionsRegistry::new();
+            reg.observe(observe_request("s", first, None));
+            assert_eq!(reg.list()[0].state, SessionState::Idle);
+            reg.observe(observe_request(
+                "s",
+                SessionEvent::RolloutTurn(RolloutTurn::Open),
+                None,
+            ));
+            assert_eq!(reg.list()[0].state, SessionState::Working, "{first:?}");
+        }
     }
 
     #[test]

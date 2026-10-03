@@ -844,19 +844,32 @@ hook: `UserPromptSubmit` lands before Codex has flushed `task_started`, and the
 still-closed marker would read the session straight back to `idle`. For the same
 reason the first read of a session is asymmetric. An open turn is reported as
 `working`, but a closed one is only recorded, so the first read can never say
-`idle` over a state a hook reported; and an open turn in a rollout that has not
-been written to within five minutes is not claimed until it is, because a crash
-leaves one open for good and `codex resume` of that holds the lock again.
+`idle` over a state a hook reported. And an open marker is not claimed if the
+rollout has not been written to within five minutes, nor if it is the one the
+session was ended in: a crash leaves a turn open for good, and `codex resume` of
+that holds the lock again. Markers are told apart by the byte offset of their
+line, so writing around a stale marker does not make it a turn; only a newer
+`task_started` does. A rollout that cannot be read is retried on the next scan.
 
 It is **passive** evidence, with `transcript_grew`'s rules (ADR-0052): a
-`waiting_for_*`, `starting` or `ended` state is held, a closed turn moves
-`working` to `idle` and nothing else, and the wrapper's authoritative
-`stream_state`, re-asserted on every poll, has the last word. The limits:
+`waiting_for_*`, `starting` or `ended` state is held; a closed turn moves
+`working` to `idle` and nothing else, so it also ends a `working` whose `Stop`
+hook never arrived; and an open turn starts `working` only from an `idle` nobody
+reported, never over a `Stop` hook's or the wrapper's `idle`, since Codex flushes
+`task_complete` on its own schedule and the marker can trail them by a scan. The
+wrapper's authoritative `stream_state`, re-asserted on every poll, has the last
+word. The limits:
 
 - A turn shorter than the 5-second scan, or one whose marker is beyond the 4 MiB
-  tail, is missed, and the session stays `idle`, as before.
-- A turn left open by a crash and then resumed can read `working` until the next
-  turn ends, if the resume writes anything but a marker.
+  tail, is missed, and the session stays `idle`, as before. Growth alone is not
+  taken as a turn when the marker is out of reach.
+- A rollout that is silent for more than five minutes mid-turn when the daemon
+  first sees it (a long tool call across a daemon restart) is not claimed
+  `working` for the rest of that turn, for the same reason a stale marker is not.
+- A wait a hook reported (`waiting_for_permission`) is released only by a hook, as
+  with `transcript_grew`: a closed turn does not release it, so a denied approval
+  whose `Interrupt` hook is untrusted keeps showing as waiting until another hook
+  arrives.
 - It is separate from the hooks: a session that has them is still driven by them,
   and the two agree because both follow the turn.
 
