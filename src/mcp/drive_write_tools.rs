@@ -1251,7 +1251,7 @@ mod tests {
             ),
             (
                 docs_write::WriteResult::Formatted {
-                    edit: edit.clone(),
+                    edit,
                     style,
                     fields: "bold".into(),
                 },
