@@ -192,6 +192,7 @@ pub(crate) enum Action {
     Observe {
         req: ObserveRequest,
         stamp: EventStamp,
+        origin: Origin,
     },
     /// Apply a `SessionEnd`.
     End {
@@ -199,28 +200,24 @@ pub(crate) enum Action {
         reason: Option<String>,
         pid: Option<u32>,
         stamp: EventStamp,
+        origin: Origin,
     },
 }
 
 impl Action {
     fn apply(self, registry: &SessionsRegistry) {
         match self {
-            Self::Observe { req, stamp } => {
-                registry.observe_stamped(req, Some(stamp), Origin::Journal);
+            Self::Observe { req, stamp, origin } => {
+                registry.observe_stamped(req, Some(stamp), origin);
             }
             Self::End {
                 session_id,
                 reason,
                 pid,
                 stamp,
+                origin,
             } => {
-                registry.end_stamped(
-                    &session_id,
-                    reason.as_deref(),
-                    pid,
-                    Some(stamp),
-                    Origin::Journal,
-                );
+                registry.end_stamped(&session_id, reason.as_deref(), pid, Some(stamp), origin);
             }
         }
     }
@@ -295,7 +292,7 @@ impl Scan<'_> {
     }
 
     /// Turns `records` into actions, oldest first.
-    fn emit(&mut self, mut records: Vec<JournalRecord>) {
+    fn emit(&mut self, mut records: Vec<JournalRecord>, origin: Origin) {
         records.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.seq.cmp(&b.seq)));
         for record in records {
             let stamp = record.stamp();
@@ -305,12 +302,13 @@ impl Scan<'_> {
                     reason: reason.clone(),
                     pid: *pid,
                     stamp,
+                    origin,
                 }),
                 JournalBody::Observe { cwd, .. } => {
                     let repo = cwd.as_deref().and_then(|cwd| self.repo_for(cwd));
                     if let Some(mut req) = record.to_observe_request() {
                         req.repo = repo;
-                        self.actions.push(Action::Observe { req, stamp });
+                        self.actions.push(Action::Observe { req, stamp, origin });
                     }
                 }
             }
@@ -585,7 +583,7 @@ fn import(scan: &mut Scan<'_>, agent: Agent, file: &JournalFile) -> Option<FileT
         }
         Verdict::Accept { proven } => {
             tracing::debug!(session_id = %file.id, proven, records = records.len(), "session_journal_replayed");
-            scan.emit(records);
+            scan.emit(records, Origin::Replay);
             Some(FileTrack {
                 session_id: file.id.clone(),
                 ino: file.ino,
@@ -609,7 +607,7 @@ fn tail(scan: &mut Scan<'_>, agent: Agent, file: &JournalFile, mut track: FileTr
     let from = if rewritten { 0 } else { track.offset };
     match read_chunk(&file.path, from, file.len) {
         Ok(chunk) => {
-            scan.emit(belonging(chunk.records, agent, &file.id));
+            scan.emit(belonging(chunk.records, agent, &file.id), Origin::Journal);
             track.offset = chunk.new_offset;
             track.ino = file.ino;
         }
@@ -2001,7 +1999,7 @@ mod tests {
             .collect();
         let last = records.last().cloned().unwrap();
         with_scan(&counting, |scan| {
-            scan.emit(records);
+            scan.emit(records, Origin::Journal);
             assert_eq!(
                 calls.get(),
                 MAX_REPO_CACHE + 1,
@@ -2009,7 +2007,7 @@ mod tests {
             );
             assert_eq!(scan.state.repos.len(), 1, "the full cache was cleared");
             // The newest cwd survived the clear, so asking again is a cache hit.
-            scan.emit(vec![last]);
+            scan.emit(vec![last], Origin::Journal);
             assert_eq!(calls.get(), MAX_REPO_CACHE + 1);
         });
     }
@@ -2120,6 +2118,78 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         remove(&dir, "test");
         assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn a_replay_and_a_tail_are_counted_apart() {
+        // First sight is a replay; what a hook appends afterwards, whose POST
+        // never came, is a recovery (#2136).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write(
+            tmp.path(),
+            &[
+                rec(
+                    ID,
+                    Agent::Claude,
+                    SessionEvent::SessionStart,
+                    ago(30),
+                    "1-1",
+                    None,
+                ),
+                rec(
+                    ID,
+                    Agent::Claude,
+                    SessionEvent::UserPromptSubmit,
+                    ago(20),
+                    "1-2",
+                    None,
+                ),
+            ],
+        );
+        let registry = SessionsRegistry::new();
+        let mut state = JournalState::default();
+        let probes = Fake::default();
+        run(tmp.path(), &mut state, &registry, &probes);
+        assert_eq!(
+            registry.delivery(),
+            crate::sessions::DeliveryStats {
+                socket: 0,
+                recovered: 0,
+                replayed: 2
+            }
+        );
+
+        let next = rec(
+            ID,
+            Agent::Claude,
+            SessionEvent::PreToolUse,
+            ago(1),
+            "1-3",
+            None,
+        );
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{}", serde_json::to_string(&next).unwrap()).unwrap();
+        run(tmp.path(), &mut state, &registry, &probes);
+        assert_eq!(
+            registry.delivery(),
+            crate::sessions::DeliveryStats {
+                socket: 0,
+                recovered: 1,
+                replayed: 2
+            }
+        );
+
+        // The socket copy of that last event, arriving late, takes it back out.
+        registry.observe_stamped(
+            next.to_observe_request().unwrap(),
+            Some(next.stamp()),
+            Origin::Socket,
+        );
+        assert_eq!(registry.delivery().recovered, 0);
     }
 
     // --- end to end ---------------------------------------------------------

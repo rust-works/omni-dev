@@ -36,7 +36,8 @@ use crate::daemon::service::{
 };
 use crate::daemon::services::worktrees::focus_window;
 use crate::sessions::{
-    EventStamp, ObserveRequest, Origin, SessionEntry, SessionState, SessionsRegistry, WindowReport,
+    DeliveryStats, EventStamp, ObserveRequest, Origin, SessionEntry, SessionState,
+    SessionsRegistry, WindowReport,
 };
 
 /// The sessions service name (the control-socket routing key).
@@ -251,12 +252,17 @@ impl DaemonService for SessionsService {
 
     async fn status(&self) -> ServiceStatus {
         let sessions = self.registry.list();
-        let summary = status_summary(&sessions);
+        let delivery = self.registry.delivery();
+        let summary = format!(
+            "{}{}",
+            status_summary(&sessions),
+            delivery_summary(delivery)
+        );
         ServiceStatus {
             name: SERVICE_NAME.to_string(),
             healthy: true,
             summary,
-            detail: json!({ "sessions": sessions }),
+            detail: json!({ "sessions": sessions, "delivery": delivery }),
         }
     }
 
@@ -388,6 +394,19 @@ fn status_summary(sessions: &[SessionEntry]) -> String {
     format!(
         "{} session(s): {working} working, {waiting} waiting, {idle} idle",
         sessions.len()
+    )
+}
+
+/// The `status` summary's tail for [`DeliveryStats`] (#2136): how the daemon has
+/// been hearing about events. Empty until the first one, so an idle daemon's
+/// summary is unchanged. A steady `0 recovered` means the socket is keeping up.
+fn delivery_summary(delivery: DeliveryStats) -> String {
+    if delivery == DeliveryStats::default() {
+        return String::new();
+    }
+    format!(
+        " · events: {} via socket, {} recovered from journals, {} replayed",
+        delivery.socket, delivery.recovered, delivery.replayed
     )
 }
 
@@ -1022,6 +1041,56 @@ mod tests {
         // "idle" tally (#1946).
         assert!(status.summary.contains("3 idle"), "{}", status.summary);
         assert!(status.summary.contains("0 working"), "{}", status.summary);
+    }
+
+    #[tokio::test]
+    async fn status_reports_how_events_were_delivered() {
+        let svc = service();
+        // An idle daemon's summary is unchanged.
+        let quiet = svc.status().await;
+        assert!(!quiet.summary.contains("events:"), "{}", quiet.summary);
+        assert_eq!(
+            quiet.detail["delivery"],
+            json!({ "socket": 0, "recovered": 0, "replayed": 0 })
+        );
+
+        svc.handle(
+            "observe",
+            json!({ "session_id": "s1", "event": "pre_tool_use" }),
+        )
+        .await
+        .unwrap();
+        svc.handle("observe", json!({ "session_id": "s1", "event": "stop" }))
+            .await
+            .unwrap();
+        let status = svc.status().await;
+        assert!(
+            status
+                .summary
+                .contains("events: 2 via socket, 0 recovered from journals, 0 replayed"),
+            "{}",
+            status.summary
+        );
+        assert_eq!(status.detail["delivery"]["socket"], 2);
+        // The session counts are still first.
+        assert!(
+            status.summary.starts_with("1 session(s)"),
+            "{}",
+            status.summary
+        );
+    }
+
+    #[test]
+    fn delivery_summary_is_empty_until_the_first_event() {
+        assert_eq!(delivery_summary(DeliveryStats::default()), "");
+        assert_eq!(
+            delivery_summary(DeliveryStats {
+                socket: 0,
+                recovered: 1,
+                replayed: 0
+            }),
+            " · events: 0 via socket, 1 recovered from journals, 0 replayed"
+        );
     }
 
     // --- Push subscription (#1414) -----------------------------------------
