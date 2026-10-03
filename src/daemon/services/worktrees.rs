@@ -2582,44 +2582,50 @@ fn upstream_target(branch: &git2::Branch<'_>) -> Option<String> {
     Some(branch.upstream().ok()?.get().target()?.to_string())
 }
 
-/// The ahead/behind divergence of `repo`'s checked-out branch versus its
-/// upstream, computed on demand for the lazy `ahead-behind` op (#1306). Mirrors the
-/// branch resolution in [`git_status_impl`] but does **only** the upstream walk
-/// [`git_status_cheap`] omits. `None` when HEAD is detached or unborn, or the
-/// branch tracks no upstream — every case the tree renders without a sync
-/// indicator.
+/// Both lazily-fetched divergences of the branch `head` names, computed on demand
+/// for the `ahead-behind` op (#1306). Mirrors the branch resolution in
+/// [`git_status_impl`] but does **only** the upstream walks [`git_status_cheap`]
+/// omits. Both are absent when `head` is detached or unborn (`None`) — every case
+/// the tree renders without a sync indicator.
 ///
-/// Takes an open repository so [`folder_divergence`] can answer this and
-/// [`repo_main_behind`] from one `Repository::discover` (#2111).
-fn repo_ahead_behind(repo: &Repository) -> Option<(usize, usize)> {
-    let head = repo.head().ok()?;
-    if !head.is_branch() {
-        return None;
-    }
+/// `shallow` is the repository's, so it is reported whatever HEAD is: a client
+/// that memoizes by commit ids needs to know the clone is shallow even for a row
+/// that has no counts (#2120).
+///
+/// `head` is the caller's to resolve, because only the caller knows which HEAD
+/// is meant: [`folder_divergence`] reads the one of the repository it opened,
+/// while [`shared_repo`] reads a linked worktree's HEAD through the main
+/// repository (#2121). Everything below reads refs and config that every worktree
+/// of a repository shares, so `repo` need not be rooted at the worktree.
+fn head_divergence(repo: &Repository, head: Option<git2::Reference<'_>>) -> Divergence {
+    let shallow = repo.is_shallow();
+    let Some(head) = head.filter(git2::Reference::is_branch) else {
+        return Divergence {
+            shallow,
+            ..Divergence::default()
+        };
+    };
     let branch = git2::Branch::wrap(head);
-    upstream_ahead_behind(repo, &branch)
+    Divergence {
+        ahead_behind: upstream_ahead_behind(repo, &branch),
+        main_behind: repo_main_behind(repo, &branch),
+        shallow,
+    }
 }
 
-/// Commits `repo`'s checked-out branch is behind the repository's remote
-/// default branch (`origin/<main>`), computed on demand for the lazy
-/// `ahead-behind` op (#1457). Resolves the default branch the same
-/// **local-only, no-fetch** way `worktree_rebase::resolve_onto` resolves its
-/// `--onto` default — via [`RemoteInfo::detect_main_branch_local`] — but,
-/// unlike that resolver, never falls back to a hardcoded `"main"`: this is a
-/// passive signal, so an unresolvable default branch means silence (`None`)
-/// rather than a guess.
+/// Commits `branch` is behind the repository's remote default branch
+/// (`origin/<main>`), computed on demand for the lazy `ahead-behind` op (#1457).
+/// Resolves the default branch the same **local-only, no-fetch** way
+/// `worktree_rebase::resolve_onto` resolves its `--onto` default — via
+/// [`RemoteInfo::detect_main_branch_local`] — but, unlike that resolver, never
+/// falls back to a hardcoded `"main"`: this is a passive signal, so an
+/// unresolvable default branch means silence (`None`) rather than a guess.
 ///
-/// `None` when: HEAD is detached/unborn, no default branch is locally
-/// resolvable, or the branch's own upstream **is** already that default branch —
-/// in which case [`repo_ahead_behind`]'s `behind` already reports this exact
-/// divergence, so repeating it here would just duplicate the existing sync count.
-fn repo_main_behind(repo: &Repository) -> Option<usize> {
-    let head = repo.head().ok()?;
-    if !head.is_branch() {
-        return None;
-    }
-    let branch = git2::Branch::wrap(head);
-
+/// `None` when: no default branch is locally resolvable, or the branch's own
+/// upstream **is** already that default branch — in which case
+/// [`upstream_ahead_behind`]'s `behind` already reports this exact divergence, so
+/// repeating it here would just duplicate the existing sync count.
+fn repo_main_behind(repo: &Repository, branch: &git2::Branch<'_>) -> Option<usize> {
     let (onto_ref, onto_oid) = default_branch_tip(repo)?;
 
     // Skip when the branch's own upstream already IS the resolved default
@@ -2660,17 +2666,14 @@ fn default_branch_tip(repo: &Repository) -> Option<(String, git2::Oid)> {
     Some((onto_ref, oid))
 }
 
-/// Both lazily-fetched divergences of `folder`, from a single repository open.
-/// What the `ahead-behind` op computes per worktree (#2111).
+/// Both lazily-fetched divergences of `folder`, from a single repository open
+/// rooted at `folder` itself. What the `ahead-behind` op computes per worktree
+/// (#2111).
 fn folder_divergence(folder: &Path) -> Divergence {
     let Ok(repo) = Repository::discover(folder) else {
         return Divergence::default();
     };
-    Divergence {
-        ahead_behind: repo_ahead_behind(&repo),
-        main_behind: repo_main_behind(&repo),
-        shallow: repo.is_shallow(),
-    }
+    head_divergence(&repo, repo.head().ok())
 }
 
 /// The main repository's directory name from git's common dir. For the usual
@@ -7297,13 +7300,13 @@ mod tests {
         // with it, and never the other way round.
         let dir = tempfile::tempdir().unwrap();
         let repo = behind_main_no_upstream_repo(dir.path());
-        assert_eq!(repo_main_behind(&repo), Some(1));
+        assert_eq!(folder_divergence(dir.path()).main_behind, Some(1));
         let before = default_branch_tip(&repo).unwrap().1;
 
         let after = simulate_default_branch_fetch(&repo);
         assert_ne!(before, after);
         assert_eq!(default_branch_tip(&repo).unwrap().1, after);
-        assert_eq!(repo_main_behind(&repo), Some(2));
+        assert_eq!(folder_divergence(dir.path()).main_behind, Some(2));
     }
 
     #[tokio::test]
