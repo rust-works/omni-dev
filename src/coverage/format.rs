@@ -151,4 +151,133 @@ mod tests {
         // Detected as JSON but invalid → parse error with context.
         assert!(parse("{ not json", None).is_err());
     }
+
+    /// Real `cargo llvm-cov` 0.8.7 output (rustc 1.98, LLVM 22.1.8, edition 2021)
+    /// for this whole `src/lib.rs`, run under `cargo llvm-cov --no-report` and
+    /// then `cargo llvm-cov report --lcov` / `--json`:
+    ///
+    /// ```text
+    ///  1 pub fn generic<T: Default + PartialEq>(t: T) -> u8 {
+    ///  2     if t == T::default() {
+    ///  3         0
+    ///  4     } else {
+    ///  5         1
+    ///  6     }
+    ///  7 }
+    ///  8
+    ///  9 pub fn wrap(v: &[u8]) -> Vec<u8> {
+    /// 10     v.iter().map(|b| b + 1).collect()
+    /// 11 }
+    /// 12
+    /// 13 #[cfg(test)]
+    /// 14 mod tests {
+    /// 15     use super::*;
+    /// 16
+    /// 17     #[test]
+    /// 18     fn t() {
+    /// 19         assert_eq!(generic(0u8), 0);
+    /// 20         assert_eq!(generic(1u16), 1);
+    /// 21         assert_eq!(wrap(&[1]), vec![2]);
+    /// 22     }
+    /// 23 }
+    /// ```
+    ///
+    /// Trimmed to the records and fields that matter here: the lcov's `FN*`/`BR*`
+    /// records and the JSON's `functions`, `branches` and non-line summaries are
+    /// elided, and the absolute path is replaced by `/repo`.
+    ///
+    /// Two things in it make llvm-cov's own summary disagree with the per-line
+    /// records (#2131):
+    ///
+    /// - the closure `|b| b + 1` is a function record of its own that *also*
+    ///   maps line 10, which `wrap` maps too, so the summary counts line 10
+    ///   twice; and
+    /// - `generic` has two instantiations (`u8` takes line 3, `u16` line 5). The
+    ///   summary merges them by `max` (one line missed); the per-line view unions
+    ///   them (every line covered).
+    ///
+    /// So the summary — and the lcov `LF`/`LH` records, which are written from
+    /// it — say 14 lines, 13 covered, while the `DA` records and the JSON
+    /// `segments` hold 13 lines, all covered.
+    const LLVM_COV_GAP_LCOV: &str = "\
+SF:/repo/src/lib.rs
+DA:1,2
+DA:2,2
+DA:3,1
+DA:5,1
+DA:7,2
+DA:9,1
+DA:10,1
+DA:11,1
+DA:18,1
+DA:19,1
+DA:20,1
+DA:21,1
+DA:22,1
+LF:14
+LH:13
+end_of_record";
+
+    /// The JSON half of [`LLVM_COV_GAP_LCOV`].
+    const LLVM_COV_GAP_JSON: &str = r#"{"data":[{"files":[{"filename":"/repo/src/lib.rs",
+"segments":[
+[1,1,2,true,true,false],[1,51,0,false,false,false],[2,8,2,true,true,false],
+[2,25,0,false,false,false],[3,9,1,true,true,false],[3,10,0,false,false,false],
+[5,9,1,true,true,false],[5,10,0,false,false,false],[7,1,2,true,true,false],
+[7,2,0,false,false,false],[9,1,1,true,true,false],[9,33,0,false,false,false],
+[10,5,1,true,true,false],[10,6,0,false,false,false],[10,7,1,true,true,false],
+[10,11,0,false,false,false],[10,14,1,true,true,false],[10,17,0,false,false,false],
+[10,22,1,true,true,false],[10,23,0,false,false,false],[10,29,1,true,true,false],
+[10,36,0,false,false,false],[11,1,1,true,true,false],[11,2,0,false,false,false],
+[18,5,1,true,true,false],[18,11,0,false,false,false],[19,9,1,true,true,false],
+[19,19,0,false,false,false],[19,20,1,true,true,false],[19,27,0,false,false,false],
+[20,9,1,true,true,false],[20,19,0,false,false,false],[20,20,1,true,true,false],
+[20,27,0,false,false,false],[21,9,1,true,true,false],[21,19,0,false,false,false],
+[21,20,1,true,true,false],[21,24,0,false,false,false],[21,25,1,true,true,false],
+[21,29,0,false,false,false],[21,32,1,true,true,false],[21,36,0,false,false,false],
+[22,5,1,true,true,false],[22,6,0,false,false,false]],
+"summary":{"lines":{"count":14,"covered":13,"percent":92.85714285714286}}}],
+"totals":{"lines":{"count":14,"covered":13,"percent":92.85714285714286}}}],
+"type":"llvm.coverage.json.export","version":"3.1.0"}"#;
+
+    /// `coverage diff`'s total is the per-line view — distinct lines — and not
+    /// the figure `llvm-cov report` prints. The lcov carries that figure too, in
+    /// `LF`/`LH`, so reading those instead of counting `DA` records would move
+    /// every `--fail-under-lines` gate; this pins that it does not.
+    #[test]
+    fn lcov_total_counts_da_records_not_lf_and_lh() {
+        assert!(LLVM_COV_GAP_LCOV.contains("\nLF:14\nLH:13\n"));
+
+        let report = parse(LLVM_COV_GAP_LCOV, Some(Format::Lcov)).unwrap();
+
+        assert_eq!(report.total_lines(), 13);
+        assert_eq!(report.covered_lines(), 13);
+    }
+
+    /// The JSON export's `summary`/`totals` carry the summary's figure as well;
+    /// the parser must keep rebuilding lines from `segments` and ignore them.
+    #[test]
+    fn llvm_json_total_is_rebuilt_from_segments_not_taken_from_summary() {
+        assert!(LLVM_COV_GAP_JSON.contains(r#""lines":{"count":14,"covered":13"#));
+
+        let report = parse(LLVM_COV_GAP_JSON, Some(Format::LlvmCovJson)).unwrap();
+
+        assert_eq!(report.total_lines(), 13);
+        assert_eq!(report.covered_lines(), 13);
+    }
+
+    /// Both real-world formats yield the same per-line view — the same
+    /// executable lines with the same hit counts — which is what lets a sharded
+    /// run mix them and a baseline in one format be compared with a head in the
+    /// other.
+    #[test]
+    fn lcov_and_llvm_json_agree_line_for_line() {
+        let lcov = parse(LLVM_COV_GAP_LCOV, Some(Format::Lcov)).unwrap();
+        let json = parse(LLVM_COV_GAP_JSON, Some(Format::LlvmCovJson)).unwrap();
+
+        assert_eq!(
+            lcov.files["/repo/src/lib.rs"].lines,
+            json.files["/repo/src/lib.rs"].lines
+        );
+    }
 }
