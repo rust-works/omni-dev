@@ -27,12 +27,18 @@ use super::{Filter, GhCounts};
 use crate::request_log::LogRecord;
 
 /// How many bytes ending at the cursor are kept to recognise a file that was
-/// rewritten in place. Log lines carry unique ids, so a rewritten file does not
-/// reproduce them at the same offset.
+/// rewritten in place. Enough to tell one from the next in all but a contrived
+/// case, which [`Cursor::is_intact`] describes.
 const TAIL_LEN: usize = 64;
 
 /// Block size of the backward search for the last complete line at the baseline.
 const BACKSCAN_BLOCK: usize = 8 * 1024;
+
+/// How far back from the end of the log the baseline looks for a line boundary.
+/// A log's last line is a record, normally a few hundred bytes, so this is far
+/// more than needed; it only bounds the pathological case of a huge run of bytes
+/// with no newline, so that taking the baseline is cheap whatever the file holds.
+const BASELINE_SCAN_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// Read buffer for the forward scan.
 const READ_BUFFER: usize = 64 * 1024;
@@ -83,6 +89,14 @@ impl Cursor {
     /// (truncation), and different bytes where the last consumed line ended (a
     /// file rewritten in place and regrown past the offset, or an inode reused
     /// after its file was deleted).
+    ///
+    /// What it cannot see is a different file with the same id (any id, off
+    /// unix) that is at least as long as the offset and ends a line at exactly
+    /// that offset with the same last [`TAIL_LEN`] bytes. A record's unique id is
+    /// at its start, not its end, so this needs a rewrite that reproduces the old
+    /// line boundary — fixed-shape records in a log that was truncated and regrew
+    /// past the offset between two refreshes. The cost is then an undercount, the
+    /// records before the offset in the new file, never a double count.
     fn is_intact(&self, file: &mut File, id: FileId, len: u64) -> io::Result<bool> {
         if self.id != id || len < self.offset {
             return Ok(false);
@@ -117,11 +131,19 @@ impl Cursor {
     /// before it. The end of the *last complete line* rather than of the file: a
     /// concurrent writer may be part-way through a line, and a cursor inside it
     /// would start the next read mid-record.
+    ///
+    /// A log that exists but cannot be positioned in also yields `None`, which
+    /// makes the first refresh scan it from its first byte: correct, but the cost
+    /// this type exists to avoid, so it is worth a warning.
     fn baseline(path: &Path) -> Option<Self> {
         match Self::try_baseline(path) {
             Ok(cursor) => cursor,
             Err(e) => {
-                tracing::debug!("github counters: cannot baseline {}: {e}", path.display());
+                tracing::warn!(
+                    "github counters: cannot take a baseline of {}: {e}; the first summary \
+                     will scan the whole log",
+                    path.display()
+                );
                 None
             }
         }
@@ -134,7 +156,7 @@ impl Cursor {
             Err(e) => return Err(e),
         };
         let meta = file.metadata()?;
-        let offset = end_of_last_line(&mut file, meta.len())?;
+        let offset = end_of_last_line(&mut file, meta.len(), BASELINE_SCAN_LIMIT)?;
         let tail = read_tail(&mut file, offset)?;
         Ok(Some(Self {
             id: file_id(&meta),
@@ -144,13 +166,20 @@ impl Cursor {
     }
 }
 
-/// The offset just past the last `\n` in the first `len` bytes of `file`, or 0
-/// when there is none. Scans backwards, so it reads only the final line.
-fn end_of_last_line(file: &mut File, len: u64) -> io::Result<u64> {
+/// The offset just past the last `\n` in the first `len` bytes of `file`. Scans
+/// backwards, so it reads only the final line, and gives up after `limit` bytes.
+///
+/// With no newline in the whole file the answer is 0, the start of its one
+/// partial line. With none in the last `limit` bytes it is `len`: a baseline
+/// inside a line that long, so the first read after it starts mid-record and
+/// skips that fragment as malformed. That loses at most the one record, which is
+/// the price of never reading more than `limit` bytes.
+fn end_of_last_line(file: &mut File, len: u64, limit: u64) -> io::Result<u64> {
+    let floor = len.saturating_sub(limit);
     let mut block = [0u8; BACKSCAN_BLOCK];
     let mut end = len;
-    while end > 0 {
-        let start = end.saturating_sub(BACKSCAN_BLOCK as u64);
+    while end > floor {
+        let start = end.saturating_sub(BACKSCAN_BLOCK as u64).max(floor);
         let want = usize::try_from(end - start).unwrap_or(BACKSCAN_BLOCK);
         let chunk = &mut block[..want];
         file.seek(SeekFrom::Start(start))?;
@@ -160,7 +189,7 @@ fn end_of_last_line(file: &mut File, len: u64) -> io::Result<u64> {
         }
         end = start;
     }
-    Ok(0)
+    Ok(if floor == 0 { 0 } else { len })
 }
 
 /// Up to [`TAIL_LEN`] bytes of `file` ending at `offset`.
@@ -519,14 +548,56 @@ mod tests {
 
         let mut file = File::open(&log.path).unwrap();
         assert_eq!(
-            end_of_last_line(&mut file, log.len()).unwrap(),
+            end_of_last_line(&mut file, log.len(), u64::MAX).unwrap(),
             first.len() as u64
         );
-        assert_eq!(end_of_last_line(&mut file, 0).unwrap(), 0);
+        assert_eq!(end_of_last_line(&mut file, 0, u64::MAX).unwrap(), 0);
 
         log.write(&long); // no newline anywhere
         let mut file = File::open(&log.path).unwrap();
-        assert_eq!(end_of_last_line(&mut file, log.len()).unwrap(), 0);
+        assert_eq!(end_of_last_line(&mut file, log.len(), u64::MAX).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_search_for_the_last_line_gives_up_at_its_limit() {
+        let log = Log::new();
+        let first = gh(1, &["pr", "list"], "cli");
+        let long = "x".repeat(3 * BACKSCAN_BLOCK + 17);
+        log.write(&format!("{first}{long}"));
+        let mut file = File::open(&log.path).unwrap();
+
+        // The newline is further back than the limit reaches: the baseline lands at
+        // the end, inside the long line, having read no more than the limit.
+        let limit = 2 * BACKSCAN_BLOCK as u64;
+        assert_eq!(
+            end_of_last_line(&mut file, log.len(), limit).unwrap(),
+            log.len()
+        );
+
+        // A limit that does reach it finds it, as does one longer than the file.
+        let reach = long.len() as u64 + 1;
+        assert_eq!(
+            end_of_last_line(&mut file, log.len(), reach).unwrap(),
+            first.len() as u64
+        );
+    }
+
+    #[test]
+    fn a_baseline_inside_a_huge_line_skips_that_fragment_and_keeps_counting() {
+        let log = Log::new();
+        // More than the baseline looks back over, with no newline in it.
+        let huge = "x".repeat(usize::try_from(BASELINE_SCAN_LIMIT).unwrap() + 1024);
+        log.write(&format!("{}{huge}", gh(1, &["pr", "list"], "cli")));
+
+        let mut tally = log.start();
+        assert_eq!(tally.offset(), Some(log.len()));
+
+        // The huge line is finished by its writer, and a real record follows it.
+        log.append("\n");
+        log.append(&gh(2, &["pr", "view"], "cli"));
+        assert!(tally.refresh(never));
+        assert_eq!(tally.counts().total(), 1);
+        assert_eq!(tally.counts().by_subcommand["pr view"], 1);
     }
 
     #[test]

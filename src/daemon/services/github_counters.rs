@@ -32,7 +32,7 @@
 //! partial count as complete.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -57,6 +57,11 @@ const SHUTDOWN_SCAN_BUDGET: Duration = Duration::from_secs(2);
 
 /// The running tally, shared by the logger task, `status`, `summary` and
 /// `shutdown`. Locked only on a blocking thread, never across an `.await`.
+///
+/// A caller that arrives while another is reading waits for it, which is cheap
+/// unless the log was just replaced: that read rebuilds the tally from the new
+/// file and so can take a while. Shutdown is not held up by it, since cancelling
+/// `stopping` makes the reader in flight stop at its next line.
 type SharedTally = Arc<Mutex<IncrementalCounts>>;
 
 /// Periodically logs, and reports on demand, the GitHub API-call counters.
@@ -166,9 +171,9 @@ async fn counts_since_boot(
     let Some(tally) = tally else {
         return (GhCounts::default(), true);
     };
-    let tally = Arc::clone(tally);
+    let reader = Arc::clone(tally);
     let read = tokio::task::spawn_blocking(move || {
-        let mut tally = tally.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut tally = reader.lock().unwrap_or_else(PoisonError::into_inner);
         let current = tally.refresh(stop);
         (tally.counts().clone(), current)
     })
@@ -177,8 +182,19 @@ async fn counts_since_boot(
         Ok(counts) => counts,
         Err(e) => {
             tracing::warn!("github counters: the log read did not complete: {e}");
-            (GhCounts::default(), false)
+            (last_known(tally), false)
         }
+    }
+}
+
+/// What the tally last held, for when a read of it failed outright. The tally
+/// outlives the failed task, so zeros would be a plausible-looking wrong answer;
+/// should the lock still be held, there is nothing better than zeros.
+fn last_known(tally: &SharedTally) -> GhCounts {
+    match tally.try_lock() {
+        Ok(tally) => tally.counts().clone(),
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().counts().clone(),
+        Err(TryLockError::WouldBlock) => GhCounts::default(),
     }
 }
 
@@ -406,6 +422,33 @@ mod tests {
         assert_eq!(tallied(&svc), 0);
         svc.shutdown().await;
         assert_eq!(tallied(&svc), 3);
+    }
+
+    #[tokio::test]
+    async fn a_read_that_fails_outright_reports_what_the_tally_last_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log.jsonl");
+        let svc = GithubCountersService::with_log_path(Some(log.clone()));
+        append(&log, &gh_line(svc.started_at, 1, &["pr", "list"]));
+        append(&log, &gh_line(svc.started_at, 2, &["pr", "view"]));
+        assert_eq!(
+            svc.status().await.summary,
+            "2 GitHub API call(s) since start"
+        );
+
+        // A stop condition that panics takes its blocking task down, and poisons
+        // the lock, mid-read. The tally is intact, so the answer is its last
+        // contents, marked incomplete, not zeros that read as complete.
+        let (counts, current) = counts_since_boot(&svc.tally, || panic!("induced")).await;
+        assert!(!current);
+        assert_eq!(counts.total(), 2);
+
+        // And the service goes on working: the poisoned lock is recovered.
+        append(&log, &gh_line(svc.started_at, 3, &["pr", "list"]));
+        assert_eq!(
+            svc.status().await.summary,
+            "3 GitHub API call(s) since start"
+        );
     }
 
     #[tokio::test]
