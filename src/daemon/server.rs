@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -13,6 +13,7 @@ use tokio::task::{JoinError, JoinSet};
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use tokio_util::sync::CancellationToken;
 
+use super::accept::{AcceptBackoff, ConnectionSource};
 use super::lifecycle;
 use super::paths;
 use super::protocol::{DaemonEnvelope, DaemonReply, StatusReport, DAEMON_SERVICE, MAX_LINE_BYTES};
@@ -97,6 +98,9 @@ pub async fn run_with_shutdown(
     opts: DaemonOptions,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    // Before the first accept: launchd starts the daemon with a soft limit of 256
+    // descriptors, which a busy day crosses (#2111).
+    lifecycle::raise_nofile_limit();
     if let Some(parent) = opts.socket_path.parent() {
         paths::ensure_dir_0700(parent)?;
     }
@@ -117,32 +121,7 @@ pub async fn run_with_shutdown(
     // Connection handlers are tracked here rather than detached, so accepted
     // requests can be drained on shutdown instead of being abandoned (#992).
     let mut conns: JoinSet<()> = JoinSet::new();
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => break,
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, _addr)) => {
-                        conns.spawn(handle_connection(
-                            stream,
-                            registry.clone(),
-                            shutdown.clone(),
-                        ));
-                    }
-                    Err(e) => tracing::warn!("daemon accept error: {e}"),
-                }
-            }
-            // Reap finished handlers during normal operation so the set does
-            // not grow unbounded over a long-lived daemon. The guard disables
-            // this arm when empty (an empty `JoinSet` yields `None` at once,
-            // which would otherwise busy-loop the select).
-            joined = conns.join_next(), if !conns.is_empty() => {
-                if let Some(result) = joined {
-                    note_reaped(result);
-                }
-            }
-        }
-    }
+    accept_loop(&listener, &registry, &shutdown, &mut conns).await;
 
     // Close the control socket *before* draining (see #993). The accept loop has
     // already exited, so any `connect`+`ping` arriving during the drain below
@@ -170,6 +149,66 @@ pub async fn run_with_shutdown(
     tracing::info!("daemon shutting down; draining services");
     registry.shutdown_all().await;
     Ok(())
+}
+
+/// Accepts connections from `source` until `shutdown` fires, serving each on its
+/// own task tracked in `conns`.
+///
+/// A failed `accept` — in practice `EMFILE`/`ENFILE` once descriptors run out — is
+/// retried after an exponentially growing pause instead of at once (#2111). The
+/// pending connection stays in the backlog on failure, so an immediate retry
+/// fails identically: it would burn a core and flood the log, while a pause lets
+/// in-flight requests finish and hand their descriptors back. The pause races
+/// `shutdown`, so a stop request is never held up by it.
+async fn accept_loop<S: ConnectionSource>(
+    source: &S,
+    registry: &Arc<ServiceRegistry>,
+    shutdown: &CancellationToken,
+    conns: &mut JoinSet<()>,
+) {
+    let mut backoff = AcceptBackoff::new();
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            accepted = source.accept() => match accepted {
+                Ok(stream) => {
+                    if let Some(recovery) = backoff.on_success(Instant::now()) {
+                        tracing::info!(
+                            failures = recovery.failures,
+                            outage = ?recovery.duration,
+                            "daemon accept recovered"
+                        );
+                    }
+                    conns.spawn(handle_connection(
+                        stream,
+                        registry.clone(),
+                        shutdown.clone(),
+                    ));
+                }
+                Err(e) => {
+                    let step = backoff.on_failure(Instant::now());
+                    if step.log {
+                        tracing::warn!(
+                            "daemon accept error: {e} (backing off; further errors are summarised)"
+                        );
+                    }
+                    tokio::select! {
+                        () = shutdown.cancelled() => break,
+                        () = tokio::time::sleep(step.delay) => {}
+                    }
+                }
+            },
+            // Reap finished handlers during normal operation so the set does
+            // not grow unbounded over a long-lived daemon. The guard disables
+            // this arm when empty (an empty `JoinSet` yields `None` at once,
+            // which would otherwise busy-loop the select).
+            joined = conns.join_next(), if !conns.is_empty() => {
+                if let Some(result) = joined {
+                    note_reaped(result);
+                }
+            }
+        }
+    }
 }
 
 /// Acquires the control-socket listener, returning it alongside whether the
@@ -1001,5 +1040,132 @@ mod tests {
         )
         .await
         .expect("run_stream should return promptly when the initial send fails");
+    }
+    // --- Accept-error backoff (#2111) ----------------------------------------
+
+    /// EMFILE ("Too many open files"), the error the daemon hit in production.
+    fn emfile() -> std::io::Error {
+        std::io::Error::from_raw_os_error(24)
+    }
+
+    /// A [`ConnectionSource`] that replays a script, then parks (like a quiet
+    /// listener). Counts every `accept` so a test can tell a paced retry from a spin.
+    struct ScriptedSource {
+        script: StdMutex<std::collections::VecDeque<std::io::Result<UnixStream>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedSource {
+        fn new(script: Vec<std::io::Result<UnixStream>>) -> Self {
+            Self {
+                script: StdMutex::new(script.into()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConnectionSource for ScriptedSource {
+        async fn accept(&self) -> std::io::Result<UnixStream> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = self.script.lock().unwrap().pop_front();
+            match next {
+                Some(result) => result,
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    fn worktrees_registry() -> Arc<ServiceRegistry> {
+        let mut registry = ServiceRegistry::new();
+        registry.register(Arc::new(
+            crate::daemon::services::worktrees::WorktreesService::new(),
+        ));
+        Arc::new(registry)
+    }
+
+    /// Accept errors are retried on a growing delay — not in a tight loop — and the
+    /// loop then serves the first connection that does arrive, on the same
+    /// instance, with nothing lost to the earlier failures.
+    #[tokio::test]
+    async fn accept_loop_backs_off_on_errors_then_serves_the_next_connection() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let source = ScriptedSource::new(vec![
+            Err(emfile()),
+            Err(emfile()),
+            Err(emfile()),
+            Ok(server),
+        ]);
+        let registry = worktrees_registry();
+        let shutdown = CancellationToken::new();
+        let mut conns: JoinSet<()> = JoinSet::new();
+
+        let started = Instant::now();
+        let serving = async {
+            accept_loop(&source, &registry, &shutdown, &mut conns).await;
+        };
+        let talking = async {
+            let (read_half, mut write_half) = client.into_split();
+            let mut reader = BufReader::new(read_half);
+            write_half.write_all(b"{\"op\":\"ping\"}\n").await.unwrap();
+            let reply = read_reply(&mut reader).await;
+            shutdown.cancel();
+            reply
+        };
+        let ((), reply) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serving, talking)
+        })
+        .await
+        .expect("the loop should recover and serve");
+
+        assert!(reply.ok, "{reply:?}");
+        // Three failures back off 5ms + 10ms + 20ms before the fourth `accept`
+        // succeeds; a loop that retried at once would finish in well under that.
+        assert!(
+            started.elapsed() >= Duration::from_millis(35),
+            "retried too fast: {:?}",
+            started.elapsed()
+        );
+        // Three failed attempts, the success, and the parked fifth the shutdown
+        // interrupted — nothing like the thousands a spinning loop would make.
+        assert!(source.calls() <= 5, "spun: {} accept calls", source.calls());
+    }
+
+    /// A stop request during a long backoff sleep ends the loop at once, rather
+    /// than waiting out the delay (which grows to a second).
+    #[tokio::test]
+    async fn accept_loop_stops_promptly_when_shutdown_arrives_mid_backoff() {
+        let errors = (0..32).map(|_| Err(emfile())).collect();
+        let source = ScriptedSource::new(errors);
+        let registry = worktrees_registry();
+        let shutdown = CancellationToken::new();
+        let mut conns: JoinSet<()> = JoinSet::new();
+
+        let stopper = shutdown.clone();
+        let stop_later = async move {
+            // By now the delay has grown well past this, so the loop is asleep.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stopper.cancel();
+        };
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                accept_loop(&source, &registry, &shutdown, &mut conns),
+                stop_later
+            )
+        })
+        .await
+        .expect("shutdown must interrupt the backoff sleep");
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "shutdown waited out a backoff sleep: {:?}",
+            started.elapsed()
+        );
     }
 }
