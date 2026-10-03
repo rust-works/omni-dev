@@ -549,9 +549,13 @@ usage: {input_tokens: 1432, output_tokens: 61}
   resolving it would leave **less design work** remaining than the text
   implies — as opposed to this issue's own remaining work being unaffected
   (already scoped separately, a parallel/sibling effort, or not a
-  precondition). Only the `design` stage is asked for v1; `implement` is
-  deferred pending the same kind of validation `design` got (see
-  [#1812](https://github.com/rust-works/omni-dev/issues/1812)). There is no
+  precondition). Only the `design` stage is asked for. Read it as "would
+  resolving this citation shrink what is left", not as design work alone: an
+  implementation-worded twin scored within 0.05 of it on all 15 pairs
+  tested (r = 0.99), so it is not asked separately (see
+  [#1812](https://github.com/rust-works/omni-dev/issues/1812) and the
+  [#1871 evaluation](evaluations/jev-route-1871/README.md#round-4-2026-10-04)).
+  Like any self-report here it is informative, not calibrated. There is no
   suppression threshold: every open citation stays visible, unfiltered. If
   Jev omits a score, that citation remains with an empty
   `could_be_cheaper` map and a warning is logged.
@@ -1131,8 +1135,18 @@ uses the production design question directly. It observed no stage-choice drift
 in class-only single-ladder requests, but all implementation choices still hit
 the minimum tier and an independent pending measurement remained close to a
 conditional-plan negative on the spike score. Both proposed signals remain
-unshipped; no threshold has been validated. The frozen inputs, exact requests,
-responses, usage and remaining shipping gates are in the evaluation record.
+unshipped; no threshold has been validated. A fourth round (254 requests,
+labels frozen and independently double-checked before any answer) found why:
+four of the five census issues routed above the bottom tier carry a triage
+paragraph that states its own class, and removing that paragraph alone puts every
+case that has one on the floor. It also found
+the implementation score tracks the design `could_be_cheaper` score almost
+exactly (r = 0.99 over 15 pairs), and that no spike threshold separates the
+labelled positives from conditional-plan negatives (the best negative scored
+0.68, above three of five positives). Adding either question left stage and class
+answers within repeat noise on this small set. The frozen inputs, exact requests,
+responses, usage and the decision against each pre-registered rule are in the
+evaluation record.
 
 ## verify-decision
 

@@ -770,6 +770,7 @@ mod tests {
             include_str!("../docs/evaluations/jev-route-1871/round4-inputs.json"),
             include_str!("../docs/evaluations/jev-route-1871/round4-spike-inputs.json"),
             include_str!("../docs/evaluations/jev-route-1871/round4-variant-inputs.json"),
+            include_str!("../docs/evaluations/jev-route-1871/round4-posthoc-inputs.json"),
         ] {
             let cases: Vec<Case> = serde_json::from_str(input).unwrap();
             validate_cases(&cases).unwrap();
@@ -843,10 +844,16 @@ mod tests {
         .into_iter()
         .map(|c| (c.id.clone(), c))
         .collect();
-        let variants: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        let mut variants: Vec<serde_json::Value> = serde_json::from_str(include_str!(
             "../docs/evaluations/jev-route-1871/round4-variant-inputs.json"
         ))
         .unwrap();
+        variants.extend(
+            serde_json::from_str::<Vec<serde_json::Value>>(include_str!(
+                "../docs/evaluations/jev-route-1871/round4-posthoc-inputs.json"
+            ))
+            .unwrap(),
+        );
         assert!(!variants.is_empty());
         for variant in variants {
             let derived = variant["derived_from"].as_str().unwrap();
@@ -888,6 +895,103 @@ mod tests {
                 assert_eq!(variant["reconstructed"], true);
             }
         }
+    }
+
+    #[test]
+    fn round4_archives_hold_exactly_the_requests_the_harness_builds() {
+        // The round before this one was invalidated by patch artifacts in its
+        // question strings. Every archived request must equal, question for
+        // question, what this file builds today from the production builders
+        // for the ladders and effort mode the observation recorded.
+        fn read(bytes: &[u8]) -> Vec<serde_json::Value> {
+            use std::io::Read;
+            let mut text = String::new();
+            flate2::read::GzDecoder::new(bytes)
+                .read_to_string(&mut text)
+                .unwrap();
+            serde_json::from_str(&text).unwrap()
+        }
+        let mut cases = BTreeMap::new();
+        for input in [
+            include_str!("../docs/evaluations/jev-route-1871/round4-inputs.json"),
+            include_str!("../docs/evaluations/jev-route-1871/round4-variant-inputs.json"),
+            include_str!("../docs/evaluations/jev-route-1871/round4-spike-inputs.json"),
+            include_str!("../docs/evaluations/jev-route-1871/round4-posthoc-inputs.json"),
+        ] {
+            for case in serde_json::from_str::<Vec<Case>>(input).unwrap() {
+                cases.insert(case.id.clone(), case);
+            }
+        }
+        let archives = [
+            read(include_bytes!(
+                "../docs/evaluations/jev-route-1871/round4-A-asis-results.json.gz"
+            )),
+            read(include_bytes!(
+                "../docs/evaluations/jev-route-1871/round4-B-variant-results.json.gz"
+            )),
+            read(include_bytes!(
+                "../docs/evaluations/jev-route-1871/round4-C-spike-results.json.gz"
+            )),
+            read(include_bytes!(
+                "../docs/evaluations/jev-route-1871/round4-D1-production-impl-results.json.gz"
+            )),
+            read(include_bytes!(
+                "../docs/evaluations/jev-route-1871/round4-D2-production-spike-results.json.gz"
+            )),
+            read(include_bytes!(
+                "../docs/evaluations/jev-route-1871/round4-E-posthoc-absorb-results.json.gz"
+            )),
+        ];
+        let mut checked = 0;
+        for observation in archives.iter().flatten() {
+            let id = observation["id"].as_str().unwrap();
+            let case = &cases[id];
+            let providers: Vec<Provider> = observation["ladders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|name| {
+                    Provider::ALL
+                        .into_iter()
+                        .find(|p| p.name() == name.as_str().unwrap())
+                        .unwrap()
+                })
+                .collect();
+            let stages =
+                stage_questions(&providers, observation["effort_advice"].as_bool().unwrap())
+                    .unwrap();
+            let (baseline, candidate) = question_maps(&stages, &case.open_citations());
+            let expected = match observation["variant"].as_str().unwrap() {
+                "baseline" => baseline,
+                "candidate" => candidate,
+                other => panic!("{id}: unknown variant {other}"),
+            };
+            assert!(
+                case.variants()
+                    .iter()
+                    .any(|v| v.name() == observation["variant"]),
+                "{id} ran a variant its input does not list"
+            );
+            assert_eq!(
+                observation["request"]["questions"],
+                serde_json::to_value(&expected).unwrap(),
+                "{id} {} request differs from the harness's",
+                observation["variant"]
+            );
+            assert_eq!(observation["request"]["model"], MODEL, "{id}");
+            assert_eq!(observation["response"]["model"], MODEL, "{id}");
+            let answered: Vec<_> = observation["response"]["answers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect();
+            assert_eq!(answered, expected.keys().collect::<Vec<_>>(), "{id}");
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 254,
+            "54 + 66 + 76 + 16 + 24 + 18 recorded requests"
+        );
     }
 
     #[test]

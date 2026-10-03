@@ -17,7 +17,14 @@ can see exactly what changed:
   are labelled `yes`/resolved by construction and are never counted as natural
   evidence.
 
-Usage: derive_round4_variants.py INPUTS.json OUTPUT.json
+A post-hoc kind exists too (`--kind absorb`): the prerequisite injection above
+turned out to test the wrong thing, because a hard prerequisite orders work but
+does not shrink THIS issue's implementation, which is what the question asks.
+`-absorb-open` / `-absorb-resolved` instead state that the cited issue delivers
+part of this issue's implementation. They were written AFTER the first run's
+scores were read, so they are exploratory and never enter a gate decision.
+
+Usage: derive_round4_variants.py INPUTS.json OUTPUT.json [--kind prerequisite|absorb]
 """
 import copy
 import json
@@ -39,6 +46,22 @@ INJECTIONS = {
         "original": "#2802 (spellings — affects which text the key/compare sees, not the mechanism)",
         "open": "#2802 (spellings — a hard prerequisite: the key and compare text rules below cannot be written until #2802 lands, because the document's original spelling is not available to them until then)",
         "resolved": "#2802 (spellings — landed: the document's original spelling is now available to the key and compare text rules below)",
+    },
+}
+
+
+ABSORB = {
+    "succinctly-2800-r4": {
+        "citation": "#2801",
+        "original": INJECTIONS["succinctly-2800-r4"]["original"],
+        "open": "#2801 (path register — overlapping scope: #2801 will also deliver this issue's integer-index lookup and wildcard key matcher, so most of the traversal work is done there and only the `has()` and delete sites would remain here)",
+        "resolved": "#2801 (path register — landed: it also delivered this issue's integer-index lookup and wildcard key matcher, so only the `has()` and delete sites remain here)",
+    },
+    "succinctly-2799-r4": {
+        "citation": "#2802",
+        "original": INJECTIONS["succinctly-2799-r4"]["original"],
+        "open": "#2802 (spellings — overlapping scope: #2802 will also deliver the key and compare text rules below, so only the first-occurrence ordering and the `sort` comparator would remain here)",
+        "resolved": "#2802 (spellings — landed: it also delivered the key and compare text rules below, so only the first-occurrence ordering and the `sort` comparator remain here)",
     },
 }
 
@@ -68,9 +91,14 @@ def strip_class(doc):
 
 def main():
     cases = json.load(open(sys.argv[1]))
+    kind = "prerequisite"
+    if "--kind" in sys.argv:
+        kind = sys.argv[sys.argv.index("--kind") + 1]
+        assert kind in ("prerequisite", "absorb"), kind
     out = []
-    for case in cases:
-        if "**Class:**" not in json.dumps(case["doc"], ensure_ascii=False):
+    for case in cases if kind == "prerequisite" else []:
+        holders = [case["doc"]] + case["doc"]["comments"]
+        if not any(CLASS_PARAGRAPH.search(h["body"]) for h in holders):
             continue
         variant = copy.deepcopy(case)
         removed = strip_class(variant["doc"])
@@ -81,19 +109,21 @@ def main():
         variant["edit"] = {"kind": "remove the triage class paragraph", "removed": removed}
         out.append(variant)
     by_id = {c["id"]: c for c in cases}
-    for base_id, spec in INJECTIONS.items():
+    for base_id, spec in (INJECTIONS if kind == "prerequisite" else ABSORB).items():
+        tag = "inject" if kind == "prerequisite" else "absorb"
         base = by_id[base_id]
         others = [c for c in base["citations"] if c != spec["citation"]]
         for state in ("open", "resolved"):
             variant = copy.deepcopy(base)
             replace_once(variant["doc"], spec["original"], spec[state])
-            variant["id"] = f"{base_id}-inject-{state}"
+            variant["id"] = f"{base_id}-{tag}-{state}"
             variant["derived_from"] = base_id
             variant["reconstructed"] = True
             variant["edit"] = {
-                "kind": "edited simulation (explicit hard prerequisite)"
+                "kind": f"edited simulation ({'explicit hard prerequisite' if kind == 'prerequisite' else 'cited issue delivers part of this issue'})"
                 if state == "open"
-                else "edited simulation (the prerequisite has landed)",
+                else f"edited simulation ({'the prerequisite has landed' if kind == 'prerequisite' else 'the overlapping work has landed'})",
+                **({"posthoc": True} if kind == "absorb" else {}),
                 "citation": spec["citation"],
                 "from": spec["original"],
                 "to": spec[state],
