@@ -86,16 +86,15 @@ See [STYLE-0023](docs/STYLE_GUIDE.md#style-0023-validate-commit-messages-with-om
 8. **Incremental Changes**: Make focused, reviewable changes
 
 ### Release Process
-When preparing releases, follow the comprehensive guide in [docs/RELEASE.md](docs/RELEASE.md):
+When preparing releases, follow the comprehensive guide in [docs/RELEASE.md](docs/RELEASE.md). `main` is protected and merges by rebase through a merge queue, so a release is a **pull request**, never a push to `main`, and the tags go on the **rebased** commits after the merge:
 
-1. Update version in `Cargo.toml`
-2. Update `CHANGELOG.md` with release notes
-3. Run quality checks (`cargo test`, `cargo clippy`)
-4. Commit changes with conventional commit format
-5. Create annotated git tag
-6. Push commits and tag
-7. Create GitHub release
-8. Publish to crates.io
+1. Update the versions (`Cargo.toml` and `Cargo.lock` for the crate; `package.json` and `package-lock.json` for the VS Code extension) and the changelogs (`CHANGELOG.md`, `editors/vscode/CHANGELOG.md`)
+2. Run quality checks (`cargo test`, `cargo clippy`)
+3. Commit in conventional commit format: `chore(release): prepare release vX.Y.Z` for the crate and `chore(release): prepare vscode extension release vA.B.C` for the extension
+4. Open a pull request and enqueue it (`gh pr merge`, never `--admin`)
+5. After it merges, create annotated tags (`vX.Y.Z`, `vscode-vA.B.C`) on the rebased commits and verify them before pushing
+6. Push the tags: CI creates the GitHub release, builds the binaries and publishes to crates.io; the extension workflow publishes to the Marketplace and Open VSX
+7. Update the Glama listing
 
 ### Understanding YAML Output
 The project generates structured YAML output with field presence tracking:

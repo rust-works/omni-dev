@@ -24,10 +24,11 @@ This skill performs the complete end-to-end release process for omni-dev, from v
    Abort if working directory is not clean.
 
 2. **Get Current Versions**
+   Read them from `origin/main`, not the local checkout, which may be behind:
    ```bash
    git fetch origin main
-   grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/'
-   jq -r .version editors/vscode/package.json
+   git show origin/main:Cargo.toml | grep -m1 '^version = ' | sed 's/version = "\(.*\)"/\1/'
+   git show origin/main:editors/vscode/package.json | jq -r .version
    ```
 
 3. **Get the Last Release Tag per Artefact**
@@ -99,10 +100,10 @@ This skill performs the complete end-to-end release process for omni-dev, from v
 
 11. **Update the Extension Version** (bumps `package.json` and the two omni-dev entries in `package-lock.json`, not dependency ranges)
     ```bash
-    cd editors/vscode
-    npm version A.B.C --no-git-tag-version --ignore-scripts
-    git diff --stat   # expect exactly package.json and package-lock.json, 3 changed lines
+    (cd editors/vscode && npm version A.B.C --no-git-tag-version --ignore-scripts --allow-same-version)
+    git diff --stat -- editors/vscode   # expect only package.json and package-lock.json, at most 3 changed lines
     ```
+    Use a subshell so later steps run from the repository root. `--allow-same-version` covers a `package.json` a feature commit already bumped: without it npm stops at `Version not changed` and the stale lockfile entries are never repaired.
 
 ### Phase 4: Quality Checks
 
@@ -117,8 +118,7 @@ This skill performs the complete end-to-end release process for omni-dev, from v
 
 13. **Run Extension Checks**
     ```bash
-    cd editors/vscode
-    npm ci && npm run typecheck && npm run build && npm test && npm run package
+    (cd editors/vscode && npm ci && npm run typecheck && npm run build && npm test && npm run package)
     ```
     Abort if any check fails.
 
@@ -175,12 +175,13 @@ This skill performs the complete end-to-end release process for omni-dev, from v
 ### Phase 6: Tag the Rebased Commits
 
 19. **Locate the Commits as They Landed on `main`**
+    Phases 6 and 7 each have a crate half and an extension half; do only the halves for the artefacts being released. The dots are escaped because `--grep` takes a regular expression:
     ```bash
     git fetch origin main
-    CRATE=$(git log origin/main --format=%H -1 --grep='^chore(release): prepare release vX.Y.Z$')
-    EXT=$(git log origin/main --format=%H -1 --grep='^chore(release): prepare vscode extension release vA.B.C$')
+    CRATE=$(git log origin/main --format=%H -1 --grep='^chore(release): prepare release vX\.Y\.Z$')
+    EXT=$(git log origin/main --format=%H -1 --grep='^chore(release): prepare vscode extension release vA\.B\.C$')
     ```
-    Abort if either is empty.
+    Abort if a lookup you need is empty. If a fix had to land after the release commit, tag the fix's hash instead: it carries the correct files, and the subject lookup would return the original commit.
 
 20. **Create Annotated Tags on Those Commits** (not on `HEAD`)
     ```bash
@@ -216,7 +217,7 @@ This skill performs the complete end-to-end release process for omni-dev, from v
 
 22. **Push the Tags**
     ```bash
-    git push origin vX.Y.Z vscode-vA.B.C
+    git push origin vX.Y.Z vscode-vA.B.C   # only the tags you created
     ```
 
 ### Phase 7: Monitor CI Release
@@ -266,8 +267,9 @@ This skill performs the complete end-to-end release process for omni-dev, from v
     gh release download vX.Y.Z --pattern 'omni-dev-macos-arm64.tar.gz' --dir "$d"   # pick the host platform's asset
     tar xzf "$d/omni-dev-macos-arm64.tar.gz" -C "$d"
     "$d/omni-dev" --version                        # omni-dev X.Y.Z (<short sha> <date>)
-    git rev-parse --short=7 'vX.Y.Z^{commit}'      # must equal <short sha>
+    git rev-parse 'vX.Y.Z^{commit}'                # full SHA; it must start with <short sha>
     ```
+    The short SHA's length varies with the machine that built the binary, so compare by prefix.
 
 29. **Verify the Extension**
     The workflow's publish steps are the evidence: both `Publish to VS Code Marketplace` and `Publish to Open VSX` must be green, not skipped. Open VSX can be read back; the Marketplace cannot be relied on, since read APIs lag a publish and `vsce show` can answer `not found` for a live extension:
