@@ -280,7 +280,7 @@ impl HookCommand {
         let stamp = journal::new_stamp();
         self.journal(&socket, &hook_op, &stamp);
         let Some((op, payload)) = hook_op.wire(self.agent, Some(&stamp)) else {
-            return;
+            return; // omni-dev: coverage ignore-line reason="wire returns None only through the serialization failure ignored in wire() itself (a non-UTF-8 cwd, which a hook payload cannot carry), so this arm is unreachable for the same reason"
         };
         let env = DaemonEnvelope::service(SERVICE, op, payload);
         let outcome =

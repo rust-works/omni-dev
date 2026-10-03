@@ -113,6 +113,13 @@ const STALE_TMP_AGE: Duration = Duration::from_secs(60 * 60);
 /// The agents whose hooks write journals.
 const AGENTS: [Agent; 2] = [Agent::Claude, Agent::Codex];
 
+/// Each journaling agent with the directory its journals live under.
+fn journal_dirs() -> impl Iterator<Item = (Agent, &'static str)> {
+    AGENTS
+        .into_iter()
+        .filter_map(|agent| Some((agent, journal::agent_dir_name(agent)?)))
+}
+
 /// The process and lock checks the replay's proof of life uses, so tests can
 /// script them without real processes.
 pub(crate) trait Probes {
@@ -448,16 +455,17 @@ fn list_journals(dir: &Path, now: SystemTime) -> Vec<JournalFile> {
     for entry in entries.flatten() {
         let path = entry.path();
         // `symlink_metadata`: a link is never followed, so a journal directory
-        // cannot be used to make the daemon read or delete something else.
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        // cannot be used to make the daemon read or delete something else. An
+        // entry that vanished since the listing is skipped like a non-file.
+        let Some(meta) = std::fs::symlink_metadata(&path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+        else {
             continue;
         };
-        if !meta.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
+        // Lossy, so a name that is not UTF-8 is judged like any other foreign
+        // name (it is no journal) rather than needing a branch of its own.
+        let name = entry.file_name().to_string_lossy().into_owned();
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         if name.starts_with('.') && name.ends_with(".tmp") {
             if now.duration_since(mtime).unwrap_or_default() > STALE_TMP_AGE {
@@ -465,7 +473,7 @@ fn list_journals(dir: &Path, now: SystemTime) -> Vec<JournalFile> {
             }
             continue;
         }
-        let Some(id) = journal_id(name) else {
+        let Some(id) = journal_id(&name) else {
             continue;
         };
         files.push(JournalFile {
@@ -524,10 +532,7 @@ pub(crate) fn scan(
         actions: Vec::new(),
     };
     let mut present = HashSet::new();
-    for agent in AGENTS {
-        let Some(name) = journal::agent_dir_name(agent) else {
-            continue;
-        };
+    for (agent, name) in journal_dirs() {
         for file in list_journals(&dir.join(name), now) {
             present.insert(file.path.clone());
             visit(&mut scan, agent, &file);
@@ -1708,10 +1713,10 @@ mod tests {
         run(tmp.path(), &mut state, &registry, &probes);
 
         let after = std::fs::metadata(&path).unwrap();
+        let len = after.len();
         assert!(
-            after.len() <= COMPACT_TO_BYTES && after.len() > COMPACT_TO_BYTES / 2,
-            "{}",
-            after.len()
+            len <= COMPACT_TO_BYTES && len > COMPACT_TO_BYTES / 2,
+            "{len}"
         );
         assert_eq!(after.permissions().mode() & 0o777, 0o600);
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1922,14 +1927,199 @@ mod tests {
         let mut state = JournalState::default();
         let probes = Fake::default();
         run(tmp.path(), &mut state, &registry, &probes);
-        assert!(
-            registry.live_session_ids().contains(ID),
-            "{:?}",
-            registry.live_session_ids()
-        );
+        let live = registry.live_session_ids();
+        assert!(live.contains(ID), "{live:?}");
         age_file(&path, 3600);
         run(tmp.path(), &mut state, &registry, &probes);
         assert!(path.exists(), "a live session's journal is not an orphan");
+    }
+
+    // --- seams the scans never reach on a healthy disk ----------------------
+
+    /// Runs `f` against a [`Scan`] over fresh state with the given enricher.
+    fn with_scan<T>(
+        enrich: &dyn Fn(&Path) -> Option<String>,
+        f: impl FnOnce(&mut Scan<'_>) -> T,
+    ) -> T {
+        let mut state = JournalState::default();
+        let live = HashSet::new();
+        let probes = Fake::default();
+        let mut scan = Scan {
+            state: &mut state,
+            now: SystemTime::now(),
+            live: &live,
+            probes: &probes,
+            enrich,
+            actions: Vec::new(),
+        };
+        f(&mut scan)
+    }
+
+    fn file_at(path: PathBuf, len: u64, ino: u64) -> JournalFile {
+        JournalFile {
+            path,
+            id: ID.to_string(),
+            len,
+            ino,
+            mtime: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn the_real_probes_read_this_process_and_never_find_a_made_up_thread_held() {
+        let probes = RealProbes;
+        let pid = std::process::id();
+        assert!(probes.pid_exists(pid));
+        let started = probes.pid_start_time(pid).expect("a start time");
+        assert!(started <= Utc::now() + chrono::Duration::seconds(2));
+        // Whatever Codex home resolves, nobody holds a thread that never existed.
+        assert_ne!(probes.codex_lock(ID), LockState::Held);
+    }
+
+    #[test]
+    fn the_repo_cache_is_emptied_when_it_fills_rather_than_grown() {
+        let calls = std::cell::Cell::new(0_usize);
+        let counting = |_: &Path| {
+            calls.set(calls.get() + 1);
+            None
+        };
+        let records: Vec<JournalRecord> = (0..=MAX_REPO_CACHE)
+            .map(|i| {
+                let mut record = rec(
+                    ID,
+                    Agent::Claude,
+                    SessionEvent::PreToolUse,
+                    ago(60),
+                    &format!("1-{i:05}"),
+                    None,
+                );
+                if let JournalBody::Observe { cwd, .. } = &mut record.body {
+                    *cwd = Some(PathBuf::from(format!("/work/repo-{i}")));
+                }
+                record
+            })
+            .collect();
+        let last = records.last().cloned().unwrap();
+        with_scan(&counting, |scan| {
+            scan.emit(records);
+            assert_eq!(
+                calls.get(),
+                MAX_REPO_CACHE + 1,
+                "each cwd is looked up once"
+            );
+            assert_eq!(scan.state.repos.len(), 1, "the full cache was cleared");
+            // The newest cwd survived the clear, so asking again is a cache hit.
+            scan.emit(vec![last]);
+            assert_eq!(calls.get(), MAX_REPO_CACHE + 1);
+        });
+    }
+
+    #[test]
+    fn a_journal_with_no_records_or_only_an_end_for_a_session_never_seen_is_rejected() {
+        let now = Utc::now();
+        assert_eq!(
+            assess(&[], now, &Fake::default()),
+            Verdict::Reject(Reject::Stale)
+        );
+        assert_eq!(
+            assess(&[end_rec(ID, ago(10), "1-1", None)], now, &Fake::default()),
+            Verdict::Reject(Reject::Ended)
+        );
+    }
+
+    #[test]
+    fn a_pid_none_of_the_records_carry_is_no_proof() {
+        let seen = rec(
+            ID,
+            Agent::Claude,
+            SessionEvent::SessionStart,
+            ago(10),
+            "1-1",
+            Some(500),
+        );
+        let entry = replay_scratch(&[seen]).unwrap();
+        assert_eq!(entry.pid, Some(500));
+        let unrelated = rec(ID, Agent::Claude, SessionEvent::Stop, ago(5), "1-2", None);
+        let probes = Fake::default();
+        probes.running(500, ago(100));
+        assert_eq!(prove(&entry, &[unrelated], &probes), Proof::Unknown);
+    }
+
+    #[test]
+    fn a_journal_that_vanishes_before_it_is_read_is_skipped_and_a_tracked_one_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join(format!("{ID}.jsonl"));
+        with_scan(&enrich, |scan| {
+            // Never judged: nothing to replay, so nothing is tracked or emitted.
+            let file = file_at(gone.clone(), 10, 1);
+            assert!(import(scan, Agent::Claude, &file).is_none());
+
+            // Already accepted: a failed tail read leaves the offset where it
+            // was, so the next scan retries the same bytes.
+            let track = FileTrack {
+                session_id: ID.to_string(),
+                ino: 1,
+                offset: 0,
+                imported_in: 0,
+            };
+            let kept = tail(scan, Agent::Claude, &file, track);
+            assert_eq!((kept.offset, kept.ino), (0, 1));
+            assert!(scan.actions.is_empty());
+        });
+    }
+
+    #[test]
+    fn compaction_that_is_abandoned_or_fails_leaves_the_journal_and_its_track_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fill(tmp.path(), 900);
+        let meta = std::fs::metadata(&path).unwrap();
+
+        // The file grew after the scan measured it: the rewrite is abandoned.
+        let seen = meta.len() - 10;
+        assert!(seen > MAX_JOURNAL_BYTES, "{seen}");
+        let mut track = FileTrack {
+            session_id: ID.to_string(),
+            ino: meta.ino(),
+            offset: seen,
+            imported_in: 0,
+        };
+        compact_if_needed(&file_at(path.clone(), seen, meta.ino()), &mut track);
+        assert_eq!((track.offset, track.ino), (seen, meta.ino()));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), meta.len());
+
+        // The file is gone: the failure is logged, not propagated.
+        let len = MAX_JOURNAL_BYTES + 1;
+        let mut track = FileTrack {
+            session_id: ID.to_string(),
+            ino: 1,
+            offset: len,
+            imported_in: 0,
+        };
+        compact_if_needed(&file_at(tmp.path().join("gone.jsonl"), len, 1), &mut track);
+        assert_eq!((track.offset, track.ino), (len, 1));
+    }
+
+    #[test]
+    fn a_journal_already_under_the_compaction_target_is_rewritten_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fill(tmp.path(), 10);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(meta.len() < COMPACT_TO_BYTES);
+        let (len, _) = compact(&path, meta.len(), meta.ino()).unwrap().unwrap();
+        assert_eq!(len, meta.len());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn removing_a_journal_is_quiet_when_it_is_gone_and_never_fatal_when_it_cannot_go() {
+        let tmp = tempfile::tempdir().unwrap();
+        remove(&tmp.path().join("gone.jsonl"), "test");
+        // `remove_file` refuses a directory on every platform, root included.
+        let dir = tmp.path().join("a-directory.jsonl");
+        std::fs::create_dir(&dir).unwrap();
+        remove(&dir, "test");
+        assert!(dir.is_dir());
     }
 
     // --- end to end ---------------------------------------------------------
