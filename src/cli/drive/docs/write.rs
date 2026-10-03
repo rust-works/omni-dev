@@ -152,6 +152,180 @@ pub struct DeleteCommand {
     pub output: OutputFormat,
 }
 
+/// CLI spelling of Google list presets, separate from engine wire types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BulletPresetArg {
+    /// Google `BULLET_DISC_CIRCLE_SQUARE` preset.
+    #[value(name = "bullet-disc-circle-square")]
+    BulletDiscCircleSquare,
+    /// Google `BULLET_DIAMONDX_ARROW3D_SQUARE` preset.
+    #[value(name = "bullet-diamondx-arrow3d-square")]
+    BulletDiamondxArrow3DSquare,
+    /// Google `BULLET_CHECKBOX` preset.
+    #[value(name = "bullet-checkbox")]
+    BulletCheckbox,
+    /// Google `BULLET_ARROW_DIAMOND_DISC` preset.
+    #[value(name = "bullet-arrow-diamond-disc")]
+    BulletArrowDiamondDisc,
+    /// Google `BULLET_STAR_CIRCLE_SQUARE` preset.
+    #[value(name = "bullet-star-circle-square")]
+    BulletStarCircleSquare,
+    /// Google `BULLET_ARROW3D_CIRCLE_SQUARE` preset.
+    #[value(name = "bullet-arrow3d-circle-square")]
+    BulletArrow3DCircleSquare,
+    /// Google `BULLET_LEFTTRIANGLE_DIAMOND_DISC` preset.
+    #[value(name = "bullet-lefttriangle-diamond-disc")]
+    BulletLefttriangleDiamondDisc,
+    /// Google `BULLET_DIAMONDX_HOLLOWDIAMOND_SQUARE` preset.
+    #[value(name = "bullet-diamondx-hollowdiamond-square")]
+    BulletDiamondxHollowdiamondSquare,
+    /// Google `BULLET_DIAMOND_CIRCLE_SQUARE` preset.
+    #[value(name = "bullet-diamond-circle-square")]
+    BulletDiamondCircleSquare,
+    /// Google `NUMBERED_DECIMAL_ALPHA_ROMAN` preset.
+    #[value(name = "numbered-decimal-alpha-roman")]
+    NumberedDecimalAlphaRoman,
+    /// Google `NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS` preset.
+    #[value(name = "numbered-decimal-alpha-roman-parens")]
+    NumberedDecimalAlphaRomanParens,
+    /// Google `NUMBERED_DECIMAL_NESTED` preset.
+    #[value(name = "numbered-decimal-nested")]
+    NumberedDecimalNested,
+    /// Google `NUMBERED_UPPERALPHA_ALPHA_ROMAN` preset.
+    #[value(name = "numbered-upperalpha-alpha-roman")]
+    NumberedUpperalphaAlphaRoman,
+    /// Google `NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL` preset.
+    #[value(name = "numbered-upperroman-upperalpha-decimal")]
+    NumberedUpperromanUpperalphaDecimal,
+    /// Google `NUMBERED_ZERODECIMAL_ALPHA_ROMAN` preset.
+    #[value(name = "numbered-zerodecimal-alpha-roman")]
+    NumberedZerodecimalAlphaRoman,
+}
+
+impl From<BulletPresetArg> for crate::drive::docs::write_types::BulletPreset {
+    fn from(preset: BulletPresetArg) -> Self {
+        match preset {
+            BulletPresetArg::BulletDiscCircleSquare => Self::BulletDiscCircleSquare,
+            BulletPresetArg::BulletDiamondxArrow3DSquare => Self::BulletDiamondxArrow3DSquare,
+            BulletPresetArg::BulletCheckbox => Self::BulletCheckbox,
+            BulletPresetArg::BulletArrowDiamondDisc => Self::BulletArrowDiamondDisc,
+            BulletPresetArg::BulletStarCircleSquare => Self::BulletStarCircleSquare,
+            BulletPresetArg::BulletArrow3DCircleSquare => Self::BulletArrow3DCircleSquare,
+            BulletPresetArg::BulletLefttriangleDiamondDisc => Self::BulletLefttriangleDiamondDisc,
+            BulletPresetArg::BulletDiamondxHollowdiamondSquare => {
+                Self::BulletDiamondxHollowdiamondSquare
+            }
+            BulletPresetArg::BulletDiamondCircleSquare => Self::BulletDiamondCircleSquare,
+            BulletPresetArg::NumberedDecimalAlphaRoman => Self::NumberedDecimalAlphaRoman,
+            BulletPresetArg::NumberedDecimalAlphaRomanParens => {
+                Self::NumberedDecimalAlphaRomanParens
+            }
+            BulletPresetArg::NumberedDecimalNested => Self::NumberedDecimalNested,
+            BulletPresetArg::NumberedUpperalphaAlphaRoman => Self::NumberedUpperalphaAlphaRoman,
+            BulletPresetArg::NumberedUpperromanUpperalphaDecimal => {
+                Self::NumberedUpperromanUpperalphaDecimal
+            }
+            BulletPresetArg::NumberedZerodecimalAlphaRoman => Self::NumberedZerodecimalAlphaRoman,
+        }
+    }
+}
+
+/// Whole-paragraph selection shared by list formatting verbs.
+#[derive(clap::Args)]
+#[command(group(ArgGroup::new("selection").required(true).args(["match_text", "from"])))]
+pub struct ListSelection {
+    /// Document id.
+    pub document_id: String,
+    /// Format the entire paragraph containing this unique literal match.
+    #[arg(long = "match", conflicts_with = "to")]
+    pub match_text: Option<String>,
+    /// First paragraph anchor, inclusive.
+    #[arg(long, requires = "to")]
+    pub from: Option<String>,
+    /// Last paragraph anchor, inclusive; must be in the same body or table cell.
+    #[arg(long, requires = "from")]
+    pub to: Option<String>,
+    /// Match anchors with Unicode simple case folding.
+    #[arg(long)]
+    pub ignore_case: bool,
+    /// Report the pre-write range and leading tabs removed, without writing.
+    #[arg(long)]
+    pub dry_run: bool,
+    #[command(flatten)]
+    pub lease: crate::cli::drive::helpers::LeaseTokenArg,
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+/// Creates bullets or numbering under docs-write; leading tabs become nesting.
+#[derive(Parser)]
+pub struct CreateBulletsCommand {
+    #[command(flatten)]
+    pub selection: ListSelection,
+    /// Concrete Google list preset. Matching preceding lists may be joined.
+    #[arg(long, value_enum)]
+    pub preset: BulletPresetArg,
+}
+
+/// Removes bullets under docs-write, preserving prose and visual indentation.
+#[derive(Parser)]
+pub struct DeleteBulletsCommand {
+    #[command(flatten)]
+    pub selection: ListSelection,
+}
+
+impl ListSelection {
+    async fn execute(
+        self,
+        client: &DriveClient,
+        preset: Option<crate::drive::docs::write_types::BulletPreset>,
+    ) -> Result<()> {
+        let docs = DocsClient::from_drive_client(client)?;
+        let (from, to) = match (self.match_text, self.from, self.to) {
+            (Some(text), None, None) => (text, None),
+            (None, Some(from), Some(to)) => (from, Some(to)),
+            _ => anyhow::bail!("use --match or both --from and --to"),
+        };
+        let opts = WriteOptions {
+            document_id: self.document_id,
+            payload: WritePayload::List {
+                from,
+                to,
+                preset,
+                match_case: !self.ignore_case,
+            },
+            dry_run: self.dry_run,
+            lease_token: self.lease.lease,
+            ledger_path: helpers::resolve_ledger_path(self.dry_run)?,
+        };
+        run_write(
+            client,
+            &docs,
+            &opts,
+            &helpers::active_account_rules()?,
+            &self.output,
+        )
+        .await
+    }
+}
+
+impl CreateBulletsCommand {
+    /// Apply list formatting through the shared gated write engine.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        self.selection
+            .execute(client, Some(self.preset.into()))
+            .await
+    }
+}
+
+impl DeleteBulletsCommand {
+    /// Remove list formatting through the shared gated write engine.
+    pub async fn execute(self, client: &DriveClient) -> Result<()> {
+        self.selection.execute(client, None).await
+    }
+}
+
 impl InsertCommand {
     /// Resolve an anchor and insert through the shared gated engine.
     pub async fn execute(self, client: &DriveClient) -> Result<()> {
@@ -367,6 +541,75 @@ mod tests {
             "delete", "doc", "--match", "anchor", "--tab-id", "child"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn list_cli_requires_a_valid_selection_and_concrete_creation_preset() {
+        assert!(
+            CreateBulletsCommand::try_parse_from(["create-bullets", "d1", "--match", "a"]).is_err()
+        );
+        assert!(CreateBulletsCommand::try_parse_from([
+            "create-bullets",
+            "d1",
+            "--match",
+            "a",
+            "--preset",
+            "raw"
+        ])
+        .is_err());
+        assert!(
+            DeleteBulletsCommand::try_parse_from(["delete-bullets", "d1", "--from", "a"]).is_err()
+        );
+        assert!(
+            DeleteBulletsCommand::try_parse_from(["delete-bullets", "d1", "--to", "a"]).is_err()
+        );
+        assert!(DeleteBulletsCommand::try_parse_from([
+            "delete-bullets",
+            "d1",
+            "--match",
+            "a",
+            "--from",
+            "b",
+            "--to",
+            "c"
+        ])
+        .is_err());
+        assert!(DeleteBulletsCommand::try_parse_from(["delete-bullets", "d1"]).is_err());
+        assert!(DeleteBulletsCommand::try_parse_from([
+            "delete-bullets",
+            "d1",
+            "--match",
+            "a",
+            "--preset",
+            "bullet-checkbox"
+        ])
+        .is_err());
+        let cmd = CreateBulletsCommand::try_parse_from([
+            "create-bullets",
+            "d1",
+            "--match",
+            "a",
+            "--preset",
+            "bullet-checkbox",
+        ])
+        .unwrap();
+        assert!(!cmd.selection.ignore_case);
+        assert_eq!(
+            crate::drive::docs::write_types::BulletPreset::from(cmd.preset),
+            crate::drive::docs::write_types::BulletPreset::BulletCheckbox
+        );
+        let cmd = DeleteBulletsCommand::try_parse_from([
+            "delete-bullets",
+            "d1",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--ignore-case",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(cmd.selection.ignore_case && cmd.selection.dry_run);
     }
 
     #[test]

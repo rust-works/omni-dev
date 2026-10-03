@@ -448,6 +448,7 @@ mod tests {
             ),
         ];
         let mut deletion_renames = 0;
+        let mut list_renames = 0;
         for (name, source) in sources {
             // Production code only: the tests and docs below deliberately
             // name the things they assert the absence of.
@@ -471,6 +472,13 @@ mod tests {
                     assert_eq!(code, "#[serde(rename = \"deleteContentRange\")]");
                     deletion_renames += 1;
                 }
+                for operation in ["createParagraphBullets", "deleteParagraphBullets"] {
+                    if code.contains(operation) {
+                        assert_eq!(name, "write_types.rs");
+                        assert_eq!(code, format!("#[serde(rename = \"{operation}\")]"));
+                        list_renames += 1;
+                    }
+                }
                 let destroys = code.contains("deletePositionedObject")
                     || code.contains("deleteTableRow")
                     || code.contains("deleteTableColumn");
@@ -481,6 +489,7 @@ mod tests {
                 );
             }
         }
+        assert_eq!(list_renames, 2, "exactly two typed list requests");
         assert_eq!(deletion_renames, 1, "exactly one typed deletion request");
     }
 }

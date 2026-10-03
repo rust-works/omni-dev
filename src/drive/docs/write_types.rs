@@ -89,6 +89,12 @@ pub enum DocsRequest {
     /// Delete an anchor-resolved content range under `DocsDelete`.
     #[serde(rename = "deleteContentRange")]
     DeleteContentRange(DeleteContentRangeRequest),
+    /// Apply a concrete list preset to resolved paragraphs under DocsWrite.
+    #[serde(rename = "createParagraphBullets")]
+    CreateParagraphBullets(CreateParagraphBulletsRequest),
+    /// Remove list formatting, preserving prose, under DocsWrite.
+    #[serde(rename = "deleteParagraphBullets")]
+    DeleteParagraphBullets(DeleteParagraphBulletsRequest),
 }
 
 /// A `replaceAllText` request.
@@ -181,6 +187,73 @@ pub struct DeleteContentRangeRequest {
     pub range: ContentRange,
 }
 
+/// Concrete Google list presets. Unspecified and arbitrary strings are excluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BulletPreset {
+    /// Google `BULLET_DISC_CIRCLE_SQUARE` preset.
+    #[serde(rename = "BULLET_DISC_CIRCLE_SQUARE")]
+    BulletDiscCircleSquare,
+    /// Google `BULLET_DIAMONDX_ARROW3D_SQUARE` preset.
+    #[serde(rename = "BULLET_DIAMONDX_ARROW3D_SQUARE")]
+    BulletDiamondxArrow3DSquare,
+    /// Google `BULLET_CHECKBOX` preset.
+    #[serde(rename = "BULLET_CHECKBOX")]
+    BulletCheckbox,
+    /// Google `BULLET_ARROW_DIAMOND_DISC` preset.
+    #[serde(rename = "BULLET_ARROW_DIAMOND_DISC")]
+    BulletArrowDiamondDisc,
+    /// Google `BULLET_STAR_CIRCLE_SQUARE` preset.
+    #[serde(rename = "BULLET_STAR_CIRCLE_SQUARE")]
+    BulletStarCircleSquare,
+    /// Google `BULLET_ARROW3D_CIRCLE_SQUARE` preset.
+    #[serde(rename = "BULLET_ARROW3D_CIRCLE_SQUARE")]
+    BulletArrow3DCircleSquare,
+    /// Google `BULLET_LEFTTRIANGLE_DIAMOND_DISC` preset.
+    #[serde(rename = "BULLET_LEFTTRIANGLE_DIAMOND_DISC")]
+    BulletLefttriangleDiamondDisc,
+    /// Google `BULLET_DIAMONDX_HOLLOWDIAMOND_SQUARE` preset.
+    #[serde(rename = "BULLET_DIAMONDX_HOLLOWDIAMOND_SQUARE")]
+    BulletDiamondxHollowdiamondSquare,
+    /// Google `BULLET_DIAMOND_CIRCLE_SQUARE` preset.
+    #[serde(rename = "BULLET_DIAMOND_CIRCLE_SQUARE")]
+    BulletDiamondCircleSquare,
+    /// Google `NUMBERED_DECIMAL_ALPHA_ROMAN` preset.
+    #[serde(rename = "NUMBERED_DECIMAL_ALPHA_ROMAN")]
+    NumberedDecimalAlphaRoman,
+    /// Google `NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS` preset.
+    #[serde(rename = "NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS")]
+    NumberedDecimalAlphaRomanParens,
+    /// Google `NUMBERED_DECIMAL_NESTED` preset.
+    #[serde(rename = "NUMBERED_DECIMAL_NESTED")]
+    NumberedDecimalNested,
+    /// Google `NUMBERED_UPPERALPHA_ALPHA_ROMAN` preset.
+    #[serde(rename = "NUMBERED_UPPERALPHA_ALPHA_ROMAN")]
+    NumberedUpperalphaAlphaRoman,
+    /// Google `NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL` preset.
+    #[serde(rename = "NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL")]
+    NumberedUpperromanUpperalphaDecimal,
+    /// Google `NUMBERED_ZERODECIMAL_ALPHA_ROMAN` preset.
+    #[serde(rename = "NUMBERED_ZERODECIMAL_ALPHA_ROMAN")]
+    NumberedZerodecimalAlphaRoman,
+}
+
+/// Apply list formatting in a single request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CreateParagraphBulletsRequest {
+    /// Complete paragraph range in the leased snapshot.
+    pub range: ContentRange,
+    /// Explicit preset; no server default.
+    #[serde(rename = "bulletPreset")]
+    pub bullet_preset: BulletPreset,
+}
+
+/// Remove bullets without deleting paragraph content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeleteParagraphBulletsRequest {
+    /// Complete paragraph range in the leased snapshot.
+    pub range: ContentRange,
+}
+
 /// The end of a segment.
 ///
 /// Serialises as `{}`. An absent `segmentId` means the document body, and an
@@ -236,6 +309,26 @@ impl DocsRequest {
                 segment_id: edit.segment_id.clone(),
             },
         })
+    }
+    /// Build one list request from the same snapshot used for its revision.
+    #[must_use]
+    pub(in crate::drive) fn list_bullets(
+        edit: &super::anchor::ListPreview,
+        preset: Option<BulletPreset>,
+    ) -> Self {
+        let range = ContentRange {
+            start_index: edit.start_index,
+            end_index: edit.end_index,
+            tab_id: edit.tab_id.clone(),
+            segment_id: None,
+        };
+        match preset {
+            Some(bullet_preset) => Self::CreateParagraphBullets(CreateParagraphBulletsRequest {
+                range,
+                bullet_preset,
+            }),
+            None => Self::DeleteParagraphBullets(DeleteParagraphBulletsRequest { range }),
+        }
     }
 }
 
@@ -311,6 +404,76 @@ mod tests {
     /// The wire-shape half of ADR-0076 §3 and §4: every batch carries a
     /// lease, carries exactly one request, and never carries the rebasing
     /// arm of the `writeControl` union.
+    #[test]
+    fn every_list_preset_has_a_single_exact_tab_scoped_leased_wire_shape() {
+        let edit = super::super::anchor::ListPreview {
+            start_index: 11,
+            end_index: 29,
+            tab_id: Some("nested-tab".into()),
+            paragraphs: 2,
+            leading_tabs_removed: 3,
+        };
+        let expected = [
+            "BULLET_DISC_CIRCLE_SQUARE",
+            "BULLET_DIAMONDX_ARROW3D_SQUARE",
+            "BULLET_CHECKBOX",
+            "BULLET_ARROW_DIAMOND_DISC",
+            "BULLET_STAR_CIRCLE_SQUARE",
+            "BULLET_ARROW3D_CIRCLE_SQUARE",
+            "BULLET_LEFTTRIANGLE_DIAMOND_DISC",
+            "BULLET_DIAMONDX_HOLLOWDIAMOND_SQUARE",
+            "BULLET_DIAMOND_CIRCLE_SQUARE",
+            "NUMBERED_DECIMAL_ALPHA_ROMAN",
+            "NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS",
+            "NUMBERED_DECIMAL_NESTED",
+            "NUMBERED_UPPERALPHA_ALPHA_ROMAN",
+            "NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL",
+            "NUMBERED_ZERODECIMAL_ALPHA_ROMAN",
+        ];
+        let presets = [
+            BulletPreset::BulletDiscCircleSquare,
+            BulletPreset::BulletDiamondxArrow3DSquare,
+            BulletPreset::BulletCheckbox,
+            BulletPreset::BulletArrowDiamondDisc,
+            BulletPreset::BulletStarCircleSquare,
+            BulletPreset::BulletArrow3DCircleSquare,
+            BulletPreset::BulletLefttriangleDiamondDisc,
+            BulletPreset::BulletDiamondxHollowdiamondSquare,
+            BulletPreset::BulletDiamondCircleSquare,
+            BulletPreset::NumberedDecimalAlphaRoman,
+            BulletPreset::NumberedDecimalAlphaRomanParens,
+            BulletPreset::NumberedDecimalNested,
+            BulletPreset::NumberedUpperalphaAlphaRoman,
+            BulletPreset::NumberedUpperromanUpperalphaDecimal,
+            BulletPreset::NumberedZerodecimalAlphaRoman,
+        ];
+        assert_eq!(presets.len(), expected.len());
+        for (preset, wire) in presets.iter().zip(expected) {
+            let body = serde_json::to_value(BatchUpdateDocumentRequest::new(
+                DocsRequest::list_bullets(&edit, Some(*preset)),
+                "r1",
+            ))
+            .unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({"requests": [{"createParagraphBullets": {
+                "range": {"startIndex": 11, "endIndex": 29, "tabId": "nested-tab"}, "bulletPreset": wire
+            }}], "writeControl": {"requiredRevisionId": "r1"}})
+            );
+        }
+        let body = serde_json::to_value(BatchUpdateDocumentRequest::new(
+            DocsRequest::list_bullets(&edit, None),
+            "r1",
+        ))
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"requests": [{"deleteParagraphBullets": {
+            "range": {"startIndex": 11, "endIndex": 29, "tabId": "nested-tab"}
+        }}], "writeControl": {"requiredRevisionId": "r1"}})
+        );
+    }
+
     #[test]
     fn a_batch_update_body_always_carries_the_lease_and_exactly_one_request() {
         let body = BatchUpdateDocumentRequest::new(DocsRequest::insert_text_at_end("hi"), "rev-1");

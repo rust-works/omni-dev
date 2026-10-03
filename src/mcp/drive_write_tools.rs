@@ -358,10 +358,11 @@ fn yaml_outcome(outcome: &impl Serialize, is_error: bool) -> Result<CallToolResu
 
 fn docs_is_error(result: &docs_write::WriteResult) -> bool {
     use docs_write::WriteResult::{
-        Appended, Blocked, Deleted, Failed, Inserted, RefusedAnchor, RefusedLeaseExpired,
-        RefusedLeaseStale, RefusedLeaseWrongFile, RefusedNoLease, RefusedNoRevisionId,
-        RefusedNoVisibleParents, RefusedNotADocument, RefusedShortcut, Replaced, StaleRevision,
-        WouldAppend, WouldDelete, WouldInsert, WouldReplace,
+        Appended, Blocked, Deleted, Failed, Inserted, ListFormatted, RefusedAnchor,
+        RefusedLeaseExpired, RefusedLeaseStale, RefusedLeaseWrongFile, RefusedNoLease,
+        RefusedNoRevisionId, RefusedNoVisibleParents, RefusedNotADocument, RefusedShortcut,
+        Replaced, StaleRevision, WouldAppend, WouldDelete, WouldFormatList, WouldInsert,
+        WouldReplace,
     };
     match result {
         WouldReplace { .. }
@@ -371,7 +372,9 @@ fn docs_is_error(result: &docs_write::WriteResult) -> bool {
         | Replaced { .. }
         | Appended { .. }
         | Inserted { .. }
-        | Deleted { .. } => false,
+        | Deleted { .. }
+        | WouldFormatList { .. }
+        | ListFormatted { .. } => false,
         RefusedNotADocument { .. }
         | RefusedAnchor { .. }
         | RefusedShortcut

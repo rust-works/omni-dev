@@ -34,10 +34,10 @@ use serde::Serialize;
 
 use crate::cli::drive::format::{write_scalar_jsonl, JsonlSerialize};
 use crate::drive::client::DriveClient;
-use crate::drive::docs::anchor::{self, AnchorError, EditPreview, Side};
+use crate::drive::docs::anchor::{self, AnchorError, EditPreview, ListPreview, Side};
 use crate::drive::docs::api::{is_stale_revision, DocsApi, SuggestionsViewMode};
 use crate::drive::docs::client::DocsClient;
-use crate::drive::docs::write_types::DocsRequest;
+use crate::drive::docs::write_types::{BulletPreset, DocsRequest};
 use crate::drive::files_api::FilesApi;
 use crate::drive::folder_ancestry;
 use crate::drive::lease::check::{
@@ -96,6 +96,17 @@ pub enum WritePayload {
         /// Existing non-body segment selector; default addresses tab bodies.
         selection: anchor::SegmentSelection,
     },
+    /// Apply or remove list formatting on whole anchor-selected paragraphs.
+    List {
+        /// First anchor or single-paragraph match.
+        from: String,
+        /// Last anchor, inclusive of its containing paragraph.
+        to: Option<String>,
+        /// Creation uses a concrete preset; None removes bullets.
+        preset: Option<BulletPreset>,
+        /// Case-sensitive by default.
+        match_case: bool,
+    },
 }
 
 impl WritePayload {
@@ -107,10 +118,16 @@ impl WritePayload {
             Self::Append { .. } => WriteVerb::Append,
             Self::Insert { .. } => WriteVerb::Insert,
             Self::Delete { .. } => WriteVerb::Delete,
+            Self::List {
+                preset: Some(_), ..
+            } => WriteVerb::CreateBullets,
+            Self::List { preset: None, .. } => WriteVerb::DeleteBullets,
         }
     }
 
     /// Permission vocabulary is independent of the request's wire operation.
+    /// List creation/removal uses DocsWrite: removal preserves prose, while
+    /// creation's leading-tab removal is an explicit part of formatting consent.
     #[must_use]
     pub const fn gate_operation(&self) -> DriveOperation {
         match self {
@@ -120,7 +137,10 @@ impl WritePayload {
     }
 
     const fn index_addressed(&self) -> bool {
-        matches!(self, Self::Insert { .. } | Self::Delete { .. })
+        matches!(
+            self,
+            Self::Insert { .. } | Self::Delete { .. } | Self::List { .. }
+        )
     }
 
     /// Rejects a payload that cannot produce a valid request, before any
@@ -148,7 +168,7 @@ impl WritePayload {
             Self::Insert { anchor, .. } if anchor.is_empty() || anchor.contains(['\n', '\r']) => {
                 Err("anchor must be nonempty and within one paragraph".to_owned())
             }
-            Self::Delete { from, to, .. }
+            Self::Delete { from, to, .. } | Self::List { from, to, .. }
                 if from.is_empty()
                     || from.contains(['\n', '\r'])
                     || to
@@ -173,6 +193,10 @@ pub enum WriteVerb {
     Insert,
     /// Anchor-addressed deletion.
     Delete,
+    /// Create paragraph bullets or numbering.
+    CreateBullets,
+    /// Remove paragraph bullets or numbering.
+    DeleteBullets,
 }
 
 impl WriteVerb {
@@ -187,6 +211,8 @@ impl WriteVerb {
             Self::Append => "docs-append",
             Self::Insert => "docs-insert",
             Self::Delete => "docs-delete",
+            Self::CreateBullets => "docs-create-bullets",
+            Self::DeleteBullets => "docs-delete-bullets",
         }
     }
 
@@ -197,6 +223,8 @@ impl WriteVerb {
             Self::Append => "append",
             Self::Insert => "insert",
             Self::Delete => "delete",
+            Self::CreateBullets => "create-bullets",
+            Self::DeleteBullets => "delete-bullets",
         }
     }
 }
@@ -260,6 +288,20 @@ pub enum WriteResult {
     Deleted {
         /// The same metadata as the preview.
         edit: EditPreview,
+    },
+    /// Metadata-only preview of whole-paragraph list formatting.
+    WouldFormatList {
+        /// Range before any leading tabs are removed.
+        edit: ListPreview,
+        /// Some for creation, None for removal.
+        preset: Option<BulletPreset>,
+    },
+    /// List formatting applied; indices still describe the pre-write snapshot.
+    ListFormatted {
+        /// The same metadata as the preview.
+        edit: ListPreview,
+        /// Some for creation, None for removal.
+        preset: Option<BulletPreset>,
     },
     /// An anchor could not safely identify a unique effect.
     RefusedAnchor {
@@ -359,6 +401,8 @@ impl WriteResult {
             Self::WouldDelete { .. } => "would-delete",
             Self::Inserted { .. } => "inserted",
             Self::Deleted { .. } => "deleted",
+            Self::WouldFormatList { .. } => "would-format-list",
+            Self::ListFormatted { .. } => "list-formatted",
             Self::RefusedAnchor { .. } => "refused-anchor",
             Self::RefusedNotADocument { .. } => "refused-not-a-document",
             Self::RefusedShortcut => "refused-shortcut",
@@ -636,6 +680,27 @@ async fn write_inner(
                 }
             }
         }
+        WritePayload::List {
+            from,
+            to,
+            preset,
+            match_case,
+        } => match anchor::resolve_list(
+            &document,
+            from,
+            to.as_deref(),
+            *match_case,
+            preset.is_some(),
+        ) {
+            Ok(edit) => (
+                DocsRequest::list_bullets(&edit, *preset),
+                WriteResult::WouldFormatList {
+                    edit,
+                    preset: *preset,
+                },
+            ),
+            Err(error) => return gated(WriteResult::RefusedAnchor { error }, Some(revision_id)),
+        },
     };
 
     if opts.dry_run {
@@ -690,10 +755,15 @@ async fn write_inner(
                 chars: text.chars().count(),
                 bytes: text.len(),
             },
-            WritePayload::Insert { .. } | WritePayload::Delete { .. } => match preview {
+            WritePayload::Insert { .. }
+            | WritePayload::Delete { .. }
+            | WritePayload::List { .. } => match preview {
+                WriteResult::WouldFormatList { edit, preset } => {
+                    WriteResult::ListFormatted { edit, preset }
+                }
                 WriteResult::WouldInsert { edit } => WriteResult::Inserted { edit },
                 WriteResult::WouldDelete { edit } => WriteResult::Deleted { edit },
-                // omni-dev: coverage ignore reason="`preview` is built by the payload match above, so an Insert/Delete payload always carries a WouldInsert/WouldDelete preview; this arm exists solely for exhaustiveness over the shared WriteResult enum"
+                // omni-dev: coverage ignore reason="`preview` is built by the payload match above, so an Insert/Delete/List payload always carries its matching edit preview; this arm exists solely for exhaustiveness over the shared WriteResult enum"
                 _ => WriteResult::Failed {
                     detail: "missing resolved edit preview".to_owned(),
                 },
@@ -847,6 +917,18 @@ pub fn describe(outcome: &WriteOutcome, verb: WriteVerb) -> String {
             format!("{action}: {} char(s) / {} byte(s) in '{name}' at [{}, {}) UTF-16 code units, tab {}{}, {} paragraph(s)",
                 edit.chars, edit.bytes, edit.start_index, edit.end_index,
                 edit.tab_id.as_deref().unwrap_or("first"), segment, edit.paragraphs)
+        }
+        WriteResult::WouldFormatList { edit, preset }
+        | WriteResult::ListFormatted { edit, preset } => {
+            let action = if matches!(outcome.result, WriteResult::WouldFormatList { .. }) {
+                "Would format list"
+            } else {
+                "Formatted list"
+            };
+            let preset = preset.map_or_else(|| "remove bullets".to_owned(), |p| format!("{p:?}"));
+            format!("{action}: {preset} in '{name}', {} paragraph(s), pre-write [{}, {}) UTF-16 code units, tab {}, {} leading tab(s) removed",
+                edit.paragraphs, edit.start_index, edit.end_index,
+                edit.tab_id.as_deref().unwrap_or("first"), edit.leading_tabs_removed)
         }
         WriteResult::RefusedAnchor { error } => {
             format!("Refused: unsafe or unresolved anchor in '{name}': {error:?}")
@@ -2071,6 +2153,94 @@ mod tests {
         }
     }
 
+    fn list_payloads() -> Vec<WritePayload> {
+        [Some(BulletPreset::BulletDiscCircleSquare), None]
+            .into_iter()
+            .map(|preset| WritePayload::List {
+                from: "Q3".into(),
+                to: None,
+                preset,
+                match_case: true,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn list_edits_preview_and_apply_the_same_snapshot_in_one_inline_leased_request() {
+        for payload in list_payloads() {
+            assert_eq!(payload.gate_operation(), DriveOperation::DocsWrite);
+            let server = MockServer::start().await;
+            let (drive, docs) = clients(&server).await;
+            mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
+                .mount(&server)
+                .await;
+            mount_folder("folder-1").mount(&server).await;
+            mount_document(Some("rev-list"), "\t\t😀 Q3 report")
+                .mount(&server)
+                .await;
+            let mut opts = replace_opts(true);
+            opts.payload = payload.clone();
+            let rule = rule_for(&payload);
+            let outcome = write(&drive, &docs, &opts, std::slice::from_ref(&rule)).await;
+            let (expected, preset) = match outcome.result {
+                WriteResult::WouldFormatList { edit, preset } => (edit, preset),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(
+                (
+                    expected.start_index,
+                    expected.end_index,
+                    expected.paragraphs
+                ),
+                (1, 16, 1)
+            );
+            assert_eq!(
+                expected.leading_tabs_removed,
+                if preset.is_some() { 2 } else { 0 }
+            );
+            mount_batch_update(serde_json::json!({"replies": [{}]}))
+                .expect(1)
+                .mount(&server)
+                .await;
+            opts.dry_run = false;
+            let outcome = write(&drive, &docs, &opts, &[rule]).await;
+            assert_eq!(
+                outcome.result,
+                WriteResult::ListFormatted {
+                    edit: expected,
+                    preset
+                }
+            );
+            let requests = server.received_requests().await.unwrap();
+            let reads: Vec<_> = requests
+                .iter()
+                .filter(|r| r.url.path() == "/v1/documents/doc-1")
+                .collect();
+            assert_eq!(reads.len(), 2);
+            assert!(reads.iter().all(|r| r
+                .url
+                .query_pairs()
+                .any(|(k, v)| k == "suggestionsViewMode" && v == "SUGGESTIONS_INLINE")));
+            let batch = requests
+                .iter()
+                .find(|r| r.url.path().ends_with(":batchUpdate"))
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+            let range = serde_json::json!({"startIndex": 1, "endIndex": 16});
+            let request = if preset.is_some() {
+                serde_json::json!({"createParagraphBullets": {"range": range, "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE"}})
+            } else {
+                serde_json::json!({"deleteParagraphBullets": {"range": range}})
+            };
+            assert_eq!(
+                body,
+                serde_json::json!({"requests": [request], "writeControl": {"requiredRevisionId": "rev-list"}})
+            );
+            let serialized = serde_json::to_string(&outcome).unwrap();
+            assert!(!serialized.contains("Q3") && !serialized.contains("report"));
+        }
+    }
+
     async fn anchored_setup(server: &MockServer) -> (DriveClient, DocsClient) {
         let clients = clients(server).await;
         mount_file("doc-1", GOOGLE_DOC_MIME_TYPE, &["folder-1"])
@@ -2179,6 +2349,7 @@ mod tests {
     async fn a_docs_write_grant_does_not_allow_delete_and_delete_does_not_allow_other_verbs() {
         let mut payloads = anchored_payloads();
         payloads.extend(segment_payloads());
+        payloads.extend(list_payloads());
         payloads.push(replace_opts(false).payload);
         payloads.push(append_opts(false).payload);
         for payload in payloads {
@@ -2209,7 +2380,7 @@ mod tests {
 
     #[tokio::test]
     async fn unresolved_anchors_and_missing_revisions_never_mutate() {
-        for payload in anchored_payloads() {
+        for payload in anchored_payloads().into_iter().chain(list_payloads()) {
             for (text, revision, expected) in [
                 ("nothing", Some("r"), "missing"),
                 ("Q3 Q3", Some("r"), "ambiguous"),
@@ -2252,7 +2423,11 @@ mod tests {
 
     #[tokio::test]
     async fn anchored_edits_preserve_every_lease_refusal() {
-        for payload in anchored_payloads().into_iter().chain(segment_payloads()) {
+        for payload in anchored_payloads()
+            .into_iter()
+            .chain(segment_payloads())
+            .chain(list_payloads())
+        {
             for expected in [
                 WriteResult::RefusedNoLease,
                 WriteResult::RefusedLeaseExpired,
@@ -2293,7 +2468,11 @@ mod tests {
 
     #[tokio::test]
     async fn anchored_edits_refuse_stale_docs_revisions() {
-        for payload in anchored_payloads().into_iter().chain(segment_payloads()) {
+        for payload in anchored_payloads()
+            .into_iter()
+            .chain(segment_payloads())
+            .chain(list_payloads())
+        {
             let server = MockServer::start().await;
             let (drive, docs) = anchored_setup(&server).await;
             if matches!(&payload, WritePayload::Insert { selection, .. } | WritePayload::Delete { selection, .. } if selection.segment_id.is_some())
@@ -2448,6 +2627,18 @@ mod tests {
             insert_payload("a", "\0"),
             delete_payload("", None),
             delete_payload("a", Some("two\nlines")),
+            WritePayload::List {
+                from: String::new(),
+                to: None,
+                preset: Some(BulletPreset::BulletCheckbox),
+                match_case: true,
+            },
+            WritePayload::List {
+                from: "a".into(),
+                to: Some("two\nlines".into()),
+                preset: None,
+                match_case: true,
+            },
         ] {
             let server = MockServer::start().await;
             let (drive, docs) = clients(&server).await;
@@ -2573,6 +2764,47 @@ mod tests {
     }
 
     #[test]
+    fn list_descriptions_expose_pre_write_indices_and_tab_removal_without_prose() {
+        let edit = ListPreview {
+            start_index: 1,
+            end_index: 20,
+            tab_id: Some("child".into()),
+            paragraphs: 2,
+            leading_tabs_removed: 3,
+        };
+        let preview = WriteResult::WouldFormatList {
+            edit: edit.clone(),
+            preset: Some(BulletPreset::BulletCheckbox),
+        };
+        let applied = WriteResult::ListFormatted {
+            edit: ListPreview {
+                leading_tabs_removed: 0,
+                ..edit
+            },
+            preset: None,
+        };
+        assert_eq!(preview.log_status(), "would-format-list");
+        assert_eq!(applied.log_status(), "list-formatted");
+        for (result, verb, action) in [
+            (preview, WriteVerb::CreateBullets, "Would format list"),
+            (applied, WriteVerb::DeleteBullets, "Formatted list"),
+        ] {
+            let text = describe(&outcome_with(result), verb);
+            assert!(text.starts_with(action), "{text}");
+            assert!(
+                text.contains("pre-write [1, 20)")
+                    && text.contains("tab child")
+                    && text.contains(if verb == WriteVerb::CreateBullets {
+                        "3 leading tab(s) removed"
+                    } else {
+                        "0 leading tab(s) removed"
+                    }),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn describe_names_the_unresolved_anchor_without_quoting_document_text() {
         let text = describe(
             &outcome_with(WriteResult::RefusedAnchor {
@@ -2594,6 +2826,8 @@ mod tests {
             (WriteVerb::Append, "append"),
             (WriteVerb::Insert, "insert"),
             (WriteVerb::Delete, "delete"),
+            (WriteVerb::CreateBullets, "create-bullets"),
+            (WriteVerb::DeleteBullets, "delete-bullets"),
         ] {
             let text = describe(&outcome_with(not_a_doc.clone()), verb);
             assert!(text.contains(&format!("`drive docs {label}`")), "{text}");
@@ -2602,6 +2836,8 @@ mod tests {
         for (verb, grant) in [
             (WriteVerb::Insert, "docs-write"),
             (WriteVerb::Delete, "docs-delete"),
+            (WriteVerb::CreateBullets, "docs-write"),
+            (WriteVerb::DeleteBullets, "docs-write"),
         ] {
             let text = describe(&outcome_with(WriteResult::RefusedNoVisibleParents), verb);
             assert!(text.contains(&format!("[\"{grant}\"]")), "{text}");

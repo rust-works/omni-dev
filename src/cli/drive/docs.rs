@@ -46,6 +46,10 @@ pub enum DocsSubcommands {
     Insert(write::InsertCommand),
     /// Deletes a unique match or inclusive anchor range, gated by docs-delete.
     Delete(write::DeleteCommand),
+    /// Creates bullets or numbering on anchor-selected paragraphs, under docs-write.
+    CreateBullets(write::CreateBulletsCommand),
+    /// Removes bullets while preserving prose and indentation, under docs-write.
+    DeleteBullets(write::DeleteBulletsCommand),
     /// Creates a new Google Doc, optionally seeded with text. Gated by the
     /// write-permission rules' `create` operation (issue #1615).
     Create(create::CreateCommand),
@@ -66,6 +70,8 @@ impl DocsCommand {
             DocsSubcommands::Append(cmd) => cmd.execute(client).await,
             DocsSubcommands::Insert(cmd) => cmd.execute(client).await,
             DocsSubcommands::Delete(cmd) => cmd.execute(client).await,
+            DocsSubcommands::CreateBullets(cmd) => cmd.execute(client).await,
+            DocsSubcommands::DeleteBullets(cmd) => cmd.execute(client).await,
             DocsSubcommands::Create(cmd) => cmd.execute(client).await,
         }
     }
