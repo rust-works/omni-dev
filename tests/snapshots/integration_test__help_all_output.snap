@@ -3209,6 +3209,7 @@ Usage: coverage [OPTIONS] <COMMAND>
 Commands:
   diff          Analyses diff/patch coverage from a per-line report and a git diff
   lint-markers  Checks source coverage markers without generating a coverage report
+  merge         Merges the per-shard reports of a sharded run into one lcov file
   help          Print this message or the help of the given subcommand(s)
 
 Options:
@@ -3280,6 +3281,24 @@ Arguments:
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev coverage merge - Merges the per-shard reports of a sharded run into one lcov file
+
+Merges the per-shard reports of a sharded run into one lcov file
+
+Usage: merge [OPTIONS] --output <PATH> <REPORT>...
+
+Arguments:
+  <REPORT>...  Coverage reports to merge (lcov / llvm-cov-json / cobertura), one per shard
+
+Options:
+      --report-format <REPORT_FORMAT>  Format of every report (auto-detected per file by default) [default: auto] [possible values: auto, lcov, llvm-cov-json, cobertura]
+  -o, --output <PATH>                  File to write the merged lcov report to
+      --strip-prefix <PATH>            Prefix stripped from report file paths to make them repo-relative (default: the working directory of the repository, if there is one)
+  -h, --help                           Print help (see more with '--help')
 
 
 ================================================================================

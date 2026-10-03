@@ -100,6 +100,9 @@ pub struct DiffCommand {
     pub head_ref: Option<String>,
 
     /// Optional baseline coverage report; enables project deltas and indirect-change detection.
+    ///
+    /// Takes one report. A baseline from a sharded run is one file: make it with
+    /// `coverage merge`.
     #[arg(long, value_name = "PATH")]
     pub baseline_report: Option<PathBuf>,
 
@@ -278,7 +281,7 @@ fn apply_ignored(report: &mut CoverageReport, markers: &BTreeMap<String, FileMar
 
 /// Resolves a relative report `path` against `repo_root`, so the report and the
 /// git repository always anchor to the same root; an absolute `path` is kept.
-fn anchor(path: &Path, repo_root: &Path) -> PathBuf {
+pub(super) fn anchor(path: &Path, repo_root: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -287,7 +290,7 @@ fn anchor(path: &Path, repo_root: &Path) -> PathBuf {
 }
 
 /// Reads and parses the report at `path`, leaving its paths as the tool wrote them.
-fn read_report(path: &Path, format: ReportFormat) -> Result<CoverageReport> {
+pub(super) fn read_report(path: &Path, format: ReportFormat) -> Result<CoverageReport> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("could not read coverage report {}", path.display()))?;
     parse(&content, format.into_format())
