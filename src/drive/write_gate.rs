@@ -400,7 +400,8 @@ pub enum DriveOperation {
     DocsDelete,
     /// Anchor-addressed styling; never implied by text-write or deletion grants.
     DocsFormat,
-    /// Add empty tables, rows or columns. Never authorizes content removal.
+    /// Add empty tables, rows or columns, or create or delete named-range metadata.
+    /// Never authorizes the removal of document text.
     DocsStructure,
     /// Remove table rows/columns under new explicit destructive consent.
     /// Neither DocsWrite nor the anchor-only DocsDelete grant authorizes this.

@@ -50,6 +50,10 @@ pub struct SegmentContent {
 /// One tab's flattened content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TabContent {
+    /// Named-range IDs and their full spans, sorted by name in JSON/YAML.
+    /// JSONL continues to stream only structural elements.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub named_ranges: std::collections::BTreeMap<String, super::types::NamedRanges>,
     /// The tab's id, absent for a legacy single-body document.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
@@ -240,6 +244,11 @@ pub async fn read(api: &DocsApi<'_>, opts: &ReadOptions) -> Result<ReadOutcome> 
     let mut tabs: Vec<TabContent> = resolved
         .iter()
         .map(|tab| TabContent {
+            named_ranges: tab
+                .named_ranges
+                .iter()
+                .map(|(name, ranges)| (name.clone(), ranges.clone()))
+                .collect(),
             tab_id: tab.tab_id.map(ToString::to_string),
             title: tab.title.map(ToString::to_string),
             nesting_level: tab.nesting_level,

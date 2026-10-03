@@ -116,6 +116,15 @@ pub enum DocsRequest {
     /// Remove one column under DocsTableDelete.
     #[serde(rename = "deleteTableColumn")]
     DeleteTableColumn(TableDimensionRequest),
+    /// Add a scoped named-range label.
+    #[serde(rename = "createNamedRange")]
+    CreateNamedRange(CreateNamedRangeRequest),
+    /// Remove metadata by stable ID, without deleting content.
+    #[serde(rename = "deleteNamedRange")]
+    DeleteNamedRange(NamedRangeIdRequest),
+    /// Replace a validated single span by stable ID.
+    #[serde(rename = "replaceNamedRangeContent")]
+    ReplaceNamedRangeContent(ReplaceNamedRangeContentRequest),
 }
 
 /// Empty table insertion; location is snapshot-resolved, never caller-supplied.
@@ -171,6 +180,44 @@ pub struct InsertTableColumnRequest {
     /// Insert right rather than left of the reference column.
     #[serde(rename = "insertRight")]
     pub insert_right: bool,
+}
+
+/// Creation over a fully bounded, snapshot-validated range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CreateNamedRangeRequest {
+    /// Label, measured in UTF-16 units.
+    pub name: String,
+    /// Complete tab and segment address.
+    pub range: super::types::Range,
+}
+
+/// A single-tab criterion; omitted only for verified legacy documents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TabsCriteria {
+    /// Exactly the selected tab.
+    #[serde(rename = "tabIds")]
+    pub tab_ids: [String; 1],
+}
+
+/// Stable-ID selection with no name fan-out arm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NamedRangeIdRequest {
+    /// Snapshot-resolved ID.
+    #[serde(rename = "namedRangeId")]
+    pub named_range_id: String,
+    /// Explicit tab restriction for modern documents.
+    #[serde(rename = "tabsCriteria", skip_serializing_if = "Option::is_none")]
+    pub tabs_criteria: Option<TabsCriteria>,
+}
+
+/// Replacement of a validated named range, including empty deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReplaceNamedRangeContentRequest {
+    /// Exactly one ID selector.
+    #[serde(flatten)]
+    pub target: NamedRangeIdRequest,
+    /// Replacement text; empty means content removal.
+    pub text: String,
 }
 
 /// A `replaceAllText` request.
@@ -514,9 +561,20 @@ impl BatchUpdateDocumentResponse {
 /// One reply of a `documents.batchUpdate`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DocsReply {
+    /// The ID assigned to a created label.
+    #[serde(default, rename = "createNamedRange")]
+    pub create_named_range: Option<CreateNamedRangeResponse>,
     /// Present only for a `replaceAllText` request.
     #[serde(default, rename = "replaceAllText")]
     pub replace_all_text: Option<ReplaceAllTextResponse>,
+}
+
+/// Server-assigned identity after creation.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CreateNamedRangeResponse {
+    /// Absent replies are treated as an unknown identity, not fabricated.
+    #[serde(default, rename = "namedRangeId")]
+    pub named_range_id: Option<String>,
 }
 
 /// The reply to a `replaceAllText`.
@@ -742,6 +800,22 @@ mod tests {
         assert_eq!(
             delete,
             serde_json::json!({"requests": [{"deleteContentRange": {"range": {"startIndex": 4, "endIndex": 10, "tabId": "child-tab"}}}], "writeControl": {"requiredRevisionId": "rev"}})
+        );
+    }
+    #[test]
+    fn create_named_range_reply_preserves_the_server_id() {
+        let response: BatchUpdateDocumentResponse = serde_json::from_value(serde_json::json!({
+            "replies": [{"createNamedRange": {"namedRangeId": "server-id"}}]
+        }))
+        .unwrap();
+        assert_eq!(
+            response.replies[0]
+                .create_named_range
+                .as_ref()
+                .unwrap()
+                .named_range_id
+                .as_deref(),
+            Some("server-id")
         );
     }
 }

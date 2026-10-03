@@ -446,6 +446,11 @@ mod tests {
                 "cli/table.rs",
                 include_str!("../../cli/drive/docs/table.rs"),
             ),
+            ("named_range.rs", include_str!("named_range.rs")),
+            (
+                "cli/named_range.rs",
+                include_str!("../../cli/drive/docs/named_range.rs"),
+            ),
             ("create.rs", include_str!("create.rs")),
             ("client.rs", include_str!("client.rs")),
             ("types.rs", include_str!("types.rs")),
@@ -461,6 +466,7 @@ mod tests {
         let mut list_renames = 0;
         let mut formatting_renames = 0;
         let mut table_deletion_renames = 0;
+        let mut named_renames = 0;
         for (name, source) in sources {
             // Production code only: the tests and docs below deliberately
             // name the things they assert the absence of.
@@ -507,6 +513,17 @@ mod tests {
                     ));
                     table_deletion_renames += 1;
                 }
+                for operation in [
+                    "createNamedRange",
+                    "deleteNamedRange",
+                    "replaceNamedRangeContent",
+                ] {
+                    if code.contains(operation) {
+                        assert_eq!(name, "write_types.rs");
+                        assert!(code.starts_with("#[serde("));
+                        named_renames += 1;
+                    }
+                }
                 let destroys = code.contains("deletePositionedObject");
                 assert!(
                     !destroys,
@@ -524,6 +541,10 @@ mod tests {
         assert_eq!(
             table_deletion_renames, 2,
             "exactly two typed dimension deletion requests"
+        );
+        assert_eq!(
+            named_renames, 4,
+            "three typed requests and one create reply"
         );
     }
 }

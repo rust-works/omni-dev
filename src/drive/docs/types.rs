@@ -132,6 +132,8 @@ pub struct ResolvedTab<'a> {
     headers_map: Option<&'a HashMap<String, Header>>,
     footers_map: Option<&'a HashMap<String, Footer>>,
     footnotes_map: Option<&'a HashMap<String, Footnote>>,
+    /// Named ranges belonging to this tab, including legacy responses.
+    pub named_ranges: &'a HashMap<String, NamedRanges>,
 }
 
 impl<'a> ResolvedTab<'a> {
@@ -206,6 +208,7 @@ impl Document {
                 headers_map: Some(&self.headers),
                 footers_map: Some(&self.footers),
                 footnotes_map: Some(&self.footnotes),
+                named_ranges: &self.named_ranges,
             }];
         }
         let mut out = Vec::new();
@@ -231,10 +234,20 @@ fn push_tab<'a>(tab: &'a Tab, depth: i64, out: &mut Vec<ResolvedTab<'a>>) {
         headers_map: doc_tab.map(|dt| &dt.headers),
         footers_map: doc_tab.map(|dt| &dt.footers),
         footnotes_map: doc_tab.map(|dt| &dt.footnotes),
+        named_ranges: match doc_tab {
+            Some(dt) => &dt.named_ranges,
+            None => empty_named_ranges(),
+        },
     });
     for child in &tab.child_tabs {
         push_tab(child, depth + 1, out);
     }
+}
+
+fn empty_named_ranges() -> &'static HashMap<String, NamedRanges> {
+    static EMPTY: std::sync::LazyLock<HashMap<String, NamedRanges>> =
+        std::sync::LazyLock::new(HashMap::new);
+    &EMPTY
 }
 
 /// One tab of a document.
