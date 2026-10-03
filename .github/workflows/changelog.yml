@@ -11,6 +11,11 @@ name: Changelog Check
 # the base as it is now) and on `merge_group` (the queue branch, where the
 # rebase actually happens), not on the pull request's own diff.
 #
+# Queue entries are stacked: each branch is built on the previous entry's head (the
+# suffix of a `gh-readonly-queue/main/pr-N-<sha>` branch name is that parent), and the
+# base passed here must be that parent, or an entry is judged on its predecessors'
+# changes too. The script prints how many commits it compared, so a queue run shows it.
+#
 # There is deliberately no `paths:` filter. The job is cheap, and a context that
 # always reports can be made required without a pull request that touches no
 # changelog waiting on a check that never runs (docs/ci-path-split.md).

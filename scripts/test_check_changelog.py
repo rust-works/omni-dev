@@ -47,9 +47,13 @@ class ParseTests(unittest.TestCase):
         items = cc.parse('# T\n\n## [Unreleased]\n\n### Fixed\n- one\n- two\n')['unreleased'].items
         self.assertEqual([(item.text, item.line) for item in items], [('one', 6), ('two', 7)])
 
-    def test_nested_numbered_and_alternate_markers_are_items(self):
-        text = '## [Unreleased]\n- a\n  - nested\n* star\n+ plus\n1. one\n2) two\n'
-        self.assertEqual(len(cc.parse(text)['unreleased'].items), 6)
+    def test_nested_and_alternate_markers_are_items(self):
+        text = '## [Unreleased]\n- a\n  - nested\n* star\n+ plus\n'
+        self.assertEqual(len(cc.parse(text)['unreleased'].items), 4)
+
+    def test_a_wrapped_line_that_looks_numbered_is_not_an_item(self):
+        text = '## [Unreleased]\n- shipped in\n2026. The rest of the sentence\n1) and another\n'
+        self.assertEqual([item.text for item in cc.parse(text)['unreleased'].items], ['shipped in'])
 
     def test_preamble_link_references_and_rules_are_not_items(self):
         text = '- stray before any heading\n## [Unreleased]\n---\n[0.1.0]: https://example.com/a...b\n'
@@ -60,6 +64,20 @@ class ParseTests(unittest.TestCase):
         sections = cc.parse(text)
         self.assertEqual(list(sections), ['unreleased'])
         self.assertEqual([item.text for item in sections['unreleased'].items], ['outside'])
+
+    def test_a_longer_fence_is_not_closed_by_a_shorter_one(self):
+        text = '## [Unreleased]\n````md\n```\n- inside\n```\n````\n- outside\n'
+        self.assertEqual([item.text for item in cc.parse(text)['unreleased'].items], ['outside'])
+
+    def test_a_fence_with_an_info_string_does_not_close_a_fence(self):
+        text = '## [Unreleased]\n```\n```yaml\n- inside\n```\n- outside\n'
+        self.assertEqual([item.text for item in cc.parse(text)['unreleased'].items], ['outside'])
+
+    def test_a_fence_left_open_is_an_error_not_a_quiet_pass(self):
+        with self.assertRaises(cc.ChangelogError) as caught:
+            cc.parse('## [Unreleased]\n- a\n```\n## [0.1.0]\n- hidden\n', 'CHANGELOG.md at HEAD')
+        self.assertIn('CHANGELOG.md at HEAD', str(caught.exception))
+        self.assertIn('line 3', str(caught.exception))
 
     def test_whitespace_is_normalised(self):
         self.assertEqual(cc.parse('## [Unreleased]\n-   a   b  \n')['unreleased'].items[0].text, 'a b')
@@ -95,7 +113,28 @@ class ReleasedSectionTests(unittest.TestCase):
         self.assertEqual(findings(base, head), [])
 
     def test_rewording_a_bullet_is_fine(self):
-        self.assertEqual(findings(render([], ('0.1.0', ['a typo'])), render([], ('0.1.0', ['a fix']))), [])
+        prose = 'The daemon now reaps a window that is silent for thirty seconds of awake time. '
+        before = render([], ('0.1.0', [prose + 'See the guide for the detials.']))
+        after = render([], ('0.1.0', [prose + 'See the guide for the details.']))
+        self.assertEqual(findings(before, after), [])
+
+    def test_a_reword_does_not_hide_a_bullet_added_beside_it(self):
+        prose = 'The daemon now reaps a window that is silent for thirty seconds of awake time. '
+        before = render([], ('0.1.0', [prose + 'See the detials.']))
+        after = render([], ('0.1.0', [prose + 'See the details.', '**Late**: something else entirely']))
+        [found] = findings(before, after)
+        self.assertIn('Late', found.message)
+
+    def test_a_bullet_swapped_for_an_unrelated_one_is_an_addition(self):
+        before = render([], ('0.1.0', ['The daemon reaps silent windows after thirty seconds']))
+        after = render([], ('0.1.0', ['Snowflake sessions renew their tokens in the background']))
+        self.assertEqual(len(findings(before, after)), 1)
+
+    def test_one_lost_bullet_excuses_only_one_reword(self):
+        prose = 'The daemon now reaps a window that is silent for thirty seconds of awake time. '
+        before = render([], ('0.1.0', [prose + 'v1']))
+        after = render([], ('0.1.0', [prose + 'v2', prose + 'v3']))
+        self.assertEqual(len(findings(before, after)), 1)
 
     def test_the_same_text_added_twice_counts_twice(self):
         base = render([], ('0.1.0', ['x']))
@@ -124,11 +163,14 @@ class ExtensionRuleTests(unittest.TestCase):
         visible = [
             'editors/vscode/src/extension.ts', 'editors/vscode/package.json', 'editors/vscode/media/icon.png',
             'editors/vscode/snippets/rust.json', 'editors/vscode/src/test-helpers.ts',
+            'editors/vscode/src/README.md', 'editors/vscode/media/config.png',
         ]
         hidden = [
             'src/main.rs', 'editors/vscode-other/src/a.ts', 'editors/vscode/CHANGELOG.md',
             'editors/vscode/README.md', 'editors/vscode/package-lock.json', 'editors/vscode/tsconfig.json',
-            'editors/vscode/esbuild.js', 'editors/vscode/.vscodeignore', 'editors/vscode/src/tree.test.ts',
+            'editors/vscode/tsconfig.build.json', 'editors/vscode/esbuild.js', 'editors/vscode/esbuild.mjs',
+            'editors/vscode/eslint.config.mjs', 'editors/vscode/LICENSE.md', 'editors/vscode/vitest.config.ts',
+            'editors/vscode/.vscodeignore', 'editors/vscode/.eslintrc.json', 'editors/vscode/src/tree.test.ts',
             'editors/vscode/src/tree.spec.mts', 'editors/vscode/test/fixture.ts', 'editors/vscode/src/__tests__/a.ts',
             'editors/vscode/.vscode-test/x.js',
         ]
@@ -150,11 +192,32 @@ class ExtensionRuleTests(unittest.TestCase):
         self.assertFalse(cc.has_new_entry(cc.parse(render(['a'])), cc.parse(render(['a']))))
         self.assertFalse(cc.has_new_entry(cc.parse(render(['a'])), cc.parse(render([]))))
 
+    def test_an_empty_release_section_is_not_an_entry(self):
+        self.assertFalse(cc.has_new_entry(cc.parse(render(['a'])), cc.parse('## [Unreleased]\n\n## [0.2.0] - 2026-01-01\n')))
+
     def test_a_recreated_empty_unreleased_heading_is_not_an_entry(self):
         self.assertFalse(cc.has_new_entry(cc.parse(''), cc.parse('## [Unreleased]\n')))
 
+    def test_manifest_changes_that_only_touch_the_build_do_not_ship(self):
+        before = '{"name": "x", "version": "1.0.0", "devDependencies": {"a": "1"}, "scripts": {"b": "c"}}'
+        after = '{"name": "x", "version": "1.0.1", "devDependencies": {"a": "2"}, "scripts": {"b": "d"}}'
+        self.assertFalse(cc.manifest_ships(before, after))
+
+    def test_manifest_changes_to_what_the_extension_does_ship(self):
+        before = '{"name": "x", "dependencies": {"a": "1"}, "contributes": {"commands": []}}'
+        for after in ('{"name": "x", "dependencies": {"a": "2"}, "contributes": {"commands": []}}',
+                      '{"name": "x", "dependencies": {"a": "1"}, "contributes": {"commands": [1]}}',
+                      '{"name": "x", "dependencies": {"a": "1"}, "contributes": {"commands": []}, "engines": {}}'):
+            self.assertTrue(cc.manifest_ships(before, after), after)
+
+    def test_a_new_or_unreadable_manifest_ships(self):
+        self.assertTrue(cc.manifest_ships(None, '{"name": "x"}'))
+        self.assertTrue(cc.manifest_ships('{"name": "x"}', 'not json'))
+        self.assertTrue(cc.manifest_ships('[1]', '[2]'))
+
     def missing(self, changed, base=(), head=()):
-        return cc.extension_entry_missing(changed, cc.parse(render(base)), cc.parse(render(head)))
+        visible = [path for path in changed if cc.is_user_visible(path)]  # as `check` does
+        return cc.extension_entry_missing(visible, cc.parse(render(base)), cc.parse(render(head)))
 
     def test_a_user_visible_change_without_an_entry_is_a_finding(self):
         [found] = self.missing(['editors/vscode/src/tree.ts'])
@@ -178,11 +241,29 @@ class ExtensionRuleTests(unittest.TestCase):
 class WaiverTests(unittest.TestCase):
     def test_trailers_are_recognised_case_insensitively(self):
         message = 'fix(vscode): x\n\nBody.\n\nchangelog: NONE not user visible\nChangelog: amend-released backfill\n'
-        self.assertEqual(cc.waivers(message), {'none', 'amend-released'})
+        self.assertEqual(cc.waivers([message]), {'none', 'amend-released'})
+
+    def test_a_trailer_may_stand_alone_without_a_reason(self):
+        self.assertEqual(cc.waivers(['fix: x\n\nChangelog: none']), {'none'})
+
+    def test_waivers_are_collected_across_commits(self):
+        messages = ['a\n\nChangelog: none r', 'b\n\nbody only', 'c\n\nChangelog: amend-released r']
+        self.assertEqual(cc.waivers(messages), {'none', 'amend-released'})
+
+    def test_a_line_in_the_body_is_not_a_trailer(self):
+        message = 'docs: explain\n\nChangelog: none is how you opt out.\nChangelog: amend-released too.\n\nCloses #1\n'
+        self.assertEqual(cc.waivers([message]), set())
+
+    def test_a_subject_line_alone_is_not_a_trailer_block(self):
+        self.assertEqual(cc.waivers(['Changelog: none']), set())
 
     def test_other_text_is_not_a_waiver(self):
-        for message in ('Changelog: nonexistent\n', 'See the Changelog: none here\n', 'Changelog:\n', ''):
-            self.assertEqual(cc.waivers(message), set(), message)
+        for message in ('x\n\nChangelog: nonexistent', 'x\n\nChangelog: none-of-this', 'x\n\nSee Changelog: none',
+                        'x\n\nChangelog:', 'x\n\nChangelog: skip', ''):
+            self.assertEqual(cc.waivers([message]), set(), message)
+
+    def test_windows_line_endings_are_understood(self):
+        self.assertEqual(cc.waivers(['fix: x\r\n\r\nChangelog: none r\r\n']), {'none'})
 
 
 class ReportTests(unittest.TestCase):
@@ -284,16 +365,23 @@ class EndToEndTests(GitTestCase):
             'editors/vscode/package.json': '{"version": "0.2.0"}\n',
         })
         code, out, _ = self.check('--base', 'main', '--head', 'release')
-        self.assertEqual((code, out), (0, 'check_changelog: ok\n'))
+        self.assertEqual(code, 0)
+        self.assertTrue(out.endswith('check_changelog: ok\n'), out)
 
-    def test_rebasing_a_stale_branch_over_a_release_lands_the_bullet_in_the_released_section(self):
-        """The mechanism of #2129, reproduced with real git rather than assumed."""
+    def stale_branch_behind_a_release(self):
+        """A feature branch forked before a release prep; returns (fork point, release prep)."""
         self.commit('base', {'CHANGELOG.md': render(['existing'], ('0.1.0', ['first']))})
+        fork = self.git('rev-parse', 'HEAD')
         self.git('checkout', '-q', '-b', 'feature')
         self.commit('feat: x', {'CHANGELOG.md': render(['existing', 'feature'], ('0.1.0', ['first']))})
         self.git('checkout', '-q', 'main')
         self.commit('chore(release): prepare 0.2.0', {
             'CHANGELOG.md': render([], ('0.2.0', ['existing']), ('0.1.0', ['first']))})
+        return fork, self.git('rev-parse', 'HEAD')
+
+    def test_rebasing_a_stale_branch_over_a_release_lands_the_bullet_in_the_released_section(self):
+        """The mechanism of #2129, reproduced with real git rather than assumed."""
+        self.stale_branch_behind_a_release()
 
         # Seen from its own fork point the branch is innocent...
         self.assertEqual(self.check('--base', 'main', '--head', 'feature')[0], 0)
@@ -308,6 +396,19 @@ class EndToEndTests(GitTestCase):
         self.assertEqual(code, 1)
         self.assertIn('## [0.2.0] - 2026-01-01', out)
         self.assertIn('feature', out)
+
+    def test_a_stacked_queue_entry_must_be_judged_against_the_entry_before_it(self):
+        """Why the workflow passes the group's parent: the release prep is queued just ahead."""
+        fork, release = self.stale_branch_behind_a_release()
+        self.git('checkout', '-q', 'feature')
+        self.git('rebase', '-q', 'main')  # the queue builds the entry on the one ahead of it
+
+        # Against its parent (the release prep) the entry's bullet is plainly in a released section.
+        self.assertEqual(self.check('--base', release, '--head', 'feature')[0], 1)
+
+        # Against the commit before the release prep, `[0.2.0]` exists only in the head, so it is
+        # taken for a release in preparation and the bullet hides behind it.
+        self.assertEqual(self.check('--base', fork, '--head', 'feature')[0], 0)
 
     def test_amend_released_trailer_waives_the_rule(self):
         self.commit('base', {'CHANGELOG.md': render([], ('0.1.0', ['x']))})
@@ -351,6 +452,43 @@ class EndToEndTests(GitTestCase):
         code, _, _ = self.extension_branch('chore(vscode): bump\n\nChangelog: none dev dependency only',
                                            {'editors/vscode/src/tree.ts': 'b\n'})
         self.assertEqual(code, 0)
+
+    def manifest_branch(self, before, after):
+        self.commit('base', {'CHANGELOG.md': render([]), EXT: render([]), 'editors/vscode/package.json': before})
+        self.git('checkout', '-q', '-b', 'feature')
+        self.commit('chore(vscode): manifest', {'editors/vscode/package.json': after})
+        return self.check('--base', 'main', '--head', 'feature')
+
+    def test_a_dev_only_manifest_bump_needs_no_entry(self):
+        code, _, _ = self.manifest_branch('{"version": "1.0.0", "devDependencies": {"a": "1"}}\n',
+                                          '{"version": "1.0.0", "devDependencies": {"a": "2"}}\n')
+        self.assertEqual(code, 0)
+
+    def test_a_manifest_change_to_contributions_needs_an_entry(self):
+        code, out, _ = self.manifest_branch('{"contributes": {"commands": []}}\n', '{"contributes": {"commands": [1]}}\n')
+        self.assertEqual(code, 1)
+        self.assertIn('editors/vscode/package.json', out)
+
+    def test_a_body_line_does_not_waive_a_finding(self):
+        code, _, _ = self.extension_branch('docs(vscode): explain\n\nChangelog: none is the opt-out.\n\nCloses #1',
+                                           {'editors/vscode/src/tree.ts': 'b\n'})
+        self.assertEqual(code, 1)
+
+    def test_an_unclosed_fence_is_a_usage_error_naming_the_file(self):
+        self.commit('base', {'CHANGELOG.md': render(['a'], ('0.1.0', ['x']))})
+        self.git('checkout', '-q', '-b', 'feature')
+        self.commit('feat: x', {'CHANGELOG.md': render(['a']) + '```\n## [0.1.0]\n'})
+        code, out, err = self.check('--base', 'main', '--head', 'feature')
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn('CHANGELOG.md at feature', err)
+
+    def test_the_run_says_what_it_compared(self):
+        self.commit('base', {'CHANGELOG.md': render([])})
+        self.git('checkout', '-q', '-b', 'feature')
+        self.commit('feat: one', {'CHANGELOG.md': render(['a'])})
+        self.commit('feat: two', {'CHANGELOG.md': render(['a', 'b'])})
+        _, out, _ = self.check('--base', 'main', '--head', 'feature')
+        self.assertIn(f'2 commit(s) since {self.git("rev-parse", "main")[:10]} (main .. feature)', out)
 
     def test_no_extension_check_skips_the_entry_requirement(self):
         self.commit('base', {'CHANGELOG.md': render([]), 'editors/vscode/src/tree.ts': 'a\n'})
