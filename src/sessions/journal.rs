@@ -34,8 +34,20 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub use super::is_session_uuid;
 use super::{Agent, EventStamp, ObserveRequest, SessionEvent};
 use crate::daemon::paths;
+
+/// How long a journal may sit unwritten before it is deleted, and the oldest last
+/// event a replay will accept. Generous: a session left open and idle for days is
+/// real, and a live pid is cheap proof.
+pub const MAX_JOURNAL_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The size past which the hook sink stops appending to a journal. The daemon
+/// compacts a journal long before this, so reaching it means nothing is reading
+/// or tending the journals (the sessions service is not running), and the sink
+/// must not grow a file without bound on its own.
+const SINK_MAX_BYTES: u64 = 512 * 1024;
 
 /// The record format version. A reader skips a record with a newer version
 /// rather than guess at its fields; unknown *fields* of a known version are
@@ -211,21 +223,6 @@ pub fn new_stamp() -> EventStamp {
     }
 }
 
-/// Whether `id` is a canonical hyphenated UUID (8-4-4-4-12 hex digits).
-///
-/// The only ids a journal is ever named for: Claude's are UUID v4 and Codex's v7.
-/// Checking the shape, not just stripping separators, is what keeps a crafted
-/// payload from naming a path outside the journal directory.
-#[must_use]
-pub fn is_session_uuid(id: &str) -> bool {
-    let groups: Vec<&str> = id.split('-').collect();
-    groups.len() == 5
-        && groups
-            .iter()
-            .zip([8, 4, 4, 4, 12])
-            .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
 /// The directory name an agent's journals live under, or `None` for an agent
 /// that has no hook feed (pi.dev reports through its own extension).
 #[must_use]
@@ -257,16 +254,28 @@ pub fn journal_path(dir: &Path, agent: Agent, session_id: &str) -> Option<PathBu
 /// the error: a journal that cannot be written costs the durability of one event,
 /// never a turn.
 ///
+/// The sink cannot tell whether a daemon is reading, so it bounds itself: it does
+/// not journal at all until the daemon's runtime directory (`dir`'s parent)
+/// exists, stops appending to a file past [`SINK_MAX_BYTES`], and, whenever it
+/// starts a new journal, deletes sibling journals untouched for
+/// [`MAX_JOURNAL_AGE`]. A daemon-less install therefore cannot accumulate
+/// journals without limit.
+///
 /// # Errors
 ///
-/// When the session id or agent cannot be journaled, a directory or the file
-/// cannot be created or opened, or the write fails.
+/// When the session id or agent cannot be journaled, the runtime directory does
+/// not exist, a directory or the file cannot be created or opened, the journal is
+/// over its cap, or the write fails.
 pub fn append(dir: &Path, record: &JournalRecord) -> Result<()> {
     let path = journal_path(dir, record.agent, &record.session_id)
         .context("the session id or agent cannot be journaled")?;
     let agent_dir = path
         .parent()
         .context("a journal path always has a parent")?;
+    anyhow::ensure!(
+        dir.parent().is_some_and(Path::is_dir),
+        "the daemon's runtime directory does not exist yet"
+    );
     paths::ensure_dir_0700(dir)?;
     paths::ensure_dir_0700(agent_dir)?;
     let mut line = serde_json::to_vec(record).context("failed to serialize the journal record")?;
@@ -278,9 +287,50 @@ pub fn append(dir: &Path, record: &JournalRecord) -> Result<()> {
         .open(&path)
         .with_context(|| format!("failed to open journal {}", path.display()))?;
     paths::ensure_handle_0600(&file)?;
+    let len = file.metadata().context("failed to stat the journal")?.len();
+    anyhow::ensure!(len < SINK_MAX_BYTES, "the journal is over its size cap");
+    if len == 0 {
+        sweep_stale(agent_dir, &path);
+    }
     (&file)
         .write_all(&line)
         .with_context(|| format!("failed to append to journal {}", path.display()))
+}
+
+/// Deletes the other `<uuid>.jsonl` journals in `agent_dir` that nothing has
+/// written to for [`MAX_JOURNAL_AGE`]. Best-effort, and only regular files with a
+/// journal's name; a symlink is never followed.
+fn sweep_stale(agent_dir: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(agent_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_journal = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .is_some_and(is_session_uuid);
+        if path == keep || !is_journal {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let stale = meta.is_file()
+            && meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age > MAX_JOURNAL_AGE);
+        if stale {
+            // Best-effort housekeeping: a failure only leaves the file for the
+            // daemon's sweep.
+            if let Err(error) = std::fs::remove_file(&path) {
+                tracing::debug!(%error, "session_journal_sweep_failed");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -566,5 +616,91 @@ mod tests {
                 "v"
             ]
         );
+    }
+
+    fn age_file(path: &Path, secs: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    #[test]
+    fn the_sink_does_not_journal_until_the_daemons_runtime_directory_exists() {
+        // The journal root is `<runtime dir>/sessions`: a machine that has never
+        // run the daemon has no runtime dir, and the hook must not create one.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("never-ran").join("sessions");
+        let record = JournalRecord::observe(
+            &observe_req(SessionEvent::Stop),
+            &stamp("2026-10-03T03:40:00Z", "7-1"),
+        );
+        let err = append(&dir, &record).unwrap_err();
+        assert!(err.to_string().contains("runtime directory"), "{err}");
+        assert!(!tmp.path().join("never-ran").exists());
+    }
+
+    #[test]
+    fn the_sink_stops_appending_to_a_journal_nothing_is_tending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        let record = JournalRecord::observe(
+            &observe_req(SessionEvent::Stop),
+            &stamp("2026-10-03T03:40:00Z", "7-1"),
+        );
+        append(&dir, &record).unwrap();
+        let path = journal_path(&dir, Agent::Claude, ID).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(SINK_MAX_BYTES)
+            .unwrap();
+        let err = append(&dir, &record).unwrap_err();
+        assert!(err.to_string().contains("size cap"), "{err}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), SINK_MAX_BYTES);
+    }
+
+    #[test]
+    fn starting_a_journal_sweeps_week_old_siblings_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        let agent_dir = dir.join("claude");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let stale = agent_dir.join("1c8f7d2b-3a5e-4b9f-8d4c-6e2f8a0b3c5d.jsonl");
+        let fresh = agent_dir.join("2d9a8e3c-4b6f-4c0a-9e5d-7f3a9b1c4d6e.jsonl");
+        let foreign = agent_dir.join("notes.jsonl");
+        for p in [&stale, &fresh, &foreign] {
+            std::fs::write(p, "x\n").unwrap();
+        }
+        age_file(&stale, 8 * 24 * 3600);
+        age_file(&foreign, 8 * 24 * 3600);
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, "keep").unwrap();
+        let link = agent_dir.join("3e0b9f4d-5c7a-4d1b-8f6e-8a4b0c2d5e7f.jsonl");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let record = JournalRecord::observe(
+            &observe_req(SessionEvent::SessionStart),
+            &stamp("2026-10-03T03:40:00Z", "7-1"),
+        );
+        append(&dir, &record).unwrap();
+        assert!(!stale.exists(), "a week-old journal is swept");
+        assert!(
+            fresh.exists() && foreign.exists(),
+            "only stale journals by name"
+        );
+        assert!(
+            link.symlink_metadata().is_ok() && outside.exists(),
+            "no symlink followed"
+        );
+
+        // An append to an existing journal does not sweep again.
+        age_file(&fresh, 8 * 24 * 3600);
+        append(&dir, &record).unwrap();
+        assert!(fresh.exists());
     }
 }

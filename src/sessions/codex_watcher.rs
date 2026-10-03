@@ -59,7 +59,14 @@ use serde::Deserialize;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{Agent, ObserveRequest, SessionEvent, SessionsRegistry};
+use super::{is_session_uuid, Agent, ObserveRequest, SessionEvent, SessionsRegistry};
+
+/// How often the lock of a rollout that has not been read is probed (#2108). A
+/// Codex home accumulates thousands of old rollouts, so probing each of them on
+/// every [`WATCH_INTERVAL`] would cost thousands of syscalls every few seconds for
+/// the daemon's whole life; a held lock on an old rollout is found within this
+/// instead (or at once, when the rollout is written to).
+const UNREAD_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Codex's home directory override, as Codex itself reads it.
 const CODEX_HOME_ENV: &str = "CODEX_HOME";
@@ -227,8 +234,9 @@ pub(crate) fn probe_thread_lock(id: &str) -> LockState {
 #[derive(Debug, Clone)]
 enum Tracked {
     /// Seen but not read: it was not recently active when first seen. Its head
-    /// is read if it later grows.
-    Unread { size: u64 },
+    /// is read if it later grows, or when its thread lock is found held.
+    /// `probed` is when that lock was last looked at (#2108).
+    Unread { size: u64, probed: SystemTime },
     /// A subagent or unreadable rollout; never reported.
     Skipped,
     /// A session rollout.
@@ -360,14 +368,14 @@ fn scan(
         present.insert(path.clone());
         let recent = is_recent(modified, now);
         let tracked = match state.remove(&path) {
-            None if !recent => unread_or_held(&path, size, locks, now, probe, &mut actions),
+            None if !recent => unread_or_held(&path, size, None, locks, now, probe, &mut actions),
             // First sight of a recent rollout, or growth of one not read yet.
             None => first_read(&path, size, locks, now, probe, &mut actions),
-            Some(Tracked::Unread { size: old }) if size != old && recent => {
+            Some(Tracked::Unread { size: old, .. }) if size != old && recent => {
                 first_read(&path, size, locks, now, probe, &mut actions)
             }
-            Some(Tracked::Unread { .. }) => {
-                unread_or_held(&path, size, locks, now, probe, &mut actions)
+            Some(Tracked::Unread { probed, .. }) => {
+                unread_or_held(&path, size, Some(probed), locks, now, probe, &mut actions)
             }
             Some(Tracked::Skipped) => Tracked::Skipped,
             Some(Tracked::Session(track)) => {
@@ -400,34 +408,36 @@ fn thread_id_from_file_name(path: &Path) -> Option<&str> {
     let stem = path.file_stem()?.to_str()?;
     let split = stem.len().checked_sub(36)?;
     let id = stem.get(split..)?;
-    let groups: Vec<&str> = id.split('-').collect();
-    let shaped = groups.len() == 5
-        && groups
-            .iter()
-            .zip([8, 4, 4, 4, 12])
-            .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()));
     let separated = split
         .checked_sub(1)
         .is_some_and(|dash| stem.as_bytes().get(dash) == Some(&b'-'));
-    (shaped && separated).then_some(id)
+    (separated && is_session_uuid(id)).then_some(id)
 }
 
 /// Handles a rollout that is not recent and has not been read: it stays
 /// [`Tracked::Unread`] unless its thread's lock is held, in which case a live
-/// process has it loaded and it is read now, whatever its mtime (#2108).
+/// process has it loaded and it is read now, whatever its mtime (#2108). `probed`
+/// is when the lock was last looked at, if it has been: it is not looked at again
+/// before [`UNREAD_PROBE_INTERVAL`] has passed.
 fn unread_or_held(
     path: &Path,
     size: u64,
+    probed: Option<SystemTime>,
     locks: &Path,
     now: SystemTime,
     probe: &dyn Fn(&Path, &str) -> LockState,
     actions: &mut Vec<Action>,
 ) -> Tracked {
+    if let Some(last) = probed {
+        if now.duration_since(last).unwrap_or_default() < UNREAD_PROBE_INTERVAL {
+            return Tracked::Unread { size, probed: last };
+        }
+    }
     match thread_id_from_file_name(path) {
         Some(id) if probe(locks, id) == LockState::Held => {
             first_read(path, size, locks, now, probe, actions)
         }
-        _ => Tracked::Unread { size },
+        _ => Tracked::Unread { size, probed: now },
     }
 }
 
@@ -443,7 +453,7 @@ fn first_read(
 ) -> Tracked {
     let (id, cwd) = match read_head(path) {
         Head::Skip => return Tracked::Skipped,
-        Head::Incomplete => return Tracked::Unread { size },
+        Head::Incomplete => return Tracked::Unread { size, probed: now },
         Head::Session { id, cwd } => (id, cwd),
     };
     let lock = probe(locks, &id);
@@ -764,7 +774,7 @@ mod tests {
     #[test]
     fn an_old_rollout_is_announced_when_its_lock_becomes_held_later() {
         // A `codex resume` that has not written yet: still `Unread`, then the
-        // lock appears and the next scan announces it without any growth.
+        // lock appears and a later probe announces it without any growth.
         let tmp = tempfile::tempdir().unwrap();
         let path = write_rollout(tmp.path(), ID, &[head(ID, serde_json::json!("cli"))]);
         let lock = RefCell::new(LockState::Absent);
@@ -778,11 +788,46 @@ mod tests {
                 tmp.path(),
                 tmp.path(),
                 &mut state,
-                far,
+                far + UNREAD_PROBE_INTERVAL,
                 &scripted(&lock)
             )),
             vec![format!("seen:{ID}")]
         );
+    }
+
+    #[test]
+    fn unread_rollouts_are_probed_once_per_interval_not_every_scan() {
+        // A Codex home holds thousands of old rollouts; probing each on every
+        // 5s scan would be thousands of syscalls for the daemon's whole life.
+        let tmp = tempfile::tempdir().unwrap();
+        write_rollout(tmp.path(), ID, &[head(ID, serde_json::json!("cli"))]);
+        let probes = std::cell::Cell::new(0_u32);
+        let counting = |_: &Path, _: &str| {
+            probes.set(probes.get() + 1);
+            LockState::Absent
+        };
+        let mut state = ScanState::new();
+        let far = SystemTime::now() + RECENT_ACTIVITY_WINDOW * 10;
+        scan(tmp.path(), tmp.path(), &mut state, far, &counting);
+        assert_eq!(probes.get(), 1, "probed on first sight");
+        for scans in 1..=10 {
+            scan(
+                tmp.path(),
+                tmp.path(),
+                &mut state,
+                far + WATCH_INTERVAL * scans,
+                &counting,
+            );
+        }
+        assert_eq!(probes.get(), 1, "not again within the interval");
+        scan(
+            tmp.path(),
+            tmp.path(),
+            &mut state,
+            far + UNREAD_PROBE_INTERVAL,
+            &counting,
+        );
+        assert_eq!(probes.get(), 2, "once the interval has passed");
     }
 
     #[test]
