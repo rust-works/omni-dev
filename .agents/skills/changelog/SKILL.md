@@ -78,6 +78,12 @@ Add entries to `[Unreleased]` as features are merged, not all at once during rel
 - Ensures nothing is missed
 - Provides better commit-to-changelog traceability
 
+### Released Sections Are Closed
+Once a version's section exists on `main`, it is released: add new bullets under `[Unreleased]` only. A branch that predates a release can have its bullet applied *inside* the renamed section when it merges, so re-check where it landed after rebasing. The `Changelog Check` workflow (`scripts/check_changelog.py`, #2129) fails a pull request or merge-queue entry that grows a released section. A deliberate backfill carries a `Changelog: amend-released <reason>` commit trailer.
+
+### Extension Entries
+A user-visible change under `editors/vscode/` needs a bullet in `editors/vscode/CHANGELOG.md` under `[Unreleased]`, not only in the root changelog. The same check requires it. A change that is not user-visible after all (a refactor, a dev-dependency bump) carries a `Changelog: none <reason>` commit trailer.
+
 ### Version Links
 Always maintain comparison links at the bottom of the file:
 
