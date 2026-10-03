@@ -19,15 +19,22 @@
 //!   burst of windows asking at once costs one per worktree, and a request never
 //!   gets an answer older than itself.
 //! - It also caps how many computations run at once, bounding blocking-pool use
-//!   and the number of live `Repository` objects (each holds its pack files open).
+//!   and the number of live `Repository` objects.
+//!
+//! What a computation reads the repository *through* is [`super::shared_repo`]'s
+//! business (#2121): the coordinator owns the [`RepoPool`] those handles come from,
+//! sized to the same cap, so a batch over N linked worktrees of one repo opens it
+//! at most that many times instead of N.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 use git2::{Oid, Repository};
 use tokio::sync::{OnceCell, Semaphore};
+
+use super::shared_repo::RepoPool;
 
 /// How many worktrees may be walked at once. Enough to keep a multi-core machine
 /// busy, few enough that the walks cannot saturate the blocking pool or pin more
@@ -167,6 +174,12 @@ pub(super) struct AheadBehindCoordinator {
     /// nothing here is a cache.
     in_flight: Mutex<HashMap<PathBuf, Arc<Flight>>>,
     permits: Arc<Semaphore>,
+    /// How many computations run at once, which is also the most repositories the
+    /// shared pool keeps open.
+    limit: usize,
+    /// The pool of shared repository handles, held weakly so it exists only while
+    /// some request holds it (see [`Self::pool`]).
+    pool: Mutex<Weak<RepoPool>>,
 }
 
 impl AheadBehindCoordinator {
@@ -174,11 +187,32 @@ impl AheadBehindCoordinator {
         Self::with_concurrency(MAX_CONCURRENT_COMPUTATIONS)
     }
 
-    fn with_concurrency(limit: usize) -> Self {
+    pub(super) fn with_concurrency(limit: usize) -> Self {
         Self {
             in_flight: Mutex::new(HashMap::new()),
             permits: Arc::new(Semaphore::new(limit)),
+            limit,
+            pool: Mutex::new(Weak::new()),
         }
+    }
+
+    /// The pool of repository handles that computations share (#2121).
+    ///
+    /// Callers hold the returned `Arc` for as long as they have work outstanding
+    /// and move a clone into each computation. Concurrent callers get the **same**
+    /// pool, so the handle cap holds across overlapping batches; once the last
+    /// holder drops it, every handle is closed and the next call starts a fresh
+    /// pool. That makes the handles live exactly as long as the requests they
+    /// serve — never a daemon-lifetime cache, which could otherwise age into a
+    /// stale view of a repository.
+    pub(super) fn pool(&self) -> Arc<RepoPool> {
+        let mut weak = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(pool) = weak.upgrade() {
+            return pool;
+        }
+        let pool = Arc::new(RepoPool::new(self.limit));
+        *weak = Arc::downgrade(&pool);
+        pool
     }
 
     /// The divergence of the worktree at `path`, from a computation that has not
@@ -630,5 +664,26 @@ mod tests {
         };
         drop(tree);
         (repo, base, first, second)
+    }
+
+    /// Overlapping requests must share one pool, or the handle cap would be per
+    /// request instead of overall; and the pool must not outlive them, or its
+    /// handles would age into a stale view of the repository.
+    #[test]
+    fn overlapping_holders_share_one_pool_and_it_is_released_with_the_last() {
+        let coordinator = AheadBehindCoordinator::with_concurrency(3);
+        let first = coordinator.pool();
+        let second = coordinator.pool();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        assert!(weak.upgrade().is_some(), "the second holder still has it");
+        drop(second);
+        assert!(weak.upgrade().is_none(), "the last holder released it");
+
+        // The next batch starts a fresh pool rather than finding a dead one.
+        let next = coordinator.pool();
+        assert_eq!(Arc::strong_count(&next), 1);
     }
 }

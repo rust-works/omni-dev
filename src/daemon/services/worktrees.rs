@@ -32,6 +32,7 @@
 
 mod divergence;
 mod geometry;
+mod shared_repo;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -2667,13 +2668,26 @@ fn default_branch_tip(repo: &Repository) -> Option<(String, git2::Oid)> {
 }
 
 /// Both lazily-fetched divergences of `folder`, from a single repository open
-/// rooted at `folder` itself. What the `ahead-behind` op computes per worktree
-/// (#2111).
+/// rooted at `folder` itself (#2111).
+///
+/// This is the reference implementation of what the `ahead-behind` op reports for
+/// a worktree. The op itself goes through [`folder_divergence_shared`], which
+/// answers from a repository handle shared with the repo's other worktrees and
+/// falls back here whenever it cannot answer exactly (#2121).
 fn folder_divergence(folder: &Path) -> Divergence {
     let Ok(repo) = Repository::discover(folder) else {
         return Divergence::default();
     };
     head_divergence(&repo, repo.head().ok())
+}
+
+/// [`folder_divergence`] answered from `pool`'s shared repository handles, so a
+/// batch over many linked worktrees of one repo opens that repo once per
+/// concurrent computation instead of once per worktree (#2121). Any input the
+/// shared path cannot answer exactly falls back to [`folder_divergence`], so the
+/// result is always the one that function would give.
+fn folder_divergence_shared(pool: &shared_repo::RepoPool, folder: &Path) -> Divergence {
+    shared_repo::divergence(pool, folder).unwrap_or_else(|| folder_divergence(folder))
 }
 
 /// The main repository's directory name from git's common dir. For the usual
@@ -3238,11 +3252,14 @@ struct AheadBehindEntry {
 /// thread (the walks are disk I/O). A computation that fails degrades to "no
 /// divergence" for that one worktree, which omits its row, rather than erroring.
 async fn ahead_behind_results(coordinator: &AheadBehindCoordinator, paths: Vec<PathBuf>) -> Value {
-    let divergences = futures::future::join_all(
-        paths
-            .iter()
-            .map(|path| coordinator.get_or_compute(path.clone(), |p| folder_divergence(&p))),
-    )
+    // One pool serves the whole batch (and any batch overlapping it), so the
+    // worktrees of one repo share a handle instead of each opening their own
+    // (#2121). It is released when the last of them finishes.
+    let pool = coordinator.pool();
+    let divergences = futures::future::join_all(paths.iter().map(|path| {
+        let pool = Arc::clone(&pool);
+        coordinator.get_or_compute(path.clone(), move |p| folder_divergence_shared(&pool, &p))
+    }))
     .await;
     let mut results = serde_json::Map::new();
     for (path, divergence) in paths.iter().zip(divergences) {
@@ -6902,6 +6919,344 @@ mod tests {
 
         assert_eq!(folder_divergence(dir.path()).ahead_behind, Some((1, 1)));
         assert_eq!(folder_divergence(dir.path()).main_behind, Some(3));
+    }
+
+    // --- One Repository per repo across a batch's worktrees (#2121) ----------
+
+    /// A repository with linked worktrees covering every HEAD and upstream shape
+    /// the `ahead-behind` op meets, so the shared path can be held to
+    /// [`folder_divergence`] on each.
+    ///
+    /// `main` is 1 ahead of / 1 behind its upstream `origin/main` (one commit past
+    /// the shared base locally, a different one remotely).
+    struct SharedCorpus {
+        _main_dir: tempfile::TempDir,
+        _wts_dir: tempfile::TempDir,
+        repo: Repository,
+        main: PathBuf,
+        wts: PathBuf,
+        tip: git2::Oid,
+        origin_main: git2::Oid,
+    }
+
+    impl SharedCorpus {
+        fn wt(&self, name: &str) -> PathBuf {
+            self.wts.join(name)
+        }
+
+        /// Points `branch` at `upstream_ref` the way `git branch -u` does.
+        fn track(&self, branch: &str, upstream_ref: &str) {
+            let mut cfg = self.repo.config().unwrap();
+            cfg.set_str(&format!("branch.{branch}.remote"), "origin")
+                .unwrap();
+            cfg.set_str(&format!("branch.{branch}.merge"), upstream_ref)
+                .unwrap();
+        }
+
+        /// Every folder the op might be asked about, with a name for failures.
+        fn cases(&self) -> Vec<(&'static str, PathBuf)> {
+            vec![
+                ("main checkout", self.main.clone()),
+                ("tracked", self.wt("tracked")),
+                (
+                    "tracked, from a subdirectory",
+                    self.wt("tracked").join("sub"),
+                ),
+                ("untracked", self.wt("untracked")),
+                ("on the default branch", self.wt("on-default")),
+                ("dangling upstream", self.wt("dangling")),
+                ("detached", self.wt("detached")),
+                ("unborn", self.wt("unborn")),
+                ("deleted directory", self.wt("deleted")),
+                ("never existed", self.wts.join("never-existed")),
+            ]
+        }
+    }
+
+    fn shared_corpus() -> SharedCorpus {
+        let main_dir = tempfile::tempdir().unwrap();
+        let wts_dir = tempfile::tempdir().unwrap();
+        let repo = diverging_repo(main_dir.path());
+        let tip = repo.refname_to_id("refs/heads/main").unwrap();
+        let origin_main = repo.refname_to_id("refs/remotes/origin/main").unwrap();
+        let base = repo.find_commit(tip).unwrap().parent_id(0).unwrap();
+        let corpus = SharedCorpus {
+            main: main_dir.path().to_path_buf(),
+            wts: wts_dir.path().to_path_buf(),
+            _main_dir: main_dir,
+            _wts_dir: wts_dir,
+            repo,
+            tip,
+            origin_main,
+        };
+
+        // Behind its own upstream by nothing, ahead of it by one commit.
+        add_worktree(&corpus.repo, tip, &corpus.wt("tracked"), "tracked");
+        corpus
+            .repo
+            .reference("refs/remotes/origin/tracked", base, true, "origin tracked")
+            .unwrap();
+        corpus.track("tracked", "refs/heads/tracked");
+        std::fs::create_dir(corpus.wt("tracked").join("sub")).unwrap();
+
+        // No upstream at all, but behind `origin/main`.
+        add_worktree(&corpus.repo, tip, &corpus.wt("untracked"), "untracked");
+
+        // Its upstream *is* the default branch, so `main_behind` stays silent.
+        add_worktree(&corpus.repo, base, &corpus.wt("on-default"), "on-default");
+        corpus.track("on-default", "refs/heads/main");
+
+        // An upstream configured but never fetched.
+        add_worktree(&corpus.repo, tip, &corpus.wt("dangling"), "dangling");
+        corpus.track("dangling", "refs/heads/gone");
+
+        add_worktree(&corpus.repo, tip, &corpus.wt("detached"), "detached");
+        Repository::open(corpus.wt("detached"))
+            .unwrap()
+            .set_head_detached(tip)
+            .unwrap();
+
+        add_worktree(&corpus.repo, tip, &corpus.wt("unborn"), "unborn");
+        Repository::open(corpus.wt("unborn"))
+            .unwrap()
+            .set_head("refs/heads/not-yet")
+            .unwrap();
+
+        // Registered with the main repo, but its directory is gone.
+        add_worktree(&corpus.repo, tip, &corpus.wt("deleted"), "deleted");
+        std::fs::remove_dir_all(corpus.wt("deleted")).unwrap();
+        corpus
+    }
+
+    /// The core guarantee: for every shape of worktree, reading it through a
+    /// handle at the common dir gives exactly what a `Repository` rooted at the
+    /// worktree gives. Absolute values are pinned too, so the two cannot agree by
+    /// both being wrong.
+    #[test]
+    fn shared_path_matches_the_discover_path_for_every_worktree_shape() {
+        let corpus = shared_corpus();
+        let pool = shared_repo::RepoPool::new(4);
+
+        for (case, path) in corpus.cases() {
+            assert_eq!(
+                shared_repo::divergence(&pool, &path),
+                Some(folder_divergence(&path)),
+                "{case}"
+            );
+        }
+
+        let expect = |name: &str, ahead_behind, main_behind| {
+            assert_eq!(
+                folder_divergence_shared(&pool, &corpus.wt(name)),
+                Divergence {
+                    ahead_behind,
+                    main_behind
+                },
+                "{name}"
+            );
+        };
+        expect("tracked", Some((1, 0)), Some(1));
+        expect("untracked", None, Some(1));
+        expect("on-default", Some((0, 1)), None);
+        expect("dangling", None, Some(1));
+        for silent in ["detached", "unborn", "deleted"] {
+            expect(silent, None, None);
+        }
+        // The main checkout and a subdirectory resolve like their own roots.
+        assert_eq!(
+            folder_divergence_shared(&pool, &corpus.main),
+            Divergence {
+                ahead_behind: Some((1, 1)),
+                main_behind: None
+            }
+        );
+        assert_eq!(
+            folder_divergence_shared(&pool, &corpus.wt("tracked").join("sub")),
+            folder_divergence_shared(&pool, &corpus.wt("tracked"))
+        );
+        // Every worktree of the repo, and the main checkout, shared one handle.
+        assert_eq!(pool.opens(), 1);
+    }
+
+    /// A bare main repository has no working tree of its own, but its linked
+    /// worktrees are read through it the same way.
+    #[test]
+    fn shared_path_serves_the_worktrees_of_a_bare_repository() {
+        let bare_dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(bare_dir.path()).unwrap();
+        let a = empty_commit(&repo, Some("refs/heads/main"), &[], "A");
+        repo.set_head("refs/heads/main").unwrap();
+        let a_commit = repo.find_commit(a).unwrap();
+        let c = empty_commit(&repo, None, &[&a_commit], "C");
+        repo.reference("refs/remotes/origin/main", c, true, "origin main")
+            .unwrap();
+        drop(a_commit);
+        let wts = tempfile::tempdir().unwrap();
+        let wt = wts.path().join("feature");
+        add_worktree(&repo, a, &wt, "feature");
+
+        let pool = shared_repo::RepoPool::new(4);
+        for path in [wt.as_path(), bare_dir.path()] {
+            assert_eq!(
+                shared_repo::divergence(&pool, path),
+                Some(folder_divergence(path)),
+                "{}",
+                path.display()
+            );
+        }
+        // Behind `origin/main` by its one commit, from the worktree and the bare
+        // repo alike (both are on `main`'s history with no upstream of their own).
+        assert_eq!(folder_divergence_shared(&pool, &wt).main_behind, Some(1));
+        assert_eq!(pool.opens(), 1);
+    }
+
+    /// With `extensions.worktreeConfig` a worktree's own `config.worktree` can
+    /// override its branch's upstream. libgit2 honours that on the discover path
+    /// and a handle at the common dir cannot see it, so the shared path must step
+    /// aside rather than answer from the wrong config.
+    #[test]
+    fn shared_path_defers_to_discover_when_config_is_per_worktree() {
+        let corpus = shared_corpus();
+        let wt = corpus.wt("tracked");
+        corpus
+            .repo
+            .config()
+            .unwrap()
+            .set_bool("extensions.worktreeConfig", true)
+            .unwrap();
+        std::fs::write(
+            corpus.repo.path().join("worktrees/tracked/config.worktree"),
+            "[branch \"tracked\"]\n\tmerge = refs/heads/elsewhere\n",
+        )
+        .unwrap();
+        // The override really changes the answer, so this test is not vacuous.
+        assert_eq!(folder_divergence(&wt).ahead_behind, None);
+
+        let pool = shared_repo::RepoPool::new(4);
+        assert_eq!(shared_repo::divergence(&pool, &wt), None);
+        assert_eq!(folder_divergence_shared(&pool, &wt), folder_divergence(&wt));
+    }
+
+    /// A handle reused across computations must still see the repository as it is
+    /// now: refs, the branch itself, and config can all change between two uses of
+    /// one pooled handle, and the answer must follow.
+    #[test]
+    fn a_pooled_handle_sees_changes_made_between_uses() {
+        let corpus = shared_corpus();
+        let wt = corpus.wt("tracked");
+        let pool = shared_repo::RepoPool::new(4);
+        let ahead_behind = || shared_repo::divergence(&pool, &wt).unwrap().ahead_behind;
+        assert_eq!(ahead_behind(), Some((1, 0)));
+        let opens = pool.opens();
+
+        // A fetch moves the remote-tracking ref.
+        corpus
+            .repo
+            .reference(
+                "refs/remotes/origin/tracked",
+                corpus.origin_main,
+                true,
+                "fetch",
+            )
+            .unwrap();
+        assert_eq!(ahead_behind(), Some((1, 1)));
+
+        // A commit moves the branch.
+        let tip = corpus.repo.find_commit(corpus.tip).unwrap();
+        empty_commit(&corpus.repo, Some("refs/heads/tracked"), &[&tip], "D");
+        assert_eq!(ahead_behind(), Some((2, 1)));
+
+        // A config edit re-points the upstream.
+        corpus.track("tracked", "refs/heads/elsewhere");
+        assert_eq!(ahead_behind(), None);
+
+        assert_eq!(pool.opens(), opens, "every answer came from one handle");
+        assert_eq!(
+            shared_repo::divergence(&pool, &wt),
+            Some(folder_divergence(&wt))
+        );
+    }
+
+    /// The acceptance criterion: a batch over many linked worktrees of one repo
+    /// opens that repo once per concurrent computation, not once per worktree.
+    #[tokio::test]
+    async fn a_batch_of_linked_worktrees_opens_their_repo_once_per_concurrent_computation() {
+        let main_dir = tempfile::tempdir().unwrap();
+        let wts_dir = tempfile::tempdir().unwrap();
+        let repo = diverging_repo(main_dir.path());
+        let tip = repo.refname_to_id("refs/heads/main").unwrap();
+        let paths: Vec<PathBuf> = (0..8)
+            .map(|i| {
+                let name = format!("w{i}");
+                let path = wts_dir.path().join(&name);
+                add_worktree(&repo, tip, &path, &name);
+                let mut cfg = repo.config().unwrap();
+                cfg.set_str(&format!("branch.{name}.remote"), "origin")
+                    .unwrap();
+                cfg.set_str(&format!("branch.{name}.merge"), "refs/heads/main")
+                    .unwrap();
+                path
+            })
+            .collect();
+
+        for (limit, most_opens) in [(1, 1), (4, 4)] {
+            let coordinator = AheadBehindCoordinator::with_concurrency(limit);
+            // Holding the pool lets the test read its counter; the batch joins it.
+            let pool = coordinator.pool();
+            let reply = ahead_behind_results(&coordinator, paths.clone()).await;
+
+            assert!(
+                (1..=most_opens).contains(&pool.opens()),
+                "{} opens for 8 worktrees at concurrency {limit}",
+                pool.opens()
+            );
+            for path in &paths {
+                let entry = reply.get(path.display().to_string()).unwrap();
+                assert_eq!(entry.get("ahead").and_then(Value::as_u64), Some(1));
+                assert_eq!(entry.get("behind").and_then(Value::as_u64), Some(1));
+            }
+            // With the batch done and the test's hold dropped, nothing is kept.
+            let weak = Arc::downgrade(&pool);
+            drop(pool);
+            assert!(weak.upgrade().is_none());
+        }
+    }
+
+    /// End to end through the op: one reply names every worktree of the repo the
+    /// way the discover path would, and omits those it has nothing to say about.
+    #[tokio::test]
+    async fn ahead_behind_op_answers_every_worktree_shape_of_one_repo() {
+        let corpus = shared_corpus();
+        let svc = WorktreesService::new();
+        let paths: Vec<String> = corpus
+            .cases()
+            .iter()
+            .map(|(_, path)| path.display().to_string())
+            .collect();
+
+        let reply = svc
+            .handle("ahead-behind", json!({ "paths": paths }))
+            .await
+            .unwrap();
+        let results = reply.get("results").unwrap();
+
+        let numbers = |name: &str| {
+            let entry = results.get(corpus.wt(name).display().to_string())?;
+            let field = |key| entry.get(key).and_then(Value::as_u64);
+            Some((field("ahead"), field("behind"), field("main_behind")))
+        };
+        assert_eq!(numbers("tracked"), Some((Some(1), Some(0), Some(1))));
+        assert_eq!(numbers("untracked"), Some((None, None, Some(1))));
+        assert_eq!(numbers("on-default"), Some((Some(0), Some(1), None)));
+        assert_eq!(numbers("dangling"), Some((None, None, Some(1))));
+        for omitted in ["detached", "unborn", "deleted", "never-existed"] {
+            assert_eq!(numbers(omitted), None, "{omitted}");
+        }
+        let main = results
+            .get(corpus.main.display().to_string())
+            .and_then(|entry| entry.get("ahead"))
+            .and_then(Value::as_u64);
+        assert_eq!(main, Some(1));
     }
 
     #[tokio::test]
