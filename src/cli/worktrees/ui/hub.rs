@@ -455,6 +455,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn on_tree_changed_does_not_re_ask_an_expected_but_omitted_row_on_every_frame() {
+        // #2143: the snapshot says this branch has an upstream, so a reply that omits
+        // its row is a failed computation, not an answer — blank, but not settled. And
+        // it must not be asked again by every identical frame that follows: a worktree
+        // whose computation fails persistently would cost one daemon call per frame.
+        let (_dir, sock, _server) = fake_daemon_replies(vec![json!({
+            "ok": true, "payload": { "results": {} }
+        })]);
+        let (mut hub, tree_tx) = test_hub_on(sock);
+        let path = PathBuf::from("/repo/wt");
+        let send = |head: &str| {
+            let mut wt = worktree("/repo/wt", Some(head));
+            wt.branch = Some("main".to_string());
+            wt.upstream_sha = Some("bbb".to_string());
+            tree_tx.send(FeedFrame::Live(snapshot(wt))).unwrap();
+        };
+
+        send("aaa");
+        hub.on_tree_changed();
+        settle(&mut hub).await;
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Unknown);
+
+        for _ in 0..3 {
+            send("aaa");
+            hub.on_tree_changed();
+            assert!(!hub.ahead_behind.is_pending(&path), "re-asked on a frame");
+            assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Unknown);
+        }
+
+        // A commit is a new situation, not a retry: it is asked at once.
+        send("ccc");
+        hub.on_tree_changed();
+        assert!(hub.ahead_behind.is_pending(&path));
+    }
+
+    #[tokio::test]
+    async fn on_tree_changed_settles_an_omitted_row_when_the_snapshot_expected_nothing() {
+        // The #2134 criterion, kept: a branch with no upstream in a repo with no
+        // default branch has nothing to compute, so an omitted row is the answer and
+        // is not asked about again on later frames.
+        let (_dir, sock, _server) = fake_daemon_replies(vec![json!({
+            "ok": true, "payload": { "results": {} }
+        })]);
+        let (mut hub, tree_tx) = test_hub_on(sock);
+        let path = PathBuf::from("/repo/wt");
+        let send = || {
+            let mut wt = worktree("/repo/wt", Some("aaa"));
+            wt.branch = Some("topic".to_string());
+            tree_tx.send(FeedFrame::Live(snapshot(wt))).unwrap();
+        };
+
+        send();
+        hub.on_tree_changed();
+        settle(&mut hub).await;
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Unavailable);
+
+        send();
+        hub.on_tree_changed();
+        assert!(!hub.ahead_behind.is_pending(&path));
+        assert_eq!(hub.ahead_behind.get(&path), AheadBehindState::Unavailable);
+    }
+
+    #[tokio::test]
     async fn on_tree_changed_re_asks_a_failed_fetch_on_the_next_frame_without_a_ref_moving() {
         // A fetch that failed is not an answer (#2134): the row has to be asked
         // again by the tree feed's next frame, with every OID unchanged, rather
