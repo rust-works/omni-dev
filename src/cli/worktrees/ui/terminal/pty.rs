@@ -308,12 +308,14 @@ mod reap_tests {
         // `SIG_DFL` is a valid disposition for `SIGHUP`.
         #[allow(unsafe_code)]
         unsafe {
+            // omni-dev: coverage ignore reason="the closure runs only in the forked child between fork and exec, and exec discards that process's coverage counters before they can be flushed, so llvm-cov reports 0 hits on these lines however often the tests run it (CI measured the whole body uncovered on PR #2169); the reset is checked by behaviour instead, in the_well_behaved_test_passes_when_the_test_process_ignores_sighup"
             command.pre_exec(|| {
                 if nix::libc::signal(nix::libc::SIGHUP, nix::libc::SIG_DFL) == nix::libc::SIG_ERR {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
+            // omni-dev: coverage end
         }
         let child = command.spawn().unwrap();
         // Let the shell install any trap before it is signalled.
