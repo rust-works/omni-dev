@@ -279,14 +279,20 @@ mod reap_tests {
     /// `process_group(0)` mirrors the `setsid()` a real PTY spawn does, so
     /// the group-wide signal under test is the one production sends.
     ///
-    /// The `pre_exec` mirrors the other half of that spawn (#2164):
-    /// `alacritty_terminal` resets `SIGHUP` to its default in the child
-    /// before `exec`, so a PTY child takes the signal even when omni-dev
-    /// itself was started under `nohup`. An ignored disposition is inherited
-    /// across `exec`, so without the reset a test process launched that way
-    /// hands its child an ignored `SIGHUP`, and only the escalation's
-    /// `SIGKILL` can end it. The child's shell cannot undo that: a signal
-    /// ignored on entry to a non-interactive shell cannot be reset by `trap`.
+    /// The `pre_exec` mirrors the part of that spawn these tests depend on
+    /// (#2164). `alacritty_terminal` resets `SIGHUP` to its default in the
+    /// child before `exec` (along with `SIGCHLD`, `SIGINT`, `SIGQUIT`,
+    /// `SIGTERM` and `SIGALRM`), so a PTY child takes the signal even when
+    /// omni-dev itself was started under `nohup`. An ignored disposition is
+    /// inherited across `exec`, so without the reset a test process launched
+    /// that way hands its child an ignored `SIGHUP`, and only the
+    /// escalation's `SIGKILL` can end it. The child's shell cannot undo that:
+    /// a signal ignored on entry to a non-interactive shell cannot be reset
+    /// by `trap`.
+    ///
+    /// Only `SIGHUP` is reset because it is the only signal these tests send.
+    /// A test that sends another one needs it reset the same way, or its
+    /// outcome depends on how the test process was launched.
     fn group_leader(script: &str) -> std::process::Child {
         let mut command = Command::new("/bin/sh");
         command
@@ -357,12 +363,13 @@ mod reap_tests {
     /// `kill(pid, 0)` on Linux, so polling the group burned the whole grace
     /// period and escalated even here.
     ///
-    /// Timing is not what can make this fail: a sleeping child takes
-    /// `SIGHUP` in a few milliseconds even on a heavily loaded machine, a
-    /// fraction of [`REAP_GRACE`]. What can is the child's inherited
-    /// `SIGHUP` disposition, which `group_leader` pins (#2164) and
+    /// It does need the child to take `SIGHUP` inside [`REAP_GRACE`]. A
+    /// sleeping child did so in a few milliseconds when #2164 measured it at
+    /// a load average of 150, a small fraction of the grace, but that is a
+    /// measurement and not a bound. What failed in #2164 was the child's
+    /// inherited `SIGHUP` disposition, which `group_leader` now pins and
     /// [`the_well_behaved_test_passes_when_the_test_process_ignores_sighup`]
-    /// guards.
+    /// guards. A `Some(9)` here is therefore worth checking against both.
     #[test]
     fn a_well_behaved_child_dies_of_sighup_and_is_never_escalated() {
         let mut child = group_leader("sleep 60");
@@ -407,7 +414,9 @@ mod reap_tests {
         // when `--exact` matches no test, which would pass vacuously.
         assert!(
             output.status.success() && report.contains("1 passed"),
-            "the test failed when its process started with SIGHUP ignored:\n{report}"
+            "the inner run did not report `1 passed`: either the test failed \
+             when its process started with SIGHUP ignored, or its name no \
+             longer matches this one:\n{report}"
         );
     }
 
