@@ -733,3 +733,67 @@ pub(crate) mod git_repo {
         dir
     }
 }
+
+pub(crate) mod shallow_repo {
+    //! Repositories shaped like a `--depth` clone, for tests of code that must walk
+    //! history through the shallow cut (#2147, #2163).
+    //!
+    //! `git2` can write the pieces a shallow clone consists of — the `shallow`
+    //! marker and a missing parent — so these need no `git` binary and no network.
+    use std::path::{Path, PathBuf};
+
+    use git2::{Oid, Repository};
+
+    /// base ← first ← second, written into a fresh repository at `dir`.
+    pub(crate) fn three_commits(dir: &Path) -> (Repository, Oid, Oid, Oid) {
+        let repo = Repository::init(dir).unwrap();
+        let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
+        let first = {
+            let parent = repo.find_commit(base).unwrap();
+            repo.commit(None, &sig, &sig, "one", &tree, &[&parent])
+                .unwrap()
+        };
+        let second = {
+            let parent = repo.find_commit(first).unwrap();
+            repo.commit(None, &sig, &sig, "two", &tree, &[&parent])
+                .unwrap()
+        };
+        drop(tree);
+        (repo, base, first, second)
+    }
+
+    /// A linked worktree of `repo` at `parent/name`, on a new branch at `base`.
+    pub(crate) fn add_linked_worktree(
+        repo: &Repository,
+        base: Oid,
+        parent: &Path,
+        name: &str,
+    ) -> PathBuf {
+        let path = parent.join(name);
+        repo.branch(name, &repo.find_commit(base).unwrap(), false)
+            .unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{name}")).unwrap();
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repo.worktree(name, &path, Some(&opts)).unwrap();
+        path
+    }
+
+    /// Marks `repo` shallow at `tip`, the way a `--depth` clone does: `tip` stays
+    /// and its parents are cut away. git keeps the marker in the common dir, which
+    /// every worktree of the repository shares.
+    pub(crate) fn mark_shallow(repo: &Repository, tip: Oid) {
+        std::fs::write(repo.commondir().join("shallow"), format!("{tip}\n")).unwrap();
+    }
+
+    /// Deletes a loose object, as a shallow clone never has the commits it cut.
+    pub(crate) fn forget_object(repo: &Repository, id: Oid) {
+        let hex = id.to_string();
+        let path = repo.path().join("objects").join(&hex[..2]).join(&hex[2..]);
+        std::fs::remove_file(path).unwrap();
+    }
+}

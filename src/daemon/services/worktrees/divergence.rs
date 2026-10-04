@@ -37,6 +37,7 @@ use git2::{Oid, Repository};
 use tokio::sync::{OnceCell, Semaphore};
 
 use super::shared_repo::RepoPool;
+use crate::git::shallow;
 
 /// How many worktrees may be walked at once. Enough to keep a multi-core machine
 /// busy, few enough that the walks cannot saturate the blocking pool or pin more
@@ -128,7 +129,8 @@ static WALKS: LazyLock<WalkMemo> = LazyLock::new(|| WalkMemo::with_capacity(WALK
 /// `None` when the walk fails (an id with no commit behind it); failures are not
 /// memoized, so a later call retries. A shallow repository is never memoized: its
 /// answer depends on how deep it currently is, which no id records. It is also
-/// walked through a handle that applies the cut (see [`walk_shallow`]).
+/// walked through a handle that applies the cut (see
+/// [`shallow::graph_ahead_behind`]).
 pub(super) fn graph_ahead_behind(
     repo: &Repository,
     local: Oid,
@@ -145,50 +147,11 @@ fn graph_ahead_behind_in(
     local: Oid,
     upstream: Oid,
 ) -> Option<(usize, usize)> {
-    if is_shallow(repo) {
-        return walk_shallow(repo, local, upstream);
+    if shallow::is_shallow(repo) {
+        return shallow::graph_ahead_behind(repo, local, upstream);
     }
     let key = (repo.commondir().to_path_buf(), local, upstream);
     memo.get_or_walk(key, || repo.graph_ahead_behind(local, upstream).ok())
-}
-
-/// Whether `repo` is shallow, as git sees it: its common dir holds a non-empty
-/// `shallow` file.
-///
-/// `Repository::is_shallow` is not that. libgit2 looks for the marker in the
-/// handle's own gitdir, which for a repository opened at a linked worktree is
-/// `<commondir>/worktrees/<name>`, while git keeps `shallow` in the common dir that
-/// every worktree shares. So that handle reports a shallow clone as complete
-/// (#2147). The two agree for a main checkout, whose gitdir is the common dir.
-/// The marker rule is libgit2's — a non-empty file — applied to the common dir.
-pub(super) fn is_shallow(repo: &Repository) -> bool {
-    repo.is_shallow()
-        || std::fs::metadata(repo.commondir().join("shallow"))
-            .is_ok_and(|marker| marker.is_file() && marker.len() > 0)
-}
-
-/// The counts for a shallow `repo`, which must be walked through a handle that
-/// applies the cut.
-///
-/// libgit2 reads the shallow grafts from the gitdir of the handle it opens, so a
-/// handle rooted at a linked worktree walks straight into the parents the clone
-/// does not have: it fails with "object not found", and the row would lose its
-/// counts (#2147). A handle opened at the common dir reads the marker, and so
-/// does what git does. A failed open is `None` — no counts — rather than counts
-/// from the uncut history, and is logged at `debug` (not `warn`: a shallow row is
-/// never cached by clients, so a persistent failure would repeat on every ask).
-fn walk_shallow(repo: &Repository, local: Oid, upstream: Oid) -> Option<(usize, usize)> {
-    if !repo.is_worktree() {
-        return repo.graph_ahead_behind(local, upstream).ok();
-    }
-    match Repository::open(repo.commondir()) {
-        Ok(common) => common.graph_ahead_behind(local, upstream).ok(),
-        Err(e) => {
-            let path = repo.commondir().display();
-            tracing::debug!("cannot open {path} to walk a shallow repository: {e}");
-            None
-        }
-    }
 }
 
 /// One computation for one worktree, shared by every request that joins it.
@@ -357,11 +320,11 @@ impl Drop for Forget<'_> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::test_support::shallow_repo::{add_linked_worktree, mark_shallow, three_commits};
 
     fn divergence(ahead: usize) -> Divergence {
         Divergence {
@@ -686,79 +649,6 @@ mod tests {
         assert_eq!(memo.len(), 0, "a shallow repository was memoized");
     }
 
-    /// A linked worktree of `repo` at `parent/name`, on a new branch at `base`.
-    fn add_linked_worktree(repo: &Repository, base: Oid, parent: &Path, name: &str) -> PathBuf {
-        let path = parent.join(name);
-        repo.branch(name, &repo.find_commit(base).unwrap(), false)
-            .unwrap();
-        let reference = repo.find_reference(&format!("refs/heads/{name}")).unwrap();
-        let mut opts = git2::WorktreeAddOptions::new();
-        opts.reference(Some(&reference));
-        repo.worktree(name, &path, Some(&opts)).unwrap();
-        path
-    }
-
-    /// Marks `repo` shallow at `tip`, the way a `--depth` clone does: `tip` stays
-    /// and its parents are cut away. git keeps the marker in the common dir, which
-    /// every worktree of the repository shares.
-    fn mark_shallow(repo: &Repository, tip: Oid) {
-        std::fs::write(repo.commondir().join("shallow"), format!("{tip}\n")).unwrap();
-    }
-
-    /// Deletes a loose object, as a shallow clone never has the commits it cut.
-    fn forget_object(repo: &Repository, id: Oid) {
-        let hex = id.to_string();
-        let path = repo.path().join("objects").join(&hex[..2]).join(&hex[2..]);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    /// git keeps the `shallow` marker in the common dir, which no linked worktree's
-    /// own gitdir contains, and libgit2 looks only in the handle's own gitdir. So
-    /// the handle a linked worktree is opened as must not decide shallowness.
-    #[test]
-    fn a_linked_worktree_of_a_shallow_repository_is_shallow() {
-        let dir = tempfile::tempdir().unwrap();
-        let wts = tempfile::tempdir().unwrap();
-        let (repo, base, first, _second) = three_commits(dir.path());
-        let linked =
-            Repository::open(add_linked_worktree(&repo, base, wts.path(), "feature")).unwrap();
-        assert!(!is_shallow(&repo) && !is_shallow(&linked));
-
-        mark_shallow(&repo, first);
-
-        assert!(is_shallow(&repo));
-        assert!(is_shallow(&linked));
-
-        // An empty marker is not shallow: libgit2's rule for a main checkout, which
-        // the common-dir check follows so the two cannot disagree. (git removes the
-        // file when it unshallows, so an empty one is not a state git leaves.)
-        std::fs::write(repo.commondir().join("shallow"), "").unwrap();
-        assert!(!is_shallow(&repo) && !is_shallow(&linked));
-    }
-
-    /// The premise of [`is_shallow`] and [`walk_shallow`], pinned the way
-    /// `shared_repo`'s `libgit2_reads_shallow_grafts_when_a_repository_is_opened`
-    /// pins its own: a handle opened at a linked worktree neither reports the common
-    /// dir's marker nor applies its cut, while one at the common dir does both. If
-    /// libgit2 starts looking in the common dir this fails, which means the
-    /// workaround has become unnecessary, not that it regressed.
-    #[test]
-    fn libgit2_ignores_the_common_dirs_shallow_marker_from_a_linked_worktree() {
-        let dir = tempfile::tempdir().unwrap();
-        let wts = tempfile::tempdir().unwrap();
-        let (repo, base, first, second) = three_commits(dir.path());
-        let path = add_linked_worktree(&repo, base, wts.path(), "feature");
-        mark_shallow(&repo, first);
-        forget_object(&repo, base);
-        let linked = Repository::open(path).unwrap();
-        let common = Repository::open(repo.commondir()).unwrap();
-
-        assert!(!linked.is_shallow());
-        assert!(linked.graph_ahead_behind(second, first).is_err());
-        assert!(common.is_shallow());
-        assert_eq!(common.graph_ahead_behind(second, first).unwrap(), (1, 0));
-    }
-
     #[test]
     fn a_linked_worktree_of_a_shallow_repository_bypasses_the_memo() {
         let memo = WalkMemo::with_capacity(8);
@@ -771,104 +661,6 @@ mod tests {
 
         assert!(graph_ahead_behind_in(&memo, &linked, second, first).is_some());
         assert_eq!(memo.len(), 0, "a shallow repository was memoized");
-    }
-
-    /// The walk must see the cut, which only a handle opened at the common dir does:
-    /// with `first` shallow it is a root, so `base` is behind it rather than
-    /// reachable from it.
-    #[test]
-    fn a_linked_worktree_of_a_shallow_repository_is_walked_with_the_cut_applied() {
-        let memo = WalkMemo::with_capacity(8);
-        let dir = tempfile::tempdir().unwrap();
-        let wts = tempfile::tempdir().unwrap();
-        let (repo, base, first, _second) = three_commits(dir.path());
-        let linked =
-            Repository::open(add_linked_worktree(&repo, base, wts.path(), "feature")).unwrap();
-        mark_shallow(&repo, first);
-
-        let complete = Repository::open(repo.commondir()).unwrap();
-        assert!(complete.is_shallow());
-        assert_eq!(complete.graph_ahead_behind(first, base).unwrap(), (1, 1));
-        assert_eq!(
-            graph_ahead_behind_in(&memo, &linked, first, base),
-            Some((1, 1))
-        );
-    }
-
-    /// What a real `--depth` clone does to a linked worktree: the commits behind the
-    /// cut are not in the object database, so a walk that does not apply the cut
-    /// fails on the missing parent and the row would lose its counts.
-    #[test]
-    fn a_linked_worktree_of_a_shallow_clone_still_gets_counts_without_the_cut_commits() {
-        let memo = WalkMemo::with_capacity(8);
-        let dir = tempfile::tempdir().unwrap();
-        let wts = tempfile::tempdir().unwrap();
-        let (repo, base, first, second) = three_commits(dir.path());
-        let path = add_linked_worktree(&repo, base, wts.path(), "feature");
-        mark_shallow(&repo, first);
-        forget_object(&repo, base);
-        let linked = Repository::open(path).unwrap();
-
-        assert_eq!(
-            graph_ahead_behind_in(&memo, &linked, second, first),
-            Some((1, 0))
-        );
-    }
-
-    /// A common dir that will not open leaves the row without counts, not with
-    /// counts from a handle that ignores the cut, and says why at `debug`. The
-    /// message is matched whole, since libgit2's own error text can name the path
-    /// too and would satisfy a bare `contains(path)`.
-    #[test]
-    fn a_common_dir_that_will_not_open_leaves_a_shallow_worktree_without_counts() {
-        let memo = WalkMemo::with_capacity(8);
-        let dir = tempfile::tempdir().unwrap();
-        let wts = tempfile::tempdir().unwrap();
-        let (repo, base, first, second) = three_commits(dir.path());
-        let linked =
-            Repository::open(add_linked_worktree(&repo, base, wts.path(), "feature")).unwrap();
-        mark_shallow(&repo, first);
-        // Without `HEAD` the directory is no longer a repository to libgit2.
-        std::fs::remove_file(repo.commondir().join("HEAD")).unwrap();
-        assert!(Repository::open(repo.commondir()).is_err());
-
-        let mut counts = Some((0, 0));
-        let logs = crate::test_support::capture_at(tracing::Level::DEBUG, || {
-            counts = graph_ahead_behind_in(&memo, &linked, second, first);
-        });
-
-        assert_eq!(counts, None);
-        assert_eq!(memo.len(), 0);
-        let logged = format!(
-            "cannot open {} to walk a shallow repository",
-            repo.commondir().display()
-        );
-        assert!(
-            logs.contains(&logged),
-            "the failed open was not logged with its path: {logs}"
-        );
-    }
-
-    /// base ← first ← second, written into a fresh repository at `dir`.
-    fn three_commits(dir: &std::path::Path) -> (Repository, Oid, Oid, Oid) {
-        let repo = Repository::init(dir).unwrap();
-        let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
-        let tree = repo
-            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
-            .unwrap();
-        let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
-        let first = {
-            let parent = repo.find_commit(base).unwrap();
-            repo.commit(None, &sig, &sig, "one", &tree, &[&parent])
-                .unwrap()
-        };
-        let second = {
-            let parent = repo.find_commit(first).unwrap();
-            repo.commit(None, &sig, &sig, "two", &tree, &[&parent])
-                .unwrap()
-        };
-        drop(tree);
-        (repo, base, first, second)
     }
 
     /// Overlapping requests must share one pool, or the handle cap would be per

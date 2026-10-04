@@ -2642,7 +2642,7 @@ fn upstream_target(branch: &git2::Branch<'_>) -> Option<String> {
 /// repository (#2121). Everything below reads refs and config that every worktree
 /// of a repository shares, so `repo` need not be rooted at the worktree.
 fn head_divergence(repo: &Repository, head: Option<git2::Reference<'_>>) -> Divergence {
-    let shallow = divergence::is_shallow(repo);
+    let shallow = crate::git::shallow::is_shallow(repo);
     let Some(head) = head.filter(git2::Reference::is_branch) else {
         return Divergence {
             shallow,
