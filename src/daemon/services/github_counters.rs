@@ -21,8 +21,10 @@
 //! grown (it is unbounded unless rotation or `prune` is opted into). The service
 //! keeps a running [`IncrementalCounts`] from the moment it starts, so each
 //! summary reads only the records appended since the previous one, never the
-//! log's history (#2132). A log that is replaced or truncated underneath it
-//! (`prune`, rotation) is rescanned once, from its first byte.
+//! log's history (#2132). A size-capped rotation is followed through the
+//! numbered files, so the tally keeps its counts (#2162); a log that is pruned,
+//! truncated or rewritten underneath it, or whose file was rotated out of
+//! retention, is rescanned once, from its first byte.
 //!
 //! Shutdown never waits on a scan beyond `SHUTDOWN_SCAN_BUDGET`. A blocking
 //! thread cannot be cancelled from outside, and the runtime waits for one before
@@ -52,7 +54,8 @@ const STARTUP_DELAY: Duration = Duration::from_secs(5);
 const PERIODIC_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// The longest the final summary may spend reading the log. Normally it reads a
 /// few minutes of records and finishes in milliseconds; this only bites when the
-/// log was replaced and has to be rescanned.
+/// log was replaced and has to be rescanned, or rotated and the rotated files have
+/// to be read.
 const SHUTDOWN_SCAN_BUDGET: Duration = Duration::from_secs(2);
 
 /// The running tally, shared by the logger task, `status`, `summary` and
