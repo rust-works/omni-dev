@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-04
+
 ### Fixed
 - **Windows stop re-asking the daemon for sync counts that cannot have changed** ([#2120](https://github.com/rust-works/omni-dev/issues/2120)): the Worktrees view re-fetched `↑ahead ↓behind` and `⇊N` for every worktree of every expanded repo on *every* refresh, and a refresh happens on every snapshot change — a CI verdict landing, a session going idle, a colour edit, another window opening a worktree — none of which can move a count. Each window now remembers a worktree's answer for as long as nothing it is computed from has moved (its branch, its commit, its upstream's commit, and the repository's default-branch tip) and re-asks only the worktrees that did, in one batch. A commit, push, rebase, branch switch or fetch still updates the affected row on the next refresh. Nothing is cached on a timer, a failed request is never cached (nor an empty answer for a worktree that has an upstream, which the daemon sends when a computation fails), and a shallow clone is never cached (deepening it changes the counts without changing a commit id — a daemon that predates the `shallow` marker cannot say, so against one a shallow clone is cached like any other).
   - **`⇊N` now also refreshes after a fetch that moves only `origin/main`**, which was invisible before: that fetch changes none of a worktree's own refs, so the daemon had nothing to push and the count stayed stale until something unrelated refreshed the view. This needs the matching daemon change (the repo's `main_sha`); against an older daemon rows showing `⇊N` simply keep being re-asked on every refresh, as before.
