@@ -470,9 +470,9 @@ Registry rules the design must add:
    report`, the registry marker, `install-mod`/`uninstall-mod`, the ADR, the docs and a
    `plugin validate` CI check.
 2. **#2152**: `claude-wrap` observes nothing under a PTY, so `worktrees ui` Claude tabs are
-   not an authoritative feed. This change adds a caveat to CLAUDE.md and the sessions guide;
-   ADR-0072 and the two code comments (`worktrees/ui/mod.rs`, `terminal/mod.rs`) still
-   say otherwise and are left to #2152, since an ADR amendment and a code edit are outside
-   a docs-only spike.
+   not an authoritative feed. This change added a caveat to CLAUDE.md and the sessions guide;
+   ADR-0072 and the two code comments (`worktrees/ui/mod.rs`, `terminal/mod.rs`) said
+   otherwise and were left to #2152, since an ADR amendment and a code edit are outside
+   a docs-only spike. #2152 has since corrected them.
 3. **#2153**: `claude-wrap` reports a stale `working` after an SDK `set_model`. Fixed
    since: a `user` line the CLI writes is never read as work.
