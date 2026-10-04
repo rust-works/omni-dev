@@ -324,7 +324,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::test_support::shallow_repo::{add_linked_worktree, mark_shallow, three_commits};
+    use crate::test_support::shallow_repo::{
+        add_linked_worktree, forget_object, mark_shallow, three_commits,
+    };
 
     fn divergence(ahead: usize) -> Divergence {
         Divergence {
@@ -660,6 +662,29 @@ mod tests {
         mark_shallow(&repo, first);
 
         assert!(graph_ahead_behind_in(&memo, &linked, second, first).is_some());
+        assert_eq!(memo.len(), 0, "a shallow repository was memoized");
+    }
+
+    /// What a real `--depth` clone does to a linked worktree, through the memoized
+    /// entry point the daemon uses: the commits behind the cut are missing from the
+    /// object database, so a walk that does not apply the cut fails on the missing
+    /// parent and the row would lose its counts (#2147). The cut applies whatever
+    /// the memo does, and nothing is memoized for a shallow repository.
+    #[test]
+    fn a_linked_worktree_of_a_shallow_clone_keeps_its_counts_through_the_memo_path() {
+        let memo = WalkMemo::with_capacity(8);
+        let dir = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        let (repo, base, first, second) = three_commits(dir.path());
+        let path = add_linked_worktree(&repo, base, wts.path(), "feature");
+        mark_shallow(&repo, first);
+        forget_object(&repo, base);
+        let linked = Repository::open(path).unwrap();
+
+        assert_eq!(
+            graph_ahead_behind_in(&memo, &linked, second, first),
+            Some((1, 0))
+        );
         assert_eq!(memo.len(), 0, "a shallow repository was memoized");
     }
 

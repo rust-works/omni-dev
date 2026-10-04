@@ -1582,11 +1582,13 @@ impl WorktreesService {
     ///   [`worktree_push::plan`], which classifies every selected worktree against
     ///   its upstream. This *is* the "does this make sense?" gate: it skips a
     ///   detached HEAD (which also covers a worktree mid-rebase), a non-worktree
-    ///   path, a branch with nowhere to publish, and a force-push of the
-    ///   repository's remote default branch — while a dirty tree is deliberately
-    ///   **not** a skip, since a push publishes commits rather than the working
-    ///   tree. Unlike `rebase`'s phase 1 this is not merely side-effect-*light*: it
-    ///   contacts no remote at all (ADR-0061).
+    ///   path, a branch with nowhere to publish, a branch whose history cannot be
+    ///   read to compare it with its upstream (never reported as up to date,
+    ///   #2163), and a force-push of the repository's remote default branch —
+    ///   while a dirty tree is deliberately **not** a skip, since a push
+    ///   publishes commits rather than the working tree. Unlike `rebase`'s phase 1
+    ///   this is not merely side-effect-*light*: it contacts no remote at all
+    ///   (ADR-0061).
     /// - **Phase 2** (`confirmed:true`) — **re-plan from scratch**, then execute. A
     ///   phase-1 result the client sends back is never trusted, as `close`,
     ///   `merge-queue` and `rebase` all re-validate. A branch that moved between

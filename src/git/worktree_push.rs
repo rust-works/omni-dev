@@ -183,7 +183,8 @@ pub enum PushResult {
         #[serde(skip_serializing_if = "is_false")]
         stale: bool,
     },
-    /// Skipped without contacting the remote, for a structural reason.
+    /// Skipped without contacting the remote: for a structural reason, or because
+    /// the branch's history could not be read to compare it with its upstream.
     Skipped {
         /// Why it was skipped.
         reason: SkipReason,
@@ -1102,22 +1103,9 @@ mod tests {
         scenario.git_in(&scenario.local, &["push", "origin", "main"]);
         git_at(&clone, &["fetch", "--depth", "1", "origin"]);
 
-        let counts = run_git_in(
-            &resolve_git_binary(),
-            &wt,
-            &[
-                "rev-list",
-                "--left-right",
-                "--count",
-                "feature...origin/main",
-            ],
-        )
-        .unwrap();
         assert_eq!(
-            String::from_utf8_lossy(&counts.stdout)
-                .split_whitespace()
-                .collect::<Vec<_>>(),
-            ["2", "1"],
+            scenario.git_counts(&wt, "feature...origin/main"),
+            (2, 1),
             "git's own count for the fixture"
         );
         // Diverged, on the remote default branch: refused rather than forced — and,
@@ -1127,6 +1115,60 @@ mod tests {
             PushResult::Skipped {
                 reason: SkipReason::DefaultBranchForcePush
             }
+        );
+    }
+
+    /// The counts themselves, not just the verdict: on a branch that is not the
+    /// default one the diverged row is `WouldForce { ahead, behind }`, so the
+    /// classifier's numbers can be held to git's own over a real `--depth 1` clone
+    /// (the test above ends in the default-branch gate, which hides them).
+    #[test]
+    fn a_linked_worktree_of_a_real_depth_clone_counts_what_git_counts() {
+        let _guard = serial();
+        let scenario = Scenario::new();
+        scenario.git_in(&scenario.local, &["checkout", "-b", "topic"]);
+        scenario.commit_in(&scenario.local, "file.txt", "t1\n", "t1");
+        scenario.commit_in(&scenario.local, "file.txt", "t2\n", "t2");
+        scenario.git_in(&scenario.local, &["push", "-u", "origin", "topic"]);
+
+        let url = format!("file://{}", scenario.origin.display());
+        git_at(
+            scenario.root.path(),
+            &["clone", "--depth", "1", "--no-single-branch", &url, "clone"],
+        );
+        let clone = scenario.root.path().join("clone");
+        config_repo(&clone, "Test", "test@example.com");
+        let wt = scenario.root.path().join("topic-wt");
+        git_at(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "topic",
+                wt.to_str().unwrap(),
+                "origin/topic",
+            ],
+        );
+        git_at(&wt, &["branch", "--set-upstream-to=origin/topic"]);
+        scenario.commit_in(&wt, "local.txt", "local\n", "local");
+        let wt = std::fs::canonicalize(&wt).unwrap();
+
+        // `origin/topic` moves and the clone follows it at depth 1, which cuts the
+        // history the worktree's branch was built on.
+        scenario.commit_in(&scenario.local, "file.txt", "t3\n", "t3");
+        scenario.git_in(&scenario.local, &["push", "origin", "topic"]);
+        git_at(&clone, &["fetch", "--depth", "1", "origin"]);
+
+        let (ahead, behind) = scenario.git_counts(&wt, "topic...origin/topic");
+        assert!(
+            ahead > 0 && behind > 0,
+            "the fixture must diverge: {ahead} ahead, {behind} behind"
+        );
+        assert_eq!(
+            classify(&wt).result,
+            PushResult::WouldForce { ahead, behind },
+            "the classifier must count the cut history exactly as git does"
         );
     }
 
@@ -1590,6 +1632,19 @@ mod tests {
             let parent = repo.find_commit(tip).unwrap().parent_id(0).unwrap();
             mark_shallow(&repo, tip);
             forget_object(&repo, parent);
+        }
+
+        /// git's own `(left, right)` count for `range` (`a...b`), run in `wt`.
+        fn git_counts(&self, wt: &Path, range: &str) -> (usize, usize) {
+            let output = run_git_in(
+                &resolve_git_binary(),
+                wt,
+                &["rev-list", "--left-right", "--count", range],
+            )
+            .unwrap();
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut fields = text.split_whitespace().map(|n| n.parse::<usize>().unwrap());
+            (fields.next().unwrap(), fields.next().unwrap())
         }
 
         /// A worktree's current HEAD commit.
