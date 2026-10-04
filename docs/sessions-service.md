@@ -950,12 +950,12 @@ a terminal session — with no window to focus — is a plain status line.
 ## Status
 
 `omni-dev daemon status` includes a `sessions` row with a one-line summary
-(`N session(s): X working, Y waiting, Z idle`) and, under `--json`, the full live
+(`N session(s): X working, Y waiting, Z idle`) and, under `-o json`, the full live
 set.
 
 Once the daemon has applied an event, the summary ends with how events have
-reached it since it started (#2136), and `--json` carries the same numbers under
-`delivery`:
+reached it since it started (#2136), and `-o json` carries the same numbers as
+`delivery` in the sessions service's `detail`:
 
 ```
 24 session(s): 11 working, 0 waiting, 13 idle · events: 5120 via socket, 0 recovered from journals, 0 superseded, 3 replayed
@@ -997,10 +997,12 @@ even when the state machine then ignores it (a late event for an ended session, 
 one a newer event overtook). The one exception is an event found by the startup
 replay: a replay is not a recovery, so a stale one is counted as nothing.
 
-The counters are monotonic since the daemon started and are not persisted. They
-cannot see a hook that never wrote a journal (a non-UUID id, a daemon-less
-install), and a duplicate whose first copy has left a session's last 32 events is
-not recognised as one.
+The counters are in memory and start from zero with each daemon; they are not
+persisted. They only grow, except that `recovered` and `superseded` give one back
+when a late POST shows an event was not dropped after all, so either can dip by
+one. They cannot see a hook that never wrote a journal (a non-UUID id, a
+daemon-less install), and a duplicate whose first copy has left a session's last
+32 events is not recognised as one.
 
 `log.jsonl` can show only the timeouts: every `sessions hook` run is logged with
 its `duration_ms`, so one at about 2000 ms hit the sink's 2 s limit, but a refused
