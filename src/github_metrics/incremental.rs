@@ -128,6 +128,15 @@ enum Located {
 /// always succeeds; the bound is for a log rotating faster than it can be read.
 const LOCATE_ATTEMPTS: u32 = 3;
 
+/// The log at `path` opened for reading, or `None` when there is no log.
+fn open_live(path: &Path) -> io::Result<Option<Open>> {
+    match Open::at(path) {
+        Ok(live) => Ok(Some(live)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The id of the file at `path` now, or `None` when there is no file.
 fn current_id(path: &Path) -> io::Result<Option<FileId>> {
     match std::fs::metadata(path) {
@@ -372,26 +381,34 @@ impl IncrementalCounts {
     }
 
     fn try_refresh(&mut self, stop: &mut impl FnMut() -> bool) -> io::Result<bool> {
-        let mut attempt = 1;
-        let Plan { mut cursor, files } = loop {
-            let live = match Open::at(&self.path) {
-                Ok(live) => Some(live),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e),
-            };
-            match self.resume(live, attempt == LOCATE_ATTEMPTS) {
-                Resumed::Plan(plan) => break plan,
-                // No log, so nothing in it: `aggregate`'s answer for a missing file.
-                // A log created later is scanned from its first byte.
-                Resumed::NoLog => return Ok(true),
-                Resumed::Retry => attempt += 1,
-            }
+        let path = self.path.clone();
+        let Some(Plan { mut cursor, files }) = self.plan(|| open_live(&path))? else {
+            // No log, so nothing in it: `aggregate`'s answer for a missing file.
+            // A log created later is scanned from its first byte.
+            return Ok(true);
         };
         let result = self.read_files(files, &mut cursor, stop);
         // Keep the cursor whatever happened: it is consistent at the last line
         // consumed, and a failed read should not cost a rebuild next time.
         self.cursor = Some(cursor);
         result
+    }
+
+    /// What one refresh reads, or `None` when there is no log. Looks again, up to
+    /// [`LOCATE_ATTEMPTS`] times, when `open_live` hands over a live file that a
+    /// rotation overtook while the cursor's file was searched for.
+    fn plan(
+        &mut self,
+        mut open_live: impl FnMut() -> io::Result<Option<Open>>,
+    ) -> io::Result<Option<Plan>> {
+        let mut attempt = 1;
+        loop {
+            match self.resume(open_live()?, attempt == LOCATE_ATTEMPTS) {
+                Resumed::Plan(plan) => return Ok(Some(plan)),
+                Resumed::NoLog => return Ok(None),
+                Resumed::Retry => attempt += 1,
+            }
+        }
     }
 
     /// What to read, and from where: the stored cursor when its file can still be
@@ -477,24 +494,26 @@ impl IncrementalCounts {
     /// file unfound, which rebuilds the tally: the same answer a prune gets, never
     /// a repeated record.
     fn find_rotated(&self, cursor: &Cursor, live: Option<FileId>) -> io::Result<Located> {
-        let found = self.search_rotated(cursor, live)?;
+        let rotated = request_log::rotated_files(&self.path);
+        let found = Self::search_rotated(cursor, live, &rotated)?;
         if current_id(&self.path)? != live {
             return Ok(Located::Raced);
         }
         Ok(found.map_or(Located::Lost, Located::Chain))
     }
 
-    /// The rotated files from the cursor's file to the newest, oldest first, or
-    /// `None` when the cursor's file is not among them or is no longer intact.
+    /// The files among `paths` (the log's rotated siblings, newest first) from the
+    /// cursor's file to the newest, oldest first, or `None` when the cursor's file
+    /// is not among them or is no longer intact.
     fn search_rotated(
-        &self,
         cursor: &Cursor,
         live: Option<FileId>,
+        paths: &[PathBuf],
     ) -> io::Result<Option<Vec<Open>>> {
         let mut seen: Vec<FileId> = live.into_iter().collect();
         let mut newer_first = Vec::new();
-        for path in request_log::rotated_files(&self.path) {
-            let mut rotated = match Open::at(&path) {
+        for path in paths {
+            let mut rotated = match Open::at(path) {
                 Ok(rotated) => rotated,
                 // Shifted or rotated out between the listing and now.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -1185,7 +1204,7 @@ mod tests {
         // The last look treats a rotation it raced as a file not found: the tally
         // is rebuilt from the file in hand rather than the search starting over.
         let Resumed::Plan(plan) = tally.resume(Some(live), true) else {
-            panic!("the last attempt must plan, not retry");
+            panic!("the last attempt must plan, not retry"); // omni-dev: coverage ignore-line reason="guards this test's assumption; the last attempt treats a raced search as a file not found, so it always plans"
         };
         assert_eq!(tally.counts().total(), 0);
         assert_eq!(plan.files.len(), 1);
@@ -1379,6 +1398,135 @@ mod tests {
         assert!(tally.refresh(never));
         assert_eq!(tally.counts().total(), 6);
         assert_eq!(*tally.counts(), log.full_scan());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_cannot_be_opened_is_not_a_missing_log() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(open_live(&dir.path().join("gone.jsonl")).unwrap().is_none());
+        assert_eq!(current_id(&dir.path().join("gone.jsonl")).unwrap(), None);
+
+        // A parent that is a file fails with `ENOTDIR`, not `NotFound`: an error to
+        // report, not a log that is not there yet.
+        let parent = dir.path().join("not-a-dir");
+        std::fs::write(&parent, "").unwrap();
+        let path = parent.join("log.jsonl");
+        assert!(open_live(&path).is_err());
+        assert!(current_id(&path).is_err());
+
+        let mut tally = IncrementalCounts::start_since(path, since());
+        assert!(!tally.refresh(never));
+        assert_eq!(tally.counts().total(), 0);
+    }
+
+    #[test]
+    fn without_file_ids_nothing_identifies_a_rotated_file() {
+        let log = Log::new();
+        log.write("");
+        let tally = log.start();
+        // No live file to match by id and no id to look for among the rotated
+        // ones, so the cursor is lost without a search.
+        assert!(matches!(
+            tally.locate(&Cursor::start_of(None), None),
+            Ok(Located::Lost)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_looks_again_when_a_rotation_overtakes_the_search() {
+        let (log, mut tally, stale) = overtaken_search();
+        let mut stale = Some(stale);
+        let mut opens = 0;
+
+        // The first look is the handle the rotations overtook, the second the log
+        // as it is.
+        let plan = tally
+            .plan(|| {
+                opens += 1;
+                match stale.take() {
+                    Some(live) => Ok(Some(live)),
+                    None => open_live(&log.path),
+                }
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(opens, 2);
+        assert_eq!(plan.files.len(), 4);
+
+        let mut cursor = plan.cursor;
+        assert!(tally
+            .read_files(plan.files, &mut cursor, &mut never)
+            .unwrap());
+        assert_eq!(tally.counts().total(), 5);
+        assert_eq!(
+            *tally.counts(),
+            full_scan_of(&[&log.rotated(3), &log.rotated(2), &log.rotated(1), &log.path])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_overtaken_on_every_look_rebuilds_after_the_last() {
+        let log = Log::new();
+        log.write("");
+        let mut tally = log.start();
+        log.append(&gh(1, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+        log.append(&gh(2, &["pr", "view"], "cli"));
+        log.rotate(10);
+        log.append(&gh(3, &["issue", "list"], "cli"));
+        let mut opens = 0u32;
+
+        let plan = tally
+            .plan(|| {
+                opens += 1;
+                let live = open_live(&log.path)?;
+                // Another rotation lands right after the log is opened, every time.
+                log.rotate(10);
+                log.append(&gh(10 + i64::from(opens), &["repo", "view"], "cli"));
+                Ok(live)
+            })
+            .unwrap()
+            .unwrap();
+
+        // Bounded: the third look rebuilds from the file in hand instead of a fourth.
+        assert_eq!(opens, LOCATE_ATTEMPTS);
+        assert_eq!(tally.counts().total(), 0);
+        assert_eq!(plan.files.len(), 1);
+        assert_eq!(plan.cursor.offset, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_search_skips_a_rotated_file_that_moved_and_reports_one_it_cannot_open() {
+        let log = Log::new();
+        log.write("");
+        let mut tally = log.start();
+        log.append(&gh(1, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+        log.append(&gh(2, &["pr", "view"], "cli"));
+        log.rotate(3);
+        let cursor = tally.cursor.as_ref().unwrap();
+
+        // `.9` was listed and shifted away before it was opened: skipped, and the
+        // search goes on to the file that is the cursor's.
+        let found =
+            IncrementalCounts::search_rotated(cursor, None, &[log.rotated(9), log.rotated(1)])
+                .unwrap()
+                .unwrap();
+        assert_eq!(found.len(), 1);
+
+        // Any other failure to open one is an error, not a file not found.
+        let parent = log.path.with_extension("blocker");
+        std::fs::write(&parent, "").unwrap();
+        assert!(IncrementalCounts::search_rotated(
+            cursor,
+            None,
+            &[parent.join("log.jsonl.1"), log.rotated(1)]
+        )
+        .is_err());
     }
 
     #[test]

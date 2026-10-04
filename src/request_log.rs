@@ -977,6 +977,20 @@ fn sibling_dir(path: &Path) -> Option<&Path> {
     })
 }
 
+/// The entry `read_dir` yielded, or `None` for one it could not read, logged at
+/// debug: that entry is skipped, and the rest of the directory is still listed.
+fn readable_entry(
+    entry: std::io::Result<std::fs::DirEntry>,
+    dir: &Path,
+) -> Option<std::fs::DirEntry> {
+    entry
+        .inspect_err(|e| {
+            let shown = dir.display();
+            tracing::debug!("request_log: skipping an unreadable entry of {shown}: {e}");
+        })
+        .ok()
+}
+
 /// The rotated siblings of the log at `path` that exist now: `<path>.<N>` for a
 /// decimal `N` of at least 1, in ascending order of `N` — newest first, since
 /// [`rotate`] shifts every file up and starts the numbering at `.1`.
@@ -997,10 +1011,8 @@ pub(crate) fn rotated_files(path: &Path) -> Vec<PathBuf> {
         Ok(entries) => entries,
         Err(e) => {
             if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(
-                    "request_log: cannot list {} for rotated files: {e}",
-                    dir.display()
-                );
+                let shown = dir.display();
+                tracing::debug!("request_log: cannot list {shown} for rotated files: {e}");
             }
             return Vec::new();
         }
@@ -1009,16 +1021,7 @@ pub(crate) fn rotated_files(path: &Path) -> Vec<PathBuf> {
     prefix.push(".");
     let prefix = prefix.to_string_lossy();
     let mut rotated: Vec<(u32, PathBuf)> = entries
-        .filter_map(|entry| {
-            entry
-                .map_err(|e| {
-                    tracing::debug!(
-                        "request_log: skipping an unreadable entry of {}: {e}",
-                        dir.display()
-                    );
-                })
-                .ok()
-        })
+        .filter_map(|entry| readable_entry(entry, dir))
         .filter_map(|entry| {
             let file_name = entry.file_name();
             let suffix = file_name
@@ -4223,6 +4226,56 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(rotated_files(&dir.path().join("gone").join("log.jsonl")).is_empty());
         assert!(rotated_files(Path::new("/")).is_empty());
+    }
+
+    #[test]
+    fn a_missing_directory_is_not_worth_a_log_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = crate::test_support::capture_at(tracing::Level::DEBUG, || {
+            assert!(rotated_files(&dir.path().join("gone").join("log.jsonl")).is_empty());
+        });
+        assert_eq!(logs, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_listed_has_no_rotated_files_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        // A parent that is a file is not a missing directory: it fails with
+        // `ENOTDIR`, which is not `NotFound`.
+        let parent = dir.path().join("not-a-dir");
+        std::fs::write(&parent, "").unwrap();
+
+        let logs = crate::test_support::capture_at(tracing::Level::DEBUG, || {
+            assert!(rotated_files(&parent.join("log.jsonl")).is_empty());
+        });
+        assert!(
+            logs.contains(&format!(
+                "request_log: cannot list {} for rotated files:",
+                parent.display()
+            )),
+            "{logs}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_entry_is_skipped_and_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("log.jsonl.1"), "").unwrap();
+        let entry = std::fs::read_dir(dir.path()).unwrap().next().unwrap();
+        assert_eq!(
+            readable_entry(entry, dir.path()).unwrap().file_name(),
+            "log.jsonl.1"
+        );
+
+        let logs = crate::test_support::capture_at(tracing::Level::DEBUG, || {
+            let failed = Err(std::io::Error::other("entry vanished"));
+            assert!(readable_entry(failed, Path::new("state")).is_none());
+        });
+        assert!(
+            logs.contains("request_log: skipping an unreadable entry of state: entry vanished"),
+            "{logs}"
+        );
     }
 
     #[cfg(unix)]
