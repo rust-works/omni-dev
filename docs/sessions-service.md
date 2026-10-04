@@ -600,6 +600,15 @@ losing state visibility, never Claude failing to launch. It **never logs or
 persists conversation content** — only the state, `session_id`, `cwd` and model
 leave the process.
 
+A turn is `working` from the editor's prompt on stdin to its `result`, including
+the model's time to first token: the `system`/`init` line Claude emits at the start
+of every turn does not reset it to `idle` while a prompt is unanswered (#2173).
+An `init` with nothing sent is still idle. Prompts queued behind a running turn
+are tracked with a flag, not a count, because after an interrupt the CLI folds
+them into one turn and a count would be left pinning the session `working`; the
+session reads `idle` for the ~50 ms between a queued turn's `result` and the next
+`init`. See [ADR-0057](adrs/adr-0057.md).
+
 It also re-reports a **busy** state (`working`, `waiting_for_*`) every 30s, so a
 long silent turn or an unanswered permission prompt does not age out on the
 5-minute TTL. An **idle** session is deliberately *not* re-reported (#1454): the
