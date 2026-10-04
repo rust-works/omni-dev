@@ -558,7 +558,9 @@ instead pruned (`log prune` unlinks the file it replaces), truncated or rewritte
 the file the daemon was reading has been rotated out of retention
 (`OMNI_DEV_LOG_KEEP_FILES`), nothing next to the log is the file it was reading, and
 it rebuilds its count once from what the live file holds, which is what `omni-dev
-log count --kind gh --since <daemon start>` reports at that point. A summary that
+log count --kind gh --since <daemon start>` reports at that point. The same goes for
+a daemon that had no position in the log to follow: one that started before any log
+existed, or could not read the end of it. A summary that
 shutdown cut short, or that could not read the log, is marked `incomplete`: in the
 summary line, and as `"incomplete": true` in the `summary` op's reply.
 
