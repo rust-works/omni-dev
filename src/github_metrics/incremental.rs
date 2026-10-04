@@ -100,6 +100,43 @@ struct Plan {
     files: Vec<Open>,
 }
 
+/// What [`IncrementalCounts::resume`] decided.
+enum Resumed {
+    /// Read these files.
+    Plan(Plan),
+    /// There is no log and nothing to follow.
+    NoLog,
+    /// The log was rotated while its files were being looked at: look again.
+    Retry,
+}
+
+/// What [`IncrementalCounts::locate`] found.
+enum Located {
+    /// The rotated files to read before the live one, oldest first with the
+    /// cursor's own file first; none when the cursor is on the live file.
+    Chain(Vec<Open>),
+    /// The cursor's file is not next to the log, or no longer matches the cursor.
+    Lost,
+    /// The log was rotated while it was searched, so what was seen cannot be put
+    /// in order.
+    Raced,
+}
+
+/// How many times a refresh looks for the cursor's file when each look is
+/// overtaken by a rotation, before it gives the file up as lost. One rotation
+/// takes microseconds and a size cap makes them rare, so a second look all but
+/// always succeeds; the bound is for a log rotating faster than it can be read.
+const LOCATE_ATTEMPTS: u32 = 3;
+
+/// The id of the file at `path` now, or `None` when there is no file.
+fn current_id(path: &Path) -> io::Result<Option<FileId>> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(Some(file_id(&meta))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Where the tally has read up to in one particular log file.
 #[derive(Debug)]
 struct Cursor {
@@ -246,8 +283,9 @@ fn read_tail(file: &mut File, offset: u64) -> io::Result<Vec<u8>> {
 /// A running tally of the `gh` records logged since a fixed instant, refreshed
 /// by reading only what was appended since the previous refresh.
 ///
-/// Equivalent to [`aggregate`](super::aggregate) over `[since, ∞)`, minus the
-/// cost: construction reads no records, and each [`refresh`](Self::refresh)
+/// Equivalent to [`aggregate`](super::aggregate) over `[since, ∞)` — of the live
+/// log, or, across a rotation, of the rotated files and the live log read as one —
+/// minus the cost: construction reads no records, and each [`refresh`](Self::refresh)
 /// reads only the complete lines appended after the last one. A line still being
 /// written (no trailing newline yet) is left for the next refresh, so a record is
 /// counted once, whole. That is the one way the two differ over the same bytes:
@@ -334,15 +372,20 @@ impl IncrementalCounts {
     }
 
     fn try_refresh(&mut self, stop: &mut impl FnMut() -> bool) -> io::Result<bool> {
-        let live = match Open::at(&self.path) {
-            Ok(live) => Some(live),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
-        };
-        let Some(Plan { mut cursor, files }) = self.resume(live) else {
-            // No log, so nothing in it: `aggregate`'s answer for a missing file. A
-            // log created later is scanned from its first byte.
-            return Ok(true);
+        let mut attempt = 1;
+        let Plan { mut cursor, files } = loop {
+            let live = match Open::at(&self.path) {
+                Ok(live) => Some(live),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            };
+            match self.resume(live, attempt == LOCATE_ATTEMPTS) {
+                Resumed::Plan(plan) => break plan,
+                // No log, so nothing in it: `aggregate`'s answer for a missing file.
+                // A log created later is scanned from its first byte.
+                Resumed::NoLog => return Ok(true),
+                Resumed::Retry => attempt += 1,
+            }
         };
         let result = self.read_files(files, &mut cursor, stop);
         // Keep the cursor whatever happened: it is consistent at the last line
@@ -353,16 +396,23 @@ impl IncrementalCounts {
 
     /// What to read, and from where: the stored cursor when its file can still be
     /// found — as the live file, or rotated to `log.jsonl.N` — otherwise a fresh
-    /// cursor at the live file's first byte with the tally reset. `None` when
-    /// there is no live file and nothing to follow, which leaves the tally empty.
-    fn resume(&mut self, mut live: Option<Open>) -> Option<Plan> {
+    /// cursor at the live file's first byte with the tally reset.
+    ///
+    /// `last_attempt` makes a search that raced a rotation count as a file not
+    /// found, so a log that keeps rotating under the search ends in a rebuild
+    /// instead of a loop.
+    fn resume(&mut self, mut live: Option<Open>, last_attempt: bool) -> Resumed {
         if let Some(cursor) = self.cursor.take() {
             match self.locate(&cursor, live.as_mut()) {
-                Ok(Some(mut files)) => {
+                Ok(Located::Chain(mut files)) => {
                     files.extend(live);
-                    return Some(Plan { cursor, files });
+                    return Resumed::Plan(Plan { cursor, files });
                 }
-                Ok(None) => {}
+                Ok(Located::Raced) if !last_attempt => {
+                    self.cursor = Some(cursor);
+                    return Resumed::Retry;
+                }
+                Ok(Located::Lost | Located::Raced) => {}
                 Err(e) => tracing::debug!(
                     "github counters: cannot verify the position in {}, rescanning: {e}",
                     self.path.display()
@@ -372,35 +422,38 @@ impl IncrementalCounts {
         // First sight of this file, or it was replaced, truncated, rewritten or
         // rotated out of retention: what was tallied came from something else.
         self.counts = GhCounts::default();
-        live.map(|live| Plan {
-            cursor: Cursor::start_of(live.id),
-            files: vec![live],
-        })
+        match live {
+            Some(live) => Resumed::Plan(Plan {
+                cursor: Cursor::start_of(live.id),
+                files: vec![live],
+            }),
+            None => Resumed::NoLog,
+        }
     }
 
-    /// The rotated files to read before the live one, oldest first with the
-    /// cursor's own file first — none at all when the cursor is on the live file
-    /// — or `None` when the cursor's file cannot be trusted and the tally has to
-    /// be rebuilt.
+    /// Where the cursor's file is: the rotated files to read before the live one,
+    /// oldest first with the cursor's own file first — none at all when the cursor
+    /// is on the live file — or that it cannot be trusted and the tally has to be
+    /// rebuilt.
     ///
     /// A live file with the cursor's id that is not intact was truncated or
     /// rewritten in place, so there is nothing to follow. A live file with another
     /// id (or none, between a rotation and the next append) is a rotation or a
     /// `prune`; only a rotation leaves the cursor's file next to the log.
-    fn locate(
-        &self,
-        cursor: &Cursor,
-        mut live: Option<&mut Open>,
-    ) -> io::Result<Option<Vec<Open>>> {
+    fn locate(&self, cursor: &Cursor, mut live: Option<&mut Open>) -> io::Result<Located> {
         if let Some(live) = live.as_deref_mut() {
             if live.id == cursor.id {
                 let intact = cursor.is_intact(&mut live.file, live.id, live.len)?;
-                return Ok(intact.then(Vec::new));
+                return Ok(if intact {
+                    Located::Chain(Vec::new())
+                } else {
+                    Located::Lost
+                });
             }
         }
         if cursor.id.is_none() {
             // No file ids on this platform, so nothing identifies a rotated file.
-            return Ok(None);
+            return Ok(Located::Lost);
         }
         self.find_rotated(cursor, live.map(|live| live.id))
     }
@@ -408,15 +461,36 @@ impl IncrementalCounts {
     /// Looks for the cursor's file among the rotated siblings of the log and
     /// returns the files to read, oldest first, ending with it at the front.
     ///
-    /// Files are identified by id, never by name: a rotation shifts every file up
-    /// one name, possibly between two opens here. They only ever move *up*, so
-    /// opening in ascending order sees every file that outlasts the search, some
-    /// of them twice — which is why a file already seen (the live file included)
-    /// is skipped. The first sighting of a file is then always newer than that of
-    /// any older one, so the order seen, reversed, is the order written. A file
-    /// the search misses leaves the cursor's file unfound, which rebuilds the
-    /// tally: the same answer a prune gets, never a repeated record.
-    fn find_rotated(&self, cursor: &Cursor, live: Option<FileId>) -> io::Result<Option<Vec<Open>>> {
+    /// `live` is the id of the live file the caller opened (none when there was
+    /// none), and the search is only worth anything if the log was not rotated
+    /// while it ran. Files are identified by id, never by name, because a rotation
+    /// shifts every file up one name, possibly between two opens here. A file
+    /// already seen (the live file included) is skipped, so one seen at two paths
+    /// is read once. But the order they were seen in is the order they were
+    /// written only while nothing new appeared below the point being looked at,
+    /// and a rotation puts one there: with the live file opened, then two
+    /// rotations, then the listing, the live file is *older* than a rotated file
+    /// found after it. So the live file is looked at again once the search is
+    /// done, and a different id means a rotation (or `prune`) landed meanwhile:
+    /// [`Located::Raced`], and the caller starts over rather than reading files it
+    /// cannot put in order. A file the search simply misses leaves the cursor's
+    /// file unfound, which rebuilds the tally: the same answer a prune gets, never
+    /// a repeated record.
+    fn find_rotated(&self, cursor: &Cursor, live: Option<FileId>) -> io::Result<Located> {
+        let found = self.search_rotated(cursor, live)?;
+        if current_id(&self.path)? != live {
+            return Ok(Located::Raced);
+        }
+        Ok(found.map_or(Located::Lost, Located::Chain))
+    }
+
+    /// The rotated files from the cursor's file to the newest, oldest first, or
+    /// `None` when the cursor's file is not among them or is no longer intact.
+    fn search_rotated(
+        &self,
+        cursor: &Cursor,
+        live: Option<FileId>,
+    ) -> io::Result<Option<Vec<Open>>> {
         let mut seen: Vec<FileId> = live.into_iter().collect();
         let mut newer_first = Vec::new();
         for path in request_log::rotated_files(&self.path) {
@@ -594,6 +668,7 @@ mod tests {
     /// What a full scan reports for `files` read oldest first as one log: the
     /// windowed scan summed over them, which is what a tally that followed a
     /// rotation must equal.
+    #[cfg(unix)]
     fn full_scan_of(files: &[&Path]) -> GhCounts {
         let dir = tempfile::tempdir().unwrap();
         let joined = dir.path().join("joined.jsonl");
@@ -1049,6 +1124,104 @@ mod tests {
         assert_eq!(tally.counts().total(), 5);
         assert_eq!(*tally.counts(), full_scan_of(&[&log.rotated(1), &log.path]));
         assert_eq!(tally.offset(), Some(log.len()));
+    }
+
+    /// A tally whose cursor is in a file that is then rotated, and a live file
+    /// handle opened *before* two more rotations land: what a refresh holds when
+    /// rotations overtake its search. The files, oldest first, are `.3` (the
+    /// cursor's, with one unread record), `.2` (the handle), `.1` and the live
+    /// log, one record each, and `1 + 1 + 1 + 1 + 1` records in all.
+    #[cfg(unix)]
+    fn overtaken_search() -> (Log, IncrementalCounts, Open) {
+        let log = Log::new();
+        log.write(""); // a log to take a baseline in, so the first rotation is followed
+        let mut tally = log.start();
+        log.append(&gh(1, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+        log.append(&gh(2, &["pr", "view"], "cli"));
+        log.rotate(3);
+        log.append(&gh(3, &["issue", "list"], "cli"));
+
+        let live = Open::at(&log.path).unwrap();
+        log.rotate(3);
+        log.append(&gh(4, &["repo", "view"], "cli"));
+        log.rotate(3);
+        log.append(&gh(5, &["api", "graphql"], "daemon"));
+        (log, tally, live)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rotation_that_lands_during_the_search_is_searched_again() {
+        let (log, mut tally, live) = overtaken_search();
+        let offset = tally.offset();
+
+        // The handle is older than a rotated file found after it, so reading them
+        // in the order seen would read that file before the handle's, and again on
+        // the refresh after. It is not tried: the caller is told to look again.
+        assert!(matches!(tally.resume(Some(live), false), Resumed::Retry));
+        assert_eq!(tally.counts().total(), 1);
+        assert_eq!(tally.offset(), offset);
+
+        // The look that follows sees the files as they are and reads each once, in
+        // order, and the refresh after it has nothing left to repeat.
+        assert!(tally.refresh(never));
+        assert_eq!(tally.counts().total(), 5);
+        assert_eq!(
+            *tally.counts(),
+            full_scan_of(&[&log.rotated(3), &log.rotated(2), &log.rotated(1), &log.path])
+        );
+        let counted = tally.counts().clone();
+        assert!(tally.refresh(never));
+        assert_eq!(*tally.counts(), counted);
+        assert_eq!(tally.offset(), Some(log.len()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_search_that_keeps_being_overtaken_gives_up_and_rebuilds() {
+        let (log, mut tally, live) = overtaken_search();
+
+        // The last look treats a rotation it raced as a file not found: the tally
+        // is rebuilt from the file in hand rather than the search starting over.
+        let Resumed::Plan(plan) = tally.resume(Some(live), true) else {
+            panic!("the last attempt must plan, not retry");
+        };
+        assert_eq!(tally.counts().total(), 0);
+        assert_eq!(plan.files.len(), 1);
+        assert_eq!(plan.cursor.offset, 0);
+
+        // Nothing is left unreadable by it: the next refresh follows from there.
+        let mut cursor = plan.cursor;
+        assert!(tally
+            .read_files(plan.files, &mut cursor, &mut never)
+            .unwrap());
+        tally.cursor = Some(cursor);
+        assert!(tally.refresh(never));
+        assert_eq!(
+            *tally.counts(),
+            full_scan_of(&[&log.rotated(2), &log.rotated(1), &log.path])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_created_during_the_search_is_searched_again() {
+        let log = Log::new();
+        let mut tally = log.start();
+        log.append(&gh(1, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+        log.append(&gh(2, &["pr", "view"], "cli"));
+        log.rotate(3);
+        assert!(!log.path.exists());
+
+        // The search found no live file, and one appeared before it finished: the
+        // chain it found stops short of the new file, so it is not used.
+        log.append(&gh(3, &["api", "graphql"], "daemon"));
+        assert!(matches!(tally.resume(None, false), Resumed::Retry));
+        assert!(tally.refresh(never));
+        assert_eq!(tally.counts().total(), 3);
+        assert_eq!(*tally.counts(), full_scan_of(&[&log.rotated(1), &log.path]));
     }
 
     #[cfg(unix)]

@@ -966,37 +966,69 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The directory a log's siblings live in. A bare file name has an empty parent,
+/// which `read_dir` rejects, so it is the current directory.
+fn sibling_dir(path: &Path) -> Option<&Path> {
+    let dir = path.parent()?;
+    Some(if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    })
+}
+
 /// The rotated siblings of the log at `path` that exist now: `<path>.<N>` for a
-/// decimal `N`, in ascending order of `N` — newest first, since [`rotate`] shifts
-/// every file up and starts the numbering at `.1`.
+/// decimal `N` of at least 1, in ascending order of `N` — newest first, since
+/// [`rotate`] shifts every file up and starts the numbering at `.1`.
 ///
 /// Lists what is on disk rather than counting up to `OMNI_DEV_LOG_KEEP_FILES`,
 /// because that variable is read per write by whichever process writes, so a
-/// reader cannot know the value the rotating writer used. Anything that is not
-/// all digits after the dot (`.lock`, an editor's `.1.bak`) is not a rotated file.
-/// A missing or unreadable directory has none.
+/// reader cannot know the value the rotating writer used. Only what rotation
+/// itself writes counts: a regular file whose suffix is the canonical decimal
+/// number, so `.lock`, an editor's `.1.bak`, `.0`, `.01` and a directory called
+/// `.3` are not rotated files. A missing directory has none; one that cannot be
+/// listed has none either, logged at debug because the caller then rebuilds
+/// instead of following a rotation.
 pub(crate) fn rotated_files(path: &Path) -> Vec<PathBuf> {
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+    let (Some(dir), Some(name)) = (sibling_dir(path), path.file_name()) else {
         return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(
+                    "request_log: cannot list {} for rotated files: {e}",
+                    dir.display()
+                );
+            }
+            return Vec::new();
+        }
     };
     let mut prefix = name.to_owned();
     prefix.push(".");
     let prefix = prefix.to_string_lossy();
     let mut rotated: Vec<(u32, PathBuf)> = entries
-        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .map_err(|e| {
+                    tracing::debug!(
+                        "request_log: skipping an unreadable entry of {}: {e}",
+                        dir.display()
+                    );
+                })
+                .ok()
+        })
         .filter_map(|entry| {
             let file_name = entry.file_name();
-            let number = file_name
+            let suffix = file_name
                 .to_string_lossy()
                 .strip_prefix(&*prefix)?
                 .to_owned();
-            if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            Some((number.parse().ok()?, entry.path()))
+            let number: u32 = suffix.parse().ok()?;
+            let canonical = number >= 1 && number.to_string() == suffix;
+            let regular = entry.file_type().is_ok_and(|kind| kind.is_file());
+            (canonical && regular).then(|| (number, entry.path()))
         })
         .collect();
     rotated.sort_by_key(|&(number, _)| number);
@@ -4151,10 +4183,16 @@ mod tests {
             "log.jsonl.",
             "log.jsonl.x",
             "log.jsonl.99999999999",
+            // Rotation numbers from 1 and writes no padding or sign.
+            "log.jsonl.0",
+            "log.jsonl.01",
+            "log.jsonl.+2",
             "other.jsonl.3",
         ] {
             std::fs::write(dir.path().join(name), "").unwrap();
         }
+        // Opening a directory succeeds and reading it does not; it is no log.
+        std::fs::create_dir(dir.path().join("log.jsonl.3")).unwrap();
 
         let names: Vec<_> = rotated_files(&path)
             .iter()
@@ -4165,6 +4203,19 @@ mod tests {
             names,
             ["log.jsonl.1", "log.jsonl.2", "log.jsonl.9", "log.jsonl.10"]
         );
+    }
+
+    #[test]
+    fn a_bare_file_name_is_listed_in_the_current_directory() {
+        // `Path::parent` of a bare name is empty, which `read_dir` rejects.
+        assert_eq!(sibling_dir(Path::new("log.jsonl")), Some(Path::new(".")));
+        assert_eq!(
+            sibling_dir(Path::new("state/log.jsonl")),
+            Some(Path::new("state"))
+        );
+        assert_eq!(sibling_dir(Path::new("/log.jsonl")), Some(Path::new("/")));
+        assert_eq!(sibling_dir(Path::new("/")), None);
+        assert!(std::fs::read_dir(sibling_dir(Path::new("log.jsonl")).unwrap()).is_ok());
     }
 
     #[test]
