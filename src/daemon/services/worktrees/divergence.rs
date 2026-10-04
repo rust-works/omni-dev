@@ -818,7 +818,9 @@ mod tests {
     }
 
     /// A common dir that will not open leaves the row without counts, not with
-    /// counts from a handle that ignores the cut.
+    /// counts from a handle that ignores the cut, and says why at `debug`. The
+    /// capture is also what makes the log's arguments evaluate: `tracing` skips
+    /// them when nothing is listening at that level.
     #[test]
     fn a_common_dir_that_will_not_open_leaves_a_shallow_worktree_without_counts() {
         let memo = WalkMemo::with_capacity(8);
@@ -832,8 +834,17 @@ mod tests {
         std::fs::remove_file(repo.commondir().join("HEAD")).unwrap();
         assert!(Repository::open(repo.commondir()).is_err());
 
-        assert_eq!(graph_ahead_behind_in(&memo, &linked, second, first), None);
+        let mut counts = Some((0, 0));
+        let logs = crate::test_support::capture_at(tracing::Level::DEBUG, || {
+            counts = graph_ahead_behind_in(&memo, &linked, second, first);
+        });
+
+        assert_eq!(counts, None);
         assert_eq!(memo.len(), 0);
+        assert!(
+            logs.contains("cannot open") && logs.contains(&repo.commondir().display().to_string()),
+            "the failed open was not logged with its path: {logs}"
+        );
     }
 
     /// base ← first ← second, written into a fresh repository at `dir`.
