@@ -14,8 +14,20 @@
 //! truncate it. A cursor that outlives such a change would read from the wrong
 //! place and produce a silently wrong tally, so the cursor is trusted only while
 //! the file is demonstrably the one it was taken on (see [`Cursor::is_intact`]).
-//! Otherwise the tally is dropped and rebuilt by a windowed scan from the first
-//! byte, which is what [`aggregate`](super::aggregate) would report.
+//!
+//! Rotation is the one change that loses nothing, and the one the live file
+//! alone cannot be told apart from a prune by (#2162). It only *renames*: the file
+//! the cursor was taken on is still next to the log as `log.jsonl.N`, under the
+//! same file id, with the records appended after the last refresh at the end of
+//! it. So the tally follows its position there, reads that tail, then every newer
+//! rotated file and the new live file from their first bytes, and keeps its
+//! counts. A prune unlinks the file it replaces, so the cursor's file is never
+//! found; neither is one rotated out of retention.
+//!
+//! Anything else — the cursor's file is not found, or is found but no longer
+//! matches — drops the tally and rebuilds it by a windowed scan of the live file
+//! from the first byte, which is what [`aggregate`](super::aggregate) would
+//! report.
 
 use std::fs::{File, Metadata};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
@@ -24,7 +36,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use super::{Filter, GhCounts};
-use crate::request_log::LogRecord;
+use crate::request_log::{self, LogRecord};
 
 /// How many bytes ending at the cursor are kept to recognise a file that was
 /// rewritten in place. Enough to tell one from the next in all but a contrived
@@ -59,6 +71,35 @@ fn file_id(_meta: &Metadata) -> FileId {
     None
 }
 
+/// A log file open for reading, with the identity and length it had when it was
+/// opened. Holding the handle keeps the file readable through any rename that
+/// follows, which is what lets a rotation happen while the chain is being read.
+struct Open {
+    file: File,
+    id: FileId,
+    len: u64,
+}
+
+impl Open {
+    fn at(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let meta = file.metadata()?;
+        Ok(Self {
+            file,
+            id: file_id(&meta),
+            len: meta.len(),
+        })
+    }
+}
+
+/// What one refresh reads: `files`, oldest first, the first from `cursor`'s
+/// offset and each later one from its first byte. The live file, when there is
+/// one, is last.
+struct Plan {
+    cursor: Cursor,
+    files: Vec<Open>,
+}
+
 /// Where the tally has read up to in one particular log file.
 #[derive(Debug)]
 struct Cursor {
@@ -85,7 +126,8 @@ impl Cursor {
     /// this cursor was taken on, with everything before `offset` untouched.
     ///
     /// Three checks, because each misses a case the others catch: a different
-    /// file id (rotation, `prune`'s rename), a file shorter than the offset
+    /// file id (rotation, `prune`'s rename — [`IncrementalCounts::locate`] tells
+    /// them apart), a file shorter than the offset
     /// (truncation), and different bytes where the last consumed line ended (a
     /// file rewritten in place and regrown past the offset, or an inode reused
     /// after its file was deleted).
@@ -292,45 +334,140 @@ impl IncrementalCounts {
     }
 
     fn try_refresh(&mut self, stop: &mut impl FnMut() -> bool) -> io::Result<bool> {
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // No log, so nothing in it: `aggregate`'s answer for a missing
-                // file. A log created later is scanned from its first byte.
-                self.counts = GhCounts::default();
-                self.cursor = None;
-                return Ok(true);
-            }
+        let live = match Open::at(&self.path) {
+            Ok(live) => Some(live),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
-        let meta = file.metadata()?;
-        let mut cursor = self.resume(&mut file, &meta);
-        let result = self.read_new_lines(&mut file, &mut cursor, stop);
+        let Some(Plan { mut cursor, files }) = self.resume(live) else {
+            // No log, so nothing in it: `aggregate`'s answer for a missing file. A
+            // log created later is scanned from its first byte.
+            return Ok(true);
+        };
+        let result = self.read_files(files, &mut cursor, stop);
         // Keep the cursor whatever happened: it is consistent at the last line
         // consumed, and a failed read should not cost a rebuild next time.
         self.cursor = Some(cursor);
         result
     }
 
-    /// The cursor to read from: the stored one when `file` is demonstrably the
-    /// file it was taken on, otherwise a fresh one at the file's first byte with
-    /// the tally reset.
-    fn resume(&mut self, file: &mut File, meta: &Metadata) -> Cursor {
-        let id = file_id(meta);
+    /// What to read, and from where: the stored cursor when its file can still be
+    /// found — as the live file, or rotated to `log.jsonl.N` — otherwise a fresh
+    /// cursor at the live file's first byte with the tally reset. `None` when
+    /// there is no live file and nothing to follow, which leaves the tally empty.
+    fn resume(&mut self, mut live: Option<Open>) -> Option<Plan> {
         if let Some(cursor) = self.cursor.take() {
-            match cursor.is_intact(file, id, meta.len()) {
-                Ok(true) => return cursor,
-                Ok(false) => {}
+            match self.locate(&cursor, live.as_mut()) {
+                Ok(Some(mut files)) => {
+                    files.extend(live);
+                    return Some(Plan { cursor, files });
+                }
+                Ok(None) => {}
                 Err(e) => tracing::debug!(
                     "github counters: cannot verify the position in {}, rescanning: {e}",
                     self.path.display()
                 ),
             }
         }
-        // First sight of this file, or it was replaced, rotated, truncated or
-        // rewritten: what was tallied came from something else.
+        // First sight of this file, or it was replaced, truncated, rewritten or
+        // rotated out of retention: what was tallied came from something else.
         self.counts = GhCounts::default();
-        Cursor::start_of(id)
+        live.map(|live| Plan {
+            cursor: Cursor::start_of(live.id),
+            files: vec![live],
+        })
+    }
+
+    /// The rotated files to read before the live one, oldest first with the
+    /// cursor's own file first — none at all when the cursor is on the live file
+    /// — or `None` when the cursor's file cannot be trusted and the tally has to
+    /// be rebuilt.
+    ///
+    /// A live file with the cursor's id that is not intact was truncated or
+    /// rewritten in place, so there is nothing to follow. A live file with another
+    /// id (or none, between a rotation and the next append) is a rotation or a
+    /// `prune`; only a rotation leaves the cursor's file next to the log.
+    fn locate(
+        &self,
+        cursor: &Cursor,
+        mut live: Option<&mut Open>,
+    ) -> io::Result<Option<Vec<Open>>> {
+        if let Some(live) = live.as_deref_mut() {
+            if live.id == cursor.id {
+                let intact = cursor.is_intact(&mut live.file, live.id, live.len)?;
+                return Ok(intact.then(Vec::new));
+            }
+        }
+        if cursor.id.is_none() {
+            // No file ids on this platform, so nothing identifies a rotated file.
+            return Ok(None);
+        }
+        self.find_rotated(cursor, live.map(|live| live.id))
+    }
+
+    /// Looks for the cursor's file among the rotated siblings of the log and
+    /// returns the files to read, oldest first, ending with it at the front.
+    ///
+    /// Files are identified by id, never by name: a rotation shifts every file up
+    /// one name, possibly between two opens here. They only ever move *up*, so
+    /// opening in ascending order sees every file that outlasts the search, some
+    /// of them twice — which is why a file already seen (the live file included)
+    /// is skipped. The first sighting of a file is then always newer than that of
+    /// any older one, so the order seen, reversed, is the order written. A file
+    /// the search misses leaves the cursor's file unfound, which rebuilds the
+    /// tally: the same answer a prune gets, never a repeated record.
+    fn find_rotated(&self, cursor: &Cursor, live: Option<FileId>) -> io::Result<Option<Vec<Open>>> {
+        let mut seen: Vec<FileId> = live.into_iter().collect();
+        let mut newer_first = Vec::new();
+        for path in request_log::rotated_files(&self.path) {
+            let mut rotated = match Open::at(&path) {
+                Ok(rotated) => rotated,
+                // Shifted or rotated out between the listing and now.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if seen.contains(&rotated.id) {
+                continue;
+            }
+            seen.push(rotated.id);
+            if rotated.id != cursor.id {
+                newer_first.push(rotated);
+                continue;
+            }
+            if !cursor.is_intact(&mut rotated.file, rotated.id, rotated.len)? {
+                return Ok(None);
+            }
+            newer_first.push(rotated);
+            newer_first.reverse();
+            return Ok(Some(newer_first));
+        }
+        Ok(None)
+    }
+
+    /// Reads `files` in order, the first from the cursor and each later one from
+    /// its first byte. Returns `false` when `stop` ended it early.
+    ///
+    /// The cursor moves to a file only when the one before it has been read to the
+    /// end, so wherever this stops — `stop`, or a read error — it is consistent at
+    /// a line boundary of the file being read, and the next refresh finds that
+    /// file again wherever a rotation has since moved it. A rotated file is
+    /// finished, so a half-written last line it may hold is never completed and is
+    /// left behind with the file.
+    fn read_files(
+        &mut self,
+        files: Vec<Open>,
+        cursor: &mut Cursor,
+        stop: &mut impl FnMut() -> bool,
+    ) -> io::Result<bool> {
+        for (n, mut open) in files.into_iter().enumerate() {
+            if n > 0 {
+                *cursor = Cursor::start_of(open.id);
+            }
+            if !self.read_new_lines(&mut open.file, cursor, stop)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn read_new_lines(
@@ -441,6 +578,31 @@ mod tests {
         fn start(&self) -> IncrementalCounts {
             IncrementalCounts::start_since(self.path.clone(), since())
         }
+
+        /// Where rotation puts the file that is `n` rotations old.
+        fn rotated(&self, n: u32) -> PathBuf {
+            self.path.with_extension(format!("jsonl.{n}"))
+        }
+
+        /// Rotates with the writer's own function, keeping `keep` files.
+        #[cfg(unix)]
+        fn rotate(&self, keep: u32) {
+            request_log::rotate(&self.path, keep).unwrap();
+        }
+    }
+
+    /// What a full scan reports for `files` read oldest first as one log: the
+    /// windowed scan summed over them, which is what a tally that followed a
+    /// rotation must equal.
+    fn full_scan_of(files: &[&Path]) -> GhCounts {
+        let dir = tempfile::tempdir().unwrap();
+        let joined = dir.path().join("joined.jsonl");
+        let mut out = File::create(&joined).unwrap();
+        for file in files {
+            out.write_all(&std::fs::read(file).unwrap()).unwrap();
+        }
+        drop(out);
+        aggregate(&joined, Some(since()), None, None)
     }
 
     fn never() -> bool {
@@ -623,21 +785,55 @@ mod tests {
         assert_eq!(*tally.counts(), log.full_scan());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_rotated_log_is_followed_to_its_replacement() {
         let log = Log::new();
         let mut tally = log.start();
         log.append(&gh(1, &["pr", "list"], "cli"));
         assert!(tally.refresh(never));
+        assert_eq!(tally.counts().total(), 1);
 
-        // Size-capped rotation: the log is renamed away and a fresh one started.
-        std::fs::rename(&log.path, log.path.with_extension("jsonl.1")).unwrap();
+        // Appended after that refresh and before the rotation, so it is in `.1` and
+        // nowhere in the live file.
+        log.append(&gh(2, &["pr", "view"], "cli"));
+        log.rotate(3);
+        log.append(&gh(3, &["api", "graphql"], "daemon"));
+        assert!(tally.refresh(never));
+
+        // Nothing is lost: every record since the baseline, as a scan of both files
+        // sees them. The live file alone holds one, which is what a rebuild reported.
+        assert_eq!(tally.counts().total(), 3);
+        assert_eq!(*tally.counts(), full_scan_of(&[&log.rotated(1), &log.path]));
+        assert_eq!(log.full_scan().total(), 1);
+        assert_eq!(tally.offset(), Some(log.len()));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn without_file_ids_a_rotation_is_a_rebuild() {
+        let log = Log::new();
+        let mut tally = log.start();
+        log.append(&gh(1, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+
+        // Nothing identifies the rotated file, so the live file is all there is.
+        std::fs::rename(&log.path, log.rotated(1)).unwrap();
         log.append(&gh(2, &["api", "graphql"], "daemon"));
         assert!(tally.refresh(never));
         assert_eq!(*tally.counts(), log.full_scan());
         assert_eq!(tally.counts().total(), 1);
+    }
 
-        // Rotated away and not yet recreated: no log, no counts.
+    #[test]
+    fn a_deleted_log_is_no_log() {
+        let log = Log::new();
+        let mut tally = log.start();
+        log.append(&gh(1, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+        assert_eq!(tally.counts().total(), 1);
+
+        // Gone, and nowhere next to it either: no log, no counts.
         std::fs::remove_file(&log.path).unwrap();
         assert!(tally.refresh(never));
         assert_eq!(*tally.counts(), GhCounts::default());
@@ -648,6 +844,269 @@ mod tests {
         assert!(tally.refresh(never));
         assert_eq!(tally.counts().total(), 2);
         assert_eq!(*tally.counts(), log.full_scan());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn several_rotations_between_refreshes_are_read_in_order() {
+        let log = Log::new();
+        let mut tally = log.start();
+        log.append(&gh(1, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+
+        // Three rotations before the next refresh. Each file holds a different
+        // command a different number of times, so a file skipped, read twice or
+        // read out of order changes the tally.
+        log.append(&gh(2, &["pr", "view"], "cli"));
+        log.rotate(3);
+        for n in 3..5 {
+            log.append(&gh(n, &["issue", "list"], "cli"));
+        }
+        log.rotate(3);
+        for n in 5..8 {
+            log.append(&gh(n, &["repo", "view"], "cli"));
+        }
+        log.rotate(3);
+        for n in 8..12 {
+            log.append(&gh(n, &["api", "graphql"], "daemon"));
+        }
+        assert!(tally.refresh(never));
+
+        let counts = tally.counts();
+        assert_eq!(counts.total(), 1 + 1 + 2 + 3 + 4);
+        assert_eq!(counts.by_subcommand["pr list"], 1);
+        assert_eq!(counts.by_subcommand["pr view"], 1);
+        assert_eq!(counts.by_subcommand["issue list"], 2);
+        assert_eq!(counts.by_subcommand["repo view"], 3);
+        assert_eq!(
+            *counts,
+            full_scan_of(&[&log.rotated(3), &log.rotated(2), &log.rotated(1), &log.path])
+        );
+        assert_eq!(tally.offset(), Some(log.len()));
+
+        // Nothing new: nothing recounted.
+        let before = tally.counts().clone();
+        assert!(tally.refresh(never));
+        assert_eq!(*tally.counts(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_tally_matches_what_was_appended_across_many_rotations() {
+        let log = Log::new();
+        log.write(""); // a log to take a baseline in, so the first rotation is followed
+        let mut tally = log.start();
+        let mut appended = 0;
+        let mut last = 0;
+        for round in 0..12 {
+            // One to three rotations a refresh, the most a keep count of three can
+            // follow, with a varying number of records in each file.
+            for rotation in 0..=round % 3 {
+                for _ in 0..=(round + rotation) % 4 {
+                    appended += 1;
+                    log.append(&gh(appended, &["pr", "list"], "cli"));
+                }
+                log.rotate(3);
+            }
+            appended += 1;
+            log.append(&gh(appended, &["pr", "list"], "cli"));
+
+            assert!(tally.refresh(never));
+            let total = tally.counts().total();
+            assert!(total >= last, "round {round}: {total} after {last}");
+            assert_eq!(total, u64::try_from(appended).unwrap(), "round {round}");
+            last = total;
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cursor_file_rotated_out_of_retention_is_rebuilt_from_the_live_file() {
+        let log = Log::new();
+        let mut tally = log.start();
+        log.append(&gh(1, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+
+        // Keeping one file, two rotations push the cursor's file out. What is left
+        // next to the log is another file, with records in the window: reading it
+        // would count what the daemon never had a cursor in.
+        log.append(&gh(2, &["pr", "list"], "cli"));
+        log.rotate(1);
+        log.append(&gh(3, &["pr", "view"], "cli"));
+        log.append(&gh(4, &["pr", "view"], "cli"));
+        log.rotate(1);
+        log.append(&gh(5, &["api", "graphql"], "daemon"));
+        assert!(tally.refresh(never));
+
+        assert_eq!(tally.counts().total(), 1);
+        assert_eq!(*tally.counts(), log.full_scan());
+        assert_eq!(tally.offset(), Some(log.len()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rotation_that_keeps_no_files_is_rebuilt_from_the_new_log() {
+        let log = Log::new();
+        let mut tally = log.start();
+        log.append(&gh(1, &["pr", "list"], "cli"));
+        log.append(&gh(2, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+        assert_eq!(tally.counts().total(), 2);
+
+        // With `OMNI_DEV_LOG_KEEP_FILES=0` rotation deletes the file.
+        log.rotate(0);
+        assert!(!log.path.exists());
+        log.append(&gh(3, &["api", "graphql"], "daemon"));
+        assert!(tally.refresh(never));
+
+        assert_eq!(tally.counts().total(), 1);
+        assert_eq!(*tally.counts(), log.full_scan());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_prune_is_rebuilt_even_when_rotated_files_exist() {
+        let log = Log::new();
+        // An earlier rotation left a file of in-window records that are not the
+        // daemon's: its baseline is taken after them.
+        let earlier: String = (1..4).map(|n| gh(n, &["issue", "list"], "cli")).collect();
+        log.write(&earlier);
+        log.rotate(3);
+        log.write("");
+        let mut tally = log.start();
+        log.append(&gh(10, &["pr", "list"], "cli"));
+        log.append(&gh(11, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+        assert_eq!(tally.counts().total(), 2);
+
+        // A prune unlinks the file the cursor was in, so it is nowhere to be found.
+        log.replace(&format!(
+            "{}{}",
+            gh(12, &["api", "graphql"], "daemon"),
+            gh(13, &["pr", "view"], "cli"),
+        ));
+        assert!(tally.refresh(never));
+
+        assert_eq!(tally.counts().total(), 2);
+        assert!(!tally.counts().by_subcommand.contains_key("issue list"));
+        assert_eq!(*tally.counts(), log.full_scan());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rotated_file_that_no_longer_matches_the_cursor_is_not_trusted() {
+        let log = Log::new();
+        let mut tally = log.start();
+        log.append(&gh(1, &["pr", "list"], "cli"));
+        log.append(&gh(2, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+        let stored = tally.offset().unwrap();
+
+        log.rotate(3);
+        log.append(&gh(3, &["api", "graphql"], "daemon"));
+
+        // The cursor's file is still `.1`, by id, but rewritten in place and longer
+        // than the stored offset: its bytes before the offset are not the ones read.
+        let rewritten: String = (10..16).map(|n| gh(n, &["issue", "list"], "cli")).collect();
+        std::fs::write(log.rotated(1), rewritten).unwrap();
+        assert!(std::fs::metadata(log.rotated(1)).unwrap().len() > stored);
+        assert!(tally.refresh(never));
+
+        assert_eq!(tally.counts().total(), 1);
+        assert_eq!(*tally.counts(), log.full_scan());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_rotated_away_and_not_yet_recreated_is_followed() {
+        let log = Log::new();
+        let mut tally = log.start();
+        log.append(&gh(1, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+
+        // Rotated, and the next append has not created the new log yet. The
+        // records the last refresh missed are in `.1`, and the tally keeps them.
+        log.append(&gh(2, &["pr", "view"], "cli"));
+        log.append(&gh(3, &["pr", "view"], "cli"));
+        log.rotate(3);
+        assert!(!log.path.exists());
+        assert!(tally.refresh(never));
+        assert_eq!(tally.counts().total(), 3);
+        assert_eq!(*tally.counts(), full_scan_of(&[&log.rotated(1)]));
+        assert_eq!(
+            tally.offset(),
+            Some(std::fs::metadata(log.rotated(1)).unwrap().len())
+        );
+
+        // Asked again before the new log exists: still nothing lost, nothing twice.
+        assert!(tally.refresh(never));
+        assert_eq!(tally.counts().total(), 3);
+
+        // The new log appears; the tally moves onto it.
+        log.append(&gh(4, &["api", "graphql"], "daemon"));
+        log.append(&gh(5, &["api", "graphql"], "daemon"));
+        assert!(tally.refresh(never));
+        assert_eq!(tally.counts().total(), 5);
+        assert_eq!(*tally.counts(), full_scan_of(&[&log.rotated(1), &log.path]));
+        assert_eq!(tally.offset(), Some(log.len()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_seen_at_two_paths_is_read_once() {
+        let log = Log::new();
+        let mut tally = log.start();
+        log.append(&gh(1, &["pr", "list"], "cli"));
+        assert!(tally.refresh(never));
+
+        log.rotate(3);
+        log.append(&gh(2, &["pr", "view"], "cli"));
+
+        // What a rotation that lands while the files are being looked at can show:
+        // the live file again, under `.1`, with the cursor's file one name further
+        // up. Read once for each path, its record would count twice.
+        std::fs::rename(log.rotated(1), log.rotated(2)).unwrap();
+        std::fs::hard_link(&log.path, log.rotated(1)).unwrap();
+        assert!(tally.refresh(never));
+
+        assert_eq!(tally.counts().total(), 2);
+        assert_eq!(tally.counts().by_subcommand["pr view"], 1);
+        assert_eq!(tally.offset(), Some(log.len()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_stopped_inside_a_rotated_file_resumes_there() {
+        let log = Log::new();
+        log.write(""); // a log to take a baseline in, so the first rotation is followed
+        let mut tally = log.start();
+        assert!(tally.refresh(never));
+
+        for n in 1..=4 {
+            log.append(&gh(n, &["pr", "list"], "cli"));
+        }
+        log.rotate(3);
+        for n in 5..=6 {
+            log.append(&gh(n, &["pr", "view"], "cli"));
+        }
+
+        // Two lines of the rotated file, then stop.
+        let mut calls = 0;
+        assert!(!tally.refresh(|| {
+            calls += 1;
+            calls > 2
+        }));
+        assert_eq!(tally.counts().total(), 2);
+
+        // Another rotation moves the file the cursor is in, before it resumes.
+        log.rotate(3);
+        log.append(&gh(7, &["api", "graphql"], "daemon"));
+        assert!(tally.refresh(never));
+        assert_eq!(tally.counts().total(), 7);
+        assert_eq!(
+            *tally.counts(),
+            full_scan_of(&[&log.rotated(2), &log.rotated(1), &log.path])
+        );
     }
 
     #[test]

@@ -966,6 +966,43 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The rotated siblings of the log at `path` that exist now: `<path>.<N>` for a
+/// decimal `N`, in ascending order of `N` — newest first, since [`rotate`] shifts
+/// every file up and starts the numbering at `.1`.
+///
+/// Lists what is on disk rather than counting up to `OMNI_DEV_LOG_KEEP_FILES`,
+/// because that variable is read per write by whichever process writes, so a
+/// reader cannot know the value the rotating writer used. Anything that is not
+/// all digits after the dot (`.lock`, an editor's `.1.bak`) is not a rotated file.
+/// A missing or unreadable directory has none.
+pub(crate) fn rotated_files(path: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut prefix = name.to_owned();
+    prefix.push(".");
+    let prefix = prefix.to_string_lossy();
+    let mut rotated: Vec<(u32, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let number = file_name
+                .to_string_lossy()
+                .strip_prefix(&*prefix)?
+                .to_owned();
+            if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some((number.parse().ok()?, entry.path()))
+        })
+        .collect();
+    rotated.sort_by_key(|&(number, _)| number);
+    rotated.into_iter().map(|(_, path)| path).collect()
+}
+
 /// Parses a human byte size: a number (with optional decimal) and an optional
 /// unit suffix — `b` (bytes, the default), `k`/`kb`/`kib`, `m`/`mb`/`mib`,
 /// `g`/`gb`/`gib` (case-insensitive, all binary/1024-based).
@@ -1037,8 +1074,13 @@ fn rotation_config() -> Option<RotationConfig> {
 /// Rotates `log.jsonl` → `log.jsonl.1`, shifting existing numbered files up and
 /// dropping any beyond `keep_files` (`keep_files == 0` simply discards the
 /// current file). Rotated files inherit the `0600` mode of their source.
+///
+/// Only renames: a file keeps its `(device, inode)` as it moves up, which is how
+/// the github counters follow their position across a rotation
+/// ([`rotated_files`]). `pub(crate)` so their tests rotate with this function
+/// instead of a copy of it.
 #[cfg(unix)]
-fn rotate(path: &Path, keep_files: u32) -> anyhow::Result<()> {
+pub(crate) fn rotate(path: &Path, keep_files: u32) -> anyhow::Result<()> {
     if keep_files == 0 {
         // Retain no history: dropping the current file lets the caller start a
         // fresh one on the following append.
@@ -4090,6 +4132,71 @@ mod tests {
         // No .1 is retained; only the current (single-line) file survives.
         assert!(!sibling(&path, ".1").exists());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), line);
+    }
+
+    #[test]
+    fn rotated_files_lists_numbered_siblings_in_numeric_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        for name in [
+            "log.jsonl",
+            "log.jsonl.1",
+            "log.jsonl.2",
+            "log.jsonl.10",
+            "log.jsonl.9",
+            // Not rotated files: the writers' lock, a backup of one, a trailing dot,
+            // a non-number, a number too large for a count, another log's rotation.
+            "log.jsonl.lock",
+            "log.jsonl.1.bak",
+            "log.jsonl.",
+            "log.jsonl.x",
+            "log.jsonl.99999999999",
+            "other.jsonl.3",
+        ] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+
+        let names: Vec<_> = rotated_files(&path)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // Numeric, not lexicographic: `.9` comes before `.10`.
+        assert_eq!(
+            names,
+            ["log.jsonl.1", "log.jsonl.2", "log.jsonl.9", "log.jsonl.10"]
+        );
+    }
+
+    #[test]
+    fn rotated_files_of_a_missing_directory_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(rotated_files(&dir.path().join("gone").join("log.jsonl")).is_empty());
+        assert!(rotated_files(Path::new("/")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotated_files_finds_what_rotation_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let cfg = RotationConfig {
+            max_size: 20,
+            keep_files: 3,
+        };
+        let line = "0123456789012345\n"; // 17 bytes: every append rotates
+        for _ in 0..7 {
+            append_with_rotation(&path, line, &cfg).unwrap();
+        }
+        // The lock file is left next to them; it is not one.
+        assert!(sibling(&path, ".lock").exists());
+        assert_eq!(
+            rotated_files(&path),
+            [
+                sibling(&path, ".1"),
+                sibling(&path, ".2"),
+                sibling(&path, ".3")
+            ]
+        );
     }
 
     #[test]
