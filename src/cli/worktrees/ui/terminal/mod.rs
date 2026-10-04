@@ -66,7 +66,9 @@ impl TabKind {
 }
 
 /// `omni-dev <wrapper> -- <program>` — how an agent tab launches its agent,
-/// through this binary's own wrapper so the session reports its state.
+/// through this binary's own wrapper. `codex-wrap` then reports the session's
+/// exact state; `claude-wrap` reports nothing under this PTY (see
+/// [`TabKind::Claude`], #2152).
 fn wrapped(wrapper: &str, program: &str) -> (String, Vec<String>) {
     let exe = std::env::current_exe().map_or_else(
         |_| "omni-dev".to_string(),
