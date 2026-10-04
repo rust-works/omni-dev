@@ -895,6 +895,9 @@ fn push_skip_reason_text(reason: worktree_push::SkipReason) -> &'static str {
             "refusing to force-push the remote default branch; \
              fast-forward it or open a PR instead"
         }
+        SkipReason::HistoryUnreadable => {
+            "could not read its history to compare it with its upstream"
+        }
     }
 }
 
@@ -4547,6 +4550,9 @@ mod tests {
             outcome(PushResult::Skipped {
                 reason: SkipReason::NoRemote,
             }),
+            outcome(PushResult::Skipped {
+                reason: SkipReason::HistoryUnreadable,
+            }),
         ]);
 
         for expected in [
@@ -4560,6 +4566,7 @@ mod tests {
             "detached HEAD",
             "not a git worktree",
             "no remote to publish to",
+            "could not read its history to compare it with its upstream",
         ] {
             assert!(
                 rendered.contains(expected),

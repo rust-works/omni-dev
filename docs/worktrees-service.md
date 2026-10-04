@@ -328,7 +328,11 @@ neither is a usage error, not a silent mass-push. Each worktree is reported as
 `created` / `rejected` / `skipped(<reason>)` (`-o json` for the machine shape). A
 **dirty worktree is not skipped** — a push publishes commits, not the working
 tree — while a detached HEAD (which includes one sitting mid-rebase), a
-non-worktree path, and a branch with no remote to publish to are. A push publishes
+non-worktree path, a branch with no remote to publish to, and a branch whose
+history cannot be compared with its upstream (`history-unreadable`: a tip has no
+commit behind it in the object database) are. That last one is a skip rather than
+`up-to-date` on purpose (#2163): neither is pending, so nothing is pushed either
+way, but only the skip says the branch was **not** checked. A push publishes
 history to everyone, so the command confirms by default
 ([ADR-0027](adrs/adr-0027.md)); the prompt names how many of the batch are force
 pushes separately from the total. This subcommand takes no `--socket` (it never
@@ -356,6 +360,18 @@ rather than `is_main`, so a linked worktree with `main` checked out is refused t
 push. A branch with no upstream is published with `--set-upstream` rather than
 refused. Pushing to a remote other than the branch's own upstream is not
 supported.
+
+**Shallow clones (#2163).** A linked worktree of a `git clone --depth` repository is
+classified against the cut history, with the counts `git rev-list --left-right
+--count` gives. git keeps the `shallow` marker in the repository's common dir, but
+libgit2 looks for it only through the gitdir of the handle it opened — for a linked
+worktree `<commondir>/worktrees/<name>` — so a walk through that handle runs into the
+parents the clone does not have and fails. That failure used to be classified as
+`up-to-date`, so a branch with unpublished commits, or a rebased one that needed its
+lease-checked force-push, was never pushed and nothing said why. The classifier now
+reads shallowness from `<commondir>/shallow` and walks through a handle opened at the
+common dir (`crate::git::shallow`, which the daemon's `ahead-behind` op shares; see
+[Git enrichment](#git-enrichment)).
 
 `worktrees merge-queue` enqueues eligible worktrees' pull requests into the GitHub
 merge queue — the daemon's two-phase `merge-queue` op driven from the CLI (#1401).
@@ -1678,8 +1694,8 @@ extension never runs git.
   reports a shallow clone as complete and does not apply its cut: the walk runs into
   the parents a `--depth` clone does not have and fails, which would drop the row's
   counts. So shallowness is read from `<commondir>/shallow` directly
-  (`divergence::is_shallow`), and a shallow repository's walks go through a handle
-  opened at the common dir. Only a shallow clone's linked worktrees pay for it: up to
+  (`crate::git::shallow::is_shallow`, shared with the `push` classifier, #2163), and
+  a shallow repository's walks go through a handle opened at the common dir. Only a shallow clone's linked worktrees pay for it: up to
   two extra, transient opens per worktree (one per walk), and libgit2 shares pack
   file descriptors across handles.
 - **`main_behind` rides the same lazy op (#1457).** `repo_main_behind`

@@ -61,6 +61,7 @@ use serde::Serialize;
 
 use crate::git::remote::RemoteInfo;
 use crate::git::resolve_git_binary;
+use crate::git::shallow;
 use crate::git::worktree_batch::{
     head_branch, is_false, resolve_selection, run_git_in, trimmed_stderr,
 };
@@ -229,6 +230,13 @@ pub enum SkipReason {
     /// `git reflog`-recoverable, but force-pushing the default branch publishes
     /// that rewrite to everyone (ADR-0061).
     DefaultBranchForcePush,
+    /// The branch's history could not be compared with its upstream: a tip has no
+    /// commit behind it in this object database (a truncated fetch, a pruned pack),
+    /// or a shallow clone's cut could not be applied. Nothing is pushed — above all,
+    /// never a force on the strength of a comparison that failed — but the row says
+    /// the branch was **not** checked, which [`PushResult::UpToDate`] would claim it
+    /// was.
+    HistoryUnreadable,
 }
 
 /// The three shapes a push can take, each with its own flags.
@@ -319,10 +327,18 @@ fn classify(path: &Path) -> WorktreeOutcome {
         return outcome(PushResult::WouldCreate);
     };
 
-    let Some((ahead, behind)) = repo.graph_ahead_behind(head, upstream_oid).ok() else {
-        // Either tip is unreachable in this object database — treat it as nothing
-        // to publish rather than guessing at a force.
-        return outcome(PushResult::UpToDate);
+    // Through `shallow`, not `repo`: a handle rooted at a linked worktree of a shallow
+    // clone does not apply the cut, and its walk fails on the parents the clone lacks
+    // (#2163).
+    let Some((ahead, behind)) = shallow::graph_ahead_behind(&repo, head, upstream_oid) else {
+        // Either tip has no commit behind it in this object database. Divergence is
+        // then unknowable, and the safe reading of that is to push nothing — never a
+        // force, which would overwrite the remote on the strength of a comparison that
+        // failed. It is a skip and not `UpToDate`, so a row that was not checked cannot
+        // read as one that was.
+        return outcome(PushResult::Skipped {
+            reason: SkipReason::HistoryUnreadable,
+        });
     };
 
     match (ahead, behind) {
@@ -871,12 +887,13 @@ mod tests {
     }
 
     #[test]
-    fn a_dangling_upstream_ref_is_not_guessed_at_as_a_force() {
+    fn a_dangling_upstream_ref_is_skipped_rather_than_guessed_at_as_a_force() {
         // The remote-tracking ref resolves, but the commit it names is absent from
         // the object database (a truncated fetch, a pruned pack). Divergence is then
-        // unknowable — and the safe reading of "unknowable" is *nothing to publish*,
-        // never a force, which would overwrite the remote on the strength of a
-        // comparison that failed.
+        // unknowable — and the safe reading of "unknowable" is *push nothing*, never
+        // a force, which would overwrite the remote on the strength of a comparison
+        // that failed. It must not read as `UpToDate` either: that claims the branch
+        // was checked and has nothing to publish, which is how #2163 stayed hidden.
         let _guard = serial();
         let scenario = Scenario::new();
         let wt = scenario.add_worktree("feature-a");
@@ -894,7 +911,58 @@ mod tests {
         std::fs::create_dir_all(tracking.parent().unwrap()).unwrap();
         std::fs::write(&tracking, "0123456789abcdef0123456789abcdef01234567\n").unwrap();
 
-        assert_eq!(classify(&wt).result, PushResult::UpToDate);
+        let outcome = classify(&wt);
+        assert_eq!(
+            outcome.result,
+            PushResult::Skipped {
+                reason: SkipReason::HistoryUnreadable
+            }
+        );
+        assert!(
+            !outcome.result.is_pending(),
+            "nothing may be pushed on a comparison that failed"
+        );
+    }
+
+    /// The unreadable-history skip is never acted on: `execute` hands it back
+    /// untouched without so much as spawning `git` (a spawn of this binary would
+    /// surface as `Rejected`).
+    #[test]
+    fn executing_an_unreadable_history_skip_runs_nothing() {
+        let skipped = WorktreeOutcome {
+            path: PathBuf::from("/x"),
+            branch: Some("feature".into()),
+            remote: "origin".into(),
+            remote_branch: "feature".into(),
+            result: PushResult::Skipped {
+                reason: SkipReason::HistoryUnreadable,
+            },
+        };
+        let opts = PushOptions {
+            git_bin: Some(PathBuf::from("/no/such/git/xyzzy")),
+        };
+
+        let executed = execute(
+            Plan {
+                worktrees: vec![skipped.clone()],
+            },
+            &opts,
+        );
+        assert_eq!(executed, vec![skipped]);
+    }
+
+    /// The reason is part of the daemon's wire protocol, which the VS Code
+    /// extension's `skipReasonText` switches on.
+    #[test]
+    fn an_unreadable_history_skip_has_a_stable_wire_name() {
+        let wire = serde_json::to_value(PushResult::Skipped {
+            reason: SkipReason::HistoryUnreadable,
+        })
+        .unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({ "status": "skipped", "reason": "history-unreadable" })
+        );
     }
 
     #[test]
@@ -938,6 +1006,127 @@ mod tests {
             classify(&wt).result,
             PushResult::WouldFastForward { ahead: 1 },
             "a dirty tree must not suppress a push"
+        );
+    }
+
+    // ── shallow clones (#2163) ────────────────────────────────────────────
+    //
+    // git keeps a shallow clone's `shallow` marker in the common dir, but libgit2
+    // applies the cut only through the handle it opened, so a handle rooted at a
+    // linked worktree walks into the parents a `--depth` clone lacks and fails. That
+    // failure used to be classified as `UpToDate`, hiding every unpublished commit.
+
+    #[test]
+    fn a_linked_worktree_of_a_shallow_clone_ahead_of_its_upstream_would_fast_forward() {
+        let _guard = serial();
+        let scenario = Scenario::new();
+        scenario.commit_in(&scenario.local, "file.txt", "second\n", "second");
+        scenario.git_in(&scenario.local, &["push", "origin", "main"]);
+        let wt = scenario.add_worktree("feature-a");
+        scenario.publish(&wt, "feature-a");
+        scenario.commit_in(&wt, "file.txt", "local\n", "local work");
+        scenario.cut_history_behind_main();
+
+        assert_eq!(
+            classify(&wt).result,
+            PushResult::WouldFastForward { ahead: 1 },
+            "the cut must be applied, not mistaken for nothing to publish"
+        );
+    }
+
+    #[test]
+    fn a_rewritten_branch_in_a_linked_worktree_of_a_shallow_clone_would_force() {
+        let _guard = serial();
+        let scenario = Scenario::new();
+        scenario.commit_in(&scenario.local, "file.txt", "second\n", "second");
+        scenario.git_in(&scenario.local, &["push", "origin", "main"]);
+        let wt = scenario.add_worktree("feature-a");
+        scenario.commit_in(&wt, "file.txt", "worktree first\n", "first");
+        scenario.publish(&wt, "feature-a");
+        scenario.git_in(&wt, &["commit", "--amend", "-m", "rewritten"]);
+        scenario.cut_history_behind_main();
+
+        assert_eq!(
+            classify(&wt).result,
+            PushResult::WouldForce {
+                ahead: 1,
+                behind: 1
+            },
+            "a rebased branch needs its lease-checked force-push, and must not read as published"
+        );
+    }
+
+    /// The issue's reproduction with a real `git clone --depth 1`, so the synthetic
+    /// fixtures above are anchored to what git itself leaves behind: a linked
+    /// worktree with one local commit tracking `origin/main`, then a shallow fetch
+    /// after `origin/main` moved. git counts 2 ahead and 1 behind.
+    #[test]
+    fn a_linked_worktree_of_a_real_depth_clone_is_classified_against_the_cut_history() {
+        let _guard = serial();
+        let scenario = Scenario::new();
+        scenario.commit_in(&scenario.local, "file.txt", "two\n", "two");
+        scenario.commit_in(&scenario.local, "file.txt", "three\n", "three");
+        scenario.git_in(&scenario.local, &["push", "origin", "main"]);
+
+        let url = format!("file://{}", scenario.origin.display());
+        git_at(
+            scenario.root.path(),
+            &["clone", "--depth", "1", &url, "clone"],
+        );
+        let clone = scenario.root.path().join("clone");
+        config_repo(&clone, "Test", "test@example.com");
+        let wt = scenario.root.path().join("feature");
+        git_at(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+                "origin/main",
+            ],
+        );
+        git_at(&wt, &["branch", "--set-upstream-to=origin/main"]);
+        scenario.commit_in(&wt, "local.txt", "local\n", "local");
+        let wt = std::fs::canonicalize(&wt).unwrap();
+
+        // Ahead only: a fast-forward, which the default branch allows.
+        assert_eq!(
+            classify(&wt).result,
+            PushResult::WouldFastForward { ahead: 1 }
+        );
+
+        // `origin/main` moves and the clone follows it at depth 1.
+        scenario.commit_in(&scenario.local, "file.txt", "four\n", "four");
+        scenario.git_in(&scenario.local, &["push", "origin", "main"]);
+        git_at(&clone, &["fetch", "--depth", "1", "origin"]);
+
+        let counts = run_git_in(
+            &resolve_git_binary(),
+            &wt,
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                "feature...origin/main",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&counts.stdout)
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["2", "1"],
+            "git's own count for the fixture"
+        );
+        // Diverged, on the remote default branch: refused rather than forced — and,
+        // above all, not `UpToDate`, which is what the failed walk used to report.
+        assert_eq!(
+            classify(&wt).result,
+            PushResult::Skipped {
+                reason: SkipReason::DefaultBranchForcePush
+            }
         );
     }
 
@@ -1388,6 +1577,19 @@ mod tests {
                 .unwrap()
                 .refname_to_id(refname)
                 .ok()
+        }
+
+        /// Cuts `local`'s history the way a `--depth 1` clone is: its `main` tip
+        /// becomes a shallow root and the commit behind it is gone from the object
+        /// database. Done last, since every git command after it would trip over
+        /// the missing object.
+        fn cut_history_behind_main(&self) {
+            use crate::test_support::shallow_repo::{forget_object, mark_shallow};
+            let repo = Repository::open(&self.local).unwrap();
+            let tip = repo.refname_to_id("refs/heads/main").unwrap();
+            let parent = repo.find_commit(tip).unwrap().parent_id(0).unwrap();
+            mark_shallow(&repo, tip);
+            forget_object(&repo, parent);
         }
 
         /// A worktree's current HEAD commit.

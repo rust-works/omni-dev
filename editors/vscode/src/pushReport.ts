@@ -74,6 +74,8 @@ export function skipReasonText(reason: string | undefined): string {
       return "no remote to publish to";
     case "default-branch-force-push":
       return "refusing to force-push the default branch";
+    case "history-unreadable":
+      return "could not read its history to compare it with its upstream";
     default:
       return reason ?? "skipped";
   }

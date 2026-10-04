@@ -150,12 +150,34 @@ test("nothingToPushMessage names why, so the action never looks like a silent fa
   assert.equal(nothingToPushMessage({}, 0), "nothing to push");
 });
 
+test("a row whose history could not be read is reported as skipped, never as up to date", () => {
+  const reply: PushReply = {
+    worktrees: [
+      outcome({ status: "skipped", branch: "a", reason: "history-unreadable" }),
+      outcome({ status: "up-to-date", branch: "b" }),
+    ],
+  };
+  assert.deepEqual(
+    skippedOutcomes(reply).map((w) => w.branch),
+    ["a"],
+  );
+  assert.equal(upToDateCount(reply), 1);
+  assert.equal(
+    nothingToPushMessage(reply, 2),
+    "1 of 2 skipped (could not read its history to compare it with its upstream), 1 already up to date",
+  );
+});
+
 test("skipReasonText renders each slug and falls through to an unknown one", () => {
   assert.equal(skipReasonText("detached-head"), "detached HEAD");
   assert.equal(skipReasonText("no-remote"), "no remote to publish to");
   assert.equal(
     skipReasonText("default-branch-force-push"),
     "refusing to force-push the default branch",
+  );
+  assert.equal(
+    skipReasonText("history-unreadable"),
+    "could not read its history to compare it with its upstream",
   );
   assert.equal(
     skipReasonText("something-a-newer-daemon-invented"),
