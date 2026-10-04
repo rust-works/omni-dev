@@ -27,9 +27,11 @@
 //! `system`/`init` line, same as every other identity field here.
 //!
 //! The CLI answers a `set_model` with a local notice, a `user` line echoed just
-//! before the `control_response`, that no turn stands behind. The tracker holds
-//! the request open until its response arrives and does not read a `user` line
-//! in that window as work (#2153).
+//! before the `control_response`, that no turn stands behind. So a `user` line
+//! the CLI writes is never read as work: a replayed prompt is written in the
+//! same instant as the turn's first `assistant` line and a tool result after
+//! one (measured on Claude Code 2.1.288), which leaves it nothing to say that
+//! the turn's own `assistant`/`stream_event` lines do not (#2153).
 //!
 //! Nothing here does I/O and nothing here retains conversation content: only the
 //! message `type`/`subtype`, the identity fields (`session_id`, `cwd`, `model`)
@@ -52,13 +54,6 @@ use super::{ObserveRequest, SessionEvent, SessionState};
 /// against a malformed or adversarial stream; ids past the cap are dropped,
 /// which can only ever make the tracker return to `working` early.
 const MAX_PENDING_PERMISSIONS: usize = 64;
-
-/// Ceiling on `set_model` requests tracked as unanswered at once.
-///
-/// The CLI answers each within milliseconds, so this only bounds memory against
-/// a malformed or adversarial stream; ids past the cap are dropped, which can
-/// only ever bring back the stale `working` this tracking exists to prevent.
-const MAX_PENDING_MODEL_SWITCHES: usize = 16;
 
 /// Which side of the wrapped process's stdio a line was observed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,10 +157,6 @@ pub struct StreamTracker {
     base: SessionState,
     /// The `request_id`s of permission prompts asked but not yet answered.
     pending: HashSet<String>,
-    /// The `request_id`s of `set_model` requests the editor sent that the CLI
-    /// has not yet answered. While any is open, a `user` line is that
-    /// request's own model-switch notice rather than a turn (#2153).
-    switching: HashSet<String>,
     /// The (state, model) pair most recently returned to the caller, for
     /// change detection. Both dimensions are tracked because they change
     /// independently: an ordinary turn changes state without the model, while
@@ -189,7 +180,6 @@ impl StreamTracker {
             // tab the user opened and has not typed into is not doing work.
             base: SessionState::Idle,
             pending: HashSet::new(),
-            switching: HashSet::new(),
             reported: None,
             diagnostics: StreamDiagnostics::default(),
         }
@@ -330,26 +320,23 @@ impl StreamTracker {
     }
 
     /// Applies a line's state effect: content messages move [`Self::base`],
-    /// control messages open and close permission prompts and `set_model`
-    /// windows.
+    /// control messages open and close permission prompts.
     fn apply(&mut self, direction: Direction, parsed: &StreamLine) {
         match parsed.kind.as_deref() {
             // The session announced itself but has not been prompted yet.
             Some("system") if parsed.subtype.as_deref() == Some("init") => {
                 self.base = SessionState::Idle;
-                // A new turn has begun, so a switch whose answer never came
-                // cannot go on hiding the turn's own `user` lines.
-                self.switching.clear();
             }
-            // The local notice that answers a `set_model`: the CLI writes it
-            // as a `user` line just ahead of the `control_response`, with no
-            // turn behind it, so reading it as one leaves the session on
-            // `working` until the next `system`/`init` (#2153). Only `user` is
-            // held back: `assistant` and `stream_event` come from a model
-            // request, which a notice never makes.
-            Some("user") if !self.switching.is_empty() => {}
-            // A replayed user prompt, a streamed assistant reply, or a tool
-            // result: the turn is running.
+            // A `user` line the CLI writes is never the first sign of a turn: a
+            // replayed prompt lands with the first `assistant` line, a tool
+            // result follows one, and a local notice, such as the answer to an
+            // SDK `set_model`, has no turn behind it. Reading it as one left
+            // the session `working` until the next `system`/`init` (#2153).
+            // Nothing is lost, since the turn's own `assistant`/`stream_event`
+            // lines still say it is running.
+            Some("user") if direction == Direction::FromClaude => {}
+            // The editor's own prompt, which starts a turn, or a streamed
+            // assistant reply: the turn is running.
             Some("assistant" | "user" | "stream_event") => self.base = SessionState::Working,
             // The turn finished. Also the drift backstop: if the stream ever
             // stops answering a permission request in a shape this tracker
@@ -365,37 +352,7 @@ impl StreamTracker {
             Some("control_response") if direction == Direction::ToClaude => {
                 self.close_permission(parsed);
             }
-            Some("control_request") if direction == Direction::ToClaude => {
-                self.open_model_switch(parsed);
-            }
-            Some("control_response") if direction == Direction::FromClaude => {
-                self.close_model_switch(parsed);
-            }
             _ => {}
-        }
-    }
-
-    /// Records a `set_model` the editor sent as unanswered. Every other editor
-    /// request is ignored: `set_model` is the one the CLI answers with a `user`
-    /// line, so nothing else needs the notice told apart from a turn.
-    fn open_model_switch(&mut self, parsed: &StreamLine) {
-        let body = parsed.request.as_ref();
-        if body.and_then(|b| b.subtype.as_deref()) != Some("set_model") {
-            return;
-        }
-        if let Some(id) = correlation_id(parsed, body) {
-            if self.switching.len() < MAX_PENDING_MODEL_SWITCHES {
-                self.switching.insert(id);
-            }
-        }
-    }
-
-    /// Clears the `set_model` a `control_response` from the CLI answers, whether
-    /// it succeeded or not.
-    fn close_model_switch(&mut self, parsed: &StreamLine) {
-        let body = parsed.response.as_ref();
-        if let Some(id) = correlation_id(parsed, body) {
-            self.switching.remove(&id);
         }
     }
 
@@ -584,9 +541,10 @@ mod tests {
     #[test]
     fn a_turn_reports_working_then_idle_once_each() {
         let mut tracker = tracker_after_init();
+        // The editor's prompt, written to the CLI's stdin, starts the turn.
         let working = tracker
             .observe_line(
-                Direction::FromClaude,
+                Direction::ToClaude,
                 r#"{"type":"user","session_id":"sess-1"}"#,
             )
             .unwrap();
@@ -934,13 +892,15 @@ mod tests {
     }
 
     // What Claude Code 2.1.288 sends after an SDK `set_model` (#2153): the
-    // request, then a local notice as a `user` line, then the `control_response`
-    // — the notice lands before the response, 2 ms after the request. The
-    // notice's content is elided; the tracker never reads it.
+    // request, then a local notice as a `user` line, then the `control_response`,
+    // the last two within 2 ms of the request. The notice's content is elided;
+    // the tracker never reads it. Its `isReplay` flag is no tell, since a
+    // replayed prompt carries it too.
     const SET_MODEL: &str = r#"{"type":"control_request","request_id":"sm-1","request":{"subtype":"set_model","model":"claude-sonnet-5"}}"#;
     const SWITCH_NOTICE: &str = r#"{"type":"user","message":{"role":"user","content":"…"},"session_id":"sess-1","parent_tool_use_id":null,"uuid":"u-1","timestamp":"2026-10-04T03:23:46.172Z","isReplay":true}"#;
     const SWITCH_ANSWER: &str =
         r#"{"type":"control_response","response":{"subtype":"success","request_id":"sm-1"}}"#;
+    const EDITOR_PROMPT: &str = r#"{"type":"user","session_id":"sess-1"}"#;
 
     /// A tracker that has run one turn to its `result`, so it is idle.
     fn after_a_finished_turn() -> StreamTracker {
@@ -972,140 +932,87 @@ mod tests {
     }
 
     #[test]
-    fn a_user_line_after_the_switch_is_answered_is_a_turn_again() {
-        for subtype in ["success", "error"] {
+    fn a_model_switch_is_not_a_turn_in_whatever_order_the_lines_arrive() {
+        // The two stdio pumps tee independently, so the CLI's reply can be seen
+        // before the editor's request it answers.
+        let lines = [
+            (Direction::ToClaude, SET_MODEL),
+            (Direction::FromClaude, SWITCH_NOTICE),
+            (Direction::FromClaude, SWITCH_ANSWER),
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
             let mut tracker = after_a_finished_turn();
-            tracker.observe_line(Direction::ToClaude, SET_MODEL);
-            tracker.observe_line(Direction::FromClaude, SWITCH_NOTICE);
-            tracker.observe_line(
-                Direction::FromClaude,
-                &format!(
-                    r#"{{"type":"control_response","response":{{"subtype":"{subtype}","request_id":"sm-1"}}}}"#
-                ),
-            );
-            let working = tracker
-                .observe_line(Direction::FromClaude, r#"{"type":"user"}"#)
-                .unwrap();
+            for index in order {
+                let (direction, line) = lines[index];
+                if let Some(request) = tracker.observe_line(direction, line) {
+                    assert_eq!(state_of(&request), SessionState::Idle, "{order:?}");
+                }
+            }
             assert_eq!(
-                state_of(&working),
-                SessionState::Working,
-                "after a {subtype} response"
+                state_of(&current(&tracker).unwrap()),
+                SessionState::Idle,
+                "{order:?}"
             );
+            assert!(tracker.keepalive().is_none(), "{order:?}");
         }
     }
 
     #[test]
-    fn an_answer_to_another_request_does_not_close_a_model_switch() {
+    fn the_editors_prompt_still_starts_a_turn_after_a_model_switch() {
+        // An SDK caller can send `set_model` and its next prompt back to back.
         let mut tracker = after_a_finished_turn();
         tracker.observe_line(Direction::ToClaude, SET_MODEL);
+        let working = tracker
+            .observe_line(Direction::ToClaude, EDITOR_PROMPT)
+            .unwrap();
+        assert_eq!(state_of(&working), SessionState::Working);
+        // The CLI's notice, arriving after the prompt, does not end the turn.
+        assert!(tracker
+            .observe_line(Direction::FromClaude, SWITCH_NOTICE)
+            .is_none());
+        assert_eq!(state_of(&current(&tracker).unwrap()), SessionState::Working);
+    }
+
+    #[test]
+    fn a_tool_turn_is_working_from_its_first_assistant_line_to_its_result() {
+        // The line order of a real turn that reads a file, run with
+        // `--replay-user-messages` on Claude Code 2.1.288: the replayed prompt
+        // is written with the first `assistant` line and a tool result after
+        // one, so neither is what tells the turn is running.
+        let mut tracker = tracker_after_init();
         assert!(tracker
             .observe_line(
                 Direction::FromClaude,
-                r#"{"type":"control_response","response":{"subtype":"success","request_id":"other"}}"#,
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text"}]},"session_id":"sess-1","isReplay":true}"#,
             )
             .is_none());
-        assert!(tracker
-            .observe_line(Direction::FromClaude, SWITCH_NOTICE)
-            .is_none());
-        assert_eq!(state_of(&current(&tracker).unwrap()), SessionState::Idle);
-    }
-
-    #[test]
-    fn an_assistant_line_during_a_model_switch_is_still_a_turn() {
-        // Only `user` is held back: a model request, not a notice, produces
-        // `assistant` and `stream_event`, so a turn overlapping a switch shows.
-        for line in [r#"{"type":"assistant"}"#, r#"{"type":"stream_event"}"#] {
-            let mut tracker = after_a_finished_turn();
-            tracker.observe_line(Direction::ToClaude, SET_MODEL);
-            let working = tracker.observe_line(Direction::FromClaude, line).unwrap();
-            assert_eq!(state_of(&working), SessionState::Working, "{line}");
-        }
-    }
-
-    #[test]
-    fn a_model_switch_during_a_turn_leaves_it_working() {
-        let mut tracker = tracker_after_init();
-        tracker.observe_line(Direction::FromClaude, r#"{"type":"assistant"}"#);
-        let switched = tracker
-            .observe_line(Direction::ToClaude, SET_MODEL)
+        let working = tracker
+            .observe_line(
+                Direction::FromClaude,
+                r#"{"type":"assistant","message":{"content":[{"type":"thinking"}]}}"#,
+            )
             .unwrap();
-        assert_eq!(state_of(&switched), SessionState::Working);
-        assert!(tracker
-            .observe_line(Direction::FromClaude, SWITCH_NOTICE)
-            .is_none());
-        assert!(tracker
-            .observe_line(Direction::FromClaude, SWITCH_ANSWER)
-            .is_none());
+        assert_eq!(state_of(&working), SessionState::Working);
+        for line in [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text"}]}}"#,
+        ] {
+            assert!(tracker.observe_line(Direction::FromClaude, line).is_none());
+        }
         let idle = tracker
-            .observe_line(Direction::FromClaude, r#"{"type":"result"}"#)
+            .observe_line(
+                Direction::FromClaude,
+                r#"{"type":"result","subtype":"success"}"#,
+            )
             .unwrap();
         assert_eq!(state_of(&idle), SessionState::Idle);
-    }
-
-    #[test]
-    fn a_new_turns_init_closes_a_model_switch_that_was_never_answered() {
-        let mut tracker = after_a_finished_turn();
-        tracker.observe_line(Direction::ToClaude, SET_MODEL);
-        // The response never arrives; the next turn announces itself instead.
-        tracker.observe_line(Direction::FromClaude, INIT);
-        let working = tracker
-            .observe_line(Direction::FromClaude, r#"{"type":"user"}"#)
-            .unwrap();
-        assert_eq!(state_of(&working), SessionState::Working);
-    }
-
-    #[test]
-    fn a_set_model_is_tracked_only_from_the_editor_and_by_id() {
-        // The same line seen on the wrong direction is not the editor's request.
-        let mut tracker = after_a_finished_turn();
-        tracker.observe_line(Direction::FromClaude, SET_MODEL);
-        assert!(tracker.switching.is_empty());
-        let working = tracker
-            .observe_line(Direction::FromClaude, r#"{"type":"user"}"#)
-            .unwrap();
-        assert_eq!(state_of(&working), SessionState::Working);
-        // A request that names no id cannot be matched to its answer.
-        let mut tracker = after_a_finished_turn();
-        tracker.observe_line(
-            Direction::ToClaude,
-            r#"{"type":"control_request","request":{"subtype":"set_model","model":"claude-sonnet-5"}}"#,
-        );
-        assert!(tracker.switching.is_empty());
-    }
-
-    #[test]
-    fn other_editor_control_requests_do_not_hold_back_a_user_line() {
-        // `set_model` is the one subtype the CLI answers with a `user` line, so a
-        // replayed prompt is not hidden while the editor polls something else.
-        for subtype in [
-            "initialize",
-            "mcp_status",
-            "set_permission_mode",
-            "interrupt",
-        ] {
-            let mut tracker = after_a_finished_turn();
-            tracker.observe_line(
-                Direction::ToClaude,
-                &format!(
-                    r#"{{"type":"control_request","request_id":"c","request":{{"subtype":"{subtype}"}}}}"#
-                ),
-            );
-            let working = tracker
-                .observe_line(Direction::FromClaude, r#"{"type":"user"}"#)
-                .unwrap();
-            assert_eq!(state_of(&working), SessionState::Working, "{subtype}");
-        }
-    }
-
-    #[test]
-    fn unanswered_model_switches_are_capped() {
-        let mut tracker = after_a_finished_turn();
-        for i in 0..(MAX_PENDING_MODEL_SWITCHES + 10) {
-            let line = format!(
-                r#"{{"type":"control_request","request_id":"sm-{i}","request":{{"subtype":"set_model","model":"claude-sonnet-5"}}}}"#
-            );
-            tracker.observe_line(Direction::ToClaude, &line);
-        }
-        assert_eq!(tracker.switching.len(), MAX_PENDING_MODEL_SWITCHES);
     }
 }

@@ -177,7 +177,8 @@ Where the mod is and is not enough:
   bracket it, though the forwarder prototype did not map it.
 - **`/model`.** `classic.PreModelSwitch` / `PostModelSwitch` with `source` `command`
   (terminal) or `sdk` (`set_model`); `turn.step.model` carries the model of each request.
-  The wrapper, by contrast, stays `working` after an SDK `set_model` (#2153).
+  The wrapper, by contrast, stayed `working` after an SDK `set_model` when this was
+  measured (#2153, since fixed: a `user` line the CLI writes no longer counts as work).
 - **`/clear`.** `session.end{reason: clear}`, then `classic.SessionStart{source: clear}`
   with a new `session_id`. `session.start` does not fire again.
 - **Window reload (kill and `--resume`).** `classic.SessionEnd`, then
@@ -473,4 +474,5 @@ Registry rules the design must add:
    ADR-0072 and the two code comments (`worktrees/ui/mod.rs`, `terminal/mod.rs`) still
    say otherwise and are left to #2152, since an ADR amendment and a code edit are outside
    a docs-only spike.
-3. **#2153**: `claude-wrap` reports a stale `working` after an SDK `set_model`.
+3. **#2153**: `claude-wrap` reports a stale `working` after an SDK `set_model`. Fixed
+   since: a `user` line the CLI writes is never read as work.
