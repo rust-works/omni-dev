@@ -184,10 +184,8 @@ fn walk_shallow(repo: &Repository, local: Oid, upstream: Oid) -> Option<(usize, 
     match Repository::open(repo.commondir()) {
         Ok(common) => common.graph_ahead_behind(local, upstream).ok(),
         Err(e) => {
-            tracing::debug!(
-                "cannot open {} to walk a shallow repository: {e}",
-                repo.commondir().display()
-            );
+            let path = repo.commondir().display();
+            tracing::debug!("cannot open {path} to walk a shallow repository: {e}");
             None
         }
     }
@@ -819,8 +817,8 @@ mod tests {
 
     /// A common dir that will not open leaves the row without counts, not with
     /// counts from a handle that ignores the cut, and says why at `debug`. The
-    /// capture is also what makes the log's arguments evaluate: `tracing` skips
-    /// them when nothing is listening at that level.
+    /// message is matched whole, since libgit2's own error text can name the path
+    /// too and would satisfy a bare `contains(path)`.
     #[test]
     fn a_common_dir_that_will_not_open_leaves_a_shallow_worktree_without_counts() {
         let memo = WalkMemo::with_capacity(8);
@@ -841,8 +839,12 @@ mod tests {
 
         assert_eq!(counts, None);
         assert_eq!(memo.len(), 0);
+        let logged = format!(
+            "cannot open {} to walk a shallow repository",
+            repo.commondir().display()
+        );
         assert!(
-            logs.contains("cannot open") && logs.contains(&repo.commondir().display().to_string()),
+            logs.contains(&logged),
             "the failed open was not logged with its path: {logs}"
         );
     }
