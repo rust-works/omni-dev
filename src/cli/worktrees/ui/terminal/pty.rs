@@ -278,15 +278,38 @@ mod reap_tests {
 
     /// `process_group(0)` mirrors the `setsid()` a real PTY spawn does, so
     /// the group-wide signal under test is the one production sends.
+    ///
+    /// The `pre_exec` mirrors the other half of that spawn (#2164):
+    /// `alacritty_terminal` resets `SIGHUP` to its default in the child
+    /// before `exec`, so a PTY child takes the signal even when omni-dev
+    /// itself was started under `nohup`. An ignored disposition is inherited
+    /// across `exec`, so without the reset a test process launched that way
+    /// hands its child an ignored `SIGHUP`, and only the escalation's
+    /// `SIGKILL` can end it. The child's shell cannot undo that: a signal
+    /// ignored on entry to a non-interactive shell cannot be reset by `trap`.
     fn group_leader(script: &str) -> std::process::Child {
-        let child = Command::new("/bin/sh")
+        let mut command = Command::new("/bin/sh");
+        command
             .args(["-c", script])
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        // `pre_exec` runs between fork and exec in the child, where only
+        // async-signal-safe calls are allowed, which is why it is `unsafe`
+        // and why there is no safe way to reset a disposition on `Command`.
+        // SAFETY: `signal(2)` is async-signal-safe and allocates nothing, and
+        // `SIG_DFL` is a valid disposition for `SIGHUP`.
+        #[allow(unsafe_code)]
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::signal(nix::libc::SIGHUP, nix::libc::SIG_DFL) == nix::libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
         // Let the shell install any trap before it is signalled.
         std::thread::sleep(Duration::from_millis(100));
         child
@@ -329,10 +352,17 @@ mod reap_tests {
     }
 
     /// A well-behaved child dies of `SIGHUP` and is **never** escalated —
-    /// asserted on the exit signal, not on elapsed time, so it cannot be
-    /// marginal. This is the case the earlier group-liveness poll got wrong:
-    /// a zombie still answers `kill(pid, 0)` on Linux, so polling the group
-    /// burned the whole grace period and escalated even here.
+    /// asserted on the exit signal, not on elapsed time. This is the case the
+    /// earlier group-liveness poll got wrong: a zombie still answers
+    /// `kill(pid, 0)` on Linux, so polling the group burned the whole grace
+    /// period and escalated even here.
+    ///
+    /// Timing is not what can make this fail: a sleeping child takes
+    /// `SIGHUP` in a few milliseconds even on a heavily loaded machine, a
+    /// fraction of [`REAP_GRACE`]. What can is the child's inherited
+    /// `SIGHUP` disposition, which `group_leader` pins (#2164) and
+    /// [`the_well_behaved_test_passes_when_the_test_process_ignores_sighup`]
+    /// guards.
     #[test]
     fn a_well_behaved_child_dies_of_sighup_and_is_never_escalated() {
         let mut child = group_leader("sleep 60");
@@ -344,6 +374,40 @@ mod reap_tests {
             status.signal(),
             Some(sighup()),
             "a child that honours SIGHUP must die of it, not of SIGKILL"
+        );
+    }
+
+    /// #2164: the test above must not depend on how the test process was
+    /// launched. `nohup`, or any launcher that did `trap '' HUP`, starts a
+    /// process with `SIGHUP` ignored, and every descendant inherits that
+    /// across `exec`. Re-run the test in exactly such a process: unless
+    /// `group_leader` resets the child's disposition, the child can only die
+    /// of the escalation's `SIGKILL` and the inner run fails with
+    /// `left: Some(9)`. CI never launches tests this way, so nothing else
+    /// would notice the regression.
+    #[test]
+    fn the_well_behaved_test_passes_when_the_test_process_ignores_sighup() {
+        // libtest names a lib test without the crate segment of `module_path!()`.
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let name = format!("{module}::a_well_behaved_child_dies_of_sighup_and_is_never_escalated");
+        let output = Command::new("/bin/sh")
+            .args(["-c", "trap '' HUP; exec \"$0\" \"$@\""])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--test-threads=1"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // `1 passed` as well as success: libtest exits 0 having run nothing
+        // when `--exact` matches no test, which would pass vacuously.
+        assert!(
+            output.status.success() && report.contains("1 passed"),
+            "the test failed when its process started with SIGHUP ignored:\n{report}"
         );
     }
 
