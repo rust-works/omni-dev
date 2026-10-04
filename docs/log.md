@@ -548,13 +548,22 @@ Those daemon figures count calls **since the daemon started**. It reads no part 
 the log that was already there when it started, and each summary reads only the
 records appended since the previous one, so what a summary costs does not grow with
 the size of the log — a multi-gigabyte `log.jsonl` no longer delays startup,
-`daemon status` or shutdown. If the log is replaced or truncated underneath it
-(`log prune`, size-capped rotation), the daemon rebuilds its count once from what
-the live file holds, which is what `omni-dev log count --kind gh --since <daemon
-start>` reports at that point, so records rotated into `log.jsonl.1` stop being
-counted. A summary that shutdown cut short, or that could not read the log, is
-marked `incomplete`: in the summary line, and as `"incomplete": true` in the
-`summary` op's reply.
+`daemon status` or shutdown. A [size-capped rotation](#automatic-size-capped-rotation)
+does not disturb the count: rotation only renames the log, so the daemon finds the
+file it was reading as `log.jsonl.N` by its file id, counts what was appended to it
+after the last summary, then reads every newer rotated file and the new `log.jsonl`
+in order. Several rotations between two summaries are followed the same way, and so
+is a rotation that has not yet been followed by a new `log.jsonl`. If the log is
+instead pruned (`log prune` unlinks the file it replaces), truncated or rewritten, or
+the file the daemon was reading has been rotated out of retention
+(`OMNI_DEV_LOG_KEEP_FILES`), nothing next to the log is the file it was reading, and
+it rebuilds its count once from what the live file holds, which is what `omni-dev
+log count --kind gh --since <daemon start>` reports at that point. A summary that
+shutdown cut short, or that could not read the log, is marked `incomplete`: in the
+summary line, and as `"incomplete": true` in the `summary` op's reply.
+
+`omni-dev log count` itself reads only the live `log.jsonl`, so a `--since` window
+that reaches back past the last rotation counts only what the live file holds.
 
 **Not yet counted:** the VS Code companion extension's `gh pr list` runs in a
 separate process and does not write to the log (a planned follow-up).
@@ -618,7 +627,10 @@ write, so they must be present in the environment of whatever writes the log
 requests). A set-but-invalid `OMNI_DEV_LOG_MAX_SIZE` is ignored (logged at
 `tracing::debug`) and leaves rotation off. The `omni-dev log` reader already
 tolerates truncation and rotation, so `-f/--follow` keeps working across a
-rotation (it restarts from the top of the fresh file).
+rotation (it restarts from the top of the fresh file). The daemon's GitHub-call
+counters follow a rotation through the numbered files (see [Counting GitHub API
+calls](#counting-github-api-calls)); the rotated files keep their file ids because
+rotation only renames them.
 
 ## Audit log
 
