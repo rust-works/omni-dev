@@ -154,7 +154,8 @@ Where the mod is and is not enough:
   does, with `isAborted: true`, in the terminal (about 80 ms after the key in the mod's own
   log, +153 ms for the state to reach the daemon) and in the panel.
 - **Turn start.** `turn.start` leads the wrapper's `working` by 1.3 to 2.0 s, because the
-  wrapper reports `idle` at `init` and only flips on the first assistant line.
+  wrapper reports `idle` at `init` and only flips on the first assistant line (#2173,
+  since fixed: an `init` after a prompt the editor wrote no longer reads `idle`).
 
 ### Observed sequences
 

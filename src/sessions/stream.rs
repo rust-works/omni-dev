@@ -33,6 +33,17 @@
 //! one (measured on Claude Code 2.1.288), which leaves it nothing to say that
 //! the turn's own `assistant`/`stream_event` lines do not (#2153).
 //!
+//! The editor's own prompt is the one `user` line that does start a turn, and it
+//! stays one until a `result` answers it. Claude re-emits `system`/`init` at the
+//! start of every turn, *after* that prompt, so an `init` that always meant "idle"
+//! undid the `working` the prompt had just set for the whole time to first token
+//! (about 2 s on Haiku, #2173). Whether an `init` means idle therefore depends on
+//! whether the editor has an unanswered prompt, which [`StreamTracker`] tracks as
+//! two booleans rather than a count: one `result` closes one turn, but after an
+//! interrupt the CLI folds every queued prompt into a single turn (3 prompts, 2
+//! `result`s, measured on 2.1.288), and a count nothing can drain would pin the
+//! session `working` through the keep-alive.
+//!
 //! Nothing here does I/O and nothing here retains conversation content: only the
 //! message `type`/`subtype`, the identity fields (`session_id`, `cwd`, `model`)
 //! and outstanding permission ids are ever read out of a line. Every parse is
@@ -155,6 +166,17 @@ pub struct StreamTracker {
     /// The state implied by the most recent content message, before the
     /// permission overlay is applied.
     base: SessionState,
+    /// The editor wrote a prompt on stdin that no `result` has answered yet.
+    /// What a `system`/`init` line means depends on it: the start of the turn
+    /// that prompt began (still `working`), or a CLI announcing itself with
+    /// nothing sent (`idle`).
+    prompted: bool,
+    /// A prompt was written while a turn was already running, so one more is
+    /// waiting behind it. A flag rather than a count on purpose: the CLI usually
+    /// runs queued prompts as separate turns but folds them into one after an
+    /// interrupt, so a count would be left above zero by a `result` that never
+    /// comes. The flag is spent by the next `result` whichever happened.
+    queued: bool,
     /// The `request_id`s of permission prompts asked but not yet answered.
     pending: HashSet<String>,
     /// The (state, model) pair most recently returned to the caller, for
@@ -179,6 +201,8 @@ impl StreamTracker {
             // every consumer counts as idle (#1946), so both feeds agree that a
             // tab the user opened and has not typed into is not doing work.
             base: SessionState::Idle,
+            prompted: false,
+            queued: false,
             pending: HashSet::new(),
             reported: None,
             diagnostics: StreamDiagnostics::default(),
@@ -323,9 +347,18 @@ impl StreamTracker {
     /// control messages open and close permission prompts.
     fn apply(&mut self, direction: Direction, parsed: &StreamLine) {
         match parsed.kind.as_deref() {
-            // The session announced itself but has not been prompted yet.
+            // Claude emits this at the start of every turn, after the prompt
+            // that began it. With a prompt unanswered it is that turn starting,
+            // and the model has not produced a token yet, so the session is
+            // still working: reading it as idle held a wrong cue for the whole
+            // time to first token (#2173). With nothing sent it is the session
+            // announcing itself, which has not been prompted yet.
             Some("system") if parsed.subtype.as_deref() == Some("init") => {
-                self.base = SessionState::Idle;
+                self.base = if self.prompted {
+                    SessionState::Working
+                } else {
+                    SessionState::Idle
+                };
             }
             // A `user` line the CLI writes is never the first sign of a turn: a
             // replayed prompt lands with the first `assistant` line, a tool
@@ -335,16 +368,30 @@ impl StreamTracker {
             // Nothing is lost, since the turn's own `assistant`/`stream_event`
             // lines still say it is running.
             Some("user") if direction == Direction::FromClaude => {}
-            // The editor's own prompt, which starts a turn, or a streamed
-            // assistant reply: the turn is running.
-            Some("assistant" | "user" | "stream_event") => self.base = SessionState::Working,
+            // The editor's own prompt, which starts a turn. One written while a
+            // turn is already running waits behind it.
+            Some("user") => {
+                self.queued |= self.base == SessionState::Working;
+                self.prompted = true;
+                self.base = SessionState::Working;
+            }
+            // A streamed assistant reply: the turn is running.
+            Some("assistant" | "stream_event") => self.base = SessionState::Working,
             // The turn finished. Also the drift backstop: if the stream ever
             // stops answering a permission request in a shape this tracker
             // recognizes, a completed turn unwedges it rather than pinning the
             // session on `waiting_for_permission` forever.
+            //
+            // The session is idle from here whatever is queued, since a queued
+            // prompt the CLI folded into this turn would otherwise pin it. A
+            // prompt that did wait behind this turn is carried only so that the
+            // next `init` still reads as a turn starting, and the one after
+            // that does not.
             Some("result") => {
                 self.base = SessionState::Idle;
                 self.pending.clear();
+                self.prompted = self.queued;
+                self.queued = false;
             }
             Some("control_request") if direction == Direction::FromClaude => {
                 self.open_permission(parsed);
@@ -1014,5 +1061,209 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state_of(&idle), SessionState::Idle);
+    }
+
+    // The lines of a turn, in the roles they play in the orders measured on
+    // Claude Code 2.1.288 (#2173): the editor's prompt, the `init` Claude emits
+    // after it at the start of every turn, the first model output, and the
+    // `result` that ends it (or `error_during_execution`, which an interrupt
+    // ends it with).
+    const PROMPT: (Direction, &str) = (Direction::ToClaude, EDITOR_PROMPT);
+    const TURN_INIT: (Direction, &str) = (Direction::FromClaude, INIT);
+    const FIRST_TOKEN: (Direction, &str) = (Direction::FromClaude, r#"{"type":"assistant"}"#);
+    const DONE: (Direction, &str) = (
+        Direction::FromClaude,
+        r#"{"type":"result","subtype":"success"}"#,
+    );
+    const INTERRUPTED: (Direction, &str) = (
+        Direction::FromClaude,
+        r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#,
+    );
+
+    /// The states reported, in order, as `lines` are fed to `tracker`.
+    fn reported(tracker: &mut StreamTracker, lines: &[(Direction, &str)]) -> Vec<SessionState> {
+        lines
+            .iter()
+            .filter_map(|&(direction, line)| tracker.observe_line(direction, line))
+            .map(|request| state_of(&request))
+            .collect()
+    }
+
+    #[test]
+    fn a_prompted_turn_stays_working_through_its_init_until_its_result() {
+        // The `init` after the prompt is the turn starting, not a session at
+        // rest: before this was fixed it reset the state to idle for the whole
+        // time to first token (#2173).
+        let mut tracker = after_a_finished_turn();
+        assert_eq!(
+            reported(&mut tracker, &[PROMPT, TURN_INIT]),
+            [SessionState::Working]
+        );
+        assert_eq!(state_of(&current(&tracker).unwrap()), SessionState::Working);
+        assert_eq!(
+            reported(&mut tracker, &[FIRST_TOKEN, DONE]),
+            [SessionState::Idle]
+        );
+    }
+
+    #[test]
+    fn the_first_prompt_is_reported_working_at_init_with_its_identity() {
+        // The editor's first prompt is written before any line carries a
+        // `session_id`, so it cannot be keyed as it is written. The turn's
+        // `init` is the first line that can, and it still reads as work.
+        let mut tracker = StreamTracker::new();
+        assert!(tracker
+            .observe_line(
+                Direction::ToClaude,
+                r#"{"type":"user","message":{"role":"user","content":"…"}}"#,
+            )
+            .is_none());
+        let request = tracker
+            .observe_line(TURN_INIT.0, TURN_INIT.1)
+            .expect("init is the first line that can be keyed");
+        assert_eq!(state_of(&request), SessionState::Working);
+        assert_eq!(request.session_id, "sess-1");
+        assert_eq!(request.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    #[test]
+    fn an_init_with_nothing_sent_still_reads_idle() {
+        // A prompt is answered by its `result`, so a later `init` with no prompt
+        // behind it is the session announcing itself, not a turn.
+        let mut tracker = after_a_finished_turn();
+        assert!(reported(&mut tracker, &[TURN_INIT]).is_empty());
+        assert_eq!(state_of(&current(&tracker).unwrap()), SessionState::Idle);
+        assert!(tracker.keepalive().is_none());
+        // A fresh tracker, which never saw a prompt, agrees.
+        let mut fresh = StreamTracker::new();
+        assert_eq!(reported(&mut fresh, &[TURN_INIT]), [SessionState::Idle]);
+    }
+
+    #[test]
+    fn the_keepalive_covers_a_prompted_turn_before_its_first_token() {
+        let mut tracker = tracker_after_init();
+        reported(&mut tracker, &[PROMPT, TURN_INIT]);
+        assert_eq!(
+            state_of(&tracker.keepalive().expect("a busy session is re-reported")),
+            SessionState::Working
+        );
+    }
+
+    #[test]
+    fn an_interrupted_turn_ends_idle_even_before_any_output() {
+        let mut tracker = after_a_finished_turn();
+        assert_eq!(
+            reported(&mut tracker, &[PROMPT, TURN_INIT, INTERRUPTED]),
+            [SessionState::Working, SessionState::Idle]
+        );
+        assert!(tracker.keepalive().is_none());
+    }
+
+    #[test]
+    fn queued_prompts_that_run_as_separate_turns_stay_working_through_each_init() {
+        // Both orders measured: two prompts written before the first `init`, and
+        // the second written while the first turn runs. Either way the CLI runs
+        // them as two turns, `init` and `result` each, the second `init` about
+        // 50 ms after the first `result`.
+        for (name, lines) in [
+            (
+                "written together",
+                [
+                    PROMPT,
+                    PROMPT,
+                    TURN_INIT,
+                    FIRST_TOKEN,
+                    DONE,
+                    TURN_INIT,
+                    FIRST_TOKEN,
+                    DONE,
+                ],
+            ),
+            (
+                "written mid-turn",
+                [
+                    PROMPT,
+                    TURN_INIT,
+                    FIRST_TOKEN,
+                    PROMPT,
+                    DONE,
+                    TURN_INIT,
+                    FIRST_TOKEN,
+                    DONE,
+                ],
+            ),
+        ] {
+            let mut tracker = after_a_finished_turn();
+            // `working` at the prompt, `idle` between the two turns, `working`
+            // again at the second `init`: never `idle` across a first token.
+            assert_eq!(
+                reported(&mut tracker, &lines),
+                [
+                    SessionState::Working,
+                    SessionState::Idle,
+                    SessionState::Working,
+                    SessionState::Idle
+                ],
+                "{name}"
+            );
+            assert!(tracker.keepalive().is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_interrupt_that_folds_queued_prompts_into_one_turn_leaves_nothing_outstanding() {
+        // Measured: three prompts, one interrupted and two queued behind it, got
+        // two `result`s, because the CLI ran the queued pair as one turn. A count
+        // of unanswered prompts would be left at one with nothing to drain it.
+        let mut tracker = after_a_finished_turn();
+        assert_eq!(
+            reported(
+                &mut tracker,
+                &[
+                    PROMPT,
+                    TURN_INIT,
+                    FIRST_TOKEN,
+                    PROMPT,
+                    PROMPT,
+                    INTERRUPTED,
+                    TURN_INIT,
+                    FIRST_TOKEN,
+                    DONE,
+                ],
+            ),
+            [
+                SessionState::Working,
+                SessionState::Idle,
+                SessionState::Working,
+                SessionState::Idle
+            ]
+        );
+        assert!(tracker.keepalive().is_none());
+        // Nothing is left outstanding, so a bare `init` is still an idle one.
+        assert!(reported(&mut tracker, &[TURN_INIT]).is_empty());
+        assert_eq!(state_of(&current(&tracker).unwrap()), SessionState::Idle);
+    }
+
+    #[test]
+    fn a_prompt_folded_into_a_running_turn_does_not_outlive_the_next_turn() {
+        // The CLI could answer a prompt written mid-turn with that turn's own
+        // `result` and no second `init`. That leaves the carry set, and the next
+        // prompt must not take it as queued behind a turn that is not running,
+        // or the flag would re-arm itself after every turn from then on.
+        let mut tracker = after_a_finished_turn();
+        assert_eq!(
+            reported(
+                &mut tracker,
+                &[PROMPT, TURN_INIT, FIRST_TOKEN, PROMPT, DONE]
+            ),
+            [SessionState::Working, SessionState::Idle]
+        );
+        assert!(tracker.keepalive().is_none(), "not pinned by the carry");
+        assert_eq!(
+            reported(&mut tracker, &[PROMPT, TURN_INIT, FIRST_TOKEN, DONE]),
+            [SessionState::Working, SessionState::Idle]
+        );
+        assert!(reported(&mut tracker, &[TURN_INIT]).is_empty());
+        assert_eq!(state_of(&current(&tracker).unwrap()), SessionState::Idle);
     }
 }
