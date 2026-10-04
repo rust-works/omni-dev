@@ -39,10 +39,13 @@
 //! undid the `working` the prompt had just set for the whole time to first token
 //! (about 2 s on Haiku, #2173). Whether an `init` means idle therefore depends on
 //! whether the editor has an unanswered prompt, which [`StreamTracker`] tracks as
-//! two booleans rather than a count: one `result` closes one turn, but after an
-//! interrupt the CLI folds every queued prompt into a single turn (3 prompts, 2
-//! `result`s, measured on 2.1.288), and a count nothing can drain would pin the
-//! session `working` through the keep-alive.
+//! three levels (`Prompts`) rather than a count: when prompts queue up the CLI
+//! runs the first, then everything queued as one second turn (three prompts, and
+//! four, each got two `result`s, measured on 2.1.288, as did three queued behind
+//! an interrupt), so one `result` can answer any number of prompts and a count
+//! nothing can drain would pin the session `working` through the keep-alive.
+//! A prompt line the wrapper's tee drops (1 MiB or more, not UTF-8, or a full
+//! channel) is never seen, so that turn keeps the old reading.
 //!
 //! Nothing here does I/O and nothing here retains conversation content: only the
 //! message `type`/`subtype`, the identity fields (`session_id`, `cwd`, `model`)
@@ -145,6 +148,47 @@ pub struct StreamDiagnostics {
     pub permission_cap_drops: u64,
 }
 
+/// How many of the editor's prompts are unanswered, as far as it matters to what
+/// a `system`/`init` line means.
+///
+/// Three levels, not a count, on purpose. When prompts queue up the CLI runs the
+/// first and then everything queued as a single next turn, so a `result` can
+/// answer any number of prompts, and a count would be left above zero by one that
+/// never comes. A level is spent by the next `result` whichever happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prompts {
+    /// Nothing the editor wrote is waiting on a `result`.
+    Answered,
+    /// The editor wrote a prompt, and its turn is running or about to.
+    Pending,
+    /// A prompt was written while a turn was already running, so one more waits
+    /// behind it and the turn after this one starts without a further prompt.
+    Queued,
+}
+
+impl Prompts {
+    /// The level after the editor writes a prompt, when `turn_running` says a
+    /// turn is already under way. A level already `Queued` stays there, since a
+    /// second prompt behind the first is the same single follow-up turn.
+    fn written(self, turn_running: bool) -> Self {
+        if self == Self::Queued || turn_running {
+            Self::Queued
+        } else {
+            Self::Pending
+        }
+    }
+
+    /// The level after a `result`: a prompt that waited behind the finished turn
+    /// is carried into the turn that follows, and nothing else is.
+    fn answered(self) -> Self {
+        if self == Self::Queued {
+            Self::Pending
+        } else {
+            Self::Answered
+        }
+    }
+}
+
 /// The authoritative session-state machine over one wrapped `claude` process.
 ///
 /// Feed it every line of both stdio directions; it returns an [`ObserveRequest`]
@@ -166,17 +210,11 @@ pub struct StreamTracker {
     /// The state implied by the most recent content message, before the
     /// permission overlay is applied.
     base: SessionState,
-    /// The editor wrote a prompt on stdin that no `result` has answered yet.
-    /// What a `system`/`init` line means depends on it: the start of the turn
-    /// that prompt began (still `working`), or a CLI announcing itself with
-    /// nothing sent (`idle`).
-    prompted: bool,
-    /// A prompt was written while a turn was already running, so one more is
-    /// waiting behind it. A flag rather than a count on purpose: the CLI usually
-    /// runs queued prompts as separate turns but folds them into one after an
-    /// interrupt, so a count would be left above zero by a `result` that never
-    /// comes. The flag is spent by the next `result` whichever happened.
-    queued: bool,
+    /// The editor's prompts that no `result` has answered yet. What a
+    /// `system`/`init` line means depends on it: the start of the turn a prompt
+    /// began (still `working`), or a CLI announcing itself with nothing sent
+    /// (`idle`).
+    prompts: Prompts,
     /// The `request_id`s of permission prompts asked but not yet answered.
     pending: HashSet<String>,
     /// The (state, model) pair most recently returned to the caller, for
@@ -201,8 +239,7 @@ impl StreamTracker {
             // every consumer counts as idle (#1946), so both feeds agree that a
             // tab the user opened and has not typed into is not doing work.
             base: SessionState::Idle,
-            prompted: false,
-            queued: false,
+            prompts: Prompts::Answered,
             pending: HashSet::new(),
             reported: None,
             diagnostics: StreamDiagnostics::default(),
@@ -354,10 +391,10 @@ impl StreamTracker {
             // time to first token (#2173). With nothing sent it is the session
             // announcing itself, which has not been prompted yet.
             Some("system") if parsed.subtype.as_deref() == Some("init") => {
-                self.base = if self.prompted {
-                    SessionState::Working
-                } else {
+                self.base = if self.prompts == Prompts::Answered {
                     SessionState::Idle
+                } else {
+                    SessionState::Working
                 };
             }
             // A `user` line the CLI writes is never the first sign of a turn: a
@@ -371,8 +408,7 @@ impl StreamTracker {
             // The editor's own prompt, which starts a turn. One written while a
             // turn is already running waits behind it.
             Some("user") => {
-                self.queued |= self.base == SessionState::Working;
-                self.prompted = true;
+                self.prompts = self.prompts.written(self.base == SessionState::Working);
                 self.base = SessionState::Working;
             }
             // A streamed assistant reply: the turn is running.
@@ -390,8 +426,7 @@ impl StreamTracker {
             Some("result") => {
                 self.base = SessionState::Idle;
                 self.pending.clear();
-                self.prompted = self.queued;
-                self.queued = false;
+                self.prompts = self.prompts.answered();
             }
             Some("control_request") if direction == Direction::FromClaude => {
                 self.open_permission(parsed);
@@ -1160,54 +1195,81 @@ mod tests {
     }
 
     #[test]
-    fn queued_prompts_that_run_as_separate_turns_stay_working_through_each_init() {
-        // Both orders measured: two prompts written before the first `init`, and
-        // the second written while the first turn runs. Either way the CLI runs
-        // them as two turns, `init` and `result` each, the second `init` about
-        // 50 ms after the first `result`.
-        for (name, lines) in [
-            (
-                "written together",
-                [
-                    PROMPT,
-                    PROMPT,
-                    TURN_INIT,
-                    FIRST_TOKEN,
-                    DONE,
-                    TURN_INIT,
-                    FIRST_TOKEN,
-                    DONE,
-                ],
-            ),
-            (
-                "written mid-turn",
-                [
-                    PROMPT,
-                    TURN_INIT,
-                    FIRST_TOKEN,
-                    PROMPT,
-                    DONE,
-                    TURN_INIT,
-                    FIRST_TOKEN,
-                    DONE,
-                ],
-            ),
-        ] {
-            let mut tracker = after_a_finished_turn();
-            // `working` at the prompt, `idle` between the two turns, `working`
-            // again at the second `init`: never `idle` across a first token.
-            assert_eq!(
-                reported(&mut tracker, &lines),
-                [
-                    SessionState::Working,
+    fn queued_prompts_run_as_one_second_turn_that_stays_working_through_its_init() {
+        // Measured on Claude Code 2.1.288: with two, three or four prompts
+        // written together, or the later ones written behind a running turn, the
+        // CLI runs the first and then everything queued as one second turn. That
+        // is two `init`s and two `result`s whatever the number, the second `init`
+        // about 50 ms after the first `result`.
+        for queued in 1..=3 {
+            for (name, before_init) in [("written together", true), ("written mid-turn", false)] {
+                let mut lines = vec![PROMPT];
+                if before_init {
+                    lines.extend(vec![PROMPT; queued]);
+                    lines.extend([TURN_INIT, FIRST_TOKEN]);
+                } else {
+                    lines.extend([TURN_INIT, FIRST_TOKEN]);
+                    lines.extend(vec![PROMPT; queued]);
+                }
+                lines.extend([DONE, TURN_INIT, FIRST_TOKEN, DONE]);
+                let mut tracker = after_a_finished_turn();
+                // `working` at the prompt, `idle` between the two turns, `working`
+                // again at the second `init`: never `idle` across a first token.
+                assert_eq!(
+                    reported(&mut tracker, &lines),
+                    [
+                        SessionState::Working,
+                        SessionState::Idle,
+                        SessionState::Working,
+                        SessionState::Idle
+                    ],
+                    "{name}, {queued} queued"
+                );
+                assert!(tracker.keepalive().is_none(), "{name}, {queued} queued");
+                // Nothing is left outstanding, so a bare `init` is still idle.
+                assert!(reported(&mut tracker, &[TURN_INIT]).is_empty());
+                assert_eq!(
+                    state_of(&current(&tracker).unwrap()),
                     SessionState::Idle,
-                    SessionState::Working,
-                    SessionState::Idle
-                ],
-                "{name}"
-            );
-            assert!(tracker.keepalive().is_none(), "{name}");
+                    "{name}, {queued} queued"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn prompts_written_during_the_second_turn_queue_a_third() {
+        // The queue is drained at the start of each turn, so a prompt written
+        // while the second turn runs waits for a third.
+        let mut tracker = after_a_finished_turn();
+        assert_eq!(
+            reported(
+                &mut tracker,
+                &[
+                    PROMPT,
+                    PROMPT,
+                    TURN_INIT,
+                    FIRST_TOKEN,
+                    DONE,
+                    TURN_INIT,
+                    FIRST_TOKEN,
+                    PROMPT,
+                    DONE,
+                    TURN_INIT,
+                    FIRST_TOKEN,
+                    DONE,
+                ],
+            ),
+            [
+                SessionState::Working,
+                SessionState::Idle,
+                SessionState::Working,
+                SessionState::Idle,
+                SessionState::Working,
+                SessionState::Idle
+            ]
+        );
+        assert!(reported(&mut tracker, &[TURN_INIT]).is_empty());
     }
 
     #[test]
@@ -1249,7 +1311,7 @@ mod tests {
         // The CLI could answer a prompt written mid-turn with that turn's own
         // `result` and no second `init`. That leaves the carry set, and the next
         // prompt must not take it as queued behind a turn that is not running,
-        // or the flag would re-arm itself after every turn from then on.
+        // or the level would re-arm itself after every turn from then on.
         let mut tracker = after_a_finished_turn();
         assert_eq!(
             reported(

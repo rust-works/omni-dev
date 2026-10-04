@@ -1172,6 +1172,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_prompt_on_stdin_keeps_the_turn_working_through_the_childs_init() {
+        let (_dir, socket, seen) = fake_daemon();
+        // The editor's prompt travels the other way from every other line here:
+        // it is written to the child's stdin and teed after being forwarded. The
+        // child answers only once it has read it, and waits a moment first so the
+        // prompt's tee reaches the tracker before the child's own lines do (the
+        // two pumps tee independently). Before #2173 the `init` reset the state,
+        // so this read `idle`, `working`, `idle`.
+        let script = concat!(
+            "read prompt; sleep 0.3;",
+            r#"printf '{"type":"system","subtype":"init","session_id":"s-1","cwd":"/w"}\n';"#,
+            r#"printf '{"type":"assistant","session_id":"s-1"}\n';"#,
+            r#"printf '{"type":"result"}\n'"#,
+        );
+        let prompt =
+            &b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n"[..];
+        let code = wrap_io(
+            "/bin/sh",
+            &["-c".to_string(), script.to_string()],
+            Some(socket),
+            prompt,
+            Sink::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+
+        let envelopes = seen.lock().await.clone();
+        let states: Vec<String> = envelopes
+            .iter()
+            .filter(|e| e["op"] == "observe")
+            .filter_map(|e| e["payload"]["event"]["stream_state"].as_str())
+            .map(ToString::to_string)
+            .collect();
+        // The prompt carries no session id, so it cannot be reported as it is
+        // written; the turn's `init` is the first line that can, and it is work.
+        assert_eq!(states, vec!["working", "idle"]);
+        assert_eq!(envelopes[0]["payload"]["session_id"], "s-1");
+    }
+
+    #[tokio::test]
     async fn a_missing_daemon_never_affects_the_child() {
         // A socket path that does not exist: every report fails silently.
         let dir = tempfile::tempdir_in("/tmp").unwrap();
