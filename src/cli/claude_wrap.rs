@@ -9,6 +9,12 @@
 //! session state — in particular the `can_use_tool` permission prompt — is
 //! visible. See ADR-0057, and [`crate::sessions::stream`] for the state machine.
 //!
+//! **It observes nothing when stdout is a terminal.** An interactive `claude` is
+//! not the stream-json protocol, so the wrapper `exec`-replaces itself with the
+//! child instead (see `ClaudeWrapCommand::run`). That includes the
+//! `worktrees ui` Claude tab, whose child runs under a PTY: such a session keeps
+//! the inferred hook and watcher feeds (#2152).
+//!
 //! **Fail-open is the hard rule.** This sits in Claude's launch path, so the
 //! worst case must be "lose state visibility", never "Claude won't launch". The
 //! byte-forwarding path therefore never awaits the parser, the daemon, or

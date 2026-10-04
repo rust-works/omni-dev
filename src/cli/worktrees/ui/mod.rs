@@ -6,8 +6,9 @@
 //! Phase 2 added row navigation/marking, an action menu, and the daemon-free
 //! parity commands plus the two-phase close flow. Phase 3 (this code) hosts
 //! one embedded terminal tab on the right — a real PTY running the user's
-//! shell or `claude` (through `omni-dev claude-wrap`, so the session reports
-//! authoritative state) — driven by `alacritty_terminal`. Phase 4 lands the
+//! shell or `claude` (through `omni-dev claude-wrap`, which under a PTY just
+//! `exec`s `claude` and observes nothing, so the session's state is inferred,
+//! not authoritative; #2152) — driven by `alacritty_terminal`. Phase 4 lands the
 //! mouse/selection contract (`mouse.rs`: per-region hit-testing, drags
 //! clamped to their origin, child-mouse-reporting handoff), then tabs/splits
 //! and the rest of the VS Code-parity surface — see the issue and

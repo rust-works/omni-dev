@@ -284,7 +284,7 @@ still be the *wrong* reason to keep a row:
 - **Prompted.** Otherwise a spare process VS Code keeps alive that is never
   prompted would pin a `starting` row forever just because its pid lives — the
   #1454-style pinning bug this feature must not reintroduce.
-- **Not stream-wrapped (#1454).** `claude-wrap` is only attached to a VS Code/SDK
+- **Not stream-wrapped (#1454).** `claude-wrap` only observes a VS Code/SDK
   `claude`, whose extension keeps a process per *chat* rather than per visible
   tab. A finished chat that was prompted keeps a live pid indefinitely, so on an
   install with both the hooks and the wrapper this watcher would pin it exactly as
@@ -294,7 +294,9 @@ still be the *wrong* reason to keep a row:
   therefore left to the TTL — the wrapper's own keep-alive holds its *busy* states
   — while a confirmed pid still *ending* it on exit is unchanged. Codex's wrapper
   and pi's extension are not affected. A terminal `claude` has no such
-  per-chat-process behaviour and keeps the exemption.
+  per-chat-process behaviour and keeps the exemption — including the
+  `worktrees ui` Claude tab, where `claude-wrap` only `exec`s and reports
+  nothing, so no `StreamState` ever marks the session `streamed`.
 - **Most recently active under the pid, by `last_seen` rather than creation
   order.** `/clear` (and possibly `/resume`) can start a new `session_id` in
   the *same* process without necessarily firing `SessionEnd` for the old one,
@@ -616,7 +618,9 @@ TTL exemption, though its death is still noticed promptly.
 Coverage is the VS Code extension's Claude tabs. Terminal Claude
 (`claudeCode.useTerminal`, or `claude` in any shell) is not stream-json and is not
 wrapped — `claude-wrap` detects a terminal and gets out of the way entirely — so
-those sessions keep Feeds 1–3 and their limits.
+those sessions keep Feeds 1–3 and their limits. That includes the `worktrees ui`
+Claude tab, which is launched *through* `claude-wrap` but observed by nothing:
+under the tab's PTY the wrapper `exec`-replaces itself with `claude` (#2152).
 
 **Terminal-tab titles carry the model, colour-coded** (issue #1445). VS Code's
 terminal API only lets the *creating* extension set a tab's icon/colour, and only
