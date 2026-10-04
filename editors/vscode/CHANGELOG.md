@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A branch whose history could not be read is listed as skipped by Push, not counted as "already up to date"** ([#2163](https://github.com/rust-works/omni-dev/issues/2163)): the daemon's `push` op now reports a worktree it could not compare with its upstream as `skipped` with the reason `history-unreadable` (it used to say `up-to-date`, which in a linked worktree of a shallow clone hid every unpublished commit), and the summary names it: "1 of 3 skipped (could not read its history to compare it with its upstream)". Needs a daemon of this release; an older one never sends the reason.
+
 ## [0.11.1] - 2026-10-04
 
 ### Fixed
