@@ -43,9 +43,11 @@ pub use pty::{GridSize, TabId};
 pub enum TabKind {
     /// The user's default shell.
     Shell,
-    /// `claude`, launched through `omni-dev claude-wrap` so the session
-    /// reports authoritative state to the daemon (ADR-0057) — the one thing
-    /// the TUI can do that the VS Code companion cannot.
+    /// `claude`, launched through `omni-dev claude-wrap`. That is a
+    /// pass-through here: `claude-wrap` only observes a stream-json pipe, and
+    /// under this tab's PTY it `exec`-replaces itself with `claude` and reports
+    /// nothing, so the session keeps the inferred hook/watcher feeds
+    /// (ADR-0052) rather than the authoritative stream feed (ADR-0057, #2152).
     Claude,
     /// `codex`, launched through `omni-dev codex-wrap`, which runs it against a
     /// private app-server and reports that server's exact thread status

@@ -614,9 +614,10 @@ the wrapper has reported from the [pid liveness watcher's](#pid-based-liveness-1
 TTL exemption, though its death is still noticed promptly.
 
 Coverage is the VS Code extension's Claude tabs. Terminal Claude
-(`claudeCode.useTerminal`, or `claude` in any shell) is not stream-json and is not
-wrapped — `claude-wrap` detects a terminal and gets out of the way entirely — so
-those sessions keep Feeds 1–3 and their limits.
+(`claudeCode.useTerminal`, or `claude` in any shell, including the `worktrees ui`
+Claude tab, which launches through `claude-wrap` but under a PTY — #2152) is not
+stream-json and is not wrapped — `claude-wrap` detects a terminal and gets out of
+the way entirely — so those sessions keep Feeds 1–3 and their limits.
 
 **Terminal-tab titles carry the model, colour-coded** (issue #1445). VS Code's
 terminal API only lets the *creating* extension set a tab's icon/colour, and only
