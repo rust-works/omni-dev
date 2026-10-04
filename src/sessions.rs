@@ -198,7 +198,9 @@ impl Origin {
 }
 
 /// How events have reached the registry since the daemon started (#2136): the
-/// numbers that say whether the socket is keeping up. Monotonic and in memory.
+/// numbers that say whether the socket is keeping up. In memory, so each daemon
+/// starts from zero. They only grow, except that `recovered` and `superseded`
+/// give one back when a late POST shows an event was not dropped after all.
 ///
 /// Every hook delivers each event twice, by the socket and through its journal,
 /// so a healthy daemon sees `recovered == 0` and `superseded == 0`: every journal
