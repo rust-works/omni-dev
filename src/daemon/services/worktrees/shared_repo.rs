@@ -357,7 +357,7 @@ impl RepoPool {
     fn open(&self, commondir: &Path) -> Option<Repository> {
         self.opens.fetch_add(1, Ordering::Relaxed);
         // The handle is at the common dir, so its own `is_shallow` is git's answer
-        // (unlike a linked worktree's, see `divergence::is_shallow`, #2147).
+        // (unlike a linked worktree's, see `crate::git::shallow::is_shallow`, #2147).
         let opened = Repository::open(commondir)
             .ok()
             .filter(|repo| !config_differs_per_worktree(repo) && !repo.is_shallow());

@@ -9,6 +9,7 @@ pub mod lint;
 pub mod main_branches;
 pub mod remote;
 pub mod repository;
+pub(crate) mod shallow;
 pub mod worktree_batch;
 pub mod worktree_push;
 pub mod worktree_rebase;
