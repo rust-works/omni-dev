@@ -371,7 +371,11 @@ parents the clone does not have and fails. That failure used to be classified as
 lease-checked force-push, was never pushed and nothing said why. The classifier now
 reads shallowness from `<commondir>/shallow` and walks through a handle opened at the
 common dir (`crate::git::shallow`, which the daemon's `ahead-behind` op shares; see
-[Git enrichment](#git-enrichment)).
+[Git enrichment](#git-enrichment)). The counts are git's own view of the *cut*
+history, which is not always the true one: after `git fetch --depth` moves a branch's
+upstream, the cut can hide that the new tip descends from the local one, so a branch
+that is only behind can read as diverged. The lease still refuses such a push
+(`rejected`, naming `git fetch` and a rebase), so nothing is overwritten.
 
 `worktrees merge-queue` enqueues eligible worktrees' pull requests into the GitHub
 merge queue — the daemon's two-phase `merge-queue` op driven from the CLI (#1401).
@@ -1695,9 +1699,10 @@ extension never runs git.
   the parents a `--depth` clone does not have and fails, which would drop the row's
   counts. So shallowness is read from `<commondir>/shallow` directly
   (`crate::git::shallow::is_shallow`, shared with the `push` classifier, #2163), and
-  a shallow repository's walks go through a handle opened at the common dir. Only a shallow clone's linked worktrees pay for it: up to
-  two extra, transient opens per worktree (one per walk), and libgit2 shares pack
-  file descriptors across handles.
+  a shallow repository's walks go through a handle opened at the common dir. Only a
+  shallow clone's linked worktrees pay for it: up to two extra, transient opens per
+  worktree (one per walk) for this op, and one per planned worktree for `push`, and
+  libgit2 shares pack file descriptors across handles.
 - **`main_behind` rides the same lazy op (#1457).** `repo_main_behind`
   resolves the repository's remote default branch the same **local-only,
   no-fetch** way `worktrees rebase`'s `--onto` default does
