@@ -170,11 +170,18 @@ impl CoverageReport {
     /// [`strip_prefix`](Self::strip_prefix), the predicate sees repo-relative
     /// paths — the same space git diffs report in — so head and baseline
     /// reports are filtered identically before any delta is computed.
-    pub fn retain_paths<F>(&mut self, keep: F)
+    ///
+    /// Returns the files that were dropped, so the caller can report what the
+    /// filter removed rather than leave a reader to infer it from a smaller total.
+    pub fn retain_paths<F>(&mut self, keep: F) -> Vec<FileCoverage>
     where
         F: Fn(&str) -> bool,
     {
-        self.files.retain(|path, _| keep(path));
+        let (kept, dropped): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut self.files)
+            .into_iter()
+            .partition(|(path, _)| keep(path));
+        self.files = kept;
+        dropped.into_values().collect()
     }
 
     /// Drops every line for which `keep` returns `false`, then drops any file
@@ -417,9 +424,16 @@ mod tests {
             f.record(1, 1);
             report.insert(f);
         }
-        report.retain_paths(|path| !path.contains("gpu/"));
+        let dropped = report.retain_paths(|path| !path.contains("gpu/"));
         assert!(report.files.contains_key("src/a.rs"));
         assert!(report.files.contains_key("src/b.rs"));
         assert!(!report.files.contains_key("src/gpu/mlx.rs"));
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].path, "src/gpu/mlx.rs");
+        assert_eq!(
+            dropped[0].lines.len(),
+            1,
+            "the dropped file keeps its lines"
+        );
     }
 }

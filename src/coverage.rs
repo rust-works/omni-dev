@@ -25,7 +25,8 @@ pub mod model;
 pub mod render;
 
 pub use analysis::{
-    analyze, analyze_with_markers, AppliedMarker, CoverageDiff, DiffScope, MarkerSide, Markers,
+    analyze, analyze_with_markers, AppliedMarker, CoverageDiff, DiffScope, ExcludedFiles,
+    MarkerSide, Markers,
 };
 pub use diff::{default_base_ref, DiffModel};
 pub use format::{parse, Format};
