@@ -31,7 +31,10 @@ fn lint(root: &Path, paths: &[&str]) -> Output {
 
 fn lint_with(root: &Path, flags: &[&str], paths: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        // Keep a developer's own global `coverage.yaml` out of the run.
         .env_remove("OMNI_DEV_CONFIG_DIR")
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root)
         .args(["coverage", "lint-markers", "-C"])
         .arg(root)
         .args(flags)
@@ -285,9 +288,15 @@ fn config_include_narrows_the_default_scan() {
     assert!(stderr.contains("a.rs:1"), "{stderr}");
     assert!(!stderr.contains("docs/b.md"), "{stderr}");
 
-    // Narrowed away entirely: nothing to report.
+    // Narrowed away entirely: nothing to report, and a warning says why.
     config_include(&repo, &["**/*.go"]);
-    assert!(lint(root, &[]).status.success());
+    let output = lint(root, &[]);
+    assert!(output.status.success());
+    assert!(
+        err_text(&output).contains("lint-markers.include in coverage.yaml"),
+        "{}",
+        err_text(&output)
+    );
 }
 
 #[test]

@@ -19,7 +19,7 @@ use crate::coverage::{
 
 /// Config file (under the discovered `.omni-dev/` dir) that declares persistent
 /// `coverage diff` settings, unioned with the CLI flags. Missing ⇒ no-op.
-pub(super) const COVERAGE_CONFIG_FILE: &str = "coverage.yaml";
+const COVERAGE_CONFIG_FILE: &str = "coverage.yaml";
 
 /// Coverage report format selector (CLI mirror of [`Format`] plus auto-detect).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -350,6 +350,24 @@ struct CoverageDiffConfig {
     ignore_filename_regex: Vec<String>,
 }
 
+/// Loads and parses `coverage.yaml` from a resolved config directory.
+///
+/// A missing file is the default (empty) config; a present-but-malformed one is
+/// a hard error, so a typo in a *value* fails loudly instead of letting excluded
+/// noise (or a wider lint scan) back in. Shared by every `coverage` subcommand
+/// that reads the file.
+pub(super) fn load_coverage_config(context_dir: &Path) -> Result<CoverageConfig> {
+    let Some(content) = load_config_content(context_dir, COVERAGE_CONFIG_FILE)? else {
+        return Ok(CoverageConfig::default());
+    };
+    serde_yaml::from_str(&content).with_context(|| {
+        format!(
+            "could not parse coverage config {}/{COVERAGE_CONFIG_FILE}",
+            context_dir.display()
+        )
+    })
+}
+
 /// The result of running `coverage diff`, separated from printing so it can be
 /// exercised by tests and reused programmatically.
 pub struct DiffOutcome {
@@ -623,16 +641,9 @@ impl DiffCommand {
     /// silently letting the excluded noise back in.
     fn load_config_ignore(&self, repo_root: &Path) -> Result<Vec<String>> {
         let context_dir = resolve_context_dir_at(self.context_dir.as_deref(), repo_root);
-        let Some(content) = load_config_content(&context_dir, COVERAGE_CONFIG_FILE)? else {
-            return Ok(Vec::new());
-        };
-        let config: CoverageConfig = serde_yaml::from_str(&content).with_context(|| {
-            format!(
-                "could not parse coverage config {}/{COVERAGE_CONFIG_FILE}",
-                context_dir.display()
-            )
-        })?;
-        Ok(config.diff.ignore_filename_regex)
+        Ok(load_coverage_config(&context_dir)?
+            .diff
+            .ignore_filename_regex)
     }
 
     /// Compiles the union of `--ignore-filename-regex` and the repo-config
