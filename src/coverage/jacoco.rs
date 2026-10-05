@@ -40,6 +40,15 @@ pub fn parse(content: &str) -> Result<CoverageReport> {
                     _ => {}
                 }
             }
+            Event::Text(e) if state.elements.is_empty() => {
+                ensure!(
+                    e.iter().all(u8::is_ascii_whitespace),
+                    "Unexpected text outside JaCoCo <report> root"
+                );
+            }
+            Event::CData(_) if state.elements.is_empty() => {
+                anyhow::bail!("Unexpected CDATA outside JaCoCo <report> root");
+            }
             Event::Eof => break,
             _ => {}
         }
@@ -213,6 +222,18 @@ mod tests {
         ] {
             assert!(parse(xml).is_err(), "{xml}");
         }
+    }
+
+    #[test]
+    fn text_outside_root_is_rejected() {
+        for xml in [
+            "junk<report/>",
+            "<report/>junk",
+            "<![CDATA[junk]]><report/>",
+        ] {
+            assert!(parse(xml).is_err(), "{xml}");
+        }
+        assert!(parse(" \n<report/>\n <!-- done -->").is_ok());
     }
 
     #[test]
