@@ -1800,7 +1800,7 @@ mod tests {
         // A malformed marker proves the mapped path is used to read source.
         fs::write(
             repo.join("b.rs"),
-            "// omni-dev: coverage ignore-line\none\n",
+            format!("// {} coverage ignore-line\none\n", "omni-dev:"),
         )
         .unwrap();
         let error = cmd.run(Some(&repo)).err().unwrap().to_string();
