@@ -29,7 +29,7 @@ const MAX_TEMP_ATTEMPTS: u32 = 100;
 /// `cargo llvm-cov` writes no newline after its last `end_of_record`, so the
 /// join glues it onto the next shard's first line.
 ///
-/// Each input may be lcov, llvm-cov JSON, Cobertura or a Go coverprofile, detected
+/// Each input may be lcov, llvm-cov JSON, Cobertura, JaCoCo or a Go coverprofile, detected
 /// per file. An input that is missing, unparseable or has no executable lines
 /// fails the run, naming it, because a shard that silently produced nothing would only make
 /// the total look slightly worse. An input whose absolute paths all fall
@@ -42,7 +42,7 @@ const MAX_TEMP_ATTEMPTS: u32 = 100;
 /// `--strip-prefix`) from each.
 #[derive(Parser)]
 pub struct MergeCommand {
-    /// Coverage reports to merge (lcov / llvm-cov-json / cobertura / go-coverprofile), one per shard.
+    /// Coverage reports to merge (lcov / llvm-cov-json / cobertura / jacoco / go-coverprofile), one per shard.
     #[arg(value_name = "REPORT", required = true)]
     pub report: Vec<PathBuf>,
 
@@ -691,6 +691,37 @@ mod tests {
         merge(vec![shard], out.clone()).run(Some(&repo)).unwrap();
 
         assert!(fs::read_to_string(&out).unwrap().contains("SF:b.rs\n"));
+    }
+
+    #[test]
+    fn jacoco_modules_merge_and_diff_with_auto_and_explicit_formats() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let a = repo.join("a.xml");
+        let b = repo.join("b.xml");
+        fs::write(&a, r#"<report><package name=""><sourcefile name="b.rs"><line nr="1" mi="1" ci="0"/><line nr="2" mi="1" ci="1"/></sourcefile></package></report>"#).unwrap();
+        fs::write(&b, r#"<report><package name=""><sourcefile name="b.rs"><line nr="1" mi="0" ci="3"/><line nr="3" mi="1" ci="0"/></sourcefile></package></report>"#).unwrap();
+        for format in [ReportFormat::Auto, ReportFormat::Jacoco] {
+            let out = repo.join("merged.lcov");
+            let mut cmd = merge(vec![a.clone(), b.clone()], out.clone());
+            cmd.report_format = format;
+            cmd.run(Some(&repo)).unwrap();
+            let r = crate::coverage::parse(&fs::read_to_string(out).unwrap(), None).unwrap();
+            assert_eq!(r.hits("b.rs", 1), Some(1));
+            assert_eq!(r.hits("b.rs", 2), Some(1));
+            assert_eq!(r.hits("b.rs", 3), Some(0));
+            let mut diff = diff_command(&[
+                "--report",
+                a.to_str().unwrap(),
+                "--report",
+                b.to_str().unwrap(),
+                "--base-ref",
+                &base,
+            ]);
+            diff.report_format = format;
+            let outcome = diff.run(Some(&repo)).unwrap();
+            assert!((outcome.line_percent.unwrap() - 200.0 / 3.0).abs() < 1e-6);
+            assert!((outcome.patch_percent.unwrap() - 200.0 / 3.0).abs() < 1e-6);
+        }
     }
 
     #[test]

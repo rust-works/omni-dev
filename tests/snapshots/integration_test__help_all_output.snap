@@ -3227,9 +3227,9 @@ Usage: diff [OPTIONS] --report <PATH>
 
 Options:
       --report <PATH>
-          Head coverage report (lcov / llvm-cov-json / cobertura / go-coverprofile); repeat once per shard to merge a sharded run
+          Head coverage report (lcov / llvm-cov-json / cobertura / jacoco / go-coverprofile); repeat once per shard to merge a sharded run
       --report-format <REPORT_FORMAT>
-          Format of every `--report` (auto-detected by default) [default: auto] [possible values: auto, lcov, llvm-cov-json, cobertura, go-coverprofile]
+          Format of every `--report` (auto-detected by default) [default: auto] [possible values: auto, lcov, llvm-cov-json, cobertura, jacoco, go-coverprofile]
       --base-ref <REV>
           Base revision to diff against (default: merge-base of `origin/main` and `HEAD`)
       --head-ref <REV>
@@ -3237,7 +3237,7 @@ Options:
       --baseline-report <PATH>
           Optional baseline coverage report; enables project deltas and indirect-change detection
       --baseline-report-format <BASELINE_REPORT_FORMAT>
-          Format of `--baseline-report` (auto-detected by default) [default: auto] [possible values: auto, lcov, llvm-cov-json, cobertura, go-coverprofile]
+          Format of `--baseline-report` (auto-detected by default) [default: auto] [possible values: auto, lcov, llvm-cov-json, cobertura, jacoco, go-coverprofile]
   -o, --output <OUTPUT>
           Output format [default: markdown] [possible values: markdown, yaml, json]
       --fail-under-patch <PCT>
@@ -3293,10 +3293,10 @@ Merges the per-shard reports of a sharded run into one lcov file
 Usage: merge [OPTIONS] --output <PATH> <REPORT>...
 
 Arguments:
-  <REPORT>...  Coverage reports to merge (lcov / llvm-cov-json / cobertura / go-coverprofile), one per shard
+  <REPORT>...  Coverage reports to merge (lcov / llvm-cov-json / cobertura / jacoco / go-coverprofile), one per shard
 
 Options:
-      --report-format <REPORT_FORMAT>  Format of every report (auto-detected per file by default) [default: auto] [possible values: auto, lcov, llvm-cov-json, cobertura, go-coverprofile]
+      --report-format <REPORT_FORMAT>  Format of every report (auto-detected per file by default) [default: auto] [possible values: auto, lcov, llvm-cov-json, cobertura, jacoco, go-coverprofile]
   -o, --output <PATH>                  File to write the merged lcov report to
       --strip-prefix <PATH>            Prefix stripped from report file paths to make them repo-relative (default: the working directory of the repository, if there is one)
   -h, --help                           Print help (see more with '--help')
