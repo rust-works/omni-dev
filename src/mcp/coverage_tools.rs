@@ -33,6 +33,8 @@ pub enum CoverageReportFormat {
     LlvmCovJson,
     /// Cobertura XML.
     Cobertura,
+    /// Go `go test -coverprofile` output.
+    GoCoverprofile,
 }
 
 impl From<CoverageReportFormat> for ReportFormat {
@@ -42,6 +44,7 @@ impl From<CoverageReportFormat> for ReportFormat {
             CoverageReportFormat::Lcov => Self::Lcov,
             CoverageReportFormat::LlvmCovJson => Self::LlvmCovJson,
             CoverageReportFormat::Cobertura => Self::Cobertura,
+            CoverageReportFormat::GoCoverprofile => Self::GoCoverprofile,
         }
     }
 }
@@ -72,7 +75,7 @@ impl From<CoverageOutputFormat> for OutputFormatArg {
 /// Parameters for the `coverage_diff` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CoverageDiffParams {
-    /// Head coverage report path (lcov / llvm-cov-json / cobertura). Required.
+    /// Head coverage report path (lcov / llvm-cov-json / cobertura / go-coverprofile). Required.
     pub report: String,
     /// Further shard reports to merge with `report` when the coverage run was
     /// split across jobs. The merge is a union of files and executable lines,
@@ -156,7 +159,7 @@ impl OmniDevServer {
                        diff, and return the rendered report with the patch-coverage percentage \
                        and gate result as YAML. Read-only. Mirrors `omni-dev coverage diff`. \
                        `report` is a required filesystem path to the head coverage report \
-                       (lcov / llvm-cov-json / cobertura, auto-detected). `format` renders the \
+                       (lcov / llvm-cov-json / cobertura / go-coverprofile, auto-detected). `format` renders the \
                        report as `markdown` (default), `yaml`, or `json`. Unlike the CLI this \
                        tool never fails the call on a low `fail_under_patch` or \
                        `fail_under_lines`; it reports `below_gate: true` / \
@@ -317,6 +320,10 @@ mod tests {
         assert_eq!(
             ReportFormat::from(CoverageReportFormat::Cobertura),
             ReportFormat::Cobertura
+        );
+        assert_eq!(
+            ReportFormat::from(CoverageReportFormat::GoCoverprofile),
+            ReportFormat::GoCoverprofile
         );
     }
 

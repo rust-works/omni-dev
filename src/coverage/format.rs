@@ -5,7 +5,7 @@ use std::fmt;
 use anyhow::{Context, Result};
 
 use super::model::CoverageReport;
-use super::{cobertura, lcov, llvm_json};
+use super::{cobertura, go_coverprofile, lcov, llvm_json};
 
 /// A supported per-line coverage report format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,8 @@ pub enum Format {
     LlvmCovJson,
     /// Cobertura XML.
     Cobertura,
+    /// Go `go test -coverprofile` output (`mode: set|count|atomic` header).
+    GoCoverprofile,
 }
 
 impl fmt::Display for Format {
@@ -24,6 +26,7 @@ impl fmt::Display for Format {
             Self::Lcov => "lcov",
             Self::LlvmCovJson => "llvm-cov-json",
             Self::Cobertura => "cobertura",
+            Self::GoCoverprofile => "go-coverprofile",
         };
         f.write_str(name)
     }
@@ -33,7 +36,10 @@ impl Format {
     /// Detects the format from report `content`.
     ///
     /// Detection is by leading non-whitespace character/token: XML opens with
-    /// `<`, JSON with `{`, and lcov with a record keyword (`TN:`/`SF:`).
+    /// `<`, JSON with `{`, lcov with a record keyword (`TN:`/`SF:`), and a Go
+    /// coverprofile with its `mode:` header. The header is matched on `mode:`
+    /// alone, so a profile with a mode Go does not write fails in the parser,
+    /// naming it, instead of reading as an unrecognised format.
     pub fn detect(content: &str) -> Result<Self> {
         let trimmed = content.trim_start();
         let first = trimmed
@@ -49,9 +55,10 @@ impl Format {
             {
                 Ok(Self::Lcov)
             }
+            _ if trimmed.starts_with("mode:") => Ok(Self::GoCoverprofile),
             _ => anyhow::bail!(
                 "could not auto-detect coverage report format; pass an explicit --report-format \
-                 (lcov, llvm-cov-json, or cobertura)"
+                 (lcov, llvm-cov-json, cobertura, or go-coverprofile)"
             ),
         }
     }
@@ -62,16 +69,22 @@ impl Format {
             Self::Lcov => lcov::parse(content),
             Self::LlvmCovJson => llvm_json::parse(content),
             Self::Cobertura => cobertura::parse(content),
+            Self::GoCoverprofile => go_coverprofile::parse(content),
         }
+    }
+}
+
+/// Resolves `format`, auto-detecting from `content` when it is `None`.
+pub fn resolve(content: &str, format: Option<Format>) -> Result<Format> {
+    match format {
+        Some(f) => Ok(f),
+        None => Format::detect(content).context("coverage report format auto-detection failed"),
     }
 }
 
 /// Parses `content` using `format`, auto-detecting when `format` is `None`.
 pub fn parse(content: &str, format: Option<Format>) -> Result<CoverageReport> {
-    let format = match format {
-        Some(f) => f,
-        None => Format::detect(content).context("coverage report format auto-detection failed")?,
-    };
+    let format = resolve(content, format)?;
     format
         .parse(content)
         .with_context(|| format!("failed to parse {format} coverage report"))
@@ -108,6 +121,28 @@ mod tests {
     }
 
     #[test]
+    fn detects_go_coverprofile_in_every_mode() {
+        for mode in ["set", "count", "atomic"] {
+            let content = format!("mode: {mode}\nm/a.go:1.1,1.9 1 1\n");
+            assert_eq!(Format::detect(&content).unwrap(), Format::GoCoverprofile);
+        }
+        assert_eq!(
+            Format::detect("\n  mode: set\n").unwrap(),
+            Format::GoCoverprofile
+        );
+    }
+
+    #[test]
+    fn an_unknown_go_mode_is_detected_so_the_parser_can_name_it() {
+        assert_eq!(
+            Format::detect("mode: sometimes\n").unwrap(),
+            Format::GoCoverprofile
+        );
+        let message = format!("{:#}", parse("mode: sometimes\n", None).unwrap_err());
+        assert!(message.contains("sometimes"), "{message}");
+    }
+
+    #[test]
     fn unknown_format_errors() {
         assert!(Format::detect("hello world").is_err());
         assert!(Format::detect("").is_err());
@@ -124,6 +159,7 @@ mod tests {
         assert_eq!(Format::Lcov.to_string(), "lcov");
         assert_eq!(Format::LlvmCovJson.to_string(), "llvm-cov-json");
         assert_eq!(Format::Cobertura.to_string(), "cobertura");
+        assert_eq!(Format::GoCoverprofile.to_string(), "go-coverprofile");
     }
 
     #[test]
@@ -144,6 +180,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(xml.hits("a.rs", 1), Some(2));
+
+        let go = parse(
+            "mode: count\nm/a.go:1.1,2.9 1 4\n",
+            Some(Format::GoCoverprofile),
+        )
+        .unwrap();
+        assert_eq!(go.hits("m/a.go", 2), Some(4));
+    }
+
+    #[test]
+    fn resolve_prefers_an_explicit_format_over_detection() {
+        assert_eq!(
+            resolve("mode: set\n", Some(Format::Lcov)).unwrap(),
+            Format::Lcov
+        );
+        assert_eq!(
+            resolve("mode: set\n", None).unwrap(),
+            Format::GoCoverprofile
+        );
+        assert!(resolve("", None).is_err());
     }
 
     #[test]
