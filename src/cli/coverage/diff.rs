@@ -608,9 +608,16 @@ impl DiffCommand {
         for path in &self.report {
             let path = anchor(path, repo_root);
             let mut report = read_report(&path, self.report_format, repo_root)?;
-            report.map_paths(mappings)?;
+            let mapped_root = report.map_paths_with_root_match(mappings)?;
             if sharded {
-                check_shard(&path.display().to_string(), &report, strip_prefix, warnings)?;
+                // Like an in-tree absolute path, an explicitly mapped runner
+                // root makes other absolute paths (SDK/vendor files) legitimate.
+                check_shard(
+                    &path.display().to_string(),
+                    &report,
+                    strip_prefix.filter(|_| !mapped_root),
+                    warnings,
+                )?;
             }
             excluded.record_head(normalise_report(&mut report, strip_prefix, ignore));
             merged.merge(report);
@@ -1759,7 +1766,7 @@ mod tests {
         let report = repo.join("head.lcov");
         fs::write(
             &report,
-            "SF:/ci/package/b.rs\nDA:1,1\nDA:2,0\nDA:3,1\nend_of_record\nSF:module/a.rs\nDA:1,0\nend_of_record\n",
+            "SF:/ci/package/b.rs\nDA:1,1\nDA:2,0\nDA:3,1\nend_of_record\nSF:/sdk/runtime.rs\nDA:1,1\nend_of_record\nSF:module/a.rs\nDA:1,0\nend_of_record\n",
         )
         .unwrap();
         let shard = repo.join("shard.lcov");

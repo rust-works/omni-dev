@@ -41,14 +41,21 @@ impl CoverageReport {
     /// by maximum line hits. Unmatched paths are retained. Backslashes become
     /// slashes when mappings are enabled; no filesystem probing is performed.
     pub fn map_paths(&mut self, mappings: &[PathMapping]) -> Result<()> {
+        self.map_paths_with_root_match(mappings).map(|_| ())
+    }
+
+    /// Returns whether an absolute report path matched an explicit mapping.
+    /// Such a match counts as an accepted runner root for shard diagnostics.
+    pub(crate) fn map_paths_with_root_match(&mut self, mappings: &[PathMapping]) -> Result<bool> {
         validate(mappings)?;
         if mappings.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let mappings: Vec<_> = mappings
             .iter()
             .map(|m| (portable(&m.from), portable(&m.to)))
             .collect();
+        let mut mapped_root = false;
         let files = std::mem::take(&mut self.files);
         for mut file in files.into_values() {
             let path = portable(&file.path);
@@ -56,6 +63,7 @@ impl CoverageReport {
                 .iter()
                 .filter_map(|(from, to)| remainder(&path, from).map(|rest| (from.len(), to, rest)))
                 .max_by_key(|(len, _, _)| *len);
+            mapped_root |= best.is_some() && (path.starts_with('/') || path.contains(':'));
             file.path = match best {
                 Some((_, to, rest)) if to.is_empty() => rest.to_string(),
                 Some((_, to, "")) => to.clone(),
@@ -64,7 +72,7 @@ impl CoverageReport {
             };
             self.insert(file);
         }
-        Ok(())
+        Ok(mapped_root)
     }
 }
 
