@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Push no longer offers a FORCE confirmation for a shallow clone's branch that only needed a fetch** ([#2175](https://github.com/rust-works/omni-dev/issues/2175)): after `git fetch --depth`, the cut can hide that a branch's upstream descends from its local tip, so a branch that was only behind counted as ahead and behind and was listed as a force-push the lease was bound to refuse. When the history shows no common ancestor the daemon now reports the row as skipped (`history-unreadable`), and the skip text reads "could not compare its history with its upstream (in a shallow clone, `git fetch --unshallow` may settle it)". Needs a daemon of this release; an older one still offers the force.
 - **A branch whose history could not be read is listed as skipped by Push, not counted as "already up to date"** ([#2163](https://github.com/rust-works/omni-dev/issues/2163)): the daemon's `push` op now reports a worktree it could not compare with its upstream as `skipped` with the reason `history-unreadable` (it used to say `up-to-date`, which in a linked worktree of a shallow clone hid every unpublished commit), and the summary names it: "1 of 3 skipped (could not read its history to compare it with its upstream)". Needs a daemon of this release; an older one never sends the reason.
 
 ## [0.11.1] - 2026-10-04

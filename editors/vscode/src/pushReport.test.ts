@@ -164,7 +164,7 @@ test("a row whose history could not be read is reported as skipped, never as up 
   assert.equal(upToDateCount(reply), 1);
   assert.equal(
     nothingToPushMessage(reply, 2),
-    "1 of 2 skipped (could not read its history to compare it with its upstream), 1 already up to date",
+    "1 of 2 skipped (could not compare its history with its upstream (in a shallow clone, `git fetch --unshallow` may settle it)), 1 already up to date",
   );
 });
 
@@ -177,7 +177,7 @@ test("skipReasonText renders each slug and falls through to an unknown one", () 
   );
   assert.equal(
     skipReasonText("history-unreadable"),
-    "could not read its history to compare it with its upstream",
+    "could not compare its history with its upstream (in a shallow clone, `git fetch --unshallow` may settle it)",
   );
   assert.equal(
     skipReasonText("something-a-newer-daemon-invented"),

@@ -75,7 +75,7 @@ export function skipReasonText(reason: string | undefined): string {
     case "default-branch-force-push":
       return "refusing to force-push the default branch";
     case "history-unreadable":
-      return "could not read its history to compare it with its upstream";
+      return "could not compare its history with its upstream (in a shallow clone, `git fetch --unshallow` may settle it)";
     default:
       return reason ?? "skipped";
   }

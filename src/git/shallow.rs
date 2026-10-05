@@ -12,8 +12,8 @@
 //! `--depth` therefore reads it through this module rather than through the handle
 //! it was given: the daemon's `ahead-behind` op (`divergence`) and the batch push
 //! classifier ([`worktree_push`]), which also asks whether the cut leaves a divergence
-//! provable ([`divergence_is_provable`], #2175). Reading is all it does — nothing here writes to
-//! the repository.
+//! provable ([`divergence_is_provable`], #2175). Reading is all it does — nothing here
+//! writes to the repository.
 //!
 //! [`worktree_push`]: crate::git::worktree_push
 
