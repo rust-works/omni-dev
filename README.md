@@ -71,6 +71,15 @@ nix profile install github:rust-works/omni-dev
 nix run github:rust-works/omni-dev
 ```
 
+Pre-built binaries are attached to each
+[release](https://github.com/rust-works/omni-dev/releases). The Linux ones
+(`omni-dev-linux.tar.gz`, `omni-dev-linux-arm64.tar.gz`) are dynamically linked
+and need **glibc 2.35 or newer** (Ubuntu 22.04 and Debian 12 qualify). On an older
+host, such as RHEL 9 or Amazon Linux 2023 (glibc 2.34), they fail in the loader
+with ``version `GLIBC_2.xx' not found``; build from source with
+`cargo install omni-dev` instead. The release workflow fails if a binary needs
+more than that floor ([docs/RELEASE.md](docs/RELEASE.md#linux-glibc-floor)).
+
 **Next step:** see [Getting Started](docs/getting-started.md) — a
 10-minute walkthrough from authentication to your first AI-improved
 commit. (For just the API-key reference, see
