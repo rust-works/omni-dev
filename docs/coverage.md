@@ -252,6 +252,10 @@ numStmts count`, not per-line hits, so they are expanded to lines:
   nothing to execute and is not a line. The reasons the total differs from a
   tool's own summary are the ones under [Why the total differs from llvm-cov's
   summary](#why-the-total-differs-from-llvm-covs-summary).
+- **A block's blank and comment lines count too.** The profile gives a block's
+  range, not which of its lines hold code, so a comment added inside a long block
+  is a new executable line, covered or not with the block. `ignore` markers can
+  mask such lines.
 - **`set`, `count` and `atomic` read the same way.** Only whether a count is zero
   matters to the output.
 
@@ -261,7 +265,9 @@ from them, which makes them repo-relative. When the module is **not** at the roo
 (a `services/api/go.mod`) or there is no `go.mod`, nothing is stripped and no file
 matches the diff; pass the import path of the repository root instead, so the
 subdirectory stays in the path: `--strip-prefix github.com/org/repo`.
-`--ignore-filename-regex` sees the mapped paths.
+`--ignore-filename-regex` sees the mapped paths. The `go.mod` is the one in the
+working tree and is applied to `--baseline-report` too, so a baseline measured
+before a module rename needs `--strip-prefix`.
 
 ## Sharded runs
 

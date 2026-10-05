@@ -143,7 +143,12 @@ impl MergeCommand {
 
         let mut warnings = Vec::new();
         let mut merged = CoverageReport::new();
-        let root = repo_root.unwrap_or_else(|| Path::new("."));
+        // `go.mod` is looked up where the default strip prefix is: the repository's
+        // working directory, so running from a subdirectory finds the root's.
+        let root = match (&self.strip_prefix, &prefix) {
+            (None, Some(workdir)) => workdir.as_path(),
+            _ => repo_root.unwrap_or_else(|| Path::new(".")),
+        };
         for path in &self.report {
             let path = resolve(path, repo_root);
             let mut report = read_report(&path, self.report_format, root)?;
@@ -619,6 +624,19 @@ mod tests {
         let mut cmd = merge(shards, out.clone());
         cmd.report_format = ReportFormat::GoCoverprofile;
         cmd.run(Some(&repo)).unwrap();
+        assert!(fs::read_to_string(&out).unwrap().contains("SF:b.rs\n"));
+    }
+
+    #[test]
+    fn the_go_mod_is_found_from_a_subdirectory_of_the_repository() {
+        let (_dir, repo, _base) = repo_with_added_file();
+        let shards = go_shards(&repo);
+        let sub = repo.join("ci");
+        fs::create_dir(&sub).unwrap();
+        let out = repo.join("merged.lcov");
+
+        merge(shards, out.clone()).run(Some(&sub)).unwrap();
+
         assert!(fs::read_to_string(&out).unwrap().contains("SF:b.rs\n"));
     }
 
