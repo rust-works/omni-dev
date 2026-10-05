@@ -790,6 +790,7 @@ mod tests {
     /// The premise of declining shallow repos. If libgit2 starts refreshing grafts
     /// on a live handle this fails, which means the guard has become unnecessary.
     #[test]
+    #[allow(clippy::disallowed_methods)] // pins what libgit2 itself does, so it calls it directly
     fn libgit2_reads_shallow_grafts_when_a_repository_is_opened() {
         let dir = tempfile::tempdir().unwrap();
         let (repo, a, b) = two_commits(dir.path());

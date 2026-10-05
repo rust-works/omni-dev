@@ -141,6 +141,7 @@ pub(super) fn graph_ahead_behind(
 
 /// [`graph_ahead_behind`] against an explicit memo, so tests need not share the
 /// process-wide one.
+#[allow(clippy::disallowed_methods)] // raw walk only after `is_shallow` is false
 fn graph_ahead_behind_in(
     memo: &WalkMemo,
     repo: &Repository,
@@ -611,6 +612,7 @@ mod tests {
     /// The memo must follow the commit graph, not stick: a new commit changes the
     /// tip id, so the same worktree is walked again and reports the new count.
     #[test]
+    #[allow(clippy::disallowed_methods)] // pins what libgit2 itself does, so it calls it directly
     fn graph_ahead_behind_tracks_new_commits_and_matches_libgit2() {
         let memo = WalkMemo::with_capacity(8);
         let dir = tempfile::tempdir().unwrap();

@@ -15,6 +15,15 @@
 //! provable ([`divergence_is_provable`], #2175). Reading is all it does — nothing here
 //! writes to the repository.
 //!
+//! The rule is enforced, not remembered (#2176): `clippy.toml` lists
+//! `Repository::graph_ahead_behind` under `disallowed-methods`, so a raw call fails
+//! `cargo clippy` with a pointer here. A site that calls it directly carries an
+//! `#[allow(clippy::disallowed_methods)]` saying why the handle's shape cannot matter
+//! there — this module's own walk, `divergence`'s memo path after `is_shallow` is
+//! false, and the tests that pin libgit2's behaviour. The lint covers that one API;
+//! `revwalk`, `merge_base` and `Commit::parents` have the same blind spot but are not
+//! listed, and a new history walk using them must still come through this module.
+//!
 //! [`worktree_push`]: crate::git::worktree_push
 
 use git2::{Oid, Repository};
@@ -48,6 +57,9 @@ pub(crate) fn is_shallow(repo: &Repository) -> bool {
 /// it in this object database (or, for a handle that was not opened at the right
 /// place, the parents of the cut). A caller must treat that as *unknown*, never as
 /// "no divergence".
+// The one sanctioned raw walk: `repo` itself is exact for a complete repository or a main
+// checkout, and `common` is opened at the common dir, which applies the cut.
+#[allow(clippy::disallowed_methods)] // this is the helper the lint points at
 pub(crate) fn graph_ahead_behind(
     repo: &Repository,
     local: Oid,
@@ -139,6 +151,7 @@ mod tests {
     /// libgit2 starts looking in the common dir this fails, which means the
     /// workaround has become unnecessary, not that it regressed.
     #[test]
+    #[allow(clippy::disallowed_methods)] // pins what libgit2 itself does, so it calls it directly
     fn libgit2_ignores_the_common_dirs_shallow_marker_from_a_linked_worktree() {
         let dir = tempfile::tempdir().unwrap();
         let wts = tempfile::tempdir().unwrap();
@@ -159,6 +172,7 @@ mod tests {
     /// with `first` shallow it is a root, so `base` is behind it rather than
     /// reachable from it.
     #[test]
+    #[allow(clippy::disallowed_methods)] // pins what libgit2 itself does, so it calls it directly
     fn a_linked_worktree_of_a_shallow_repository_is_walked_with_the_cut_applied() {
         let dir = tempfile::tempdir().unwrap();
         let wts = tempfile::tempdir().unwrap();
@@ -207,6 +221,7 @@ mod tests {
     /// A complete repository is not touched by any of this: the counts are libgit2's
     /// own, whatever shape of handle asks.
     #[test]
+    #[allow(clippy::disallowed_methods)] // pins what libgit2 itself does, so it calls it directly
     fn a_complete_repository_gets_libgit2s_counts_from_any_handle() {
         let dir = tempfile::tempdir().unwrap();
         let wts = tempfile::tempdir().unwrap();

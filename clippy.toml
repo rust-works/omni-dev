@@ -2,3 +2,12 @@ too-many-arguments-threshold = 7
 cognitive-complexity-threshold = 25
 type-complexity-threshold = 250
 msrv = "1.88.0"
+
+# A shallow clone's cut is applied only through the gitdir of the handle libgit2
+# opened, so a handle rooted at a linked worktree fails on the parents a `--depth`
+# clone lacks (#2147, #2163). Every commit-graph walk goes through
+# `crate::git::shallow`; the sites that call libgit2 directly carry an `allow` that
+# says why it is safe there (#2176).
+disallowed-methods = [
+    { path = "git2::Repository::graph_ahead_behind", reason = "use `crate::git::shallow::graph_ahead_behind`: libgit2 applies a shallow clone's cut only through the handle's own gitdir (#2147, #2163)" },
+]
