@@ -73,7 +73,7 @@ rand = "0.10"
 thiserror = "2.0"
 async-trait = "0.1"
 regex = "1.12.3"
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 quote = "1"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 tracing = "0.1"
