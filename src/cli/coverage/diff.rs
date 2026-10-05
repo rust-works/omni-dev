@@ -1484,7 +1484,7 @@ mod tests {
         let md = cmd.run(Some(&repo)).unwrap().rendered;
         assert!(
             md.contains(
-                "_Excluded by ignore-filename-regex: 1 file (1 of them touched by this diff)._"
+                "_Excluded by ignore-filename-regex: 1 file (1 of them touched by this diff, adding 3 executable lines)._"
             ),
             "{md}"
         );

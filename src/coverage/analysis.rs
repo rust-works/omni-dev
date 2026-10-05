@@ -274,8 +274,10 @@ impl ExcludedFiles {
         self.touched.clear();
         self.new_executable_lines = 0;
         for file in diff.files.values() {
+            // One entry per diff file: a rename excluded under both its names is
+            // still one touched file.
             let names = std::iter::once(&file.new_path).chain(file.old_path.as_ref());
-            for name in names.filter(|name| self.paths.contains(*name)) {
+            if let Some(name) = names.into_iter().find(|name| self.paths.contains(*name)) {
                 self.touched.insert(name.clone());
             }
             if let Some(lines) = self.head_lines.get(&file.new_path) {
@@ -791,6 +793,26 @@ mod tests {
             2,
             "baseline line numbers are base-side and must not match added head lines"
         );
+    }
+
+    #[test]
+    fn a_rename_excluded_under_both_names_is_one_touched_file() {
+        let mut excluded = ExcludedFiles::default();
+        excluded.record_baseline(vec![file_with_lines("gen/a.rs", &[1])]);
+        excluded.record_head(vec![file_with_lines("gen/b.rs", &[1])]);
+        let fd = FileDiff::new(
+            "gen/b.rs",
+            Some("gen/a.rs".to_string()),
+            false,
+            true,
+            BTreeSet::from([1]),
+            BTreeSet::new(),
+        );
+        let mut diff = DiffModel::default();
+        diff.files.insert("gen/b.rs".to_string(), fd);
+        excluded.resolve(&diff);
+        assert_eq!(excluded.count(), 2);
+        assert_eq!(excluded.touched_count(), 1);
     }
 
     #[test]
