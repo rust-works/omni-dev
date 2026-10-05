@@ -896,7 +896,7 @@ fn push_skip_reason_text(reason: worktree_push::SkipReason) -> &'static str {
              fast-forward it or open a PR instead"
         }
         SkipReason::HistoryUnreadable => {
-            "could not read its history to compare it with its upstream"
+            "could not compare its history with its upstream (in a shallow clone, `git fetch --unshallow` may settle it)"
         }
     }
 }
@@ -4566,7 +4566,7 @@ mod tests {
             "detached HEAD",
             "not a git worktree",
             "no remote to publish to",
-            "could not read its history to compare it with its upstream",
+            "could not compare its history with its upstream (in a shallow clone, `git fetch --unshallow` may settle it)",
         ] {
             assert!(
                 rendered.contains(expected),
