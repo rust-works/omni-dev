@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import pathlib
+import re
+import shutil
+import sys
 import unittest
 
 import check_glibc_floor as cgf
 
-# Captured from `readelf -V /bin/ls` (binutils 2.38) on Ubuntu 22.04, trimmed:
-# the `.gnu.version` table lists the same names per symbol and must be ignored.
+# The needs table is verbatim from `readelf -V /bin/ls` (binutils 2.38, Ubuntu
+# 22.04), trimmed to four libc entries. The `.gnu.version` table before it is cut
+# down, and its GLIBC_2.99 is invented: that table lists names per symbol and must
+# be ignored, so a parser that read it would see 2.99.
 REAL = """
 Version symbols section '.gnu.version' contains 123 entries:
  Addr: 0x000000000000152e  Offset: 0x00152e  Link: 6 (.dynsym)
@@ -97,10 +103,50 @@ class CheckTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("highest weak requirement GLIBC_2.39", detail)
 
-    def test_a_binary_with_no_glibc_requirement_passes(self) -> None:
-        ok, detail = cgf.check("", (2, 35))
-        self.assertTrue(ok)
-        self.assertIn("none", detail)
+    def test_no_glibc_requirement_fails_closed(self) -> None:
+        # Output this does not recognise must not read as "within the floor".
+        for output in ("", "There are no version sections.", "Version needs section 'x'\n"):
+            ok, detail = cgf.check(output, (2, 35))
+            self.assertFalse(ok, output)
+            self.assertIn("no GLIBC_ requirement found", detail)
+
+    def test_a_blank_line_ends_the_table(self) -> None:
+        output = NEXT_SECTION.replace("Version definition", "\n  0x0030:   Name: GLIBC_2.31  Flags: none  Version: 1\nVersion definition")
+        self.assertEqual(cgf.glibc_needs(output)[0], [(2, 30)])
+
+
+class RealReadelfTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("readelf"), "needs readelf")
+    def test_parses_the_real_tool_output_for_a_real_binary(self) -> None:
+        # Only a glibc-linked ELF has the table; skip where the interpreter is not.
+        try:
+            output = cgf.readelf_versions(sys.executable)
+        except cgf.ReadelfError:
+            self.skipTest("interpreter is not an ELF binary")
+        hard, _ = cgf.glibc_needs(output)
+        if not hard:
+            self.skipTest("interpreter is not linked against glibc")
+        self.assertTrue(cgf.check(output, (99, 0))[0])
+        self.assertFalse(cgf.check(output, (1, 0))[0])
+
+    def test_a_missing_readelf_or_binary_is_exit_status_2(self) -> None:
+        self.assertEqual(cgf.main(["--floor", "2.35", "/nonexistent/omni-dev"]), 2)
+
+
+class DocsTests(unittest.TestCase):
+    """The floor is stated in four places; they must not drift apart (#2178)."""
+
+    ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+    def read(self, rel: str) -> str:
+        return (self.ROOT / rel).read_text(encoding="utf-8")
+
+    def test_the_documented_floor_matches_glibc_floor(self) -> None:
+        match = re.search(r"GLIBC_FLOOR:\s*'([\d.]+)'", self.read(".github/workflows/release.yml"))
+        self.assertIsNotNone(match, "release.yml has no GLIBC_FLOOR")
+        floor = match.group(1)
+        self.assertIn(f"glibc {floor} or newer", self.read("README.md"))
+        self.assertIn(f"**glibc {floor}**", self.read("docs/RELEASE.md"))
 
 
 if __name__ == "__main__":

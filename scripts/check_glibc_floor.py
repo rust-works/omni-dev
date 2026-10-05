@@ -26,7 +26,6 @@ import subprocess
 import sys
 
 NEEDS_HEADING = re.compile(r"^Version needs section\b")
-SECTION_HEADING = re.compile(r"^(Version \w+|Dynamic|Symbol table|[A-Z][\w ]*) section\b")
 # `  0x0020:   Name: GLIBC_2.38  Flags: WEAK  Version: 2`
 NEED = re.compile(r"\bName:\s*GLIBC_(?P<version>\d+(?:\.\d+)*)\s+Flags:\s*(?P<flags>\S+)")
 
@@ -59,7 +58,9 @@ def glibc_needs(readelf_output: str) -> tuple[list[Version], list[Version]]:
         if NEEDS_HEADING.match(line):
             in_needs = True
             continue
-        if SECTION_HEADING.match(line):
+        # Section headings start in column 0 and everything under them is
+        # indented, so any other unindented line (or a blank one) ends the table.
+        if not line.strip() or not line[0].isspace():
             in_needs = False
             continue
         if not in_needs:
@@ -74,16 +75,22 @@ def glibc_needs(readelf_output: str) -> tuple[list[Version], list[Version]]:
 def check(readelf_output: str, floor: Version) -> tuple[bool, str]:
     """Whether the binary is within the floor, and a one-line account of why."""
     hard, weak = glibc_needs(readelf_output)
-    highest = max(hard, default=None)
-    highest_weak = max(weak, default=None)
-    parts = [
-        "highest hard requirement "
-        + (f"GLIBC_{format_version(highest)}" if highest else "none")
-    ]
-    if highest_weak and (highest is None or highest_weak > highest):
-        parts.append(f"highest weak requirement GLIBC_{format_version(highest_weak)}")
-    ok = highest is None or highest <= floor
-    return ok, f"{', '.join(parts)}; floor GLIBC_{format_version(floor)}"
+    limit = f"floor GLIBC_{format_version(floor)}"
+    if not hard:
+        # A binary linked against glibc always has a hard GLIBC_ entry, so finding
+        # none means the output was not what this parses (or the binary is static,
+        # which needs neither a floor nor this check): fail rather than ship it
+        # unverified.
+        return False, f"no GLIBC_ requirement found in the version-needs table; {limit}"
+    highest = max(hard)
+    parts = [f"highest hard requirement GLIBC_{format_version(highest)}"]
+    if weak and max(weak) > highest:
+        parts.append(f"highest weak requirement GLIBC_{format_version(max(weak))}")
+    return highest <= floor, f"{', '.join(parts)}; {limit}"
+
+
+class ReadelfError(Exception):
+    """readelf is missing or could not read the binary (exit status 2)."""
 
 
 def readelf_versions(path: str) -> str:
@@ -92,9 +99,9 @@ def readelf_versions(path: str) -> str:
             ["readelf", "-V", path], capture_output=True, text=True, check=False
         )
     except FileNotFoundError:
-        sys.exit("error: readelf not found (install binutils)")
+        raise ReadelfError("readelf not found (install binutils)") from None
     if done.returncode != 0:
-        sys.exit(f"error: readelf -V {path} failed: {done.stderr.strip()}")
+        raise ReadelfError(f"readelf -V {path} failed: {done.stderr.strip()}")
     return done.stdout
 
 
@@ -110,7 +117,11 @@ def main(argv: list[str]) -> int:
 
     failed = False
     for path in args.binaries:
-        ok, detail = check(readelf_versions(path), floor)
+        try:
+            ok, detail = check(readelf_versions(path), floor)
+        except ReadelfError as err:
+            print(f"::error::{err}")
+            return 2
         if ok:
             print(f"ok: {path}: {detail}")
         else:
