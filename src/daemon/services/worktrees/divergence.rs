@@ -141,7 +141,6 @@ pub(super) fn graph_ahead_behind(
 
 /// [`graph_ahead_behind`] against an explicit memo, so tests need not share the
 /// process-wide one.
-#[allow(clippy::disallowed_methods)] // raw walk only after `is_shallow` is false
 fn graph_ahead_behind_in(
     memo: &WalkMemo,
     repo: &Repository,
@@ -152,7 +151,9 @@ fn graph_ahead_behind_in(
         return shallow::graph_ahead_behind(repo, local, upstream);
     }
     let key = (repo.commondir().to_path_buf(), local, upstream);
-    memo.get_or_walk(key, || repo.graph_ahead_behind(local, upstream).ok())
+    #[allow(clippy::disallowed_methods)] // raw walk only after `is_shallow` is false, above
+    let walk = || repo.graph_ahead_behind(local, upstream).ok();
+    memo.get_or_walk(key, walk)
 }
 
 /// One computation for one worktree, shared by every request that joins it.

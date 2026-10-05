@@ -10,10 +10,10 @@
 //!
 //! Anything that compares history in a repository a user may have cloned with
 //! `--depth` therefore reads it through this module rather than through the handle
-//! it was given: the daemon's `ahead-behind` op (`divergence`) and the batch push
+//! it was given: the daemon's `ahead-behind` op (`divergence`), the batch push
 //! classifier ([`worktree_push`]), which also asks whether the cut leaves a divergence
-//! provable ([`divergence_is_provable`], #2175). Reading is all it does — nothing here
-//! writes to the repository.
+//! provable ([`divergence_is_provable`], #2175), and the rebase planner's behind count.
+//! Reading is all it does — nothing here writes to the repository.
 //!
 //! The rule is enforced, not remembered (#2176): `clippy.toml` lists
 //! `Repository::graph_ahead_behind` under `disallowed-methods`, so a raw call fails
@@ -22,7 +22,9 @@
 //! there — this module's own walk, `divergence`'s memo path after `is_shallow` is
 //! false, and the tests that pin libgit2's behaviour. The lint covers that one API;
 //! `revwalk`, `merge_base` and `Commit::parents` have the same blind spot but are not
-//! listed, and a new history walk using them must still come through this module.
+//! listed (some existing sites already use them), and a new history walk using them
+//! must still come through this module. `clippy_toml_forbids_a_raw_graph_ahead_behind`
+//! keeps the entry itself from lapsing under plain `cargo test`.
 //!
 //! [`worktree_push`]: crate::git::worktree_push
 
@@ -57,15 +59,14 @@ pub(crate) fn is_shallow(repo: &Repository) -> bool {
 /// it in this object database (or, for a handle that was not opened at the right
 /// place, the parents of the cut). A caller must treat that as *unknown*, never as
 /// "no divergence".
-// The one sanctioned raw walk: `repo` itself is exact for a complete repository or a main
-// checkout, and `common` is opened at the common dir, which applies the cut.
-#[allow(clippy::disallowed_methods)] // this is the helper the lint points at
 pub(crate) fn graph_ahead_behind(
     repo: &Repository,
     local: Oid,
     upstream: Oid,
 ) -> Option<(usize, usize)> {
     with_cut_applied(repo, |walker| {
+        // The sanctioned walk the lint points at: `walker` is the handle with the cut applied.
+        #[allow(clippy::disallowed_methods)]
         walker.graph_ahead_behind(local, upstream).ok()
     })?
 }
@@ -119,6 +120,20 @@ mod tests {
     use crate::test_support::shallow_repo::{
         add_linked_worktree, forget_object, mark_shallow, three_commits,
     };
+
+    /// The lint is the enforcement (#2176), so a dropped or mistyped `clippy.toml`
+    /// entry would let a raw walk back in with every test green. This is the same
+    /// kind of pin `secret_env` keeps on its own rule.
+    #[test]
+    fn clippy_toml_forbids_a_raw_graph_ahead_behind() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("clippy.toml");
+        let toml = std::fs::read_to_string(path).unwrap();
+        assert!(
+            toml.contains("disallowed-methods")
+                && toml.contains("git2::Repository::graph_ahead_behind"),
+            "clippy.toml must list git2::Repository::graph_ahead_behind under disallowed-methods"
+        );
+    }
 
     /// git keeps the `shallow` marker in the common dir, which no linked worktree's
     /// own gitdir contains, and libgit2 looks only in the handle's own gitdir. So
