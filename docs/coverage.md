@@ -58,11 +58,9 @@ branch counters and class/method summaries do not contribute to line coverage.
 
 Paths are `package/SourceFile.java`, relative to the source root. For example,
 `com/example/App.java` may correspond to `src/main/java/com/example/App.java`
-in git. The parser preserves the reported path; `--strip-prefix` can remove
-prefixes but cannot add that source root. Source-root mapping is tracked in
-[#2188](https://github.com/rust-works/omni-dev/issues/2188). Until that is
-available, paths must be aligned before diff attribution. Overall line coverage
-and shard merging work with source-root-relative paths. Identical package/file
+in git. Use [path mappings](#package-relative-and-source-root-relative-paths)
+to prepend that source root before diff attribution. Overall line coverage and
+shard merging also work with source-root-relative paths. Identical package/file
 paths across modules merge by covered-line union, so unrelated sources with the
 same path must be distinguished before merging.
 
@@ -85,6 +83,161 @@ omni-dev coverage diff \
   --report head.lcov --baseline-report base.lcov \
   -o json
 ```
+
+## Report paths and repository paths
+
+Coverage attribution joins report filenames to git's repo-relative paths. A
+mismatch can leave patch coverage empty even when overall coverage is present.
+Check the `SF:` records (lcov), `filename` attributes (Cobertura), or package and
+sourcefile names (JaCoCo) against `git ls-files` before trusting a patch gate.
+
+The path pipeline for `coverage diff` is:
+
+1. Parse the report. For a native Go coverprofile, strip the module import path
+   from the repository root's `go.mod`, if available.
+2. Apply explicit `diff.path-mappings`, if configured.
+3. Strip `--strip-prefix` (default: the checkout working directory), then trim
+   leading `./` and `/`.
+4. Apply filename exclusions, read source markers, and join to the git diff.
+
+These steps apply to each head shard and the baseline independently. Cobertura
+`<sources>` are metadata: the parser uses each class's `filename` and does not
+choose or prepend a source root. JaCoCo uses `package/SourceFile.java`, without
+its module or `src/main/java` directory.
+
+### Absolute paths from another runner
+
+For reports generated under a different checkout, remove that runner's root:
+
+```bash
+omni-dev coverage diff --report head.lcov \
+  --strip-prefix /home/runner/work/project/project
+```
+
+One strip prefix applies to both head and baseline. If they came from different
+roots, map each root explicitly instead:
+
+```yaml
+# .omni-dev/coverage.yaml
+diff:
+  path-mappings:
+    - from: /ci/head/project
+      to: ''
+    - from: /ci/base/project
+      to: ''
+```
+
+### Package-relative and source-root-relative paths
+
+Use explicit directory replacements when a tool omits a directory git retains:
+
+```yaml
+# .omni-dev/coverage.yaml — choose the mappings for your report, not all examples
+diff:
+  path-mappings:
+    # nyc invoked inside packages/web: src/app.ts -> packages/web/src/app.ts
+    - from: src
+      to: packages/web/src
+    # JaCoCo: com/example/App.java -> services/api/src/main/java/com/example/App.java
+    - from: com/example
+      to: services/api/src/main/java/com/example
+    # Go module below repo root (no root go.mod to infer this import prefix)
+    - from: example.com/project/service
+      to: services/api
+```
+
+An empty `from: ''` prepends `to` to every relative report filename, useful for a
+single source root such as `src/main/java` or a coverage.py report that contains
+only basenames. It does not match absolute filenames. An empty `to: ''` removes
+the matched prefix. Matches respect directory boundaries (`src` cannot match
+`src2`), and the longest prefix wins. Each path is mapped once; replacements are
+not chained. With mappings enabled, backslashes become `/` and leading `./` and
+trailing `/` on prefixes are removed, allowing Windows runner prefixes such as
+`from: 'C:\agent\project'`. Destinations must be repo-relative without `..`;
+duplicate normalised source prefixes and misspelled mapping fields fail loudly.
+Absent or empty mappings preserve the existing path behavior.
+
+Unmatched filenames retain their paths and continue through prefix stripping.
+Aliases mapping to one git path combine by maximum line hits. Avoid mapping
+unrelated files to the same path: their coverage would be unioned. If two modules
+both emit `src/App.java`, a single combined report cannot distinguish them; make
+filenames unique in each module report before combining. There is no filesystem
+search or guessed source-root selection.
+
+Mappings use the same config discovery and override rules as the ignore-list.
+They belong to `coverage diff`; `coverage merge` does not read this block. Merge
+repo-relative reports, use its `--strip-prefix` for a common runner root, or
+normalise module reports before merging them.
+
+## Using with other languages
+
+The parser depends on the report format, not the source language. Run coverage
+against the head revision, produce a report below, then use
+`omni-dev coverage diff --report <report>` (and optionally a baseline produced
+at the base revision). Reports must include per-line records; summary-only JSON,
+HTML, Clover XML and OpenCover XML are not supported. Branch/function data is
+ignored. Install/configure each tool in your project before using these examples.
+
+- **JavaScript / TypeScript — Istanbul/nyc lcov.**
+  `npx nyc --reporter=lcov npm test` writes `coverage/lcov.info`. Run from the
+  repository root or map package-relative `SF:` paths. For TypeScript, configure
+  instrumentation and source maps so the report names original `.ts` files, not
+  emitted JavaScript. See [nyc's configuration](https://github.com/istanbuljs/nyc).
+- **Python — coverage.py Cobertura.**
+  `coverage run -m pytest` followed by `coverage xml -o coverage.xml`.
+  Prefer `[run] include = ...` over `source = ...` when you need complete paths;
+  `source` can shorten filenames relative to source roots. Use mappings when
+  needed; `<sources>` does not add the root automatically. See
+  [coverage.py XML reporting](https://coverage.readthedocs.io/en/latest/commands/cmd_xml.html).
+- **C / C++ — gcovr Cobertura.** Build with GCC `--coverage`, run the tests,
+  then `gcovr --root . --cobertura coverage.xml` from the repo root. Set `--root`
+  to the repository rather than a build subdirectory; filenames are relative
+  to that root. See [gcovr's Cobertura output](https://gcovr.com/en/stable/output/cobertura.html).
+- **Swift — llvm-cov lcov or JSON.** Run `swift test --enable-code-coverage`,
+  obtain the test binary and profile under the build directory, then run
+  `xcrun llvm-cov export <test-binary> -instr-profile=<profile.profdata> -format=lcov > coverage.lcov`.
+  Omit `-format=lcov` for llvm-cov JSON; do not use `-summary-only`. Supply the
+  instrumented binary for your platform and strip the original checkout prefix.
+  See [llvm-cov export](https://www.llvm.org/docs/CommandGuide/llvm-cov.html#llvm-cov-export).
+- **Ruby — SimpleCov with simplecov-lcov.** In the test helper, before loading
+  application code, require `simplecov` and `simplecov-lcov`, set
+  `SimpleCov::Formatter::LcovFormatter.config.report_with_single_file = true`,
+  set `SimpleCov.formatter = SimpleCov::Formatter::LcovFormatter`, then call
+  `SimpleCov.start`. Run `bundle exec rspec` (or your test runner) and pass the
+  generated `.lcov` file under `coverage/lcov/`. The filename can be configured;
+  see [simplecov-lcov](https://github.com/fortissimo1997/simplecov-lcov).
+- **PHP — PHPUnit Cobertura.**
+  `XDEBUG_MODE=coverage vendor/bin/phpunit --coverage-filter src --coverage-cobertura coverage.xml`.
+  Enable Xdebug coverage mode or install PCOV, and set the source filter (or its
+  XML configuration equivalent). See [PHPUnit coverage](https://docs.phpunit.de/en/12.5/code-coverage.html).
+- **.NET — coverlet Cobertura.** For VSTest projects with `coverlet.collector`,
+  `dotnet test --collect:"XPlat Code Coverage"` writes
+  `TestResults/<id>/coverage.cobertura.xml`. Map source-root-relative filenames
+  or runner prefixes as needed. Microsoft Testing Platform projects use
+  `coverlet.MTP` and its `--coverlet --coverlet-output-format cobertura` options
+  instead. See [coverlet integrations](https://github.com/coverlet-coverage/coverlet).
+- **Dart — package:coverage lcov.**
+  `dart pub global activate coverage` then
+  `dart pub global run coverage:test_with_coverage` produces `coverage/lcov.info`
+  from a package root. Explicit formatting uses `--lcov` and
+  `--packages=.dart_tool/package_config.json` to resolve package URIs to source
+  files; map or strip the resulting paths. See [package:coverage](https://pub.dev/packages/coverage).
+- **Scala — scoverage Cobertura.** `sbt clean coverage test coverageReport`
+  produces `target/scala-<version>/coverage-report/cobertura.xml` in each module.
+  Map module/source prefixes as necessary. Do not pass `scoverage.xml`, whose
+  schema is different. See [sbt-scoverage](https://github.com/scoverage/sbt-scoverage).
+- **Go — native coverprofile.** `go test ./... -coverprofile=coverage.out`;
+  see [Go coverprofiles](#go-coverprofiles) for block-to-line semantics and root
+  module inference. A nested module needs an explicit import-prefix mapping.
+- **Java / Kotlin — native JaCoCo XML.** With the JaCoCo Maven plugin configured,
+  `mvn verify` (with its report goal bound) produces `target/site/jacoco/jacoco.xml`;
+  with Gradle's JaCoCo plugin, `./gradlew test jacocoTestReport` produces XML only
+  if `reports.xml.required = true` is configured. Map the package path to the
+  correct module's source root; see [JaCoCo XML](#jacoco-xml).
+
+The [non-Rust fixtures](../tests/fixtures/coverage/non-rust/README.md) record
+producer provenance and exercise git patch attribution without installing all
+these toolchains to run the Rust tests.
 
 ## Output formats
 
@@ -361,7 +514,7 @@ omni-dev coverage diff --report head.lcov --baseline-report merged.lcov
 - **Same merge, same checks.** The files are unioned and, for a line present in
   several inputs, the larger hit count wins, exactly as for repeated `--report`
   (see [how shards combine](#sharded-runs)). Each input may be lcov, llvm-cov JSON,
-  Cobertura or a Go coverprofile, detected per file; `--report-format` applies to all of them. An
+  Cobertura, JaCoCo or a Go coverprofile, detected per file; `--report-format` applies to all of them. An
   input that is missing, unparseable or has no executable lines fails the run and
   names it — **including a lone input**, unlike `coverage diff`, because the output
   is trusted by whatever reads it next. An input whose absolute paths all fall
@@ -668,7 +821,7 @@ wires it up.
 | Flag | Purpose |
 |------|---------|
 | `--report <PATH>` | Head coverage report (required); repeat once per shard to merge a [sharded run](#sharded-runs) |
-| `--report-format <FMT>` | Format of every `--report`: `auto` (default) \| `lcov` \| `llvm-cov-json` \| `cobertura` \| `go-coverprofile` |
+| `--report-format <FMT>` | Format of every `--report`: `auto` (default) \| `lcov` \| `llvm-cov-json` \| `cobertura` \| `jacoco` \| `go-coverprofile` |
 | `--base-ref <REV>` | Base revision (default: merge-base of `origin/main` and `HEAD`) |
 | `--head-ref <REV>` | Head revision the report was measured at (default: `HEAD`) |
 | `--baseline-report <PATH>` | Base-side report; enables project deltas + indirect changes |
@@ -689,8 +842,8 @@ wires it up.
 
 | Flag | Purpose |
 |------|---------|
-| `<REPORT>...` | Reports to merge, one per shard (required); lcov, llvm-cov JSON, Cobertura or Go coverprofile |
-| `--report-format <FMT>` | Format of every report: `auto` (default) \| `lcov` \| `llvm-cov-json` \| `cobertura` \| `go-coverprofile` |
+| `<REPORT>...` | Reports to merge, one per shard (required); lcov, llvm-cov JSON, Cobertura, JaCoCo or Go coverprofile |
+| `--report-format <FMT>` | Format of every report: `auto` (default) \| `lcov` \| `llvm-cov-json` \| `cobertura` \| `jacoco` \| `go-coverprofile` |
 | `-o, --output <PATH>` | File to write the merged lcov report to (required); a path, not a format |
 | `--strip-prefix <PATH>` | Prefix stripped from report paths (default: the repository working directory) |
 | `-C, --repo <PATH>` | Operate as if started in `<PATH>`; relative paths and the default prefix follow it |

@@ -25,6 +25,7 @@ pub mod llvm_json;
 pub mod markers;
 pub mod merge;
 pub mod model;
+pub mod paths;
 pub mod render;
 
 pub use analysis::{
@@ -35,4 +36,5 @@ pub use diff::{default_base_ref, DiffModel};
 pub use format::{parse, Format};
 pub use markers::{FileMarkers, MarkerKind, Region};
 pub use model::{CoverageReport, FileCoverage};
+pub use paths::PathMapping;
 pub use render::{render, OutputFormat, RenderOptions};
