@@ -368,6 +368,31 @@ normalisation, so patterns match the repo-relative path. The flag is repeatable
 and comma-separated; an empty pattern is treated as a no-op (a bare regex would
 match every path).
 
+### The comment says what the filter excluded
+
+A filter leaves nothing in the numbers: a smaller total and an empty patch look
+exactly like a diff that added no code. So whenever the filter removed at least one
+file from a report, the comment says so:
+
+```
+_Excluded by ignore-filename-regex: 3 files (1 of them touched by this diff)._
+```
+
+The files the diff touched are listed beneath it (the first 20; the rest are counted),
+and `-o json`/`-o yaml` carry an `excluded_files` object with `count`, `touched_count`,
+`new_executable_lines`, every excluded path in `paths`, and the touched subset in
+`touched`. Only files that were *in a report* count, as a head or a baseline entry,
+once each; a path matching the regex that no report mentioned was never measured.
+
+The empty-patch sentence tells its two causes apart. `_No new executable lines added
+by this diff._` means the diff added no instrumented code. When the filter removed
+files in which the diff added executable lines, it reads `_No new executable lines
+in the files measured: 3 new executable lines are in files excluded by
+ignore-filename-regex._` instead, and `excluded_files.new_executable_lines` holds the
+count. Nothing is shown when the filter removed nothing, so a run with no filter, or
+one that matches no file, renders exactly as before. The gates are unchanged: a patch
+with no measured lines still passes `--fail-under-patch`.
+
 ### Declaring the ignore-list persistently in repo config
 
 Because these files are CPU-conditional forever — a property of the

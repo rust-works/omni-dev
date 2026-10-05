@@ -9,12 +9,12 @@ use git2::Repository;
 use regex::RegexSet;
 
 use crate::claude::context::{load_config_content, resolve_context_dir_at};
-use crate::coverage::analysis::{analyze_with_markers, Markers};
+use crate::coverage::analysis::{analyze_with_markers, ExcludedFiles, Markers};
 use crate::coverage::markers::{self, FileMarkers};
 use crate::coverage::merge::check_shard;
 use crate::coverage::{
-    default_base_ref, parse, render, CoverageReport, DiffModel, DiffScope, Format, OutputFormat,
-    RenderOptions,
+    default_base_ref, parse, render, CoverageReport, DiffModel, DiffScope, FileCoverage, Format,
+    OutputFormat, RenderOptions,
 };
 
 /// Config file (under the discovered `.omni-dev/` dir) that declares persistent
@@ -297,19 +297,21 @@ pub(super) fn read_report(path: &Path, format: ReportFormat) -> Result<CoverageR
         .with_context(|| format!("could not parse coverage report {}", path.display()))
 }
 
-/// Makes `report`'s paths repo-relative, then drops the files `ignore` excludes.
+/// Makes `report`'s paths repo-relative, then drops the files `ignore` excludes,
+/// returning the dropped files so the caller can report them.
 fn normalise_report(
     report: &mut CoverageReport,
     strip_prefix: Option<&Path>,
     ignore: Option<&RegexSet>,
-) {
+) -> Vec<FileCoverage> {
     if let Some(prefix) = strip_prefix {
         report.strip_prefix(prefix);
     }
     // Match on the repo-relative path (post strip-prefix), so the same
     // pattern applies identically to head and baseline.
-    if let Some(ignore) = ignore {
-        report.retain_paths(|path| !ignore.is_match(path));
+    match ignore {
+        Some(ignore) => report.retain_paths(|path| !ignore.is_match(path)),
+        None => Vec::new(),
     }
 }
 
@@ -434,11 +436,13 @@ impl DiffCommand {
         let ignore = self.compile_ignore(&config_ignore)?;
 
         let mut warnings = Vec::new();
+        let mut excluded = ExcludedFiles::default();
         let head = self.load_head(
             strip_prefix.as_deref(),
             ignore.as_ref(),
             &repo_path,
             &mut warnings,
+            &mut excluded,
         )?;
         let baseline = match &self.baseline_report {
             Some(path) => Some(self.load_report(
@@ -447,6 +451,7 @@ impl DiffCommand {
                 strip_prefix.as_deref(),
                 ignore.as_ref(),
                 &repo_path,
+                &mut excluded,
             )?),
             None => None,
         };
@@ -479,7 +484,9 @@ impl DiffCommand {
         } else {
             DiffScope::DiffOnly
         };
-        let result = analyze_with_markers(&head, &diff, baseline.as_ref(), scope, &markers);
+        let mut result = analyze_with_markers(&head, &diff, baseline.as_ref(), scope, &markers);
+        excluded.resolve(&diff);
+        result.excluded = excluded;
 
         let opts = self.render_options();
         let rendered = render(&result, &opts, self.output.into())?;
@@ -522,6 +529,7 @@ impl DiffCommand {
         ignore: Option<&RegexSet>,
         repo_root: &Path,
         warnings: &mut Vec<String>,
+        excluded: &mut ExcludedFiles,
     ) -> Result<CoverageReport> {
         anyhow::ensure!(
             !self.report.is_empty(),
@@ -535,13 +543,14 @@ impl DiffCommand {
             if sharded {
                 check_shard(&path.display().to_string(), &report, strip_prefix, warnings)?;
             }
-            normalise_report(&mut report, strip_prefix, ignore);
+            excluded.record_head(normalise_report(&mut report, strip_prefix, ignore));
             merged.merge(report);
         }
         Ok(merged)
     }
 
-    /// Reads and parses a coverage report, normalising paths to be repo-relative.
+    /// Reads and parses the baseline report, normalising paths to be repo-relative
+    /// and recording the files `ignore` removed in `excluded`.
     ///
     /// A relative `path` is resolved against `repo_root` so the report and the
     /// git repository always anchor to the same root; an absolute `path` is
@@ -553,9 +562,10 @@ impl DiffCommand {
         strip_prefix: Option<&Path>,
         ignore: Option<&RegexSet>,
         repo_root: &Path,
+        excluded: &mut ExcludedFiles,
     ) -> Result<CoverageReport> {
         let mut report = read_report(&anchor(path, repo_root), format)?;
-        normalise_report(&mut report, strip_prefix, ignore);
+        excluded.record_baseline(normalise_report(&mut report, strip_prefix, ignore));
         Ok(report)
     }
 
@@ -1461,6 +1471,145 @@ mod tests {
         let outcome = cmd.run(Some(&repo)).unwrap();
         assert_eq!(outcome.patch_percent, None);
         assert!(!outcome.rendered.contains("`b.rs:2`"));
+    }
+
+    #[test]
+    fn excluding_the_only_touched_file_is_visible_and_not_an_empty_diff() {
+        // #2167: the diff's one file is excluded. The comment must say so, and
+        // must not read like a diff that added no code.
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        let mut cmd = command(report, &base);
+        cmd.ignore_filename_regex = vec![r"b\.rs".to_string()];
+        let md = cmd.run(Some(&repo)).unwrap().rendered;
+        assert!(
+            md.contains(
+                "_Excluded by ignore-filename-regex: 1 file (1 of them touched by this diff)._"
+            ),
+            "{md}"
+        );
+        assert!(md.contains("- `b.rs`"), "{md}");
+        assert!(
+            md.contains("3 new executable lines are in files excluded by ignore-filename-regex"),
+            "{md}"
+        );
+        assert!(!md.contains("_No new executable lines added by this diff._"));
+
+        cmd.output = OutputFormatArg::Json;
+        let json: serde_json::Value =
+            serde_json::from_str(&cmd.run(Some(&repo)).unwrap().rendered).unwrap();
+        let excluded = &json["excluded_files"];
+        assert_eq!(excluded["count"], 1);
+        assert_eq!(excluded["touched_count"], 1);
+        assert_eq!(excluded["new_executable_lines"], 3);
+        assert_eq!(excluded["paths"], serde_json::json!(["b.rs"]));
+        assert_eq!(excluded["touched"], serde_json::json!(["b.rs"]));
+    }
+
+    #[test]
+    fn a_filter_matching_no_file_leaves_the_output_unchanged() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        let plain = command(report.clone(), &base)
+            .run(Some(&repo))
+            .unwrap()
+            .rendered;
+        let mut cmd = command(report, &base);
+        cmd.ignore_filename_regex = vec![r"nomatch\.rs".to_string()];
+        let filtered = cmd.run(Some(&repo)).unwrap().rendered;
+        assert_eq!(filtered, plain);
+        assert!(!filtered.contains("Excluded by"));
+        for format in [OutputFormatArg::Json, OutputFormatArg::Yaml] {
+            cmd.output = format;
+            assert!(!cmd
+                .run(Some(&repo))
+                .unwrap()
+                .rendered
+                .contains("excluded_files:"));
+            assert!(!cmd
+                .run(Some(&repo))
+                .unwrap()
+                .rendered
+                .contains("\"excluded_files\""));
+        }
+    }
+
+    #[test]
+    fn excluding_an_untouched_file_says_the_diff_did_not_touch_it() {
+        // `a.rs` is in the report but the diff only adds `b.rs`: the note counts
+        // it, says nothing touched it, and the patch is measured as before.
+        let (_dir, repo, base) = repo_with_added_file();
+        let head = format!(
+            "SF:{a}\nDA:1,1\nend_of_record\nSF:{b}\nDA:1,1\nDA:2,0\nDA:3,4\nend_of_record\n",
+            a = repo.join("a.rs").display(),
+            b = repo.join("b.rs").display(),
+        );
+        let report = repo.join("head.lcov");
+        fs::write(&report, head).unwrap();
+        let mut cmd = command(report, &base);
+        cmd.ignore_filename_regex = vec![r"a\.rs".to_string()];
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        assert!(
+            outcome.rendered.contains(
+                "_Excluded by ignore-filename-regex: 1 file (none of them touched by this diff)._"
+            ),
+            "{}",
+            outcome.rendered
+        );
+        assert!(!outcome.rendered.contains("Excluded files touched"));
+        assert!(outcome.patch_percent.is_some());
+    }
+
+    #[test]
+    fn a_diff_that_added_no_executable_code_reads_as_before_beside_the_note() {
+        // The diff's file is not in the report at all, so the filter took no new
+        // executable line out of the patch: the empty-patch sentence is unchanged.
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = repo.join("head.lcov");
+        fs::write(
+            &report,
+            format!(
+                "SF:{}\nDA:1,1\nend_of_record\n",
+                repo.join("a.rs").display()
+            ),
+        )
+        .unwrap();
+        let mut cmd = command(report, &base);
+        cmd.ignore_filename_regex = vec![r"a\.rs".to_string()];
+        let md = cmd.run(Some(&repo)).unwrap().rendered;
+        assert!(
+            md.contains("_No new executable lines added by this diff._"),
+            "{md}"
+        );
+        assert!(
+            md.contains("Excluded by ignore-filename-regex: 1 file"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn a_file_only_the_baseline_held_counts_as_excluded() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        let baseline = repo.join("base.lcov");
+        fs::write(
+            &baseline,
+            format!(
+                "SF:{}\nDA:1,1\nend_of_record\n",
+                repo.join("a.rs").display()
+            ),
+        )
+        .unwrap();
+        let mut cmd = command(report, &base);
+        cmd.baseline_report = Some(baseline);
+        cmd.ignore_filename_regex = vec![r"a\.rs".to_string()];
+        let md = cmd.run(Some(&repo)).unwrap().rendered;
+        assert!(
+            md.contains(
+                "_Excluded by ignore-filename-regex: 1 file (none of them touched by this diff)._"
+            ),
+            "{md}"
+        );
     }
 
     #[test]

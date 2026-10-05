@@ -230,6 +230,7 @@ fn render_markdown(diff: &CoverageDiff, opts: &RenderOptions) -> String {
     }
     // Also without a baseline: `ignore` still shapes the total and the patch.
     render_markers(diff, &mut out);
+    render_excluded(diff, &mut out);
 
     render_patch_section(diff, opts, &mut out);
 
@@ -370,11 +371,67 @@ fn render_markers(diff: &CoverageDiff, out: &mut String) {
     out.push_str("\n</details>\n\n");
 }
 
+/// Maximum touched paths listed in the markdown note; the rest are counted.
+const EXCLUDED_LISTED: usize = 20;
+
+/// `1 file` / `3 files`.
+fn files_noun(n: usize) -> String {
+    format!("{n} file{}", if n == 1 { "" } else { "s" })
+}
+
+/// Renders the note saying what `--ignore-filename-regex` removed.
+///
+/// The filter leaves no trace in the numbers, so without this a pattern wider
+/// than intended cannot be told from a correct one by reading the comment. Only
+/// the paths the diff touched are listed — the full set is in the structured
+/// output, and is as long as the pattern is broad.
+fn render_excluded(diff: &CoverageDiff, out: &mut String) {
+    let excluded = &diff.excluded;
+    if excluded.is_empty() {
+        return;
+    }
+    let touched = match excluded.touched_count() {
+        0 => "none of them touched by this diff".to_string(),
+        n => format!("{n} of them touched by this diff"),
+    };
+    out.push_str(&format!(
+        "_Excluded by ignore-filename-regex: {} ({touched})._\n\n",
+        files_noun(excluded.count())
+    ));
+    if excluded.touched_count() == 0 {
+        return;
+    }
+    out.push_str(&format!(
+        "<details><summary>Excluded files touched by this diff ({})</summary>\n\n",
+        excluded.touched_count()
+    ));
+    for path in excluded.touched().take(EXCLUDED_LISTED) {
+        out.push_str(&format!("- `{path}`\n"));
+    }
+    if excluded.touched_count() > EXCLUDED_LISTED {
+        out.push_str(&format!(
+            "- _…and {} more_\n",
+            excluded.touched_count() - EXCLUDED_LISTED
+        ));
+    }
+    out.push_str("\n</details>\n\n");
+}
+
 fn render_patch_section(diff: &CoverageDiff, opts: &RenderOptions, out: &mut String) {
     out.push_str("### Patch coverage\n\n");
 
     if diff.patch.total() == 0 {
-        out.push_str("_No new executable lines added by this diff._\n\n");
+        // An empty patch is two different facts: the diff added no code, or all
+        // of it sits in files the filter removed. Say which.
+        match diff.excluded.new_executable_lines() {
+            0 => out.push_str("_No new executable lines added by this diff._\n\n"),
+            n => out.push_str(&format!(
+                "_No new executable lines in the files measured: {n} new executable line{} \
+                 {} in files excluded by ignore-filename-regex._\n\n",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "is" } else { "are" },
+            )),
+        }
         return;
     }
 
@@ -485,6 +542,21 @@ struct CoverageDiffView {
     /// Source-marker regions that applied. Empty when no marker was found.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     markers: Vec<MarkerView>,
+    /// Files `--ignore-filename-regex` removed. Absent when it removed nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excluded_files: Option<ExcludedFilesView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExcludedFilesView {
+    count: usize,
+    touched_count: usize,
+    /// Executable lines the diff added to excluded files: patch lines the filter
+    /// took out of the denominator.
+    new_executable_lines: u64,
+    paths: Vec<String>,
+    /// The subset of `paths` this diff touched.
+    touched: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -642,6 +714,14 @@ impl CoverageDiffView {
             })
             .collect();
 
+        let excluded_files = (!diff.excluded.is_empty()).then(|| ExcludedFilesView {
+            count: diff.excluded.count(),
+            touched_count: diff.excluded.touched_count(),
+            new_executable_lines: diff.excluded.new_executable_lines(),
+            paths: diff.excluded.paths().map(str::to_string).collect(),
+            touched: diff.excluded.touched().map(str::to_string).collect(),
+        });
+
         Self {
             explanation: explanation(),
             patch_coverage,
@@ -649,6 +729,7 @@ impl CoverageDiffView {
             project_delta,
             indirect_changes,
             markers,
+            excluded_files,
         }
     }
 
@@ -662,6 +743,7 @@ impl CoverageDiffView {
             .as_ref()
             .is_some_and(|i| !i.lines.is_empty());
         let has_markers = !self.markers.is_empty();
+        let has_excluded = self.excluded_files.is_some();
         for field in &mut self.explanation.fields {
             field.present = match field.name.as_str() {
                 "patch_coverage.percent" | "patch_coverage.covered" | "patch_coverage.total" => {
@@ -672,6 +754,7 @@ impl CoverageDiffView {
                 "project_delta.total_after" | "project_delta.files[].path" => has_baseline,
                 "indirect_changes.lines[].path" => has_indirect,
                 "markers[].path" => has_markers,
+                "excluded_files.paths[]" => has_excluded,
                 _ => false,
             };
         }
@@ -730,6 +813,14 @@ fn explanation() -> FieldExplanation {
                  masked). Where a region was tolerated, `delta` is computed from \
                  `after_effective`, not from the displayed `after`.",
             ),
+            field(
+                "excluded_files.paths[]",
+                "Files `--ignore-filename-regex` (or `coverage.yaml`) removed from the head or \
+                 baseline report. `touched` is the subset this diff changed, and \
+                 `new_executable_lines` counts the executable lines it added to them, so an \
+                 empty `patch_coverage` caused by the filter can be told from a diff that added \
+                 no code. Absent when nothing was excluded.",
+            ),
         ],
     }
 }
@@ -739,7 +830,8 @@ fn explanation() -> FieldExplanation {
 mod tests {
     use super::*;
     use crate::coverage::analysis::{
-        AppliedMarker, FileDelta, FilePatch, IndirectChange, MarkerSide, PatchCoverage,
+        AppliedMarker, ExcludedFiles, FileDelta, FilePatch, IndirectChange, MarkerSide,
+        PatchCoverage,
     };
 
     #[test]
@@ -1106,6 +1198,123 @@ mod tests {
             ],
             ..Default::default()
         }
+    }
+
+    fn excluded(touched_paths: &[&str], other_paths: &[&str], added: &[u32]) -> ExcludedFiles {
+        use crate::coverage::diff::{DiffModel, FileDiff};
+        use crate::coverage::model::FileCoverage;
+        let mut e = ExcludedFiles::default();
+        let mut diff = DiffModel::default();
+        for path in touched_paths.iter().chain(other_paths) {
+            let mut f = FileCoverage::new(*path);
+            f.record(1, 1);
+            e.record_head(vec![f]);
+        }
+        for path in touched_paths {
+            diff.files.insert(
+                (*path).to_string(),
+                FileDiff::new(
+                    *path,
+                    None,
+                    true,
+                    false,
+                    added.iter().copied().collect(),
+                    std::collections::BTreeSet::new(),
+                ),
+            );
+        }
+        e.resolve(&diff);
+        e
+    }
+
+    #[test]
+    fn nothing_excluded_adds_nothing_to_either_format() {
+        let diff = sample_diff();
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(!md.contains("Excluded"));
+        let json = render(&diff, &RenderOptions::default(), OutputFormat::Json).unwrap();
+        assert!(!json.contains("\"excluded_files\""));
+    }
+
+    #[test]
+    fn markdown_says_how_many_files_were_excluded_and_touched() {
+        let mut diff = sample_diff();
+        diff.excluded = excluded(&["src/a.rs"], &["src/b.rs", "src/c.rs"], &[1]);
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(md.contains(
+            "_Excluded by ignore-filename-regex: 3 files (1 of them touched by this diff)._"
+        ));
+        assert!(md.contains("Excluded files touched by this diff (1)"));
+        assert!(md.contains("- `src/a.rs`"));
+        assert!(
+            !md.contains("- `src/b.rs`"),
+            "untouched paths stay in the JSON"
+        );
+        // The patch is not empty here, so its sentence is untouched.
+        assert!(md.contains("Patch: **80%**"));
+    }
+
+    #[test]
+    fn markdown_caps_the_touched_list_and_counts_the_rest() {
+        let mut diff = sample_diff();
+        let paths: Vec<String> = (0..25).map(|i| format!("gen/f{i:02}.rs")).collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        diff.excluded = excluded(&refs, &[], &[1]);
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(md.contains("- `gen/f19.rs`"));
+        assert!(!md.contains("- `gen/f20.rs`"));
+        assert!(md.contains("- _…and 5 more_"));
+    }
+
+    #[test]
+    fn markdown_says_when_the_diff_touched_no_excluded_file() {
+        let mut diff = sample_diff();
+        diff.excluded = excluded(&[], &["src/b.rs"], &[]);
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(md.contains(
+            "_Excluded by ignore-filename-regex: 1 file (none of them touched by this diff)._"
+        ));
+        assert!(!md.contains("<summary>Excluded files touched"));
+    }
+
+    #[test]
+    fn empty_patch_reads_differently_when_the_filter_took_the_new_lines() {
+        let mut diff = CoverageDiff::default();
+        let plain = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(plain.contains("_No new executable lines added by this diff._"));
+
+        diff.excluded = excluded(&["src/gen.rs"], &[], &[1]);
+        let one = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(!one.contains("_No new executable lines added by this diff._"));
+        assert!(one.contains(
+            "_No new executable lines in the files measured: 1 new executable line is in \
+             files excluded by ignore-filename-regex._"
+        ));
+
+        diff.excluded = excluded(&["src/a.rs", "src/b.rs"], &[], &[1]);
+        let two = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(two.contains("2 new executable lines are in files excluded"));
+    }
+
+    #[test]
+    fn json_lists_excluded_paths_and_marks_the_field_present() {
+        let mut diff = sample_diff();
+        diff.excluded = excluded(&["src/a.rs"], &["src/b.rs"], &[1]);
+        let json = render(&diff, &RenderOptions::default(), OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let e = &value["excluded_files"];
+        assert_eq!(e["count"], 2);
+        assert_eq!(e["touched_count"], 1);
+        assert_eq!(e["new_executable_lines"], 1);
+        assert_eq!(e["paths"], serde_json::json!(["src/a.rs", "src/b.rs"]));
+        assert_eq!(e["touched"], serde_json::json!(["src/a.rs"]));
+        let field = value["explanation"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "excluded_files.paths[]")
+            .unwrap();
+        assert_eq!(field["present"], true);
     }
 
     #[test]

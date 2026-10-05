@@ -225,6 +225,96 @@ pub struct IndirectChange {
     pub became_covered: bool,
 }
 
+/// The files `--ignore-filename-regex` removed from the reports, for the
+/// visibility note.
+///
+/// The filter leaves no trace in the numbers: a smaller total and an empty patch
+/// look exactly like a diff that added no code. This records what it dropped, so
+/// a pattern wider than intended can be told from a correct one. Only files that
+/// were *in a report* count — a path matching the regex that no report mentioned
+/// was never part of the measurement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExcludedFiles {
+    /// Repo-relative paths removed from the head or baseline report.
+    paths: BTreeSet<String>,
+    /// Executable lines of each file removed from the head report. Baseline
+    /// lines are not kept: they are base-side numbers, and only head lines can
+    /// be compared with the lines a diff added.
+    head_lines: BTreeMap<String, BTreeSet<u32>>,
+    /// The excluded paths the diff touched. Filled by [`resolve`](Self::resolve).
+    touched: BTreeSet<String>,
+    /// Executable added lines that sit in excluded files — the patch lines the
+    /// filter took out of the denominator. Filled by [`resolve`](Self::resolve).
+    new_executable_lines: u64,
+}
+
+impl ExcludedFiles {
+    /// Records files the filter removed from the head report.
+    pub fn record_head(&mut self, removed: Vec<FileCoverage>) {
+        for file in removed {
+            self.paths.insert(file.path.clone());
+            self.head_lines
+                .entry(file.path)
+                .or_default()
+                .extend(file.lines.into_keys());
+        }
+    }
+
+    /// Records files the filter removed from the baseline report.
+    pub fn record_baseline(&mut self, removed: Vec<FileCoverage>) {
+        self.paths.extend(removed.into_iter().map(|f| f.path));
+    }
+
+    /// Works out, against `diff`, which excluded files it touched and how many
+    /// executable lines it added to them.
+    ///
+    /// A file counts as touched under either name it has in the diff, so a
+    /// rename whose old path the baseline report used is still recognised.
+    pub fn resolve(&mut self, diff: &DiffModel) {
+        self.touched.clear();
+        self.new_executable_lines = 0;
+        for file in diff.files.values() {
+            let names = std::iter::once(&file.new_path).chain(file.old_path.as_ref());
+            for name in names.filter(|name| self.paths.contains(*name)) {
+                self.touched.insert(name.clone());
+            }
+            if let Some(lines) = self.head_lines.get(&file.new_path) {
+                self.new_executable_lines += file.added.intersection(lines).count() as u64;
+            }
+        }
+    }
+
+    /// Whether the filter removed nothing.
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    /// Every excluded path, sorted.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.paths.iter().map(String::as_str)
+    }
+
+    /// The excluded paths this diff touched, sorted.
+    pub fn touched(&self) -> impl Iterator<Item = &str> {
+        self.touched.iter().map(String::as_str)
+    }
+
+    /// Number of excluded files.
+    pub fn count(&self) -> usize {
+        self.paths.len()
+    }
+
+    /// Number of excluded files the diff touched.
+    pub fn touched_count(&self) -> usize {
+        self.touched.len()
+    }
+
+    /// Executable lines the diff added to excluded files.
+    pub fn new_executable_lines(&self) -> u64 {
+        self.new_executable_lines
+    }
+}
+
 /// The full attribution result.
 #[derive(Debug, Clone, Default)]
 pub struct CoverageDiff {
@@ -263,6 +353,9 @@ pub struct CoverageDiff {
     /// Source-marker regions that applied, for the visibility note. Empty when
     /// no marker was found.
     pub markers: Vec<AppliedMarker>,
+    /// Files `--ignore-filename-regex` removed, for the visibility note. Empty
+    /// when the filter removed nothing, which leaves the output unchanged.
+    pub excluded: ExcludedFiles,
 }
 
 impl CoverageDiff {
@@ -639,6 +732,86 @@ mod tests {
     use super::*;
     use crate::coverage::model::FileCoverage;
     use std::collections::{BTreeMap, BTreeSet};
+
+    fn file_with_lines(path: &str, lines: &[u32]) -> FileCoverage {
+        let mut f = FileCoverage::new(path);
+        for &n in lines {
+            f.record(n, 1);
+        }
+        f
+    }
+
+    #[test]
+    fn excluded_files_start_empty_and_stay_empty_when_resolved() {
+        let mut excluded = ExcludedFiles::default();
+        assert!(excluded.is_empty());
+        excluded.resolve(&diff_added("src/a.rs", true, &[1, 2]));
+        assert!(excluded.is_empty());
+        assert_eq!(excluded.count(), 0);
+        assert_eq!(excluded.touched_count(), 0);
+        assert_eq!(excluded.new_executable_lines(), 0);
+    }
+
+    #[test]
+    fn excluded_files_count_touched_files_and_their_new_executable_lines() {
+        let mut excluded = ExcludedFiles::default();
+        excluded.record_head(vec![
+            file_with_lines("src/gen.rs", &[1, 2, 3, 9]),
+            file_with_lines("src/other.rs", &[1]),
+        ]);
+        // The diff adds 2, 3 and 4 to `gen.rs`; line 4 is not executable.
+        excluded.resolve(&diff_added("src/gen.rs", false, &[2, 3, 4]));
+        assert_eq!(excluded.count(), 2);
+        assert_eq!(
+            excluded.paths().collect::<Vec<_>>(),
+            ["src/gen.rs", "src/other.rs"]
+        );
+        assert_eq!(excluded.touched().collect::<Vec<_>>(), ["src/gen.rs"]);
+        assert_eq!(excluded.touched_count(), 1);
+        assert_eq!(excluded.new_executable_lines(), 2);
+    }
+
+    #[test]
+    fn excluded_files_merge_shards_and_the_baseline_by_path() {
+        let mut excluded = ExcludedFiles::default();
+        excluded.record_head(vec![file_with_lines("src/a.rs", &[1])]);
+        excluded.record_head(vec![file_with_lines("src/a.rs", &[2])]);
+        excluded.record_baseline(vec![
+            file_with_lines("src/a.rs", &[50]),
+            file_with_lines("src/gone.rs", &[1]),
+        ]);
+        excluded.resolve(&diff_added("src/a.rs", false, &[1, 2, 50]));
+        assert_eq!(
+            excluded.count(),
+            2,
+            "a path is counted once however many reports held it"
+        );
+        assert_eq!(
+            excluded.new_executable_lines(),
+            2,
+            "baseline line numbers are base-side and must not match added head lines"
+        );
+    }
+
+    #[test]
+    fn excluded_files_recognise_a_rename_by_its_old_path() {
+        let mut excluded = ExcludedFiles::default();
+        // Only the baseline report knew the file, under its old name.
+        excluded.record_baseline(vec![file_with_lines("src/old.rs", &[1])]);
+        let fd = FileDiff::new(
+            "src/new.rs",
+            Some("src/old.rs".to_string()),
+            false,
+            true,
+            BTreeSet::from([1]),
+            BTreeSet::new(),
+        );
+        let mut diff = DiffModel::default();
+        diff.files.insert("src/new.rs".to_string(), fd);
+        excluded.resolve(&diff);
+        assert_eq!(excluded.touched().collect::<Vec<_>>(), ["src/old.rs"]);
+        assert_eq!(excluded.new_executable_lines(), 0);
+    }
 
     pub(super) fn report(files: &[(&str, &[(u32, u64)])]) -> CoverageReport {
         let mut r = CoverageReport::new();
