@@ -252,10 +252,11 @@ numStmts count`, not per-line hits, so they are expanded to lines:
   nothing to execute and is not a line. The reasons the total differs from a
   tool's own summary are the ones under [Why the total differs from llvm-cov's
   summary](#why-the-total-differs-from-llvm-covs-summary).
-- **A block's blank and comment lines count too.** The profile gives a block's
-  range, not which of its lines hold code, so a comment added inside a long block
-  is a new executable line, covered or not with the block. `ignore` markers can
-  mask such lines.
+- **Lines between a block's first and last statement all count.** Go starts a
+  block at its first statement and ends it at its last, so a comment before the
+  first statement or after the last is outside it. The profile does not say which
+  lines in between hold code, so a blank or comment line there is an executable
+  line, covered or not with the block. `ignore` markers can mask such lines.
 - **`set`, `count` and `atomic` read the same way.** Only whether a count is zero
   matters to the output.
 
