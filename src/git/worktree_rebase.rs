@@ -38,6 +38,7 @@ use serde::Serialize;
 
 use crate::git::remote::RemoteInfo;
 use crate::git::resolve_git_binary;
+use crate::git::shallow;
 use crate::git::worktree_batch::{
     head_branch, is_false, main_root, resolve_selection, run_git_in, trimmed_stderr,
 };
@@ -414,7 +415,7 @@ fn is_dirty(repo: &Repository) -> bool {
 fn behind_count(repo_root: &Path, head: Oid, onto: &str) -> Option<usize> {
     let repo = Repository::open(repo_root).ok()?;
     let onto_oid = repo.revparse_single(onto).ok()?.peel_to_commit().ok()?.id();
-    let (_ahead, behind) = repo.graph_ahead_behind(head, onto_oid).ok()?;
+    let (_ahead, behind) = shallow::graph_ahead_behind(&repo, head, onto_oid)?;
     Some(behind)
 }
 
