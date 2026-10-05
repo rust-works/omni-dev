@@ -11,7 +11,8 @@
 //! Anything that compares history in a repository a user may have cloned with
 //! `--depth` therefore reads it through this module rather than through the handle
 //! it was given: the daemon's `ahead-behind` op (`divergence`) and the batch push
-//! classifier ([`worktree_push`]). Reading is all it does — nothing here writes to
+//! classifier ([`worktree_push`]), which also asks whether the cut leaves a divergence
+//! provable ([`divergence_is_provable`], #2175). Reading is all it does — nothing here writes to
 //! the repository.
 //!
 //! [`worktree_push`]: crate::git::worktree_push
@@ -52,11 +53,45 @@ pub(crate) fn graph_ahead_behind(
     local: Oid,
     upstream: Oid,
 ) -> Option<(usize, usize)> {
+    with_cut_applied(repo, |walker| {
+        walker.graph_ahead_behind(local, upstream).ok()
+    })?
+}
+
+/// Whether "ahead *and* behind" between `local` and `upstream` proves that they
+/// diverged (#2175).
+///
+/// In a complete repository it does, so this is `true`. In a shallow one it proves
+/// divergence only when the cut leaves a common ancestor visible: `git fetch --depth`
+/// can make the upstream a shallow root whose parent — the local tip — is hidden, and
+/// then a branch that is merely *behind* counts as 1 ahead and 1 behind, identical to
+/// one that truly diverged. Without a visible merge base the two cannot be told apart,
+/// so a caller about to act on "diverged" (a force-push) must not.
+///
+/// A visible merge base is a heuristic, not a proof: a merge commit at the boundary
+/// can still hide ancestry through the cut. It removes the no-merge-base case, which
+/// is the one a plain `--depth` fetch produces. A walk that fails outright (a tip with
+/// no commit behind it, a common dir that will not open) is `false`: unknown is never
+/// provable.
+pub(crate) fn divergence_is_provable(repo: &Repository, local: Oid, upstream: Oid) -> bool {
+    if !is_shallow(repo) {
+        return true;
+    }
+    with_cut_applied(repo, |walker| walker.merge_base(local, upstream).ok())
+        .flatten()
+        .is_some()
+}
+
+/// Runs `walk` against the handle through which `repo`'s history is read with a
+/// shallow cut applied: a handle opened at the common dir for a linked worktree of a
+/// shallow repository, `repo` itself for every other shape. `None` when that handle
+/// cannot be opened, logged at `debug` (see [`graph_ahead_behind`]).
+fn with_cut_applied<T>(repo: &Repository, walk: impl FnOnce(&Repository) -> T) -> Option<T> {
     if !(repo.is_worktree() && is_shallow(repo)) {
-        return repo.graph_ahead_behind(local, upstream).ok();
+        return Some(walk(repo));
     }
     match Repository::open(repo.commondir()) {
-        Ok(common) => common.graph_ahead_behind(local, upstream).ok(),
+        Ok(common) => Some(walk(&common)),
         Err(e) => {
             let path = repo.commondir().display();
             tracing::debug!("cannot open {path} to walk a shallow repository: {e}");
@@ -230,5 +265,96 @@ mod tests {
             logs.contains(&logged),
             "the failed open was not logged with its path: {logs}"
         );
+    }
+
+    /// A commit with no parent, written into `repo`: with `first` made a shallow
+    /// root it is what a cut upstream looks like next to a local tip — two roots
+    /// sharing no visible ancestor.
+    fn unrelated_root(repo: &Repository) -> Oid {
+        let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        repo.commit(None, &sig, &sig, "root", &tree, &[]).unwrap()
+    }
+
+    /// "Ahead and behind" proves divergence in a complete repository, whatever shape
+    /// of handle asks, so nothing is withheld there.
+    #[test]
+    fn divergence_in_a_complete_repository_is_always_provable() {
+        let dir = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        let (repo, base, first, _second) = three_commits(dir.path());
+        let other = unrelated_root(&repo);
+        let linked =
+            Repository::open(add_linked_worktree(&repo, base, wts.path(), "feature")).unwrap();
+
+        for handle in [&repo, &linked] {
+            assert!(divergence_is_provable(handle, first, other));
+        }
+    }
+
+    /// The case of #2175: with both tips shallow roots no merge base is visible, so
+    /// the two cannot be told from a branch that is only behind.
+    #[test]
+    fn divergence_with_no_visible_merge_base_in_a_shallow_repository_is_not_provable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, base, first, _second) = three_commits(dir.path());
+        let other = unrelated_root(&repo);
+        mark_shallow(&repo, first);
+        forget_object(&repo, base);
+        let checkout = Repository::open(dir.path()).unwrap();
+
+        assert!(!divergence_is_provable(&checkout, first, other));
+    }
+
+    /// A merge base inside the cut is visible, so the verdict stands. Checked through
+    /// a linked worktree's handle too, which must be walked at the common dir.
+    #[test]
+    fn divergence_with_a_visible_merge_base_in_a_shallow_repository_is_provable() {
+        let dir = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        let (repo, base, first, second) = three_commits(dir.path());
+        let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let sibling = repo
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "sibling",
+                &tree,
+                &[&repo.find_commit(first).unwrap()],
+            )
+            .unwrap();
+        let path = add_linked_worktree(&repo, base, wts.path(), "feature");
+        mark_shallow(&repo, first);
+        forget_object(&repo, base);
+        let linked = Repository::open(path).unwrap();
+        let checkout = Repository::open(dir.path()).unwrap();
+
+        // `second` and `sibling` both descend from the shallow root `first`.
+        for handle in [&checkout, &linked] {
+            assert!(divergence_is_provable(handle, second, sibling));
+        }
+    }
+
+    /// Unknown is never provable: a tip with no commit behind it, or a common dir
+    /// that will not open, must not read as a divergence to act on.
+    #[test]
+    fn a_walk_that_cannot_be_answered_is_not_provable() {
+        let dir = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        let (repo, base, first, second) = three_commits(dir.path());
+        let linked =
+            Repository::open(add_linked_worktree(&repo, base, wts.path(), "feature")).unwrap();
+        mark_shallow(&repo, first);
+        let nothing = Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert!(!divergence_is_provable(&repo, second, nothing));
+
+        std::fs::remove_file(repo.commondir().join("HEAD")).unwrap();
+        assert!(!divergence_is_provable(&linked, second, first));
     }
 }

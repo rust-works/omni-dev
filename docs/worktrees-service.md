@@ -330,7 +330,8 @@ neither is a usage error, not a silent mass-push. Each worktree is reported as
 tree — while a detached HEAD (which includes one sitting mid-rebase), a
 non-worktree path, a branch with no remote to publish to, and a branch whose
 history cannot be compared with its upstream (`history-unreadable`: a tip has no
-commit behind it in the object database) are. That last one is a skip rather than
+commit behind it in the object database, or a shallow clone's cut hides whether an
+ahead-and-behind branch really diverged, #2175) are. That last one is a skip rather than
 `up-to-date` on purpose (#2163): neither is pending, so nothing is pushed either
 way, but only the skip says the branch was **not** checked. A push publishes
 history to everyone, so the command confirms by default
@@ -374,8 +375,18 @@ common dir (`crate::git::shallow`, which the daemon's `ahead-behind` op shares; 
 [Git enrichment](#git-enrichment)). The counts are git's own view of the *cut*
 history, which is not always the true one: after `git fetch --depth` moves a branch's
 upstream, the cut can hide that the new tip descends from the local one, so a branch
-that is only behind can read as diverged. The lease still refuses such a push
-(`rejected`, naming `git fetch` and a rebase), so nothing is overwritten.
+that is only behind can count as 1 ahead and 1 behind, the same as one that really
+diverged. "Ahead and behind" therefore proves divergence only when a merge base is
+visible inside the cut (#2175, `shallow::divergence_is_provable`); without one the
+row is `skipped(history-unreadable)` rather than `would-force`, and the
+default-branch gate is not reached (so it reads `history-unreadable`, not
+`default-branch-force-push`). That removes the no-merge-base case a plain `--depth`
+fetch produces; it is a heuristic, not a proof, since a merge commit at the boundary
+can still hide ancestry through the cut. `git fetch --unshallow` (or a deeper fetch)
+settles a skipped row. The lease still refuses a doomed force-push either way
+(`rejected`, naming `git fetch` and a rebase), so nothing is overwritten. The
+`ahead-behind` op is unchanged: it shows the cut counts and reports `shallow: true`
+for exactly this reason.
 
 `worktrees merge-queue` enqueues eligible worktrees' pull requests into the GitHub
 merge queue — the daemon's two-phase `merge-queue` op driven from the CLI (#1401).
