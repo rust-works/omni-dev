@@ -30,10 +30,12 @@ Line coverage only; branch-coverage data in the report is ignored.
 
 ## Inputs
 
-- `--report <PATH>` (**required**, repeatable) — the head coverage report. Three
+- `--report <PATH>` (**required**, repeatable) — the head coverage report. Four
   formats are accepted and **auto-detected** from content: lcov trace files,
-  llvm-cov JSON (`cargo llvm-cov report --json`), and Cobertura XML. Override
-  detection with `--report-format <auto|lcov|llvm-cov-json|cobertura>`. Pass it
+  llvm-cov JSON (`cargo llvm-cov report --json`), Cobertura XML, and Go
+  coverprofiles (`go test -coverprofile`, see [Go coverprofiles](#go-coverprofiles)).
+  Override detection with
+  `--report-format <auto|lcov|llvm-cov-json|cobertura|go-coverprofile>`. Pass it
   once per shard to merge a [sharded run](#sharded-runs), or merge the shards
   into one file first with [`coverage merge`](#merging-shards-into-one-file).
 - `--base-ref <REV>` / `--head-ref <REV>` — the revisions to diff. Defaults are
@@ -222,6 +224,45 @@ prefix. Override the stripped prefix with `--strip-prefix <PATH>` when the repor
 was generated under a different root (for example, a container build path that
 differs from the checkout location).
 
+## Go coverprofiles
+
+`go test -coverprofile=cover.out ./...` writes its own format, read natively with
+no `gocover-cobertura` or `gcov2lcov` step. It is detected by its `mode: set`,
+`mode: count` or `mode: atomic` header line, or named with
+`--report-format go-coverprofile`. Sharded profiles work like any other: repeat
+`--report`, or [merge them](#merging-shards-into-one-file) (a `cat` of profiles
+is also read, since a repeated `mode:` line is accepted).
+
+```bash
+go test -coverprofile=cover.out ./...
+omni-dev coverage diff --report cover.out
+```
+
+A profile records **blocks**, source ranges written `file:startLine.startCol,endLine.endCol
+numStmts count`, not per-line hits, so they are expanded to lines:
+
+- **Every line a block spans takes the block's count.** Where blocks overlap, the
+  larger count wins, the rule for any line several regions cover. A line shared by
+  two blocks (`} else {`) therefore reads covered if either ran, because the
+  blocks are sub-line spans and the model is per line.
+- **A line is executable if a block with statements spans it.** The total is the
+  number of such lines, so it differs from the statement-weighted percentage of
+  `go tool cover -func` (a long multi-statement block counts its lines, not its
+  statements). A block with no statements, such as an empty function body, holds
+  nothing to execute and is not a line. The reasons the total differs from a
+  tool's own summary are the ones under [Why the total differs from llvm-cov's
+  summary](#why-the-total-differs-from-llvm-covs-summary).
+- **`set`, `count` and `atomic` read the same way.** Only whether a count is zero
+  matters to the output.
+
+Go names files by import path (`github.com/org/repo/pkg/a.go`), not by path on
+disk. The module path declared by the `go.mod` at the repository root is stripped
+from them, which makes them repo-relative. When the module is **not** at the root
+(a `services/api/go.mod`) or there is no `go.mod`, nothing is stripped and no file
+matches the diff; pass the import path of the repository root instead, so the
+subdirectory stays in the path: `--strip-prefix github.com/org/repo`.
+`--ignore-filename-regex` sees the mapped paths.
+
 ## Sharded runs
 
 When the instrumented test run is split across several concurrent CI jobs, each
@@ -292,8 +333,8 @@ omni-dev coverage diff --report head.lcov --baseline-report merged.lcov
 
 - **Same merge, same checks.** The files are unioned and, for a line present in
   several inputs, the larger hit count wins, exactly as for repeated `--report`
-  (see [how shards combine](#sharded-runs)). Each input may be lcov, llvm-cov JSON
-  or Cobertura, detected per file; `--report-format` applies to all of them. An
+  (see [how shards combine](#sharded-runs)). Each input may be lcov, llvm-cov JSON,
+  Cobertura or a Go coverprofile, detected per file; `--report-format` applies to all of them. An
   input that is missing, unparseable or has no executable lines fails the run and
   names it — **including a lone input**, unlike `coverage diff`, because the output
   is trusted by whatever reads it next. An input whose absolute paths all fall
@@ -600,7 +641,7 @@ wires it up.
 | Flag | Purpose |
 |------|---------|
 | `--report <PATH>` | Head coverage report (required); repeat once per shard to merge a [sharded run](#sharded-runs) |
-| `--report-format <FMT>` | Format of every `--report`: `auto` (default) \| `lcov` \| `llvm-cov-json` \| `cobertura` |
+| `--report-format <FMT>` | Format of every `--report`: `auto` (default) \| `lcov` \| `llvm-cov-json` \| `cobertura` \| `go-coverprofile` |
 | `--base-ref <REV>` | Base revision (default: merge-base of `origin/main` and `HEAD`) |
 | `--head-ref <REV>` | Head revision the report was measured at (default: `HEAD`) |
 | `--baseline-report <PATH>` | Base-side report; enables project deltas + indirect changes |
@@ -621,8 +662,8 @@ wires it up.
 
 | Flag | Purpose |
 |------|---------|
-| `<REPORT>...` | Reports to merge, one per shard (required); lcov, llvm-cov JSON or Cobertura |
-| `--report-format <FMT>` | Format of every report: `auto` (default) \| `lcov` \| `llvm-cov-json` \| `cobertura` |
+| `<REPORT>...` | Reports to merge, one per shard (required); lcov, llvm-cov JSON, Cobertura or Go coverprofile |
+| `--report-format <FMT>` | Format of every report: `auto` (default) \| `lcov` \| `llvm-cov-json` \| `cobertura` \| `go-coverprofile` |
 | `-o, --output <PATH>` | File to write the merged lcov report to (required); a path, not a format |
 | `--strip-prefix <PATH>` | Prefix stripped from report paths (default: the repository working directory) |
 | `-C, --repo <PATH>` | Operate as if started in `<PATH>`; relative paths and the default prefix follow it |
