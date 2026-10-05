@@ -502,15 +502,50 @@ omni-dev: coverage tolerate-line reason="…"
 omni-dev coverage lint-markers
 omni-dev coverage lint-markers src/bits/popcount.rs
 omni-dev coverage lint-markers -C /path/to/repo src/bits/popcount.rs
+omni-dev coverage lint-markers --include 'src/**/*.py' --include 'scripts/*.sh'
 ```
 
-With no paths, the command checks every tracked `.rs` file in the Git index
+With no paths, the command checks every tracked text file in the Git index
 against its current working-tree contents, including staged additions and
-unstaged edits. Deleted worktree files are skipped. Explicit paths select only
-those files, including untracked files, and are relative to the repository root
-unless absolute. Malformed markers print the same `path:line` diagnostics as
-`coverage diff` and make the command exit nonzero. No coverage report or
-`llvm-cov` run is needed. `scripts/build.sh` runs this check after formatting.
+unstaged edits — in any language, since a marker is a plain substring in any
+comment syntax. Deleted worktree files are skipped, as are symlinks and
+submodules, and so is any file that is not valid UTF-8: binaries are never
+flagged. Explicit paths select only those files, including untracked files, and
+are relative to the repository root unless absolute; a non-UTF-8 file named
+explicitly is skipped too, so a hook can pass every staged path. Malformed
+markers print the same `path:line` diagnostics as `coverage diff` and make the
+command exit nonzero. No coverage report or `llvm-cov` run is needed.
+`scripts/build.sh` runs this check after formatting.
+
+To narrow the default scan, pass `--include <GLOB>` (repeatable) or declare the
+same list in `.omni-dev/coverage.yaml`:
+
+```yaml
+# .omni-dev/coverage.yaml
+lint-markers:
+  include:
+    - 'src/**/*.py'
+    - '**/*.rs'
+```
+
+- **Globs** match the repo-relative, `/`-separated path. `*` stays within one
+  path component and `**` crosses directories, so `*.py` is a top-level file and
+  `**/*.py` is any. A file is scanned when it matches *any* glob; an invalid glob
+  is a hard error.
+- **The flag replaces the config list** rather than adding to it (unlike
+  `diff.ignore-filename-regex`, which only ever grows), so a one-off `--include`
+  can narrow a repo-wide list. With neither, every tracked text file is scanned.
+- **Explicit paths ignore both**: naming a file is a selection, so `--include`
+  and the config list apply only to the default scan.
+- Discovery of `coverage.yaml` is the one `coverage diff` uses
+  (`OMNI_DEV_CONFIG_DIR`, else a walk-up for `.omni-dev/`). A malformed file is
+  a hard error.
+
+Before this command scanned every tracked file it checked only `.rs` files. A
+repository that runs it bare, in CI or a hook, may now see errors from files
+that document the marker syntax (this repository's own `docs/` do, so its
+`coverage.yaml` sets `include: ['**/*.rs']`). Restoring the old scope is one
+line: `--include '**/*.rs'`, or that glob under `lint-markers.include`.
 
 ### How masking works, precisely
 

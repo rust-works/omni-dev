@@ -19,7 +19,7 @@ use crate::coverage::{
 
 /// Config file (under the discovered `.omni-dev/` dir) that declares persistent
 /// `coverage diff` settings, unioned with the CLI flags. Missing ⇒ no-op.
-const COVERAGE_CONFIG_FILE: &str = "coverage.yaml";
+pub(super) const COVERAGE_CONFIG_FILE: &str = "coverage.yaml";
 
 /// Coverage report format selector (CLI mirror of [`Format`] plus auto-detect).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -320,10 +320,23 @@ fn normalise_report(
 /// Forward-compatible: unknown top-level keys are ignored, so a newer schema
 /// stays readable by an older binary. A missing `diff` block defaults to empty.
 #[derive(Debug, Default, serde::Deserialize)]
-struct CoverageConfig {
+pub(super) struct CoverageConfig {
     /// Settings for the `diff` subcommand.
     #[serde(default)]
     diff: CoverageDiffConfig,
+    /// Settings for the `lint-markers` subcommand.
+    #[serde(default, rename = "lint-markers")]
+    pub(super) lint_markers: CoverageLintMarkersConfig,
+}
+
+/// The `lint-markers:` block of `coverage.yaml`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) struct CoverageLintMarkersConfig {
+    /// Repo-relative globs narrowing which tracked files `lint-markers` scans
+    /// when it is given no paths. Replaced by any `--include` on the command line.
+    #[serde(default)]
+    pub(super) include: Vec<String>,
 }
 
 /// The `diff:` block of `coverage.yaml`.
@@ -1718,6 +1731,19 @@ mod tests {
     #[test]
     fn coverage_config_defaults_to_empty() {
         let config: CoverageConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(config.diff.ignore_filename_regex.is_empty());
+        assert!(config.lint_markers.include.is_empty());
+    }
+
+    #[test]
+    fn coverage_config_parses_lint_markers_include() {
+        let yaml =
+            "lint-markers:\n  future-key: 1\n  include:\n    - 'src/**/*.py'\n    - '**/*.rs'\n";
+        let config: CoverageConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.lint_markers.include,
+            vec!["src/**/*.py".to_string(), "**/*.rs".to_string()]
+        );
         assert!(config.diff.ignore_filename_regex.is_empty());
     }
 
