@@ -10,11 +10,12 @@ use regex::RegexSet;
 
 use crate::claude::context::{load_config_content, resolve_context_dir_at};
 use crate::coverage::analysis::{analyze_with_markers, ExcludedFiles, Markers};
+use crate::coverage::format::resolve as resolve_format;
 use crate::coverage::markers::{self, FileMarkers};
 use crate::coverage::merge::check_shard;
 use crate::coverage::{
-    default_base_ref, parse, render, CoverageReport, DiffModel, DiffScope, FileCoverage, Format,
-    OutputFormat, RenderOptions,
+    default_base_ref, go_coverprofile, parse, render, CoverageReport, DiffModel, DiffScope,
+    FileCoverage, Format, OutputFormat, RenderOptions,
 };
 
 /// Config file (under the discovered `.omni-dev/` dir) that declares persistent
@@ -33,6 +34,8 @@ pub enum ReportFormat {
     LlvmCovJson,
     /// Cobertura XML.
     Cobertura,
+    /// Go `go test -coverprofile` output.
+    GoCoverprofile,
 }
 
 impl ReportFormat {
@@ -43,6 +46,7 @@ impl ReportFormat {
             Self::Lcov => Some(Format::Lcov),
             Self::LlvmCovJson => Some(Format::LlvmCovJson),
             Self::Cobertura => Some(Format::Cobertura),
+            Self::GoCoverprofile => Some(Format::GoCoverprofile),
         }
     }
 }
@@ -72,7 +76,7 @@ impl From<OutputFormatArg> for OutputFormat {
 /// Analyses diff/patch coverage from a per-line report and a git diff.
 #[derive(Parser)]
 pub struct DiffCommand {
-    /// Head coverage report (lcov / llvm-cov-json / cobertura); repeat once per
+    /// Head coverage report (lcov / llvm-cov-json / cobertura / go-coverprofile); repeat once per
     /// shard to merge a sharded run.
     ///
     /// Pass one `--report` per shard of a sharded coverage run and
@@ -289,12 +293,33 @@ pub(super) fn anchor(path: &Path, repo_root: &Path) -> PathBuf {
     }
 }
 
-/// Reads and parses the report at `path`, leaving its paths as the tool wrote them.
-pub(super) fn read_report(path: &Path, format: ReportFormat) -> Result<CoverageReport> {
+/// Reads and parses the report at `path`.
+///
+/// Paths are left as the tool wrote them, except in a Go coverprofile, whose file
+/// names are import paths: those lose the leading module path declared by the
+/// `go.mod` in `repo_root`, which makes them repo-relative. A profile of a module
+/// that is not at the repository root, or with no readable `go.mod`, is left
+/// as written; `--strip-prefix <module path>` maps those.
+pub(super) fn read_report(
+    path: &Path,
+    format: ReportFormat,
+    repo_root: &Path,
+) -> Result<CoverageReport> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("could not read coverage report {}", path.display()))?;
-    parse(&content, format.into_format())
-        .with_context(|| format!("could not parse coverage report {}", path.display()))
+    let resolved = resolve_format(&content, format.into_format())
+        .with_context(|| format!("could not parse coverage report {}", path.display()))?;
+    let mut report = parse(&content, Some(resolved))
+        .with_context(|| format!("could not parse coverage report {}", path.display()))?;
+    if resolved == Format::GoCoverprofile {
+        if let Some(module) = std::fs::read_to_string(repo_root.join("go.mod"))
+            .ok()
+            .and_then(|go_mod| go_coverprofile::module_path(&go_mod))
+        {
+            report.strip_prefix(Path::new(&module));
+        }
+    }
+    Ok(report)
 }
 
 /// Makes `report`'s paths repo-relative, then drops the files `ignore` excludes,
@@ -570,7 +595,7 @@ impl DiffCommand {
         let mut merged = CoverageReport::new();
         for path in &self.report {
             let path = anchor(path, repo_root);
-            let mut report = read_report(&path, self.report_format)?;
+            let mut report = read_report(&path, self.report_format, repo_root)?;
             if sharded {
                 check_shard(&path.display().to_string(), &report, strip_prefix, warnings)?;
             }
@@ -595,7 +620,7 @@ impl DiffCommand {
         repo_root: &Path,
         excluded: &mut ExcludedFiles,
     ) -> Result<CoverageReport> {
-        let mut report = read_report(&anchor(path, repo_root), format)?;
+        let mut report = read_report(&anchor(path, repo_root), format, repo_root)?;
         excluded.record_baseline(normalise_report(&mut report, strip_prefix, ignore));
         Ok(report)
     }
@@ -812,6 +837,10 @@ mod tests {
         assert_eq!(
             ReportFormat::Cobertura.into_format(),
             Some(Format::Cobertura)
+        );
+        assert_eq!(
+            ReportFormat::GoCoverprofile.into_format(),
+            Some(Format::GoCoverprofile)
         );
     }
 

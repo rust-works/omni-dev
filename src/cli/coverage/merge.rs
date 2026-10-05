@@ -29,9 +29,9 @@ const MAX_TEMP_ATTEMPTS: u32 = 100;
 /// `cargo llvm-cov` writes no newline after its last `end_of_record`, so the
 /// join glues it onto the next shard's first line.
 ///
-/// Each input may be lcov, llvm-cov JSON or Cobertura, detected per file. An
-/// input that is missing, unparseable or has no executable lines fails the run,
-/// naming it, because a shard that silently produced nothing would only make
+/// Each input may be lcov, llvm-cov JSON, Cobertura or a Go coverprofile, detected
+/// per file. An input that is missing, unparseable or has no executable lines
+/// fails the run, naming it, because a shard that silently produced nothing would only make
 /// the total look slightly worse. An input whose absolute paths all fall
 /// outside the strip prefix draws a warning.
 ///
@@ -42,7 +42,7 @@ const MAX_TEMP_ATTEMPTS: u32 = 100;
 /// `--strip-prefix`) from each.
 #[derive(Parser)]
 pub struct MergeCommand {
-    /// Coverage reports to merge (lcov / llvm-cov-json / cobertura), one per shard.
+    /// Coverage reports to merge (lcov / llvm-cov-json / cobertura / go-coverprofile), one per shard.
     #[arg(value_name = "REPORT", required = true)]
     pub report: Vec<PathBuf>,
 
@@ -143,9 +143,10 @@ impl MergeCommand {
 
         let mut warnings = Vec::new();
         let mut merged = CoverageReport::new();
+        let root = repo_root.unwrap_or_else(|| Path::new("."));
         for path in &self.report {
             let path = resolve(path, repo_root);
-            let mut report = read_report(&path, self.report_format)?;
+            let mut report = read_report(&path, self.report_format, root)?;
             // Unlike `coverage diff`, a lone input is checked too: a merge's
             // output is trusted by whatever reads it next, and nothing else
             // would notice it came from a run that measured nothing.
@@ -520,6 +521,158 @@ mod tests {
         // `b.rs` line 2 is covered by the JSON shard only; line 3 exists only there.
         assert!(text.contains("SF:b.rs\nDA:1,1\nDA:2,4\nDA:3,0\n"), "{text}");
         assert!(text.contains("SF:c.rs\nDA:9,2\n"), "{text}");
+    }
+
+    // ── Go coverprofiles ─────────────────────────────────────────────────
+
+    /// Writes a Go coverprofile under `dir`, naming files by import path under
+    /// `module` the way `go test -coverprofile` does.
+    fn write_go_profile(dir: &Path, name: &str, module: &str, body: &[&str]) -> PathBuf {
+        let mut text = String::from("mode: set\n");
+        for block in body {
+            text.push_str(&format!("{module}/{block}\n"));
+        }
+        let path = dir.join(name);
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// Three sharded profiles of `b.rs` (three lines) under `example.com/m`,
+    /// each covering a different block, with a `go.mod` at the repository root.
+    fn go_shards(repo: &Path) -> Vec<PathBuf> {
+        fs::write(repo.join("go.mod"), "module example.com/m\n\ngo 1.22\n").unwrap();
+        vec![
+            write_go_profile(
+                repo,
+                "one.cov",
+                "example.com/m",
+                &["b.rs:1.1,1.9 1 1", "b.rs:2.1,3.9 2 0"],
+            ),
+            write_go_profile(
+                repo,
+                "two.cov",
+                "example.com/m",
+                &["b.rs:1.1,1.9 1 0", "b.rs:2.1,2.9 1 1"],
+            ),
+            write_go_profile(
+                repo,
+                "three.cov",
+                "example.com/m",
+                &["b.rs:1.1,1.9 1 0", "b.rs:2.1,3.9 2 0"],
+            ),
+        ]
+    }
+
+    #[test]
+    fn sharded_go_profiles_merge_to_repo_relative_lcov() {
+        let (_dir, repo, _base) = repo_with_added_file();
+        let out = repo.join("merged.lcov");
+
+        let outcome = merge(go_shards(&repo), out.clone())
+            .run(Some(&repo))
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&out).unwrap(),
+            "TN:\nSF:b.rs\nDA:1,1\nDA:2,1\nDA:3,0\nLF:3\nLH:2\nend_of_record\n"
+        );
+        assert_eq!(outcome.files, 1);
+        assert_eq!(outcome.total_lines, 3);
+        assert_eq!(outcome.covered_lines, 2);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    }
+
+    #[test]
+    fn diff_over_sharded_go_profiles_gives_the_merged_files_figures() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let shards = go_shards(&repo);
+        let out = repo.join("merged.lcov");
+        merge(shards.clone(), out.clone()).run(Some(&repo)).unwrap();
+
+        let mut from_shards = vec![];
+        for shard in &shards {
+            from_shards.extend(["--report", shard.to_str().unwrap()]);
+        }
+        from_shards.extend(["--base-ref", base.as_str()]);
+        let from_merged = [
+            "--report",
+            out.to_str().unwrap(),
+            "--base-ref",
+            base.as_str(),
+        ];
+
+        let by_shards = diff_command(&from_shards).run(Some(&repo)).unwrap();
+        let by_merge = diff_command(&from_merged).run(Some(&repo)).unwrap();
+
+        // `b.rs` is the whole diff: lines 1 and 2 covered by some shard, 3 by none.
+        let patch = by_shards.patch_percent.unwrap();
+        assert!((patch - 200.0 / 3.0).abs() < 1e-9, "{patch}");
+        assert_eq!(by_shards.patch_percent, by_merge.patch_percent);
+        assert_eq!(by_shards.rendered, by_merge.rendered);
+    }
+
+    #[test]
+    fn a_go_profile_is_detected_and_may_be_named_explicitly() {
+        let (_dir, repo, _base) = repo_with_added_file();
+        let shards = go_shards(&repo);
+        let out = repo.join("merged.lcov");
+        let mut cmd = merge(shards, out.clone());
+        cmd.report_format = ReportFormat::GoCoverprofile;
+        cmd.run(Some(&repo)).unwrap();
+        assert!(fs::read_to_string(&out).unwrap().contains("SF:b.rs\n"));
+    }
+
+    #[test]
+    fn go_paths_are_left_as_written_without_a_go_mod() {
+        let (_dir, repo, _base) = repo_with_added_file();
+        let shard = write_go_profile(&repo, "one.cov", "example.com/m", &["b.rs:1.1,1.9 1 1"]);
+        let out = repo.join("merged.lcov");
+
+        merge(vec![shard], out.clone()).run(Some(&repo)).unwrap();
+
+        assert!(fs::read_to_string(&out)
+            .unwrap()
+            .contains("SF:example.com/m/b.rs\n"));
+    }
+
+    #[test]
+    fn go_paths_outside_the_go_mod_module_are_left_as_written() {
+        let (_dir, repo, _base) = repo_with_added_file();
+        fs::write(repo.join("go.mod"), "module example.com/other\n").unwrap();
+        let shard = write_go_profile(&repo, "one.cov", "example.com/m", &["b.rs:1.1,1.9 1 1"]);
+        let out = repo.join("merged.lcov");
+
+        merge(vec![shard], out.clone()).run(Some(&repo)).unwrap();
+
+        assert!(fs::read_to_string(&out)
+            .unwrap()
+            .contains("SF:example.com/m/b.rs\n"));
+    }
+
+    #[test]
+    fn strip_prefix_maps_go_paths_when_there_is_no_go_mod_at_the_root() {
+        let (_dir, repo, _base) = repo_with_added_file();
+        // A module in a subdirectory: its import paths carry the subdirectory.
+        let shard = write_go_profile(&repo, "one.cov", "example.com/m/svc", &["b.rs:1.1,1.9 1 1"]);
+        let out = repo.join("merged.lcov");
+        let mut cmd = merge(vec![shard], out.clone());
+        cmd.strip_prefix = Some(PathBuf::from("example.com/m/svc"));
+
+        cmd.run(Some(&repo)).unwrap();
+
+        assert!(fs::read_to_string(&out).unwrap().contains("SF:b.rs\n"));
+    }
+
+    #[test]
+    fn a_go_mod_is_not_read_for_other_formats() {
+        let (_dir, repo, _base) = repo_with_added_file();
+        fs::write(repo.join("go.mod"), "module b.rs\n").unwrap();
+        let shard = write_shard(&repo, "one.lcov", &[(1, 1)], &[(1, 1)]);
+        let out = repo.join("merged.lcov");
+
+        merge(vec![shard], out.clone()).run(Some(&repo)).unwrap();
+
+        assert!(fs::read_to_string(&out).unwrap().contains("SF:b.rs\n"));
     }
 
     #[test]
