@@ -3274,13 +3274,14 @@ omni-dev coverage lint-markers - Checks source coverage markers without generati
 
 Checks source coverage markers without generating a coverage report
 
-Usage: lint-markers [PATH]...
+Usage: lint-markers [OPTIONS] [PATH]...
 
 Arguments:
-  [PATH]...  Files to scan (default: every tracked Rust file in the repository)
+  [PATH]...  Files to scan (default: every tracked text file in the repository)
 
 Options:
-  -h, --help  Print help
+      --include <GLOB>  Scan only tracked files matching this glob (repeatable)
+  -h, --help            Print help (see more with '--help')
 
 
 ================================================================================

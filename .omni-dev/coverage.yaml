@@ -1,0 +1,8 @@
+# Repo settings for `omni-dev coverage`.
+lint-markers:
+  # Scope the marker lint to Rust source. `docs/coverage.md` and `CHANGELOG.md`
+  # describe the marker syntax with literal markers (some deliberately
+  # malformed or on one line), which the default all-tracked-files scan would
+  # report as errors.
+  include:
+    - '**/*.rs'
