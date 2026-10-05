@@ -233,10 +233,11 @@ pub enum SkipReason {
     DefaultBranchForcePush,
     /// The branch's history could not be compared with its upstream: a tip has no
     /// commit behind it in this object database (a truncated fetch, a pruned pack),
-    /// or a shallow clone's cut could not be applied. Nothing is pushed — above all,
-    /// never a force on the strength of a comparison that failed — but the row says
-    /// the branch was **not** checked, which [`PushResult::UpToDate`] would claim it
-    /// was.
+    /// a shallow clone's cut could not be applied, or the cut hides whether a branch
+    /// that is both ahead and behind really diverged (#2175). Nothing is pushed —
+    /// above all, never a force on the strength of a comparison that failed — but the
+    /// row says the branch was **not** checked, which [`PushResult::UpToDate`] would
+    /// claim it was.
     HistoryUnreadable,
 }
 
@@ -346,6 +347,16 @@ fn classify(path: &Path) -> WorktreeOutcome {
         (0, _) => outcome(PushResult::UpToDate),
         (ahead, 0) => outcome(PushResult::WouldFastForward { ahead }),
         (ahead, behind) => {
+            // "Ahead and behind" is only divergence when the history shows it. In a
+            // shallow clone the cut can hide that the upstream descends from the local
+            // tip, so a branch that merely needs a fetch reads the same as a rewritten
+            // one; with no merge base visible the verdict is a guess, and a guess is
+            // never a force (#2175).
+            if !shallow::divergence_is_provable(&repo, head, upstream_oid) {
+                return outcome(PushResult::Skipped {
+                    reason: SkipReason::HistoryUnreadable,
+                });
+            }
             // The one gate that inverts ADR-0060: refuse to *force*-push the
             // repository's remote default branch, whichever worktree holds it. A
             // fast-forward onto it (above) stays an ordinary push and is allowed.
@@ -1108,24 +1119,28 @@ mod tests {
             (2, 1),
             "git's own count for the fixture"
         );
-        // Diverged, on the remote default branch: refused rather than forced — and,
-        // above all, not `UpToDate`, which is what the failed walk used to report.
+        // 2 ahead and 1 behind, but `origin/main` is a shallow root and the local
+        // branch's own history is cut at the old one, so no merge base is visible and
+        // the divergence is a guess (#2175). Not forced, and, above all, not
+        // `UpToDate`, which is what the failed walk used to report.
         assert_eq!(
             classify(&wt).result,
             PushResult::Skipped {
-                reason: SkipReason::DefaultBranchForcePush
+                reason: SkipReason::HistoryUnreadable
             }
         );
     }
 
-    /// The counts themselves, not just the verdict: on a branch that is not the
-    /// default one the diverged row is `WouldForce { ahead, behind }`, so the
-    /// classifier's numbers can be held to git's own over a real `--depth 1` clone
-    /// (the test above ends in the default-branch gate, which hides them).
-    #[test]
-    fn a_linked_worktree_of_a_real_depth_clone_counts_what_git_counts() {
-        let _guard = serial();
-        let scenario = Scenario::new();
+    /// A real `--depth` clone of `topic` with a linked worktree on it, one local
+    /// commit ahead of `origin/topic`. `origin/topic` then moves by `moves` commits and
+    /// the clone follows it at `depth`. Returns the worktree.
+    ///
+    /// `local_commit` is `false` for the branch that only ever falls behind.
+    fn depth_clone_whose_upstream_moves(
+        scenario: &Scenario,
+        depth: &str,
+        local_commit: bool,
+    ) -> PathBuf {
         scenario.git_in(&scenario.local, &["checkout", "-b", "topic"]);
         scenario.commit_in(&scenario.local, "file.txt", "t1\n", "t1");
         scenario.commit_in(&scenario.local, "file.txt", "t2\n", "t2");
@@ -1134,7 +1149,14 @@ mod tests {
         let url = format!("file://{}", scenario.origin.display());
         git_at(
             scenario.root.path(),
-            &["clone", "--depth", "1", "--no-single-branch", &url, "clone"],
+            &[
+                "clone",
+                "--depth",
+                depth,
+                "--no-single-branch",
+                &url,
+                "clone",
+            ],
         );
         let clone = scenario.root.path().join("clone");
         config_repo(&clone, "Test", "test@example.com");
@@ -1151,14 +1173,28 @@ mod tests {
             ],
         );
         git_at(&wt, &["branch", "--set-upstream-to=origin/topic"]);
-        scenario.commit_in(&wt, "local.txt", "local\n", "local");
+        if local_commit {
+            scenario.commit_in(&wt, "local.txt", "local\n", "local");
+        }
         let wt = std::fs::canonicalize(&wt).unwrap();
 
-        // `origin/topic` moves and the clone follows it at depth 1, which cuts the
-        // history the worktree's branch was built on.
+        // `origin/topic` moves and the clone follows it at the same depth.
         scenario.commit_in(&scenario.local, "file.txt", "t3\n", "t3");
         scenario.git_in(&scenario.local, &["push", "origin", "topic"]);
-        git_at(&clone, &["fetch", "--depth", "1", "origin"]);
+        git_at(&clone, &["fetch", "--depth", depth, "origin"]);
+        wt
+    }
+
+    /// The counts themselves, not just the verdict: on a branch that is not the
+    /// default one the diverged row is `WouldForce { ahead, behind }`, so the
+    /// classifier's numbers can be held to git's own over a real `--depth` clone. At
+    /// depth 2 the fetch leaves the branch point visible, so the divergence is real
+    /// and provable (#2175); the depth-1 case below is the one that is not.
+    #[test]
+    fn a_linked_worktree_of_a_real_depth_clone_counts_what_git_counts() {
+        let _guard = serial();
+        let scenario = Scenario::new();
+        let wt = depth_clone_whose_upstream_moves(&scenario, "2", true);
 
         let (ahead, behind) = scenario.git_counts(&wt, "topic...origin/topic");
         assert!(
@@ -1169,6 +1205,60 @@ mod tests {
             classify(&wt).result,
             PushResult::WouldForce { ahead, behind },
             "the classifier must count the cut history exactly as git does"
+        );
+    }
+
+    /// The issue's reproduction (#2175): a branch that is only *behind* its upstream,
+    /// after `git fetch --depth 1` made the new tip a shallow root, counts as 1 ahead
+    /// and 1 behind in the cut history. That is not provably divergence, so it must not
+    /// be offered as a force-push.
+    #[test]
+    fn a_branch_only_behind_in_a_depth_one_clone_is_not_called_diverged() {
+        let _guard = serial();
+        let scenario = Scenario::new();
+        let wt = depth_clone_whose_upstream_moves(&scenario, "1", false);
+
+        assert_eq!(
+            scenario.git_counts(&wt, "topic...origin/topic"),
+            (1, 1),
+            "git's own count for the fixture: the cut makes `behind` look like divergence"
+        );
+        let outcome = classify(&wt);
+        assert_eq!(
+            outcome.result,
+            PushResult::Skipped {
+                reason: SkipReason::HistoryUnreadable
+            }
+        );
+        assert!(!outcome.result.is_pending());
+    }
+
+    /// The same cut on the remote default branch reads `history-unreadable` rather
+    /// than `default-branch-force-push`: the gate is for a divergence that exists.
+    #[test]
+    fn an_unprovable_divergence_on_the_default_branch_is_unreadable_not_a_force_refusal() {
+        let _guard = serial();
+        let scenario = Scenario::new();
+        scenario.commit_in(&scenario.local, "file.txt", "two\n", "two");
+        scenario.git_in(&scenario.local, &["push", "origin", "main"]);
+        let url = format!("file://{}", scenario.origin.display());
+        git_at(
+            scenario.root.path(),
+            &["clone", "--depth", "1", &url, "clone"],
+        );
+        let clone = scenario.root.path().join("clone");
+        config_repo(&clone, "Test", "test@example.com");
+        scenario.commit_in(&scenario.local, "file.txt", "three\n", "three");
+        scenario.git_in(&scenario.local, &["push", "origin", "main"]);
+        git_at(&clone, &["fetch", "--depth", "1", "origin"]);
+        let clone = std::fs::canonicalize(&clone).unwrap();
+
+        assert_eq!(scenario.git_counts(&clone, "main...origin/main"), (1, 1));
+        assert_eq!(
+            classify(&clone).result,
+            PushResult::Skipped {
+                reason: SkipReason::HistoryUnreadable
+            }
         );
     }
 
