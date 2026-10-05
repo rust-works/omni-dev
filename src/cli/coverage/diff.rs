@@ -13,6 +13,7 @@ use crate::coverage::analysis::{analyze_with_markers, ExcludedFiles, Markers};
 use crate::coverage::format::resolve as resolve_format;
 use crate::coverage::markers::{self, FileMarkers};
 use crate::coverage::merge::check_shard;
+use crate::coverage::paths::{self, PathMapping};
 use crate::coverage::{
     default_base_ref, go_coverprofile, parse, render, CoverageReport, DiffModel, DiffScope,
     FileCoverage, Format, OutputFormat, RenderOptions,
@@ -371,6 +372,9 @@ pub(super) struct CoverageLintMarkersConfig {
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct CoverageDiffConfig {
+    /// Explicit report directory prefixes mapped before strip-prefix and filters.
+    #[serde(default)]
+    path_mappings: Vec<PathMapping>,
     /// Repo-relative path regexes excluded from both head and baseline reports,
     /// unioned with `--ignore-filename-regex` and applied after `--strip-prefix`
     /// normalisation. Same unanchored semantics as the flag.
@@ -491,12 +495,15 @@ impl DiffCommand {
         // Union the repo-config ignore-list with the CLI flag, then compile once
         // so an invalid pattern is a single up-front error rather than failing
         // separately per report.
-        let config_ignore = self.load_config_ignore(&repo_path)?;
-        let ignore = self.compile_ignore(&config_ignore)?;
+        let context_dir = resolve_context_dir_at(self.context_dir.as_deref(), &repo_path);
+        let config = load_coverage_config(&context_dir)?.diff;
+        paths::validate(&config.path_mappings)?;
+        let ignore = self.compile_ignore(&config.ignore_filename_regex)?;
 
         let mut warnings = Vec::new();
         let mut excluded = ExcludedFiles::default();
         let head = self.load_head(
+            &config.path_mappings,
             strip_prefix.as_deref(),
             ignore.as_ref(),
             &repo_path,
@@ -504,9 +511,9 @@ impl DiffCommand {
             &mut excluded,
         )?;
         let baseline = match &self.baseline_report {
-            Some(path) => Some(self.load_report(
+            Some(path) => Some(self.load_baseline(
                 path,
-                self.baseline_report_format,
+                &config.path_mappings,
                 strip_prefix.as_deref(),
                 ignore.as_ref(),
                 &repo_path,
@@ -578,12 +585,14 @@ impl DiffCommand {
 
     /// Loads the head report: one `--report`, or the merge of every shard.
     ///
-    /// Each shard is read and, when there is more than one, checked **as parsed**
-    /// — an empty one fails, one under a different workspace root is noted in
-    /// `warnings` — then normalised exactly like a lone report and merged. The
+    /// Each shard is read and explicitly mapped before workspace-root checks
+    /// (so a mapped runner root is not warned about). An empty shard fails; an
+    /// unmapped workspace root is noted in `warnings`. Paths are then stripped
+    /// and filtered exactly like a lone report and merged. The
     /// merge is a union, so shard order cannot change the result.
     fn load_head(
         &self,
+        mappings: &[PathMapping],
         strip_prefix: Option<&Path>,
         ignore: Option<&RegexSet>,
         repo_root: &Path,
@@ -599,6 +608,7 @@ impl DiffCommand {
         for path in &self.report {
             let path = anchor(path, repo_root);
             let mut report = read_report(&path, self.report_format, repo_root)?;
+            report.map_paths(mappings)?;
             if sharded {
                 check_shard(&path.display().to_string(), &report, strip_prefix, warnings)?;
             }
@@ -614,16 +624,21 @@ impl DiffCommand {
     /// A relative `path` is resolved against `repo_root` so the report and the
     /// git repository always anchor to the same root; an absolute `path` is
     /// used as-is.
-    fn load_report(
+    fn load_baseline(
         &self,
         path: &Path,
-        format: ReportFormat,
+        mappings: &[PathMapping],
         strip_prefix: Option<&Path>,
         ignore: Option<&RegexSet>,
         repo_root: &Path,
         excluded: &mut ExcludedFiles,
     ) -> Result<CoverageReport> {
-        let mut report = read_report(&anchor(path, repo_root), format, repo_root)?;
+        let mut report = read_report(
+            &anchor(path, repo_root),
+            self.baseline_report_format,
+            repo_root,
+        )?;
+        report.map_paths(mappings)?;
         excluded.record_baseline(normalise_report(&mut report, strip_prefix, ignore));
         Ok(report)
     }
@@ -657,21 +672,6 @@ impl DiffCommand {
             }
         }
         Ok(found)
-    }
-
-    /// Loads the repo-config ignore-list (`coverage.yaml`'s
-    /// `diff.ignore-filename-regex`) from the discovered `.omni-dev/` directory.
-    ///
-    /// Discovery mirrors the other config-consuming commands: `--context-dir`
-    /// wins, else `OMNI_DEV_CONFIG_DIR`, else walk-up from `repo_root`. A missing
-    /// file is a no-op (`Ok(Vec::new())`); a present-but-malformed file is a hard
-    /// error, matching the CLI flag's invalid-pattern behavior rather than
-    /// silently letting the excluded noise back in.
-    fn load_config_ignore(&self, repo_root: &Path) -> Result<Vec<String>> {
-        let context_dir = resolve_context_dir_at(self.context_dir.as_deref(), repo_root);
-        Ok(load_coverage_config(&context_dir)?
-            .diff
-            .ignore_filename_regex)
     }
 
     /// Compiles the union of `--ignore-filename-regex` and the repo-config
@@ -1748,6 +1748,77 @@ mod tests {
     }
 
     // ── .omni-dev/coverage.yaml ignore-list (#1398) ──────────────────────
+
+    #[test]
+    fn path_mappings_apply_to_shards_baseline_filters_and_markers() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let config_dir = repo.join(".omni-dev");
+        fs::create_dir(&config_dir).unwrap();
+        fs::write(config_dir.join("coverage.yaml"),
+            "diff:\n  path-mappings:\n    - from: /ci/package\n      to: ''\n    - from: module\n      to: ''\n").unwrap();
+        let report = repo.join("head.lcov");
+        fs::write(
+            &report,
+            "SF:/ci/package/b.rs\nDA:1,1\nDA:2,0\nDA:3,1\nend_of_record\nSF:module/a.rs\nDA:1,0\nend_of_record\n",
+        )
+        .unwrap();
+        let shard = repo.join("shard.lcov");
+        fs::write(&shard, "SF:module/b.rs\nDA:2,1\nend_of_record\n").unwrap();
+        let baseline = repo.join("base.lcov");
+        fs::write(&baseline, "SF:module/a.rs\nDA:1,1\nend_of_record\n").unwrap();
+        let mut cmd = command(report, &base);
+        cmd.context_dir = Some(config_dir);
+        cmd.report.push(shard);
+        cmd.baseline_report = Some(baseline);
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        assert_eq!(outcome.patch_percent, Some(100.0));
+        assert!(outcome.warnings.is_empty());
+
+        cmd.all_files = true;
+        cmd.output = OutputFormatArg::Json;
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&outcome.rendered).unwrap();
+        let deltas = json["project_delta"]["files"].as_array().unwrap();
+        assert!(deltas
+            .iter()
+            .any(|d| d["path"] == "a.rs" && d["before"] == 100.0));
+        cmd.output = OutputFormatArg::Markdown;
+        cmd.ignore_filename_regex = vec!["^b\\.rs$".into()];
+        let outcome = cmd.run(Some(&repo)).unwrap();
+        assert_eq!(outcome.patch_percent, None);
+        assert!(outcome
+            .rendered
+            .contains("Excluded by ignore-filename-regex"));
+        cmd.ignore_filename_regex.clear();
+        // A malformed marker proves the mapped path is used to read source.
+        fs::write(
+            repo.join("b.rs"),
+            "// omni-dev: coverage ignore-line\none\n",
+        )
+        .unwrap();
+        let error = cmd.run(Some(&repo)).err().unwrap().to_string();
+        assert!(error.contains("b.rs"), "{error}");
+    }
+
+    #[test]
+    fn invalid_path_mapping_config_fails_before_report_loading() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let dir = repo.join(".omni-dev");
+        fs::create_dir(&dir).unwrap();
+        fs::write(
+            dir.join("coverage.yaml"),
+            "diff:\n  path-mappings:\n    - from: src\n      to: ../outside\n",
+        )
+        .unwrap();
+        let mut cmd = command(repo.join("missing.lcov"), &base);
+        cmd.context_dir = Some(dir);
+        assert!(cmd
+            .run(Some(&repo))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("repo-relative"));
+    }
 
     #[test]
     fn coverage_config_parses_ignore_list() {

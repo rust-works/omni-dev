@@ -202,3 +202,150 @@ fn rename_does_not_show_false_lost_coverage() -> Result<()> {
     );
     Ok(())
 }
+
+/// Exercises real producer reports through the command's config and path pipeline.
+fn producer_fixture(
+    fixture: &str,
+    git_path: &str,
+    from: &str,
+    to: &str,
+    covered: u64,
+    total: u64,
+) -> Result<()> {
+    use clap::Parser;
+    use omni_dev::cli::coverage::{CoverageCommand, CoverageSubcommands};
+
+    let mut repo = TestRepo::new()?;
+    repo.commit("base", &[("base.txt", "base\n")])?;
+    let source = "line\n".repeat(40);
+    repo.commit("add source", &[("base.txt", "base\n"), (git_path, &source)])?;
+    let config = repo.repo_path.join(".omni-dev");
+    fs::create_dir(&config)?;
+    fs::write(config.join("coverage.yaml"), "{}\n")?;
+    let report = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/coverage/non-rust")
+        .join(fixture);
+    let base = repo.base_sha();
+    let command = CoverageCommand::try_parse_from([
+        "coverage",
+        "diff",
+        "--report",
+        report.to_str().unwrap(),
+        "--base-ref",
+        &base,
+        "--context-dir",
+        config.to_str().unwrap(),
+        "-o",
+        "json",
+    ])?;
+    let CoverageSubcommands::Diff(cmd) = command.command else {
+        unreachable!("parsed a diff command")
+    };
+    // Overall coverage can exist while a path mismatch leaves the patch empty.
+    assert_eq!(
+        cmd.run(Some(&repo.repo_path))?.patch_percent,
+        None,
+        "{fixture}"
+    );
+    fs::write(
+        config.join("coverage.yaml"),
+        format!("diff:\n  path-mappings:\n    - from: '{from}'\n      to: '{to}'\n"),
+    )?;
+    let result = cmd.run(Some(&repo.repo_path))?;
+    assert_eq!(
+        result.patch_percent,
+        Some(covered as f64 / total as f64 * 100.0),
+        "{fixture}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&result.rendered)?;
+    assert_eq!(json["patch_coverage"]["total"], total, "{fixture}");
+    assert_eq!(json["patch_coverage"]["covered"], covered, "{fixture}");
+    assert_eq!(
+        json["patch_coverage"]["files"][0]["path"], git_path,
+        "{fixture}"
+    );
+    Ok(())
+}
+
+#[test]
+fn nyc_monorepo_patch_attribution() -> Result<()> {
+    producer_fixture(
+        "nyc.lcov",
+        "packages/web/src/calc.js",
+        "src",
+        "packages/web/src",
+        2,
+        3,
+    )
+}
+
+#[test]
+fn coverage_py_source_root_patch_attribution() -> Result<()> {
+    producer_fixture(
+        "coverage-py.xml",
+        "services/python/src/calc.py",
+        "",
+        "services/python",
+        4,
+        5,
+    )
+}
+
+#[test]
+fn gcovr_source_root_patch_attribution() -> Result<()> {
+    producer_fixture("gcovr.xml", "native/example.cpp", "", "native", 6, 7)
+}
+
+#[test]
+fn coverlet_source_root_patch_attribution() -> Result<()> {
+    producer_fixture(
+        "coverlet.xml",
+        "src/dotnet/AbstractClass.cs",
+        "",
+        "src/dotnet",
+        4,
+        8,
+    )
+}
+
+#[test]
+fn dart_runner_root_patch_attribution() -> Result<()> {
+    producer_fixture(
+        "dart.lcov",
+        "packages/mobile/lib/calc.dart",
+        "/private/tmp/2188-producers/dart",
+        "packages/mobile",
+        1,
+        2,
+    )
+}
+
+#[test]
+fn jacoco_source_root_mapping_attributes_patch() -> Result<()> {
+    use omni_dev::coverage::paths::PathMapping;
+    let mut repo = TestRepo::new()?;
+    repo.commit("base", &[("base.txt", "base\n")])?;
+    repo.commit(
+        "add java",
+        &[(
+            "services/api/src/main/java/com/example/App.java",
+            "one\ntwo\n",
+        )],
+    )?;
+    let mut head = omni_dev::coverage::parse(
+        r#"<report name="app"><package name="com/example"><sourcefile name="App.java"><line nr="1" mi="0" ci="2"/><line nr="2" mi="1" ci="0"/></sourcefile></package></report>"#,
+        None,
+    )?;
+    head.map_paths(&[PathMapping {
+        from: String::new(),
+        to: "services/api/src/main/java".into(),
+    }])?;
+    let result = analyze(&head, &repo.diff()?, None, DiffScope::DiffOnly);
+    assert_eq!(result.patch.covered, 1);
+    assert_eq!(result.patch.uncovered, 1);
+    assert_eq!(
+        result.uncovered_new_lines,
+        vec![("services/api/src/main/java/com/example/App.java".into(), 2)]
+    );
+    Ok(())
+}
