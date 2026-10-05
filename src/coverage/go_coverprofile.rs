@@ -42,6 +42,9 @@ const MAX_BLOCK_LINES: u32 = 1_000_000;
 pub fn parse(content: &str) -> Result<CoverageReport> {
     let mut report = CoverageReport::new();
     let mut seen_mode = false;
+    // A profile is written grouped by file, so one file's blocks are built up
+    // in place and inserted once, rather than once per block.
+    let mut current: Option<FileCoverage> = None;
 
     for (index, raw) in content.lines().enumerate() {
         let line = raw.trim();
@@ -70,11 +73,19 @@ pub fn parse(content: &str) -> Result<CoverageReport> {
         if block.statements == 0 {
             continue;
         }
-        let mut file = FileCoverage::new(block.file);
-        for number in block.start..=block.end {
-            file.record(number, block.count);
+        if current.as_ref().is_none_or(|file| file.path != block.file) {
+            if let Some(done) = current.replace(FileCoverage::new(block.file)) {
+                report.insert(done);
+            }
         }
-        report.insert(file);
+        if let Some(file) = current.as_mut() {
+            for number in block.start..=block.end {
+                file.record(number, block.count);
+            }
+        }
+    }
+    if let Some(done) = current.take() {
+        report.insert(done);
     }
 
     ensure!(seen_mode, "go coverprofile has no `mode:` header");
@@ -84,11 +95,14 @@ pub fn parse(content: &str) -> Result<CoverageReport> {
 /// Returns the module path declared by a `go.mod`, or `None` when it has no
 /// `module` directive.
 ///
-/// The path may be bare, double-quoted or backtick-quoted, and may be followed by
-/// a `//` comment.
+/// The path may be bare, double-quoted or backtick-quoted, may be followed by a
+/// `//` comment, and may sit on its own line inside the parenthesised
+/// `module ( … )` form.
 pub fn module_path(go_mod: &str) -> Option<String> {
-    for raw in go_mod.lines() {
-        let line = raw.split("//").next().unwrap_or_default().trim();
+    let mut lines = go_mod
+        .lines()
+        .map(|raw| raw.split("//").next().unwrap_or_default().trim());
+    while let Some(line) = lines.next() {
         let Some(rest) = line.strip_prefix("module") else {
             continue;
         };
@@ -96,8 +110,15 @@ pub fn module_path(go_mod: &str) -> Option<String> {
         if !rest.starts_with(char::is_whitespace) {
             continue;
         }
-        let path = rest.trim().trim_matches(['"', '`']);
-        if !path.is_empty() {
+        let mut path = rest.trim();
+        if path == "(" {
+            path = lines
+                .by_ref()
+                .find(|line| !line.is_empty())
+                .unwrap_or_default();
+        }
+        let path = path.trim_matches(['"', '`']);
+        if !path.is_empty() && path != ")" {
             return Some(path.to_string());
         }
     }
@@ -233,6 +254,16 @@ mod tests {
     }
 
     #[test]
+    fn a_file_whose_blocks_are_not_contiguous_is_still_one_file() {
+        let report =
+            parse("mode: set\nm/a.go:1.1,1.9 1 1\nm/b.go:1.1,1.9 1 1\nm/a.go:2.1,2.9 1 0\n")
+                .unwrap();
+        assert_eq!(report.files.len(), 2);
+        assert_eq!(report.hits("m/a.go", 1), Some(1));
+        assert_eq!(report.hits("m/a.go", 2), Some(0));
+    }
+
+    #[test]
     fn files_are_kept_apart() {
         let report = parse("mode: set\nm/a.go:1.1,1.9 1 1\nm/b/b.go:1.1,1.9 1 0\n").unwrap();
         assert_eq!(report.hits("m/a.go", 1), Some(1));
@@ -336,6 +367,16 @@ mod tests {
             module_path("module `example.com/m`\n").as_deref(),
             Some("example.com/m")
         );
+    }
+
+    #[test]
+    fn module_path_reads_the_parenthesised_form() {
+        assert_eq!(
+            module_path("module (\n\t// the path\n\t\"example.com/m\"\n)\n").as_deref(),
+            Some("example.com/m")
+        );
+        assert_eq!(module_path("module (\n)\n"), None);
+        assert_eq!(module_path("module (\n"), None);
     }
 
     #[test]
