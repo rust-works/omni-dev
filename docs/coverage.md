@@ -30,12 +30,12 @@ Line coverage only; branch-coverage data in the report is ignored.
 
 ## Inputs
 
-- `--report <PATH>` (**required**, repeatable) — the head coverage report. Four
+- `--report <PATH>` (**required**, repeatable) — the head coverage report. Five
   formats are accepted and **auto-detected** from content: lcov trace files,
-  llvm-cov JSON (`cargo llvm-cov report --json`), Cobertura XML, and Go
+  llvm-cov JSON (`cargo llvm-cov report --json`), Cobertura XML, JaCoCo XML, and Go
   coverprofiles (`go test -coverprofile`, see [Go coverprofiles](#go-coverprofiles)).
   Override detection with
-  `--report-format <auto|lcov|llvm-cov-json|cobertura|go-coverprofile>`. Pass it
+  `--report-format <auto|lcov|llvm-cov-json|cobertura|jacoco|go-coverprofile>`. Pass it
   once per shard to merge a [sharded run](#sharded-runs), or merge the shards
   into one file first with [`coverage merge`](#merging-shards-into-one-file).
 - `--base-ref <REV>` / `--head-ref <REV>` — the revisions to diff. Defaults are
@@ -45,6 +45,26 @@ Line coverage only; branch-coverage data in the report is ignored.
   *base-side* report. Supplying it enables the project-delta and
   indirect-change sections; without it you still get patch coverage and the
   uncovered-line list.
+
+## JaCoCo XML
+
+Native JaCoCo reports from Java, Kotlin and Scala are auto-detected by their
+`<report>` root, including reports with an XML declaration and JaCoCo DTD.
+Use `--report-format jacoco` to select it explicitly. Both `coverage diff`
+and `coverage merge` accept module reports and aggregate reports with groups.
+A line with `ci > 0` is covered, including a partially covered line with both
+missed and covered instructions. Instruction counts become boolean hits;
+branch counters and class/method summaries do not contribute to line coverage.
+
+Paths are `package/SourceFile.java`, relative to the source root. For example,
+`com/example/App.java` may correspond to `src/main/java/com/example/App.java`
+in git. The parser preserves the reported path; `--strip-prefix` can remove
+prefixes but cannot add that source root. Source-root mapping is tracked in
+[#2188](https://github.com/rust-works/omni-dev/issues/2188). Until that is
+available, paths must be aligned before diff attribution. Overall line coverage
+and shard merging work with source-root-relative paths. Identical package/file
+paths across modules merge by covered-line union, so unrelated sources with the
+same path must be distinguished before merging.
 
 ## Quick start
 

@@ -34,6 +34,8 @@ pub enum ReportFormat {
     LlvmCovJson,
     /// Cobertura XML.
     Cobertura,
+    /// JaCoCo XML.
+    Jacoco,
     /// Go `go test -coverprofile` output.
     GoCoverprofile,
 }
@@ -46,6 +48,7 @@ impl ReportFormat {
             Self::Lcov => Some(Format::Lcov),
             Self::LlvmCovJson => Some(Format::LlvmCovJson),
             Self::Cobertura => Some(Format::Cobertura),
+            Self::Jacoco => Some(Format::Jacoco),
             Self::GoCoverprofile => Some(Format::GoCoverprofile),
         }
     }
@@ -76,8 +79,8 @@ impl From<OutputFormatArg> for OutputFormat {
 /// Analyses diff/patch coverage from a per-line report and a git diff.
 #[derive(Parser)]
 pub struct DiffCommand {
-    /// Head coverage report (lcov / llvm-cov-json / cobertura / go-coverprofile); repeat once per
-    /// shard to merge a sharded run.
+    /// Head coverage report (lcov / llvm-cov-json / cobertura / jacoco / go-coverprofile);
+    /// repeat once per shard to merge a sharded run.
     ///
     /// Pass one `--report` per shard of a sharded coverage run and
     /// they are merged before anything is computed. The merge is a union of the
@@ -829,6 +832,7 @@ mod tests {
     #[test]
     fn report_format_into_format() {
         assert_eq!(ReportFormat::Auto.into_format(), None);
+        assert_eq!(ReportFormat::Jacoco.into_format(), Some(Format::Jacoco));
         assert_eq!(ReportFormat::Lcov.into_format(), Some(Format::Lcov));
         assert_eq!(
             ReportFormat::LlvmCovJson.into_format(),

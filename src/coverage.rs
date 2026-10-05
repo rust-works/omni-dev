@@ -1,6 +1,6 @@
 //! Diff/patch coverage analysis.
 //!
-//! Ingests a per-line coverage report (lcov / llvm-cov JSON / cobertura / Go
+//! Ingests a per-line coverage report (lcov / llvm-cov JSON / cobertura / JaCoCo / Go
 //! coverprofile) plus a
 //! git diff and produces PR-attributable coverage: **patch coverage** (the
 //! fraction of lines the diff added that are covered), the explicit list of
@@ -19,6 +19,7 @@ pub mod cobertura;
 pub mod diff;
 pub mod format;
 pub mod go_coverprofile;
+pub mod jacoco;
 pub mod lcov;
 pub mod llvm_json;
 pub mod markers;

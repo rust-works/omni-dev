@@ -5,7 +5,7 @@ use std::fmt;
 use anyhow::{Context, Result};
 
 use super::model::CoverageReport;
-use super::{cobertura, go_coverprofile, lcov, llvm_json};
+use super::{cobertura, go_coverprofile, jacoco, lcov, llvm_json};
 
 /// A supported per-line coverage report format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,8 @@ pub enum Format {
     LlvmCovJson,
     /// Cobertura XML.
     Cobertura,
+    /// JaCoCo XML.
+    Jacoco,
     /// Go `go test -coverprofile` output (`mode: set|count|atomic` header).
     GoCoverprofile,
 }
@@ -26,6 +28,7 @@ impl fmt::Display for Format {
             Self::Lcov => "lcov",
             Self::LlvmCovJson => "llvm-cov-json",
             Self::Cobertura => "cobertura",
+            Self::Jacoco => "jacoco",
             Self::GoCoverprofile => "go-coverprofile",
         };
         f.write_str(name)
@@ -36,18 +39,22 @@ impl Format {
     /// Detects the format from report `content`.
     ///
     /// Detection is by leading non-whitespace character/token: XML opens with
-    /// `<`, JSON with `{`, lcov with a record keyword (`TN:`/`SF:`), and a Go
+    /// `<` (the root distinguishes Cobertura and JaCoCo), JSON with `{`, lcov
+    /// with a record keyword (`TN:`/`SF:`), and a Go
     /// coverprofile with its `mode:` header. The header is matched on `mode:`
     /// alone, so a profile with a mode Go does not write fails in the parser,
     /// naming it, instead of reading as an unrecognised format.
     pub fn detect(content: &str) -> Result<Self> {
-        let trimmed = content.trim_start();
+        let trimmed = content
+            .trim_start()
+            .trim_start_matches('\u{feff}')
+            .trim_start();
         let first = trimmed
             .chars()
             .next()
             .context("coverage report is empty; cannot detect format")?;
         match first {
-            '<' => Ok(Self::Cobertura),
+            '<' => detect_xml(trimmed),
             '{' | '[' => Ok(Self::LlvmCovJson),
             _ if trimmed.starts_with("TN:")
                 || trimmed.starts_with("SF:")
@@ -58,7 +65,7 @@ impl Format {
             _ if trimmed.starts_with("mode:") => Ok(Self::GoCoverprofile),
             _ => anyhow::bail!(
                 "could not auto-detect coverage report format; pass an explicit --report-format \
-                 (lcov, llvm-cov-json, cobertura, or go-coverprofile)"
+                 (lcov, llvm-cov-json, cobertura, jacoco, or go-coverprofile)"
             ),
         }
     }
@@ -69,7 +76,31 @@ impl Format {
             Self::Lcov => lcov::parse(content),
             Self::LlvmCovJson => llvm_json::parse(content),
             Self::Cobertura => cobertura::parse(content),
+            Self::Jacoco => jacoco::parse(content),
             Self::GoCoverprofile => go_coverprofile::parse(content),
+        }
+    }
+}
+
+/// Detects XML by the root element, skipping declarations, DTDs and comments.
+fn detect_xml(content: &str) -> Result<Format> {
+    let mut reader = quick_xml::Reader::from_str(content);
+    loop {
+        match reader
+            .read_event()
+            .context("Failed to detect coverage XML root")?
+        {
+            quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e) => {
+                return match e.name().as_ref() {
+                    b"report" => Ok(Format::Jacoco),
+                    b"coverage" => Ok(Format::Cobertura),
+                    _ => {
+                        anyhow::bail!("Unknown coverage XML root; expected <coverage> or <report>")
+                    }
+                };
+            }
+            quick_xml::events::Event::Eof => anyhow::bail!("Coverage XML has no root element"),
+            _ => {}
         }
     }
 }
@@ -118,6 +149,29 @@ mod tests {
             Format::detect("<?xml version=\"1.0\"?><coverage/>").unwrap(),
             Format::Cobertura
         );
+    }
+
+    #[test]
+    fn detects_jacoco_and_dispatches_after_xml_preamble() {
+        let content = r#"<?xml version="1.0"?><!-- <coverage/> -->
+<!DOCTYPE report PUBLIC "-//JACOCO//DTD Report 1.1//EN" "report.dtd">
+<report name="demo"><package name="p"><sourcefile name="A.java">
+<line nr="1" mi="1" ci="1"/></sourcefile></package></report>"#;
+        assert_eq!(Format::detect(content).unwrap(), Format::Jacoco);
+        assert_eq!(Format::Jacoco.to_string(), "jacoco");
+        assert_eq!(Format::detect("\u{feff}<report/>").unwrap(), Format::Jacoco);
+        assert_eq!(parse(content, None).unwrap().hits("p/A.java", 1), Some(1));
+        assert_eq!(
+            parse(content, Some(Format::Jacoco)).unwrap(),
+            parse(content, None).unwrap()
+        );
+        assert_eq!(
+            Format::detect("<!-- <report/> --><coverage/>").unwrap(),
+            Format::Cobertura
+        );
+        for content in ["<other/>", "<?xml version=\"1.0\"?>", "<report"] {
+            assert!(Format::detect(content).is_err(), "{content}");
+        }
     }
 
     #[test]
