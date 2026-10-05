@@ -291,8 +291,9 @@ The two tag families trigger separate workflows and never each other's: `release
 **Release Workflow (`.github/workflows/release.yml`)**
 - **Creates GitHub Release**: Automatically from the tag
 - **Builds Cross-Platform Binaries** (both `omni-dev` and `omni-dev-mcp` for each target):
-  - Linux (x86_64-unknown-linux-gnu), as `omni-dev-linux.tar.gz`
-  - Linux ARM64 (aarch64-unknown-linux-gnu), as `omni-dev-linux-arm64.tar.gz`, built natively on GitHub's `ubuntu-24.04-arm` runner ([#2116](https://github.com/rust-works/omni-dev/issues/2116))
+  - Linux (x86_64-unknown-linux-gnu), as `omni-dev-linux.tar.gz`, built on `ubuntu-22.04`
+  - Linux ARM64 (aarch64-unknown-linux-gnu), as `omni-dev-linux-arm64.tar.gz`, built natively on GitHub's `ubuntu-22.04-arm` runner ([#2116](https://github.com/rust-works/omni-dev/issues/2116))
+  - Both Linux legs then run `scripts/check_glibc_floor.py` and fail if a binary needs a newer glibc than the floor ([below](#linux-glibc-floor))
   - macOS (aarch64-apple-darwin)
   - Windows (x86_64-pc-windows-msvc)
 - **Uploads Release Assets**: Attaches compiled binaries to the GitHub release
@@ -361,6 +362,16 @@ After pushing the tags, monitor the automated releases.
    ```bash
    gh run rerun <run_id> --failed
    ```
+
+## Linux glibc floor
+
+The Linux release binaries link dynamically against the glibc of the image that builds them, so on a host with an older glibc `omni-dev --version` dies in the dynamic loader before omni-dev's own code runs ([#2178](https://github.com/rust-works/omni-dev/issues/2178)). The floor is **glibc 2.35** (Ubuntu 22.04), and it is deliberate and checked, not a side effect of the runner:
+
+- **The image is pinned.** The Linux legs of `release.yml` build on `ubuntu-22.04` and `ubuntu-22.04-arm`, never on a moving label such as `ubuntu-latest`, which would raise the floor when GitHub moves it to the next Ubuntu.
+- **The floor is checked.** After the build, `scripts/check_glibc_floor.py --floor "$GLIBC_FLOOR"` reads each binary's version-needs table (`readelf -V`) and fails the leg if the highest non-weak `GLIBC_x.y` is above `GLIBC_FLOOR` (set once, in `release.yml`'s `env`). A weak requirement (the loader's non-fatal `weak version` line) is reported but does not fail. `publish-crates` waits on every leg, so a failure also holds back the crates.io publish; fix it and release a patch, as for any workflow defect (see [Monitor and Verify](#8-monitor-and-verify)). The check runs only on a tag push, so a runner-image change is first seen on the release it affects; run the script by hand against a locally built `target/release/omni-dev` on Linux to see where a change would land.
+- **Changing it.** Raising the floor is a decision to drop hosts: edit `GLIBC_FLOOR` and the runner image together, and update the floor stated in the [README](../README.md#installation) and here. GitHub retires old images eventually; when `ubuntu-22.04` goes, the build fails visibly and the options are a newer floor, building with `cargo zigbuild --target <triple>.2.17`, or a static `musl` build (neither has been tried; the check works unchanged with either).
+
+To see what a binary needs: `readelf -V omni-dev` and read `.gnu.version_r`, or `python3 scripts/check_glibc_floor.py --floor 2.35 omni-dev`.
 
 ## Ordering with Dependents
 
