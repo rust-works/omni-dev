@@ -390,9 +390,15 @@ fn render_excluded(diff: &CoverageDiff, out: &mut String) {
     if excluded.is_empty() {
         return;
     }
-    let touched = match excluded.touched_count() {
-        0 => "none of them touched by this diff".to_string(),
-        n => format!("{n} of them touched by this diff"),
+    let touched = match (excluded.touched_count(), excluded.new_executable_lines()) {
+        (0, _) => "none of them touched by this diff".to_string(),
+        (n, 0) => format!("{n} of them touched by this diff"),
+        // A mixed diff still shows a patch percentage, so say how many of its
+        // lines the filter took out of that denominator.
+        (n, lines) => format!(
+            "{n} of them touched by this diff, adding {lines} executable line{}",
+            if lines == 1 { "" } else { "s" }
+        ),
     };
     out.push_str(&format!(
         "_Excluded by ignore-filename-regex: {} ({touched})._\n\n",
@@ -1242,7 +1248,8 @@ mod tests {
         diff.excluded = excluded(&["src/a.rs"], &["src/b.rs", "src/c.rs"], &[1]);
         let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
         assert!(md.contains(
-            "_Excluded by ignore-filename-regex: 3 files (1 of them touched by this diff)._"
+            "_Excluded by ignore-filename-regex: 3 files (1 of them touched by this diff, \
+             adding 1 executable line)._"
         ));
         assert!(md.contains("Excluded files touched by this diff (1)"));
         assert!(md.contains("- `src/a.rs`"));

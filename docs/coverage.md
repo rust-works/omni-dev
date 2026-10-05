@@ -375,10 +375,13 @@ exactly like a diff that added no code. So whenever the filter removed at least 
 file from a report, the comment says so:
 
 ```
-_Excluded by ignore-filename-regex: 3 files (1 of them touched by this diff)._
+_Excluded by ignore-filename-regex: 3 files (1 of them touched by this diff, adding 40 executable lines)._
 ```
 
-The files the diff touched are listed beneath it (the first 20; the rest are counted),
+The clause after the touched count appears when the diff added executable lines to
+excluded files: those are lines the filter took out of the patch denominator, so a
+mixed diff is visible even though it still shows a patch percentage. The files the
+diff touched are listed beneath it (the first 20; the rest are counted),
 and `-o json`/`-o yaml` carry an `excluded_files` object with `count`, `touched_count`,
 `new_executable_lines`, every excluded path in `paths`, and the touched subset in
 `touched`. Only files that were *in a report* count, as a head or a baseline entry,
