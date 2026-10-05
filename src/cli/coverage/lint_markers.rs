@@ -7,8 +7,8 @@ use clap::Parser;
 use git2::Repository;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
-use super::diff::{CoverageConfig, COVERAGE_CONFIG_FILE};
-use crate::claude::context::{load_config_content, resolve_context_dir_at};
+use super::diff::load_coverage_config;
+use crate::claude::context::resolve_context_dir_at;
 use crate::coverage::markers;
 
 /// Index modes of a regular file. A symlink (`0o120000`) or a gitlink
@@ -53,7 +53,15 @@ impl LintMarkersCommand {
                 (self.include, "--include")
             };
             let include = compile_include(&patterns, origin)?;
-            select_tracked(tracked_paths(&repo)?, include.as_ref())
+            let selected = select_tracked(tracked_paths(&repo)?, include.as_ref());
+            if include.is_some() && selected.is_empty() {
+                // A typo in a glob must not look like a clean scan.
+                eprintln!(
+                    "warning: no tracked file matches the globs in {origin}; \
+                     no coverage markers were checked"
+                );
+            }
+            selected
         } else {
             self.paths
         };
@@ -92,22 +100,14 @@ impl LintMarkersCommand {
 
 /// Loads `lint-markers.include` from the discovered `.omni-dev/coverage.yaml`.
 ///
-/// Discovery is the one `coverage diff` uses: `OMNI_DEV_CONFIG_DIR`, else a
-/// walk-up from the repository root. A missing file is no restriction; a
-/// present-but-malformed one is a hard error, so a typo cannot quietly widen the
-/// scan back to every file.
+/// Discovery is the one `coverage diff` uses without `--context-dir`:
+/// `OMNI_DEV_CONFIG_DIR`, else a walk-up from the repository root, plus the
+/// usual local-override and XDG/home fallbacks. A missing file is no
+/// restriction; a malformed one is a hard error (a misspelled *key* is ignored,
+/// as everywhere in this file, so the schema can grow).
 fn load_config_include(repo_root: &Path) -> Result<Vec<String>> {
     let context_dir = resolve_context_dir_at(None, repo_root);
-    let Some(content) = load_config_content(&context_dir, COVERAGE_CONFIG_FILE)? else {
-        return Ok(Vec::new());
-    };
-    let config: CoverageConfig = serde_yaml::from_str(&content).with_context(|| {
-        format!(
-            "could not parse coverage config {}/{COVERAGE_CONFIG_FILE}",
-            context_dir.display()
-        )
-    })?;
-    Ok(config.lint_markers.include)
+    Ok(load_coverage_config(&context_dir)?.lint_markers.include)
 }
 
 /// Compiles include globs into a set, or `None` when there are none (no
@@ -139,16 +139,20 @@ fn select_tracked(paths: Vec<PathBuf>, include: Option<&GlobSet>) -> Vec<PathBuf
 }
 
 /// Lists regular files in the index, including staged additions.
+///
+/// A path in a conflict has one entry per stage; it is listed once. A path that
+/// is not valid UTF-8 cannot be matched against a glob or shown in a
+/// diagnostic, so it is skipped like non-UTF-8 content is.
 fn tracked_paths(repo: &Repository) -> Result<Vec<PathBuf>> {
     let index = repo.index().context("could not read Git index")?;
-    index
+    let mut paths: Vec<PathBuf> = index
         .iter()
         .filter(|entry| REGULAR_FILE_MODES.contains(&entry.mode))
-        .map(|entry| {
-            let path = std::str::from_utf8(&entry.path).context("tracked path is not UTF-8")?;
-            Ok(PathBuf::from(path))
-        })
-        .collect()
+        .filter_map(|entry| std::str::from_utf8(&entry.path).ok().map(PathBuf::from))
+        .collect();
+    // The index is sorted by path, so a path's stages are adjacent.
+    paths.dedup();
+    Ok(paths)
 }
 
 #[cfg(test)]
@@ -203,11 +207,46 @@ mod tests {
         assert!(message.contains("--include"), "{message}");
     }
 
+    fn entry(path: &str, mode: u32, stage: u16, id: git2::Oid) -> git2::IndexEntry {
+        git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id,
+            flags: stage << 12,
+            flags_extended: 0,
+            path: path.as_bytes().to_vec(),
+        }
+    }
+
     #[test]
-    fn only_regular_file_modes_are_scanned() {
-        assert!(REGULAR_FILE_MODES.contains(&0o100_644));
-        assert!(REGULAR_FILE_MODES.contains(&0o100_755));
-        assert!(!REGULAR_FILE_MODES.contains(&0o120_000));
-        assert!(!REGULAR_FILE_MODES.contains(&0o160_000));
+    fn tracked_paths_keeps_regular_files_once_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let blob = repo.blob(b"x").unwrap();
+        // A gitlink names a commit in another repository, so it has no object here.
+        let commit = git2::Oid::from_str("0123456789012345678901234567890123456789").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add(&entry("a.txt", 0o100_644, 0, blob)).unwrap();
+        index.add(&entry("run.sh", 0o100_755, 0, blob)).unwrap();
+        index.add(&entry("link", 0o120_000, 0, blob)).unwrap();
+        index
+            .add(&entry("vendor/lib", 0o160_000, 0, commit))
+            .unwrap();
+        // A conflicted path has one entry per stage.
+        for stage in 1..=3 {
+            index
+                .add(&entry("conflict.md", 0o100_644, stage, blob))
+                .unwrap();
+        }
+        assert_eq!(
+            tracked_paths(&repo).unwrap(),
+            paths(&["a.txt", "conflict.md", "run.sh"])
+        );
     }
 }

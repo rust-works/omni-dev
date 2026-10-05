@@ -538,8 +538,11 @@ lint-markers:
 - **Explicit paths ignore both**: naming a file is a selection, so `--include`
   and the config list apply only to the default scan.
 - Discovery of `coverage.yaml` is the one `coverage diff` uses
-  (`OMNI_DEV_CONFIG_DIR`, else a walk-up for `.omni-dev/`). A malformed file is
-  a hard error.
+  (`OMNI_DEV_CONFIG_DIR`, else a walk-up for `.omni-dev/`, plus the usual
+  `local/` override and XDG/home fallbacks, so a user-global file applies to a
+  repository that has none of its own). A malformed file is a hard error, but a
+  misspelled key is ignored, like every unknown key. A glob that matches no
+  tracked file scans nothing and prints a warning.
 
 Before this command scanned every tracked file it checked only `.rs` files. A
 repository that runs it bare, in CI or a hook, may now see errors from files
