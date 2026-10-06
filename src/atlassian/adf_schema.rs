@@ -68,7 +68,7 @@ pub(crate) fn local_schema_map() -> BTreeMap<&'static str, BTreeSet<&'static str
 ///
 /// Format: `<npm-package-version>-<transcription-date>`. Bumped manually when
 /// the lookup table is refreshed against a new upstream release.
-pub const SCHEMA_VERSION: &str = "57.6.19-2026-10-01";
+pub const SCHEMA_VERSION: &str = "57.6.21-2026-10-06";
 
 /// SHA-256 of the upstream `@atlaskit/adf-schema` tarball used as the source
 /// for the current transcription.
@@ -79,11 +79,11 @@ pub const SCHEMA_VERSION: &str = "57.6.19-2026-10-01";
 ///
 /// To verify locally:
 /// ```text
-/// curl -sL https://registry.npmjs.org/@atlaskit/adf-schema/-/adf-schema-57.6.19.tgz \
+/// curl -sL https://registry.npmjs.org/@atlaskit/adf-schema/-/adf-schema-57.6.21.tgz \
 ///   | shasum -a 256
 /// ```
 pub const UPSTREAM_TARBALL_SHA256: &str =
-    "bafc2e41ed5757e1f63a4434c68546a1b645c03cb2fca0a942e6b9253c7245ce";
+    "9f17f6d3cb3baf053f3ca069d023c0b76e9efda31e5416c903ddf3341449d2be";
 
 // -----------------------------------------------------------------------------
 // Quantifier and content-term types
