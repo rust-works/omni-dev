@@ -348,7 +348,7 @@ fn map_boundary(runs: &[Run<'_>], mut byte: usize) -> Result<i64, AnchorError> {
         }
         byte -= run.text.len();
     }
-    Err(AnchorError::InvalidIndices) // omni-dev: coverage ignore-line reason="map_boundary is only called with a byte offset inside the text its runs concatenate, so the loop always returns first; the Err keeps the function total without a panic"
+    Err(AnchorError::InvalidIndices) // patchcov: coverage ignore-line reason="map_boundary is only called with a byte offset inside the text its runs concatenate, so the loop always returns first; the Err keeps the function total without a panic"
 }
 
 /// Counts the text Google actually inserts, excluding documented stripped
@@ -401,7 +401,7 @@ pub fn resolve_insert_in(
         Side::After => found.end,
     };
     if index < p.start || index >= p.end {
-        return Err(AnchorError::UnsafeRange); // omni-dev: coverage ignore-line reason="a match never contains the paragraph's closing newline (find rejects a needle with one) and collect verified the last run ends at it, so the index always lies inside the paragraph; kept as defence on the write boundary"
+        return Err(AnchorError::UnsafeRange); // patchcov: coverage ignore-line reason="a match never contains the paragraph's closing newline (find rejects a needle with one) and collect verified the last run ends at it, so the index always lies inside the paragraph; kept as defence on the write boundary"
     }
     Ok(EditPreview {
         start_index: index,
@@ -460,7 +460,7 @@ pub fn resolve_delete_in(
     let mut count = 0;
     for p in &paragraphs[first.paragraph..=last.paragraph] {
         if p.tab != a.tab || p.container != a.container {
-            return Err(AnchorError::UnsafeRange); // omni-dev: coverage ignore-line reason="a container switch between two paragraphs of one container is always a table, and the paragraph before it has protected_newline, so the check below refuses the range before the walk reaches a foreign paragraph; kept as defence in depth"
+            return Err(AnchorError::UnsafeRange); // patchcov: coverage ignore-line reason="a container switch between two paragraphs of one container is always a table, and the paragraph before it has protected_newline, so the check below refuses the range before the walk reaches a foreign paragraph; kept as defence in depth"
         }
         if p.protected_newline && start < p.end && end >= p.end {
             return Err(AnchorError::UnsafeRange);
@@ -485,7 +485,7 @@ pub fn resolve_delete_in(
                     chars += 1;
                     bytes += ch.len_utf8();
                 } else if index < hi && next > lo {
-                    return Err(AnchorError::InvalidIndices); // omni-dev: coverage ignore-line reason="lo and hi are regex match boundaries mapped through whole runs, so neither falls inside a surrogate pair; kept as defence in the UTF-16 arithmetic"
+                    return Err(AnchorError::InvalidIndices); // patchcov: coverage ignore-line reason="lo and hi are regex match boundaries mapped through whole runs, so neither falls inside a surrogate pair; kept as defence in the UTF-16 arithmetic"
                 }
                 index = next;
             }
@@ -493,7 +493,7 @@ pub fn resolve_delete_in(
         }
     }
     if cursor != end {
-        return Err(AnchorError::UnsafeRange); // omni-dev: coverage ignore-line reason="end is the end of the last anchor, which lies inside a run the loop above visits, and a gap before it already returned UnsafeRange, so the cursor always reaches it; kept as defence in depth"
+        return Err(AnchorError::UnsafeRange); // patchcov: coverage ignore-line reason="end is the end of the last anchor, which lies inside a run the loop above visits, and a gap before it already returned UnsafeRange, so the cursor always reaches it; kept as defence in depth"
     }
     Ok(EditPreview {
         start_index: start,
@@ -574,7 +574,7 @@ pub fn resolve_list(
             cursor = run.end;
         }
         if cursor != p.end {
-            return Err(AnchorError::UnsafeRange); // omni-dev: coverage ignore-line reason="collect verified every paragraph has a final run ending at p.end, and the loop above leaves cursor at that run's end, so it always matches; kept as defence in depth on the write boundary"
+            return Err(AnchorError::UnsafeRange); // patchcov: coverage ignore-line reason="collect verified every paragraph has a final run ending at p.end, and the loop above leaves cursor at that run's end, so it always matches; kept as defence in depth on the write boundary"
         }
         // Structural elements can occupy no text index space, so contiguity
         // alone is insufficient. The last paragraph is safe to format.
@@ -645,7 +645,7 @@ pub fn resolve_format(
             cursor = run.end;
         }
         if cursor != p.end {
-            return Err(AnchorError::UnsafeRange); // omni-dev: coverage ignore-line reason="collect refuses a paragraph whose last run does not end at the paragraph's end, and the loop above leaves cursor on the last run's end, so cursor always equals p.end here; kept as defence in depth on the write boundary"
+            return Err(AnchorError::UnsafeRange); // patchcov: coverage ignore-line reason="collect refuses a paragraph whose last run does not end at the paragraph's end, and the loop above leaves cursor on the last run's end, so cursor always equals p.end here; kept as defence in depth on the write boundary"
         }
     }
     edit.start_index = first.start;

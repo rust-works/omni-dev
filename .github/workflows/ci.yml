@@ -189,10 +189,8 @@ jobs:
   coverage:
     name: Coverage
     needs: gate
-    # Skip on tag pushes (#1289). A release-tag Coverage run resolves the
-    # coverage tool's `version: latest` to the very release being published and
-    # 404s on its not-yet-uploaded binary (release.yml creates the release object
-    # minutes before its ~18 MB assets finish uploading). Coverage is meaningful
+    # Skip on tag pushes (#1289). The action installs patchcov independently
+    # of omni-dev releases. Coverage is meaningful
     # on PRs (diff comment) and main pushes (baseline publish); a tag has no PR
     # and its commit was already validated on main, so skipping loses nothing.
     if: needs.gate.outputs.code == 'true' && github.ref_type != 'tag'
@@ -205,13 +203,13 @@ jobs:
       with:
         fetch-depth: 0          # full history so `git merge-base` can resolve the PR's fork point
     # The coverage pipeline — cargo-llvm-cov run, merge-base baseline (download
-    # + git-worktree recompute fallback), `omni-dev coverage diff` sticky PR
+    # + git-worktree recompute fallback), `patchcov diff` sticky PR
     # comment, summary + artifacts, baseline publish on main, and the line gate
-    # — is packaged in action-works/omni-dev-coverage-check (issue #1024).
+    # — is packaged in action-works/omni-dev-coverage-check v2 (patchcov-based, #2200).
     # worktree-system-deps installs the ALSA headers only on the merge-base
     # recompute path, for fork points that predate the cpal/voice removal
     # (#980); a no-op once the merge-base is itself cpal-free.
-    - uses: action-works/omni-dev-coverage-check@v1.1
+    - uses: action-works/omni-dev-coverage-check@v2.0
       with:
         fail-under-lines: 30
         worktree-system-deps: libasound2-dev

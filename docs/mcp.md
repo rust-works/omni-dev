@@ -369,12 +369,6 @@ Read-only YouTube content fetch. The mutating `sync` subcommand has no MCP form.
 | `transcript_youtube_info` | Video metadata (title, author, duration, tracks) as YAML | `omni-dev transcript youtube info` |
 | `transcript_youtube_list_langs` | List available caption tracks as YAML | `omni-dev transcript youtube list-langs` |
 
-### Coverage (1 tool)
-
-| Tool | Purpose | CLI equivalent |
-|------|---------|----------------|
-| `coverage_diff` | Diff/patch coverage from a report path + git diff; returns the rendered report, patch and overall line percentages, and both gate results. `additional_reports` merges further shard reports with `report`. Never fails the call — reports `below_gate` / `below_line_gate` instead | `omni-dev coverage diff` |
-
 ### Browser bridge (1 tool)
 
 Drives one HTTP request through a running, authenticated browser tab (requires a
@@ -523,7 +517,7 @@ restarting the MCP server.
 
 ### Response size cap
 
-Tools that can emit large output (git analyses, log searches, coverage, JIRA
+Tools that can emit large output (git analyses, log searches, JIRA
 bodies, …) cap their response so a multi-megabyte payload cannot blow out the
 assistant's context window. When a response exceeds the cap it is truncated on
 a UTF-8 boundary, a `\n\n[output truncated]` marker is appended, and a second

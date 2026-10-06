@@ -683,7 +683,7 @@ The repository is `--repo-name`, **not** `--repo`: at the time of #1420,
 `-C/--repo` was a root-global path flag, and because clap propagates a
 global arg by its *id*, a subcommand-local `repo` displaced it and made
 every `register` invocation that used it panic. `-C/--repo` is no longer
-root-global — it is now scoped to `git`, `coverage`, `config scopes`, and
+root-global — it is now scoped to `git`, `config scopes`, and
 the `worktrees rebase`/`worktrees push` leaves (#1778) — but `register`
 keeps the `--repo-name` name regardless, since a subcommand still must not
 reuse a global arg id (a structural test walks the command tree asserting

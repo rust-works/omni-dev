@@ -787,7 +787,7 @@ mod tests {
         mount_metadata(&server).await;
         let outcome = sort_range(&drive, &sheets, &options(true), &[rule()]).await;
         let SortRangeResult::WouldChange { width_warning, .. } = outcome.result else {
-            panic!("expected would-change"); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected would-change"); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(width_warning
             .unwrap()
@@ -876,7 +876,7 @@ mod tests {
         opts.sort_by = vec!["no-colon-here".into()];
         let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
         let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("COLUMN:asc|desc"), "{detail}");
         assert!(outcome.file_name.is_none());
@@ -891,7 +891,7 @@ mod tests {
         opts.sort_by = vec![];
         let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
         let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("pass at least one --sort-by"), "{detail}");
         assert!(server.received_requests().await.unwrap().is_empty());
@@ -908,7 +908,7 @@ mod tests {
         opts.sort_by = vec!["3:asc".into(), "3:desc".into()];
         let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
         let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(
             detail.contains("column 3 is given more than once"),
@@ -925,7 +925,7 @@ mod tests {
         opts.sort_by = vec!["-1:asc".into()];
         let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
         let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("non-negative"), "{detail}");
         assert!(server.received_requests().await.unwrap().is_empty());
@@ -939,7 +939,7 @@ mod tests {
         opts.sort_by = vec!["0:sideways".into()];
         let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
         let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("'asc' or 'desc'"), "{detail}");
         assert!(server.received_requests().await.unwrap().is_empty());
@@ -954,7 +954,7 @@ mod tests {
         opts.range = Some("Sheet1!A1:B2".into());
         let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
         let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("already names a sheet"), "{detail}");
         assert!(server.received_requests().await.unwrap().is_empty());
@@ -1084,7 +1084,7 @@ mod tests {
         assert!(lines.contains("sheets-structure"), "{lines}");
         assert!(lines.contains("rule on folder parent-1"), "{lines}");
         let SortRangeResult::Blocked { operation, .. } = outcome.result else {
-            panic!("expected Blocked, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected Blocked, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert_eq!(operation, DriveOperation::SheetsStructure);
     }
@@ -1118,7 +1118,7 @@ mod tests {
         opts.range = Some("A2:C10".into()); // no `Sheet!` prefix, and no `--sheet` either.
         let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
         let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("does not name a sheet"), "{detail}");
         assert!(server
@@ -1139,7 +1139,7 @@ mod tests {
         opts.range = Some("Nope!A2:C10".into());
         let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
         let SortRangeResult::RefusedSheetNotFound { title, available } = &outcome.result else {
-            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert_eq!(title, "Nope");
         assert_eq!(available, &["Q1".to_string()]);
@@ -1155,7 +1155,7 @@ mod tests {
         opts.range = Some("Q1!A:A".into());
         let outcome = sort_range(&drive, &sheets, &opts, &[rule()]).await;
         let SortRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(
             detail.starts_with("Q1!A:A is open-ended"),
@@ -1180,7 +1180,7 @@ mod tests {
         mount_workbook_no_column_count().mount(&server).await;
         let outcome = sort_range(&drive, &sheets, &options(true), &[rule()]).await;
         let SortRangeResult::WouldChange { width_warning, .. } = outcome.result else {
-            panic!("expected would-change"); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected would-change"); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(width_warning.unwrap().contains("may be narrower"));
     }

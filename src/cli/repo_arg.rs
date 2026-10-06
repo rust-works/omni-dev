@@ -1,6 +1,6 @@
 //! The `-C/--repo` flag, scoped to the commands that act on a local repository.
 //!
-//! Flattened as a subtree-`global = true` arg onto `git`, `coverage`,
+//! Flattened as a subtree-`global = true` arg onto `git`,
 //! `config scopes`, and `ai claude skills` (every leaf below them reads it),
 //! and onto the `worktrees rebase` / `worktrees push` leaves (the only
 //! `worktrees` subcommands that touch the local repository) — per the

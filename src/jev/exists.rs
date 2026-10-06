@@ -187,7 +187,7 @@ fn git(repo: &Path, args: &[&str], cap: usize, allow_no_hits: bool) -> Result<(V
     if overflow {
         // Best-effort cleanup: git may already have exited after filling the pipe.
         if let Err(error) = child.kill() {
-            tracing::debug!("git retrieval cleanup: {error}"); // omni-dev: coverage ignore-line reason="Child::kill returns Ok for a child that has exited but not been reaped, and wait() only runs after this call, so only an OS-level failure such as EPERM reaches this arm; it exists so that failure is logged rather than silently dropped"
+            tracing::debug!("git retrieval cleanup: {error}"); // patchcov: coverage ignore-line reason="Child::kill returns Ok for a child that has exited but not been reaped, and wait() only runs after this call, so only an OS-level failure such as EPERM reaches this arm; it exists so that failure is logged rather than silently dropped"
         }
         bytes.truncate(cap);
     }

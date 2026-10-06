@@ -1312,7 +1312,7 @@ mod tests {
             read_clamped_to_sheet,
         } = outcome.result
         else {
-            panic!("expected would-change"); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; the mocked run always produces it"
+            panic!("expected would-change"); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; the mocked run always produces it"
         };
         assert_eq!(range, "'Q1'!A2:C10");
         // Offsets are the range's own start (row 1, column 0 zero-based).
@@ -1433,7 +1433,7 @@ mod tests {
         opts.range = None;
         let outcome = trim_whitespace(&drive, &sheets, &opts, &[rule()]).await;
         let TrimWhitespaceResult::Changed { range, .. } = &outcome.result else {
-            panic!("expected changed"); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; the mocked run always produces it"
+            panic!("expected changed"); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; the mocked run always produces it"
         };
         assert_eq!(range, "'Q1'!A1:F100");
 

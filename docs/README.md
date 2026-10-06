@@ -60,9 +60,6 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 - **[Request Log](log.md)** - The local, append-only invocation + HTTP log and the `omni-dev log` reader (filter matrix, query mini-language, `--follow`); central header redaction and the `OMNI_DEV_LOG_*` opt-ins/opt-out
 
-### Coverage
-
-- **[Coverage Diff](coverage.md)** - `omni-dev coverage diff`: patch coverage, uncovered new lines, per-file deltas, and indirect changes from lcov / llvm-cov-json / Cobertura / Go coverprofile reports; output formats, the `--fail-under-patch` / `--fail-under-lines` gates, merging sharded reports (on the fly, or into one file with `omni-dev coverage merge`), and the PR-comment renderer
 
 ### MCP Server
 

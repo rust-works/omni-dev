@@ -547,7 +547,7 @@ mod tests {
             verdict, denied, ..
         } = outcome
         else {
-            panic!("expected Gated"); // omni-dev: coverage ignore-line reason="every operation is granted by the mounted rule, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
+            panic!("expected Gated"); // patchcov: coverage ignore-line reason="every operation is granted by the mounted rule, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
         };
         assert_eq!(verdict, Verdict::Allow);
         assert_eq!(denied, None);
@@ -578,7 +578,7 @@ mod tests {
             verdict, denied, ..
         } = outcome
         else {
-            panic!("expected Gated"); // omni-dev: coverage ignore-line reason="the target has a visible parent with a matching folder rule, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
+            panic!("expected Gated"); // patchcov: coverage ignore-line reason="the target has a visible parent with a matching folder rule, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
         };
         assert_eq!(verdict, Verdict::Deny);
         assert_eq!(denied.map(|(op, _)| op), Some(DriveOperation::SheetsWrite));
@@ -606,7 +606,7 @@ mod tests {
             verdict, denied, ..
         } = outcome
         else {
-            panic!("expected Gated"); // omni-dev: coverage ignore-line reason="the target has a visible parent with a matching folder rule, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
+            panic!("expected Gated"); // patchcov: coverage ignore-line reason="the target has a visible parent with a matching folder rule, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
         };
         assert_eq!(verdict, Verdict::Deny);
         assert_eq!(
@@ -642,7 +642,7 @@ mod tests {
         )
         .await;
         let TargetGateUnionOutcome::Gated { requires_lease, .. } = outcome else {
-            panic!("expected Gated"); // omni-dev: coverage ignore-line reason="every operation is granted by a mounted rule, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
+            panic!("expected Gated"); // patchcov: coverage ignore-line reason="every operation is granted by a mounted rule, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
         };
         assert!(requires_lease);
     }
@@ -719,7 +719,7 @@ mod tests {
             verdict, denied, ..
         } = outcome
         else {
-            panic!("expected Gated, got a Refused fold"); // omni-dev: coverage ignore-line reason="the file rule gives sheets-structure something to deny rather than find nothing, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
+            panic!("expected Gated, got a Refused fold"); // patchcov: coverage ignore-line reason="the file rule gives sheets-structure something to deny rather than find nothing, so resolve_all always returns Gated here; this branch is a safety net against an unexpected refusal, not a coverage gap"
         };
         assert_eq!(verdict, Verdict::Deny);
         assert_eq!(

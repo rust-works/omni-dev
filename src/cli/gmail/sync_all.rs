@@ -210,7 +210,7 @@ type ClientFor = Arc<dyn Fn(&str) -> Result<GmailClient> + Send + Sync>;
 
 impl SyncAllCommand {
     pub(crate) async fn execute(self) -> Result<()> {
-        // omni-dev: coverage ignore reason="SyncAllCommand::execute is the process-bound wiring shell: it loads the real ~/.omni-dev settings and builds clients against the real Gmail host; run_sync_all, load_gmail_sync_config and validate_accounts are its tested seams"
+        // patchcov: coverage ignore reason="SyncAllCommand::execute is the process-bound wiring shell: it loads the real ~/.omni-dev settings and builds clients against the real Gmail host; run_sync_all, load_gmail_sync_config and validate_accounts are its tested seams"
         let (context_dir, _source) =
             discovery::resolve_context_dir_with_source(self.context_dir.as_deref());
         let config = load_gmail_sync_config(&context_dir)?;
@@ -243,7 +243,7 @@ impl SyncAllCommand {
             client_for,
         )
         .await
-        // omni-dev: coverage end
+        // patchcov: coverage end
     }
 }
 

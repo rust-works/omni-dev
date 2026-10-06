@@ -939,11 +939,11 @@ async fn write_inner(
         Ok(response) => match &opts.payload {
             WritePayload::Table(_) => match preview {
                 WriteResult::WouldEditTable { edit } => WriteResult::EditedTable { edit },
-                // omni-dev: coverage ignore reason="`preview` is built by the payload match above, so a Table payload always carries a WouldEditTable preview; this arm exists solely for exhaustiveness over the shared WriteResult enum"
+                // patchcov: coverage ignore reason="`preview` is built by the payload match above, so a Table payload always carries a WouldEditTable preview; this arm exists solely for exhaustiveness over the shared WriteResult enum"
                 _ => WriteResult::Failed {
                     detail: "missing resolved table preview".into(),
                 },
-                // omni-dev: coverage end
+                // patchcov: coverage end
             },
             WritePayload::NamedRange { .. } => match preview {
                 WriteResult::WouldMutateNamedRange { mut preview } => {
@@ -957,11 +957,11 @@ async fn write_inner(
                     }
                     WriteResult::MutatedNamedRange { preview }
                 }
-                // omni-dev: coverage ignore reason="`preview` is built by the NamedRange payload match above, so a NamedRange payload always carries WouldMutateNamedRange; this arm exists solely for exhaustiveness over the shared WriteResult enum"
+                // patchcov: coverage ignore reason="`preview` is built by the NamedRange payload match above, so a NamedRange payload always carries WouldMutateNamedRange; this arm exists solely for exhaustiveness over the shared WriteResult enum"
                 _ => WriteResult::Failed {
                     detail: "missing named-range preview".into(),
                 },
-                // omni-dev: coverage end
+                // patchcov: coverage end
             },
             WritePayload::Replace { .. } => WriteResult::Replaced {
                 occurrences_changed: response.occurrences_changed_for_replace(),
@@ -988,11 +988,11 @@ async fn write_inner(
                 },
                 WriteResult::WouldInsert { edit } => WriteResult::Inserted { edit },
                 WriteResult::WouldDelete { edit } => WriteResult::Deleted { edit },
-                // omni-dev: coverage ignore reason="`preview` is built by the payload match above, so an Insert/Delete/List payload always carries its matching edit preview; this arm exists solely for exhaustiveness over the shared WriteResult enum"
+                // patchcov: coverage ignore reason="`preview` is built by the payload match above, so an Insert/Delete/List payload always carries its matching edit preview; this arm exists solely for exhaustiveness over the shared WriteResult enum"
                 _ => WriteResult::Failed {
                     detail: "missing resolved edit preview".to_owned(),
                 },
-                // omni-dev: coverage end
+                // patchcov: coverage end
             },
         },
         Err(err) => {
@@ -2340,7 +2340,7 @@ mod tests {
                         selection.segment_id = Some(id.into());
                         selection.tab_id = Some("child".into());
                     }
-                    _ => unreachable!(), // omni-dev: coverage ignore-line reason="anchored_payloads yields only Insert and Delete"
+                    _ => unreachable!(), // patchcov: coverage ignore-line reason="anchored_payloads yields only Insert and Delete"
                 }
                 out.push(payload);
             }

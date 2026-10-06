@@ -11,7 +11,6 @@ pub mod commands;
 pub mod completions;
 pub mod config;
 pub(crate) mod confirm;
-pub mod coverage;
 // The daemon and the Snowflake client (which talks to the daemon over its
 // Unix-domain control socket) are Unix-only; on Windows they run only under WSL2,
 // and a native (non-WSL) Windows port is future work (#1363).
@@ -120,8 +119,6 @@ pub enum Commands {
     #[cfg(unix)]
     #[command(name = "codex-wrap")]
     CodexWrap(codex_wrap::CodexWrapCommand),
-    /// Coverage: diff/patch coverage analysis for PR comments, and merging sharded reports.
-    Coverage(coverage::CoverageCommand),
     /// Transcript and caption fetching from media platforms.
     Transcript(transcript::TranscriptCommand),
     /// Search the local invocation + HTTP request log.
@@ -210,7 +207,6 @@ impl Cli {
             Commands::ClaudeWrap(cmd) => cmd.execute().await,
             #[cfg(unix)]
             Commands::CodexWrap(cmd) => cmd.execute().await,
-            Commands::Coverage(cmd) => cmd.execute(),
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Log(log_cmd) => log_cmd.execute(),
             Commands::Config(config_cmd) => config_cmd.execute(),
@@ -361,7 +357,6 @@ mod tests {
                 "repo",
                 vec![
                     "git",
-                    "coverage",
                     "config scopes",
                     "worktrees rebase",
                     "worktrees push",
@@ -428,7 +423,6 @@ mod tests {
         let mut expected_globals: BTreeSet<String> = [
             "omni-dev --profile",
             "omni-dev git --repo",
-            "omni-dev coverage --repo",
             "omni-dev config scopes --repo",
             "omni-dev ai claude skills --repo",
             // `RepoArg` is `global = true` even on this leaf (a no-op there).

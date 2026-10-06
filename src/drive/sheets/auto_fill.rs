@@ -581,7 +581,7 @@ async fn auto_fill_inner(
             });
         }
     } else {
-        destination // omni-dev: coverage ignore-line reason="unreachable by construction: source_grid.sheet_id was itself resolved from this same workbook by resolve_grid_range above, so find_sheet_by_id always finds it"
+        destination // patchcov: coverage ignore-line reason="unreachable by construction: source_grid.sheet_id was itself resolved from this same workbook by resolve_grid_range above, so find_sheet_by_id always finds it"
     };
     let destination_a1 = grid_range_to_a1(&sheet_title, &applied_destination);
     // `None` in the common case (no clipping happened), so the JSON output
@@ -799,7 +799,7 @@ fn grid_range_to_a1(sheet_title: &str, grid: &GridRange) -> String {
         grid.end_column_index,
     ) else {
         unreachable!("auto-fill ranges are refused earlier unless fully bounded")
-        // omni-dev: coverage ignore-line reason="every call site resolves grid from a range already checked with grid_range::is_bounded, or computes it from one via compute_destination, which only ever produces a fully bounded range from a fully bounded source; this else-arm exists only to unwrap the shared Option fields"
+        // patchcov: coverage ignore-line reason="every call site resolves grid from a range already checked with grid_range::is_bounded, or computes it from one via compute_destination, which only ever produces a fully bounded range from a fully bounded source; this else-arm exists only to unwrap the shared Option fields"
     };
     let start = format!("{}{}", grid_range::column_index_to_letters(c0), r0 + 1);
     let end = format!("{}{}", grid_range::column_index_to_letters(c1 - 1), r1);
@@ -812,7 +812,7 @@ fn grid_range_to_a1(sheet_title: &str, grid: &GridRange) -> String {
         // *trailing* comment because `ignore-line` silences its own line
         // only (`coverage/markers.rs`: `start: line, end: line`), so on a
         // line of its own it would silence nothing.
-        Err(err) => unreachable!("auto-fill composes only bounded numeric ranges: {err}"), // omni-dev: coverage ignore-line reason="unreachable by construction: compose rejects only a sheet-prefixed or whole-sheet range, and the numeric {start}:{end} built just above is neither"
+        Err(err) => unreachable!("auto-fill composes only bounded numeric ranges: {err}"), // patchcov: coverage ignore-line reason="unreachable by construction: compose rejects only a sheet-prefixed or whole-sheet range, and the numeric {start}:{end} built just above is neither"
     }
 }
 
@@ -1468,7 +1468,7 @@ mod tests {
             range: Some("A1:B2".to_string()),
         };
         let BatchUpdateRequestItem::AutoFill(request) = build_request(&form, source, true) else {
-            panic!("expected AutoFill"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns AutoFill"
+            panic!("expected AutoFill"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns AutoFill"
         };
         assert_eq!(request.range, Some(source));
         assert_eq!(request.source_and_destination, None);
@@ -1485,7 +1485,7 @@ mod tests {
             fill_length: 5,
         };
         let BatchUpdateRequestItem::AutoFill(request) = build_request(&form, source, false) else {
-            panic!("expected AutoFill"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns AutoFill"
+            panic!("expected AutoFill"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns AutoFill"
         };
         assert_eq!(request.range, None);
         let sad = request.source_and_destination.unwrap();
@@ -2685,7 +2685,7 @@ mod tests {
             ..
         } = &outcome.result
         else {
-            panic!("{:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; the mocked response above always leads to WouldChange"
+            panic!("{:?}", outcome.result); // patchcov: coverage ignore-line reason="guards this test's assumption; the mocked response above always leads to WouldChange"
         };
         assert_eq!(destination, "'Q1'!B1:Z3");
         assert!(requested_destination.is_some(), "{requested_destination:?}");
@@ -2733,7 +2733,7 @@ mod tests {
             ..
         } = &outcome.result
         else {
-            panic!("{:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; the mocked response above always leads to WouldChange"
+            panic!("{:?}", outcome.result); // patchcov: coverage ignore-line reason="guards this test's assumption; the mocked response above always leads to WouldChange"
         };
         assert_eq!(destination, "'Q1'!A990:A1000");
         assert_eq!(requested_destination.as_deref(), Some("'Q1'!A990:A1010"));
@@ -2771,7 +2771,7 @@ mod tests {
             ..
         } = &outcome.result
         else {
-            panic!("{:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; the mocked response above always leads to WouldChange"
+            panic!("{:?}", outcome.result); // patchcov: coverage ignore-line reason="guards this test's assumption; the mocked response above always leads to WouldChange"
         };
         assert!(requested_destination.is_none());
         let mut out = Vec::new();
@@ -2825,7 +2825,7 @@ mod tests {
             ..
         } = &outcome.result
         else {
-            panic!("{:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; the mocked response above always leads to WouldChange"
+            panic!("{:?}", outcome.result); // patchcov: coverage ignore-line reason="guards this test's assumption; the mocked response above always leads to WouldChange"
         };
         assert_eq!(destination, "'Q1'!A4:A1003");
         assert!(requested_destination.is_none());

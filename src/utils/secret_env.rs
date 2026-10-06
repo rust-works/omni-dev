@@ -933,7 +933,7 @@ mod tests {
     fn any_group_or_other_bit_is_rejected() {
         for mode in [0o640, 0o604, 0o610, 0o601] {
             let (_dir, path) = secret_file(b"x", mode);
-            // omni-dev: coverage ignore reason="the loop above runs this 4 times and every mode fails the same way; verified locally that llvm-cov still reports 0 hits on the matches!( line — a region-attribution artifact on the nested assert!/matches! macro call, not an untested path"
+            // patchcov: coverage ignore reason="the loop above runs this 4 times and every mode fails the same way; verified locally that llvm-cov still reports 0 hits on the matches!( line — a region-attribution artifact on the nested assert!/matches! macro call, not an untested path"
             assert!(
                 matches!(
                     resolve(&env_with_file(&path)).unwrap_err(),
@@ -941,7 +941,7 @@ mod tests {
                 ),
                 "{mode:o}"
             );
-            // omni-dev: coverage end
+            // patchcov: coverage end
         }
     }
 
@@ -1363,7 +1363,7 @@ mod tests {
                         if text[i + 1 + c.len_utf8()..].starts_with('\'') {
                             i += 1 + c.len_utf8();
                         }
-                    } // omni-dev: coverage ignore-line reason="exercised by strip_test_modules_ignores_braces_in_literals_and_comments's '{' char literal; verified locally that llvm-cov still reports 0 hits — a region-attribution artifact on this closing brace, not an untested path"
+                    } // patchcov: coverage ignore-line reason="exercised by strip_test_modules_ignores_braces_in_literals_and_comments's '{' char literal; verified locally that llvm-cov still reports 0 hits — a region-attribution artifact on this closing brace, not an untested path"
                 }
                 b'{' => depth += 1,
                 b'}' => {
@@ -1418,7 +1418,7 @@ mod tests {
         for source in production_sources() {
             for name in env_like_literals(&source.code) {
                 if is_secret_shaped(&name) && !is_known(&name) {
-                    unknown.push(format!("{}: {name}", source.rel)); // omni-dev: coverage ignore-line reason="only runs if an unregistered secret-shaped literal exists; the assert below that unknown is empty is this test's whole point, so a passing run never takes this branch"
+                    unknown.push(format!("{}: {name}", source.rel)); // patchcov: coverage ignore-line reason="only runs if an unregistered secret-shaped literal exists; the assert below that unknown is empty is this test's whole point, so a passing run never takes this branch"
                 }
             }
         }
@@ -1476,9 +1476,9 @@ mod tests {
                 let args = balanced_args(&source.code[m.end()..]);
                 for (re, name) in &spelling_res {
                     if re.is_match(args) {
-                        // omni-dev: coverage ignore reason="only runs if a registered secret is read through a plain accessor outside this module; offenders.is_empty() below is this test's whole point"
+                        // patchcov: coverage ignore reason="only runs if a registered secret is read through a plain accessor outside this module; offenders.is_empty() below is this test's whole point"
                         offenders.push(format!("{}: `{}…` reads {name}", source.rel, m.as_str()));
-                        // omni-dev: coverage end
+                        // patchcov: coverage end
                     }
                 }
             }
@@ -1522,7 +1522,7 @@ mod tests {
         for source in production_sources() {
             for name in env_like_literals(&source.code) {
                 if companions.contains(&name) {
-                    collisions.push(format!("{}: {name}", source.rel)); // omni-dev: coverage ignore-line reason="only runs if a _FILE companion collides with an existing variable; collisions.is_empty() below is this test's whole point"
+                    collisions.push(format!("{}: {name}", source.rel)); // patchcov: coverage ignore-line reason="only runs if a _FILE companion collides with an existing variable; collisions.is_empty() below is this test's whole point"
                 }
             }
         }
@@ -1553,7 +1553,7 @@ mod tests {
             let mentions =
                 source.code.contains("command_var_name(") || source.code.contains("COMMAND_SUFFIX");
             if mentions && !ALLOWED.contains(&source.rel.as_str()) {
-                strays.push(source.rel); // omni-dev: coverage ignore-line reason="only runs if a stray file names the companion; strays.is_empty() below is this test's whole point"
+                strays.push(source.rel); // patchcov: coverage ignore-line reason="only runs if a stray file names the companion; strays.is_empty() below is this test's whole point"
             }
         }
         assert!(

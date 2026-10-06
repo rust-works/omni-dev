@@ -675,7 +675,7 @@ mod tests {
         mount_metadata(&server).await;
         let outcome = randomize_range(&drive, &sheets, &options(true), &[rule()]).await;
         let RandomizeRangeResult::WouldChange { width_warning, .. } = outcome.result else {
-            panic!("expected would-change"); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected would-change"); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(width_warning
             .unwrap()
@@ -737,7 +737,7 @@ mod tests {
         opts.range = Some("Sheet1!A1:B2".into());
         let outcome = randomize_range(&drive, &sheets, &opts, &[rule()]).await;
         let RandomizeRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("already names a sheet"), "{detail}");
         assert!(server.received_requests().await.unwrap().is_empty());
@@ -876,7 +876,7 @@ mod tests {
         assert!(lines.contains("sheets-structure"), "{lines}");
         assert!(lines.contains("rule on folder parent-1"), "{lines}");
         let RandomizeRangeResult::Blocked { operation, .. } = outcome.result else {
-            panic!("expected Blocked, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected Blocked, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert_eq!(operation, DriveOperation::SheetsStructure);
     }
@@ -913,7 +913,7 @@ mod tests {
         opts.range = Some("A2:C10".into()); // no `Sheet!` prefix, and no `--sheet` either.
         let outcome = randomize_range(&drive, &sheets, &opts, &[rule()]).await;
         let RandomizeRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("does not name a sheet"), "{detail}");
         assert!(server
@@ -935,7 +935,7 @@ mod tests {
         let outcome = randomize_range(&drive, &sheets, &opts, &[rule()]).await;
         let RandomizeRangeResult::RefusedSheetNotFound { title, available } = &outcome.result
         else {
-            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert_eq!(title, "Nope");
         assert_eq!(available, &["Q1".to_string()]);
@@ -951,7 +951,7 @@ mod tests {
         opts.range = Some("Q1!A:A".into());
         let outcome = randomize_range(&drive, &sheets, &opts, &[rule()]).await;
         let RandomizeRangeResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(
             detail.starts_with("Q1!A:A is open-ended"),
@@ -976,7 +976,7 @@ mod tests {
         mount_workbook_no_column_count().mount(&server).await;
         let outcome = randomize_range(&drive, &sheets, &options(true), &[rule()]).await;
         let RandomizeRangeResult::WouldChange { width_warning, .. } = outcome.result else {
-            panic!("expected would-change"); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected would-change"); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(width_warning.unwrap().contains("may be narrower"));
     }

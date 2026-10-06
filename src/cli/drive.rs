@@ -2404,7 +2404,7 @@ mod tests {
         ])
         .unwrap();
         let DriveSubcommands::Sync(sync) = cmd.command else {
-            panic!("expected sync"); // omni-dev: coverage ignore-line reason="guards this test's assumption; the parse above always yields DriveSubcommands::Sync for a sync argv"
+            panic!("expected sync"); // patchcov: coverage ignore-line reason="guards this test's assumption; the parse above always yields DriveSubcommands::Sync for a sync argv"
         };
         assert!(sync.verify && sync.dry_run);
         assert_eq!(sync.export_mime_type.as_deref(), Some("application/pdf"));

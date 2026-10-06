@@ -165,7 +165,7 @@ mod tests {
             let (crate::cli::drive::DriveSubcommands::Trash(leaf)
             | crate::cli::drive::DriveSubcommands::Untrash(leaf)) = cmd.command
             else {
-                panic!("wrong subcommand"); // omni-dev: coverage ignore-line reason="guards this test's assumption; the parse above always yields a trash or untrash subcommand"
+                panic!("wrong subcommand"); // patchcov: coverage ignore-line reason="guards this test's assumption; the parse above always yields a trash or untrash subcommand"
             };
             assert_eq!(leaf.file_id, "file-1");
             assert!(leaf.dry_run);

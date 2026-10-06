@@ -57,7 +57,7 @@ impl Diagnostics {
                 let _ = done_tx.send(());
             });
         if worker.is_err() {
-            return (Self::default(), None); // omni-dev: coverage ignore-line reason="Builder::spawn fails only when the OS refuses a new thread (resource exhaustion), which a test cannot provoke; the fail-open return is what keeps the wrapper forwarding"
+            return (Self::default(), None); // patchcov: coverage ignore-line reason="Builder::spawn fails only when the OS refuses a new thread (resource exhaustion), which a test cannot provoke; the fail-open return is what keeps the wrapper forwarding"
         }
         (
             Self {

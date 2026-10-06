@@ -1204,7 +1204,7 @@ mod tests {
         // The last look treats a rotation it raced as a file not found: the tally
         // is rebuilt from the file in hand rather than the search starting over.
         let Resumed::Plan(plan) = tally.resume(Some(live), true) else {
-            panic!("the last attempt must plan, not retry"); // omni-dev: coverage ignore-line reason="guards this test's assumption; the last attempt treats a raced search as a file not found, so it always plans"
+            panic!("the last attempt must plan, not retry"); // patchcov: coverage ignore-line reason="guards this test's assumption; the last attempt treats a raced search as a file not found, so it always plans"
         };
         assert_eq!(tally.counts().total(), 0);
         assert_eq!(plan.files.len(), 1);

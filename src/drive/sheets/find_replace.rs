@@ -303,11 +303,11 @@ async fn find_replace_inner(
         Err(result) => return gated(result),
     };
     let Some(scope) = target.request_scope(grid) else {
-        // omni-dev: coverage ignore reason="request_scope only returns None for a Range target paired with no grid, but resolve_target's Range arm always returns Ok with Some(grid) alongside it; this arm exists only to unwrap the shared Option"
+        // patchcov: coverage ignore reason="request_scope only returns None for a Range target paired with no grid, but resolve_target's Range arm always returns Ok with Some(grid) alongside it; this arm exists only to unwrap the shared Option"
         return gated(FindReplaceResult::Failed {
             detail: "internal error: a range scope did not resolve a GridRange".to_string(),
         });
-        // omni-dev: coverage end
+        // patchcov: coverage end
     };
     let request = FindReplaceRequest {
         find: opts.find.clone(),
@@ -390,28 +390,28 @@ fn resolve_target(
     debug_assert!(validate_scope_syntax(opts).is_ok());
     if opts.all_sheets {
         if opts.sheet.is_some() {
-            // omni-dev: coverage ignore reason="validate_scope_syntax already refuses --all-sheets combined with --sheet before resolve_target is ever reached; this arm exists only as a defensive re-check"
+            // patchcov: coverage ignore reason="validate_scope_syntax already refuses --all-sheets combined with --sheet before resolve_target is ever reached; this arm exists only as a defensive re-check"
             return Err(FindReplaceResult::RefusedInvalidRequest {
                 detail: "--all-sheets cannot be combined with --sheet".to_string(),
             });
-            // omni-dev: coverage end
+            // patchcov: coverage end
         }
         return Ok((FindReplaceTarget::AllSheets, None));
     }
     if opts.whole_sheet {
         if opts.range.is_some() {
-            // omni-dev: coverage ignore reason="validate_scope_syntax's scope_count check already guarantees --range is unset whenever --whole-sheet is set, before resolve_target is ever reached; this arm exists only as a defensive re-check"
+            // patchcov: coverage ignore reason="validate_scope_syntax's scope_count check already guarantees --range is unset whenever --whole-sheet is set, before resolve_target is ever reached; this arm exists only as a defensive re-check"
             return Err(FindReplaceResult::RefusedInvalidRequest {
                 detail: "--whole-sheet cannot be combined with --range".to_string(),
             });
-            // omni-dev: coverage end
+            // patchcov: coverage end
         }
         let Some(sheet) = opts.sheet.as_deref() else {
-            // omni-dev: coverage ignore reason="validate_scope_syntax already refuses --whole-sheet without --sheet before resolve_target is ever reached; this arm exists only as a defensive re-check"
+            // patchcov: coverage ignore reason="validate_scope_syntax already refuses --whole-sheet without --sheet before resolve_target is ever reached; this arm exists only as a defensive re-check"
             return Err(FindReplaceResult::RefusedInvalidRequest {
                 detail: "--whole-sheet requires --sheet".to_string(),
             });
-            // omni-dev: coverage end
+            // patchcov: coverage end
         };
         let sheet_id = grid_range::find_sheet_id(workbook, sheet, |title, available| {
             FindReplaceResult::RefusedSheetNotFound { title, available }
@@ -500,7 +500,7 @@ fn logged_counts(result: &FindReplaceResult) -> (Option<i64>, Option<i64>, Optio
         FindReplaceResult::AppliedReplyUnreadable { summary, .. } => {
             (None, None, Some(summary.clone()))
         }
-        FindReplaceResult::WouldChange { target, .. } => (None, None, Some(target.describe())), // omni-dev: coverage ignore-line reason="record_attempt is only called when !opts.dry_run, and WouldChange is only ever returned when opts.dry_run is true, so this arm can never run"
+        FindReplaceResult::WouldChange { target, .. } => (None, None, Some(target.describe())), // patchcov: coverage ignore-line reason="record_attempt is only called when !opts.dry_run, and WouldChange is only ever returned when opts.dry_run is true, so this arm can never run"
         _ => (None, None, None),
     }
 }
@@ -840,7 +840,7 @@ mod tests {
         o.find = String::new();
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("--find"), "{detail}");
     }
@@ -853,7 +853,7 @@ mod tests {
         o.all_sheets = true; // `--range` is also set by `opts`.
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("exactly one scope"), "{detail}");
     }
@@ -867,7 +867,7 @@ mod tests {
         o.whole_sheet = true;
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("requires --sheet"), "{detail}");
     }
@@ -891,7 +891,7 @@ mod tests {
         o.sheet = Some("Q1".to_string());
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("already names a sheet"), "{detail}");
     }
@@ -911,7 +911,7 @@ mod tests {
         o.whole_sheet = true;
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::RefusedSheetNotFound { title, available } = &outcome.result else {
-            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert_eq!(title, "Nope");
         assert_eq!(available, &["Q1".to_string(), "Q2".to_string()]);
@@ -930,7 +930,7 @@ mod tests {
         o.range = Some("A1:B2".to_string()); // no `Sheet!` prefix, and no `--sheet` either.
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedInvalidRequest, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(detail.contains("does not name a sheet"), "{detail}");
     }
@@ -948,7 +948,7 @@ mod tests {
         o.range = Some("Nope!A1:B2".to_string());
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::RefusedSheetNotFound { title, available } = &outcome.result else {
-            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected RefusedSheetNotFound, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert_eq!(title, "Nope");
         assert_eq!(available, &["Q1".to_string(), "Q2".to_string()]);
@@ -1088,7 +1088,7 @@ mod tests {
         o.include_formulas = true;
         let outcome = find_replace(&drive, &sheets, &o, &[allow_rule("parent-1")]).await;
         let FindReplaceResult::WouldChange { target, summary } = &outcome.result else {
-            panic!("expected WouldChange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected WouldChange, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(matches!(target, FindReplaceTarget::Range { .. }));
         assert!(summary.contains("\"draft\""), "{summary}");
@@ -1152,7 +1152,7 @@ mod tests {
 
         let outcome = find_replace(&drive, &sheets, &opts(false), &[allow_rule("parent-1")]).await;
         let FindReplaceResult::Changed { target, counts } = &outcome.result else {
-            panic!("expected Changed, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
+            panic!("expected Changed, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; this test always constructs that exact variant, so the branch never executes"
         };
         assert!(matches!(target, FindReplaceTarget::Range { .. }));
         let counts = counts.as_ref().expect("counts present");
@@ -1578,7 +1578,7 @@ mod tests {
                 lines.len(),
                 expected,
                 "describe_lines emitted {} lines for {:?}: {lines:?}",
-                lines.len(), // omni-dev: coverage ignore-line reason="assert_eq!'s message args are only evaluated on failure, and this test always passes"
+                lines.len(), // patchcov: coverage ignore-line reason="assert_eq!'s message args are only evaluated on failure, and this test always passes"
                 outcome.result
             );
             assert!(

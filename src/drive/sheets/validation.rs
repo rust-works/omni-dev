@@ -1790,7 +1790,7 @@ mod tests {
             let outcome = dry_run_on_a_sized_grid(range).await;
             let ValidationResult::RefusedInvalidRange { detail } = &outcome.result else {
                 panic!("expected RefusedInvalidRange, got {:?}", outcome.result);
-                // omni-dev: coverage ignore-line reason="guards this test's assumption; only reached when the refusal regresses"
+                // patchcov: coverage ignore-line reason="guards this test's assumption; only reached when the refusal regresses"
             };
             assert!(
                 detail.contains("wholly past the sheet's current grid"),

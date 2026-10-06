@@ -278,7 +278,7 @@ fn run(command_var: &str, argv: &[String], limits: Limits) -> Result<Secret, Sec
                     secs: timeout.as_secs(),
                 });
             }
-            // omni-dev: coverage ignore reason="try_wait on a live, owned child fails only if waitpid itself errors (ECHILD/EINTR from outside the process); no in-process test can provoke it, and the arm only reaps and reports"
+            // patchcov: coverage ignore reason="try_wait on a live, owned child fails only if waitpid itself errors (ECHILD/EINTR from outside the process); no in-process test can provoke it, and the arm only reaps and reports"
             Err(source) => {
                 kill_and_reap(&mut child, own_group);
                 return Err(SecretEnvError::CommandSpawn {
@@ -287,7 +287,7 @@ fn run(command_var: &str, argv: &[String], limits: Limits) -> Result<Secret, Sec
                     hint: "",
                     source,
                 });
-            } // omni-dev: coverage end
+            } // patchcov: coverage end
         }
     };
     let stdout = stdout.finish();

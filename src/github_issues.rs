@@ -576,7 +576,7 @@ fn build_aliased_query(
     let mut repos = Vec::new();
     for (ri, (project, items)) in by_project.iter().enumerate() {
         let Some((owner, name)) = project.split_once('/') else {
-            // omni-dev: coverage ignore-line reason="validated by the citation parser; every ItemRef reaching here already has a project of the form owner/repo"
+            // patchcov: coverage ignore-line reason="validated by the citation parser; every ItemRef reaching here already has a project of the form owner/repo"
             continue;
         };
         let mut frags = Vec::new();

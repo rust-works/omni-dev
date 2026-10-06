@@ -270,17 +270,17 @@ impl HookCommand {
             return;
         };
         let Ok(socket) = server::resolve_socket(self.socket.clone()) else {
-            // omni-dev: coverage ignore reason="resolve_socket fails only when the platform has no data directory to put the default socket in (no resolvable home), which a test cannot reproduce on macOS or Linux; the sink is fail-open by design, so this is the same silent return as every other skipped hook"
+            // patchcov: coverage ignore reason="resolve_socket fails only when the platform has no data directory to put the default socket in (no resolvable home), which a test cannot reproduce on macOS or Linux; the sink is fail-open by design, so this is the same silent return as every other skipped hook"
             tracing::debug!(agent = ?self.agent, outcome = "socket_resolution_failed", "session_hook_skipped");
             return;
-            // omni-dev: coverage end
+            // patchcov: coverage end
         };
         // Stamped once, so the journal record and the POST name the same event and
         // the daemon can drop whichever copy it sees second (#2108).
         let stamp = journal::new_stamp();
         self.journal(&socket, &hook_op, &stamp);
         let Some((op, payload)) = hook_op.wire(self.agent, Some(&stamp)) else {
-            return; // omni-dev: coverage ignore-line reason="wire returns None only through the serialization failure ignored in wire() itself (a non-UTF-8 cwd, which a hook payload cannot carry), so this arm is unreachable for the same reason"
+            return; // patchcov: coverage ignore-line reason="wire returns None only through the serialization failure ignored in wire() itself (a non-UTF-8 cwd, which a hook payload cannot carry), so this arm is unreachable for the same reason"
         };
         let env = DaemonEnvelope::service(SERVICE, op, payload);
         let outcome =
@@ -400,14 +400,14 @@ impl HookOp {
         let (op, mut payload) = match self {
             Self::Observe(request) => {
                 let Ok(payload) = serde_json::to_value(request) else {
-                    // omni-dev: coverage ignore reason="to_value on an ObserveRequest fails only for a non-UTF-8 cwd, and the hook payload's cwd is deserialized from a JSON string, so it is always UTF-8; the arm exists so a future non-string field cannot silently drop the report"
+                    // patchcov: coverage ignore reason="to_value on an ObserveRequest fails only for a non-UTF-8 cwd, and the hook payload's cwd is deserialized from a JSON string, so it is always UTF-8; the arm exists so a future non-string field cannot silently drop the report"
                     tracing::debug!(
                         ?agent,
                         outcome = "serialization_failed",
                         "session_hook_skipped"
                     );
                     return None;
-                    // omni-dev: coverage end
+                    // patchcov: coverage end
                 };
                 ("observe", payload)
             }
@@ -3526,11 +3526,11 @@ mod tests {
             SessionsSubcommands::InstallHooks(cmd) => {
                 assert_eq!(cmd.pi_agent_dir, Some(PathBuf::from("/x/agent")));
             }
-            _ => panic!("expected install-hooks"), // omni-dev: coverage ignore-line reason="the arm above always matches: parse() above always parses an install-hooks argv into SessionsSubcommands::InstallHooks"
+            _ => panic!("expected install-hooks"), // patchcov: coverage ignore-line reason="the arm above always matches: parse() above always parses an install-hooks argv into SessionsSubcommands::InstallHooks"
         }
         match parse(&["uninstall-hooks"]) {
             SessionsSubcommands::UninstallHooks(cmd) => assert_eq!(cmd.pi_agent_dir, None),
-            _ => panic!("expected uninstall-hooks"), // omni-dev: coverage ignore-line reason="the arm above always matches: parse() above always parses an uninstall-hooks argv into SessionsSubcommands::UninstallHooks"
+            _ => panic!("expected uninstall-hooks"), // patchcov: coverage ignore-line reason="the arm above always matches: parse() above always parses an uninstall-hooks argv into SessionsSubcommands::UninstallHooks"
         }
     }
 

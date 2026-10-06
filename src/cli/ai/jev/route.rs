@@ -173,7 +173,7 @@ fn parse_close_call_margin(value: &str) -> std::result::Result<f64, String> {
 impl RouteCommand {
     /// Executes the route command.
     pub async fn execute(self) -> Result<()> {
-        // omni-dev: coverage ignore reason="RouteCommand::execute is the process-bound wiring shell; fetch_docs, run_route_with_reference_fetch_failures, render_output_with_style and terminal_style_with provide its deterministic seams"
+        // patchcov: coverage ignore reason="RouteCommand::execute is the process-bound wiring shell; fetch_docs, run_route_with_reference_fetch_failures, render_output_with_style and terminal_style_with provide its deterministic seams"
         let drafts = self.load_draft_comments()?;
         let env = crate::utils::settings::SettingsEnv::load();
         let mut config = JevConfig::from_env_with(&env)?;
@@ -248,7 +248,7 @@ impl RouteCommand {
             )?
         );
         failure_summary(&report).map_or(Ok(()), |msg| bail!(msg))
-        // omni-dev: coverage end
+        // patchcov: coverage end
     }
 
     fn load_draft_comments(&self) -> Result<Vec<String>> {
@@ -322,12 +322,12 @@ fn render_output_with_style(
     }
 }
 
-// omni-dev: coverage ignore reason="the SystemEnv/stdout probe is process-bound; terminal_style_with is exhaustively covered through its injected environment and TTY seam"
+// patchcov: coverage ignore reason="the SystemEnv/stdout probe is process-bound; terminal_style_with is exhaustively covered through its injected environment and TTY seam"
 /// Whether stdout may carry colour and OSC 8 links.
 fn terminal_style() -> TerminalStyle {
     terminal_style_with(&SystemEnv, std::io::stdout().is_terminal())
 }
-// omni-dev: coverage end
+// patchcov: coverage end
 
 /// The env-parsing seam behind [`terminal_style`] (STYLE-0028): given these
 /// variables and whether stdout is a terminal, what may be emitted?
@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn route_rejects_ignore_closed_with_allow_closed() {
         let Err(err) = parse(&["#1", "--ignore-closed", "--allow-closed"]) else {
-            panic!("expected a conflict"); // omni-dev: coverage ignore-line reason="guards this test's assumption; the parse above always fails on --ignore-closed with --allow-closed"
+            panic!("expected a conflict"); // patchcov: coverage ignore-line reason="guards this test's assumption; the parse above always fails on --ignore-closed with --allow-closed"
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
@@ -911,7 +911,7 @@ mod tests {
     #[test]
     fn clap_rejects_a_malformed_ladder_definition() {
         let Err(err) = parse(&["#1", "--ladder-definition", "noequals"]) else {
-            // omni-dev: coverage ignore-line reason="guards this test's assumption; the parse above always fails on a malformed --ladder-definition"
+            // patchcov: coverage ignore-line reason="guards this test's assumption; the parse above always fails on a malformed --ladder-definition"
             panic!("a malformed --ladder-definition parsed");
         };
         assert!(err.to_string().contains("NAME=FILE"), "{err}");

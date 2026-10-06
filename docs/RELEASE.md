@@ -286,7 +286,7 @@ The two tag families trigger separate workflows and never each other's: `release
 
 **CI Workflow (`.github/workflows/ci.yml`)**
 - Runs the full suite: tests on stable, beta and nightly Rust, formatting, clippy, documentation, a Windows build, the security audit, the dependency policy and secret scanning
-- **Skips Coverage on tags** ([#1289](https://github.com/rust-works/omni-dev/issues/1289)): the coverage action resolves `version: latest` to the release being published and would 404 on its not-yet-uploaded binary
+- **Skips Coverage on tags** ([#1289](https://github.com/rust-works/omni-dev/issues/1289)): coverage is checked on PRs and main pushes; the v2 action installs patchcov independently of omni-dev releases
 
 **Release Workflow (`.github/workflows/release.yml`)**
 - **Creates GitHub Release**: Automatically from the tag
@@ -325,7 +325,7 @@ After pushing the tags, monitor the automated releases.
    gh release view vX.Y.Z --json assets --jq '.assets[].name'
    # omni-dev-linux.tar.gz, omni-dev-linux-arm64.tar.gz, omni-dev-macos-arm64.tar.gz, omni-dev-windows.zip
    ```
-   A leg that fails to build leaves its asset out of the release, and because `publish-crates` waits on every leg it also holds back the crates.io publish. After a transient failure (a runner outage, a network error) re-run the failed jobs with `gh run rerun <run_id> --failed`; if the upload then fails because the asset already exists, delete the stale one first with `gh release delete-asset vX.Y.Z <asset-name>`. A defect in the code or the workflow is not fixed by a re-run, which uses the tag's commit: it needs a patch release. Do not carry on without the asset, since the coverage action and other consumers download these by exact name.
+   A leg that fails to build leaves its asset out of the release, and because `publish-crates` waits on every leg it also holds back the crates.io publish. After a transient failure (a runner outage, a network error) re-run the failed jobs with `gh run rerun <run_id> --failed`; if the upload then fails because the asset already exists, delete the stale one first with `gh release delete-asset vX.Y.Z <asset-name>`. A defect in the code or the workflow is not fixed by a re-run, which uses the tag's commit: it needs a patch release. Do not carry on without the asset, since consumers download these by exact name.
 
 3. **Verify crates.io Publication**:
    ```bash
@@ -375,7 +375,7 @@ To see what a binary needs: `readelf -V omni-dev` and read `.gnu.version_r`, or 
 
 ## Ordering with Dependents
 
-The `action-works/omni-dev-coverage-check` action used by `ci.yml` resolves `version: latest`. A change that depends on a **new omni-dev flag** (for example `coverage diff --fail-under-lines`, [#2114](https://github.com/rust-works/omni-dev/issues/2114)) can fail its own Coverage check until that flag exists in a **released** binary. For such changes the release, not the merge, is what unblocks them, so release soon after the change lands, or sequence the pull requests accordingly.
+The `action-works/omni-dev-coverage-check@v2.0` action used by `ci.yml` installs patchcov 0.1.1 independently of omni-dev. Coverage functionality now lives in [rust-works/patchcov](https://github.com/rust-works/patchcov) (#2200). Changes that need new patchcov behavior require a published patchcov version and an action version input update; releasing omni-dev does not unblock them.
 
 ## Post-Release Tasks
 

@@ -145,10 +145,10 @@ fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
     };
     for project in project_dirs {
         let Ok(project) = project else {
-            // omni-dev: coverage ignore reason="read_dir yields an Err entry only on an I/O fault (EIO, a vanished directory mid-iteration), which a test cannot provoke; the scan counts it and moves on, the same handling as the unreadable project directory below"
+            // patchcov: coverage ignore reason="read_dir yields an Err entry only on an I/O fault (EIO, a vanished directory mid-iteration), which a test cannot provoke; the scan counts it and moves on, the same handling as the unreadable project directory below"
             io_errors += 1;
             continue;
-            // omni-dev: coverage end
+            // patchcov: coverage end
         };
         let Ok(files) = std::fs::read_dir(project.path()) else {
             io_errors += 1;
@@ -156,10 +156,10 @@ fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
         };
         for file in files {
             let Ok(file) = file else {
-                // omni-dev: coverage ignore reason="read_dir yields an Err entry only on an I/O fault (EIO, a vanished directory mid-iteration), which a test cannot provoke; the scan counts it and moves on, the same handling as the unreadable project directory above"
+                // patchcov: coverage ignore reason="read_dir yields an Err entry only on an I/O fault (EIO, a vanished directory mid-iteration), which a test cannot provoke; the scan counts it and moves on, the same handling as the unreadable project directory above"
                 io_errors += 1;
                 continue;
-                // omni-dev: coverage end
+                // patchcov: coverage end
             };
             let path = file.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -171,19 +171,19 @@ fn scan(root: &Path, state: &mut ScanState, now: SystemTime) -> Vec<Sighting> {
                 continue;
             };
             let Ok(meta) = file.metadata() else {
-                // omni-dev: coverage ignore reason="DirEntry::metadata does not follow symlinks, so it fails only when the entry vanished between read_dir and the stat, a race a test cannot provoke; the scan counts it and moves on"
+                // patchcov: coverage ignore reason="DirEntry::metadata does not follow symlinks, so it fails only when the entry vanished between read_dir and the stat, a race a test cannot provoke; the scan counts it and moves on"
                 io_errors += 1;
                 continue;
-                // omni-dev: coverage end
+                // patchcov: coverage end
             };
             let size = meta.len();
             let recent = if let Ok(modified) = meta.modified() {
                 is_recent(modified, now)
             } else {
-                // omni-dev: coverage ignore reason="Metadata::modified fails only on a platform with no mtime, and every supported one (Linux, macOS) has it"
+                // patchcov: coverage ignore reason="Metadata::modified fails only on a platform with no mtime, and every supported one (Linux, macOS) has it"
                 io_errors += 1;
                 false
-                // omni-dev: coverage end
+                // patchcov: coverage end
             };
             let previous = state.insert(path.clone(), size);
             if !recent {
@@ -247,11 +247,11 @@ pub fn spawn(registry: Arc<SessionsRegistry>, token: CancellationToken) -> JoinH
             })
             .await
             .unwrap_or_else(|error| {
-                // omni-dev: coverage ignore reason="spawn_blocking's JoinError needs the scan closure to panic or the runtime to shut down mid-scan; scan has no panicking path, and the runtime outlives the watcher, whose token is cancelled first"
+                // patchcov: coverage ignore reason="spawn_blocking's JoinError needs the scan closure to panic or the runtime to shut down mid-scan; scan has no panicking path, and the runtime outlives the watcher, whose token is cancelled first"
                 tracing::warn!(%error, outcome = "state_reset", "session_transcript_scan_failed");
                 (ScanState::new(), Vec::new())
             });
-            // omni-dev: coverage end
+            // patchcov: coverage end
             state = returned_state;
             for sighting in sightings {
                 registry.observe(sighting.into_observe());

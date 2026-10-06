@@ -561,11 +561,11 @@ fn print_restore_result(result: &RestoreResult) {
         } => {
             println!("{new_token}");
             let backup_desc = match backup {
-                // omni-dev: coverage ignore reason="a sheet restore's fresh backup is always a DriveCopy — restore.rs's own recheck refuses unless the target is still a spreadsheet, and acquire() only ever takes a Bytes backup of a non-native target; this arm exists solely for exhaustiveness over the shared LeaseBackup enum"
+                // patchcov: coverage ignore reason="a sheet restore's fresh backup is always a DriveCopy — restore.rs's own recheck refuses unless the target is still a spreadsheet, and acquire() only ever takes a Bytes backup of a non-native target; this arm exists solely for exhaustiveness over the shared LeaseBackup enum"
                 LeaseBackup::Bytes { path, .. } => {
                     sanitize_for_terminal(&path.display().to_string())
                 }
-                // omni-dev: coverage end
+                // patchcov: coverage end
                 LeaseBackup::DriveCopy { file_id } => {
                     format!("Drive copy {}", sanitize_for_terminal(file_id))
                 }
@@ -1271,10 +1271,10 @@ mod tests {
         match Wrapper::try_parse_from(full).unwrap().cmd {
             Wrapped::Lease(cmd) => match cmd.action {
                 LeaseAction::Acquire(acquire) => acquire,
-                // omni-dev: coverage ignore reason="guards this test helper against misuse; every call site below passes an acquire subcommand"
+                // patchcov: coverage ignore reason="guards this test helper against misuse; every call site below passes an acquire subcommand"
                 LeaseAction::Restore(_) | LeaseAction::Release(_) | LeaseAction::Prune(_) => {
                     panic!("expected an Acquire command")
-                } // omni-dev: coverage end
+                } // patchcov: coverage end
             },
         }
     }
@@ -1285,10 +1285,10 @@ mod tests {
         match Wrapper::try_parse_from(full).unwrap().cmd {
             Wrapped::Lease(cmd) => match cmd.action {
                 LeaseAction::Prune(prune) => prune,
-                // omni-dev: coverage ignore reason="guards this test helper against misuse; every call site below passes a prune subcommand"
+                // patchcov: coverage ignore reason="guards this test helper against misuse; every call site below passes a prune subcommand"
                 LeaseAction::Acquire(_) | LeaseAction::Restore(_) | LeaseAction::Release(_) => {
                     panic!("expected a Prune command")
-                } // omni-dev: coverage end
+                } // patchcov: coverage end
             },
         }
     }

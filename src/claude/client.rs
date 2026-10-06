@@ -812,7 +812,7 @@ impl ClaudeClient {
     }
 
     /// Creates a new Claude client with API key from environment variables.
-    // omni-dev: coverage ignore reason="process-bound: hardcodes SystemEnv with no injectable seam (unlike create_default_claude_client_with's tested Default arm, which this mirrors) and has no in-crate caller; testing it would mean mutating real process env for shared credential vars"
+    // patchcov: coverage ignore reason="process-bound: hardcodes SystemEnv with no injectable seam (unlike create_default_claude_client_with's tested Default arm, which this mirrors) and has no in-crate caller; testing it would mean mutating real process env for shared credential vars"
     pub fn from_env(model: String) -> Result<Self> {
         // Try to get API key from environment variables
         let api_key = secret_var_any(
@@ -824,7 +824,7 @@ impl ClaudeClient {
         let ai_client = ClaudeAiClient::new(model, api_key.expose_secret().to_string(), None)?;
         Ok(Self::new(Box::new(ai_client)))
     }
-    // omni-dev: coverage end
+    // patchcov: coverage end
 
     /// Generates commit message amendments from repository view.
     pub async fn generate_amendments(&self, repo_view: &RepositoryView) -> Result<AmendmentFile> {

@@ -124,7 +124,7 @@ fn citation_from_captures(
             .ok()
             .map(|number| (default_project.to_string(), ItemKind::Issue, number))
     } else {
-        // omni-dev: coverage ignore-line reason="unreachable: both call sites (find_citations, first_citation) already filtered out the only alternative with no numbered group (other_url) via number_end before calling this"
+        // patchcov: coverage ignore-line reason="unreachable: both call sites (find_citations, first_citation) already filtered out the only alternative with no numbered group (other_url) via number_end before calling this"
         None
     }
 }

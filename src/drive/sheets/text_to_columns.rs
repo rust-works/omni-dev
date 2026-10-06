@@ -1499,7 +1499,7 @@ mod tests {
                 assert_eq!(req.delimiter, None);
                 assert_eq!(req.delimiter_type, DelimiterType::Comma);
             }
-            other => panic!("unexpected request: {other:?}"), // omni-dev: coverage ignore-line reason="this match's catch-all only runs if build_request failed to return the request variant this test constructs it to build; that never happens, so the branch never executes"
+            other => panic!("unexpected request: {other:?}"), // patchcov: coverage ignore-line reason="this match's catch-all only runs if build_request failed to return the request variant this test constructs it to build; that never happens, so the branch never executes"
         }
     }
 
@@ -1511,7 +1511,7 @@ mod tests {
                 assert_eq!(req.delimiter, Some("|".to_string()));
                 assert_eq!(req.delimiter_type, DelimiterType::Custom);
             }
-            other => panic!("unexpected request: {other:?}"), // omni-dev: coverage ignore-line reason="this match's catch-all only runs if build_request failed to return the request variant this test constructs it to build; that never happens, so the branch never executes"
+            other => panic!("unexpected request: {other:?}"), // patchcov: coverage ignore-line reason="this match's catch-all only runs if build_request failed to return the request variant this test constructs it to build; that never happens, so the branch never executes"
         }
     }
 
@@ -1581,7 +1581,7 @@ mod tests {
                 overwritten_cells,
                 past_grid_extent,
             },
-            other => other, // omni-dev: coverage ignore-line reason="would_change_outcome always constructs a WouldChange result, so this catch-all identity arm never runs"
+            other => other, // patchcov: coverage ignore-line reason="would_change_outcome always constructs a WouldChange result, so this catch-all identity arm never runs"
         };
         let lines = describe_lines(&outcome);
         assert!(lines[0].starts_with("Applied: "));
@@ -1664,7 +1664,7 @@ mod tests {
     fn a_failed_lease_check_maps_to_failed() {
         match TextToColumnsResult::from_lease_failed("ledger unreadable".to_string()) {
             TextToColumnsResult::Failed { detail } => assert_eq!(detail, "ledger unreadable"),
-            other => panic!("expected Failed, got {other:?}"), // omni-dev: coverage ignore-line reason="from_lease_failed always returns Failed; this test's catch-all guards that assumption and never runs"
+            other => panic!("expected Failed, got {other:?}"), // patchcov: coverage ignore-line reason="from_lease_failed always returns Failed; this test's catch-all guards that assumption and never runs"
         }
     }
 
@@ -2305,7 +2305,7 @@ mod tests {
             TextToColumnsResult::WouldChange {
                 overwritten_cells, ..
             } => assert_eq!(overwritten_cells, &vec!["B2".to_string()]),
-            other => panic!("expected WouldChange, got {other:?}"), // omni-dev: coverage ignore-line reason="this test's mocked responses always drive a WouldChange outcome; this catch-all guards that assumption and never runs"
+            other => panic!("expected WouldChange, got {other:?}"), // patchcov: coverage ignore-line reason="this test's mocked responses always drive a WouldChange outcome; this catch-all guards that assumption and never runs"
         }
         let rendered = describe_lines(&outcome).join("\n");
         assert!(
@@ -2400,7 +2400,7 @@ mod tests {
                 assert!(overwritten_cells.is_empty());
                 assert!(past_grid_extent);
             }
-            other => panic!("expected Changed, got {other:?}"), // omni-dev: coverage ignore-line reason="this test's mocked responses always drive a Changed outcome; this catch-all guards that assumption and never runs"
+            other => panic!("expected Changed, got {other:?}"), // patchcov: coverage ignore-line reason="this test's mocked responses always drive a Changed outcome; this catch-all guards that assumption and never runs"
         }
         // Only the source was read: there was no in-grid spill to ask about.
         let reads: Vec<_> = server
@@ -2855,7 +2855,7 @@ mod tests {
                 assert!(!past_grid_extent);
                 assert!(summary.contains("no row spills beyond the source"));
             }
-            other => panic!("expected Changed, got {other:?}"), // omni-dev: coverage ignore-line reason="this test's mocked responses always drive a Changed outcome; this catch-all guards that assumption and never runs"
+            other => panic!("expected Changed, got {other:?}"), // patchcov: coverage ignore-line reason="this test's mocked responses always drive a Changed outcome; this catch-all guards that assumption and never runs"
         }
         let reads: Vec<_> = server
             .received_requests()

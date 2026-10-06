@@ -631,7 +631,7 @@ fn split_multipart<'a>(body: &'a [u8], boundary: &str) -> Option<Multipart<'a>> 
                 } else if body[..pos].ends_with(b"\n") {
                     pos - 1
                 } else {
-                    pos // omni-dev: coverage ignore-line reason="unreachable: a delimiter line's start is always the position right after some previous line's '\n' (either the outer while loop's line_end, or 0 for the very first line), so it always ends with '\n'; this arm exists solely for exhaustiveness over the byte-slice check"
+                    pos // patchcov: coverage ignore-line reason="unreachable: a delimiter line's start is always the position right after some previous line's '\n' (either the outer while loop's line_end, or 0 for the very first line), so it always ends with '\n'; this arm exists solely for exhaustiveness over the byte-slice check"
                 };
                 parts.push(&body[part_start..end.max(part_start)]);
             }
