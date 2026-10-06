@@ -205,11 +205,11 @@ jobs:
     # The coverage pipeline — cargo-llvm-cov run, merge-base baseline (download
     # + git-worktree recompute fallback), `patchcov diff` sticky PR
     # comment, summary + artifacts, baseline publish on main, and the line gate
-    # — is packaged in action-works/omni-dev-coverage-check v2 (patchcov-based, #2200).
+    # — is packaged in action-works/patchcov-action (patchcov-based, #2200, #2206).
     # worktree-system-deps installs the ALSA headers only on the merge-base
     # recompute path, for fork points that predate the cpal/voice removal
     # (#980); a no-op once the merge-base is itself cpal-free.
-    - uses: action-works/omni-dev-coverage-check@v2.0
+    - uses: action-works/patchcov-action@v1.0
       with:
         fail-under-lines: 30
         worktree-system-deps: libasound2-dev
