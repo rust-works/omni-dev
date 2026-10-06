@@ -293,7 +293,7 @@ mod reap_tests {
     /// Only `SIGHUP` is reset because it is the only signal these tests send.
     /// A test that sends another one needs it reset the same way, or its
     /// outcome depends on how the test process was launched.
-    fn group_leader(script: &str) -> std::process::Child {
+    fn group_leader(script: &str, ready: Option<&std::path::Path>) -> std::process::Child {
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", script])
@@ -301,6 +301,9 @@ mod reap_tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(ready) = ready {
+            command.env("OMNI_DEV_REAP_READY", ready);
+        }
         // `pre_exec` runs between fork and exec in the child, where only
         // async-signal-safe calls are allowed, which is why it is `unsafe`
         // and why there is no safe way to reset a disposition on `Command`.
@@ -317,9 +320,27 @@ mod reap_tests {
             });
             // patchcov: coverage end
         }
-        let child = command.spawn().unwrap();
-        // Let the shell install any trap before it is signalled.
-        std::thread::sleep(Duration::from_millis(100));
+        let mut child = command.spawn().unwrap();
+        if let Some(ready) = ready {
+            // The shell writes this only after installing its trap. The
+            // deadline diagnoses failed setup; elapsed time is not readiness.
+            const READY_TIMEOUT: Duration = Duration::from_secs(10);
+            const READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+            let deadline = Instant::now() + READY_TIMEOUT;
+            while !ready.exists() {
+                if Instant::now() >= deadline {
+                    let pid = i32::try_from(child.id()).unwrap();
+                    reap_child_group(pid, Duration::ZERO);
+                    // Best-effort cleanup before reporting the setup failure.
+                    let _ = child.wait();
+                    panic!(
+                        "shell did not signal readiness at {} within {READY_TIMEOUT:?}",
+                        ready.display()
+                    );
+                }
+                std::thread::sleep(READY_POLL_INTERVAL);
+            }
+        }
         child
     }
 
@@ -339,7 +360,21 @@ mod reap_tests {
     /// nothing but the escalation can end this.
     #[test]
     fn a_child_ignoring_sighup_is_escalated_and_reaped() {
-        let mut child = group_leader("trap '' HUP; sleep 60");
+        assert_ignoring_child_is_reaped("");
+    }
+
+    /// #2174: setup can take longer than the old 100 ms sleep; the marker,
+    /// rather than elapsed time, must gate the first signal.
+    #[test]
+    fn a_child_with_delayed_trap_setup_is_escalated_and_reaped() {
+        assert_ignoring_child_is_reaped("sleep 1; ");
+    }
+
+    fn assert_ignoring_child_is_reaped(setup: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let script = format!("{setup}trap '' HUP; : > \"$OMNI_DEV_REAP_READY\"; sleep 60");
+        let mut child = group_leader(&script, Some(&ready));
         let pid = i32::try_from(child.id()).unwrap();
         let started = Instant::now();
         reap_child_group(pid, REAP_GRACE);
@@ -374,7 +409,7 @@ mod reap_tests {
     /// guards. A `Some(9)` here is therefore worth checking against both.
     #[test]
     fn a_well_behaved_child_dies_of_sighup_and_is_never_escalated() {
-        let mut child = group_leader("sleep 60");
+        let mut child = group_leader("sleep 60", None);
         let pid = i32::try_from(child.id()).unwrap();
         reap_child_group(pid, REAP_GRACE);
         let status = child.wait().unwrap();
@@ -446,7 +481,8 @@ mod reap_tests {
         let handle = spawn(&request, tx).unwrap();
         let pid = handle.child_pid;
         assert!(pid > 1, "spawn must capture a real pid, got {pid}");
-        std::thread::sleep(Duration::from_millis(150));
+        // `setsid()` runs in pre_exec, before spawn returns: the group is
+        // already established, independently of the shell running its script.
         assert!(
             killpg(Pid::from_raw(pid), None).is_ok(),
             "the captured pid is not a process-group leader, so a group-wide \
