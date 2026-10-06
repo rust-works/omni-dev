@@ -2436,6 +2436,18 @@ fn whitelisted_env() -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Lines as omni-dev 0.46.0 wrote them, kept as literals rather than builder calls:
+/// the Google writers move to gwi (#2203, ADR-0095), but the reader must keep
+/// decoding and rendering what they left behind in `log.jsonl` and `audit.jsonl`.
+#[cfg(test)]
+pub(crate) mod legacy_lines {
+    /// A `drivemutation` line from `log.jsonl`.
+    pub(crate) const DRIVE_MUTATION: &str = r#"{"id":"rec-1","invocation_id":"inv-3","kind":"drivemutation","timestamp":"2026-06-22T12:34:56.789Z","hostname":"host","pid":4242,"omni_dev_version":"0.46.0","cwd":"/work/repo","system_user":"user","command":["drive","move"],"duration_ms":17,"source":"mcp","mcp_tool":"drive_file_move","service":"drive","context":{"added_principals":"alice@example.com","crosses_drive_boundary":"true","file_id":"f1","file_name":"report.pdf","resolved_folder_id":"dest1","status":"blocked"}}"#;
+
+    /// An `audit` line from `audit.jsonl`.
+    pub(crate) const AUDIT: &str = r#"{"id":"rec-2","invocation_id":"inv-3","kind":"audit","timestamp":"2026-06-22T12:35:00.000Z","hostname":"host","pid":4242,"omni_dev_version":"0.46.0","cwd":"/work/repo","system_user":"user","command":["drive","lease-acquire"],"source":"mcp","mcp_tool":"drive_file_move","service":"drive","context":{"file_id":"f1","integration":"drive","lease_id":"lease-1","verdict":"acquired","version_after":"7"}}"#;
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -2642,6 +2654,46 @@ mod tests {
         assert_eq!(back.kind, RecordKind::Worktree);
         assert_eq!(back.command, argv(&["git", "worktree", "add"]));
         assert_eq!(back.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn legacy_drive_mutation_line_still_decodes_with_its_kind_and_context() {
+        let rec: LogRecord = serde_json::from_str(legacy_lines::DRIVE_MUTATION).unwrap();
+        assert_eq!(rec.kind, RecordKind::DriveMutation);
+        assert_eq!(rec.kind.as_str(), "drivemutation");
+        assert_eq!(rec.invocation_id, "inv-3");
+        assert_eq!(rec.source, Some(Source::Mcp));
+        assert_eq!(rec.mcp_tool.as_deref(), Some("drive_file_move"));
+        assert_eq!(rec.command, argv(&["drive", "move"]));
+        assert_eq!(rec.duration_ms, Some(17));
+        assert_eq!(
+            rec.context.get("file_name").map(String::as_str),
+            Some("report.pdf")
+        );
+        assert_eq!(
+            rec.context.get("status").map(String::as_str),
+            Some("blocked")
+        );
+    }
+
+    #[test]
+    fn legacy_audit_line_still_decodes_with_its_kind_and_context() {
+        let rec: LogRecord = serde_json::from_str(legacy_lines::AUDIT).unwrap();
+        assert_eq!(rec.kind, RecordKind::Audit);
+        assert_eq!(rec.kind.as_str(), "audit");
+        assert_eq!(rec.command, argv(&["drive", "lease-acquire"]));
+        assert_eq!(
+            rec.context.get("integration").map(String::as_str),
+            Some("drive")
+        );
+        assert_eq!(
+            rec.context.get("lease_id").map(String::as_str),
+            Some("lease-1")
+        );
+        assert_eq!(
+            rec.context.get("verdict").map(String::as_str),
+            Some("acquired")
+        );
     }
 
     #[test]
