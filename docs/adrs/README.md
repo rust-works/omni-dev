@@ -118,3 +118,4 @@ by Michael Nygard.
 | [ADR-0092](adr-0092.md)                                 | ✅ Accepted                              | 2026-10-02 | Gated Trash and Restore for Individual Drive Files                                          |
 | [ADR-0093](adr-0093.md)                                 | ✅ Accepted                              | 2026-10-02 | Google Slides object reads and guarded text replacement                                     |
 | [ADR-0094](adr-0094.md)                                 | ✅ Accepted                              | 2026-10-02 | Anchor-Addressed Docs Insertion and Deletion                                                |
+| [ADR-0095](adr-0095.md)                                 | 🟡 Proposed                              | 2026-10-07 | Extract Google Workspace Functionality into the Standalone gwi Project                      |
