@@ -466,7 +466,7 @@ async fn dimension_group_inner(
         Err(result) => return pre_gated(result),
     };
     let Some(sheet) = find_sheet(&workbook, sheet_id) else {
-        unreachable!("find_sheet_id resolved this id from this same workbook") // omni-dev: coverage ignore-line reason="find_sheet_id only ever returns an id it read out of this same workbook's sheets, so a lookup by that id in the same workbook always succeeds; this else-arm exists only to unwrap the shared Option"
+        unreachable!("find_sheet_id resolved this id from this same workbook") // patchcov: coverage ignore-line reason="find_sheet_id only ever returns an id it read out of this same workbook's sheets, so a lookup by that id in the same workbook always succeeds; this else-arm exists only to unwrap the shared Option"
     };
 
     let range = match validate_span(dimension, start, end, sheet, sheet_id) {
@@ -713,9 +713,9 @@ fn build_request(
         ),
         DimensionGroupVerb::UpdateDimensionGroup { collapsed, .. } => {
             let ExistingGroups::One(existing) = existing else {
-                // omni-dev: coverage ignore reason="resolve_for_update returns Ok only with exactly one group, or the caller has already returned RefusedDimensionGroupNotFound/RefusedAmbiguousDimensionGroup; this else-arm exists only to unwrap the shared enum"
+                // patchcov: coverage ignore reason="resolve_for_update returns Ok only with exactly one group, or the caller has already returned RefusedDimensionGroupNotFound/RefusedAmbiguousDimensionGroup; this else-arm exists only to unwrap the shared enum"
                 unreachable!("existing is resolved for UpdateDimensionGroup above")
-                // omni-dev: coverage end
+                // patchcov: coverage end
             };
             let dimension_group = DimensionGroup {
                 range,
@@ -732,9 +732,9 @@ fn build_request(
         }
         DimensionGroupVerb::DeleteDimensionGroup { .. } => {
             let ExistingGroups::MaybeOne(depth) = existing else {
-                // omni-dev: coverage ignore reason="resolve_for_delete returns Ok only as MaybeOne, or the caller has already returned RefusedDimensionGroupNotFound; this else-arm exists only to unwrap the shared enum"
+                // patchcov: coverage ignore reason="resolve_for_delete returns Ok only as MaybeOne, or the caller has already returned RefusedDimensionGroupNotFound; this else-arm exists only to unwrap the shared enum"
                 unreachable!("existing is resolved for DeleteDimensionGroup above")
-                // omni-dev: coverage end
+                // patchcov: coverage end
             };
             (
                 BatchUpdateRequestItem::DeleteDimensionGroup(DeleteDimensionGroupRequest { range }),
@@ -1215,7 +1215,7 @@ mod tests {
         let deep = group(0, 4, 9, 2, true);
         let err = resolve_for_update(vec![&shallow, &deep], None).unwrap_err();
         let DimensionGroupResult::RefusedAmbiguousDimensionGroup { depths } = err else {
-            panic!("expected RefusedAmbiguousDimensionGroup"); // omni-dev: coverage ignore-line reason="guards this test's assumption; resolve_for_update always returns RefusedAmbiguousDimensionGroup for more than one candidate with no depth given"
+            panic!("expected RefusedAmbiguousDimensionGroup"); // patchcov: coverage ignore-line reason="guards this test's assumption; resolve_for_update always returns RefusedAmbiguousDimensionGroup for more than one candidate with no depth given"
         };
         assert_eq!(depths, vec![1, 2]);
     }
@@ -1298,7 +1298,7 @@ mod tests {
         let (request, depth) = build_request(&add_verb(), target.clone(), ExistingGroups::None);
         assert_eq!(depth, None);
         let BatchUpdateRequestItem::AddDimensionGroup(add) = request else {
-            panic!("expected AddDimensionGroup"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns AddDimensionGroup for a DimensionGroupVerb::AddDimensionGroup verb"
+            panic!("expected AddDimensionGroup"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns AddDimensionGroup for a DimensionGroupVerb::AddDimensionGroup verb"
         };
         assert_eq!(add.range, target);
     }
@@ -1318,7 +1318,7 @@ mod tests {
         let (request, depth) = build_request(&verb, target.clone(), ExistingGroups::One(&existing));
         assert_eq!(depth, Some(3));
         let BatchUpdateRequestItem::UpdateDimensionGroup(update) = request else {
-            panic!("expected UpdateDimensionGroup"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateDimensionGroup for a DimensionGroupVerb::UpdateDimensionGroup verb"
+            panic!("expected UpdateDimensionGroup"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateDimensionGroup for a DimensionGroupVerb::UpdateDimensionGroup verb"
         };
         assert_eq!(update.fields, "collapsed");
         assert_eq!(update.dimension_group.depth, 3);
@@ -1336,7 +1336,7 @@ mod tests {
         );
         assert_eq!(depth, Some(2));
         let BatchUpdateRequestItem::DeleteDimensionGroup(delete) = request else {
-            panic!("expected DeleteDimensionGroup"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns DeleteDimensionGroup for a DimensionGroupVerb::DeleteDimensionGroup verb"
+            panic!("expected DeleteDimensionGroup"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns DeleteDimensionGroup for a DimensionGroupVerb::DeleteDimensionGroup verb"
         };
         assert_eq!(delete.range, target);
     }
@@ -1838,7 +1838,7 @@ mod tests {
         let rules = vec![allow_rule("folder-1")];
         let outcome = dimension_group(&drive, &sheets, &base_opts(add_verb(), false), &rules).await;
         let DimensionGroupResult::RefusedSheetNotFound { title, available } = outcome.result else {
-            panic!("expected RefusedSheetNotFound"); // omni-dev: coverage ignore-line reason="guards this test's assumption; the mounted workbook has no sheet titled Q1"
+            panic!("expected RefusedSheetNotFound"); // patchcov: coverage ignore-line reason="guards this test's assumption; the mounted workbook has no sheet titled Q1"
         };
         assert_eq!(title, "Q1");
         assert_eq!(available, vec!["Other".to_string()]);

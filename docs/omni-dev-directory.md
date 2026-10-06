@@ -19,7 +19,7 @@ Two distinct precedence systems are at work, depending on which file is being
 loaded:
 
 - **Chain A** — for `commit-guidelines.md`, `pr-guidelines.md`, `scopes.yaml`,
-  `coverage.yaml`, and feature contexts. Resolves through `local/` overrides, project scope,
+  and feature contexts. Resolves through `local/` overrides, project scope,
   XDG, and a legacy `~/.omni-dev/` fallback. Discussed in
   [Chain A — hierarchical resolution](#chain-a--hierarchical-resolution).
 - **Chain B** — for `models.yaml`. A layered merge with deep-merge semantics
@@ -36,7 +36,6 @@ chain — see [settings.json](#settingsjson).
 | `commit-guidelines.md` | Commit-message rules consumed by `git commit message check` / `twiddle` | Markdown | project / user / XDG / `~/.omni-dev/` | Chain A | [`src/claude/context/discovery.rs:456`](../src/claude/context/discovery.rs#L456) |
 | `pr-guidelines.md` | PR title / body rules consumed by `git pr` flows | Markdown | same as above | Chain A | [`src/claude/context/discovery.rs:471`](../src/claude/context/discovery.rs#L471) |
 | `scopes.yaml` | Commit/PR scope vocabulary; merged with ecosystem defaults | YAML | same as above | Chain A | [`src/claude/context/discovery.rs:486`](../src/claude/context/discovery.rs#L486) |
-| `coverage.yaml` | Coverage path mappings, filename exclusions and marker scan globs | YAML | project / user / XDG / `~/.omni-dev/` | Chain A | [`src/cli/coverage/diff.rs`](../src/cli/coverage/diff.rs) |
 | `gmail-sync.yaml` | The account list + output dirs `gmail sync-all` fans out to concurrently ([ADR-0068](adrs/adr-0068.md)) | YAML | project / user / XDG / `~/.omni-dev/` | Chain A (loaded strictly — see [Validation behaviour](#gmail-syncyaml-1)) | [`src/cli/gmail/sync_all.rs:70`](../src/cli/gmail/sync_all.rs#L70) |
 | `models.yaml` | AI model catalog overrides | YAML | project / user / embedded | Chain B | [`src/claude/model_config.rs:178`](../src/claude/model_config.rs#L178) |
 | `context/feature-contexts/*.yaml` | Per-feature AI prompt context fragments | YAML | inside the active `.omni-dev/` (plus `local/` override) | Chain A (variant) | [`src/claude/context/discovery.rs:502`](../src/claude/context/discovery.rs#L502) |
@@ -52,7 +51,7 @@ except `gmail-sync.yaml`, whose absence is a hard error; see its own
 
 ### Chain A — hierarchical resolution
 
-Used for `commit-guidelines.md`, `pr-guidelines.md`, `scopes.yaml`, `coverage.yaml`, and the
+Used for `commit-guidelines.md`, `pr-guidelines.md`, `scopes.yaml`, and the
 `context/feature-contexts/` files. Implemented by `resolve_config_file` in
 [`src/claude/context/discovery.rs:43-72`](../src/claude/context/discovery.rs#L43-L72).
 The first existing file wins:
@@ -423,17 +422,6 @@ No file-specific validation. Read errors during
 prompt falls back to
 [`src/templates/default-commit-guidelines.md`](../src/templates/default-commit-guidelines.md)
 (`commit-guidelines.md` only — `pr-guidelines.md` has no embedded default).
-
-### `coverage.yaml`
-
-`diff.path-mappings` replaces report directory prefixes with repo-relative
-directories before checkout-prefix stripping, filename exclusions and source
-markers. `diff.ignore-filename-regex` is unioned with the CLI flag;
-`lint-markers.include` supplies the default scan globs. A missing file or block
-is a no-op; malformed YAML, invalid regexes/globs and invalid path mappings fail
-the consuming command. Unknown block keys are ignored, while individual mapping
-entries require exactly `from` and `to`. See [coverage paths](coverage.md#report-paths-and-repository-paths)
-for ordering, validation and module examples.
 
 ## See also
 

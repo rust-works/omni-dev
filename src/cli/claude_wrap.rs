@@ -157,7 +157,7 @@ fn exec_replace(program: &str, args: &[String]) -> anyhow::Error {
 
 /// Wraps `program`, joining it to this process's own stdin and stdout.
 async fn wrap(program: &str, args: &[String], socket: Option<PathBuf>) -> Result<i32> {
-    // omni-dev: coverage ignore reason="process-bound wiring shell: it joins this process's own stdin/stdout and reads the real OMNI_DEV_CLAUDE_WRAP_LOG, which a test must not take over (see the note on run/wrap in the tests module); wrap_io_diagnostics beneath it is covered directly"
+    // patchcov: coverage ignore reason="process-bound wiring shell: it joins this process's own stdin/stdout and reads the real OMNI_DEV_CLAUDE_WRAP_LOG, which a test must not take over (see the note on run/wrap in the tests module); wrap_io_diagnostics beneath it is covered directly"
     wrap_io_diagnostics(
         program,
         args,
@@ -167,7 +167,7 @@ async fn wrap(program: &str, args: &[String], socket: Option<PathBuf>) -> Result
         std::env::var_os("OMNI_DEV_CLAUDE_WRAP_LOG").map(PathBuf::from),
     )
     .await
-    // omni-dev: coverage end
+    // patchcov: coverage end
 }
 
 /// Spawns the child with piped stdio, pumps `input` and `output` through it
@@ -713,11 +713,11 @@ async fn observe_diagnostics(
     diagnostics: Diagnostics,
 ) {
     let Ok(socket) = server::resolve_socket(socket) else {
-        // omni-dev: coverage ignore reason="resolve_socket fails only when the platform has no data directory to put the default socket in (no resolvable home), which a test cannot reproduce on macOS or Linux; the fail-open return is what keeps the wrapper forwarding"
+        // patchcov: coverage ignore reason="resolve_socket fails only when the platform has no data directory to put the default socket in (no resolvable home), which a test cannot reproduce on macOS or Linux; the fail-open return is what keeps the wrapper forwarding"
         diagnostics
             .record(|| json!({"event":"observer_stopped", "outcome":"socket_resolution_failed"}));
         return;
-        // omni-dev: coverage end
+        // patchcov: coverage end
     };
     let mut tracker = StreamTracker::new();
     let mut last_model: Option<String> = None;
@@ -770,11 +770,11 @@ async fn observe_diagnostics(
             if let Ok(payload) = serde_json::to_value(request) {
                 report_diagnostics(&socket, "observe", payload, &diagnostics).await;
             } else {
-                // omni-dev: coverage ignore reason="to_value on an ObserveRequest fails only for a non-UTF-8 cwd, and the tracker takes cwd from a JSON string, so it is always UTF-8; the arm exists so a future non-string field cannot silently drop the report"
+                // patchcov: coverage ignore reason="to_value on an ObserveRequest fails only for a non-UTF-8 cwd, and the tracker takes cwd from a JSON string, so it is always UTF-8; the arm exists so a future non-string field cannot silently drop the report"
                 diagnostics.record(
                     || json!({"event":"report", "op":"observe", "outcome":"serialization_failed"}),
                 );
-                // omni-dev: coverage end
+                // patchcov: coverage end
             }
         }
     }

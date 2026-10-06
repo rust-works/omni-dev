@@ -760,7 +760,7 @@ fn build_request(
             ..
         } => {
             let Some(range) = resolved else {
-                unreachable!("resolved is resolved for AddBanding above") // omni-dev: coverage ignore-line reason="resolve_sheet_target always resolves AddBanding to a range or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
+                unreachable!("resolved is resolved for AddBanding above") // patchcov: coverage ignore-line reason="resolve_sheet_target always resolves AddBanding to a range or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
             };
             let properties = BandingProperties {
                 header_color_style: header_color.as_deref().map(parse_color_style).transpose()?,
@@ -793,7 +793,7 @@ fn build_request(
             ..
         } => {
             let Some(existing) = existing else {
-                unreachable!("existing is resolved for UpdateBanding above") // omni-dev: coverage ignore-line reason="find_existing_banded_range returns Some for UpdateBanding or has already returned RefusedBandedRangeNotFound; this else-arm exists only to unwrap the shared Option"
+                unreachable!("existing is resolved for UpdateBanding above") // patchcov: coverage ignore-line reason="find_existing_banded_range returns Some for UpdateBanding or has already returned RefusedBandedRangeNotFound; this else-arm exists only to unwrap the shared Option"
             };
             let update = build_update(
                 existing,
@@ -1230,7 +1230,7 @@ mod tests {
         let (request, existing_id) = build_request(&verb, Some(range), None).unwrap();
         assert_eq!(existing_id, None);
         let BatchUpdateRequestItem::AddBanding(add) = request else {
-            panic!("expected AddBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns AddBanding for a BandingVerb::AddBanding verb"
+            panic!("expected AddBanding"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns AddBanding for a BandingVerb::AddBanding verb"
         };
         assert_eq!(add.banded_range.banded_range_id, None);
         assert_eq!(add.banded_range.range, Some(range));
@@ -1258,7 +1258,7 @@ mod tests {
         };
         let (request, _) = build_request(&verb, Some(range), None).unwrap();
         let BatchUpdateRequestItem::AddBanding(add) = request else {
-            panic!("expected AddBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns AddBanding for a BandingVerb::AddBanding verb"
+            panic!("expected AddBanding"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns AddBanding for a BandingVerb::AddBanding verb"
         };
         assert!(add.banded_range.row_properties.is_none());
         assert!(add.banded_range.column_properties.is_some());
@@ -1299,7 +1299,7 @@ mod tests {
         let (request, existing_id) = build_request(&verb, None, Some(&existing)).unwrap();
         assert_eq!(existing_id, Some(7));
         let BatchUpdateRequestItem::UpdateBanding(update) = request else {
-            panic!("expected UpdateBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
+            panic!("expected UpdateBanding"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
         };
         assert_eq!(update.fields, "rowProperties");
         assert!(update.banded_range.range.is_none());
@@ -1339,7 +1339,7 @@ mod tests {
         };
         let (request, _) = build_request(&verb, None, Some(&existing)).unwrap();
         let BatchUpdateRequestItem::UpdateBanding(update) = request else {
-            panic!("expected UpdateBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
+            panic!("expected UpdateBanding"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
         };
         let properties = update.banded_range.row_properties.unwrap();
         let serialized = serde_json::to_value(&properties).unwrap();
@@ -1370,7 +1370,7 @@ mod tests {
         };
         let (request, _) = build_request(&verb, None, Some(&existing)).unwrap();
         let BatchUpdateRequestItem::UpdateBanding(update) = request else {
-            panic!("expected UpdateBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
+            panic!("expected UpdateBanding"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
         };
         assert_eq!(update.fields, "rowProperties");
         let properties = update.banded_range.row_properties.unwrap();
@@ -1395,7 +1395,7 @@ mod tests {
         };
         let (request, _) = build_request(&verb, None, Some(&existing)).unwrap();
         let BatchUpdateRequestItem::UpdateBanding(update) = request else {
-            panic!("expected UpdateBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
+            panic!("expected UpdateBanding"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
         };
         assert_eq!(update.fields, "columnProperties");
         assert!(update.banded_range.row_properties.is_none());
@@ -1508,7 +1508,7 @@ mod tests {
         };
         let (request, _) = build_request(&verb, Some(range), Some(&existing)).unwrap();
         let BatchUpdateRequestItem::UpdateBanding(update) = request else {
-            panic!("expected UpdateBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
+            panic!("expected UpdateBanding"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns UpdateBanding for a BandingVerb::UpdateBanding verb"
         };
         assert_eq!(update.fields, "range");
         assert_eq!(update.banded_range.range, Some(range));
@@ -1521,7 +1521,7 @@ mod tests {
         let (request, existing_id) = build_request(&verb, None, None).unwrap();
         assert_eq!(existing_id, Some(7));
         let BatchUpdateRequestItem::DeleteBanding(delete) = request else {
-            panic!("expected DeleteBanding"); // omni-dev: coverage ignore-line reason="guards this test's assumption; build_request always returns DeleteBanding for a BandingVerb::DeleteBanding verb"
+            panic!("expected DeleteBanding"); // patchcov: coverage ignore-line reason="guards this test's assumption; build_request always returns DeleteBanding for a BandingVerb::DeleteBanding verb"
         };
         assert_eq!(delete.banded_range_id, 7);
     }
@@ -2023,7 +2023,7 @@ mod tests {
 
     fn assert_refused_missing_second_band_color(outcome: &BandingOutcome) {
         let BandingResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; only reached when the refusal regresses"
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="guards this test's assumption; only reached when the refusal regresses"
         };
         assert!(detail.contains("no column banding"), "{detail}");
         assert!(detail.ends_with("missing: --second-band-color"), "{detail}");

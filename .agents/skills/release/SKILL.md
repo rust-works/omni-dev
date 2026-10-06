@@ -340,7 +340,7 @@ Pushing a `vscode-v*` tag triggers:
 - Cross-platform binaries (Linux, macOS, Windows) are built and attached
 - crates.io publication uses `CARGO_REGISTRY_TOKEN` secret
 - Extension publication uses the `VSCE_PAT` and `OVSX_PAT` secrets; each registry is skipped if its token is unset
-- The coverage action resolves `version: latest`, so a change that needs a new omni-dev flag only passes its Coverage check once that flag is in a **released** binary: releasing is what unblocks it
+- The Coverage action v2 installs patchcov independently of omni-dev releases. Changes to coverage behavior require a published patchcov version; an omni-dev release does not unblock them
 
 ## Commands Reference
 

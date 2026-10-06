@@ -1261,7 +1261,7 @@ fn build_add_chart(
         new_sheet,
     } = verb
     else {
-        unreachable!("build_add_chart is only ever called for AddChart") // omni-dev: coverage ignore-line reason="build_plan only calls build_add_chart after matching verb as EmbeddedObjectVerb::AddChart; this else-arm exists only to destructure the already-known variant"
+        unreachable!("build_add_chart is only ever called for AddChart") // patchcov: coverage ignore-line reason="build_plan only calls build_add_chart after matching verb as EmbeddedObjectVerb::AddChart; this else-arm exists only to destructure the already-known variant"
     };
 
     let kind = parse_chart_type(chart_type).map_err(invalid)?;
@@ -1364,7 +1364,7 @@ fn build_add_chart(
             }
             let mut series_ranges = series_ranges;
             let Some(pie_series_range) = series_ranges.pop() else {
-                unreachable!("checked series_ranges.len() == 1 above") // omni-dev: coverage ignore-line reason="the series_ranges.len() != 1 check immediately above has already returned, so the pop always yields Some; this else-arm exists only to unwrap it"
+                unreachable!("checked series_ranges.len() == 1 above") // patchcov: coverage ignore-line reason="the series_ranges.len() != 1 check immediately above has already returned, so the pop always yields Some; this else-arm exists only to unwrap it"
             };
             ChartSpec {
                 title: title.clone(),
@@ -1605,7 +1605,7 @@ fn merge_chart_spec(
         ..
     } = verb
     else {
-        unreachable!("merge_chart_spec is only ever called for UpdateChart") // omni-dev: coverage ignore-line reason="merge_chart_spec is only ever called from build_update_chart, which build_plan reaches only after matching verb as EmbeddedObjectVerb::UpdateChart; this else-arm exists only to destructure the already-known variant"
+        unreachable!("merge_chart_spec is only ever called for UpdateChart") // patchcov: coverage ignore-line reason="merge_chart_spec is only ever called from build_update_chart, which build_plan reaches only after matching verb as EmbeddedObjectVerb::UpdateChart; this else-arm exists only to destructure the already-known variant"
     };
 
     let existing_kind = existing_chart_kind(existing).map_err(|detail| {
@@ -1685,7 +1685,7 @@ fn merge_pie_chart(
         ..
     } = verb
     else {
-        unreachable!("merge_pie_chart is only ever called for UpdateChart") // omni-dev: coverage ignore-line reason="merge_pie_chart is only ever called from merge_chart_spec, which has already destructured the same verb as EmbeddedObjectVerb::UpdateChart; this else-arm exists only to destructure the already-known variant"
+        unreachable!("merge_pie_chart is only ever called for UpdateChart") // patchcov: coverage ignore-line reason="merge_pie_chart is only ever called from merge_chart_spec, which has already destructured the same verb as EmbeddedObjectVerb::UpdateChart; this else-arm exists only to destructure the already-known variant"
     };
 
     if header_count.is_some() {
@@ -1759,7 +1759,7 @@ fn merge_basic_chart(
         ..
     } = verb
     else {
-        unreachable!("merge_basic_chart is only ever called for UpdateChart") // omni-dev: coverage ignore-line reason="merge_basic_chart is only ever called from merge_chart_spec, which has already destructured the same verb as EmbeddedObjectVerb::UpdateChart; this else-arm exists only to destructure the already-known variant"
+        unreachable!("merge_basic_chart is only ever called for UpdateChart") // patchcov: coverage ignore-line reason="merge_basic_chart is only ever called from merge_chart_spec, which has already destructured the same verb as EmbeddedObjectVerb::UpdateChart; this else-arm exists only to destructure the already-known variant"
     };
 
     // The mirror image of `merge_pie_chart`'s basic-only rejections below:
@@ -1935,7 +1935,7 @@ fn build_add_slicer(
         height,
     } = verb
     else {
-        unreachable!("build_add_slicer is only ever called for AddSlicer") // omni-dev: coverage ignore-line reason="build_plan only calls build_add_slicer after matching verb as EmbeddedObjectVerb::AddSlicer; this else-arm exists only to destructure the already-known variant"
+        unreachable!("build_add_slicer is only ever called for AddSlicer") // patchcov: coverage ignore-line reason="build_plan only calls build_add_slicer after matching verb as EmbeddedObjectVerb::AddSlicer; this else-arm exists only to destructure the already-known variant"
     };
 
     let data_range = compose_and_resolve(workbook, sheet.as_deref(), range)?;
@@ -2001,9 +2001,9 @@ fn build_update_slicer(
         ..
     } = verb
     else {
-        // omni-dev: coverage ignore reason="build_plan only calls build_update_slicer after matching verb as EmbeddedObjectVerb::UpdateSlicer; this else-arm exists only to destructure the already-known variant"
+        // patchcov: coverage ignore reason="build_plan only calls build_update_slicer after matching verb as EmbeddedObjectVerb::UpdateSlicer; this else-arm exists only to destructure the already-known variant"
         unreachable!("build_update_slicer is only ever called for UpdateSlicer")
-        // omni-dev: coverage end
+        // patchcov: coverage end
     };
 
     let (host_sheet, slicer) = find_slicer_or_refuse(workbook, slicer_id)?;
@@ -2288,7 +2288,7 @@ fn build_move_chart(
         ..
     } = verb
     else {
-        unreachable!("build_move_chart is only ever called for MoveChart") // omni-dev: coverage ignore-line reason="build_plan only calls build_move_chart after matching verb as EmbeddedObjectVerb::MoveChart; this else-arm exists only to destructure the already-known variant"
+        unreachable!("build_move_chart is only ever called for MoveChart") // patchcov: coverage ignore-line reason="build_plan only calls build_move_chart after matching verb as EmbeddedObjectVerb::MoveChart; this else-arm exists only to destructure the already-known variant"
     };
 
     let (host_sheet, chart) = find_chart_or_refuse(workbook, chart_id)?;
@@ -2359,7 +2359,7 @@ fn build_move_slicer(
         ..
     } = verb
     else {
-        unreachable!("build_move_slicer is only ever called for MoveSlicer") // omni-dev: coverage ignore-line reason="build_plan only calls build_move_slicer after matching verb as EmbeddedObjectVerb::MoveSlicer; this else-arm exists only to destructure the already-known variant"
+        unreachable!("build_move_slicer is only ever called for MoveSlicer") // patchcov: coverage ignore-line reason="build_plan only calls build_move_slicer after matching verb as EmbeddedObjectVerb::MoveSlicer; this else-arm exists only to destructure the already-known variant"
     };
 
     let (host_sheet, slicer) = find_slicer_or_refuse(workbook, slicer_id)?;
@@ -2404,7 +2404,7 @@ fn build_update_chart_border(
     chart_id: i64,
 ) -> Result<Plan, EmbeddedObjectResult> {
     let EmbeddedObjectVerb::UpdateChartBorder { color, clear, .. } = verb else {
-        unreachable!("only ever called for UpdateChartBorder") // omni-dev: coverage ignore-line reason="build_plan only calls build_update_chart_border after matching verb as EmbeddedObjectVerb::UpdateChartBorder; this else-arm exists only to destructure the already-known variant"
+        unreachable!("only ever called for UpdateChartBorder") // patchcov: coverage ignore-line reason="build_plan only calls build_update_chart_border after matching verb as EmbeddedObjectVerb::UpdateChartBorder; this else-arm exists only to destructure the already-known variant"
     };
 
     let (sheet, chart) = find_chart_or_refuse(workbook, chart_id)?;
@@ -2418,7 +2418,7 @@ fn build_update_chart_border(
         )
     } else {
         let Some(color) = color else {
-            unreachable!("validate_verb refuses neither --color nor --clear") // omni-dev: coverage ignore-line reason="validate_verb already refuses UpdateChartBorder { color: None, clear: false, .. } before build_plan is ever reached, so this arm can never run"
+            unreachable!("validate_verb refuses neither --color nor --clear") // patchcov: coverage ignore-line reason="validate_verb already refuses UpdateChartBorder { color: None, clear: false, .. } before build_plan is ever reached, so this arm can never run"
         };
         let rgb_color = parse_hex_color(color).map_err(invalid)?;
         (
@@ -2733,7 +2733,7 @@ mod tests {
             match (&kind, expect_basic) {
                 (ChartKind::Basic(t), Some(expected)) => assert_eq!(*t, expected),
                 (ChartKind::Pie, None) => {}
-                _ => panic!("unexpected parse for {raw:?}: {kind:?}"), // omni-dev: coverage ignore-line reason="every row of the table above pairs its raw value with the kind `parse_chart_type` returns for it, so the mismatch arm only fires if one of the two assertions above would already have failed"
+                _ => panic!("unexpected parse for {raw:?}: {kind:?}"), // patchcov: coverage ignore-line reason="every row of the table above pairs its raw value with the kind `parse_chart_type` returns for it, so the mismatch arm only fires if one of the two assertions above would already have failed"
             }
         }
     }
@@ -2947,7 +2947,7 @@ mod tests {
     fn validate_verb_rejects_add_chart_with_no_series() {
         let mut verb = add_chart_verb();
         let EmbeddedObjectVerb::AddChart { series, .. } = &mut verb else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         series.clear();
         let err = validate_verb(&verb).unwrap_err();
@@ -2958,7 +2958,7 @@ mod tests {
     fn validate_verb_rejects_add_chart_with_neither_anchor_nor_new_sheet() {
         let mut verb = add_chart_verb();
         let EmbeddedObjectVerb::AddChart { anchor, .. } = &mut verb else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *anchor = None;
         let err = validate_verb(&verb).unwrap_err();
@@ -2969,7 +2969,7 @@ mod tests {
     fn validate_verb_rejects_new_sheet_combined_with_anchor() {
         let mut verb = add_chart_verb();
         let EmbeddedObjectVerb::AddChart { new_sheet, .. } = &mut verb else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *new_sheet = true;
         let err = validate_verb(&verb).unwrap_err();
@@ -2983,7 +2983,7 @@ mod tests {
             anchor, new_sheet, ..
         } = &mut verb
         else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *anchor = None;
         *new_sheet = true;
@@ -3086,7 +3086,7 @@ mod tests {
             ..
         } = &mut verb
         else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         // `chart_type` must be `pie` here, or the applicability check now
         // fires first (see the ordering test below) and this would assert
@@ -3109,7 +3109,7 @@ mod tests {
             ..
         } = &mut verb
         else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *chart_type = "pie".to_string();
         *pie_hole = Some(0.5);
@@ -3126,7 +3126,7 @@ mod tests {
                 ..
             } = &mut verb
             else {
-                unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
             };
             *chart_type = "pie".to_string();
             *pie_hole = Some(boundary);
@@ -3147,7 +3147,7 @@ mod tests {
                 ..
             } = &mut verb
             else {
-                unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
             };
             *chart_type = "pie".to_string();
             *pie_hole = Some(bad);
@@ -3168,7 +3168,7 @@ mod tests {
         // `validate_verb`'s `AddChart` arm doc comment.
         let mut verb = add_chart_verb();
         let EmbeddedObjectVerb::AddChart { pie_hole, .. } = &mut verb else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *pie_hole = Some(1.5);
         let err = validate_verb(&verb).unwrap_err();
@@ -3180,7 +3180,7 @@ mod tests {
     fn validate_verb_rejects_add_chart_pie_hole_on_a_non_pie_chart_even_in_range() {
         let mut verb = add_chart_verb();
         let EmbeddedObjectVerb::AddChart { pie_hole, .. } = &mut verb else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *pie_hole = Some(0.5);
         let err = validate_verb(&verb).unwrap_err();
@@ -3429,7 +3429,7 @@ mod tests {
         let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
         let mut verb = update_chart_verb(1);
         let EmbeddedObjectVerb::UpdateChart { chart_type, .. } = &mut verb else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *chart_type = Some("pie".to_string());
         let err = merge_chart_spec(&workbook, existing, &verb).unwrap_err();
@@ -3446,7 +3446,7 @@ mod tests {
         let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
         let mut verb = update_chart_verb(1);
         let EmbeddedObjectVerb::UpdateChart { chart_type, .. } = &mut verb else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *chart_type = Some("bar".to_string());
         let (spec, _) = merge_chart_spec(&workbook, existing, &verb).unwrap();
@@ -3464,7 +3464,7 @@ mod tests {
             ..
         } = &mut verb
         else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *horizontal_axis_title = Some("Quarter".to_string());
         let (spec, summary) = merge_chart_spec(&workbook, existing, &verb).unwrap();
@@ -3517,7 +3517,7 @@ mod tests {
         let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
         let mut verb = update_chart_verb(1);
         let EmbeddedObjectVerb::UpdateChart { header_count, .. } = &mut verb else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *header_count = Some(1);
         let err = merge_chart_spec(&workbook, existing, &verb).unwrap_err();
@@ -3566,7 +3566,7 @@ mod tests {
             ..
         } = &mut verb
         else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *title = None;
         *sheet = Some("Q1".to_string());
@@ -3595,7 +3595,7 @@ mod tests {
             ..
         } = &mut verb
         else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *title = None;
         *sheet = Some("Q1".to_string());
@@ -3620,7 +3620,7 @@ mod tests {
             title, pie_hole, ..
         } = &mut verb
         else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::UpdateChart above, so this arm can never run"
         };
         *title = None;
         *pie_hole = Some(0.4);
@@ -4147,7 +4147,7 @@ mod tests {
             chart_type, series, ..
         } = &mut verb
         else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *chart_type = "pie".to_string();
         series.push("C1:C10".to_string());
@@ -4794,7 +4794,7 @@ mod tests {
 
     fn set_pie(verb: &mut EmbeddedObjectVerb) {
         let EmbeddedObjectVerb::AddChart { chart_type, .. } = verb else {
-            unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
         };
         *chart_type = "pie".to_string();
     }
@@ -4807,7 +4807,7 @@ mod tests {
                 anchor, new_sheet, ..
             } = verb
             else {
-                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
             };
             *anchor = None;
             *new_sheet = true;
@@ -4827,7 +4827,7 @@ mod tests {
         let workbook = plain_workbook("Sheet1");
         let verb = add_chart_verb_with(|verb| {
             let EmbeddedObjectVerb::AddChart { anchor, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
             };
             *anchor = None;
         });
@@ -4842,7 +4842,7 @@ mod tests {
         let workbook = plain_workbook("Sheet1");
         let verb = add_chart_verb_with(|verb| {
             let EmbeddedObjectVerb::AddChart { anchor, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
             };
             *anchor = Some("E2:F3".to_string());
         });
@@ -4855,7 +4855,7 @@ mod tests {
         let workbook = plain_workbook("Sheet1");
         let verb = add_chart_verb_with(|verb| {
             let EmbeddedObjectVerb::AddChart { pie_hole, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
             };
             *pie_hole = Some(0.4);
         });
@@ -4870,7 +4870,7 @@ mod tests {
             (
                 Box::new(|verb: &mut EmbeddedObjectVerb| {
                     let EmbeddedObjectVerb::AddChart { header_count, .. } = verb else {
-                        unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                        unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
                     };
                     *header_count = Some(1);
                 }) as Box<dyn FnOnce(&mut EmbeddedObjectVerb)>,
@@ -4879,7 +4879,7 @@ mod tests {
             (
                 Box::new(|verb: &mut EmbeddedObjectVerb| {
                     let EmbeddedObjectVerb::AddChart { stacked, .. } = verb else {
-                        unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                        unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
                     };
                     *stacked = Some("stacked".to_string());
                 }),
@@ -4892,7 +4892,7 @@ mod tests {
                         ..
                     } = verb
                     else {
-                        unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                        unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
                     };
                     *horizontal_axis_title = Some("Quarter".to_string());
                 }),
@@ -4905,7 +4905,7 @@ mod tests {
                         ..
                     } = verb
                     else {
-                        unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                        unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
                     };
                     *vertical_axis_title = Some("Revenue".to_string());
                 }),
@@ -4927,7 +4927,7 @@ mod tests {
         let verb = add_chart_verb_with(|verb| {
             set_pie(verb);
             let EmbeddedObjectVerb::AddChart { series, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
             };
             series.push("C1:C10".to_string());
         });
@@ -4948,7 +4948,7 @@ mod tests {
                 ..
             } = verb
             else {
-                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
             };
             *title = Some("Share".to_string());
             *subtitle = Some("by region".to_string());
@@ -5067,7 +5067,7 @@ mod tests {
                 subtitle, legend, ..
             } = verb
             else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
             };
             *subtitle = Some("FY25".to_string());
             *legend = Some("top".to_string());
@@ -5091,7 +5091,7 @@ mod tests {
 
         let stacked = update_chart_verb_with(1, |verb| {
             let EmbeddedObjectVerb::UpdateChart { stacked, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
             };
             *stacked = Some("stacked".to_string());
         });
@@ -5106,7 +5106,7 @@ mod tests {
                 ..
             } = verb
             else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
             };
             *horizontal_axis_title = Some("Quarter".to_string());
         });
@@ -5122,7 +5122,7 @@ mod tests {
         let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
         let verb = update_chart_verb_with(1, |verb| {
             let EmbeddedObjectVerb::UpdateChart { sheet, series, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
             };
             *sheet = Some("Q1".to_string());
             *series = vec!["B1:B10".to_string(), "C1:C10".to_string()];
@@ -5140,7 +5140,7 @@ mod tests {
         let original = existing.pie_chart.clone().unwrap();
         let verb = update_chart_verb_with(1, |verb| {
             let EmbeddedObjectVerb::UpdateChart { pie_hole, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
             };
             *pie_hole = Some(0.6);
         });
@@ -5158,7 +5158,7 @@ mod tests {
         let existing = workbook.sheets[0].charts[0].spec.as_ref().unwrap();
         let verb = update_chart_verb_with(1, |verb| {
             let EmbeddedObjectVerb::UpdateChart { sheet, series, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
             };
             *sheet = Some("Nope".to_string());
             *series = vec!["B1:B10".to_string()];
@@ -5185,7 +5185,7 @@ mod tests {
                 ..
             } = verb
             else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
             };
             *title = None;
             *sheet = Some("Q1".to_string());
@@ -5230,7 +5230,7 @@ mod tests {
                 ..
             } = verb
             else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_chart_verb_with's only callers pass an EmbeddedObjectVerb::UpdateChart, so this arm can never run"
             };
             *title = None;
             *sheet = Some("Q1".to_string());
@@ -5361,7 +5361,7 @@ mod tests {
         let workbook = mixed_object_workbook();
         let verb = update_slicer_verb(|verb| {
             let EmbeddedObjectVerb::UpdateSlicer { title, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
             };
             *title = Some("Territory".to_string());
         });
@@ -5438,7 +5438,7 @@ mod tests {
             ..
         } = add_slicer_verb()
         else {
-            unreachable!() // omni-dev: coverage ignore-line reason="add_slicer_verb always returns an EmbeddedObjectVerb::AddSlicer, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="add_slicer_verb always returns an EmbeddedObjectVerb::AddSlicer, so this arm can never run"
         };
         let verb = EmbeddedObjectVerb::AddSlicer {
             sheet,
@@ -5469,7 +5469,7 @@ mod tests {
             ..
         } = add_slicer_verb()
         else {
-            unreachable!() // omni-dev: coverage ignore-line reason="add_slicer_verb always returns an EmbeddedObjectVerb::AddSlicer, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="add_slicer_verb always returns an EmbeddedObjectVerb::AddSlicer, so this arm can never run"
         };
         let verb = EmbeddedObjectVerb::AddSlicer {
             sheet,
@@ -5563,7 +5563,7 @@ mod tests {
             (
                 Box::new(|verb: &mut EmbeddedObjectVerb| {
                     let EmbeddedObjectVerb::UpdateSlicer { range, .. } = verb else {
-                        unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                        unreachable!() // patchcov: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
                     };
                     *range = Some("A1:D20".to_string());
                 }),
@@ -5573,7 +5573,7 @@ mod tests {
             (
                 Box::new(|verb: &mut EmbeddedObjectVerb| {
                     let EmbeddedObjectVerb::UpdateSlicer { clear_criteria, .. } = verb else {
-                        unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                        unreachable!() // patchcov: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
                     };
                     *clear_criteria = true;
                 }),
@@ -5583,7 +5583,7 @@ mod tests {
             (
                 Box::new(|verb: &mut EmbeddedObjectVerb| {
                     let EmbeddedObjectVerb::UpdateSlicer { hide_values, .. } = verb else {
-                        unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                        unreachable!() // patchcov: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
                     };
                     *hide_values = vec!["Closed".to_string()];
                 }),
@@ -5593,7 +5593,7 @@ mod tests {
             (
                 Box::new(|verb: &mut EmbeddedObjectVerb| {
                     let EmbeddedObjectVerb::UpdateSlicer { column, .. } = verb else {
-                        unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                        unreachable!() // patchcov: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
                     };
                     *column = Some(2);
                 }),
@@ -5603,7 +5603,7 @@ mod tests {
             (
                 Box::new(|verb: &mut EmbeddedObjectVerb| {
                     let EmbeddedObjectVerb::UpdateSlicer { title, .. } = verb else {
-                        unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                        unreachable!() // patchcov: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
                     };
                     *title = Some("Territory".to_string());
                 }),
@@ -5617,7 +5617,7 @@ mod tests {
                         ..
                     } = verb
                     else {
-                        unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                        unreachable!() // patchcov: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
                     };
                     *apply_to_pivot_tables = Some(true);
                 }),
@@ -5672,7 +5672,7 @@ mod tests {
 
         let verb = update_slicer_verb(|verb| {
             let EmbeddedObjectVerb::UpdateSlicer { range, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
             };
             *range = Some("A1:D20".to_string());
         });
@@ -5681,7 +5681,7 @@ mod tests {
 
         let verb = update_slicer_verb(|verb| {
             let EmbeddedObjectVerb::UpdateSlicer { column, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
             };
             *column = Some(2);
         });
@@ -5736,7 +5736,7 @@ mod tests {
 
         let verb = update_slicer_verb(|verb| {
             let EmbeddedObjectVerb::UpdateSlicer { range, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
             };
             *range = Some("A1:D20".to_string());
         });
@@ -5750,7 +5750,7 @@ mod tests {
         let workbook = slicer_workbook();
         let verb = update_slicer_verb(|verb| {
             let EmbeddedObjectVerb::UpdateSlicer { title, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_slicer_verb always builds an EmbeddedObjectVerb::UpdateSlicer, so this arm can never run"
             };
             *title = Some("Territory".to_string());
         });
@@ -5802,14 +5802,14 @@ mod tests {
 
     fn set_move_chart_anchor(verb: &mut EmbeddedObjectVerb, value: &str) {
         let EmbeddedObjectVerb::MoveChart { anchor, .. } = verb else {
-            unreachable!() // omni-dev: coverage ignore-line reason="callers always pass a verb built by move_chart_verb, which is always MoveChart"
+            unreachable!() // patchcov: coverage ignore-line reason="callers always pass a verb built by move_chart_verb, which is always MoveChart"
         };
         *anchor = Some(value.to_string());
     }
 
     fn set_move_slicer_anchor(verb: &mut EmbeddedObjectVerb, value: &str) {
         let EmbeddedObjectVerb::MoveSlicer { anchor, .. } = verb else {
-            unreachable!() // omni-dev: coverage ignore-line reason="callers always pass a verb built by move_slicer_verb, which is always MoveSlicer"
+            unreachable!() // patchcov: coverage ignore-line reason="callers always pass a verb built by move_slicer_verb, which is always MoveSlicer"
         };
         *anchor = Some(value.to_string());
     }
@@ -5853,7 +5853,7 @@ mod tests {
         let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
         let verb = move_chart_verb(|verb| {
             let EmbeddedObjectVerb::MoveChart { width, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
             };
             *width = Some(480);
         });
@@ -5885,7 +5885,7 @@ mod tests {
                 ..
             } = verb
             else {
-                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
             };
             *offset_x = Some(3);
             *offset_y = Some(4);
@@ -5909,7 +5909,7 @@ mod tests {
         let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
         let verb = move_chart_verb(|verb| {
             let EmbeddedObjectVerb::MoveChart { new_sheet, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
             };
             *new_sheet = true;
         });
@@ -5952,7 +5952,7 @@ mod tests {
         let workbook = workbook_with_sheet(sheet);
         let verb = move_chart_verb(|verb| {
             let EmbeddedObjectVerb::MoveChart { width, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
             };
             *width = Some(480);
         });
@@ -5968,7 +5968,7 @@ mod tests {
         // `move_chart_refuses_a_sheet_flag_with_no_anchor` for that case).
         let verb = move_chart_verb(|verb| {
             let EmbeddedObjectVerb::MoveChart { sheet, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
             };
             *sheet = None;
         });
@@ -5983,7 +5983,7 @@ mod tests {
         // `--sheet`-without-`--anchor` check first.
         let verb = move_slicer_verb(|verb| {
             let EmbeddedObjectVerb::MoveSlicer { sheet, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="move_slicer_verb always builds an EmbeddedObjectVerb::MoveSlicer, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="move_slicer_verb always builds an EmbeddedObjectVerb::MoveSlicer, so this arm can never run"
             };
             *sheet = None;
         });
@@ -6022,7 +6022,7 @@ mod tests {
         // ignored (issue #1837 review).
         let verb = move_chart_verb(|verb| {
             let EmbeddedObjectVerb::MoveChart { width, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
             };
             *width = Some(480);
         });
@@ -6037,7 +6037,7 @@ mod tests {
     fn move_slicer_refuses_a_sheet_flag_with_no_anchor() {
         let verb = move_slicer_verb(|verb| {
             let EmbeddedObjectVerb::MoveSlicer { width, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="move_slicer_verb always builds an EmbeddedObjectVerb::MoveSlicer, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="move_slicer_verb always builds an EmbeddedObjectVerb::MoveSlicer, so this arm can never run"
             };
             *width = Some(480);
         });
@@ -6053,7 +6053,7 @@ mod tests {
         let verb = move_chart_verb(|verb| {
             set_move_chart_anchor(verb, "F2");
             let EmbeddedObjectVerb::MoveChart { new_sheet, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="move_chart_verb always builds an EmbeddedObjectVerb::MoveChart, so this arm can never run"
             };
             *new_sheet = true;
         });
@@ -6087,7 +6087,7 @@ mod tests {
         let workbook = two_sheet_slicer_workbook();
         let verb = move_slicer_verb(|verb| {
             let EmbeddedObjectVerb::MoveSlicer { sheet, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="move_slicer_verb always builds an EmbeddedObjectVerb::MoveSlicer, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="move_slicer_verb always builds an EmbeddedObjectVerb::MoveSlicer, so this arm can never run"
             };
             *sheet = Some("Q2".to_string());
             set_move_slicer_anchor(verb, "B2");
@@ -6166,7 +6166,7 @@ mod tests {
         let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
         let verb = update_chart_border_verb(|verb| {
             let EmbeddedObjectVerb::UpdateChartBorder { color, clear, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_border_verb always builds an EmbeddedObjectVerb::UpdateChartBorder, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_chart_border_verb always builds an EmbeddedObjectVerb::UpdateChartBorder, so this arm can never run"
             };
             *color = None;
             *clear = true;
@@ -6184,7 +6184,7 @@ mod tests {
         let workbook = workbook_with_sheet(basic_chart_sheet(1, "COLUMN"));
         let verb = update_chart_border_verb(|verb| {
             let EmbeddedObjectVerb::UpdateChartBorder { color, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_border_verb always builds an EmbeddedObjectVerb::UpdateChartBorder, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_chart_border_verb always builds an EmbeddedObjectVerb::UpdateChartBorder, so this arm can never run"
             };
             *color = Some("not-a-color".to_string());
         });
@@ -6196,7 +6196,7 @@ mod tests {
     fn update_chart_border_refuses_an_empty_flag_set() {
         let verb = update_chart_border_verb(|verb| {
             let EmbeddedObjectVerb::UpdateChartBorder { color, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_border_verb always builds an EmbeddedObjectVerb::UpdateChartBorder, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_chart_border_verb always builds an EmbeddedObjectVerb::UpdateChartBorder, so this arm can never run"
             };
             *color = None;
         });
@@ -6208,7 +6208,7 @@ mod tests {
     fn update_chart_border_refuses_color_and_clear_together() {
         let verb = update_chart_border_verb(|verb| {
             let EmbeddedObjectVerb::UpdateChartBorder { clear, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="update_chart_border_verb always builds an EmbeddedObjectVerb::UpdateChartBorder, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="update_chart_border_verb always builds an EmbeddedObjectVerb::UpdateChartBorder, so this arm can never run"
             };
             *clear = true;
         });
@@ -6687,7 +6687,7 @@ mod tests {
         let (drive, sheets) = clients(&server).await;
         let verb = add_chart_verb_with(|verb| {
             let EmbeddedObjectVerb::AddChart { series, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
             };
             series.clear();
         });
@@ -6862,7 +6862,7 @@ mod tests {
         let rules = vec![allow_rule("folder-1")];
         let verb = add_chart_verb_with(|verb| {
             let EmbeddedObjectVerb::AddChart { sheet, .. } = verb else {
-                unreachable!() // omni-dev: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
+                unreachable!() // patchcov: coverage ignore-line reason="add_chart_verb_with's only callers pass an EmbeddedObjectVerb::AddChart, so this arm can never run"
             };
             *sheet = Some("Nope".to_string());
         });
@@ -7131,7 +7131,7 @@ mod tests {
         let (lease_token, ledger_path) = leased_opts_for("sheet-1");
         let mut verb = add_chart_verb();
         let EmbeddedObjectVerb::AddChart { anchor, .. } = &mut verb else {
-            unreachable!() // omni-dev: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
+            unreachable!() // patchcov: coverage ignore-line reason="this test always constructs `verb` as EmbeddedObjectVerb::AddChart above, so this arm can never run"
         };
         *anchor = Some("A1".to_string());
         let opts = EmbeddedObjectOptions {

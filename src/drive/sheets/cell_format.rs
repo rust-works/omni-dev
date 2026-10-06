@@ -291,7 +291,7 @@ pub(crate) fn render_line(entry: &CellFormatEntry) -> String {
                         number.format_type, number.pattern
                     ));
                 }
-            } // omni-dev: coverage ignore-line reason="this closing brace reports 0 hits under llvm-cov regardless of test count — verified locally: render_line_covers_background_bold_number_note_and_validation and render_line_covers_italic_strikethrough_underline_foreground_alignment_and_bare_validation both complete the block above (the pattern and no-pattern pushes both measure as hit), yet this specific brace, closing the format_type.is_empty() check, never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
+            } // patchcov: coverage ignore-line reason="this closing brace reports 0 hits under llvm-cov regardless of test count — verified locally: render_line_covers_background_bold_number_note_and_validation and render_line_covers_italic_strikethrough_underline_foreground_alignment_and_bare_validation both complete the block above (the pattern and no-pattern pushes both measure as hit), yet this specific brace, closing the format_type.is_empty() check, never registers a hit; the same llvm-cov region-attribution artifact as src/utils/settings.rs:1096"
         }
         if let Some(align) = &format.horizontal_alignment {
             attrs.push(format!("align={align}"));

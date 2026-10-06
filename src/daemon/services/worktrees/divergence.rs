@@ -343,7 +343,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("timed out waiting for a computation to start"); // omni-dev: coverage ignore-line reason="only runs if a started computation never sets its flag within 2s, which fails the calling test; a passing run never takes it"
+        panic!("timed out waiting for a computation to start"); // patchcov: coverage ignore-line reason="only runs if a started computation never sets its flag within 2s, which fails the calling test; a passing run never takes it"
     }
 
     /// Starts a computation for `path` that holds a permit for `hold`, and returns

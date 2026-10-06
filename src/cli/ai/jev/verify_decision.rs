@@ -86,7 +86,7 @@ pub struct VerifyDecisionCommand {
 impl VerifyDecisionCommand {
     /// Executes the verify-decision command.
     pub async fn execute(self) -> Result<()> {
-        // omni-dev: coverage ignore reason="VerifyDecisionCommand::execute is the process-bound wiring shell; fetch_input and run_verify provide its deterministic seams"
+        // patchcov: coverage ignore reason="VerifyDecisionCommand::execute is the process-bound wiring shell; fetch_input and run_verify provide its deterministic seams"
         self.ai.apply();
 
         let env = crate::utils::settings::SettingsEnv::load();
@@ -139,7 +139,7 @@ impl VerifyDecisionCommand {
             format_output_with_cache(&report, cache.usage(), self.output)?
         );
         Ok(())
-        // omni-dev: coverage end
+        // patchcov: coverage end
     }
 }
 

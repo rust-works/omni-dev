@@ -2085,11 +2085,11 @@ mod tests {
     struct UnreadableStdin;
 
     impl Read for UnreadableStdin {
-        // omni-dev: coverage ignore reason="never called: every test using UnreadableStdin gives an HTML body, so resolve_body returns before reading stdin; the panic exists to fail loudly if that ever changes"
+        // patchcov: coverage ignore reason="never called: every test using UnreadableStdin gives an HTML body, so resolve_body returns before reading stdin; the panic exists to fail loudly if that ever changes"
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
             panic!("stdin was read")
         }
-        // omni-dev: coverage end
+        // patchcov: coverage end
     }
 
     #[test]

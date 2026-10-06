@@ -593,39 +593,6 @@ checks each claim in a decision comment against the sources it cites. See
 omni-dev ai jev route '#1779' '#1820' -o text
 ```
 
-### 📈 Coverage Diff
-
-Attribute a per-line coverage report to a git diff and report **patch
-coverage** — the share of added lines that are tested — plus the uncovered new
-lines, per-file deltas, and indirect coverage changes. Reads lcov, llvm-cov
-JSON, Cobertura XML, or Go coverprofiles (auto-detected), renders markdown/YAML/JSON, and can gate
-a branch. Coverage that is inherently non-deterministic across runs — a
-CPU-gated region measured on two different runner CPUs — can be excluded by file
-or, more precisely, by source comment markers that `ignore` a region or
-`tolerate` it (keeping its real coverage in the total while masking its
-flips). It powers the project's PR coverage comment and runs locally too. See
-[docs/coverage.md](docs/coverage.md).
-
-```bash
-# Patch coverage for the working tree against the default merge-base
-omni-dev coverage diff --report head.lcov
-
-# Fail if patch coverage is under 80% (a CI gate or a pre-push check)
-omni-dev coverage diff --report head.lcov --fail-under-patch 80
-
-# Fail if overall line coverage is under 70%
-omni-dev coverage diff --report head.lcov --fail-under-lines 70
-
-# Merge the reports of a coverage run sharded across CI jobs, then gate as usual
-omni-dev coverage diff --report shard-1.lcov --report shard-2.lcov --fail-under-lines 70
-
-# Merge the shards into one file, for a baseline or an upload that needs a single report
-omni-dev coverage merge shard-1.lcov shard-2.lcov -o merged.lcov
-
-# Full report with project deltas, as JSON
-omni-dev coverage diff --report head.lcov --baseline-report base.lcov --format json
-```
-
 ### ✏️ Manual Amendment
 
 ```bash

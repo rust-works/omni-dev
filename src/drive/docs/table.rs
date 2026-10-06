@@ -326,7 +326,7 @@ pub fn resolve(
             }
             if cs <= preview.location.index && preview.location.index < ce {
                 if reference.is_some() {
-                    return Err(TableError::InvalidTable); // omni-dev: coverage ignore-line reason="rows, cells and paragraphs are each checked above to start at or after the previous one's end, so the half-open cell ranges are pairwise disjoint and at most one contains the index; kept as defence in depth on the write boundary"
+                    return Err(TableError::InvalidTable); // patchcov: coverage ignore-line reason="rows, cells and paragraphs are each checked above to start at or after the previous one's end, so the half-open cell ranges are pairwise disjoint and at most one contains the index; kept as defence in depth on the write boundary"
                 }
                 reference = Some((r as i64, c as i64));
             }
@@ -346,7 +346,7 @@ pub fn resolve(
         column_index: column,
     };
     let TableEdit::Dimension { after, .. } = edit else {
-        return Err(TableError::InvalidIntent); // omni-dev: coverage ignore-line reason="an Insert edit returned from the branch above, so only a Dimension edit reaches here; the else-arm exists only to destructure the already-known variant"
+        return Err(TableError::InvalidIntent); // patchcov: coverage ignore-line reason="an Insert edit returned from the branch above, so only a Dimension edit reaches here; the else-arm exists only to destructure the already-known variant"
     };
     let request = match verb {
         TableVerb::InsertRow => {
@@ -383,7 +383,7 @@ pub fn resolve(
                 table_cell_location: cell,
             })
         }
-        TableVerb::InsertTable => return Err(TableError::InvalidIntent), // omni-dev: coverage ignore-line reason="validate already refuses a Dimension edit carrying InsertTable before resolve reads the document, so this arm exists solely for exhaustiveness over TableVerb"
+        TableVerb::InsertTable => return Err(TableError::InvalidIntent), // patchcov: coverage ignore-line reason="validate already refuses a Dimension edit carrying InsertTable before resolve reads the document, so this arm exists solely for exhaustiveness over TableVerb"
     };
     Ok((request, preview))
 }

@@ -56,7 +56,6 @@ impl OmniDevServer {
             + Self::drive_write_tool_router()
             + Self::log_tool_router()
             + Self::transcript_tool_router()
-            + Self::coverage_tool_router()
             + Self::browser_tool_router();
 
         // Snowflake tools reach the daemon over its Unix control socket, so they
@@ -435,8 +434,6 @@ mod tests {
             "transcript_youtube_fetch",
             "transcript_youtube_info",
             "transcript_youtube_list_langs",
-            // coverage
-            "coverage_diff",
             // git amend
             "git_amend_commits",
             // browser bridge

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **Coverage functionality moves to [patchcov](https://github.com/rust-works/patchcov)** ([#2200](https://github.com/rust-works/omni-dev/issues/2200)): remove `omni-dev coverage`, the `coverage_diff` MCP tool and the `omni_dev::coverage` library module. Use `patchcov diff`, `patchcov merge` and `patchcov lint-markers` instead; source marker prefixes change to `patchcov: coverage`. CI uses the patchcov-based coverage action v2. This is a breaking change for the next pre-1.0 minor release.
+
 ### Added
 - **Coverage report path mappings** ([#2188](https://github.com/rust-works/omni-dev/issues/2188)): `coverage diff` accepts explicit `diff.path-mappings` in `coverage.yaml` to replace runner, package and source-root prefixes with git paths. The longest directory prefix wins, mappings apply to head shards and the baseline before filters and source markers, and aliases combine by maximum line hits. Fixtures verify nyc, coverage.py, gcovr, coverlet and Dart reports; [the coverage guide](docs/coverage.md#using-with-other-languages) documents producer commands for non-Rust languages and native Go/JaCoCo usage.
 - **Native JaCoCo XML coverage** ([#2187](https://github.com/rust-works/omni-dev/issues/2187)): `coverage diff`, `coverage merge` and the MCP coverage tool accept Java/Kotlin/Scala JaCoCo reports directly, auto-detected from the `<report>` root or selected with `jacoco`. Partially covered lines count as covered when `ci > 0`; aggregate groups and module shards merge by covered-line union. Paths remain source-root-relative; mapping them to git paths is tracked in #2188. See [docs/coverage.md](docs/coverage.md#jacoco-xml).

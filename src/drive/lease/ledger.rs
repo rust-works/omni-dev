@@ -1106,11 +1106,11 @@ mod tests {
         let path = dir.path().join("lease-ledger.jsonl");
         let _held = LedgerLock::acquire(&path).unwrap();
 
-        // omni-dev: coverage ignore reason="mutate_locked refuses before ever calling the closure, so its body never runs — a hit here is a regression, not a coverage gap"
+        // patchcov: coverage ignore reason="mutate_locked refuses before ever calling the closure, so its body never runs — a hit here is a regression, not a coverage gap"
         let err = LeaseLedger::mutate_locked(&path, |ledger| {
             ledger.insert(sample_record("t1"));
         })
-        // omni-dev: coverage end
+        // patchcov: coverage end
         .unwrap_err();
         assert!(err.to_string().contains("already be in progress"));
     }

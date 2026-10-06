@@ -67,10 +67,6 @@ scopes:
     description: "Data structures and serialization"
     examples: ["data: add context structures", "data: improve YAML output"]
     file_patterns: ["src/data.rs", "src/data/**"]
-  - name: "coverage"
-    description: "Coverage report parsing, diffing and rendering"
-    examples: ["coverage: add lcov parser", "coverage: render diff summary table"]
-    file_patterns: ["src/coverage.rs", "src/coverage/**", "src/cli/coverage.rs", "src/cli/coverage/**"]
   - name: "transcript"
     description: "Transcript fetching and formatting: source retrieval and subtitle conversion"
     examples: ["transcript: add youtube transcript source", "transcript: support vtt output format"]

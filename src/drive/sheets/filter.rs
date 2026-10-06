@@ -640,7 +640,7 @@ async fn filter_inner(
             ..
         } => {
             let Some(existing) = existing else {
-                // omni-dev: coverage ignore-line reason="find_existing_filter_view returns Some for UpdateFilterView or has already returned RefusedFilterViewNotFound; this else-arm exists only to unwrap the shared Option"
+                // patchcov: coverage ignore-line reason="find_existing_filter_view returns Some for UpdateFilterView or has already returned RefusedFilterViewNotFound; this else-arm exists only to unwrap the shared Option"
                 unreachable!("existing is resolved for UpdateFilterView above")
             };
             match build_update(
@@ -690,7 +690,7 @@ async fn filter_inner(
     let (requests, existing_id) = match &opts.verb {
         FilterVerb::SetBasicFilter { .. } => {
             let Some(grid) = resolved_target else {
-                // omni-dev: coverage ignore-line reason="resolve_sheet_target returns Some for SetBasicFilter or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
+                // patchcov: coverage ignore-line reason="resolve_sheet_target returns Some for SetBasicFilter or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
                 unreachable!("resolved_target is resolved for SetBasicFilter above")
             };
             (
@@ -708,7 +708,7 @@ async fn filter_inner(
         }
         FilterVerb::ClearBasicFilter { .. } => {
             let Some(sheet_id) = sheet_id else {
-                // omni-dev: coverage ignore-line reason="resolve_sheet_target returns Some for ClearBasicFilter or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
+                // patchcov: coverage ignore-line reason="resolve_sheet_target returns Some for ClearBasicFilter or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
                 unreachable!("sheet_id is resolved for ClearBasicFilter above")
             };
             (
@@ -720,7 +720,7 @@ async fn filter_inner(
         }
         FilterVerb::AddFilterView { title, .. } => {
             let Some(grid) = resolved_target else {
-                // omni-dev: coverage ignore-line reason="resolve_sheet_target returns Some for AddFilterView or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
+                // patchcov: coverage ignore-line reason="resolve_sheet_target returns Some for AddFilterView or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
                 unreachable!("resolved_target is resolved for AddFilterView above")
             };
             (
@@ -742,7 +742,7 @@ async fn filter_inner(
         }
         FilterVerb::UpdateFilterView { filter_view_id, .. } => {
             let Some(write) = update_write else {
-                // omni-dev: coverage ignore-line reason="update_write is built for UpdateFilterView above or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
+                // patchcov: coverage ignore-line reason="update_write is built for UpdateFilterView above or has already returned its refusal; this else-arm exists only to unwrap the shared Option"
                 unreachable!("update_write is built for UpdateFilterView above")
             };
             (write.into_requests(*filter_view_id), Some(*filter_view_id))
@@ -3929,7 +3929,7 @@ mod tests {
             FilterResult::AppliedReplyUnreadable { filter_view_id, .. } => {
                 assert_eq!(*filter_view_id, Some(7));
             }
-            other => panic!("expected AppliedReplyUnreadable, got {other:?}"), // omni-dev: coverage ignore-line reason="this arm only fires if the match failed to bind the expected variant; the assertion below it pins the same variant, so the branch never executes"
+            other => panic!("expected AppliedReplyUnreadable, got {other:?}"), // patchcov: coverage ignore-line reason="this arm only fires if the match failed to bind the expected variant; the assertion below it pins the same variant, so the branch never executes"
         }
         assert_eq!(outcome.result.log_status(), "applied-reply-unreadable");
         assert!(

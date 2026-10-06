@@ -12,7 +12,6 @@ pub mod catalogue_cache;
 pub mod config_tools;
 pub mod confluence_tools;
 pub mod content_input;
-pub mod coverage_tools;
 pub mod datadog_tools;
 pub mod drive_docs_tools;
 pub mod drive_sheets_tools;

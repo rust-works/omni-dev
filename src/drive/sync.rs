@@ -107,7 +107,7 @@ impl SyncReport {
             "skipped" => self.skipped += 1,
             "failed" => self.failed += 1,
             "orphaned" => self.orphaned += 1,
-            _ => unreachable!("internal action"), // omni-dev: coverage ignore-line reason="every caller passes one of the five literal actions above; the arm only guards against a future caller adding a sixth without a counter"
+            _ => unreachable!("internal action"), // patchcov: coverage ignore-line reason="every caller passes one of the five literal actions above; the arm only guards against a future caller adding a sixth without a counter"
         }
         self.items.push(SyncItem {
             id: id.to_string(),
@@ -470,7 +470,7 @@ async fn sync_content(
             true
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e.into()), // omni-dev: coverage ignore-line reason="TOCTOU only: safe_path above already ran this identical lstat on the leaf and fails on any non-NotFound error, so a deterministic test cannot reach it"
+        Err(e) => return Err(e.into()), // patchcov: coverage ignore-line reason="TOCTOU only: safe_path above already ran this identical lstat on the leaf and fails on any non-NotFound error, so a deterministic test cannot reach it"
     };
     if exists && old.is_some_and(|e| unchanged(file, e, rel, export)) {
         if opts.verify && !file.is_google_native() {

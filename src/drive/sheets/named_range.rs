@@ -486,7 +486,7 @@ async fn named_range_inner(
     } = &opts.verb
     {
         let Some(existing) = existing else {
-            unreachable!("existing is resolved for UpdateNamedRange above") // omni-dev: coverage ignore-line reason="existing is always Some for UpdateNamedRange: find_existing_named_range above either returns it or refuses and returns early"
+            unreachable!("existing is resolved for UpdateNamedRange above") // patchcov: coverage ignore-line reason="existing is always Some for UpdateNamedRange: find_existing_named_range above either returns it or refuses and returns early"
         };
         if let Err(result) =
             check_new_name_available(&workbook, existing.named_range_id.as_deref(), new_name)
@@ -538,7 +538,7 @@ async fn named_range_inner(
     // target was selected by `--id`.
     let referencing_formulas = if let NamedRangeVerb::DeleteNamedRange { .. } = &opts.verb {
         let Some(existing) = existing else {
-            unreachable!("existing is resolved for DeleteNamedRange above") // omni-dev: coverage ignore-line reason="existing is always Some for DeleteNamedRange: find_existing_named_range_target above either returns it or refuses and returns early"
+            unreachable!("existing is resolved for DeleteNamedRange above") // patchcov: coverage ignore-line reason="existing is always Some for DeleteNamedRange: find_existing_named_range_target above either returns it or refuses and returns early"
         };
         match scan_referencing_formulas(&api, &opts.spreadsheet_id, &workbook, &existing.name).await
         {
@@ -561,7 +561,7 @@ async fn named_range_inner(
     let (request, existing_id) = match &opts.verb {
         NamedRangeVerb::AddNamedRange { name, .. } => {
             let Some(grid) = new_grid else {
-                unreachable!("new_grid is resolved for AddNamedRange above") // omni-dev: coverage ignore-line reason="new_grid is always Some for AddNamedRange: resolve_grid above either returns it or refuses and returns early"
+                unreachable!("new_grid is resolved for AddNamedRange above") // patchcov: coverage ignore-line reason="new_grid is always Some for AddNamedRange: resolve_grid above either returns it or refuses and returns early"
             };
             (
                 BatchUpdateRequestItem::AddNamedRange(AddNamedRangeRequest {
@@ -576,7 +576,7 @@ async fn named_range_inner(
         }
         NamedRangeVerb::UpdateNamedRange { new_name, .. } => {
             let Some(existing) = existing else {
-                unreachable!("existing is resolved for UpdateNamedRange above") // omni-dev: coverage ignore-line reason="existing is always Some for UpdateNamedRange: find_existing_named_range above either returns it or refuses and returns early"
+                unreachable!("existing is resolved for UpdateNamedRange above") // patchcov: coverage ignore-line reason="existing is always Some for UpdateNamedRange: find_existing_named_range above either returns it or refuses and returns early"
             };
             (
                 BatchUpdateRequestItem::UpdateNamedRange(build_update(
@@ -587,7 +587,7 @@ async fn named_range_inner(
         }
         NamedRangeVerb::DeleteNamedRange { .. } => {
             let Some(existing) = existing else {
-                unreachable!("existing is resolved for DeleteNamedRange above") // omni-dev: coverage ignore-line reason="existing is always Some for DeleteNamedRange: find_existing_named_range above either returns it or refuses and returns early"
+                unreachable!("existing is resolved for DeleteNamedRange above") // patchcov: coverage ignore-line reason="existing is always Some for DeleteNamedRange: find_existing_named_range above either returns it or refuses and returns early"
             };
             let id = existing.named_range_id.clone();
             (
@@ -1267,7 +1267,7 @@ mod tests {
                 candidates.sort();
                 assert_eq!(candidates, ["id-1", "id-2"]);
             }
-            other => panic!("expected RefusedAmbiguousName, got {other:?}"), // omni-dev: coverage ignore-line reason="find_existing_named_range always returns RefusedAmbiguousName here; this test's mounted workbook always has two matching names"
+            other => panic!("expected RefusedAmbiguousName, got {other:?}"), // patchcov: coverage ignore-line reason="find_existing_named_range always returns RefusedAmbiguousName here; this test's mounted workbook always has two matching names"
         }
     }
 
@@ -1353,7 +1353,7 @@ mod tests {
                 assert_eq!(new_name, "allS1");
                 assert_eq!(existing_ids, ["id-2"]);
             }
-            other => panic!("expected RefusedDuplicateName, got {other:?}"), // omni-dev: coverage ignore-line reason="check_new_name_available always returns RefusedDuplicateName here; this test's new_name always collides with a different named range"
+            other => panic!("expected RefusedDuplicateName, got {other:?}"), // patchcov: coverage ignore-line reason="check_new_name_available always returns RefusedDuplicateName here; this test's new_name always collides with a different named range"
         }
     }
 
@@ -1378,7 +1378,7 @@ mod tests {
                 existing_ids.sort();
                 assert_eq!(existing_ids, ["id-2", "id-3"]);
             }
-            other => panic!("expected RefusedDuplicateName, got {other:?}"), // omni-dev: coverage ignore-line reason="check_new_name_available always returns RefusedDuplicateName here; this test's new_name always collides with two different named ranges"
+            other => panic!("expected RefusedDuplicateName, got {other:?}"), // patchcov: coverage ignore-line reason="check_new_name_available always returns RefusedDuplicateName here; this test's new_name always collides with two different named ranges"
         }
     }
 

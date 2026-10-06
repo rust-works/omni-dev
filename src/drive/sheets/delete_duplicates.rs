@@ -1402,7 +1402,7 @@ mod tests {
         opts.range = Some("A:C".into());
         let outcome = delete_duplicates(&drive, &sheets, &opts, &[rule()]).await;
         let DeleteDuplicatesResult::RefusedInvalidRequest { detail } = &outcome.result else {
-            panic!("expected a refusal"); // omni-dev: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; an open-ended range always refuses here"
+            panic!("expected a refusal"); // patchcov: coverage ignore-line reason="this let-else panic only runs if the match failed to bind the expected variant; an open-ended range always refuses here"
         };
         assert!(detail.contains("open-ended"), "{detail}");
         assert!(

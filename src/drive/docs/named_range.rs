@@ -211,7 +211,7 @@ pub(crate) fn resolve(
     }
     let id = match mutation {
         Mutation::Delete { id } | Mutation::Replace { id, .. } => id,
-        Mutation::Create { .. } => return Err(Error::UnsafeRange), // omni-dev: coverage ignore-line reason="the Create branch above always returns, so a Create mutation never reaches the ID lookup; the arm exists solely for exhaustiveness"
+        Mutation::Create { .. } => return Err(Error::UnsafeRange), // patchcov: coverage ignore-line reason="the Create branch above always returns, so a Create mutation never reaches the ID lookup; the arm exists solely for exhaustiveness"
     };
     let matches: Vec<_> = tab
         .named_ranges
@@ -280,7 +280,7 @@ pub(crate) fn resolve(
                 preview,
             ))
         }
-        Mutation::Create { .. } => Err(Error::UnsafeRange), // omni-dev: coverage ignore-line reason="the Create branch above always returns, so a Create mutation never reaches this match; the arm exists solely for exhaustiveness"
+        Mutation::Create { .. } => Err(Error::UnsafeRange), // patchcov: coverage ignore-line reason="the Create branch above always returns, so a Create mutation never reaches this match; the arm exists solely for exhaustiveness"
     }
 }
 

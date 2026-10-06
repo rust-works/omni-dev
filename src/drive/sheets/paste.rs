@@ -698,7 +698,7 @@ async fn paste_inner(
         // sized from a bounded source or a non-empty `--data`, so it is never
         // empty. Falling back to the destination beats an `unwrap` on a value
         // only invariants — not types — keep `Some`.
-        .unwrap_or_else(|| destination_composed.clone()); // omni-dev: coverage ignore-line reason="extents are bounded and non-empty by construction; the fallback exists so an invariant break degrades instead of panicking"
+        .unwrap_or_else(|| destination_composed.clone()); // patchcov: coverage ignore-line reason="extents are bounded and non-empty by construction; the fallback exists so an invariant break degrades instead of panicking"
 
     let overwritten = if opts.verb.paste_type().writes_values() {
         match read_non_blank(&api, &opts.spreadsheet_id, &workbook, &dest_title, &extent).await {

@@ -1865,9 +1865,9 @@ fn build_request(
                 // `validate_verb_args` already refuses this before
                 // `build_request` is ever reached; this is an unreachable
                 // defensive fallback, not a real path.
-                // omni-dev: coverage ignore reason="validate_verb_args refuses an UpdateSheetProperties verb that set none of its six properties before structure_inner ever reaches build_request, and every one of those six pushes a fields entry, so fields is never empty here"
+                // patchcov: coverage ignore reason="validate_verb_args refuses an UpdateSheetProperties verb that set none of its six properties before structure_inner ever reaches build_request, and every one of those six pushes a fields entry, so fields is never empty here"
                 return Err("update-sheet-properties: no property was set".to_string());
-                // omni-dev: coverage end
+                // patchcov: coverage end
             }
             Ok(BatchUpdateRequestItem::UpdateSheetProperties(
                 UpdateSheetPropertiesRequest {
@@ -1959,11 +1959,11 @@ fn workbook_properties_summary(verb: &StructureVerb) -> String {
         iterative_calculation_max_iterations,
         iterative_calculation_convergence_threshold,
     } = verb
-    // omni-dev: coverage ignore reason="every call site matches on the verb as UpdateWorkbookProperties before calling workbook_properties_summary, so this else-arm exists only to destructure the already-known variant"
+    // patchcov: coverage ignore reason="every call site matches on the verb as UpdateWorkbookProperties before calling workbook_properties_summary, so this else-arm exists only to destructure the already-known variant"
     else {
         unreachable!("workbook_properties_summary called on a non-UpdateWorkbookProperties verb")
     };
-    // omni-dev: coverage end
+    // patchcov: coverage end
 
     let mut parts = Vec::new();
     if let Some(locale) = locale {
@@ -6252,7 +6252,7 @@ mod tests {
         )
         .await;
         let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; validate_verb_args always refuses --tab-color with --clear-tab-color as RefusedInvalidRange"
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="guards this test's assumption; validate_verb_args always refuses --tab-color with --clear-tab-color as RefusedInvalidRange"
         };
         assert!(detail.contains("mutually exclusive"), "{detail}");
     }
@@ -6304,7 +6304,7 @@ mod tests {
         )
         .await;
         let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; check_freeze_bound always refuses a negative --freeze-rows as RefusedInvalidRange"
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="guards this test's assumption; check_freeze_bound always refuses a negative --freeze-rows as RefusedInvalidRange"
         };
         assert!(
             detail.contains("--freeze-rows must be at least 0"),
@@ -6332,7 +6332,7 @@ mod tests {
         )
         .await;
         let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; check_freeze_bound always refuses a --freeze-rows at or above the sheet's known row count as RefusedInvalidRange"
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="guards this test's assumption; check_freeze_bound always refuses a --freeze-rows at or above the sheet's known row count as RefusedInvalidRange"
         };
         assert!(detail.contains("would freeze every row"), "{detail}");
     }
@@ -6432,7 +6432,7 @@ mod tests {
         )
         .await;
         let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; check_freeze_bound always refuses a negative --freeze-columns as RefusedInvalidRange"
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="guards this test's assumption; check_freeze_bound always refuses a negative --freeze-columns as RefusedInvalidRange"
         };
         assert!(
             detail.contains("--freeze-columns must be at least 0"),
@@ -6459,7 +6459,7 @@ mod tests {
         )
         .await;
         let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; check_freeze_bound always refuses a --freeze-columns at or above the sheet's known column count as RefusedInvalidRange"
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="guards this test's assumption; check_freeze_bound always refuses a --freeze-columns at or above the sheet's known column count as RefusedInvalidRange"
         };
         assert!(detail.contains("would freeze every column"), "{detail}");
     }
@@ -6505,7 +6505,7 @@ mod tests {
         )
         .await;
         let StructureResult::RefusedInvalidRange { detail } = &outcome.result else {
-            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // omni-dev: coverage ignore-line reason="guards this test's assumption; validate_verb_args always refuses an update-sheet-properties verb that set no property as RefusedInvalidRange"
+            panic!("expected RefusedInvalidRange, got {:?}", outcome.result); // patchcov: coverage ignore-line reason="guards this test's assumption; validate_verb_args always refuses an update-sheet-properties verb that set no property as RefusedInvalidRange"
         };
         assert!(detail.contains("at least one"), "{detail}");
     }
@@ -8049,7 +8049,7 @@ mod tests {
         };
         let request = build_request(&verb, None).unwrap();
         let BatchUpdateRequestItem::UpdateSpreadsheetProperties(req) = request else {
-            panic!("expected UpdateSpreadsheetProperties, got {request:?}"); // omni-dev: coverage ignore-line reason="build_request always returns UpdateSpreadsheetProperties for an UpdateWorkbookProperties verb, so this else-arm exists only to unwrap the shared enum"
+            panic!("expected UpdateSpreadsheetProperties, got {request:?}"); // patchcov: coverage ignore-line reason="build_request always returns UpdateSpreadsheetProperties for an UpdateWorkbookProperties verb, so this else-arm exists only to unwrap the shared enum"
         };
         assert_eq!(req.fields, "locale,autoRecalc");
         assert_eq!(req.properties.locale.as_deref(), Some("en_US"));
@@ -8073,7 +8073,7 @@ mod tests {
         };
         let request = build_request(&verb, None).unwrap();
         let BatchUpdateRequestItem::UpdateSpreadsheetProperties(req) = request else {
-            panic!("expected UpdateSpreadsheetProperties, got {request:?}"); // omni-dev: coverage ignore-line reason="build_request always returns UpdateSpreadsheetProperties for an UpdateWorkbookProperties verb, so this else-arm exists only to unwrap the shared enum"
+            panic!("expected UpdateSpreadsheetProperties, got {request:?}"); // patchcov: coverage ignore-line reason="build_request always returns UpdateSpreadsheetProperties for an UpdateWorkbookProperties verb, so this else-arm exists only to unwrap the shared enum"
         };
         assert_eq!(req.fields, "iterativeCalculationSettings");
         assert_eq!(
@@ -8101,7 +8101,7 @@ mod tests {
         };
         let request = build_request(&verb, None).unwrap();
         let BatchUpdateRequestItem::UpdateSpreadsheetProperties(req) = request else {
-            panic!("expected UpdateSpreadsheetProperties, got {request:?}"); // omni-dev: coverage ignore-line reason="build_request always returns UpdateSpreadsheetProperties for an UpdateWorkbookProperties verb, so this else-arm exists only to unwrap the shared enum"
+            panic!("expected UpdateSpreadsheetProperties, got {request:?}"); // patchcov: coverage ignore-line reason="build_request always returns UpdateSpreadsheetProperties for an UpdateWorkbookProperties verb, so this else-arm exists only to unwrap the shared enum"
         };
         assert_eq!(req.fields, "iterativeCalculationSettings");
         assert_eq!(req.properties.iterative_calculation_settings, None);
@@ -8153,7 +8153,7 @@ mod tests {
                 assert_eq!(*sheet, None);
                 assert_eq!(*sheet_count, 2);
             }
-            other => panic!("expected WouldChange, got {other:?}"), // omni-dev: coverage ignore-line reason="guards this test's assumption; a dry run against an allowed target always reaches WouldChange here"
+            other => panic!("expected WouldChange, got {other:?}"), // patchcov: coverage ignore-line reason="guards this test's assumption; a dry run against an allowed target always reaches WouldChange here"
         }
         let lines = describe_lines(&outcome);
         assert_eq!(lines.len(), 1);
@@ -8233,7 +8233,7 @@ mod tests {
                 assert_eq!(*sheet, None);
                 assert_eq!(*sheet_id, None);
             }
-            other => panic!("expected Changed, got {other:?}"), // omni-dev: coverage ignore-line reason="guards this test's assumption; an apply against an allowed target with a mocked batchUpdate always reaches Changed here"
+            other => panic!("expected Changed, got {other:?}"), // patchcov: coverage ignore-line reason="guards this test's assumption; an apply against an allowed target with a mocked batchUpdate always reaches Changed here"
         }
 
         let requests = server.received_requests().await.unwrap();

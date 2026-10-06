@@ -1489,7 +1489,7 @@ mod tests {
             .await
             .unwrap();
         let BatchUpdateOutcome::AppliedReplyUnreadable { detail } = outcome else {
-            panic!("expected AppliedReplyUnreadable, got {outcome:?}"); // omni-dev: coverage ignore-line reason="the assertion arm only fires if the outcome type regresses, in which case the test has already failed"
+            panic!("expected AppliedReplyUnreadable, got {outcome:?}"); // patchcov: coverage ignore-line reason="the assertion arm only fires if the outcome type regresses, in which case the test has already failed"
         };
         assert!(
             detail.contains("Failed to parse Sheets batchUpdate response"),
