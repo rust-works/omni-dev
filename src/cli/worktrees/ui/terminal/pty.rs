@@ -322,26 +322,30 @@ mod reap_tests {
         }
         let mut child = command.spawn().unwrap();
         if let Some(ready) = ready {
-            // The shell writes this only after installing its trap. The
-            // deadline diagnoses failed setup; elapsed time is not readiness.
             const READY_TIMEOUT: Duration = Duration::from_secs(10);
-            const READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
-            let deadline = Instant::now() + READY_TIMEOUT;
-            while !ready.exists() {
-                if Instant::now() >= deadline {
-                    let pid = i32::try_from(child.id()).unwrap();
-                    reap_child_group(pid, Duration::ZERO);
-                    // Best-effort cleanup before reporting the setup failure.
-                    let _ = child.wait();
-                    panic!(
-                        "shell did not signal readiness at {} within {READY_TIMEOUT:?}",
-                        ready.display()
-                    );
-                }
-                std::thread::sleep(READY_POLL_INTERVAL);
-            }
+            wait_for_ready(&mut child, ready, READY_TIMEOUT);
         }
         child
+    }
+
+    fn wait_for_ready(child: &mut std::process::Child, ready: &std::path::Path, timeout: Duration) {
+        // The shell writes this only after installing its trap. The
+        // deadline diagnoses failed setup; elapsed time is not readiness.
+        const READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+        let deadline = Instant::now() + timeout;
+        while !ready.exists() {
+            if Instant::now() >= deadline {
+                let pid = i32::try_from(child.id()).unwrap();
+                reap_child_group(pid, Duration::ZERO);
+                // Best-effort cleanup before reporting the setup failure.
+                let _ = child.wait();
+                panic!(
+                    "shell did not signal readiness at {} within {timeout:?}",
+                    ready.display()
+                );
+            }
+            std::thread::sleep(READY_POLL_INTERVAL);
+        }
     }
 
     fn sigkill() -> i32 {
@@ -368,6 +372,47 @@ mod reap_tests {
     #[test]
     fn a_child_with_delayed_trap_setup_is_escalated_and_reaped() {
         assert_ignoring_child_is_reaped("sleep 1; ");
+    }
+
+    #[test]
+    fn missing_readiness_kills_and_reaps_the_child_before_panicking() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        use nix::sys::signal::killpg;
+        use nix::sys::wait::{waitpid, WaitPidFlag};
+        use nix::unistd::Pid;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        // Wait for the trap first, then exercise a missing marker with an
+        // immediate deadline. exec keeps the group to one process, so there
+        // are no orphaned descendant zombies in the group-liveness assertion.
+        let mut child = group_leader(
+            "trap '' HUP; : > \"$OMNI_DEV_REAP_READY\"; exec sleep 60",
+            Some(&ready),
+        );
+        let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+        let missing = dir.path().join("missing");
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            wait_for_ready(&mut child, &missing, Duration::ZERO);
+        }))
+        .unwrap_err();
+
+        assert_eq!(
+            panic.downcast_ref::<String>().unwrap(),
+            &format!(
+                "shell did not signal readiness at {} within 0ns",
+                missing.display()
+            )
+        );
+        // Check the OS before try_wait, which could itself reap a child if
+        // timeout cleanup regressed and omitted wait().
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
+        );
+        assert_eq!(child.try_wait().unwrap().unwrap().signal(), Some(sigkill()));
+        assert_eq!(killpg(pid, None), Err(nix::errno::Errno::ESRCH));
     }
 
     fn assert_ignoring_child_is_reaped(setup: &str) {
