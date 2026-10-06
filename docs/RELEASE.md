@@ -286,7 +286,7 @@ The two tag families trigger separate workflows and never each other's: `release
 
 **CI Workflow (`.github/workflows/ci.yml`)**
 - Runs the full suite: tests on stable, beta and nightly Rust, formatting, clippy, documentation, a Windows build, the security audit, the dependency policy and secret scanning
-- **Skips Coverage on tags** ([#1289](https://github.com/rust-works/omni-dev/issues/1289)): coverage is checked on PRs and main pushes; the v2 action installs patchcov independently of omni-dev releases
+- **Skips Coverage on tags** ([#1289](https://github.com/rust-works/omni-dev/issues/1289)): coverage is checked on PRs and main pushes; the patchcov action installs patchcov independently of omni-dev releases
 
 **Release Workflow (`.github/workflows/release.yml`)**
 - **Creates GitHub Release**: Automatically from the tag
@@ -375,7 +375,7 @@ To see what a binary needs: `readelf -V omni-dev` and read `.gnu.version_r`, or 
 
 ## Ordering with Dependents
 
-The `action-works/omni-dev-coverage-check@v2.0` action used by `ci.yml` installs patchcov 0.1.1 independently of omni-dev. Coverage functionality now lives in [rust-works/patchcov](https://github.com/rust-works/patchcov) (#2200). Changes that need new patchcov behavior require a published patchcov version and an action version input update; releasing omni-dev does not unblock them.
+The `action-works/patchcov-action@v1.0` action used by `ci.yml` installs patchcov 0.1.1 independently of omni-dev. Coverage functionality now lives in [rust-works/patchcov](https://github.com/rust-works/patchcov) (#2200). Changes that need new patchcov behavior require a published patchcov version and an action version input update; releasing omni-dev does not unblock them.
 
 ## Post-Release Tasks
 
