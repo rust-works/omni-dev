@@ -2395,6 +2395,79 @@ mod tests {
         }
     }
 
+    /// A settings file as the Google commands leave it: the `gmail`, `drive` and
+    /// `lease` blocks, a field no omni-dev type models, and an unrelated block
+    /// from a product omni-dev has never heard of.
+    ///
+    /// A literal rather than the typed structs: the Google types move to gwi
+    /// (#2203, ADR-0095), after which omni-dev no longer models these blocks but
+    /// must still carry them through its own writes (gwi's import reads them).
+    const GOOGLE_BLOCKS_SETTINGS: &str = r#"{
+        "env": {"KEEP": "me"},
+        "gmail": {
+            "default_account": "work",
+            "accounts": {
+                "work": {"client_id": "cid", "refresh_token_file": "/secrets/gmail-token", "scope": "gmail.readonly"}
+            }
+        },
+        "drive": {
+            "default_account": "work",
+            "accounts": {
+                "work": {
+                    "client_id": "cid",
+                    "backup_folder_id": "backup1",
+                    "write_permissions": {
+                        "rules": [{"folder_id": "f1", "operations": ["rename"]}],
+                        "future_field": "not modelled anywhere"
+                    }
+                }
+            }
+        },
+        "lease": {"expiry_minutes": 15, "biometrics_only": true},
+        "futureproduct": {"nested": {"list": [1, 2, 3]}}
+    }"#;
+
+    #[test]
+    fn google_blocks_survive_every_non_google_settings_writer() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, GOOGLE_BLOCKS_SETTINGS).unwrap();
+        let original: serde_json::Value = serde_json::from_str(GOOGLE_BLOCKS_SETTINGS).unwrap();
+        let untouched = ["gmail", "drive", "lease", "futureproduct"];
+        let assert_untouched = |step: &str| {
+            let now = read_json(&path);
+            for key in untouched {
+                assert_eq!(now[key], original[key], "{key} changed after {step}");
+            }
+        };
+
+        Settings::upsert_env_vars(&path, &[("A_KEY", "a")]).unwrap();
+        assert_untouched("upsert_env_vars");
+
+        Settings::upsert_env_vars_in(&path, Some("work"), &[("B_KEY", "b")]).unwrap();
+        assert_untouched("upsert_env_vars_in(profile)");
+
+        assert!(Settings::remove_env_vars(&path, &["A_KEY"]).unwrap());
+        assert_untouched("remove_env_vars");
+
+        assert!(Settings::remove_env_vars_in(&path, Some("work"), &["B_KEY"]).unwrap());
+        assert_untouched("remove_env_vars_in(profile)");
+
+        // The writers did their own job too, so the checks above were not vacuous.
+        assert_eq!(read_json(&path)["env"]["KEEP"], "me");
+    }
+
+    #[test]
+    fn settings_with_a_block_omni_dev_does_not_model_still_load() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, GOOGLE_BLOCKS_SETTINGS).unwrap();
+
+        let settings = Settings::load_from_path(&path).unwrap();
+
+        assert_eq!(settings.env.get("KEEP").map(String::as_str), Some("me"));
+    }
+
     #[test]
     fn upsert_env_vars_merges_and_preserves_unknown_fields() {
         let (_tmp, path) = temp_settings_path();

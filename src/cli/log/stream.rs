@@ -283,6 +283,63 @@ mod tests {
         assert!(text.contains(r#""id":"1""#));
     }
 
+    /// The Google writers move to gwi (#2203, ADR-0095), but `omni-dev log` must
+    /// keep reading what they already wrote.
+    #[test]
+    fn backlog_renders_legacy_drive_mutation_and_audit_lines() {
+        use crate::request_log::legacy_lines;
+
+        let input = format!(
+            "{}\n{}\n{}\n",
+            legacy_lines::DRIVE_MUTATION,
+            legacy_lines::AUDIT,
+            r#"{"id":"3","invocation_id":"inv","kind":"a-future-kind"}"#,
+        );
+
+        let mut reader = BufReader::new(Cursor::new(input.clone()));
+        let mut out = Vec::new();
+        emit_backlog(
+            &mut reader,
+            &empty_filter(),
+            Format::Oneline,
+            None,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "text was: {text}");
+        assert!(lines[0].contains("drv"), "line was: {}", lines[0]);
+        assert!(lines[0].contains("drive move"), "line was: {}", lines[0]);
+        assert!(lines[0].contains("report.pdf"), "line was: {}", lines[0]);
+        assert!(
+            lines[0].contains("status=blocked"),
+            "line was: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("17ms"), "line was: {}", lines[0]);
+        assert!(lines[1].contains("aud"), "line was: {}", lines[1]);
+        assert!(
+            lines[1].contains("drive lease-acquire"),
+            "line was: {}",
+            lines[1]
+        );
+        assert!(lines[1].contains("lease=lease-1"), "line was: {}", lines[1]);
+        assert!(
+            lines[1].contains("verdict=acquired"),
+            "line was: {}",
+            lines[1]
+        );
+
+        // JSON output stays byte-identical to what is on disk.
+        let mut reader = BufReader::new(Cursor::new(input));
+        let mut out = Vec::new();
+        emit_backlog(&mut reader, &empty_filter(), Format::Json, None, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().next(), Some(legacy_lines::DRIVE_MUTATION));
+        assert_eq!(text.lines().nth(1), Some(legacy_lines::AUDIT));
+    }
+
     #[test]
     fn backlog_applies_filter() {
         let filter = Filter::build(FilterInput {

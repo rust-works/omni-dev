@@ -1,6 +1,6 @@
 # Extracting Google Workspace functionality into gwi
 
-**Status:** In Progress — phase 1 (design) written, phase 2 not started
+**Status:** In Progress — phases 0-2 done, phase 3 (extract) not started
 **ADRs:** [ADR-0095](../adrs/adr-0095.md) · [gwi ADR-0001](https://github.com/rust-works/gwi/blob/main/docs/adrs/adr-0001.md)
 
 Tracking issue: [#2203](https://github.com/rust-works/omni-dev/issues/2203). New project:
@@ -89,14 +89,28 @@ overwrite existing gwi state without `--force`; takes the ledger's advisory lock
 copying; reports every `_file`/`_command` reference that points inside `~/.omni-dev/` so
 the user can relocate it; copies no audit history (forensic records keep their provenance).
 
+## Fork baseline
+
+The shared modules are forked from omni-dev `main` at **`819907d14`** (the merge of
+ADR-0095). Phase 3 updates this line if it forks from a later commit, and the gwi fork
+records the same SHA in its commit message. Until gwi has a release, a fix to one of the
+forked modules in omni-dev (`utils/secret*`, `utils/env.rs`, `utils/settings.rs`,
+`request_log.rs`, `daemon/paths.rs`, `utils/{http,rate_limit,multipart,terminal,path}.rs`,
+`test_support.rs`) must be carried into the fork by hand.
+
 ## Revised phases
 
 0. **Reserve and scaffold.** Done except the crates.io publish, which needs a token.
 1. **Design.** This plan and the two ADRs.
-2. **Prerequisites in omni-dev (no refactor).** With no shared crate there is nothing to
-   invert. Add a test that an omni-dev write to `settings.json` preserves `gmail`, `drive`
-   and `lease` blocks it no longer models, and one that `omni-dev log` still renders
-   `drivemutation` and `audit` records after the writers go. Record the fork-point commit.
+2. **Prerequisites in omni-dev (no refactor).** Done. With no shared crate there is nothing
+   to invert, so this phase only pins what the removal must not break, with literal
+   fixtures that survive the Google writers going away:
+   `google_blocks_survive_every_non_google_settings_writer` and
+   `settings_with_a_block_omni_dev_does_not_model_still_load` (`utils/settings.rs`) cover
+   settings; `legacy_drive_mutation_line_still_decodes_with_its_kind_and_context`,
+   `legacy_audit_line_still_decodes_with_its_kind_and_context` (`request_log.rs`) and
+   `backlog_renders_legacy_drive_mutation_and_audit_lines` (`cli/log/stream.rs`) cover the
+   log. The fixture lines were captured from the 0.46.0 builders. See *Fork baseline*.
 3. **Extract.** Import history with `git filter-repo` (rewriting bare `#N` references to
    `rust-works/omni-dev#N`); fork the shared modules; add the import command and
    `gwi-mcp`; port docs, ADRs and the live-test notes; publish a real release.
