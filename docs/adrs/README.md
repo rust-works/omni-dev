@@ -119,4 +119,5 @@ by Michael Nygard.
 | [ADR-0093](adr-0093.md)                                 | ✅ Accepted                              | 2026-10-02 | Google Slides object reads and guarded text replacement                                     |
 | [ADR-0094](adr-0094.md)                                 | ✅ Accepted                              | 2026-10-02 | Anchor-Addressed Docs Insertion and Deletion                                                |
 | [ADR-0095](adr-0095.md)                                 | 🟡 Proposed                              | 2026-10-07 | Extract Google Workspace Functionality into the Standalone gwi Project                      |
+| [ADR-0096](adr-0096.md)                                 | ✅ Accepted                              | 2026-10-07 | Persisted Closure History and Recreating Removed Worktrees                                  |
 | [ADR-0097](adr-0097.md)                                 | ✅ Accepted                              | 2026-10-07 | Per-Pull-Request Changelog Fragments                                                        |
