@@ -1,123 +1,93 @@
 ---
 name: changelog
-description: Manages CHANGELOG.md entries following Keep a Changelog format. Use when adding changelog entries, documenting changes, updating release notes, or preparing for a release. Triggers on terms like "changelog", "document changes", "release notes", "what changed".
+description: Writes changelog fragments (changelog.d/) following Keep a Changelog format, and assembles CHANGELOG.md from them at release time. Use when adding changelog entries, documenting changes, updating release notes, or preparing for a release. Triggers on terms like "changelog", "changelog fragment", "document changes", "release notes", "what changed".
 ---
 
 # Changelog Management Skill
 
-This skill helps maintain CHANGELOG.md following [Keep a Changelog](https://keepachangelog.com/) format.
+Pull requests never edit `CHANGELOG.md` or `editors/vscode/CHANGELOG.md`. Each
+one adds a **fragment** file, and the release assembles the fragments into the
+changelog with `scripts/changelog.py collect` (#2213, ADR-0097). The full
+contributor guide is [`changelog.d/README.md`](../../../changelog.d/README.md).
 
-## Changelog Structure
+## Adding an entry
+
+Create one file per entry:
+
+| Change to             | File                                      |
+|-----------------------|-------------------------------------------|
+| the crate             | `changelog.d/<id>.<type>[.<n>].md`        |
+| the VS Code extension | `changelog.d/vscode/<id>.<type>[.<n>].md` |
+
+- `<id>`: the issue number, or `+<slug>` for a pull request with no issue.
+- `<type>`: the section the entry goes in.
+- `<n>`: optional, for a second entry with the same id and type (`2213.fixed.2.md`).
+
+| Type         | Section           | Use for                                      |
+|--------------|-------------------|----------------------------------------------|
+| `added`      | **Added**         | New features                                 |
+| `changed`    | **Changed**       | Changes in existing functionality            |
+| `deprecated` | **Deprecated**    | Soon-to-be removed features                  |
+| `removed`    | **Removed**       | Now removed features                         |
+| `fixed`      | **Fixed**         | Bug fixes                                    |
+| `security`   | **Security**      | Vulnerability fixes                          |
+| `ci`         | **CI/CD**         | Workflow, release and build-pipeline changes |
+| `docs`       | **Documentation** | Documentation-only changes worth announcing  |
+
+A change to both the crate and the extension adds one fragment to each
+directory. A user-visible change under `editors/vscode/` must have a fragment in
+`changelog.d/vscode/`.
+
+## Entry format
+
+The file body is the entry exactly as it reads in the changelog: one bullet with
+a bold lead-in, the issue link, then the prose. Continuation lines and nested
+bullets are indented two spaces. No heading (the type is the section) and no
+blank lines.
 
 ```markdown
-# Changelog
+- **`worktrees push` no longer offers a force-push on a guessed verdict** ([#2175](https://github.com/rust-works/omni-dev/issues/2175)): in a shallow clone ...
+```
 
-All notable changes to this project will be documented in this file.
+Bad:
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [Unreleased]
-
-## [X.Y.Z] - YYYY-MM-DD
-
-### Added
-### Changed
-### Deprecated
-### Removed
+```markdown
 ### Fixed
-### Security
-
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/vX.Y.Z...HEAD
-[X.Y.Z]: https://github.com/rust-works/omni-dev/compare/vPREV...vX.Y.Z
+- fixed push
 ```
 
-## Categories
+To correct an entry that has not been released yet, edit that pull request's
+fragment rather than adding another.
 
-| Category          | Use For                                 |
-|-------------------|-----------------------------------------|
-| **Added**         | New features                            |
-| **Changed**       | Changes in existing functionality       |
-| **Deprecated**    | Soon-to-be removed features             |
-| **Removed**       | Now removed features                    |
-| **Fixed**         | Bug fixes                               |
-| **Security**      | Vulnerability fixes                     |
-| **Documentation** | Documentation-only changes              |
-| **Refactored**    | Code changes that don't affect behavior |
-
-## Entry Format
-
-Each entry should:
-- Start with `**Bold Feature Name**:` followed by description
-- Use sub-bullets for implementation details
-- Be written in past tense for releases, present for unreleased
-
-### Good Example
-
-```markdown
-### Added
-- **Commit Message Validation Command**: New `check` command for validating commit messages
-  - AI-powered analysis with configurable severity levels
-  - Multiple output formats (text, JSON, YAML) for CI/CD integration
-  - Smart exit codes for pipeline integration
-```
-
-### Bad Example
-
-```markdown
-### Added
-- Added check command
-- It validates commits
-```
-
-## Key Learnings
-
-### Incremental Updates
-Add entries to `[Unreleased]` as features are merged, not all at once during release. This:
-- Makes release prep faster
-- Ensures nothing is missed
-- Provides better commit-to-changelog traceability
-
-### Released Sections Are Closed
-Once a version's section exists on `main`, it is released: add new bullets under `[Unreleased]` only. A branch that predates a release can have its bullet applied *inside* the renamed section when it merges, so re-check where it landed after rebasing. The `Changelog Check` workflow (`scripts/check_changelog.py`, #2129) fails a pull request or merge-queue entry that grows a released section. A deliberate backfill carries a `Changelog: amend-released <reason>` commit trailer.
-
-### Extension Entries
-A user-visible change under `editors/vscode/` needs a bullet in `editors/vscode/CHANGELOG.md` under `[Unreleased]`, not only in the root changelog. The same check requires it. A change that is not user-visible after all (a refactor, a dev-dependency bump) carries a `Changelog: none <reason>` commit trailer.
-
-### Version Links
-Always maintain comparison links at the bottom of the file:
-
-```markdown
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/vX.Y.Z...HEAD
-[X.Y.Z]: https://github.com/rust-works/omni-dev/compare/vPREV...vX.Y.Z
-```
-
-Replace `PREV` with the actual previous release tag's version, which may differ
-in more than its patch number.
-
-When releasing:
-1. Update `[Unreleased]` link to compare against new version
-2. Add new version's comparison link
-
-### Gathering Changes
-
-To see what changed since last release:
+## Checking
 
 ```bash
-# Get last release tag
-git describe --tags --abbrev=0
-
-# Show commits since last release
-git log --oneline $(git describe --tags --abbrev=0)..HEAD
-
-# Show detailed commit info
-git show <commit-hash> --stat
+python3 scripts/changelog.py check                          # every fragment is valid
+python3 scripts/changelog.py check-pr --base origin/main    # this branch carries what CI requires
 ```
 
-## Instructions
+The `Changelog` CI check runs both. A change with no user-visible effect (docs,
+CI, a refactor) carries a `Changelog: none <reason>` commit trailer instead of a
+fragment. Correcting an already published section is the one direct edit to a
+changelog, and needs a `Changelog: amend-released <reason>` trailer. Trailers go
+in the last paragraph of a commit message.
 
-1. Read current CHANGELOG.md
-2. Identify the appropriate category for changes
-3. Write clear, descriptive entries with details
-4. For releases, move `[Unreleased]` content to new version section
-5. Update version comparison links
+## Releasing
+
+```bash
+python3 scripts/changelog.py collect --component crate  --version X.Y.Z --dry-run
+python3 scripts/changelog.py collect --component crate  --version X.Y.Z
+python3 scripts/changelog.py collect --component vscode --version A.B.C
+```
+
+`collect` writes `## [X.Y.Z] - <today>` with the sections in the order above and
+entries by issue number, updates the crate changelog's compare links, carries any
+legacy text under `[Unreleased]` into the section verbatim, and deletes the
+fragments it consumed. Reconcile the fragments against the log first:
+
+```bash
+git log --oneline $(git describe --tags --abbrev=0 --match 'v[0-9]*')..origin/main
+ls changelog.d/ changelog.d/vscode/
+```
+
+See [docs/RELEASE.md](../../../docs/RELEASE.md) for the whole release flow.

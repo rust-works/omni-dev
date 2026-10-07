@@ -9,7 +9,9 @@ name: VS Code extension release
 # Release flow (extension version is independent of the Rust crate; the full
 # procedure is docs/RELEASE.md):
 #   1. bump `version` in editors/vscode/package.json (and package-lock.json),
-#      update editors/vscode/CHANGELOG.md, and land it through a pull request —
+#      assemble editors/vscode/CHANGELOG.md from the changelog.d/vscode/
+#      fragments (`scripts/changelog.py collect --component vscode`), and land
+#      it through a pull request —
 #      `main` merges by rebase through a merge queue, so the commit's hash changes
 #   2. after the merge, tag that rebased commit `vscode-v<version>`
 #      (e.g. vscode-v0.2.1) — never the local pre-merge commit
