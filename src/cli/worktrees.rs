@@ -4,12 +4,15 @@
 //! Lifecycle stays on `omni-dev daemon` (`start`/`stop`/`status`/`restart`);
 //! this command sends the `worktrees` service's ops over the daemon's Unix
 //! control socket: the read views (`list`, `tree`, `tree --follow`), the actions
-//! (`focus`, `close`, `show-closed`), and — for typed parity with the companion
+//! (`focus`, `close`, `show-closed`, `recent`, `reopen`), and — for typed parity with the companion
 //! (#1361) — the window feed ops (`register`/`heartbeat`/`unregister`) that let a
 //! scripted/headless reporter or an integration test drive the registry the way
 //! the VS Code extension does from each window.
 
+mod closed;
 mod ui;
+
+pub use closed::{RecentCommand, ReopenCommand};
 
 use std::path::{Path, PathBuf};
 
@@ -63,6 +66,10 @@ pub enum WorktreesSubcommands {
     Reload(ReloadCommand),
     /// Show or set whether closed worktrees are shown across all windows.
     ShowClosed(ShowClosedCommand),
+    /// List recently closed worktrees, including ones since removed from disk.
+    Recent(RecentCommand),
+    /// Reopen a recently closed worktree, recreating it first if it was removed.
+    Reopen(ReopenCommand),
     /// Register a window's open worktree folders (companion feed op).
     Register(RegisterCommand),
     /// Refresh a window's liveness and read any pending close/reload directive.
@@ -91,6 +98,8 @@ impl WorktreesCommand {
             WorktreesSubcommands::Reposition(cmd) => cmd.execute().await,
             WorktreesSubcommands::Reload(cmd) => cmd.execute().await,
             WorktreesSubcommands::ShowClosed(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Recent(cmd) => cmd.execute().await,
+            WorktreesSubcommands::Reopen(cmd) => cmd.execute().await,
             WorktreesSubcommands::Register(cmd) => cmd.execute().await,
             WorktreesSubcommands::Heartbeat(cmd) => cmd.execute().await,
             WorktreesSubcommands::Unregister(cmd) => cmd.execute().await,

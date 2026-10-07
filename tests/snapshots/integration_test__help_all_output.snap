@@ -8462,6 +8462,8 @@ Commands:
   reposition   Move and resize worktrees' open windows to match a reference window
   reload       Signal worktrees' open windows to reload themselves
   show-closed  Show or set whether closed worktrees are shown across all windows
+  recent       List recently closed worktrees, including ones since removed from disk
+  reopen       Reopen a recently closed worktree, recreating it first if it was removed
   register     Register a window's open worktree folders (companion feed op)
   heartbeat    Refresh a window's liveness and read any pending close/reload directive
   unregister   Remove a window's registration (companion feed op)
@@ -8598,6 +8600,20 @@ Options:
 
 ================================================================================
 
+omni-dev worktrees recent - List recently closed worktrees, including ones since removed from disk
+
+List recently closed worktrees, including ones since removed from disk
+
+Usage: recent [OPTIONS]
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+      --socket <PATH>    Control-socket path. Defaults to the per-user runtime location
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev worktrees register - Register a window's open worktree folders (companion feed op)
 
 Register a window's open worktree folders (companion feed op)
@@ -8629,6 +8645,24 @@ Options:
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
       --socket <PATH>    Control-socket path. Defaults to the per-user runtime location
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev worktrees reopen - Reopen a recently closed worktree, recreating it first if it was removed
+
+Reopen a recently closed worktree, recreating it first if it was removed
+
+Usage: reopen [OPTIONS] <PATH>
+
+Arguments:
+  <PATH>  The worktree folder, as `worktrees recent` shows it
+
+Options:
+      --dry-run        Print what reopening would do, but open and create nothing
+  -y, --yes            Skip the interactive confirmation before recreating a removed worktree
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
 
 
 ================================================================================
