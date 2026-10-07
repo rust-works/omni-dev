@@ -99,7 +99,8 @@ impl ReopenCommand {
                 println!("Would open {} (dry run; nothing opened)", sanitize(&path));
                 return Ok(());
             }
-            call(&socket, "reopen", json!({ "path": path })).await?;
+            let reply = call(&socket, "reopen", json!({ "path": path })).await?;
+            ensure_reopened(&reply, &path)?;
             println!("Reopened {}", sanitize(&path));
             return Ok(());
         }
@@ -108,6 +109,7 @@ impl ReopenCommand {
         // the plan (or, if it is back on disk after all, just opens it).
         let reply = call(&socket, "reopen", json!({ "path": path })).await?;
         let Some(plan) = reply.get("plan") else {
+            ensure_reopened(&reply, &path)?;
             println!("Reopened {}", sanitize(&path));
             return Ok(());
         };
@@ -132,6 +134,7 @@ impl ReopenCommand {
             json!({ "path": path, "confirmed": true }),
         )
         .await?;
+        ensure_reopened(&done, &path)?;
         println!("Recreated and reopened {}", sanitize(&path));
         if done["opened"].as_bool() == Some(false) {
             println!(
@@ -141,6 +144,21 @@ impl ReopenCommand {
         }
         Ok(())
     }
+}
+
+/// Fails unless the daemon's reply says it reopened `path`. The daemon re-plans on
+/// every call, so a worktree can stop being restorable between the plan the user
+/// saw and the confirmed call (its branch checked out elsewhere, say); that comes
+/// back as an `ok` reply carrying a plan, and must not be reported as success.
+fn ensure_reopened(reply: &Value, path: &str) -> Result<()> {
+    if reply["reopened"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    let why = reply
+        .get("plan")
+        .and_then(|plan| plan["reason"].as_str())
+        .unwrap_or("the daemon did not reopen it");
+    bail!("{} was not reopened: {}", sanitize(path), sanitize(why))
 }
 
 /// Prints the recreate prompt on stderr and reads the answer; anything but an
@@ -432,6 +450,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ops(&server.await.unwrap()), ["recent-closed", "reopen"]);
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_call_the_daemon_refuses_is_an_error_not_a_success() {
+        let (_dir, sock, _server) = fake_daemon(vec![
+            listing(vec![entry("/wt/a", true)]),
+            plan(true),
+            // Re-planned at execute time and no longer restorable.
+            plan(false),
+        ]);
+        let err = reopen_cmd(sock, false, true)
+            .execute_with(|| async { None })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("was not reopened"), "{err}");
+        assert!(err.to_string().contains("is gone"), "{err}");
     }
 
     #[tokio::test]

@@ -1540,11 +1540,15 @@ first, capped at **50 entries and 30 days**, oldest evicted first.
 
 - A *closed window* has its worktree still on disk; a *removed worktree* does not.
   Reopening them is different work, so the entry says which it is. A closed window
-  whose directory is later found missing is marked removed.
+  whose directory is later found missing is marked removed — but only while its
+  repository is still there, so an unmounted volume is not mistaken for a removal.
 - **Reopening a folder forgets its closure.** A window `register`ing a folder removes
-  that folder's entry, so a window **reload** (an unregister followed by a register)
+  the entry of the worktree it is in (matched by worktree root, so a window opened on
+  a subdirectory counts), so a window **reload** (an unregister followed by a register)
   and a worktree you reopened by hand leave nothing behind. A worktree another live
-  window still has open is never recorded.
+  window still has open is never recorded. `reopen` itself does not drop the entry:
+  the window's own `register` does, so a launcher that never produces a window loses
+  nothing.
 - Only closures the daemon **observed** are recorded. A worktree pruned in a terminal
   that the daemon never saw close is not discovered.
 

@@ -1835,7 +1835,10 @@ impl DaemonService for WorktreesService {
                 if req.key.trim().is_empty() {
                     bail!("`register` requires a non-empty `key`");
                 }
+                let folders = req.folders.clone();
                 self.registry.register(req);
+                // A worktree that is open again is not "closed" (#2211).
+                self.forget_opened(folders).await;
                 Ok(json!({ "ok": true }))
             }
             "heartbeat" => {

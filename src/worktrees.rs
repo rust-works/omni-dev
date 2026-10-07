@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -1015,7 +1016,14 @@ impl WorktreesRegistry {
             if let Some(parent) = path.parent() {
                 crate::daemon::paths::ensure_dir_0700(parent)?;
             }
-            crate::daemon::paths::write_file_0600(&path, &bytes)
+            // Written beside the file and renamed over it, so a crash mid-write
+            // leaves the previous list rather than a truncated one.
+            let mut staging = path.clone().into_os_string();
+            staging.push(".tmp");
+            let staging = PathBuf::from(staging);
+            crate::daemon::paths::write_file_0600(&staging, &bytes)?;
+            std::fs::rename(&staging, &path)
+                .with_context(|| format!("failed to replace {}", path.display()))
         });
         if let Err(err) = written {
             tracing::warn!(
@@ -1032,13 +1040,8 @@ impl Default for WorktreesRegistry {
     }
 }
 
-/// Removes entries last heard from longer than `ttl` ago on the awake clock,
-/// returning how many were dropped. `awake` is the registry's [`AwakeClock`]
-/// reading, so time spent asleep never counts (#2126). Pure CPU; the caller holds
-/// the registry lock but never `.await`s while holding it. The count lets a
-/// *mutation* path ([`register`](WorktreesRegistry::register) et al.) decide
-/// whether to [`bump`](WorktreesRegistry::bump) the change-notify; read paths
-/// ignore it (see [`list`](WorktreesRegistry::list)).
+/// [`reap_departed`], keeping only how many windows it dropped. A test-only
+/// convenience: production callers need the departures themselves.
 #[cfg(test)]
 fn reap(windows: &mut HashMap<String, WindowEntry>, ttl: Duration, awake: Duration) -> usize {
     reap_departed(windows, ttl, awake).len()

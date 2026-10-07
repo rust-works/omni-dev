@@ -100,6 +100,9 @@ export type PrBadgeFetcher = (
  */
 export const ITEM_CLICKED_COMMAND = "omniDevWorktrees.itemClicked";
 
+/** How often the Recently Closed group re-renders its relative ages (#2211). */
+const CLOSED_AGE_REFRESH_MS = 60_000;
+
 /**
  * Maps a pure {@link RowIcon} onto the editor's icon type — the whole of this file's
  * share of the row-icon logic (#1428).
@@ -152,6 +155,14 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<TreeEl
    * shows issues no request (#2120). `undefined` when no fetcher was injected.
    */
   private readonly aheadBehind?: AheadBehindMemo;
+  /**
+   * Re-renders the Recently Closed group so its relative ages ("5m ago") do not
+   * freeze while the daemon has nothing to push. Running only while the list is
+   * non-empty, and firing for the group alone: a whole-tree refresh would re-run
+   * `getChildren` for every expanded repo and re-trigger its lazy fetches.
+   */
+  private ageTimer: ReturnType<typeof setInterval> | undefined;
+
   private readonly emitter = new vscode.EventEmitter<TreeElement | undefined | null | void>();
   readonly onDidChangeTreeData = this.emitter.event;
 
@@ -183,6 +194,7 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<TreeEl
   update(repos: TreeRepoPayload[], closed: ClosedWorktreePayload[] = this.recentlyClosed): void {
     this.repos = repos;
     this.recentlyClosed = closed;
+    this.syncAgeTimer();
     // Every worktree in the snapshot, not just the visible ones: toggling
     // show-closed must not throw away answers it will need again.
     this.aheadBehind?.prune(repos.flatMap((repo) => repo.worktrees.map((wt) => wt.path)));
@@ -202,7 +214,24 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<TreeEl
     }
     this.recentlyClosed = closed;
     this.emitter.fire(undefined);
+    this.syncAgeTimer();
     return true;
+  }
+
+  /** Starts or stops the {@link ageTimer} to match whether any entry is listed. */
+  private syncAgeTimer(): void {
+    if (this.recentlyClosed.length === 0) {
+      if (this.ageTimer !== undefined) {
+        clearInterval(this.ageTimer);
+        this.ageTimer = undefined;
+      }
+      return;
+    }
+    if (this.ageTimer === undefined) {
+      this.ageTimer = setInterval(() => {
+        this.emitter.fire({ kind: "closedGroup", closed: this.recentlyClosed });
+      }, CLOSED_AGE_REFRESH_MS);
+    }
   }
 
   /**
@@ -449,6 +478,9 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<TreeEl
   }
 
   dispose(): void {
+    if (this.ageTimer !== undefined) {
+      clearInterval(this.ageTimer);
+    }
     this.emitter.dispose();
   }
 }
