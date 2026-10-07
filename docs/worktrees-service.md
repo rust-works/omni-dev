@@ -456,6 +456,22 @@ omni-dev worktrees show-closed          # read the current value
 omni-dev worktrees show-closed false    # hide closed worktrees everywhere
 ```
 
+`worktrees recent` lists the recently closed worktrees and `worktrees reopen` brings
+one back ([Recently closed worktrees](#recently-closed-worktrees)):
+
+```bash
+omni-dev worktrees recent                 # newest first: age, state, repo, branch, path
+omni-dev worktrees recent -o json         # the daemon's `recent-closed` reply, verbatim
+omni-dev worktrees reopen /path/to/wt     # open its window; a removed worktree is recreated first
+omni-dev worktrees reopen /path/to/wt --dry-run   # print what would happen, change nothing
+omni-dev worktrees reopen /path/to/wt -y          # skip the recreate confirmation
+```
+
+`reopen` takes a path `recent` lists and nothing else. A closed window just opens. A
+**removed** worktree prints the daemon's plan, including that uncommitted changes
+cannot be recovered, and asks `[y/N]` (a closed stdin declines) before recreating
+anything; a worktree the plan says cannot be restored is an error that names why.
+
 `worktrees tree --follow` (`-f`) streams live snapshots via the daemon's
 `subscribe` push op, re-rendering the tree on every change until interrupted
 (Ctrl-C) — the terminal equivalent of the editor tree view. It honours `-o json`
@@ -1507,6 +1523,66 @@ the key of the window that has it open. Unlike the tree view, a named worktree w
 **no** open window is an **error**, not a silent skip: there the selection is a sweep,
 here you named each target explicitly.
 
+### Recently closed worktrees
+
+The `tree` only shows repos derived from open windows, so closing a window — or a
+repo's last window — used to leave nothing to click, and **Close Worktree**
+([ADR-0049](adrs/adr-0049.md)) left no record that a worktree had existed. The daemon
+now keeps a **recently closed** list ([ADR-0096](adrs/adr-0096.md), #2211), the way
+VS Code's *Reopen Closed Editor* does.
+
+**What is recorded.** A closure is added when a window unregisters, when one is reaped
+on the liveness TTL (a crashed window), and when the `close` op removes a worktree.
+Each entry holds the worktree path, its repository's main working tree, repo name,
+GitHub identity, branch, head commit, whether it is the main working tree, whether it
+was **removed from disk**, and a closed-at time. There is one entry per path, newest
+first, capped at **50 entries and 30 days**, oldest evicted first.
+
+- A *closed window* has its worktree still on disk; a *removed worktree* does not.
+  Reopening them is different work, so the entry says which it is. A closed window
+  whose directory is later found missing is marked removed.
+- **Reopening a folder forgets its closure.** A window `register`ing a folder removes
+  that folder's entry, so a window **reload** (an unregister followed by a register)
+  and a worktree you reopened by hand leave nothing behind. A worktree another live
+  window still has open is never recorded.
+- Only closures the daemon **observed** are recorded. A worktree pruned in a terminal
+  that the daemon never saw close is not discovered.
+
+**It survives a daemon restart.** The list is the one piece of registry state that
+cannot be re-reported by a live window, because the window is gone. It is persisted to
+`worktrees-closed.json` beside the control socket (`0600`, in the `0700` runtime
+directory) and rewritten on each change. A missing file is the first-run default; a
+corrupt or unreadable one is logged and treated as empty. It holds paths, branch names
+and commit ids — no secrets and no content.
+
+**Reopening.** `reopen { path }` takes a path the daemon recorded and nothing else (no
+branch, base or destination). A worktree still on disk is opened with the same launcher
+as `open`. A **removed** one is two-phase like `close`:
+
+1. `reopen { path }` returns a plan and creates nothing: `{ reopened: false, plan }`.
+2. `reopen { path, confirmed: true }` **re-plans from scratch**, creates the worktree
+   with `git2`, opens it, and replies `{ reopened: true, recreated: true, source }`.
+
+The plan recreates the worktree on its recorded branch if that branch still exists;
+if only the recorded commit survives, it recreates the branch at that commit
+(`source: "head-sha"`); otherwise it is `restorable: false` with a `reason`. It is also
+refused for the main working tree, for a detached HEAD, when the destination already
+exists, when the repository is gone, and when the branch is checked out in another
+worktree. Every restorable plan carries `warnings`, always including that **uncommitted
+changes in the removed worktree cannot be recovered**.
+
+**In the tree view** the list is a **Recently Closed** group at the end of the tree,
+newest first, with a distinct icon for a removed worktree; double-click or the inline
+action reopens, and **omni-dev: Reopen Closed Worktree…** offers the same list in a
+quick-pick. A removed worktree asks for a modal confirmation built from the plan. The
+group is fed by the `recently_closed` field of the pushed snapshot, so every window
+stays in sync; an older daemon sends none and the group does not appear.
+
+**Not covered.** Repos with no open window still do not appear in the tree itself, so
+a repo's *other* on-disk worktrees stay invisible until one is reopened; configured repo
+roots remain the follow-up noted below. The terminal UI (`worktrees ui`) does not show
+the list yet.
+
 ## Workspace Trust (Restricted Mode)
 
 When the daemon opens a worktree folder VS Code has never seen before — the tray
@@ -1963,6 +2039,17 @@ must be added by hand; without it the op moves nothing and says so. Note that
 because omni-dev installs unsigned, the grant is invalidated by every upgrade and
 must be re-applied — see [Window repositioning](#window-repositioning-macos).
 
+The **recently-closed list** (#2211, [ADR-0096](adrs/adr-0096.md)) is the one piece of
+registry state the daemon persists itself: `worktrees-closed.json` (`0600`, in the `0700`
+runtime directory) holds worktree paths, branch names and commit ids — no secret and no
+file or conversation content, though it does name what you were working on. The
+**`reopen`** op can make git *write*: for a removed worktree it creates a worktree and,
+if the branch is gone, a branch. It is bounded by taking **only a path the daemon
+recorded** — no branch, base or destination from the client — so a socket writer can
+recreate only what the daemon watched close, at the path it had, and it stays within the
+owning user. Recreation is two-phase and re-planned on the confirmed call, serialized
+with `close`'s prune, and uses `git2` rather than a shell.
+
 The **`reload`** op (#1417) adds **no capability at all**, and needs no ADR. It rides
 the same `0600` socket, persists nothing (the directive is in-memory like `close`'s,
 so a daemon restart drops it), and touches neither git nor the OS — the daemon only
@@ -1996,9 +2083,11 @@ Ops:
 | `heartbeat`       | `{ key }`                                                             | `{ known: <bool>, close?: true, reload?: true }`                          |
 | `unregister`      | `{ key }`                                                             | `{ removed: <bool> }`                                                     |
 | `list`            | `null`                                                                | `{ windows: [entry, …] }`                                                 |
-| `tree`            | `null`                                                                | `{ repos: [repo, …], show_closed }`                                       |
+| `tree`            | `null`                                                                | `{ repos: [repo, …], show_closed, recently_closed? }`                     |
 | `ahead-behind`    | `{ paths: [path, …] }`                                                | `{ results: { "<path>": { ahead?, behind?, main_behind?, shallow? } } }`  |
 | `open`            | `{ path }`                                                            | `{ ok: true }`                                                            |
+| `recent-closed`   | `null`                                                                | `{ closed: [entry, …] }` *(newest first)*                                 |
+| `reopen`          | `{ path, confirmed? }`                                                | `{ reopened, recreated?, plan?, source?, opened? }`                       |
 | `open-prs`        | `{ owner, name }`                                                     | `{ pull_requests: [pr, …] }`                                              |
 | `close`           | `{ path, remove, requester_key?, confirmed? }`                        | *(safety report, or `{ removed/closed }`)*                                |
 | `reload`          | `{ target_keys[] }`                                                   | `{ requested, signalled, unknown[] }`                                     |
@@ -2080,6 +2169,19 @@ Where:
   or prune failure at WARN), plus an ERROR line if the safety check or the removal
   task itself fails (a non-git-worktree target, a panicked task). Only the worktree
   path and window keys are logged, never a secret.
+- `recent-closed` — the [recently closed list](#recently-closed-worktrees), newest
+  first, as `{ closed: [entry, …] }`. Each entry is `{ path, repo_root, main_repo,
+  github?, branch?, head_sha?, is_main, removed, closed_at }`. The same entries ride
+  every `tree`/`subscribe` snapshot as an additive `recently_closed` field, **omitted
+  when empty** so a client that predates it is byte-identical.
+- `reopen` — reopens a recently closed worktree (#2211). `path` must match a recorded
+  entry exactly (or by its canonical form); anything else is an error. A worktree on
+  disk is opened and the reply is `{ reopened: true, recreated: false }`. A removed one
+  is two-phase: without `confirmed` the reply is `{ reopened: false, plan }` and nothing
+  is created; with `confirmed: true` the daemon re-plans, recreates and opens it, and
+  replies `{ reopened: true, recreated: true, source, opened }` (`opened: false` plus
+  `open_error` if the worktree exists but its window could not be launched). The plan is
+  `{ restorable, source?: "branch" | "head-sha", branch?, head_sha?, reason?, warnings[] }`.
 - `reload` — signals each listed window to reload itself (#1417), the batch form of
   `Developer: Reload Window`. Addressed by **window key**, like `reposition` and
   unlike `close`: a reload acts on a window, and one tree row is one window, whereas
