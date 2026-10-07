@@ -53,7 +53,12 @@ The `Changelog` check (`.github/workflows/changelog.yml`) runs:
     changelog and readme, the lockfile, build configuration, dotfiles and the
     dev-only keys of `package.json`) must add a fragment under
     `changelog.d/vscode/`;
-  - it must not edit `CHANGELOG.md` or `editors/vscode/CHANGELOG.md` directly.
+  - it must not edit `CHANGELOG.md` or `editors/vscode/CHANGELOG.md` directly;
+  - a release must consume every fragment of its component.
+
+  On a merge-queue entry only the last two run (`check-pr --queue`): a rebase
+  cannot change which files a pull request adds, but it can bring in a fragment
+  that merged while a release was waiting in the queue.
 
 Run it locally before pushing:
 
@@ -68,11 +73,14 @@ Waivers are commit trailers, in the last paragraph of any commit on the branch:
 | Trailer                              | Waives                                                                                     |
 |--------------------------------------|--------------------------------------------------------------------------------------------|
 | `Changelog: none <reason>`           | the fragment requirements, for a change with no user-visible effect (docs, CI, a refactor) |
-| `Changelog: amend-released <reason>` | the direct-edit rule, to correct notes in an already published section                     |
+| `Changelog: amend-released <reason>` | the direct-edit rule and the crate-fragment requirement, to correct a published section    |
 
-Pull requests opened by a bot (Dependabot) are waived. A release pull request is
-recognised by the new `## [X.Y.Z]` section it adds to the changelog it releases,
-never by its title.
+`amend-released` covers published sections only: an edit under `[Unreleased]`
+still fails, and an extension change still needs its fragment. Pull requests
+opened by a bot (Dependabot) are waived. A release pull request is recognised by
+the new `## [X.Y.Z]` section it adds to the changelog it releases, never by its
+title; it waives the fragment requirement, and the extension fragment only when
+it is the extension's release.
 
 ## Releasing
 

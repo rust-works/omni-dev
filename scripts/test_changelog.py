@@ -173,6 +173,12 @@ class LoadTests(unittest.TestCase):
         self.assertTrue(crate_errors[1].startswith('changelog.d/other: not a regular file'))
         self.assertTrue(vscode_errors[0].startswith('changelog.d/vscode/2.fixed.md: an entry'))
 
+    def test_dotfiles_are_ignored(self):
+        self.t.write('changelog.d/.DS_Store', 'junk')
+        self.t.write('changelog.d/vscode/.gitkeep', '')
+        for component in (CRATE, VSCODE):
+            self.assertEqual(cl.load_fragments(self.t.root, component), ([], []))
+
     def test_a_subdirectory_of_the_extension_directory_is_an_error(self):
         (self.t.root / 'changelog.d/vscode/vscode').mkdir()
         _, errors = cl.load_fragments(self.t.root, VSCODE)
@@ -519,6 +525,84 @@ class CheckPrTests(unittest.TestCase):
         result = self.check()
         self.assertPasses(result)
         self.assertIn('fragment requirement waived: release pull request', result.notes)
+
+    def release(self, version='0.3.0', component='crate'):
+        status, _, err = run(['collect', '--root', str(self.t.root), '--component', component,
+                              '--version', version, '--date', '2026-02-03'])
+        self.assertEqual(status, 0, err)
+
+    def test_a_release_that_leaves_a_fragment_unconsumed_fails_in_the_queue_too(self):
+        self.t.write('changelog.d/42.added.md', '- x\n')
+        self.commit('feat: x')
+        self.git('checkout', '-q', '-B', 'main')
+        self.git('checkout', '-q', '-b', 'release')
+        self.release()
+        self.commit('chore(release): prepare release v0.3.0')
+        # A fragment merges into main while the release waits; the queue rebases onto it.
+        self.git('checkout', '-q', 'main')
+        self.t.write('changelog.d/43.fixed.md', '- late\n')
+        self.commit('fix: late')
+        self.git('checkout', '-q', 'release')
+        self.git('rebase', '-q', 'main')
+        for queue in (False, True):
+            with self.subTest(queue=queue):
+                result = cl.check_pr(self.t.root, 'main', 'HEAD', queue=queue)
+                self.assertFails(result, 'leaves 1 fragment(s) unconsumed (changelog.d/43.fixed.md)')
+
+    def test_a_crate_release_ignores_extension_fragments(self):
+        self.t.write('changelog.d/vscode/44.fixed.md', '- ext\n')
+        self.t.write('changelog.d/42.added.md', '- x\n')
+        self.commit('feat: x')
+        self.git('checkout', '-q', '-B', 'main')
+        self.git('checkout', '-q', '-b', 'release')
+        self.release()
+        self.commit('chore(release): prepare release v0.3.0')
+        self.assertPasses(self.check())
+
+    def test_a_crate_release_does_not_waive_the_extension_fragment(self):
+        self.t.write('changelog.d/42.added.md', '- x\n')
+        self.commit('feat: x')
+        self.git('checkout', '-q', '-B', 'main')
+        self.git('checkout', '-q', '-b', 'release')
+        self.release()
+        self.t.write('editors/vscode/src/extension.ts', 'export const x = 1;\n')
+        self.commit('chore(release): prepare release v0.3.0')
+        self.assertFails(self.check(), 'changes the VS Code extension')
+
+    def test_an_extension_release_waives_the_extension_fragment(self):
+        self.t.write('changelog.d/vscode/42.fixed.md', '- x\n')
+        self.commit('fix(vscode): x')
+        self.git('checkout', '-q', '-B', 'main')
+        self.git('checkout', '-q', '-b', 'release')
+        self.release('0.2.0', 'vscode')
+        self.t.write('editors/vscode/package.json', '{"version": "0.2.0", "contributes": {}}\n')
+        self.commit('chore(release): prepare vscode extension release v0.2.0')
+        self.assertPasses(self.check())
+
+    def test_amend_released_does_not_cover_unreleased(self):
+        self.t.write('CHANGELOG.md', CRATE_CHANGELOG.replace('## [Unreleased]\n', '## [Unreleased]\n\n- hand\n'))
+        self.commit('feat: x\n\nChangelog: amend-released not really')
+        self.assertFails(self.check(), 'changes `## [Unreleased]` by hand')
+
+    def test_amend_released_does_not_waive_the_extension_fragment(self):
+        self.t.write('CHANGELOG.md', CRATE_CHANGELOG.replace('**Two** (#2).', '**Two, corrected** (#2).'))
+        self.t.write('editors/vscode/src/extension.ts', 'export const x = 1;\n')
+        self.commit('fix: x\n\nChangelog: amend-released wrong claim')
+        self.assertFails(self.check(), 'changes the VS Code extension')
+
+    def test_the_queue_skips_the_fragment_requirement_but_not_a_direct_edit(self):
+        self.t.write('src/main.rs', 'fn main() { }\n')
+        self.commit('feat: x')
+        self.assertPasses(cl.check_pr(self.t.root, 'main', 'HEAD', queue=True))
+        self.t.write('CHANGELOG.md', CRATE_CHANGELOG.replace('## [Unreleased]\n', '## [Unreleased]\n\n- hand\n'))
+        self.commit('feat: y')
+        self.assertFails(cl.check_pr(self.t.root, 'main', 'HEAD', queue=True), 'CHANGELOG.md is edited directly')
+
+    def test_a_non_ascii_extension_path_is_seen(self):
+        self.t.write('editors/vscode/media/icône.svg', '<svg/>\n')
+        self.t.write('changelog.d/42.fixed.md', '- crate note\n')
+        self.commit('feat(vscode): icon')
+        self.assertFails(self.check(), 'editors/vscode/media/icône.svg')
 
     def test_a_release_title_alone_does_not_waive(self):
         self.t.write('src/main.rs', 'fn main() { }\n')
