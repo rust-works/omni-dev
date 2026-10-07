@@ -3115,6 +3115,37 @@ mod tests {
         .unwrap();
         server.await.unwrap();
 
+        // Recent (table), then Reopen: a `--dry-run` of a closed window reads only
+        // the list. Reopen's own `execute` is the stdin-reading wrapper, reached
+        // without a prompt here.
+        let entry = json!({
+            "path": "/wt/a", "repo_root": "/r", "main_repo": "repo", "branch": "feature",
+            "is_main": false, "removed": false, "closed_at": "2026-10-07T11:00:00Z",
+        });
+        let list = json!({ "ok": true, "payload": { "closed": [entry] } });
+        let (_d, sock, server) = fake_daemon_seq(vec![list.clone(), list]);
+        WorktreesCommand {
+            command: WorktreesSubcommands::Recent(RecentCommand {
+                output: TableOrJson::Table,
+                socket: Some(sock.clone()),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+        WorktreesCommand {
+            command: WorktreesSubcommands::Reopen(ReopenCommand {
+                path: PathBuf::from("/wt/a"),
+                dry_run: true,
+                yes: false,
+                socket: Some(sock),
+            }),
+        }
+        .execute()
+        .await
+        .unwrap();
+        server.await.unwrap();
+
         // Reposition: `--undo` needs no path resolution, so one reply suffices.
         let (_d, sock, server) = fake_daemon_seq(vec![json!({
             "ok": true,
