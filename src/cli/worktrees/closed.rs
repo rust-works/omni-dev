@@ -491,4 +491,17 @@ mod tests {
         assert!(err.to_string().contains("not in the recently closed list"));
         assert_eq!(ops(&server.await.unwrap()), ["recent-closed"]);
     }
+
+    #[tokio::test]
+    async fn a_removed_worktree_back_on_disk_is_just_opened() {
+        let (_dir, sock, server) = fake_daemon(vec![
+            listing(vec![entry("/wt/a", true)]),
+            json!({ "ok": true, "payload": { "reopened": true, "recreated": false } }),
+        ]);
+        reopen_cmd(sock, false, false)
+            .execute_with(|| async { panic!("nothing to recreate, so nothing to confirm") })
+            .await
+            .unwrap();
+        assert_eq!(ops(&server.await.unwrap()), ["recent-closed", "reopen"]);
+    }
 }

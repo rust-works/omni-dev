@@ -1175,4 +1175,216 @@ mod tests {
         svc.load_closed(root);
         assert!(svc.registry.closed_entries().is_empty());
     }
+
+    #[test]
+    fn closed_worktree_for_records_the_github_identity() {
+        let (_guard, root) = tempdir();
+        let (repo, main) = main_repo(&root);
+        repo.remote("origin", "git@github.com:rust-works/omni-dev.git")
+            .unwrap();
+        let github = closed_worktree_for(&main, Utc::now())
+            .unwrap()
+            .github
+            .unwrap();
+        assert_eq!(github.owner, "rust-works");
+        assert_eq!(github.name, "omni-dev");
+    }
+
+    #[tokio::test]
+    async fn a_window_outside_any_repository_records_nothing() {
+        let (_guard, root) = tempdir();
+        let svc = WorktreesService::new();
+        register(&svc, "w1", &root);
+        svc.registry.unregister("w1");
+        assert!(closed_paths(&svc.recent_closed().await).is_empty());
+    }
+
+    #[test]
+    fn a_path_that_exists_again_is_not_recreated_over() {
+        let (_guard, root) = tempdir();
+        let svc = WorktreesService::new();
+        let (_repo, wt) = removed_worktree(&svc, &root);
+        let entry = svc.registry.closed_entry(&wt).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        let (plan, how) = plan_recreate(&entry);
+        assert!(!plan.restorable && how.is_none());
+        assert!(plan.reason.unwrap().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn a_branch_that_moved_is_checked_out_at_its_new_tip_with_a_warning() {
+        let (_guard, root) = tempdir();
+        let svc = WorktreesService::new();
+        let (repo, wt) = removed_worktree(&svc, &root);
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(
+            Some("refs/heads/feature"),
+            &sig,
+            &sig,
+            "B",
+            &parent.tree().unwrap(),
+            &[&parent],
+        )
+        .unwrap();
+
+        let reply = reopen(&svc, &wt, false, &Launched::default())
+            .await
+            .unwrap();
+
+        assert_eq!(reply["plan"]["source"], "branch");
+        assert!(reply["plan"]["warnings"][1]
+            .as_str()
+            .unwrap()
+            .contains("has moved"));
+    }
+
+    #[test]
+    fn a_recorded_root_that_is_no_longer_the_main_working_tree_is_refused() {
+        let (_guard, root) = tempdir();
+        let (repo, _) = main_repo(&root);
+        let wt = root.join("wt");
+        add_worktree(&repo, &wt, "feature");
+        let reason = open_main_repo(&wt).err().unwrap();
+        assert!(reason.contains("no longer the repository's main working tree"));
+    }
+
+    #[test]
+    fn a_branch_the_main_checkout_holds_cannot_be_restored() {
+        let (_guard, root) = tempdir();
+        let svc = WorktreesService::new();
+        let (repo, wt) = removed_worktree(&svc, &root);
+        repo.set_head("refs/heads/feature").unwrap();
+        let entry = svc.registry.closed_entry(&wt).unwrap();
+        let (plan, _) = plan_recreate(&entry);
+        assert!(!plan.restorable);
+        let reason = plan.reason.unwrap();
+        assert!(reason.contains("already checked out at"), "{reason}");
+        assert!(
+            reason.contains(root.join("main").to_str().unwrap()),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_failed_recreate_deletes_the_branch_it_created() {
+        let (_guard, root) = tempdir();
+        let svc = WorktreesService::new();
+        let (repo, wt) = removed_worktree(&svc, &root);
+        let oid = repo.head().unwrap().target().unwrap();
+        repo.find_branch("feature", BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+        // Something now occupies the checkout, so git refuses to add it there.
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("squatter"), b"x").unwrap();
+        let entry = svc.registry.closed_entry(&wt).unwrap();
+
+        let err = recreate_worktree(&entry, &Recreate::BranchAtCommit("feature".into(), oid))
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("failed to recreate the worktree"),
+            "{err:#}"
+        );
+        assert!(
+            repo.find_branch("feature", BranchType::Local).is_err(),
+            "the branch made for the recreate is removed again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recreate_that_fails_after_the_plan_is_logged_and_reported() {
+        let (_guard, root) = tempdir();
+        let svc = WorktreesService::new();
+        let (_repo, wt) = removed_worktree(&svc, &root);
+        // The checkout's parent is a file, so the plan passes but creating fails.
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut entry = svc.registry.closed_entry(&wt).unwrap();
+        entry.path = blocker.join("wt");
+        entry.closed_at += ChronoDuration::seconds(1);
+        svc.registry.record_closed(vec![entry.clone()]);
+        let launched = Launched::default();
+
+        let (result, logs) = crate::test_support::capture_future_at(
+            tracing::Level::WARN,
+            reopen(&svc, &entry.path, true, &launched),
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("failed to create"), "{err:#}");
+        assert!(logs.contains("worktrees reopen: recreate failed"), "{logs}");
+        assert!(logs.contains(entry.path.to_str().unwrap()), "{logs}");
+        assert!(launched.paths().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recreated_worktree_whose_window_fails_to_open_is_still_recreated() {
+        let (_guard, root) = tempdir();
+        let svc = WorktreesService::new();
+        let (_repo, wt) = removed_worktree(&svc, &root);
+
+        let (reply, logs) = crate::test_support::capture_future_at(
+            tracing::Level::INFO,
+            svc.reopen_with(
+                ReopenRequest {
+                    path: wt.clone(),
+                    confirmed: true,
+                },
+                &|_| Err(anyhow!("no editor")),
+            ),
+        )
+        .await;
+
+        let reply = reply.unwrap();
+        assert_eq!(reply["recreated"], true);
+        assert_eq!(reply["opened"], false);
+        assert_eq!(reply["open_error"], "no editor");
+        assert!(wt.exists());
+        assert!(
+            logs.contains("worktrees reopen: removed worktree recreated")
+                && logs.contains("source=\"branch\""),
+            "{logs}"
+        );
+    }
+
+    #[test]
+    fn unreadable_and_unwritable_closed_files_are_logged() {
+        let (_guard, root) = tempdir();
+        let corrupt = root.join("corrupt.json");
+        std::fs::write(&corrupt, b"{ not json").unwrap();
+        let logs = crate::test_support::capture_at(tracing::Level::WARN, || {
+            WorktreesService::new().load_closed(corrupt.clone());
+            WorktreesService::new().load_closed(root.clone());
+        });
+        assert!(
+            logs.contains("ignoring unreadable recently-closed worktrees"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("could not read recently-closed worktrees"),
+            "{logs}"
+        );
+
+        // A parent that is a file: the list cannot be persisted, which is logged.
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let (repo, _) = main_repo(&root);
+        let wt = root.join("wt");
+        add_worktree(&repo, &wt, "feature");
+        let svc = WorktreesService::new();
+        svc.load_closed(blocker.join("closed.json"));
+        let logs = crate::test_support::capture_at(tracing::Level::WARN, || {
+            svc.registry
+                .record_closed(vec![closed_worktree_for(&wt, Utc::now()).unwrap()]);
+        });
+        assert!(
+            logs.contains("could not persist recently-closed worktrees"),
+            "{logs}"
+        );
+        assert_eq!(svc.registry.closed_entries().len(), 1);
+    }
 }
