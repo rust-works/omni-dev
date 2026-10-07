@@ -40,11 +40,13 @@ pub(super) fn closed_worktree_for(
 ) -> Option<ClosedWorktree> {
     let repo = Repository::discover(folder).ok()?;
     let workdir = canonical(repo.workdir()?);
-    // The common dir (`…/<root>/.git`) is shared by the main checkout and every
-    // linked worktree; its parent is the main working tree — the same derivation
-    // the tree snapshot uses to decide `is_main`.
+    // The common dir is shared by the main checkout and every linked worktree;
+    // the working tree of the repository *it* belongs to is the main one. Asking
+    // git for that, rather than taking the common dir's parent, keeps a submodule
+    // (`<super>/.git/modules/<name>`) or a `--separate-git-dir` repository from
+    // being recorded under a bogus root.
     let commondir = canonical(repo.commondir());
-    let repo_root = commondir.parent()?.to_path_buf();
+    let repo_root = canonical(Repository::open(&commondir).ok()?.workdir()?);
     // Wire shape needs UTF-8 paths; a path that is not has nothing to show.
     workdir.to_str()?;
     repo_root.to_str()?;
@@ -68,6 +70,17 @@ pub(super) fn closed_worktree_for(
     })
 }
 
+/// The root of the worktree `folder` is in — what a closed entry's `path` is
+/// keyed by — or the folder itself when it is not in a repository. A window may be
+/// opened on a subdirectory or through a symlink, so a raw folder compares equal to
+/// a recorded path only by luck.
+fn worktree_root_of(folder: &Path) -> PathBuf {
+    Repository::discover(folder)
+        .ok()
+        .and_then(|repo| repo.workdir().map(canonical))
+        .unwrap_or_else(|| canonical(folder))
+}
+
 /// Settles every window that has left the registry into the recently-closed log,
 /// then reconciles the log with the disk.
 ///
@@ -83,11 +96,14 @@ pub(super) async fn settle_departures(registry: &WorktreesRegistry) {
         return;
     }
     let settled = tokio::task::spawn_blocking(move || {
-        let open: Vec<PathBuf> = open.iter().map(|f| canonical(f)).collect();
+        let open: Vec<PathBuf> = open.iter().map(|f| worktree_root_of(f)).collect();
         let recorded = resolve_departures(&departures, &open);
         let vanished: Vec<PathBuf> = log_entries
             .iter()
-            .filter(|e| !e.removed && !e.path.exists())
+            // The repository must still be there: a worktree on a volume that is
+            // merely unmounted is missing along with its repository, and is not
+            // thereby removed.
+            .filter(|e| !e.removed && !e.path.exists() && e.repo_root.exists())
             .map(|e| e.path.clone())
             .collect();
         (recorded, vanished)
@@ -106,7 +122,8 @@ pub(super) async fn settle_departures(registry: &WorktreesRegistry) {
 
 /// Resolves each departed window's folders to closed worktrees, skipping any a
 /// live window still has open (another window on the same worktree, or a window
-/// that re-registered). `open` is canonicalized. One entry per worktree: a
+/// that re-registered). `open` holds the roots of the worktrees windows have
+/// open ([`worktree_root_of`]), so a nested worktree does not mask its parent. One entry per worktree: a
 /// multi-root window with two folders in one worktree records it once.
 fn resolve_departures(departures: &[Departure], open: &[PathBuf]) -> Vec<ClosedWorktree> {
     let mut recorded: Vec<ClosedWorktree> = Vec::new();
@@ -115,7 +132,7 @@ fn resolve_departures(departures: &[Departure], open: &[PathBuf]) -> Vec<ClosedW
             let Some(entry) = closed_worktree_for(folder, departure.at) else {
                 continue;
             };
-            let still_open = open.iter().any(|f| f.starts_with(&entry.path));
+            let still_open = open.contains(&entry.path);
             if still_open || recorded.iter().any(|r| r.path == entry.path) {
                 continue;
             }
@@ -335,7 +352,10 @@ fn free_worktree_name(repo: &Repository, path: &Path) -> Result<String> {
         let Ok(existing) = repo.find_worktree(&name) else {
             return Ok(name);
         };
-        if !existing.path().exists() {
+        // Only metadata left over by *this* worktree's own removal is cleared. A
+        // same-named worktree whose checkout is merely missing (an unmounted
+        // volume) belongs to someone else, and git would forget it.
+        if existing.path() == path && !existing.path().exists() {
             let mut opts = WorktreePruneOptions::new();
             existing
                 .prune(Some(&mut opts))
@@ -432,9 +452,9 @@ impl WorktreesService {
         if on_disk {
             // Worktree still there (the window was closed, or the removal flag was
             // set while a drive was unmounted): just open it.
+            // The entry is not dropped here: the window's own `register` forgets it,
+            // so a launcher that never produces a window loses nothing.
             launch(&entry.path)?;
-            self.registry
-                .forget_closed(std::slice::from_ref(&entry.path));
             return Ok(json!({ "reopened": true, "recreated": false }));
         }
         let planned = entry.clone();
@@ -462,8 +482,12 @@ impl WorktreesService {
             source = plan.source.unwrap_or("-"),
             "worktrees reopen: removed worktree recreated"
         );
-        self.registry
-            .forget_closed(std::slice::from_ref(&entry.path));
+        // It exists again, so it is no longer "removed". The entry stays until the
+        // window registers (and forgets it), for the same reason as above.
+        self.registry.record_closed(vec![ClosedWorktree {
+            removed: false,
+            ..entry.clone()
+        }]);
         // The worktree exists now; failing to open its window is not a failed
         // recreate, so say so rather than erroring.
         let open_error = launch(&entry.path).err().map(|e| format!("{e:#}"));
@@ -479,6 +503,24 @@ impl WorktreesService {
             reply["open_error"] = json!(err);
         }
         Ok(reply)
+    }
+
+    /// Forgets the closures of the worktrees `folders` belong to — they are open
+    /// (again). Resolves each folder to its worktree root first, so a window opened
+    /// on a subdirectory or through a symlink still matches its entry.
+    pub(super) async fn forget_opened(&self, folders: Vec<PathBuf>) {
+        if self.registry.closed_entries().is_empty() {
+            return;
+        }
+        let roots = tokio::task::spawn_blocking(move || {
+            folders
+                .iter()
+                .map(|f| worktree_root_of(f))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        self.registry.forget_closed(&roots);
     }
 
     /// The recorded closure for `path` — exactly, or by its canonical form (a
@@ -713,6 +755,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_a_subdirectory_forgets_the_worktrees_closure() {
+        let (_guard, root) = tempdir();
+        let (repo, _) = main_repo(&root);
+        let wt = root.join("wt");
+        add_worktree(&repo, &wt, "feature");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        let svc = WorktreesService::new();
+        register(&svc, "w1", &wt);
+        svc.registry.unregister("w1");
+        assert_eq!(closed_paths(&svc.recent_closed().await).len(), 1);
+
+        svc.handle(
+            "register",
+            json!({ "key": "w2", "folders": [wt.join("src")] }),
+        )
+        .await
+        .unwrap();
+
+        assert!(closed_paths(&svc.recent_closed().await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_worktree_nested_inside_another_does_not_mask_it() {
+        // A repo that keeps linked worktrees inside its own working tree: the
+        // window on the nested one stays open while the one on the main tree closes.
+        let (_guard, root) = tempdir();
+        let (repo, main) = main_repo(&root);
+        let nested = main.join(".worktrees").join("x");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        add_worktree(&repo, &nested, "feature");
+        let svc = WorktreesService::new();
+        register(&svc, "main", &main);
+        register(&svc, "nested", &nested);
+        svc.registry.unregister("main");
+
+        assert_eq!(
+            closed_paths(&svc.recent_closed().await),
+            [main.to_str().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_checkout_is_not_removed_while_its_repository_is_missing_too() {
+        // An unmounted volume takes both away; neither was removed.
+        let (_guard, root) = tempdir();
+        let svc = WorktreesService::new();
+        let mut entry = closed_worktree_for(&main_repo(&root).1, Utc::now()).unwrap();
+        entry.path = root.join("gone").join("wt");
+        entry.repo_root = root.join("gone").join("repo");
+        svc.registry.record_closed(vec![entry]);
+
+        assert_eq!(svc.recent_closed().await["closed"][0]["removed"], false);
+    }
+
+    #[test]
+    fn the_repository_root_of_a_separate_gitdir_is_its_working_tree() {
+        let (_guard, root) = tempdir();
+        let gitdir = root.join("sep.git");
+        let workdir = root.join("wd");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let mut opts = git2::RepositoryInitOptions::new();
+        opts.workdir_path(&workdir);
+        let repo = Repository::init_opts(&gitdir, &opts).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        repo.commit(Some("refs/heads/main"), &sig, &sig, "A", &tree, &[])
+            .unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+
+        let entry = closed_worktree_for(&workdir, Utc::now()).unwrap();
+
+        assert_eq!(entry.repo_root, std::fs::canonicalize(&workdir).unwrap());
+        assert!(entry.is_main);
+    }
+
+    #[tokio::test]
     async fn the_snapshot_omits_the_field_until_something_has_closed() {
         let svc = WorktreesService::new();
         let tree = svc.handle("tree", Value::Null).await.unwrap();
@@ -759,7 +879,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopening_a_closed_window_opens_it_and_forgets_the_entry() {
+    async fn reopening_a_closed_window_opens_it_and_the_windows_register_forgets_the_entry() {
         let (_guard, root) = tempdir();
         let (repo, _) = main_repo(&root);
         let wt = root.join("wt");
@@ -773,6 +893,12 @@ mod tests {
 
         assert_eq!(reply, json!({ "reopened": true, "recreated": false }));
         assert_eq!(launched.paths(), std::slice::from_ref(&wt));
+        // Not dropped at launch: a launcher that never produces a window loses
+        // nothing. The window's own `register` is what forgets it.
+        assert_eq!(closed_paths(&svc.recent_closed().await).len(), 1);
+        svc.handle("register", json!({ "key": "w2", "folders": [wt] }))
+            .await
+            .unwrap();
         assert!(closed_paths(&svc.recent_closed().await).is_empty());
     }
 
@@ -828,7 +954,11 @@ mod tests {
         assert_eq!(recreated.branch.as_deref(), Some("feature"));
         assert!(!recreated.is_main);
         assert_eq!(launched.paths(), std::slice::from_ref(&wt));
-        assert!(closed_paths(&svc.recent_closed().await).is_empty());
+        // It exists again, so it is listed as closed rather than removed, until a
+        // window registers on it.
+        let listed = svc.recent_closed().await;
+        assert_eq!(closed_paths(&listed), [wt.to_str().unwrap()]);
+        assert_eq!(listed["closed"][0]["removed"], false);
         drop(repo);
     }
 
@@ -962,6 +1092,26 @@ mod tests {
     }
 
     #[test]
+    fn another_worktrees_missing_checkout_is_never_pruned() {
+        // `wt` is held by a worktree whose checkout is merely missing (say, an
+        // unmounted volume). Recreating a different `…/wt` must not clear it.
+        let (_guard, root) = tempdir();
+        let (repo, _) = main_repo(&root);
+        let other = root.join("volume").join("wt");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        add_worktree(&repo, &other, "feature");
+        std::fs::remove_dir_all(&other).unwrap();
+
+        let name = free_worktree_name(&repo, &root.join("elsewhere").join("wt")).unwrap();
+
+        assert_eq!(name, "wt-2");
+        assert!(
+            repo.find_worktree("wt").is_ok(),
+            "its metadata is untouched"
+        );
+    }
+
+    #[test]
     fn a_name_held_by_a_live_worktree_gets_a_suffix() {
         let (_guard, root) = tempdir();
         let (repo, _) = main_repo(&root);
@@ -988,6 +1138,11 @@ mod tests {
             let mode = std::fs::metadata(&file).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+
+        assert!(
+            !root.join("run").join("worktrees-closed.json.tmp").exists(),
+            "the staging file is renamed over the list, not left behind"
+        );
 
         let restarted = WorktreesService::new();
         restarted.load_closed(file);
