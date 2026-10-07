@@ -1,6 +1,6 @@
 # Extracting Google Workspace functionality into gwi
 
-**Status:** In Progress — phases 0-2 done, phase 3 (extract) not started
+**Status:** In Progress — phases 0-2 done, phase 3 under way (history imported; Gmail slice next)
 **ADRs:** [ADR-0095](../adrs/adr-0095.md) · [gwi ADR-0001](https://github.com/rust-works/gwi/blob/main/docs/adrs/adr-0001.md)
 
 Tracking issue: [#2203](https://github.com/rust-works/omni-dev/issues/2203). New project:
@@ -98,6 +98,53 @@ forked modules in omni-dev (`utils/secret*`, `utils/env.rs`, `utils/settings.rs`
 `request_log.rs`, `daemon/paths.rs`, `utils/{http,rate_limit,multipart,terminal,path}.rs`,
 `test_support.rs`) must be carried into the fork by hand.
 
+## History import
+
+Done in [gwi#2](https://github.com/rust-works/gwi/pull/2), merged 2026-10-07 as `73c22a7`.
+
+**Procedure** (reproducible from a clone of omni-dev pinned at the fork baseline):
+
+1. `git filter-repo --paths-from-file paths.txt --commit-callback "$(cat commit.py)"` on a
+   fresh `--no-local` clone. `paths.txt` lists `src/gmail.rs`, `src/gmail/`, `src/drive.rs`,
+   `src/drive/`, `src/cli/gmail.rs`, `src/cli/gmail/`, `src/cli/drive.rs`, `src/cli/drive/`,
+   the five `src/mcp/{gmail,drive*}_tools.rs`, `tests/drive_lease_exit_code_test.rs`,
+   `docs/{gmail,gmail-quickstart,drive,drive-quickstart}.md`,
+   `docs/plan/drive-content-hashing.md`, and a `glob:docs/adrs/adr-NNNN*.md` line for each of
+   the 27 ADRs (the glob matters: four have titled filenames).
+2. `commit.py` rewrites bare `#N` to `rust-works/omni-dev#N` and appends a trailer:
+
+   ```python
+   import re
+   msg = re.sub(rb'(?<![\w/#])#(\d+)\b', rb'rust-works/omni-dev#\1', commit.message)
+   commit.message = msg.rstrip() + b"\n\nomni-dev-commit: " + commit.original_id + b"\n"
+   ```
+
+3. In the gwi clone, `git rebase --onto origin/main --root` replays the filtered history
+   onto gwi's `main` (no conflicts: the paths are disjoint), then one commit of gwi's own
+   adds `autotests = false`.
+
+**Measured:** 46 path entries select 246 files; history shrinks from 3,311 commits (51 MB) to
+626 (5.6 MB), 590 after the rebase flattens 36 merge commits. The final tree of the moved
+paths is byte-identical to omni-dev at the baseline. 653 references over 262 distinct
+issues and PRs were rewritten; all 104 closing-keyword targets were already closed, so the
+push closed nothing. Signatures are lost (rewritten commits cannot keep them).
+
+**Pitfalls found:**
+
+- Cargo auto-discovers `tests/*.rs`, so the imported test would not compile in gwi until its
+  dependencies exist; `autotests = false` stays until each test is declared with `[[test]]`.
+- GitHub **refused to rebase-merge** the 591-commit PR (`rebaseable: false` although
+  `mergeable: true`, shown as "cannot be rebased due to conflicts"). A 100-commit probe was
+  rebaseable and a 250-commit probe never got a verdict, so there is a size limit somewhere
+  between; its exact value is not documented. gwi therefore allows **merge commits** and its
+  merge queue uses `MERGE`. (A force-push was never needed: rebasing onto `main` makes the
+  import a fast-forward of gwi's existing commits.)
+- With a non-required check red (the old commits fail gwi's commit lint on scopes and subject
+  length), `gh pr merge` falls back to auto-merge, which gwi disables; enqueue from the queue
+  button or with the `enqueuePullRequest` GraphQL mutation.
+- Importing again later (for example ADRs that land on omni-dev `main` after the baseline)
+  needs the same procedure with a narrower path list, rebased onto gwi's current `main`.
+
 ## Revised phases
 
 0. **Reserve and scaffold.** Done except the crates.io publish, which needs a token.
@@ -111,19 +158,25 @@ forked modules in omni-dev (`utils/secret*`, `utils/env.rs`, `utils/settings.rs`
    `legacy_audit_line_still_decodes_with_its_kind_and_context` (`request_log.rs`) and
    `backlog_renders_legacy_drive_mutation_and_audit_lines` (`cli/log/stream.rs`) cover the
    log. The fixture lines were captured from the 0.46.0 builders. See *Fork baseline*.
-3. **Extract.** Import history with `git filter-repo` (rewriting bare `#N` references to
-   `rust-works/omni-dev#N`); fork the shared modules; add the import command and
-   `gwi-mcp`; port docs, ADRs and the live-test notes; publish a real release.
+3. **Extract, Gmail first.** Gmail and Drive do not depend on each other in code (every
+   cross-reference between them is a doc comment), so phase 3 runs vertically rather than by
+   layer, to prove the whole pipeline on the ~39k-line Gmail half before the ~156k-line Drive
+   half that carries the lease and audit code:
+   1. **History import.** Done: [gwi#2](https://github.com/rust-works/gwi/pull/2). See
+      *History import*.
+   2. **Forked infrastructure**, only what Gmail needs, at the baseline above.
+   3. **Gmail** library, `gwi gmail` CLI, MCP tools and docs, with the import command for
+      Gmail settings.
+   4. **gwi 0.1.0, Gmail only**, a pre-1.0 release; the removal gate in ADR-0095 still needs
+      Drive too.
+   5. **Drive**, the same way (lease ledger, audit sink, write gate, macOS Touch ID code).
+   6. A second release.
 4. **Remove from omni-dev.** Stub release, then deletion; `Removed` bullet under
    `[Unreleased]`; `update-snapshots`; relocate the ADRs; check crate size and `cargo deny`.
 
 ## Open items and risks
 
 - `gwi` on crates.io is unreserved until the 0.0.1 placeholder is published.
-- Importing gwi's history into a repository whose `main` already has scaffold commits needs
-  either a one-time force-push (branch protection must be toggled) or an unrelated-history
-  merge. Prefer the force-push while `main` is a single commit, and treat it as a
-  user-authorised step.
 - Live testing uses a personal Google account and a test folder. Neither is recorded in the
   public repository; gwi documents the procedure with placeholders.
 - macOS-only code (Touch ID lease authentication, `authenticate`) and its target-specific
