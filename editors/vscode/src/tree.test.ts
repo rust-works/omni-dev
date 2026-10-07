@@ -3,6 +3,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { ClosedWorktreePayload } from "./socket";
 import {
   Node,
   PrBadge,
@@ -10,6 +11,11 @@ import {
   TreeWorktreePayload,
   WorktreeNode,
   checkStateDecoration,
+  closedChildNodes,
+  closedTargets,
+  elementId,
+  recentlyClosedOf,
+  rootNodes,
   describeReload,
   isCurrentWindow,
   needsPrFallback,
@@ -874,4 +880,78 @@ test("describeReload degrades to a nothing-to-do line when there were no targets
     describeReload({ signalled: 0, skipped: 2, self: 0 }),
     "omni-dev: nothing to reload.",
   );
+});
+
+const CLOSED: ClosedWorktreePayload[] = [
+  {
+    path: "/wt/a",
+    repo_root: "/home/me/omni-dev",
+    main_repo: "omni-dev",
+    branch: "a",
+    is_main: false,
+    removed: true,
+    closed_at: "2026-10-07T11:55:00Z",
+  },
+  {
+    path: "/wt/b",
+    repo_root: "/home/me/omni-dev",
+    main_repo: "omni-dev",
+    is_main: false,
+    removed: false,
+    closed_at: "2026-10-07T11:00:00Z",
+  },
+];
+
+test("rootNodes puts the Recently Closed group last, only when there are entries", () => {
+  const roots = rootNodes(REPOS, CLOSED);
+  assert.deepEqual(
+    roots.map((n) => n.kind),
+    [...REPOS.map(() => "repo"), "closedGroup"],
+  );
+  assert.deepEqual(roots[roots.length - 1], { kind: "closedGroup", closed: CLOSED });
+  // Nothing to reopen: exactly the repo rows, as before the feature existed.
+  assert.deepEqual(rootNodes(REPOS, []), reposToNodes(REPOS));
+  // And with no repos at all the group is the whole tree.
+  assert.deepEqual(
+    rootNodes([], CLOSED).map((n) => n.kind),
+    ["closedGroup"],
+  );
+});
+
+test("the group's children keep the order received", () => {
+  assert.deepEqual(
+    closedChildNodes(CLOSED).map((n) => n.entry.path),
+    ["/wt/a", "/wt/b"],
+  );
+});
+
+test("an absent recently_closed field reads as empty", () => {
+  assert.deepEqual(recentlyClosedOf({}), []);
+  assert.deepEqual(recentlyClosedOf({ recently_closed: CLOSED }), CLOSED);
+});
+
+test("element ids are distinct across the group and its rows", () => {
+  const [a, b] = closedChildNodes(CLOSED);
+  assert.equal(elementId({ kind: "closedGroup", closed: CLOSED }), "closed-group");
+  assert.equal(elementId(a), "closed:/wt/a");
+  assert.notEqual(elementId(a), elementId(b));
+  assert.equal(elementId(reposToNodes(REPOS)[0]), nodeId(reposToNodes(REPOS)[0]));
+});
+
+test("selectionTargets drops closed rows and the group, so item actions never see them", () => {
+  const [a] = closedChildNodes(CLOSED);
+  const group = { kind: "closedGroup", closed: CLOSED } as const;
+  const repo = reposToNodes(REPOS)[0];
+  assert.deepEqual(selectionTargets(a, undefined), []);
+  assert.deepEqual(selectionTargets(group, [group, a]), []);
+  assert.deepEqual(selectionTargets(a, [repo, a]), [repo]);
+});
+
+test("closedTargets picks the closed rows of a selection, deduplicated", () => {
+  const [a, b] = closedChildNodes(CLOSED);
+  const repo = reposToNodes(REPOS)[0];
+  assert.deepEqual(closedTargets(a, undefined), [a]);
+  assert.deepEqual(closedTargets(a, [repo, b, a, b]), [b, a]);
+  assert.deepEqual(closedTargets(repo, undefined), []);
+  assert.deepEqual(closedTargets(undefined, undefined), []);
 });
