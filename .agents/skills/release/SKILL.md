@@ -65,33 +65,20 @@ This skill performs the complete end-to-end release process for omni-dev, from v
 
    Update any docs that are outdated before proceeding.
 
-8. **Update CHANGELOG.md** (crate)
-   - Reconcile `[Unreleased]` against `git log --oneline vPREV..origin/main`; it is routinely incomplete.
-   - Check that nothing landed in an already-released section after its tag was cut (#2129). The `Changelog Check` workflow rejects it on pull requests and queue entries, but only blocks if its context is required, so audit `main`. Any finding is a late bullet that belongs in the new section:
+8. **Assemble CHANGELOG.md** (crate) from the fragments in `changelog.d/` (#2213; see `changelog.d/README.md`)
+   - Reconcile the fragments against `git log --oneline vPREV..origin/main`: a commit with a user-visible effect and no fragment (a wrong `Changelog: none` trailer) gets one now.
+   - Preview, then write the section:
      ```bash
-     PREV=A.B.C   # previous crate version
-     python3 scripts/check_changelog.py --base "v$PREV" --no-extension-check
+     python3 scripts/changelog.py collect --component crate --version X.Y.Z --dry-run
+     python3 scripts/changelog.py collect --component crate --version X.Y.Z
      ```
-   - Add new version section: `## [X.Y.Z] - YYYY-MM-DD`, and leave an empty `## [Unreleased]` above it
-   - Document all changes since last release under appropriate categories:
-     - **Added**: New features
-     - **Changed**: Changes in existing functionality
-     - **Deprecated**: Soon-to-be removed features
-     - **Removed**: Now removed features
-     - **Fixed**: Bug fixes
-     - **Security**: Vulnerability fixes
-     - **Documentation**: Docs-only changes
-     - **CI/CD**: Build/workflow changes
-   - Update version comparison links at bottom:
-     ```markdown
-     [Unreleased]: https://github.com/rust-works/omni-dev/compare/vX.Y.Z...HEAD
-     [X.Y.Z]: https://github.com/rust-works/omni-dev/compare/vPREV...vX.Y.Z
-     ```
+     It adds `## [X.Y.Z] - <today>` under an empty `## [Unreleased]` (sections Added, Changed, Deprecated, Removed, Fixed, Security, CI/CD, Documentation; entries by issue number), updates the compare links at the bottom, and deletes the consumed fragments. The first release after #2213 also carries the hand-written `[Unreleased]` text into the section verbatim.
+   - Read the rendered section; the release commit is the one place the changelog is edited by hand.
 
-9. **Update editors/vscode/CHANGELOG.md** (extension)
-   - Move `[Unreleased]` into `## [A.B.C] - YYYY-MM-DD`. Both registries render a Changelog tab from it, so every published version needs an entry.
-   - Reconcile against `git log --oneline vscode-vPREV..origin/main -- editors/vscode`. This file lags more often than the root one: changes are often recorded only in the root changelog.
-   - Then run `python3 scripts/check_changelog.py --base "vscode-vPREV"`. It is a floor, not the reconciliation: it fails when the extension changed user-visibly since that tag and its changelog gained nothing, or when a bullet sits in an already-released section of either changelog.
+9. **Assemble editors/vscode/CHANGELOG.md** (extension) from `changelog.d/vscode/`
+   - Both registries render a Changelog tab from it, so every published version needs an entry.
+   - Reconcile against `git log --oneline vscode-vPREV..origin/main -- editors/vscode` and `ls changelog.d/vscode/`.
+   - `python3 scripts/changelog.py collect --component vscode --version A.B.C` (preview with `--dry-run` first). This changelog has no compare links.
 
 ### Phase 3: Version Update
 
@@ -134,12 +121,12 @@ This skill performs the complete end-to-end release process for omni-dev, from v
 
 15. **Commit the Crate Release**
     ```bash
-    git add Cargo.toml Cargo.lock CHANGELOG.md
+    git add -A -- Cargo.toml Cargo.lock CHANGELOG.md changelog.d ':!changelog.d/vscode'
     git commit -m "$(cat <<'EOF'
     chore(release): prepare release vX.Y.Z
 
     - Update version from PREV to X.Y.Z
-    - Update CHANGELOG.md with release notes
+    - Assemble CHANGELOG.md from the changelog.d fragments
     EOF
     )"
     ```
@@ -147,12 +134,12 @@ This skill performs the complete end-to-end release process for omni-dev, from v
 
 16. **Commit the Extension Release**
     ```bash
-    git add editors/vscode/package.json editors/vscode/package-lock.json editors/vscode/CHANGELOG.md
+    git add editors/vscode/package.json editors/vscode/package-lock.json editors/vscode/CHANGELOG.md && git add -A -- changelog.d/vscode
     git commit -m "$(cat <<'EOF'
     chore(release): prepare vscode extension release vA.B.C
 
     - Update version from PREV to A.B.C in package.json and package-lock.json
-    - Update the extension CHANGELOG.md with release notes
+    - Assemble the extension CHANGELOG.md from the changelog.d/vscode fragments
     EOF
     )"
     ```
@@ -170,7 +157,7 @@ This skill performs the complete end-to-end release process for omni-dev, from v
     ```bash
     gh pr view <PR> --json state,mergeCommit
     ```
-    Poll until `state` is `MERGED`. If `main` moved and `CHANGELOG.md` now conflicts, rebase the branch onto `origin/main`, resolve it, push and enqueue again. If the queue ejects the entry, fix the failing check on the branch and re-enqueue.
+    Poll until `state` is `MERGED`. If `main` moved and the branch now conflicts, rebase the branch onto `origin/main`, resolve it, push and enqueue again. If the queue ejects the entry, fix the failing check on the branch and re-enqueue.
 
 ### Phase 6: Tag the Rebased Commits
 

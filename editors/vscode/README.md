@@ -332,10 +332,12 @@ What is specific to the extension:
   `npm version X.Y.Z --no-git-tag-version --ignore-scripts --allow-same-version`
   in this directory. It changes `package.json` and the two omni-dev entries at the
   top of `package-lock.json`, and nothing else.
-- In [`CHANGELOG.md`](CHANGELOG.md), move the `[Unreleased]` items into a new
-  `## [X.Y.Z] - YYYY-MM-DD` section (add one if `[Unreleased]` is empty), grouped
-  under Keep a Changelog headings (Added / Changed / Fixed / …). Add entries to
-  `[Unreleased]` as changes land, not all at once here.
+- Pull requests do not edit [`CHANGELOG.md`](CHANGELOG.md): a user-visible
+  change adds a fragment under
+  [`changelog.d/vscode/`](../../changelog.d/README.md) as it lands. The release
+  assembles them into a new `## [X.Y.Z] - YYYY-MM-DD` section with
+  `python3 scripts/changelog.py collect --component vscode --version X.Y.Z`
+  (run from the repository root; `--dry-run` previews).
 
 A one-time account + secrets setup is required before the first publish:
 

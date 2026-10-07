@@ -95,5 +95,5 @@ When bumping version, update:
 
 1. **Cargo.toml** - `version = "X.Y.Z"`
 2. **Cargo.lock** - Refresh the `omni-dev` package version (for example, by running `cargo check`) and include the lockfile change
-3. **CHANGELOG.md** - Add `## [X.Y.Z] - YYYY-MM-DD` section
-4. **Version links** - Update comparison URLs at bottom of CHANGELOG.md
+3. **CHANGELOG.md** - Run `python3 scripts/changelog.py collect --component crate --version X.Y.Z`, which adds the `## [X.Y.Z] - YYYY-MM-DD` section from the `changelog.d/` fragments
+4. **Version links** - `collect` updates the comparison URLs at the bottom of CHANGELOG.md; check them

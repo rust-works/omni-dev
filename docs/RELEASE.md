@@ -92,40 +92,20 @@ version = "X.Y.Z"
 
 The quality checks below build the crate, which rewrites the `omni-dev` entry in `Cargo.lock`; commit it with the version.
 
-**Changelog.** Update `CHANGELOG.md` following [Keep a Changelog](https://keepachangelog.com/) format.
+**Changelog.** Assemble `CHANGELOG.md` from the fragments in [`changelog.d/`](../changelog.d/README.md) ([#2213](https://github.com/rust-works/omni-dev/issues/2213)). Pull requests do not edit the changelog; each adds a `changelog.d/<issue>.<type>.md` file, and `collect` renders them into the release section in [Keep a Changelog](https://keepachangelog.com/) order (Added, Changed, Deprecated, Removed, Fixed, Security, then CI/CD and Documentation).
 
-1. Reconcile `[Unreleased]` against the commit log first. It is routinely incomplete, so compare it with `git log --oneline vPREV..origin/main` and add what is missing.
+1. Reconcile the fragments against the commit log first. The `Changelog` check requires a fragment or a `Changelog: none` trailer on every pull request, but a trailer can be wrong, so compare `git log --oneline vPREV..origin/main` with `ls changelog.d/` and add a fragment for anything user-visible that is missing.
 
-2. Check that nothing landed in an **already-released** section after its tag was cut. A pull request branched before the previous release can add its bullet under `[Unreleased]`, and when that heading is renamed to the release the bullet merges into the now-released section (see [#2129](https://github.com/rust-works/omni-dev/issues/2129)). The `Changelog Check` workflow rejects this on every pull request and merge-queue entry, but it blocks only if its context is required, so audit what is actually on `main`. Any finding is a bullet added late, and belongs in the new section:
+2. Preview, then write the section:
 
    ```bash
-   PREV=A.B.C   # the previous crate version
-   python3 scripts/check_changelog.py --base "v$PREV" --no-extension-check
+   python3 scripts/changelog.py collect --component crate --version X.Y.Z --dry-run
+   python3 scripts/changelog.py collect --component crate --version X.Y.Z
    ```
 
-   See [Changelog Check](#changelog-check) for what the script judges and how to opt out.
+   `collect` adds `## [X.Y.Z] - <today>` under an empty `## [Unreleased]`, sorts entries by issue number, updates the `[Unreleased]` and `[X.Y.Z]` compare links at the bottom, and deletes the fragments it consumed (`--date YYYY-MM-DD` overrides the date). The first release after #2213 also carries the text written by hand under `[Unreleased]` before fragments existed into the section verbatim, after the fragment sections.
 
-3. Add the new version section with the current date:
-   ```markdown
-   ## [X.Y.Z] - YYYY-MM-DD
-   ```
-
-4. Move the unreleased changes into it under the appropriate categories:
-   - **Added**: New features
-   - **Changed**: Changes in existing functionality
-   - **Deprecated**: Soon-to-be removed features
-   - **Removed**: Removed features
-   - **Fixed**: Bug fixes
-   - **Security**: Security improvements
-   - **Documentation**, **CI/CD**: Docs-only and workflow changes
-
-   Leave an empty `## [Unreleased]` heading above it.
-
-5. Update the version links at the bottom of the changelog:
-   ```markdown
-   [Unreleased]: https://github.com/rust-works/omni-dev/compare/vX.Y.Z...HEAD
-   [X.Y.Z]: https://github.com/rust-works/omni-dev/compare/vPREV...vX.Y.Z
-   ```
+3. Read the rendered section and edit it in place if an entry needs it: the release commit is the one place the changelog is edited by hand.
 
 **Quality checks.** Run them to ensure the release is ready:
 
@@ -139,11 +119,11 @@ cargo build --release
 **Commit.** One commit for the crate, with the conventional-commit scope `release`:
 
 ```bash
-git add Cargo.toml Cargo.lock CHANGELOG.md
+git add -A -- Cargo.toml Cargo.lock CHANGELOG.md changelog.d ':!changelog.d/vscode'
 git commit -m "chore(release): prepare release vX.Y.Z
 
 - Update version from PREV to X.Y.Z
-- Update CHANGELOG.md with release notes"
+- Assemble CHANGELOG.md from the changelog.d fragments"
 ```
 
 The subject must match this form exactly: step 6 finds the rebased commit by it.
@@ -161,14 +141,16 @@ git diff --stat -- editors/vscode   # expect only package.json and package-lock.
 
 The subshell keeps your shell at the repository root for the `git add` below. Prefer this to a plain `npm install`, which re-resolves the whole lockfile and can pull unrelated dependency changes into the release commit. `--allow-same-version` covers a feature commit that already bumped `package.json` and left `package-lock.json` behind (this has happened): without it npm stops at `Version not changed` and never repairs the lockfile. Either way, check that all three version strings agree.
 
-**Changelog.** Update [`editors/vscode/CHANGELOG.md`](../editors/vscode/CHANGELOG.md): move `[Unreleased]` into a new `## [A.B.C] - YYYY-MM-DD` section. Both registries render a **Changelog** tab from it, so every published version needs an entry. As with the crate, reconcile it against the log first, and it lags more often because changes are often recorded only in the root changelog:
+**Changelog.** Assemble [`editors/vscode/CHANGELOG.md`](../editors/vscode/CHANGELOG.md) from the fragments in `changelog.d/vscode/`. Both registries render a **Changelog** tab from it, so every published version needs an entry. Reconcile the fragments against the log first:
 
 ```bash
 git log --oneline vscode-vPREV..origin/main -- editors/vscode
-python3 scripts/check_changelog.py --base "vscode-vPREV"
+ls changelog.d/vscode/
+python3 scripts/changelog.py collect --component vscode --version A.B.C --dry-run
+python3 scripts/changelog.py collect --component vscode --version A.B.C
 ```
 
-The script is a floor, not the reconciliation: it fails when the extension changed user-visibly since that tag and its changelog gained nothing, and when a bullet sits in an already-released section of either changelog.
+The extension's changelog has no compare links, so `collect` only adds the section and deletes the consumed fragments. It refuses a release with no fragments and an empty `[Unreleased]`; write a fragment saying what the release carries rather than publish a version with no entry.
 
 **Checks.** The release workflow re-runs these, so run them first:
 
@@ -179,11 +161,11 @@ The script is a floor, not the reconciliation: it fails when the extension chang
 **Commit.**
 
 ```bash
-git add editors/vscode/package.json editors/vscode/package-lock.json editors/vscode/CHANGELOG.md
+git add editors/vscode/package.json editors/vscode/package-lock.json editors/vscode/CHANGELOG.md && git add -A -- changelog.d/vscode
 git commit -m "chore(release): prepare vscode extension release vA.B.C
 
 - Update version from PREV to A.B.C in package.json and package-lock.json
-- Update the extension CHANGELOG.md with release notes"
+- Assemble the extension CHANGELOG.md from the changelog.d/vscode fragments"
 ```
 
 ### 4. Check the Publish Tokens
@@ -219,7 +201,7 @@ The merge queue builds the entry on a `gh-readonly-queue/main/...` branch and re
 gh pr view <PR> --json state,mergeCommit
 ```
 
-If `main` moves before the queue reaches your entry and `CHANGELOG.md` now conflicts, rebase the branch onto `origin/main`, resolve it, push and enqueue again.
+If `main` moves before the queue reaches your entry and the branch now conflicts (a version file, or a changelog another release touched), rebase the branch onto `origin/main`, resolve it, push and enqueue again. Feature pull requests add their own fragment files rather than editing `CHANGELOG.md`, so they no longer conflict there.
 
 ### 6. Create the Tags on the Rebased Commits
 
@@ -471,26 +453,24 @@ The automated release pipeline requires these GitHub secrets:
 
 ### Changelog Check
 
-`scripts/check_changelog.py` ([#2129](https://github.com/rust-works/omni-dev/issues/2129)) guards both changelogs. It judges a change against the merge base with `--base`, so a pull request is blamed only for what it adds, and the workflow runs it on the pull request's merge ref and on the merge-queue branch. The first mistake is made by the merge rather than by the pull request, so a check of the pull request's own diff could not see it.
+`scripts/changelog.py` ([#2213](https://github.com/rust-works/omni-dev/issues/2213), [ADR-0097](adrs/adr-0097.md)) replaced `scripts/check_changelog.py` (#2129). Pull requests add [changelog fragments](../changelog.d/README.md) instead of editing either changelog, so two in flight never conflict, and none can have its bullet applied inside a section a release has since closed. The workflow runs:
 
-- **No bullet added to a released section.** A section is released when the base changelog has it and it is not `[Unreleased]`. The check fails if such a section gains a bullet, in `CHANGELOG.md` or `editors/vscode/CHANGELOG.md`. A section that exists only in the change is a release in preparation, so a release-prep pull request passes. Moving a bullet out to `[Unreleased]` (the fix for a failure) adds nothing, and neither does fixing a typo: a bullet that is at least 80% similar to one the change removed from the same section counts as a rewording of it. A bullet swapped for an unrelated one is an addition.
-- **A user-visible extension change needs an entry.** A change under `editors/vscode/` that is not a test, the changelog or readme, the lockfile, build configuration or a dotfile must add a bullet under the extension's `[Unreleased]`, or open a release section that holds one. Changes to `package.json` count only when they go beyond `devDependencies`, `scripts` and `version`.
+- **`check`**, on pull requests and merge-queue entries: every file in `changelog.d/` and `changelog.d/vscode/` other than `README.md` must be a valid fragment (`<id>.<type>[.<n>].md`, a known type, a body that is one or more bullets with indented continuations), so a typo cannot silently drop an entry at release.
+- **`check-pr`**, on pull requests only, judged against the merge base with the base branch:
+  - **A fragment is required.** The pull request must add, edit or rename one.
+  - **A user-visible extension change needs an extension fragment** under `changelog.d/vscode/`. A change under `editors/vscode/` counts unless it is a test, the changelog or readme, the lockfile, build configuration or a dotfile; a change to `package.json` counts only when it goes beyond `devDependencies`, `scripts` and `version`.
+  - **The changelogs are not edited directly.** A pull request that changes `CHANGELOG.md` or `editors/vscode/CHANGELOG.md` fails, unless it is a release: one that adds a new `## [X.Y.Z]` section to that changelog. The title is never consulted.
 
-Opt-outs are commit trailers, because commit messages exist on a merge-queue entry and a pull request body does not. A trailer belongs in the last paragraph of the message, beside `Closes #N`; the same words in the body waive nothing. It waives the rule for the whole change, whichever commit carries it. Say why after the keyword:
+  These are properties of the pull request, which a queue rebase cannot change, so the merge-queue run checks fragment validity only.
 
-| Trailer                              | Waives                                                                      |
-|--------------------------------------|-----------------------------------------------------------------------------|
-| `Changelog: none <reason>`           | The extension entry, for a change that is not user-visible after all        |
-| `Changelog: amend-released <reason>` | The released-section rule, for a deliberate backfill of a published release |
+Waivers are commit trailers, because commit messages exist on the pull request and on its queue entry while a pull request body is not under review. A trailer belongs in the last paragraph of the message, beside `Closes #N`; the same words in the body waive nothing. It waives the rule for the whole pull request, whichever commit carries it. Say why after the keyword:
 
-`python3 scripts/check_changelog.py --help` lists the flags, and `python3 -m unittest discover -s scripts -p 'test_*.py'` runs its tests. The workflow has no `paths:` filter, so its `Changelog` context reports on every pull request and can be made required without deadlocking one that touches no changelog. **It is not required yet, so the merge queue does not wait for it.** The merge-queue run is the authoritative one, since a pull request's own run is not repeated when `main` moves. Making it required is a branch-protection change:
+| Trailer                              | Waives                                                                                       |
+|--------------------------------------|----------------------------------------------------------------------------------------------|
+| `Changelog: none <reason>`           | Both fragment requirements, for a change with no user-visible effect (docs, CI, a refactor)  |
+| `Changelog: amend-released <reason>` | The direct-edit rule (and the fragment requirement), to correct an already published section |
 
-```bash
-gh api -X POST repos/rust-works/omni-dev/branches/main/protection/required_status_checks/contexts \
-  --input - <<< '["Changelog"]'
-```
-
-Every run prints `N commit(s) since <base>`. On a queue entry that base must be the previous entry's tip, not the branch point: queue entries are stacked, and a base that included earlier entries' changes would blame one entry for another's, or let a release-prep entry hide the bullet behind it.
+A pull request opened by a bot (Dependabot) is waived. `python3 scripts/changelog.py --help` lists the subcommands, `python3 scripts/changelog.py check-pr --base origin/main` runs the pull request check locally, and `python3 -m unittest discover -s scripts -p 'test_*.py'` runs the tests. The workflow has no `paths:` filter, so its `Changelog` context reports on every pull request and merge-queue entry; it is a required status check on `main`.
 
 ## Security Notes
 

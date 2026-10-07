@@ -113,7 +113,7 @@ across sibling directories.
 
 - Update the README.md if your changes affect usage
 - Add doc comments for new public APIs
-- Update CHANGELOG.md for notable changes, adding bullets under `[Unreleased]` only. A user-visible change to the VS Code extension also needs a bullet in `editors/vscode/CHANGELOG.md`. The Changelog Check workflow enforces both; see [Changelog Check](docs/RELEASE.md#changelog-check) for the opt-outs
+- Add a changelog fragment, not a bullet in `CHANGELOG.md`: `changelog.d/<issue>.<type>.md` for the crate, and `changelog.d/vscode/<issue>.<type>.md` for a user-visible change to the VS Code extension (see [changelog.d/README.md](changelog.d/README.md)). The release assembles the changelogs from them. The Changelog Check workflow requires one; a change with no user-visible effect carries a `Changelog: none <reason>` commit trailer instead, see [Changelog Check](docs/RELEASE.md#changelog-check)
 
 ## Pull Request Process
 

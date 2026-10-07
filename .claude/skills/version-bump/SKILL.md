@@ -94,5 +94,5 @@ For versions < 1.0.0 (like this project):
 When bumping version, update:
 
 1. **Cargo.toml** - `version = "X.Y.Z"`
-2. **CHANGELOG.md** - Add `## [X.Y.Z] - YYYY-MM-DD` section
-3. **Version links** - Update comparison URLs at bottom of CHANGELOG.md
+2. **CHANGELOG.md** - Run `python3 scripts/changelog.py collect --component crate --version X.Y.Z`, which adds the `## [X.Y.Z] - YYYY-MM-DD` section from the `changelog.d/` fragments
+3. **Version links** - `collect` updates the comparison URLs at the bottom of CHANGELOG.md; check them
