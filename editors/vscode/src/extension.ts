@@ -58,22 +58,25 @@ import { agentTerminalIdentity, agentTerminalOptions } from "./agentTerminal";
 import { moveClaudeSessionHere } from "./moveSessionCommand";
 import { pushForceWithLease } from "./pushCommand";
 import { rebaseOnMain } from "./rebaseCommand";
+import { reopenClosedWorktree } from "./reopenCommand";
 import { RowColorMap } from "./icons";
 import { clearAllRowColors, setRowColor } from "./rowColorCommand";
 import {
   AheadBehindMap,
   Node,
   PrBadge,
+  TreeElement,
   TreeGithubIdentity,
   TreeRepoPayload,
   WorktreeNode,
   describeReload,
+  elementId,
   isCurrentWindow,
   nodeDirectories,
-  nodeId,
   partitionByRole,
   partitionByWindow,
   partitionSelfLast,
+  recentlyClosedOf,
   repoLabel,
   selectionTargets,
   withoutPrBadges,
@@ -145,7 +148,7 @@ let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 let output: vscode.OutputChannel | undefined;
 
 // --- Tree-view UI state ------------------------------------------------------
-let treeView: vscode.TreeView<Node> | undefined;
+let treeView: vscode.TreeView<TreeElement> | undefined;
 let provider: WorktreesTreeDataProvider | undefined;
 /** Paints PR-check badges and combined check/session colours; pulsed on snapshots. */
 let decorationProvider: WorktreeDecorationProvider | undefined;
@@ -613,7 +616,7 @@ function setupTreeView(context: vscode.ExtensionContext): void {
   // `(clicked, selected[])`, and each handler resolves its targets through
   // `selectionTargets` and re-validates them (the `when` clause only ever saw the
   // *clicked* row, so a mixed selection can reach any handler).
-  const view = vscode.window.createTreeView<Node>(TREE_VIEW_ID, {
+  const view = vscode.window.createTreeView<TreeElement>(TREE_VIEW_ID, {
     treeDataProvider: treeProvider,
     showCollapseAll: true,
     canSelectMany: true,
@@ -635,8 +638,12 @@ function setupTreeView(context: vscode.ExtensionContext): void {
 
   const sub = new TreeSubscription(socketPath(), {
     onSnapshot: (snapshot) => {
-      view.message = snapshot.repos.length === 0 ? EMPTY_MESSAGE : undefined;
-      treeProvider.update(visibleRepos(snapshot.repos));
+      // A daemon predating #2211 sends no `recently_closed`, which reads as empty.
+      const closed = recentlyClosedOf(snapshot);
+      // With nothing open but something to reopen, the Recently Closed group is the
+      // useful content, so the "nothing open" hint steps aside for it.
+      view.message = snapshot.repos.length === 0 && closed.length === 0 ? EMPTY_MESSAGE : undefined;
+      treeProvider.update(visibleRepos(snapshot.repos), closed);
       rememberWorktreePaths(snapshot.repos);
       // The daemon-backed toggle rides every snapshot, so a flip in any window
       // re-renders this one and a fresh window initializes on its first frame.
@@ -706,7 +713,9 @@ function setupTreeView(context: vscode.ExtensionContext): void {
     // Fires from `TreeItem.command`, which passes only its own declared
     // `arguments` — never the `(clicked, selected[])` pair a `view/item/context`
     // command gets — so this one stays single-node.
-    vscode.commands.registerCommand(ITEM_CLICKED_COMMAND, (node?: Node) => onItemClicked(node)),
+    vscode.commands.registerCommand(ITEM_CLICKED_COMMAND, (node?: TreeElement) =>
+      onItemClicked(node),
+    ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.openWorktree",
       (node?: Node, selected?: Node[]) => void openWorktrees(node, selected),
@@ -716,6 +725,13 @@ function setupTreeView(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "omniDevWorktrees.openGithubRepository",
       (node?: Node, selected?: Node[]) => void openGithubRepository(node, selected),
+    ),
+    // Recently Closed (#2211). Palette-invocable with no argument (a quick-pick over
+    // a fresh `recent-closed` fetch) as well as from a closed row's inline button.
+    vscode.commands.registerCommand(
+      "omniDevWorktrees.reopenClosedWorktree",
+      (node?: TreeElement, selected?: TreeElement[]) =>
+        void reopenClosedWorktree({ send }, node, selected),
     ),
     vscode.commands.registerCommand(
       "omniDevWorktrees.closeWorktree",
@@ -969,16 +985,17 @@ async function setPolling(
  * same item within {@link DOUBLE_CLICK_MS} opens it, otherwise the click is just
  * recorded and VS Code's native selection stands.
  */
-function onItemClicked(node?: Node): void {
-  if (!node || node.kind !== "worktree") {
+function onItemClicked(node?: TreeElement): void {
+  if (!node || (node.kind !== "worktree" && node.kind !== "closed")) {
     lastClick = undefined;
     return;
   }
-  const id = nodeId(node);
+  const id = elementId(node);
   const now = Date.now();
   if (lastClick && lastClick.id === id && now - lastClick.at <= DOUBLE_CLICK_MS) {
     lastClick = undefined;
-    void openNode(node);
+    // A Recently Closed row (#2211) reopens; a live one focuses its window.
+    void (node.kind === "closed" ? reopenClosedWorktree({ send }, node) : openNode(node));
     return;
   }
   lastClick = { id, at: now };
@@ -1989,7 +2006,8 @@ async function refreshTree(): Promise<void> {
   const reply = await send(treeEnvelope());
   if (reply?.ok && Array.isArray(reply.payload?.repos)) {
     const repos = reply.payload.repos as TreeRepoPayload[];
-    provider?.update(visibleRepos(repos));
+    const closed = recentlyClosedOf(reply.payload);
+    provider?.update(visibleRepos(repos), closed);
     rememberWorktreePaths(repos);
     // The one-shot `tree` reply carries `show_closed` too, so a manual refresh
     // (subscription momentarily down) keeps the toggle applied (#1301).
@@ -1998,7 +2016,7 @@ async function refreshTree(): Promise<void> {
     refreshDecorations();
     syncSessionCues();
     if (treeView) {
-      treeView.message = repos.length === 0 ? EMPTY_MESSAGE : undefined;
+      treeView.message = repos.length === 0 && closed.length === 0 ? EMPTY_MESSAGE : undefined;
     }
   }
 }

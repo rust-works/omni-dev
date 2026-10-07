@@ -592,6 +592,85 @@ export function reloadEnvelope(targetKeys: string[]): Envelope {
 }
 
 /**
+ * One recently closed worktree (#2211) — the daemon's `ClosedWorktree`, carried on
+ * the `recently_closed` snapshot field and the `recent-closed` reply. `removed`
+ * tells the two cases apart: `false` means only the window was closed (the folder
+ * is still on disk), `true` means the worktree itself was deleted.
+ */
+export interface ClosedWorktreePayload {
+  /** Absolute, canonical path of the worktree folder. */
+  path: string;
+  /** Absolute path of the repository's main working tree. */
+  repo_root: string;
+  /** The repository's directory name. */
+  main_repo: string;
+  github?: { owner: string; name: string };
+  /** Absent when HEAD was detached. */
+  branch?: string;
+  head_sha?: string;
+  /** Main working tree (`true`) vs linked worktree (`false`). */
+  is_main: boolean;
+  removed: boolean;
+  /** RFC 3339 timestamp. */
+  closed_at: string;
+}
+
+/** The `recent-closed` reply payload, newest first. */
+export interface RecentClosedReply {
+  closed?: ClosedWorktreePayload[];
+}
+
+/**
+ * Builds a `recent-closed` envelope — the fresh list behind the "Reopen Closed
+ * Worktree…" quick-pick (#2211). The pushed `recently_closed` snapshot field feeds
+ * the tree; this op is for a picker that must not trust a stale view. An older
+ * daemon without the op replies `{ ok: false }`.
+ */
+export function recentClosedEnvelope(): Envelope {
+  return { service: WORKTREES_SERVICE, op: "recent-closed" };
+}
+
+/**
+ * What the daemon's side-effect-free `reopen` phase reports for a removed
+ * worktree: whether it can be recreated, from what, and why not. `warnings` are
+ * shown verbatim in the confirmation.
+ */
+export interface ReopenPlan {
+  restorable: boolean;
+  source?: "branch" | "head-sha";
+  branch?: string;
+  head_sha?: string;
+  reason?: string;
+  warnings?: string[];
+}
+
+/**
+ * A `reopen` reply. A window-closed entry replies `reopened:true,
+ * recreated:false` straight away; a removed entry replies a `plan` until the
+ * client confirms, then `reopened:true, recreated:true`.
+ */
+export interface ReopenReply {
+  reopened?: boolean;
+  recreated?: boolean;
+  source?: "branch" | "head-sha";
+  plan?: ReopenPlan;
+}
+
+/**
+ * Builds a `reopen` envelope (#2211). Without `confirmed` it is side-effect free
+ * for a removed worktree (it returns a plan); `confirmed:true` recreates it. Only
+ * the recorded `path` is sent — the daemon never takes a branch or destination
+ * from the client, so a request cannot make it create a worktree anywhere else.
+ */
+export function reopenEnvelope(path: string, confirmed?: boolean): Envelope {
+  const payload: { path: string; confirmed?: boolean } = { path };
+  if (confirmed) {
+    payload.confirmed = true;
+  }
+  return { service: WORKTREES_SERVICE, op: "reopen", payload };
+}
+
+/**
  * The fields a window reports on the sessions `window` op (mirrors `WindowReport`
  * in `src/sessions.rs`) — how many Claude editor tabs / integrated terminals this
  * window has, plus its folders, so the daemon can tag a session's source as VS

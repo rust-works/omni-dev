@@ -17,7 +17,9 @@ import {
   heartbeatEnvelope,
   mergeQueueCheckEnvelope,
   mergeQueueEnvelope,
+  recentClosedEnvelope,
   reloadEnvelope,
+  reopenEnvelope,
   repositionEnvelope,
   repositionUndoEnvelope,
   openEnvelope,
@@ -263,4 +265,28 @@ test("merge-queue envelope builders match the two-phase batched wire contract", 
     op: "merge-queue",
     payload: { paths: ["/wt/a"], requester_key: "k1", confirmed: true },
   });
+});
+
+test("recent-closed envelope is payload-less and routed to the worktrees service", () => {
+  assert.deepEqual(recentClosedEnvelope(), { service: "worktrees", op: "recent-closed" });
+});
+
+test("reopen envelope sends only the recorded path", () => {
+  // Phase 1 omits `confirmed` entirely: the daemon treats absent as false, and an
+  // explicit false would be a second spelling of the same side-effect-free call.
+  assert.deepEqual(reopenEnvelope("/wt/issue-2211"), {
+    service: "worktrees",
+    op: "reopen",
+    payload: { path: "/wt/issue-2211" },
+  });
+  assert.equal("confirmed" in (reopenEnvelope("/wt/x", false).payload as object), false);
+  assert.deepEqual(reopenEnvelope("/wt/issue-2211", true).payload, {
+    path: "/wt/issue-2211",
+    confirmed: true,
+  });
+  // Never a branch or destination: the daemon only accepts what it recorded.
+  assert.deepEqual(Object.keys(reopenEnvelope("/wt/x", true).payload as object).sort(), [
+    "confirmed",
+    "path",
+  ]);
 });

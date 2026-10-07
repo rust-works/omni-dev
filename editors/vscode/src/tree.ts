@@ -9,6 +9,8 @@
 
 import * as path from "path";
 
+import { ClosedWorktreePayload } from "./socket";
+
 /** A GitHub `owner/name` identity, present only for `github.com` origins. */
 export interface TreeGithubIdentity {
   owner: string;
@@ -280,6 +282,19 @@ export interface TreeSnapshot {
    * read as `true` (show all, the original behavior).
    */
   show_closed?: boolean;
+  /**
+   * Worktrees recently closed in any window, newest first (#2211) — the data behind
+   * the Recently Closed group. Omitted by the daemon when empty, and by a daemon
+   * predating the feature, so absent reads as `[]` (see {@link recentlyClosedOf}).
+   */
+  recently_closed?: ClosedWorktreePayload[];
+}
+
+/** A snapshot's recently-closed list, with an absent field (empty, or an older daemon) as `[]`. */
+export function recentlyClosedOf(snapshot: {
+  recently_closed?: ClosedWorktreePayload[];
+}): ClosedWorktreePayload[] {
+  return Array.isArray(snapshot.recently_closed) ? snapshot.recently_closed : [];
 }
 
 /**
@@ -290,6 +305,48 @@ export interface TreeSnapshot {
 export type Node =
   | { kind: "repo"; repo: TreeRepoPayload }
   | { kind: "worktree"; repo: TreeRepoPayload; wt: TreeWorktreePayload };
+
+/**
+ * The Recently Closed group row (#2211): the last root node, present only when the
+ * list is non-empty. Carries the entries so its children need no second lookup.
+ */
+export type ClosedGroupNode = { kind: "closedGroup"; closed: ClosedWorktreePayload[] };
+
+/** One recently closed worktree, a child of the {@link ClosedGroupNode}. */
+export type ClosedNode = { kind: "closed"; entry: ClosedWorktreePayload };
+
+/**
+ * Everything the tree view can hold: a {@link Node} plus the Recently Closed group
+ * and its rows.
+ *
+ * Kept apart from {@link Node} on purpose. Nearly every action takes a `Node` and
+ * reads its `repo`, which a closed row has none of; widening `Node` itself would
+ * make each of those sites guard against a case their menus never offer. Instead
+ * {@link selectionTargets} narrows a selection back to `Node`s at the one boundary,
+ * so a stray closed row in a multi-selection is dropped rather than dereferenced.
+ */
+export type TreeElement = Node | ClosedGroupNode | ClosedNode;
+
+/**
+ * The tree's root nodes: every repository in the daemon's order, then — only when
+ * there is something to reopen — the Recently Closed group, collapsed by the
+ * provider. Last, so it never pushes a live repo down the view.
+ */
+export function rootNodes(
+  repos: TreeRepoPayload[],
+  closed: ClosedWorktreePayload[],
+): TreeElement[] {
+  const roots: TreeElement[] = reposToNodes(repos);
+  if (closed.length > 0) {
+    roots.push({ kind: "closedGroup", closed });
+  }
+  return roots;
+}
+
+/** The rows under the Recently Closed group, in the order received (newest first). */
+export function closedChildNodes(closed: ClosedWorktreePayload[]): ClosedNode[] {
+  return closed.map((entry) => ({ kind: "closed", entry }));
+}
 
 /** The top-level repository nodes, in the daemon's (already deterministic) order. */
 export function reposToNodes(repos: TreeRepoPayload[]): Node[] {
@@ -735,6 +792,41 @@ export function nodeId(node: Node): string {
   return node.kind === "repo" ? `repo:${node.repo.root}` : `wt:${node.wt.path}`;
 }
 
+/**
+ * A stable per-element identity — {@link nodeId} extended to the Recently Closed
+ * group and its rows, for the `vscode.TreeItem.id` of every element in the view.
+ */
+export function elementId(element: TreeElement): string {
+  switch (element.kind) {
+    case "closedGroup":
+      return "closed-group";
+    case "closed":
+      return `closed:${element.entry.path}`;
+    default:
+      return nodeId(element);
+  }
+}
+
+/** Whether `element` is a repo or worktree row, the only kinds the item actions understand. */
+export function isNode(element: TreeElement): element is Node {
+  return element.kind === "repo" || element.kind === "worktree";
+}
+
+/** The closed rows of a selection, in order, deduplicated by path. */
+export function closedTargets(clicked?: TreeElement, selected?: TreeElement[]): ClosedNode[] {
+  const elements = selected?.length ? selected : clicked ? [clicked] : [];
+  const seen = new Set<string>();
+  const out: ClosedNode[] = [];
+  for (const element of elements) {
+    if (element.kind !== "closed" || seen.has(element.entry.path)) {
+      continue;
+    }
+    seen.add(element.entry.path);
+    out.push(element);
+  }
+  return out;
+}
+
 /** A {@link Node} narrowed to a worktree — what every item command acts on. */
 export type WorktreeNode = Extract<Node, { kind: "worktree" }>;
 
@@ -751,8 +843,11 @@ export type WorktreeNode = Extract<Node, { kind: "worktree" }>;
  * The dedupe by {@link nodeId} is cheap insurance — the same identity already
  * keys `vscode.TreeItem.id`, so a selection cannot normally repeat a node.
  */
-export function selectionTargets(clicked?: Node, selected?: Node[]): Node[] {
-  const nodes = selected?.length ? selected : clicked ? [clicked] : [];
+export function selectionTargets(clicked?: TreeElement, selected?: TreeElement[]): Node[] {
+  // The view also holds the Recently Closed group and its rows (#2211), which carry
+  // no `repo` for the actions below to read; narrow to repo/worktree rows here, once.
+  const elements = selected?.length ? selected : clicked ? [clicked] : [];
+  const nodes = elements.filter(isNode);
   const seen = new Set<string>();
   return nodes.filter((node) => {
     const id = nodeId(node);

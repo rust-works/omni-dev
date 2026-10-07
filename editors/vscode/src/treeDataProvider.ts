@@ -22,18 +22,31 @@ import {
   AheadBehindTarget,
 } from "./aheadBehindMemo";
 import {
+  CLOSED_GROUP_CONTEXT,
+  CLOSED_GROUP_LABEL,
+  closedContextValue,
+  closedDescription,
+  closedGroupDescription,
+  closedIconId,
+  closedLabel,
+  closedTooltip,
+  sameClosed,
+} from "./recentlyClosed";
+import { ClosedWorktreePayload } from "./socket";
+import {
   AheadBehindMap,
-  Node,
   PrBadge,
+  TreeElement,
   TreeGithubIdentity,
   TreeRepoPayload,
+  closedChildNodes,
+  elementId,
   needsPrFallback,
-  nodeId,
   repoContextValue,
   repoDescription,
   repoLabel,
   repoPollingEnabled,
-  reposToNodes,
+  rootNodes,
   unbadgedBranches,
   visibleWorktreePaths,
   withAheadBehind,
@@ -102,8 +115,10 @@ function themeIcon(icon: RowIcon): vscode.ThemeIcon {
 }
 
 /** Serves the repo→worktree tree from the latest daemon `tree` snapshot. */
-export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> {
+export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<TreeElement> {
   private repos: TreeRepoPayload[] = [];
+  /** The Recently Closed entries (#2211), newest first; the group row shows when non-empty. */
+  private recentlyClosed: ClosedWorktreePayload[] = [];
   /** Whether worktrees with no open window are shown; false hides them. */
   private showClosed = true;
   /**
@@ -137,7 +152,7 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
    * shows issues no request (#2120). `undefined` when no fetcher was injected.
    */
   private readonly aheadBehind?: AheadBehindMemo;
-  private readonly emitter = new vscode.EventEmitter<Node | undefined | null | void>();
+  private readonly emitter = new vscode.EventEmitter<TreeElement | undefined | null | void>();
   readonly onDidChangeTreeData = this.emitter.event;
 
   /**
@@ -156,13 +171,38 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     this.aheadBehind = fetchAheadBehind ? new AheadBehindMemo(fetchAheadBehind) : undefined;
   }
 
-  /** Replaces the snapshot and refreshes the whole tree. */
-  update(repos: TreeRepoPayload[]): void {
+  /**
+   * Replaces the snapshot and refreshes the whole tree. `closed` is the snapshot's
+   * Recently Closed list (#2211); an older daemon sends none, which is `[]`.
+   *
+   * Takes the list *with* the repos rather than through a second setter so one
+   * snapshot is one refresh: a separate setter would fire again for the same frame
+   * whenever the closed list moved. {@link setRecentlyClosed} is the entry point for
+   * a caller holding only the list.
+   */
+  update(repos: TreeRepoPayload[], closed: ClosedWorktreePayload[] = this.recentlyClosed): void {
     this.repos = repos;
+    this.recentlyClosed = closed;
     // Every worktree in the snapshot, not just the visible ones: toggling
     // show-closed must not throw away answers it will need again.
     this.aheadBehind?.prune(repos.flatMap((repo) => repo.worktrees.map((wt) => wt.path)));
     this.emitter.fire(undefined);
+  }
+
+  /**
+   * Replaces the Recently Closed list on its own, returning whether it changed and
+   * refreshing only then — the same no-op-when-unchanged rule as
+   * {@link setSessionState}, since a refresh re-runs {@link getChildren} for every
+   * expanded repo. Compared by serialised value, so a daemon re-sending an equal
+   * list costs nothing.
+   */
+  setRecentlyClosed(closed: ClosedWorktreePayload[]): boolean {
+    if (sameClosed(this.recentlyClosed, closed)) {
+      return false;
+    }
+    this.recentlyClosed = closed;
+    this.emitter.fire(undefined);
+    return true;
   }
 
   /**
@@ -231,9 +271,12 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     return true;
   }
 
-  async getChildren(element?: Node): Promise<Node[]> {
+  async getChildren(element?: TreeElement): Promise<TreeElement[]> {
     if (!element) {
-      return reposToNodes(this.repos);
+      return rootNodes(this.repos, this.recentlyClosed);
+    }
+    if (element.kind === "closedGroup") {
+      return closedChildNodes(element.closed);
     }
     if (element.kind !== "repo") {
       return [];
@@ -295,13 +338,44 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
     });
   }
 
-  getTreeItem(node: Node): vscode.TreeItem {
+  getTreeItem(node: TreeElement): vscode.TreeItem {
+    if (node.kind === "closedGroup") {
+      // Collapsed by default: it is a way back, not part of the live working set.
+      const item = new vscode.TreeItem(
+        CLOSED_GROUP_LABEL,
+        vscode.TreeItemCollapsibleState.Collapsed,
+      );
+      item.id = elementId(node);
+      item.iconPath = new vscode.ThemeIcon("history");
+      item.contextValue = CLOSED_GROUP_CONTEXT;
+      item.description = closedGroupDescription(node.closed.length);
+      return item;
+    }
+    if (node.kind === "closed") {
+      const item = new vscode.TreeItem(
+        closedLabel(node.entry),
+        vscode.TreeItemCollapsibleState.None,
+      );
+      item.id = elementId(node);
+      item.iconPath = new vscode.ThemeIcon(closedIconId(node.entry));
+      item.contextValue = closedContextValue(node.entry);
+      item.description = closedDescription(node.entry, new Date());
+      item.tooltip = closedTooltip(node.entry);
+      // Routed through the same double-click timer as a live row, so a stray click
+      // while selecting (or the first click of a multi-select) reopens nothing.
+      item.command = {
+        command: ITEM_CLICKED_COMMAND,
+        title: "Reopen Closed Worktree",
+        arguments: [node],
+      };
+      return item;
+    }
     if (node.kind === "repo") {
       const item = new vscode.TreeItem(
         repoLabel(node.repo),
         vscode.TreeItemCollapsibleState.Expanded,
       );
-      item.id = nodeId(node);
+      item.id = elementId(node);
       item.iconPath = themeIcon(
         repoRowIcon(node.repo, this.showPr, rowColorTag(this.rowColors, node)),
       );
@@ -335,7 +409,7 @@ export class WorktreesTreeDataProvider implements vscode.TreeDataProvider<Node> 
       vscode.TreeItemCollapsibleState.None,
     );
     const sessions = this.sessionTallies[node.wt.path];
-    item.id = nodeId(node);
+    item.id = elementId(node);
     const sessionsSegment = [
       sessionGlyphs(sessions),
       formatModelMarker(this.modelFamilies[node.wt.path]),
