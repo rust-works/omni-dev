@@ -27,6 +27,7 @@ exclude = [
     "assets/",
     "scratch/",
     "editors/",
+    "changelog.d/",
     "docs/evaluations/jev-route-1871/round4-*",
     "docs/evaluations/jev-route-2053/heldout-default-shape/",
     "examples/jev_route_signal_eval.rs",
