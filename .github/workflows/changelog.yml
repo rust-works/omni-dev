@@ -12,7 +12,11 @@ name: Changelog Check
 #
 # It also runs on `merge_group`, so the required `Changelog` context reports on
 # queue entries. The fragment *requirement* is a property of the pull request,
-# which a queue rebase cannot change, so only fragment validity is checked there.
+# which a queue rebase cannot change, so it is skipped there (`--queue`). The
+# changelog rules are not: a rebase can bring in a fragment that merged while a
+# release waited in the queue, and a release must have consumed every fragment
+# of its component. Queue entries are stacked, so the base is the previous
+# entry's tip (`merge_group.base_sha`), never the branch point.
 #
 # There is deliberately no `paths:` filter. The job is cheap, and a context that
 # always reports can be made required without a pull request that touches no
@@ -56,3 +60,8 @@ jobs:
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         PR_AUTHOR: ${{ github.event.pull_request.user.login }}
       run: python3 scripts/changelog.py check-pr --base "$BASE_SHA" --head "$HEAD_SHA" --author "$PR_AUTHOR"
+    - name: Check the changelogs of the queue entry
+      if: github.event_name == 'merge_group'
+      env:
+        BASE_SHA: ${{ github.event.merge_group.base_sha }}
+      run: python3 scripts/changelog.py check-pr --queue --base "$BASE_SHA" --head HEAD

@@ -460,17 +460,17 @@ The automated release pipeline requires these GitHub secrets:
   - **A fragment is required.** The pull request must add, edit or rename one.
   - **A user-visible extension change needs an extension fragment** under `changelog.d/vscode/`. A change under `editors/vscode/` counts unless it is a test, the changelog or readme, the lockfile, build configuration or a dotfile; a change to `package.json` counts only when it goes beyond `devDependencies`, `scripts` and `version`.
   - **The changelogs are not edited directly.** A pull request that changes `CHANGELOG.md` or `editors/vscode/CHANGELOG.md` fails, unless it is a release: one that adds a new `## [X.Y.Z]` section to that changelog. The title is never consulted.
-
-  These are properties of the pull request, which a queue rebase cannot change, so the merge-queue run checks fragment validity only.
+  - **A release consumes every fragment of its component.** A fragment that merges while the release waits in the queue would ship in the tagged code but not in its notes, so the entry fails; rebase and fold it in.
+- **`check-pr --queue`**, on merge-queue entries, against the previous entry's tip (`merge_group.base_sha`): the last two rules only. Which files a pull request adds is a property of the pull request that a queue rebase cannot change, but what the changelogs and `changelog.d/` hold after the rebase is not.
 
 Waivers are commit trailers, because commit messages exist on the pull request and on its queue entry while a pull request body is not under review. A trailer belongs in the last paragraph of the message, beside `Closes #N`; the same words in the body waive nothing. It waives the rule for the whole pull request, whichever commit carries it. Say why after the keyword:
 
 | Trailer                              | Waives                                                                                       |
 |--------------------------------------|----------------------------------------------------------------------------------------------|
 | `Changelog: none <reason>`           | Both fragment requirements, for a change with no user-visible effect (docs, CI, a refactor)  |
-| `Changelog: amend-released <reason>` | The direct-edit rule (and the fragment requirement), to correct an already published section |
+| `Changelog: amend-released <reason>` | The direct-edit rule and the crate-fragment requirement, to correct a published section only |
 
-A pull request opened by a bot (Dependabot) is waived. `python3 scripts/changelog.py --help` lists the subcommands, `python3 scripts/changelog.py check-pr --base origin/main` runs the pull request check locally, and `python3 -m unittest discover -s scripts -p 'test_*.py'` runs the tests. The workflow has no `paths:` filter, so its `Changelog` context reports on every pull request and merge-queue entry; it is a required status check on `main`.
+`amend-released` never covers an edit under `[Unreleased]`, nor an extension change's fragment. A release waives the fragment requirement, and the extension fragment only when it releases the extension. A pull request opened by a bot (Dependabot) is waived. `python3 scripts/changelog.py --help` lists the subcommands, `python3 scripts/changelog.py check-pr --base origin/main` runs the pull request check locally, and `python3 -m unittest discover -s scripts -p 'test_*.py'` runs the tests. The workflow has no `paths:` filter, so its `Changelog` context reports on every pull request and merge-queue entry; it is a required status check on `main`.
 
 ## Security Notes
 

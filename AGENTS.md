@@ -26,7 +26,7 @@ Add focused `#[test]` or `#[tokio::test]` cases near changed Rust code and integ
 
 ## Commit & Pull Request Guidelines
 
-Use scoped conventional commits, such as `feat(drive): add sheet metadata` or `fix(cli): reject invalid input`. Valid types and scopes are listed in `.omni-dev/commit-guidelines.md` and `.omni-dev/scopes.yaml`; CI checks commit messages. In PRs, use `.github/pull_request_template.md`: explain the change and why, link the issue, report tests and coverage, and include screenshots for UI changes. Update user-facing docs and `CHANGELOG.md` for notable changes, under `[Unreleased]` only; a user-visible `editors/vscode/` change also needs a bullet in `editors/vscode/CHANGELOG.md`. The Changelog Check workflow (`scripts/check_changelog.py`) enforces both, and `docs/RELEASE.md#changelog-check` lists the opt-out commit trailers.
+Use scoped conventional commits, such as `feat(drive): add sheet metadata` or `fix(cli): reject invalid input`. Valid types and scopes are listed in `.omni-dev/commit-guidelines.md` and `.omni-dev/scopes.yaml`; CI checks commit messages. In PRs, use `.github/pull_request_template.md`: explain the change and why, link the issue, report tests and coverage, and include screenshots for UI changes. Update user-facing docs, and add a changelog fragment for notable changes, never edit `CHANGELOG.md` itself: `changelog.d/<issue>.<type>.md` for the crate, and `changelog.d/vscode/<issue>.<type>.md` for a user-visible `editors/vscode/` change (see `changelog.d/README.md`). The Changelog Check workflow (`scripts/changelog.py check-pr`) enforces both, and `docs/RELEASE.md#changelog-check` lists the opt-out commit trailers.
 
 ## Worktree Practice
 

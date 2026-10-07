@@ -194,6 +194,9 @@ def load_fragments(root: Path, component: Component) -> tuple[list[Fragment], li
         shown = f'{component.fragments}/{name}'
         if name in NOT_FRAGMENTS or (path.is_dir() and name in SUBDIRECTORIES[component.name]):
             continue
+        if name.startswith('.'):
+            # .DS_Store, .gitkeep, editor swap files: never a fragment, never published.
+            continue
         if not path.is_file() or path.is_symlink():
             errors.append(f'{shown}: not a regular file')
             continue
@@ -389,12 +392,12 @@ def git(repo: Path, *args: str) -> str:
 
 
 def read_at(repo: Path, rev: str, path: str) -> str | None:
-    """A file's text at `rev`, or None if it does not exist there."""
-    proc = subprocess.run(['git', '-C', str(repo), 'cat-file', '-e', f'{rev}:{path}'],
-                          capture_output=True, check=False)
-    if proc.returncode != 0:
-        return None
-    return git(repo, 'show', f'{rev}:{path}')
+    """A file's text at `rev`, or None if it does not exist there.
+
+    The revisions are validated by `merge-base` first, so a failed `show` is a missing path.
+    """
+    proc = subprocess.run(['git', '-C', str(repo), 'show', f'{rev}:{path}'], capture_output=True, check=False)
+    return proc.stdout.decode('utf-8') if proc.returncode == 0 else None
 
 
 @dataclass
@@ -404,17 +407,41 @@ class Change:
 
 
 def changes(repo: Path, since: str, head: str) -> list[Change]:
-    out = git(repo, 'diff', '--name-status', '-M', '--no-ext-diff', since, head)
-    result = []
-    for line in out.splitlines():
-        fields = line.split('\t')
-        status = fields[0][0]
-        if status == 'C':
-            status = 'A'
-        result.append(Change(status, fields[-1]))
-        if status == 'R':
-            result.append(Change('D', fields[1]))
+    """The paths changed from `since` to `head`; NUL-separated, so no path is quoted."""
+    fields = git(repo, 'diff', '--name-status', '-z', '-M', '--no-ext-diff', since, head).split('\0')
+    result, i = [], 0
+    while i < len(fields) and fields[i]:
+        status = fields[i][0]
+        if status in 'RC':
+            old, new = fields[i + 1], fields[i + 2]
+            i += 3
+            if status == 'R':
+                result.append(Change('D', old))
+            result.append(Change('R' if status == 'R' else 'A', new))
+        else:
+            result.append(Change(status, fields[i + 1]))
+            i += 2
     return result
+
+
+def unreleased_text(text: str | None) -> str:
+    """What sits under `## [Unreleased]`, up to the next release heading or the link footer."""
+    lines = (text or '').splitlines()
+    if '## [Unreleased]' not in lines:
+        return ''
+    body = []
+    for line in lines[lines.index('## [Unreleased]') + 1:]:
+        if line.startswith('## [') or re.match(r'^\[[^\]]+\]: ', line):
+            break
+        body.append(line)
+    return '\n'.join(body).strip()
+
+
+def fragments_at(repo: Path, rev: str, component: Component) -> list[str]:
+    """The fragment files of `component` in the tree of `rev`."""
+    names = git(repo, 'ls-tree', '-z', '--name-only', f'{rev}:', '--', component.fragments + '/').split('\0')
+    return sorted(n for n in names if n and Path(n).parent.as_posix() == component.fragments
+                  and FRAGMENT_RE.match(Path(n).name))
 
 
 @dataclass
@@ -424,8 +451,14 @@ class PrCheck:
     errors: list[str]
 
 
-def check_pr(repo: Path, base: str, head: str, author: str = '') -> PrCheck:
-    """Judge a pull request's changes (the merge base of `base` and `head` .. `head`)."""
+def check_pr(repo: Path, base: str, head: str, author: str = '', queue: bool = False) -> PrCheck:
+    """Judge a pull request's changes (the merge base of `base` and `head` .. `head`).
+
+    With `queue`, judge a merge-queue entry: the rules about the changelogs themselves
+    still apply, since a rebase can change what they hold, but the fragment requirements
+    do not, since a rebase cannot change which files a pull request adds (and the
+    entry's author is not known there).
+    """
     try:
         since = git(repo, 'merge-base', base, head).strip()
     except GitError as err:
@@ -433,66 +466,77 @@ def check_pr(repo: Path, base: str, head: str, author: str = '') -> PrCheck:
                        'A shallow checkout hides it; fetch the full history (`fetch-depth: 0`).') from err
     allowed = waivers(git(repo, 'log', '--format=%B%x00', f'{since}..{head}').split('\0'))
     changed = changes(repo, since, head)
+    edited = {c.path for c in changed}
     notes: list[str] = []
     errors: list[str] = []
 
-    # A release pull request opens a new version section in the changelog it releases;
-    # the title is not consulted, so naming a pull request cannot skip the gate.
+    # A release opens a new version section in the changelog it releases; the title is
+    # not consulted, so naming a pull request cannot skip the gate.
     released = set()
     for component in COMPONENTS.values():
-        if any(c.path == component.changelog for c in changed):
-            before, after = (read_at(repo, rev, component.changelog) for rev in (since, head))
-            if released_versions(after) - released_versions(before):
-                released.add(component.name)
-                notes.append(f'release of the {component.name} ({component.changelog} gains a version section)')
-
-    for component in COMPONENTS.values():
-        if component.name in released or not any(c.path == component.changelog for c in changed):
+        if component.changelog not in edited:
             continue
-        if 'amend-released' in allowed:
-            notes.append(f'{component.changelog} edited directly, waived by `Changelog: amend-released`')
+        before, after = (read_at(repo, rev, component.changelog) for rev in (since, head))
+        if released_versions(after) - released_versions(before):
+            released.add(component.name)
+            notes.append(f'release of the {component.name} ({component.changelog} gains a version section)')
+            # A fragment merged after `collect` ran (while the release waited in the queue)
+            # would ship in the tagged code but not in its notes.
+            left = fragments_at(repo, head, component)
+            if left:
+                errors.append(
+                    f'this release of the {component.name} leaves {len(left)} fragment(s) unconsumed '
+                    f'({", ".join(left)}): they landed after `collect` ran. Rebase onto the base branch '
+                    f'and fold them into the new section (re-run `collect` on a fresh copy of the changelog).')
+        elif 'amend-released' in allowed:
+            if unreleased_text(before) != unreleased_text(after):
+                errors.append(
+                    f'{component.changelog} changes `## [Unreleased]` by hand. `Changelog: amend-released` '
+                    f'covers corrections to published sections only; add a fragment under '
+                    f'{component.fragments}/ instead.')
+            else:
+                notes.append(f'{component.changelog} edited directly, waived by `Changelog: amend-released`')
         else:
             errors.append(
                 f'{component.changelog} is edited directly. Add a fragment under {component.fragments}/ '
                 'instead (see changelog.d/README.md); the release assembles the changelog. To correct '
                 'notes already published, add a `Changelog: amend-released <reason>` trailer to a commit.')
+    if queue:
+        return PrCheck(since, notes, errors)
 
-    fragments = {c.path: fragment_component(c.path) for c in changed if c.status in 'AMR'}
-    present = {name for name in fragments.values() if name}
-    if present:
-        notes.append('fragment(s): ' + ', '.join(sorted(p for p, name in fragments.items() if name)))
+    fragments = sorted(c.path for c in changed if c.status in 'AMR' and fragment_component(c.path))
+    present = {fragment_component(path) for path in fragments}
+    if fragments:
+        notes.append('fragment(s): ' + ', '.join(fragments))
 
-    waived = None
-    if released:
-        waived = 'release pull request'
-    elif author.endswith('[bot]'):
-        waived = f'opened by a bot ({author})'
-    elif 'none' in allowed:
-        waived = '`Changelog: none` trailer'
-    elif 'amend-released' in allowed:
-        # Correcting published notes is itself the changelog change.
-        waived = '`Changelog: amend-released` trailer'
-
+    bot = f'opened by a bot ({author})' if author.endswith('[bot]') else None
+    none = '`Changelog: none` trailer' if 'none' in allowed else None
+    waived = (('release pull request' if released else None) or bot or none
+              # Correcting published notes is itself the changelog change.
+              or ('`Changelog: amend-released` trailer' if 'amend-released' in allowed else None))
     if not present and not waived:
         errors.append(
             'this pull request adds no changelog fragment. Add changelog.d/<issue>.<type>.md '
             '(see changelog.d/README.md), or, for a change with no user-visible effect, add a '
             '`Changelog: none <reason>` trailer to a commit.')
+    elif waived:
+        notes.append(f'fragment requirement waived: {waived}')
 
     visible = [c.path for c in changed if is_user_visible(c.path)]
     if EXTENSION_MANIFEST in visible and not manifest_ships(
             read_at(repo, since, EXTENSION_MANIFEST), read_at(repo, head, EXTENSION_MANIFEST)):
         visible.remove(EXTENSION_MANIFEST)
-    if visible and 'vscode' not in present and not waived:
-        shown = ', '.join(sorted(visible)[:3]) + (f' and {len(visible) - 3} more' if len(visible) > 3 else '')
-        errors.append(
-            f'this pull request changes the VS Code extension ({shown}) but adds no fragment under '
-            f'{COMPONENTS["vscode"].fragments}/. If the change is not user-visible after all, add a '
-            '`Changelog: none <reason>` trailer to a commit.')
-    elif visible and waived:
-        notes.append(f'extension fragment waived: {waived}')
-    if waived and not errors:
-        notes.append(f'fragment requirement waived: {waived}')
+    # Only the extension's own release, a bot or `Changelog: none` waives its fragment.
+    extension_waived = ('extension release' if 'vscode' in released else None) or bot or none
+    if visible and 'vscode' not in present:
+        if extension_waived:
+            notes.append(f'extension fragment waived: {extension_waived}')
+        else:
+            shown = ', '.join(sorted(visible)[:3]) + (f' and {len(visible) - 3} more' if len(visible) > 3 else '')
+            errors.append(
+                f'this pull request changes the VS Code extension ({shown}) but adds no fragment under '
+                f'{COMPONENTS["vscode"].fragments}/. If the change is not user-visible after all, add a '
+                '`Changelog: none <reason>` trailer to a commit.')
     return PrCheck(since, notes, errors)
 
 
@@ -524,7 +568,7 @@ def cmd_check(args) -> int:
 
 def cmd_check_pr(args) -> int:
     status = cmd_check(args)
-    result = check_pr(Path(args.root), args.base, args.head, args.author)
+    result = check_pr(Path(args.root), args.base, args.head, args.author, queue=args.queue)
     print(f'changes since {result.since[:10]} ({args.base} .. {args.head})')
     for note in result.notes:
         print(f'  {note}')
@@ -595,6 +639,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument('--base', default='origin/main', help='revision the pull request targets')
     sp.add_argument('--head', default='HEAD', help='the pull request head')
     sp.add_argument('--author', default='', help="the pull request author's login (a bot is waived)")
+    sp.add_argument('--queue', action='store_true',
+                    help='judge a merge-queue entry: the changelog rules only, not the fragment requirements')
     sp.set_defaults(func=cmd_check_pr)
 
     sp = sub.add_parser('collect', help='render one component\'s fragments into a release section')
