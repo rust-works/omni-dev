@@ -74,7 +74,7 @@ scopes:
   - name: "worktrees"
     description: "Worktrees registry: cross-window repo/worktree tracking and window management on the daemon"
     examples: ["worktrees: add close-worktree op", "worktrees: fix ahead/behind lazy fetch"]
-    file_patterns: ["src/worktrees.rs"]
+    file_patterns: ["src/worktrees.rs", "src/worktrees/**"]
   - name: "docs"
     description: "Documentation and planning"
     examples: ["docs: update twiddle plan", "docs: add context intelligence spec"]
