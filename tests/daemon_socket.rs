@@ -547,10 +547,17 @@ async fn worktrees_subscribe_pushes_initial_and_updates() {
         .unwrap();
     let removed = read_frame(&mut reader).await;
     assert_eq!(
-        removed.payload,
-        json!({ "repos": [], "show_closed": true }),
+        removed.payload["repos"],
+        json!([]),
         "expected the post-unregister empty frame, not a duplicate of the repo frame"
     );
+    assert_eq!(removed.payload["show_closed"], json!(true));
+    // The window that just closed is offered back (#2211): the repo left the tree
+    // with its last window, but the closure is on the snapshot.
+    let closed = removed.payload["recently_closed"].as_array().unwrap();
+    assert_eq!(closed.len(), 1, "{:?}", removed.payload);
+    assert_eq!(closed[0]["removed"], json!(false));
+    assert_eq!(closed[0]["is_main"], json!(true));
 
     // 4) Daemon shutdown tears the stream down cleanly: the reader hits EOF.
     client.shutdown().await.ok();

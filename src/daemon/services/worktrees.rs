@@ -30,6 +30,7 @@
 //! "is a window open on it?" becomes a per-worktree attribute. All of this is
 //! git disk I/O, so it runs on a blocking thread, never under the registry lock.
 
+mod closed;
 mod divergence;
 mod geometry;
 mod shared_repo;
@@ -634,6 +635,14 @@ impl WorktreesService {
             .polling_prefs_path
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(path);
+    }
+
+    /// Seeds the recently-closed list from its persisted `0600` file and
+    /// remembers `path` so later closures persist back to it (#2211). Called once
+    /// by the daemon at startup, before any window subscribes. Best-effort: see
+    /// [`WorktreesRegistry::load_closed`].
+    pub fn load_closed(&self, path: PathBuf) {
+        self.registry.load_closed(path);
     }
 
     /// Writes the current enable set to the `0600` prefs file, if persistence is
@@ -1311,13 +1320,27 @@ impl WorktreesService {
             // `await_windows_closed` would restack the waits and undo the whole
             // point. Pinned by `concurrent_closes_overlap_their_heartbeat_waits`.
             let _guard = self.prune_lock.lock().await;
+            // What the worktree was, read *before* the prune takes the directory
+            // (and with it every way to ask git) so a removed worktree can be
+            // offered back (#2211).
+            let capture = req.path.clone();
+            let closed = tokio::task::spawn_blocking(move || {
+                closed::closed_worktree_for(&capture, Utc::now())
+            })
+            .await
+            .unwrap_or(None);
             let removed = tokio::task::spawn_blocking(move || remove_worktree(&path, &entries))
                 .await
                 .map_err(|e| anyhow!("worktree removal task panicked: {e}"))
                 .map_err(|err| log_close_error(&req.path, "removal task", err))?;
             // The audit line + Result→reply mapping lives in a sync helper so the
             // destructive outcome is unit-testable off the runtime (#1364).
-            log_and_map_removal(&req.path, removed)
+            let reply = log_and_map_removal(&req.path, removed);
+            if let (Ok(_), Some(mut entry)) = (&reply, closed) {
+                entry.removed = true;
+                self.registry.record_closed(vec![entry]);
+            }
+            reply
         } else {
             // "Close Window" with no owning window is a no-op success; a
             // self-close replies and the extension closes its own window.
@@ -1933,6 +1956,20 @@ impl DaemonService for WorktreesService {
                 let path = require_str(&payload, "path", "open")?;
                 focus_window(Path::new(path))?;
                 Ok(json!({ "ok": true }))
+            }
+            "recent-closed" => {
+                // The recently-closed worktrees, newest first (#2211): windows
+                // that closed and worktrees that were removed, kept across a
+                // daemon restart. See ADR-0096.
+                Ok(self.recent_closed().await)
+            }
+            "reopen" => {
+                // Reopen a recently closed worktree (#2211): open its window, or —
+                // for one that was removed — recreate it after a two-phase
+                // confirm. Takes only a recorded `path`. See ADR-0096.
+                let req: closed::ReopenRequest =
+                    serde_json::from_value(payload).context("invalid `reopen` payload")?;
+                self.reopen(req).await
             }
             "close" => {
                 // Close a worktree's window and (for a linked worktree)
@@ -3504,16 +3541,26 @@ impl TreeSnapshotCache {
 /// lock on a blocking thread inside [`tree_repos`].
 async fn tree_snapshot(registry: &WorktreesRegistry, pr_cache: Arc<PrStatusCache>) -> Value {
     let folders = registry.open_folders();
+    // After the reap above, so a window that has just aged out is recorded in
+    // this very snapshot rather than the next one (#2211).
+    closed::settle_departures(registry).await;
+    let recently_closed = registry.closed_entries();
     let windows = registry.list();
     let show_closed = registry.show_closed();
     let enabled_polling = registry.enabled_polling_repos();
     // The transient rebase (#1415) and push (#1443) cues, read here with the other
     // cheap registry locks so the git work below deals only in plain data.
     let in_flight = InFlight::read(registry);
-    json!({
+    let mut snapshot = json!({
         "repos": tree_repos(folders, windows, pr_cache, enabled_polling, in_flight).await,
         "show_closed": show_closed,
-    })
+    });
+    // Additive and omitted when empty, so a client that predates it — and the
+    // common no-history case — sees the snapshot it always did (#2211).
+    if !recently_closed.is_empty() {
+        snapshot["recently_closed"] = serde_json::to_value(recently_closed).unwrap_or_default();
+    }
+    snapshot
 }
 
 /// A short human name for a window: its repo, else its first folder's basename,

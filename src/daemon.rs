@@ -165,6 +165,12 @@ pub async fn build_default_registry(
             Ok(path) => worktrees.load_pr_cache(path),
             Err(err) => tracing::warn!("worktrees PR cache disabled: {err:#}"),
         }
+        // Seed the recently-closed list so a restart does not forget which worktrees
+        // the user closed (#2211); same best-effort contract as the prefs above.
+        match crate::daemon::paths::worktrees_closed_path() {
+            Ok(path) => worktrees.load_closed(path),
+            Err(err) => tracing::warn!("worktrees recently-closed list disabled: {err:#}"),
+        }
         worktrees.start_menu_refresh();
         // Keep PR check badges fresh for every open window from one `gh` call, rather
         // than each window resolving its own and none of them ever re-asking (#1337).
