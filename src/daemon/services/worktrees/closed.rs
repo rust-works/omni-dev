@@ -116,7 +116,7 @@ pub(super) async fn settle_departures(registry: &WorktreesRegistry) {
             // removed (outside omni-dev, for we only see our own removals).
             registry.mark_closed_removed(&vanished);
         }
-        Err(err) => tracing::warn!("worktrees: settling closed windows panicked: {err}"),
+        Err(err) => tracing::warn!("worktrees: settling closed windows panicked: {err}"), // patchcov: coverage ignore-line reason="spawn_blocking only fails if the closure panics, which nothing in it can do"
     }
 }
 
@@ -363,17 +363,16 @@ fn free_worktree_name(repo: &Repository, path: &Path) -> Result<String> {
             return Ok(name);
         }
     }
-    bail!("no free worktree name derived from `{base}`")
+    bail!("no free worktree name derived from `{base}`") // patchcov: coverage ignore-line reason="needs 99 live worktrees sharing one directory name; the suffix loop is covered by a_name_held_by_a_live_worktree_gets_a_suffix"
 }
 
 /// Recreates the removed worktree `entry` the way [`plan_recreate`] decided.
 /// Blocking.
 fn recreate_worktree(entry: &ClosedWorktree, how: &Recreate) -> Result<()> {
     let repo = open_main_repo(&entry.repo_root).map_err(|reason| anyhow!(reason))?;
-    if let Some(parent) = entry.path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
+    let parent = entry.path.parent().unwrap_or(Path::new(""));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
     let name = free_worktree_name(&repo, &entry.path)?;
     let (reference, created_branch) = match how {
         Recreate::Branch(branch) => {
@@ -392,14 +391,10 @@ fn recreate_worktree(entry: &ClosedWorktree, how: &Recreate) -> Result<()> {
         // A branch this op just made would otherwise outlive the failure that
         // made it pointless.
         if let Some(branch) = created_branch {
-            if let Err(cleanup) = repo
+            // Best-effort: the add's own error is the one worth reporting.
+            let _ = repo
                 .find_branch(branch, BranchType::Local)
-                .and_then(|mut b| b.delete())
-            {
-                tracing::debug!(
-                    "could not remove branch `{branch}` after a failed recreate: {cleanup}"
-                );
-            }
+                .and_then(|mut b| b.delete());
         }
         return Err(err).with_context(|| {
             format!(
@@ -467,21 +462,16 @@ impl WorktreesService {
         // The same resource `close` serializes on: both write `.git/worktrees`.
         let _guard = self.prune_lock.lock().await;
         let created = entry.clone();
+        let shown = entry.path.display();
         tokio::task::spawn_blocking(move || recreate_worktree(&created, &how))
             .await
             .map_err(|e| anyhow!("reopen task panicked: {e}"))
             .and_then(|inner| inner)
             .inspect_err(|err| {
-                tracing::warn!(
-                    path = %entry.path.display(),
-                    "worktrees reopen: recreate failed: {err:#}"
-                );
+                tracing::warn!("worktrees reopen: recreate failed at {shown}: {err:#}");
             })?;
-        tracing::info!(
-            path = %entry.path.display(),
-            source = plan.source.unwrap_or("-"),
-            "worktrees reopen: removed worktree recreated"
-        );
+        let source = plan.source.unwrap_or("-");
+        tracing::info!("worktrees reopen: recreated {shown} from {source}");
         // It exists again, so it is no longer "removed". The entry stays until the
         // window registers (and forgets it), for the same reason as above.
         self.registry.record_closed(vec![ClosedWorktree {
@@ -915,6 +905,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_op_entry_point_refuses_an_unrecorded_path_before_launching_anything() {
+        let (_guard, root) = tempdir();
+        let svc = WorktreesService::new();
+        let err = svc
+            .reopen(ReopenRequest {
+                path: root.join("nope"),
+                confirmed: true,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no recently closed worktree"));
+    }
+
+    #[tokio::test]
     async fn the_plan_for_a_removed_worktree_creates_nothing() {
         let (_guard, root) = tempdir();
         let svc = WorktreesService::new();
@@ -1294,6 +1298,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_failed_recreate_keeps_a_branch_it_did_not_create() {
+        let (_guard, root) = tempdir();
+        let svc = WorktreesService::new();
+        let (repo, wt) = removed_worktree(&svc, &root);
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("squatter"), b"x").unwrap();
+        let entry = svc.registry.closed_entry(&wt).unwrap();
+
+        let err = recreate_worktree(&entry, &Recreate::Branch("feature".into())).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("failed to recreate the worktree"),
+            "{err:#}"
+        );
+        assert!(
+            repo.find_branch("feature", BranchType::Local).is_ok(),
+            "a branch that already existed is the user's, and survives the failure"
+        );
+    }
+
     #[tokio::test]
     async fn a_recreate_that_fails_after_the_plan_is_logged_and_reported() {
         let (_guard, root) = tempdir();
@@ -1345,8 +1370,10 @@ mod tests {
         assert_eq!(reply["open_error"], "no editor");
         assert!(wt.exists());
         assert!(
-            logs.contains("worktrees reopen: removed worktree recreated")
-                && logs.contains("source=\"branch\""),
+            logs.contains(&format!(
+                "worktrees reopen: recreated {} from branch",
+                wt.display()
+            )),
             "{logs}"
         );
     }

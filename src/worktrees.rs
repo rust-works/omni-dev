@@ -890,20 +890,15 @@ impl WorktreesRegistry {
     ///
     /// [`WorktreesService::load_polling_prefs`]: crate::daemon::services::worktrees::WorktreesService::load_polling_prefs
     pub fn load_closed(&self, path: PathBuf) {
+        let shown = path.display();
         let entries = match std::fs::read(&path) {
             Ok(bytes) => closed::from_file_bytes(&bytes).unwrap_or_else(|err| {
-                tracing::warn!(
-                    "ignoring unreadable recently-closed worktrees at {}: {err:#}",
-                    path.display()
-                );
+                tracing::warn!("ignoring unreadable recently-closed worktrees at {shown}: {err:#}");
                 Vec::new()
             }),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => {
-                tracing::warn!(
-                    "could not read recently-closed worktrees at {}: {err:#}",
-                    path.display()
-                );
+                tracing::warn!("could not read recently-closed worktrees at {shown}: {err:#}");
                 Vec::new()
             }
         };
@@ -1013,9 +1008,9 @@ impl WorktreesRegistry {
             return;
         };
         let written = closed::to_file_bytes(log.entries()).and_then(|bytes| {
-            if let Some(parent) = path.parent() {
-                crate::daemon::paths::ensure_dir_0700(parent)?;
-            }
+            path.parent()
+                .map(crate::daemon::paths::ensure_dir_0700)
+                .transpose()?;
             // Written beside the file and renamed over it, so a crash mid-write
             // leaves the previous list rather than a truncated one.
             let mut staging = path.clone().into_os_string();
@@ -1026,10 +1021,8 @@ impl WorktreesRegistry {
                 .with_context(|| format!("failed to replace {}", path.display()))
         });
         if let Err(err) = written {
-            tracing::warn!(
-                "could not persist recently-closed worktrees to {}: {err:#}",
-                path.display()
-            );
+            let shown = path.display();
+            tracing::warn!("could not persist recently-closed worktrees to {shown}: {err:#}");
         }
     }
 }

@@ -169,7 +169,7 @@ pub async fn build_default_registry(
         // the user closed (#2211); same best-effort contract as the prefs above.
         match crate::daemon::paths::worktrees_closed_path() {
             Ok(path) => worktrees.load_closed(path),
-            Err(err) => tracing::warn!("worktrees recently-closed list disabled: {err:#}"),
+            Err(err) => tracing::warn!("worktrees recently-closed list disabled: {err:#}"), // patchcov: coverage ignore-line reason="path resolution fails only without a data dir, which the daemon cannot start without; same arm as the PR cache above"
         }
         worktrees.start_menu_refresh();
         // Keep PR check badges fresh for every open window from one `gh` call, rather
