@@ -31,6 +31,10 @@ use tokio::sync::watch;
 
 use crate::utils::awake_clock::AwakeClock;
 
+pub mod closed;
+
+use closed::{ClosedLog, ClosedWorktree};
+
 /// How long a window may go silent before it ages out of the registry. Three
 /// missed ~10s heartbeats; a window that crashed without firing `unregister`
 /// disappears on the next read. The resident process is what makes this
@@ -55,6 +59,28 @@ const DEFAULT_POLL_LEASE: Duration = Duration::from_secs(15 * 60);
 /// `{known: false}` → re-register path, so `register` stays infallible for the
 /// companion.
 const MAX_WINDOWS: usize = 256;
+
+/// Ceiling on departures waiting to be settled into the closed-worktree log
+/// (#2211). They are drained on every tree snapshot and every `unregister`, so
+/// this only ever bites if nothing reads for a long while; the oldest are
+/// dropped first.
+const MAX_DEPARTURES: usize = MAX_WINDOWS;
+
+/// A window that left the registry — unregistered, or aged out — waiting to be
+/// settled into the closed-worktree log (#2211).
+///
+/// Raw on purpose: turning a folder into a branch, repository and head is git
+/// I/O, which this engine does not do. The adapter drains these
+/// ([`WorktreesRegistry::take_departures`]), resolves them, and hands the
+/// result back to [`WorktreesRegistry::record_closed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Departure {
+    /// The workspace folders the window had open.
+    pub folders: Vec<PathBuf>,
+    /// When it left: the unregister time, or — for a window that aged out — the
+    /// last time it was heard from.
+    pub at: DateTime<Utc>,
+}
 
 /// A `register` request from a companion extension.
 ///
@@ -100,7 +126,7 @@ pub struct WindowEntry {
     /// the wall clock. For display only: liveness is measured on `last_active`.
     pub last_seen: DateTime<Utc>,
     /// The registry's [`AwakeClock`] reading when this window was last heard
-    /// from. [`reap`] and [`evict_oldest`] compare it, so a system sleep ages no
+    /// from. [`reap_departed`] and [`evict_oldest`] compare it, so a system sleep ages no
     /// window (#2126). Never serialized: a reading means nothing outside the
     /// registry that took it.
     #[serde(skip)]
@@ -242,6 +268,26 @@ pub struct WorktreesRegistry {
     /// `#[cfg(test)]` `with_poll_ttl` constructor (not linked — it does not exist
     /// in a non-test doc build).
     poll_ttl: Duration,
+    /// Windows that have left and not yet been settled into
+    /// [`closed`](Self::closed) (#2211): pushed by `unregister` and by every
+    /// TTL reap, drained by [`take_departures`](Self::take_departures). Behind
+    /// its **own** `Mutex`, only ever taken with no other registry lock held.
+    departures: Mutex<Vec<Departure>>,
+    /// The **recently closed** list (#2211): the worktrees whose windows closed
+    /// or that were removed, newest first, bounded in size and age. Behind its
+    /// **own** `Mutex`, never held across an `.await`. Where a lock order
+    /// exists it is `closed` then [`closed_path`](Self::closed_path), and
+    /// neither is ever taken while the window map's lock is held.
+    ///
+    /// Unlike the window map this survives a daemon restart: it is seeded from
+    /// the file [`load_closed`](Self::load_closed) names and written back on each
+    /// change — the one persisted state this engine owns itself (the PR-poll
+    /// enable set is persisted by the adapter), because the tree snapshot reads
+    /// it without going through the adapter.
+    closed: Mutex<ClosedLog>,
+    /// Where [`closed`](Self::closed) is persisted; `None` disables persistence,
+    /// which is the default so a bare registry stays I/O-free for unit tests.
+    closed_path: Mutex<Option<PathBuf>>,
 }
 
 impl WorktreesRegistry {
@@ -260,6 +306,9 @@ impl WorktreesRegistry {
             show_closed: AtomicBool::new(true),
             polling_enabled: Mutex::new(HashMap::new()),
             poll_ttl: DEFAULT_POLL_LEASE,
+            departures: Mutex::new(Vec::new()),
+            closed: Mutex::new(ClosedLog::default()),
+            closed_path: Mutex::new(None),
         }
     }
 
@@ -327,9 +376,13 @@ impl WorktreesRegistry {
     pub fn register(&self, req: RegisterRequest) {
         let now = Utc::now();
         let awake = self.clock.now();
-        {
+        // A worktree that is open again is not "closed" (#2211): this is what keeps
+        // a window reload (unregister, then register) and a worktree the user
+        // reopened by hand out of the recently-closed list.
+        self.forget_closed(&req.folders);
+        let departed = {
             let mut windows = self.lock();
-            reap(&mut windows, self.ttl, awake);
+            let departed = reap_departed(&mut windows, self.ttl, awake);
             // Upserts never evict; only a genuinely new key can grow the map, and
             // never past MAX_WINDOWS.
             if !windows.contains_key(&req.key) && windows.len() >= MAX_WINDOWS {
@@ -347,7 +400,9 @@ impl WorktreesRegistry {
                     last_active: awake,
                 },
             );
-        }
+            departed
+        };
+        self.stash_departures(departed);
         // Always bump: a register is infrequent (once per companion `activate()`,
         // not per heartbeat) and may add or alter a window's folders/repo. A
         // no-op re-register with identical data is harmless — the subscriber
@@ -399,9 +454,9 @@ impl WorktreesRegistry {
     pub fn heartbeat(&self, key: &str) -> bool {
         let now = Utc::now();
         let awake = self.clock.now();
-        let (known, reaped) = {
+        let (known, departed) = {
             let mut windows = self.lock();
-            let reaped = reap(&mut windows, self.ttl, awake);
+            let departed = reap_departed(&mut windows, self.ttl, awake);
             let known = match windows.get_mut(key) {
                 Some(entry) => {
                     entry.last_seen = now;
@@ -410,11 +465,13 @@ impl WorktreesRegistry {
                 }
                 None => false,
             };
-            (known, reaped)
+            (known, departed)
         };
         // A heartbeat is frequent (~every 10 s per window); a pure liveness
         // refresh does not change the visible set, so bump *only* when this
         // heartbeat's inline reap actually aged a stale sibling out.
+        let reaped = departed.len();
+        self.stash_departures(departed);
         if reaped > 0 {
             self.bump();
         }
@@ -424,12 +481,23 @@ impl WorktreesRegistry {
     /// Drops a window's registration. Returns whether an entry was present.
     pub fn unregister(&self, key: &str) -> bool {
         let awake = self.clock.now();
-        let (removed, reaped) = {
+        let (removed, mut departed) = {
             let mut windows = self.lock();
-            let removed = windows.remove(key).is_some();
-            let reaped = reap(&mut windows, self.ttl, awake);
-            (removed, reaped)
+            let removed = windows.remove(key);
+            let departed = reap_departed(&mut windows, self.ttl, awake);
+            (removed, departed)
         };
+        let reaped = departed.len();
+        // The window that unregistered left now; the ones reaped alongside it left
+        // when they were last heard from (#2211).
+        let removed = removed.is_some_and(|entry| {
+            departed.push(Departure {
+                folders: entry.folders,
+                at: Utc::now(),
+            });
+            true
+        });
+        self.stash_departures(departed);
         // The window is gone; any directive for it is fulfilled or moot.
         // (Keys are per-`activate()` UUIDs, never reused, so a stale directive
         // would only ever leak a little memory — but clearing keeps it tidy.)
@@ -738,9 +806,13 @@ impl WorktreesRegistry {
     /// bumping here would only make the subscription wake itself (#1267).
     pub fn list(&self) -> Vec<WindowEntry> {
         let awake = self.clock.now();
-        let mut windows = self.lock();
-        reap(&mut windows, self.ttl, awake);
-        sorted_entries(&windows)
+        let (entries, departed) = {
+            let mut windows = self.lock();
+            let departed = reap_departed(&mut windows, self.ttl, awake);
+            (sorted_entries(&windows), departed)
+        };
+        self.stash_departures(departed);
+        entries
     }
 
     /// The first workspace folder of a still-live window, if it has one. Used by
@@ -763,15 +835,194 @@ impl WorktreesRegistry {
     /// `Mutex`-never-across-`.await` invariant.
     pub fn open_folders(&self) -> Vec<PathBuf> {
         let awake = self.clock.now();
-        let mut windows = self.lock();
-        reap(&mut windows, self.ttl, awake);
-        let mut folders: Vec<PathBuf> = windows
-            .values()
-            .flat_map(|e| e.folders.iter().cloned())
-            .collect();
+        let (mut folders, departed) = {
+            let mut windows = self.lock();
+            let departed = reap_departed(&mut windows, self.ttl, awake);
+            let folders: Vec<PathBuf> = windows
+                .values()
+                .flat_map(|e| e.folders.iter().cloned())
+                .collect();
+            (folders, departed)
+        };
+        self.stash_departures(departed);
         folders.sort();
         folders.dedup();
         folders
+    }
+
+    /// Queues `departed` for [`take_departures`](Self::take_departures). A no-op
+    /// for an empty batch, so the common read path costs one length check.
+    fn stash_departures(&self, departed: Vec<Departure>) {
+        if departed.is_empty() {
+            return;
+        }
+        let mut inbox = self
+            .departures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        inbox.extend(departed);
+        let excess = inbox.len().saturating_sub(MAX_DEPARTURES);
+        inbox.drain(..excess);
+    }
+
+    /// Drains the windows that have left since the last call (#2211), for the
+    /// adapter to resolve into [`ClosedWorktree`]s. Reaps first, so a window that
+    /// has just aged out is included.
+    pub fn take_departures(&self) -> Vec<Departure> {
+        // `open_folders` is the cheapest reaping read; its result is not needed.
+        self.open_folders();
+        std::mem::take(
+            &mut *self
+                .departures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// Seeds the recently-closed list from the file at `path` and remembers
+    /// `path` so later changes persist back to it (#2211). Called once at startup,
+    /// before any window subscribes, so it needs no bump. Best-effort throughout —
+    /// the [`WorktreesService::load_polling_prefs`] contract: a missing file is the
+    /// first-run default, a corrupt or unreadable one is logged and treated as
+    /// empty, and the path is kept regardless so the next change rewrites a clean
+    /// file.
+    ///
+    /// [`WorktreesService::load_polling_prefs`]: crate::daemon::services::worktrees::WorktreesService::load_polling_prefs
+    pub fn load_closed(&self, path: PathBuf) {
+        let entries = match std::fs::read(&path) {
+            Ok(bytes) => closed::from_file_bytes(&bytes).unwrap_or_else(|err| {
+                tracing::warn!(
+                    "ignoring unreadable recently-closed worktrees at {}: {err:#}",
+                    path.display()
+                );
+                Vec::new()
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    "could not read recently-closed worktrees at {}: {err:#}",
+                    path.display()
+                );
+                Vec::new()
+            }
+        };
+        *self.closed_lock() = ClosedLog::from_entries(entries, Utc::now());
+        *self
+            .closed_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(path);
+    }
+
+    /// The recently-closed list, newest first. Applies the age bound first, so an
+    /// entry that has aged out is gone from the answer *and* the file.
+    pub fn closed_entries(&self) -> Vec<ClosedWorktree> {
+        let mut log = self.closed_lock();
+        if log.prune(Utc::now()) {
+            self.persist_closed(&log);
+        }
+        log.entries().to_vec()
+    }
+
+    /// The recorded closure at exactly `path`, if there is one.
+    pub fn closed_entry(&self, path: &std::path::Path) -> Option<ClosedWorktree> {
+        self.closed_lock().get(path).cloned()
+    }
+
+    /// Records `entries` as closed (#2211). Persists and [`bump`](Self::bump)s
+    /// only if the list actually changed, so re-recording what is already there is
+    /// free.
+    pub fn record_closed(&self, entries: Vec<ClosedWorktree>) {
+        if entries.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        let changed = {
+            let mut log = self.closed_lock();
+            let mut changed = false;
+            for entry in entries {
+                changed |= log.record(entry, now);
+            }
+            if changed {
+                self.persist_closed(&log);
+            }
+            changed
+        };
+        if changed {
+            self.bump();
+        }
+    }
+
+    /// Drops the recorded closures at `paths` — those worktrees are open (or
+    /// reopened) again. Persists and bumps only on a real change.
+    pub fn forget_closed(&self, paths: &[PathBuf]) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        let changed = {
+            let mut log = self.closed_lock();
+            let changed = log.forget(paths);
+            if changed {
+                self.persist_closed(&log);
+            }
+            changed
+        };
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
+    /// Marks the recorded closure at each of `paths` as removed from disk,
+    /// returning whether any changed. Persists and bumps only on a real change.
+    pub fn mark_closed_removed(&self, paths: &[PathBuf]) -> bool {
+        let changed = {
+            let mut log = self.closed_lock();
+            let mut changed = false;
+            for path in paths {
+                changed |= log.mark_removed(path);
+            }
+            if changed {
+                self.persist_closed(&log);
+            }
+            changed
+        };
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
+    /// Locks the closed log, recovering from a poisoned mutex.
+    fn closed_lock(&self) -> MutexGuard<'_, ClosedLog> {
+        self.closed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Writes `log` to the persisted file, if a path was configured. Called with
+    /// the log's lock held, so two writers cannot interleave and the file always
+    /// holds the last state. Best-effort: a failed write is logged and swallowed —
+    /// the in-memory list is authoritative for the running daemon, it just would
+    /// not survive a restart.
+    fn persist_closed(&self, log: &ClosedLog) {
+        let Some(path) = self
+            .closed_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        let written = closed::to_file_bytes(log.entries()).and_then(|bytes| {
+            if let Some(parent) = path.parent() {
+                crate::daemon::paths::ensure_dir_0700(parent)?;
+            }
+            crate::daemon::paths::write_file_0600(&path, &bytes)
+        });
+        if let Err(err) = written {
+            tracing::warn!(
+                "could not persist recently-closed worktrees to {}: {err:#}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -788,16 +1039,37 @@ impl Default for WorktreesRegistry {
 /// *mutation* path ([`register`](WorktreesRegistry::register) et al.) decide
 /// whether to [`bump`](WorktreesRegistry::bump) the change-notify; read paths
 /// ignore it (see [`list`](WorktreesRegistry::list)).
+#[cfg(test)]
 fn reap(windows: &mut HashMap<String, WindowEntry>, ttl: Duration, awake: Duration) -> usize {
-    let before = windows.len();
-    windows.retain(|_, e| awake.saturating_sub(e.last_active) <= ttl);
-    before - windows.len()
+    reap_departed(windows, ttl, awake).len()
+}
+
+/// The reaping step: returns each dropped window as a [`Departure`] stamped with when
+/// it was last heard from (#2211). The caller queues them *after* releasing the
+/// window map's lock.
+fn reap_departed(
+    windows: &mut HashMap<String, WindowEntry>,
+    ttl: Duration,
+    awake: Duration,
+) -> Vec<Departure> {
+    let mut departed = Vec::new();
+    windows.retain(|_, e| {
+        let alive = awake.saturating_sub(e.last_active) <= ttl;
+        if !alive {
+            departed.push(Departure {
+                folders: e.folders.clone(),
+                at: e.last_seen,
+            });
+        }
+        alive
+    });
+    departed
 }
 
 /// Removes the entry with the oldest `last_active` (ties broken by lowest key
 /// for determinism). Called when a `register` of a new key would grow the
 /// registry past [`MAX_WINDOWS`]. Pure CPU under the registry lock, like
-/// [`reap`].
+/// [`reap_departed`].
 fn evict_oldest(windows: &mut HashMap<String, WindowEntry>) {
     let oldest = windows
         .values()
@@ -1821,5 +2093,127 @@ mod tests {
             ]
         );
         assert!(snap.iter().all(|(_, expiry)| *expiry == future));
+    }
+
+    // --- Recently closed (#2211) -------------------------------------------
+
+    fn closed_entry(path: &str, minutes_ago: i64) -> ClosedWorktree {
+        ClosedWorktree {
+            path: PathBuf::from(path),
+            repo_root: PathBuf::from("/repo"),
+            main_repo: "repo".to_string(),
+            github: None,
+            branch: Some("feature".to_string()),
+            head_sha: None,
+            is_main: false,
+            removed: false,
+            closed_at: Utc::now() - ChronoDuration::minutes(minutes_ago),
+        }
+    }
+
+    #[test]
+    fn an_unregister_queues_a_departure_with_the_windows_folders() {
+        let reg = WorktreesRegistry::new();
+        reg.register(register_request("w1", None, "/wt/a"));
+        assert!(reg.take_departures().is_empty());
+
+        assert!(reg.unregister("w1"));
+        let departures = reg.take_departures();
+        assert_eq!(departures.len(), 1);
+        assert_eq!(departures[0].folders, vec![PathBuf::from("/wt/a")]);
+        assert!(reg.take_departures().is_empty(), "drained exactly once");
+
+        // An unregister of an unknown key is not a departure.
+        assert!(!reg.unregister("w1"));
+        assert!(reg.take_departures().is_empty());
+    }
+
+    #[test]
+    fn a_ttl_reap_queues_a_departure_stamped_with_the_last_heard_time() {
+        let reg = registry_with_headroom();
+        insert_silent(&reg, "w", Duration::from_secs(40));
+        let heard = reg.lock()["w"].last_seen;
+        let departures = reg.take_departures();
+        assert_eq!(departures.len(), 1);
+        assert_eq!(departures[0].at, heard);
+    }
+
+    #[test]
+    fn evicting_at_the_cap_is_not_a_departure() {
+        let reg = WorktreesRegistry::new();
+        for i in 0..=MAX_WINDOWS {
+            reg.register(register_request(&format!("w{i}"), None, "/wt"));
+        }
+        assert!(
+            reg.take_departures().is_empty(),
+            "an evicted window is alive and re-registers"
+        );
+    }
+
+    #[test]
+    fn departures_are_bounded() {
+        let reg = WorktreesRegistry::new();
+        for i in 0..(MAX_DEPARTURES + 10) {
+            reg.register(register_request("w", None, &format!("/wt/{i}")));
+            reg.unregister("w");
+        }
+        let departures = reg.take_departures();
+        assert_eq!(departures.len(), MAX_DEPARTURES);
+        assert_eq!(
+            departures.last().unwrap().folders,
+            vec![PathBuf::from(format!("/wt/{}", MAX_DEPARTURES + 9))],
+            "the oldest are the ones dropped"
+        );
+    }
+
+    #[test]
+    fn registering_a_folder_forgets_its_closure() {
+        let reg = WorktreesRegistry::new();
+        reg.record_closed(vec![closed_entry("/wt/a", 2), closed_entry("/wt/b", 1)]);
+        reg.register(register_request("w1", None, "/wt/a"));
+        let paths: Vec<_> = reg.closed_entries().into_iter().map(|e| e.path).collect();
+        assert_eq!(paths, vec![PathBuf::from("/wt/b")]);
+    }
+
+    #[test]
+    fn closed_changes_bump_only_when_the_list_changes() {
+        let reg = WorktreesRegistry::new();
+        let before = reg.change_generation();
+        reg.record_closed(vec![]);
+        assert_eq!(reg.change_generation(), before, "nothing to record");
+
+        let entry = closed_entry("/wt/a", 1);
+        reg.record_closed(vec![entry.clone()]);
+        let after_record = reg.change_generation();
+        assert_ne!(after_record, before);
+
+        reg.record_closed(vec![entry]);
+        assert_eq!(reg.change_generation(), after_record, "unchanged");
+
+        assert!(!reg.forget_closed(&[PathBuf::from("/nope")]));
+        assert!(!reg.forget_closed(&[]));
+        assert_eq!(reg.change_generation(), after_record);
+
+        assert!(reg.mark_closed_removed(&[PathBuf::from("/wt/a")]));
+        let after_mark = reg.change_generation();
+        assert_ne!(after_mark, after_record);
+        assert!(!reg.mark_closed_removed(&[PathBuf::from("/wt/a")]));
+        assert_eq!(reg.change_generation(), after_mark);
+
+        assert!(reg.forget_closed(&[PathBuf::from("/wt/a")]));
+        assert_ne!(reg.change_generation(), after_mark);
+    }
+
+    #[test]
+    fn closed_entries_age_out_on_read() {
+        let reg = WorktreesRegistry::new();
+        let fresh = closed_entry("/wt/fresh", 1);
+        let stale = closed_entry("/wt/stale", 60 * 24 * (closed::MAX_AGE_DAYS + 1));
+        // Inserted through the log directly: `record_closed` would prune it.
+        *reg.closed_lock() = ClosedLog::from_entries(vec![fresh.clone()], Utc::now());
+        reg.closed_lock()
+            .record(stale, Utc::now() - ChronoDuration::days(365));
+        let kept = reg.closed_entries();
+        assert_eq!(kept, vec![fresh]);
     }
 }

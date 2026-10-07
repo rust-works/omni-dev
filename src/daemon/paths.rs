@@ -43,6 +43,17 @@ pub fn worktrees_polling_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("worktrees-polling.json"))
 }
 
+/// Default recently-closed-worktrees path: `<runtime_dir>/worktrees-closed.json`.
+///
+/// The worktrees service persists the bounded list of worktrees whose windows
+/// closed (or that were removed) here (`0600`), so the list survives a daemon
+/// restart (#2211). Holds paths, branch names and commit ids — no secrets and no
+/// file or conversation content — but is co-located with the other `0600`
+/// runtime state for a consistent posture.
+pub fn worktrees_closed_path() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("worktrees-closed.json"))
+}
+
 /// Default resolved-PR-badge cache path: `<runtime_dir>/worktrees-pr-cache.json`.
 ///
 /// The worktrees service persists the last polled PR badges (number / URL /
