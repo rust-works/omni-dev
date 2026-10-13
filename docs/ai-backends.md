@@ -16,6 +16,12 @@ shape (a state plus a map of typed questions) is not a chat completion. It has
 its own credentials and model knob (`--jev-model`, not `--model`). See
 [docs/jev.md](jev.md).
 
+The **Anthropic gateway** (`omni-dev ai gateway`) is the reverse direction and
+not a backend either: it lets *other* tools, such as Claude Code, reach an
+OpenAI-protocol model through the Anthropic API. It shares the OpenAI wire
+helpers with the backend described here but has its own configuration
+(`OMNI_DEV_GATEWAY_*`). See [docs/anthropic-gateway.md](anthropic-gateway.md).
+
 ## Table of Contents
 
 1. [Backends at a Glance](#backends-at-a-glance)
