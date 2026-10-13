@@ -43,10 +43,11 @@ AI operations
 Usage: ai <COMMAND>
 
 Commands:
-  chat    Interactive AI chat session
-  claude  Claude Code diagnostics and inspection
-  jev     TypeSafe Jev typed judgments (choice, score, yes/no)
-  help    Print this message or the help of the given subcommand(s)
+  chat     Interactive AI chat session
+  claude   Claude Code diagnostics and inspection
+  gateway  Anthropic Messages gateway in front of OpenAI-protocol upstreams
+  jev      TypeSafe Jev typed judgments (choice, score, yes/no)
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -254,6 +255,75 @@ Options:
       --dry-run          Preview the changes without creating symlinks or modifying the exclude file
       --format <FORMAT>  Output format [default: text] [possible values: text, yaml]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev ai gateway - Anthropic Messages gateway in front of OpenAI-protocol upstreams
+
+Anthropic Messages gateway in front of OpenAI-protocol upstreams
+
+Usage: gateway <COMMAND>
+
+Commands:
+  serve   Runs the gateway in the foreground until interrupted
+  env     Prints the environment a client needs to use the gateway
+  fields  Prints how each Anthropic request field is handled
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev ai gateway env - Prints the environment a client needs to use the gateway
+
+Prints the environment a client needs to use the gateway
+
+Usage: env [OPTIONS]
+
+Options:
+      --port <PORT>      Port to print (default: OMNI_DEV_GATEWAY_PORT, else 9997)
+      --format <FORMAT>  Output format [default: shell] [possible values: shell, json]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev ai gateway fields - Prints how each Anthropic request field is handled
+
+Prints how each Anthropic request field is handled
+
+Usage: fields
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev ai gateway serve - Runs the gateway in the foreground until interrupted
+
+Runs the gateway in the foreground until interrupted
+
+Usage: serve [OPTIONS]
+
+Options:
+      --port <PORT>
+          Port on 127.0.0.1 (`0` picks a free one). Default: OMNI_DEV_GATEWAY_PORT, else 9997
+      --upstream-url <URL>
+          Upstream base URL, e.g. `https://api.fireworks.ai/inference` or `http://localhost:11434`
+      --upstream-protocol <UPSTREAM_PROTOCOL>
+          Protocol the upstream speaks [possible values: chat, responses, anthropic]
+      --flavor <FLAVOR>
+          Upstream provider family, for its quirks [possible values: generic, openai, fireworks]
+      --model <MODEL>
+          Default upstream model, used for client model names the map does not cover
+      --map <PATTERN=MODEL>
+          Model mapping `PATTERN=MODEL` (`*` globs, e.g. `claude-haiku-*=small`); repeatable
+  -h, --help
+          Print help (see more with '--help')
 
 
 ================================================================================
@@ -3346,7 +3416,7 @@ Usage: restart [OPTIONS]
 
 Options:
       --socket <PATH>   Control-socket path. Defaults to the per-user runtime location
-      --services <SVC>  Re-bake this comma-separated subset of services (default: preserve whatever the running daemon currently hosts). Values: browser-bridge, snowflake, worktrees, sessions [possible values: browser-bridge, snowflake, worktrees, sessions]
+      --services <SVC>  Re-bake this comma-separated subset of services (default: preserve whatever the running daemon currently hosts). Values: browser-bridge, snowflake, worktrees, sessions, anthropic-gateway [possible values: browser-bridge, snowflake, worktrees, sessions, anthropic-gateway]
   -h, --help            Print help (see more with '--help')
 
 
@@ -3372,7 +3442,7 @@ Options:
       --no-menu
           Run headless: never show the macOS menu-bar tray (no effect on non-macOS or non-`menu-bar` builds, which are always headless)
       --services <SVC>
-          Host only this comma-separated subset of services (default: all). Overrides `OMNI_DEV_DAEMON_SERVICES`. Values: browser-bridge, snowflake, worktrees, sessions [possible values: browser-bridge, snowflake, worktrees, sessions]
+          Host only this comma-separated subset of services (default: all). Overrides `OMNI_DEV_DAEMON_SERVICES`. Values: browser-bridge, snowflake, worktrees, sessions, anthropic-gateway [possible values: browser-bridge, snowflake, worktrees, sessions, anthropic-gateway]
   -h, --help
           Print help (see more with '--help')
 
@@ -3405,7 +3475,7 @@ Usage: start [OPTIONS]
 
 Options:
       --socket <PATH>   Control-socket path. Defaults to the per-user runtime location
-      --services <SVC>  Host only this comma-separated subset of services (default: all), baked into the generated launchd plist / systemd unit so it survives the service-manager exec. Overrides `OMNI_DEV_DAEMON_SERVICES`. Values: browser-bridge, snowflake, worktrees, sessions [possible values: browser-bridge, snowflake, worktrees, sessions]
+      --services <SVC>  Host only this comma-separated subset of services (default: all), baked into the generated launchd plist / systemd unit so it survives the service-manager exec. Overrides `OMNI_DEV_DAEMON_SERVICES`. Values: browser-bridge, snowflake, worktrees, sessions, anthropic-gateway [possible values: browser-bridge, snowflake, worktrees, sessions, anthropic-gateway]
   -h, --help            Print help (see more with '--help')
 
 
