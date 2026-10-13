@@ -1472,6 +1472,55 @@ mod tests {
         assert_eq!(env_ref.var("OMNI_DEV_TEST_SETTINGS_ENV_REF_MISSING"), None);
     }
 
+    #[test]
+    fn settings_env_from_settings_wraps_loaded_settings_without_a_disk_read() {
+        let mut base = HashMap::new();
+        base.insert(
+            "OMNI_DEV_TEST_FROM_SETTINGS_K".to_string(),
+            "from-base".to_string(),
+        );
+        let mut work_env = HashMap::new();
+        work_env.insert(
+            "OMNI_DEV_TEST_FROM_SETTINGS_K".to_string(),
+            "from-work".to_string(),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert("work".to_string(), Profile { env: work_env });
+        let settings = Settings {
+            env: base,
+            profiles,
+            ..Settings::default()
+        };
+
+        let no_profile = SettingsEnv::from_settings(settings, None);
+        assert_eq!(
+            no_profile.var("OMNI_DEV_TEST_FROM_SETTINGS_K"),
+            Some("from-base".to_string())
+        );
+        assert_eq!(no_profile.var("OMNI_DEV_TEST_FROM_SETTINGS_MISSING"), None);
+    }
+
+    #[test]
+    fn settings_env_from_settings_honours_the_given_profile() {
+        let mut work_env = HashMap::new();
+        work_env.insert(
+            "OMNI_DEV_TEST_FROM_SETTINGS_PROFILE_K".to_string(),
+            "from-work".to_string(),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert("work".to_string(), Profile { env: work_env });
+        let settings = Settings {
+            profiles,
+            ..Settings::default()
+        };
+
+        let env = SettingsEnv::from_settings(settings, Some("work"));
+        assert_eq!(
+            env.var("OMNI_DEV_TEST_FROM_SETTINGS_PROFILE_K"),
+            Some("from-work".to_string())
+        );
+    }
+
     // ── sourced resolution (issue #1143: provenance for warnings) ──
 
     #[test]
