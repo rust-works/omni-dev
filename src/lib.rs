@@ -46,6 +46,7 @@ pub mod cli;
 pub mod daemon;
 pub mod data;
 pub mod datadog;
+pub mod gateway;
 pub mod git;
 pub mod github_issues;
 pub mod github_metrics;

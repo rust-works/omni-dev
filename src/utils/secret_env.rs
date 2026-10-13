@@ -82,6 +82,9 @@ pub const SECRET_ENV_VARS: &[&str] = &[
     "SNOWFLAKE_PRIVATE_KEY",
     // Browser bridge
     "OMNI_BRIDGE_TOKEN",
+    // Anthropic gateway (#2226): the upstream key and the inbound token
+    "OMNI_DEV_GATEWAY_API_KEY",
+    "OMNI_DEV_GATEWAY_TOKEN",
 ];
 
 /// Secret-shaped names that are deliberately **not** read through this
