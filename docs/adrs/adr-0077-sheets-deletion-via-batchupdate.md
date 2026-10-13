@@ -2,7 +2,11 @@
 
 ## Status
 
-✅ Accepted (2026-09-08)
+➡️ Relocated to gwi (2026-10-13)
+
+Moved to [rust-works/gwi](https://github.com/rust-works/gwi) by [#2203](https://github.com/rust-works/omni-dev/issues/2203) and [ADR-0095](adr-0095.md). The decision stands; its maintained copy is [gwi ADR-0077](https://github.com/rust-works/gwi/blob/main/docs/adrs/adr-0077-sheets-deletion-via-batchupdate.md). This copy stays as history so existing links keep working.
+
+Originally: ✅ Accepted (2026-09-08)
 
 **Extends [ADR-0075](adr-0075.md), and supersedes its §3/§4 claim that
 `deleteSheet`/`deleteDimension`/`deleteRange` stay structurally
@@ -213,7 +217,7 @@ dimension deletes reuse the existing `sheet_id`/`sheet_title`/
 `delete-range` cannot: `dimension_range` only ever spans one axis, and a
 rectangle needs both, so `DriveMutationOutcome` gains one more
 omit-if-absent key, `grid_range` (e.g. `"rows 2-4, columns 2-3"`), the
-`deleteRange` analogue of `dimension_range`. [docs/log.md](../log.md)
+`deleteRange` analogue of `dimension_range`. [docs/log.md](https://github.com/rust-works/gwi/blob/main/docs/log.md)
 documents it alongside the rest.
 
 ## Consequences
@@ -245,9 +249,9 @@ documents it alongside the rest.
   (routes through the right gate) rather than an absence one (cannot be
   constructed at all), because the latter is no longer true and asserting
   it would be a lie the test suite told.
-- **Sync obligation.** [docs/drive.md](../drive.md) documents the four new
+- **Sync obligation.** [docs/drive.md](https://github.com/rust-works/gwi/blob/main/docs/drive.md) documents the four new
   verbs, the `sheets-delete` row in the write-permission table, and removes
   the "no deletion, at all" limitation it used to state;
-  [docs/log.md](../log.md) documents the new `drivemutation` operations and
+  [docs/log.md](https://github.com/rust-works/gwi/blob/main/docs/log.md) documents the new `drivemutation` operations and
   the `grid_range` context field. Keep both in sync when this ADR's
   decisions change.
