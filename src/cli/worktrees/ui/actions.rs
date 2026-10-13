@@ -1172,10 +1172,8 @@ fn note_lines(path: &Path, notes: &[CloseNoteWire]) -> Vec<String> {
         .collect()
 }
 
-/// Opens `url` with the platform's default handler — the `BrowserLaunch::
-/// Auto` pattern already live in `src/gmail/auth.rs::open_browser`, without
-/// that module's Gmail-specific `Manual`/`Command` variants (this action has
-/// no configured-browser concept, only "open the OS default").
+/// Opens `url` with the platform's default handler (this action has no
+/// configured-browser concept, only "open the OS default").
 fn open_in_os(url: &str) -> Result<()> {
     let program = if cfg!(target_os = "macos") {
         "open"

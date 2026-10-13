@@ -46,12 +46,10 @@ pub mod cli;
 pub mod daemon;
 pub mod data;
 pub mod datadog;
-pub mod drive;
 pub mod git;
 pub mod github_issues;
 pub mod github_metrics;
 pub mod github_rate_limit;
-pub mod gmail;
 pub mod jev;
 #[cfg(feature = "mcp")]
 pub mod mcp;

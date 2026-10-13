@@ -199,9 +199,8 @@ pub fn ensure_parent_dir_0700(path: &Path) -> Result<()> {
 /// `create_new` (`O_EXCL`), so two callers racing to create the same path
 /// see exactly one winner and the other an error, never a silent overwrite
 /// — [`write_file_0600`]'s sibling for callers that need "either I created
-/// this file first, or I must fail" rather than a truncating write. Used by
-/// the Drive lease ledger's advisory lock file, its backup files, and the
-/// pre-existing `gmail insert` ledger lock.
+/// this file first, or I must fail" rather than a truncating write. Used for
+/// advisory lock files and other create-exclusive state.
 pub fn create_new_file_0600(path: &Path) -> Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -373,23 +372,6 @@ impl Drop for FileLock {
         // will (incorrectly) see this as still held (STYLE-0018).
         if let Err(err) = std::fs::remove_file(&self.path) {
             tracing::debug!("failed to remove lock file {}: {err}", self.path.display());
-        }
-    }
-}
-
-/// [`try_lock_file_exclusive`], but folding [`FileLockError::Busy`] into
-/// `Ok(None)` instead of an `Err` variant — for callers that want to decide
-/// for themselves whether a busy lock is a wait-and-retry condition or an
-/// immediate failure, rather than that choice being baked into this
-/// function. An I/O failure is still `Err`, wrapped with `what` (a short
-/// noun phrase, e.g. `"the lease lock file"`) describing what was being
-/// locked, for a caller-appropriate error message.
-pub(crate) fn try_lock_or_busy(path: &Path, what: &str) -> Result<Option<FileLock>> {
-    match try_lock_file_exclusive(path) {
-        Ok(inner) => Ok(Some(inner)),
-        Err(FileLockError::Busy) => Ok(None),
-        Err(FileLockError::Io(err)) => {
-            Err(err.context(format!("failed to lock {what} at {}", path.display())))
         }
     }
 }

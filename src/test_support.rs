@@ -10,7 +10,7 @@
 /// resolution depends on it (`dirs::home_dir()` /
 /// `Settings::get_settings_path()`).
 ///
-/// Every HOME-mutating test-support module (Atlassian, Datadog, Gmail, the
+/// Every HOME-mutating test-support module (Atlassian, Datadog, the
 /// `ai_chat`/`cli::ai::chat` provider tests, …) aliases this **one** static
 /// rather than declaring its own `Mutex<()>`. Independent per-module mutexes
 /// provide no mutual exclusion against each other — each only serialises its
@@ -20,97 +20,6 @@
 /// resurfaced as a Gmail-vs-Datadog race (both mutating `HOME` under their
 /// own independent mutex) in issue #1465.
 pub(crate) static HOME_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Redirects the audit log into an isolated tempdir for the life of one
-/// test — for this thread only, through `request_log::TEST_AUDIT_ROUTE`,
-/// not the process-global `OMNI_DEV_AUDIT_LOG_FILE` — so it needs no lock
-/// and tests holding one run fully in parallel.
-///
-/// Every Drive lease-check/acquire test that reaches a live lease or a
-/// refusal triggers a best-effort or write-ahead audit write (ADR-0080
-/// §11) as a side effect of calling production code, whether or not the
-/// test cares about its content. A test that doesn't redirect lands in
-/// `request_log`'s shared scratch file — never the real machine's
-/// `audit.jsonl`, and never another test's env override either, since an
-/// un-opted thread does not consult the env var at all; a test that wants
-/// to read its *own* records back takes this guard. The writes this guard
-/// observes must therefore happen on the test's own thread (a
-/// `#[tokio::test]` body does; a `spawn_blocking` closure does not).
-///
-/// [`Self::records`] reads back what production code wrote, so a test
-/// asserting on the audit trail needs no private line-parsing helper.
-pub(crate) struct AuditLogGuard {
-    path: std::path::PathBuf,
-}
-
-impl AuditLogGuard {
-    pub(crate) fn redirect(dir: &std::path::Path) -> Self {
-        let path = dir.join("audit.jsonl");
-        crate::request_log::TEST_AUDIT_ROUTE.with(|slot| *slot.borrow_mut() = Some(path.clone()));
-        Self { path }
-    }
-
-    /// Every record written so far, in order. An audit file that was never
-    /// created (nothing wrote) reads as empty rather than panicking, so a
-    /// "must write nothing" assertion is `assert!(guard.records().is_empty())`.
-    pub(crate) fn records(&self) -> Vec<crate::request_log::LogRecord> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(text) => text
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(err) => panic!("failed to read {}: {err}", self.path.display()),
-        }
-    }
-
-    /// The `verdict` of every record written so far, in order — the
-    /// assertion almost every audit-trail test makes.
-    pub(crate) fn verdicts(&self) -> Vec<String> {
-        self.records()
-            .iter()
-            .map(|record| record.context.get("verdict").cloned().unwrap_or_default())
-            .collect()
-    }
-}
-
-impl Drop for AuditLogGuard {
-    fn drop(&mut self) {
-        crate::request_log::TEST_AUDIT_ROUTE.with(|slot| *slot.borrow_mut() = None);
-    }
-}
-
-#[cfg(test)]
-mod audit_log_guard_tests {
-    use super::AuditLogGuard;
-
-    /// Direct cover for the "nothing wrote" branch of [`AuditLogGuard::records`]
-    /// (`ErrorKind::NotFound` reads as empty rather than panicking): every
-    /// other caller in the crate redirects and then triggers a write before
-    /// reading records back, so this path is otherwise never exercised.
-    #[test]
-    fn records_reads_as_empty_before_anything_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let guard = AuditLogGuard::redirect(dir.path());
-        assert!(guard.records().is_empty());
-    }
-
-    /// Direct cover for the panic branch of [`AuditLogGuard::records`]: a
-    /// read failure other than `NotFound` must not read as "nothing wrote
-    /// yet" — it must panic instead, the same fail-loud contract every
-    /// other test-support helper in this file follows. A directory in
-    /// place of the audit file forces that non-`NotFound` failure, the
-    /// same trick `drive::lease::check`'s own fail-closed test uses.
-    #[test]
-    fn records_panics_when_the_read_fails_for_a_reason_other_than_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let guard = AuditLogGuard::redirect(dir.path());
-        std::fs::create_dir(dir.path().join("audit.jsonl")).unwrap();
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.records()));
-        assert!(result.is_err());
-    }
-}
 
 /// Thread-scoped log buffer backing [`capture_at`].
 #[derive(Clone, Default)]

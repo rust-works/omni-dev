@@ -21,12 +21,11 @@ pub mod codex_wrap;
 #[cfg(unix)]
 pub mod daemon;
 pub mod datadog;
-pub mod drive;
 pub mod format;
 pub mod git;
-pub mod gmail;
 pub mod help;
 pub mod log;
+pub mod moved;
 pub mod repo_arg;
 pub mod resources;
 #[cfg(unix)]
@@ -97,10 +96,12 @@ pub enum Commands {
     Daemon(daemon::DaemonCommand),
     /// Datadog: read-only API operations.
     Datadog(datadog::DatadogCommand),
-    /// Drive: search and read Google Drive files via OAuth2 (read-only).
-    Drive(drive::DriveCommand),
-    /// Gmail: search, read, and label messages via OAuth2.
-    Gmail(gmail::GmailCommand),
+    /// Removed: moved to gwi (https://github.com/rust-works/gwi).
+    #[command(hide = true)]
+    Drive(moved::MovedCommand),
+    /// Removed: moved to gwi (https://github.com/rust-works/gwi).
+    #[command(hide = true)]
+    Gmail(moved::MovedCommand),
     /// Snowflake: run arbitrary SQL through the daemon's multiplexed sessions.
     #[cfg(unix)]
     Snowflake(snowflake::SnowflakeCommand),
@@ -195,8 +196,8 @@ impl Cli {
             #[cfg(unix)]
             Commands::Daemon(cmd) => cmd.execute().await,
             Commands::Datadog(cmd) => cmd.execute().await,
-            Commands::Drive(cmd) => cmd.execute().await,
-            Commands::Gmail(cmd) => cmd.execute().await,
+            Commands::Drive(cmd) => cmd.execute("drive"),
+            Commands::Gmail(cmd) => cmd.execute("gmail"),
             #[cfg(unix)]
             Commands::Snowflake(cmd) => cmd.execute().await,
             #[cfg(unix)]
@@ -237,34 +238,6 @@ impl Cli {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-
-    // `execute()`'s command dispatch is otherwise only exercised by spawning
-    // the real binary in integration tests; this covers the `Gmail` arm
-    // in-process (deterministic, network-free: missing credentials fail
-    // fast before any Gmail API call).
-    #[tokio::test]
-    async fn execute_routes_gmail_subcommand() {
-        let guard = crate::gmail::test_support::EnvGuard::take();
-        let _dir = guard.clear_credentials();
-
-        let cli = Cli::try_parse_from(["omni-dev", "gmail", "auth", "status"]).unwrap();
-        let err = cli.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
-    }
-
-    // `execute()`'s command dispatch is otherwise only exercised by spawning
-    // the real binary in integration tests; this covers the `Drive` arm
-    // in-process (deterministic, network-free: missing credentials fail
-    // fast before any Drive API call).
-    #[tokio::test]
-    async fn execute_routes_drive_subcommand() {
-        let guard = crate::drive::test_support::EnvGuard::take();
-        let _dir = guard.clear_credentials();
-
-        let cli = Cli::try_parse_from(["omni-dev", "drive", "auth", "status"]).unwrap();
-        let err = cli.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
-    }
 
     // ── global arg-id collision tests (#1420) ──
 
@@ -432,9 +405,6 @@ mod tests {
             "omni-dev atlassian jira --instance",
             "omni-dev atlassian confluence --instance",
             "omni-dev atlassian auth status --instance",
-            // Pre-#1778 subtree globals, scoped the same way.
-            "omni-dev gmail --account",
-            "omni-dev drive --account",
         ]
         .into_iter()
         .map(str::to_string)
@@ -465,8 +435,8 @@ mod tests {
 
         // A global arg isn't only declared at the root (`--profile`,
         // `--instance`, …) — a subcommand can scope its own `global = true`
-        // arg to just its subtree (e.g. `gmail`'s `--account`, inherited by
-        // every `gmail` subcommand but not by sibling top-level commands
+        // arg to just its subtree (e.g. `atlassian jira`'s `--instance`, inherited by
+        // every `jira` subcommand but not by sibling top-level commands
         // like `snowflake`). So globals accumulate as the walk descends,
         // not just once at the root.
         //
@@ -536,10 +506,10 @@ mod tests {
     // ── propagate_profile_flag() tests ──
     //
     // These tests mutate `OMNI_DEV_PROFILE`, which `execute()` reads (via
-    // `validate_active_profile`) in the `execute_routes_*` tests above. Those
-    // hold `HOME_ENV_MUTEX` (through the Gmail/Drive `EnvGuard`s), so these
-    // serialise on the same mutex — otherwise a profile set here makes a
-    // concurrent routing test fail with "unknown profile".
+    // `validate_active_profile`). Every test that reaches `execute()` or loads
+    // settings holds `HOME_ENV_MUTEX`, so these serialise on the same mutex —
+    // otherwise a profile set here makes a concurrent test fail with "unknown
+    // profile".
 
     const PROFILE_VAR: &str = "OMNI_DEV_PROFILE";
 

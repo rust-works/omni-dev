@@ -2,8 +2,8 @@
 //!
 //! [`retry_429`] is the literal-429-only driver behind the Atlassian and
 //! Datadog clients — a thin wrapper over [`retry_if`], the general driver
-//! that also lets Gmail retry its own quota-exhaustion signal (HTTP 403 with
-//! a `reason` Atlassian/Datadog never emit). Both rebuild the request per
+//! that also lets a client retry its own quota-exhaustion signal (for example
+//! an HTTP 403 with a `reason` Atlassian/Datadog never emit). Both rebuild the request per
 //! attempt, log every attempt, and on a retryable response wait per
 //! `Retry-After`, then `X-RateLimit-Reset`, then exponential backoff.
 //! Consolidating the previously per-verb loops also unified the
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use reqwest::{Response, ResponseBuilderExt as _};
 
 /// Default timeout for just the connect phase (TCP + TLS handshake) of a
-/// REST client request (Atlassian, Datadog, Gmail). Overridable via
+/// REST client request (Atlassian, Datadog, Jev). Overridable via
 /// [`CONNECT_TIMEOUT_ENV_VAR`].
 ///
 /// Deliberately short and independent of [`DEFAULT_READ_TIMEOUT`]: a
@@ -24,15 +24,14 @@ use reqwest::{Response, ResponseBuilderExt as _};
 pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default timeout for each individual read operation of a REST client
-/// response body (Atlassian, Datadog, Gmail). Overridable via
+/// response body (Atlassian, Datadog, Jev). Overridable via
 /// [`READ_TIMEOUT_ENV_VAR`].
 ///
 /// `reqwest`'s `read_timeout` resets on every successful read rather than
-/// imposing one fixed deadline on the whole response — the right shape for
-/// Gmail's `messages.get?format=raw`, which can return tens of megabytes
-/// for an attachment-heavy message. A single caller downloading that alone
-/// finishes in seconds, but several downloading concurrently (bounded by
-/// `gmail sync --concurrency`) divide the available bandwidth, and a fixed
+/// imposing one fixed deadline on the whole response — the right shape for a
+/// large download. A single caller downloading tens of megabytes alone
+/// finishes in seconds, but several downloading concurrently divide the
+/// available bandwidth, and a fixed
 /// *total* deadline can trip even though every read is still making
 /// progress — the failure mode a total `.timeout()` (the previous, single-
 /// knob design) couldn't distinguish from an actually-stalled connection
@@ -102,10 +101,10 @@ const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
 /// status, the delay in seconds, and the 1-based attempt number — the same
 /// three values the default message prints.
 ///
-/// Lets a caller with progress-bar context (Gmail's `sync`/`sync-all`, #1651)
-/// render the notice appropriately instead of a raw scrolling stderr line
-/// that can tear a live `indicatif::MultiProgress` render. Callers without
-/// one (Atlassian, Datadog, Drive) pass `None` and keep the plain fallback.
+/// Lets a caller with progress-bar context render the notice appropriately
+/// instead of a raw scrolling stderr line that can tear a live progress
+/// render. Callers without one (Atlassian, Datadog, Jev) pass `None` and keep
+/// the plain fallback.
 pub(crate) type RetryNotifyFn = dyn Fn(u16, u64, u32) + Send + Sync;
 
 /// Drives an HTTP request through the shared literal-429 retry loop.
@@ -394,7 +393,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    // ── retry_if: caller-supplied predicate (the Gmail 403 case) ──────
+    // ── retry_if: caller-supplied predicate (a service-specific 403 case) ──────
 
     #[tokio::test]
     async fn retry_if_retries_a_custom_status_when_predicate_says_so() {

@@ -49,11 +49,6 @@ impl OmniDevServer {
             + Self::jev_tool_router()
             + Self::config_tool_router()
             + Self::datadog_tool_router()
-            + Self::gmail_tool_router()
-            + Self::drive_tool_router()
-            + Self::drive_sheets_tool_router()
-            + Self::drive_docs_tool_router()
-            + Self::drive_write_tool_router()
             + Self::log_tool_router()
             + Self::transcript_tool_router()
             + Self::browser_tool_router();
@@ -383,8 +378,10 @@ mod tests {
         }
     }
 
+    /// The 23 Gmail and Drive tools moved to `gwi-mcp` (#2203, ADR-0095). A
+    /// route that reappears here would be a second, divergent copy.
     #[test]
-    fn tool_router_registers_all_gmail_tools() {
+    fn tool_router_no_longer_registers_gmail_or_drive_tools() {
         let server = OmniDevServer::new();
         for name in [
             "gmail_auth_status",
@@ -395,15 +392,6 @@ mod tests {
             "gmail_account_list",
             "gmail_draft_list",
             "gmail_draft_show",
-        ] {
-            assert!(server.tool_router.has_route(name), "missing route: {name}");
-        }
-    }
-
-    #[test]
-    fn tool_router_registers_all_drive_tools() {
-        let server = OmniDevServer::new();
-        for name in [
             "drive_auth_status",
             "drive_search",
             "drive_file_read",
@@ -420,7 +408,10 @@ mod tests {
             "drive_sheets_clear",
             "drive_lease_acquire",
         ] {
-            assert!(server.tool_router.has_route(name), "missing route: {name}");
+            assert!(
+                !server.tool_router.has_route(name),
+                "unexpected route: {name}"
+            );
         }
     }
 

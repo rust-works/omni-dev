@@ -1,13 +1,9 @@
 //! Shared POSIX-style tokenizer for a user-supplied browser-launch command
-//! string (e.g. `SNOWFLAKE_BROWSER_COMMAND`, Gmail's per-account
-//! `browser_command`).
+//! string (e.g. `SNOWFLAKE_BROWSER_COMMAND`).
 //!
-//! Promoted out of `crate::snowflake` on its second consumer
-//! (`crate::gmail::auth`, issue #1505) — unlike the small, stable
-//! `BrowserLaunch` enum shape each of those modules keeps duplicated (see the
-//! doc comment on `crate::gmail::auth::BrowserLaunch`: "extract only on a
-//! third consumer"), this tokenizer is non-trivial escaping logic worth
-//! sharing as soon as a second caller needs it.
+//! Promoted out of `crate::snowflake` when a second consumer appeared (the
+//! Gmail login, since moved to gwi, #2203) — this tokenizer is non-trivial
+//! escaping logic worth sharing as soon as a second caller needs it.
 
 use anyhow::{bail, Result};
 

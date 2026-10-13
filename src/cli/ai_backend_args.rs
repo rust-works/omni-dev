@@ -6,7 +6,7 @@
 //! (#1778). They are now declared only on the commands that read them.
 //!
 //! **Placement rule:** a flag attaches to the **narrowest node whose entire
-//! subtree reads it** — subtree-`global = true` there (the `gmail --account`
+//! subtree reads it** — subtree-`global = true` there (the `atlassian jira --instance`
 //! precedent), or `#[command(flatten)]`ed onto individual leaves when the
 //! readers are scattered, as the AI commands are. clap then rejects a flag on
 //! a command that would ignore it, and `--help` is accurate by construction.
@@ -97,7 +97,7 @@ pub struct AiBackendArgs {
     /// session to load MCP servers from `~/.claude/settings.json`.
     ///
     /// **Only use deliberately.** MCP servers commonly hold OAuth tokens
-    /// (Gmail, Drive, Slack) and may be arbitrary network-attached services;
+    /// (Gmail, Drive, Slack, …) and may be arbitrary network-attached services;
     /// enabling this exposes them to the nested session. By default the
     /// session runs with `--strict-mcp-config` and no MCP servers load.
     /// Equivalent to setting `OMNI_DEV_CLAUDE_CLI_ALLOW_MCP=true`.
