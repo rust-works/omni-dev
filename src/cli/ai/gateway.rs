@@ -106,7 +106,7 @@ impl ServeCommand {
         let path = token_path()?;
         let token = resolve_token(&path)?;
         let summary = config.describe();
-        let server = GatewayServer::start(config, token).await?;
+        let server = GatewayServer::start(config, token)?;
         eprintln!(
             "omni-dev Anthropic gateway listening on {}\n  {summary}\n  token: OMNI_DEV_GATEWAY_TOKEN if set, else {}\n\
              Run `omni-dev ai gateway env` for the client settings; Ctrl-C stops.",

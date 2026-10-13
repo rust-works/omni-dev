@@ -277,7 +277,7 @@ pub struct GatewayServer {
 impl GatewayServer {
     /// Binds `127.0.0.1:<port>` (fail-closed: a taken port is an error) and
     /// starts serving. `token` is the resolved gateway token (never from argv).
-    pub async fn start(config: GatewayConfig, token: String) -> Result<Self> {
+    pub fn start(config: GatewayConfig, token: String) -> Result<Self> {
         // `SO_REUSEADDR`, like the browser bridge (#990): a restart rebinds the
         // same port while just-closed client connections sit in `TIME_WAIT`. It
         // does not allow a second live listener, so a taken port still fails.

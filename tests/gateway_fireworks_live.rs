@@ -46,7 +46,7 @@ async fn start(protocol: UpstreamProtocol, model: &str) -> GatewayServer {
         config.api_key.is_some(),
         "set OMNI_DEV_GATEWAY_API_KEY (or _FILE / _COMMAND) to a Fireworks key"
     );
-    GatewayServer::start(config, TOKEN.into()).await.unwrap()
+    GatewayServer::start(config, TOKEN.into()).unwrap()
 }
 
 async fn post(server: &GatewayServer, body: &Value) -> (u16, String) {

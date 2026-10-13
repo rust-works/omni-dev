@@ -41,7 +41,7 @@ impl Harness {
             env = env.with(k, v);
         }
         let config = GatewayConfig::from_env_with(&env, &ConfigOverrides::default()).unwrap();
-        let server = GatewayServer::start(config, token.into()).await.unwrap();
+        let server = GatewayServer::start(config, token.into()).unwrap();
         Self {
             upstream,
             server,
@@ -373,7 +373,7 @@ async fn unmapped_claude_models_are_404s() {
         .with("OMNI_DEV_GATEWAY_PORT", "0")
         .with("OMNI_DEV_GATEWAY_MODEL_MAP", "claude-haiku-*=small");
     let config = GatewayConfig::from_env_with(&env, &ConfigOverrides::default()).unwrap();
-    let server = GatewayServer::start(config, TOKEN.into()).await.unwrap();
+    let server = GatewayServer::start(config, TOKEN.into()).unwrap();
     let client = reqwest::Client::new();
     let response = client
         .post(format!("http://127.0.0.1:{}/v1/messages", server.port()))
