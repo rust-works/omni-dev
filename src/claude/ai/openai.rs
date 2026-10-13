@@ -84,11 +84,15 @@ pub(crate) fn chat_completions_url(base_url: &str) -> String {
     format!("{}/v1/chat/completions", base_url.trim_end_matches('/'))
 }
 
-/// Whether `model` is a GPT-5 / o-series model, which takes
-/// `max_completion_tokens` instead of `max_tokens` and accepts only the
-/// default temperature.
+/// Whether `model` is a GPT-5 / o-series model (`o1`, `o3`, `o4-mini`, ...),
+/// which takes `max_completion_tokens` instead of `max_tokens` and accepts only
+/// the default temperature. A provider prefix (`openai/gpt-5`, as routers such
+/// as OpenRouter spell it) is ignored.
 pub(crate) fn uses_max_completion_tokens(model: &str) -> bool {
-    model.starts_with("gpt-5") || model.starts_with("o1")
+    let name = model.rsplit('/').next().unwrap_or(model);
+    let mut chars = name.chars();
+    name.starts_with("gpt-5")
+        || (chars.next() == Some('o') && chars.next().is_some_and(|c| c.is_ascii_digit()))
 }
 
 /// Inner spec of an OpenAI `response_format: json_schema` envelope.
@@ -744,6 +748,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(openai.service_tag(), "openai");
+    }
+
+    #[test]
+    fn uses_max_completion_tokens_covers_every_reasoning_family() {
+        for model in [
+            "gpt-5",
+            "gpt-5-mini",
+            "o1",
+            "o1-mini",
+            "o3",
+            "o4-mini",
+            "openai/gpt-5",
+            "openai/o3",
+        ] {
+            assert!(uses_max_completion_tokens(model), "{model}");
+        }
+        for model in [
+            "gpt-4o",
+            "gpt-4.1",
+            "llama3",
+            "ollama",
+            "omni",
+            "openai/gpt-4o",
+            "",
+        ] {
+            assert!(!uses_max_completion_tokens(model), "{model}");
+        }
     }
 
     // ── is_gpt5_series ───────────────────────────────────────────────
