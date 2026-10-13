@@ -2,7 +2,11 @@
 
 ## Status
 
-✅ Accepted (2026-09-22)
+➡️ Relocated to gwi (2026-10-13)
+
+Moved to [rust-works/gwi](https://github.com/rust-works/gwi) by [#2203](https://github.com/rust-works/omni-dev/issues/2203) and [ADR-0095](adr-0095.md). The decision stands; its maintained copy is [gwi ADR-0086](https://github.com/rust-works/gwi/blob/main/docs/adrs/adr-0086-workbook-properties.md). This copy stays as history so existing links keep working.
+
+Originally: ✅ Accepted (2026-09-22)
 
 **Extends [ADR-0078](adr-0078.md) and [ADR-0081](adr-0081.md), reverses
 none.** ADR-0078 §1's "a property of the sheet, not the sheet's data" test —
