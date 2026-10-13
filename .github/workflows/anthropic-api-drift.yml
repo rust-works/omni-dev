@@ -1,0 +1,60 @@
+name: Anthropic API Drift Check
+
+on:
+  schedule:
+    # Mondays at 12:30 UTC, half an hour after the ADF schema drift check.
+    # The Anthropic API changes often (#2226); a week's lag keeps the gateway's
+    # unknown-field rejection from surprising users for long.
+    - cron: "30 12 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    name: Compare the gateway's field policy with the Anthropic SDK types
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DRIFT_LABEL: anthropic-api-drift
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build anthropic-api-drift
+        run: cargo build --release --bin anthropic-api-drift
+
+      - name: Run drift check
+        id: drift
+        run: ./target/release/anthropic-api-drift --output-dir .
+
+      - name: Ensure drift label exists
+        if: steps.drift.outputs.drift == 'true'
+        run: |
+          gh label create "$DRIFT_LABEL" \
+            --description "Anthropic API fields the gateway's field policy does not class yet" \
+            --color B60205 \
+            2>/dev/null || true
+
+      - name: Open or update tracking issue
+        if: steps.drift.outputs.drift == 'true'
+        run: |
+          set -euo pipefail
+          existing=$(
+            gh issue list \
+              --label "$DRIFT_LABEL" \
+              --state open \
+              --json number \
+              --jq '.[0].number // empty'
+          )
+          title="Anthropic API drift: the gateway's field policy needs updating"
+          if [ -z "$existing" ]; then
+            gh issue create \
+              --title "$title" \
+              --label "$DRIFT_LABEL" \
+              --body-file drift-report.md
+          else
+            gh issue comment "$existing" --body-file drift-report.md
+          fi
