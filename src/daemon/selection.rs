@@ -18,7 +18,7 @@
 
 use clap::ValueEnum;
 
-use super::services::{bridge, sessions, snowflake, worktrees};
+use super::services::{bridge, gateway, sessions, snowflake, worktrees};
 
 /// Environment variable naming the service subset the daemon should host
 /// (comma-separated canonical names). Honored by a manually-run `daemon run`;
@@ -45,11 +45,24 @@ pub enum DaemonServiceKind {
     /// The Claude Code sessions tracker (`sessions`).
     #[value(name = "sessions")]
     Sessions,
+    /// The Anthropic Messages gateway (`anthropic-gateway`).
+    #[value(name = "anthropic-gateway")]
+    Gateway,
 }
 
 impl DaemonServiceKind {
     /// Every kind, in canonical registration order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
+        Self::Bridge,
+        Self::Snowflake,
+        Self::Worktrees,
+        Self::Sessions,
+        Self::Gateway,
+    ];
+
+    /// The selectable services that existed before the Anthropic gateway (#2226);
+    /// see [`ServiceSelection::from_service_names`].
+    pub const PRE_GATEWAY: [Self; 4] = [
         Self::Bridge,
         Self::Snowflake,
         Self::Worktrees,
@@ -64,6 +77,7 @@ impl DaemonServiceKind {
             Self::Snowflake => snowflake::SERVICE_NAME,
             Self::Worktrees => worktrees::SERVICE_NAME,
             Self::Sessions => sessions::SERVICE_NAME,
+            Self::Gateway => gateway::SERVICE_NAME,
         }
     }
 
@@ -158,8 +172,26 @@ impl ServiceSelection {
     /// Builds a selection from live service names (a running daemon's `status`),
     /// for `daemon restart`'s subset-preserving path. Unknown names are ignored;
     /// an empty result means host everything.
+    ///
+    /// A set that covers [`DaemonServiceKind::PRE_GATEWAY`] is also `All`: a daemon
+    /// built before the Anthropic gateway (#2226) reports exactly those four when it
+    /// hosts everything, and resolving them to an explicit list would freeze the
+    /// gateway out of the first `restart` after an upgrade — breaking the promise
+    /// that a new selectable service auto-enables on a plain restart (#1352). The
+    /// cost: a newer daemon deliberately started without the gateway gains it on a
+    /// plain `restart`; it binds nothing unless an upstream is configured.
     pub fn from_service_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
-        Self::from_kinds(names.into_iter().filter_map(DaemonServiceKind::from_name))
+        let kinds: Vec<DaemonServiceKind> = names
+            .into_iter()
+            .filter_map(DaemonServiceKind::from_name)
+            .collect();
+        if DaemonServiceKind::PRE_GATEWAY
+            .iter()
+            .all(|k| kinds.contains(k))
+        {
+            return Self::All;
+        }
+        Self::from_kinds(kinds.into_iter())
     }
 
     /// Dedupes `kinds` preserving first-seen order. Two results collapse to
@@ -202,6 +234,7 @@ mod tests {
             (Snowflake, snowflake::SERVICE_NAME),
             (Worktrees, worktrees::SERVICE_NAME),
             (Sessions, sessions::SERVICE_NAME),
+            (Gateway, gateway::SERVICE_NAME),
         ] {
             assert_eq!(kind.to_name(), expected);
             assert_eq!(
@@ -268,11 +301,14 @@ mod tests {
         // the env var, or a running daemon's status names (which also carry the
         // always-on `github` service, dropped as non-selectable).
         assert_eq!(
-            ServiceSelection::resolve(&[Bridge, Snowflake, Worktrees, Sessions], None),
+            ServiceSelection::resolve(&[Bridge, Snowflake, Worktrees, Sessions, Gateway], None),
             ServiceSelection::All
         );
         assert_eq!(
-            ServiceSelection::resolve(&[], Some("browser-bridge,snowflake,worktrees,sessions")),
+            ServiceSelection::resolve(
+                &[],
+                Some("browser-bridge,snowflake,worktrees,sessions,anthropic-gateway")
+            ),
             ServiceSelection::All
         );
         assert_eq!(
@@ -281,14 +317,43 @@ mod tests {
                 "snowflake",
                 "worktrees",
                 "sessions",
+                "anthropic-gateway",
                 "github",
             ]),
             ServiceSelection::All
         );
         // A full set collapses even when it arrives out of order or with repeats.
         assert_eq!(
-            ServiceSelection::resolve(&[Sessions, Worktrees, Snowflake, Bridge, Bridge], None),
+            ServiceSelection::resolve(
+                &[Gateway, Sessions, Worktrees, Snowflake, Bridge, Bridge],
+                None
+            ),
             ServiceSelection::All
+        );
+    }
+
+    #[test]
+    fn a_pre_gateway_full_daemon_restarts_as_all() {
+        // A daemon built before #2226 hosts everything as these four; its first
+        // restart on the new binary must not freeze the gateway out.
+        assert_eq!(
+            ServiceSelection::from_service_names([
+                "browser-bridge",
+                "snowflake",
+                "worktrees",
+                "sessions",
+            ]),
+            ServiceSelection::All
+        );
+        // An explicit flag naming the same four is still honoured as a subset.
+        assert_eq!(
+            ServiceSelection::resolve(&[Bridge, Snowflake, Worktrees, Sessions], None),
+            ServiceSelection::Only(vec![Bridge, Snowflake, Worktrees, Sessions])
+        );
+        // A partial running set stays a subset.
+        assert_eq!(
+            ServiceSelection::from_service_names(["worktrees", "anthropic-gateway"]),
+            ServiceSelection::Only(vec![Worktrees, Gateway])
         );
     }
 

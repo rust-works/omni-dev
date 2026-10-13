@@ -29,7 +29,7 @@ pub struct RestartCommand {
 
     /// Re-bake this comma-separated subset of services (default: preserve
     /// whatever the running daemon currently hosts). Values: browser-bridge,
-    /// snowflake, worktrees, sessions.
+    /// snowflake, worktrees, sessions, anthropic-gateway.
     #[arg(long, value_name = "SVC", value_delimiter = ',')]
     pub services: Vec<DaemonServiceKind>,
 }
