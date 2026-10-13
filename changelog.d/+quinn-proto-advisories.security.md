@@ -1,0 +1,1 @@
+- **`quinn-proto` updated to 0.11.19** to clear five RustSec advisories (RUSTSEC-2026-0338 to -0342: remote-triggerable panics and unbounded memory growth in QUIC stream and datagram handling) that `cargo audit` began reporting against the locked 0.11.15. The dependency arrives through `reqwest`'s HTTP/3 stack; the update is a lockfile-only patch bump.
