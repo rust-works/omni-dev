@@ -485,6 +485,20 @@ omni-dev sessions list
 
 Runs on the daemon, so it is Unix-only.
 
+### 🔀 Anthropic Gateway
+
+`omni-dev ai gateway` serves the Anthropic Messages API in front of a model
+that speaks the OpenAI protocol (OpenAI, Ollama, LM Studio, vLLM, OpenRouter,
+Fireworks), so Claude Code and the Anthropic SDKs can use it. It runs
+standalone or as the daemon's `anthropic-gateway` service, on `127.0.0.1`
+behind a token. See [docs/anthropic-gateway.md](docs/anthropic-gateway.md).
+
+```bash
+OMNI_DEV_GATEWAY_UPSTREAM_URL=http://localhost:11434 OMNI_DEV_GATEWAY_MODEL=qwen3-coder \
+  omni-dev ai gateway serve
+eval "$(omni-dev ai gateway env)" && claude
+```
+
 ### ⚖️ Jev Judgments
 
 `omni-dev ai jev` is a client for TypeSafe AI's Jev API, which returns typed

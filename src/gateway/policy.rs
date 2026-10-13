@@ -876,6 +876,21 @@ mod tests {
     }
 
     #[test]
+    fn the_operator_guide_carries_the_current_table() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/anthropic-gateway.md");
+        let guide = std::fs::read_to_string(path).unwrap();
+        let start = guide.find("<!-- BEGIN gateway-fields").unwrap();
+        let start = start + guide[start..].find('\n').unwrap() + 1;
+        let end = guide.find("<!-- END gateway-fields -->").unwrap();
+        assert_eq!(
+            guide[start..end].trim_end(),
+            render_markdown().trim_end(),
+            "docs/anthropic-gateway.md is out of date: paste `omni-dev ai gateway fields` \
+             between its gateway-fields markers"
+        );
+    }
+
+    #[test]
     fn markdown_lists_every_row() {
         let md = render_markdown();
         for rule in REQUEST_FIELDS.iter().chain(CONTENT_BLOCK_TYPES) {
