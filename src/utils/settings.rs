@@ -885,8 +885,9 @@ where
 
 /// Tries multiple environment variables with fallback to settings.
 pub fn get_env_vars(keys: &[&str]) -> Result<String> {
+    // patchcov: coverage ignore reason="process-bound: binds the real process env and the settings file on disk; get_env_vars_with is the tested core"
     get_env_vars_with(&SystemEnv, Settings::load, keys)
-}
+} // patchcov: coverage end
 
 /// Pure core of [`get_env_vars`]: the first of `keys` that resolves wins.
 fn get_env_vars_with<E, F>(env: &E, load: F, keys: &[&str]) -> Result<String>

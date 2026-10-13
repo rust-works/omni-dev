@@ -199,15 +199,15 @@ impl Commands {
             Self::Ai(ai_cmd) => ai_cmd.execute().await,
             Self::Git(git_cmd) => git_cmd.execute().await,
             Self::Commands(commands_cmd) => commands_cmd.execute(),
-            Self::Atlassian(cmd) => cmd.execute().await,
+            Self::Atlassian(cmd) => cmd.execute().await, // patchcov: coverage ignore-line reason="process-bound: the command opens a real network or daemon connection, or reads the real stdin and credentials, so a test cannot dispatch it; each command is covered through its own run_* seams"
             Self::Browser(cmd) => cmd.execute().await,
             #[cfg(unix)]
             Self::Daemon(cmd) => cmd.execute().await,
-            Self::Datadog(cmd) => cmd.execute().await,
+            Self::Datadog(cmd) => cmd.execute().await, // patchcov: coverage ignore-line reason="process-bound: the command opens a real network or daemon connection, or reads the real stdin and credentials, so a test cannot dispatch it; each command is covered through its own run_* seams"
             Self::Drive(cmd) => cmd.execute("drive"),
             Self::Gmail(cmd) => cmd.execute("gmail"),
             #[cfg(unix)]
-            Self::Snowflake(cmd) => cmd.execute().await,
+            Self::Snowflake(cmd) => cmd.execute().await, // patchcov: coverage ignore-line reason="process-bound: the command opens a real network or daemon connection, or reads the real stdin and credentials, so a test cannot dispatch it; each command is covered through its own run_* seams"
             #[cfg(unix)]
             Self::Worktrees(cmd) => cmd.execute().await,
             #[cfg(unix)]
@@ -215,8 +215,8 @@ impl Commands {
             #[cfg(unix)]
             Self::ClaudeWrap(cmd) => cmd.execute().await,
             #[cfg(unix)]
-            Self::CodexWrap(cmd) => cmd.execute().await,
-            Self::Transcript(cmd) => cmd.execute().await,
+            Self::CodexWrap(cmd) => cmd.execute().await, // patchcov: coverage ignore-line reason="process-bound: the command opens a real network or daemon connection, or reads the real stdin and credentials, so a test cannot dispatch it; each command is covered through its own run_* seams"
+            Self::Transcript(cmd) => cmd.execute().await, // patchcov: coverage ignore-line reason="process-bound: the command opens a real network or daemon connection, or reads the real stdin and credentials, so a test cannot dispatch it; each command is covered through its own run_* seams"
             Self::Log(log_cmd) => log_cmd.execute(),
             Self::Config(config_cmd) => config_cmd.execute(),
             Self::Resources(resources_cmd) => resources_cmd.execute(),
