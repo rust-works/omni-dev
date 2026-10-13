@@ -21,6 +21,9 @@ pub struct ServiceRegistry {
     /// the built-in `status` op can report machine-wide GitHub budget usage as a
     /// top-level field without downcasting a specific service.
     github_rate_limit: Option<Arc<RateLimitCache>>,
+    /// Whether the daemon hosts every selectable service (#2226), reported by
+    /// the built-in `status` op; `None` when the builder never said.
+    hosts_all: Option<bool>,
 }
 
 impl ServiceRegistry {
@@ -57,6 +60,18 @@ impl ServiceRegistry {
     /// same `Arc` the worktrees service's poller writes.
     pub fn set_github_rate_limit(&mut self, cache: Arc<RateLimitCache>) {
         self.github_rate_limit = Some(cache);
+    }
+
+    /// Records whether the daemon hosts every selectable service, for the
+    /// built-in `status` op.
+    pub fn set_hosts_all(&mut self, hosts_all: bool) {
+        self.hosts_all = Some(hosts_all);
+    }
+
+    /// Whether the daemon hosts every selectable service, if recorded.
+    #[must_use]
+    pub fn hosts_all(&self) -> Option<bool> {
+        self.hosts_all
     }
 
     /// The latest GitHub rate-limit snapshot, or `None` when the monitor is

@@ -140,6 +140,13 @@ pub struct StatusReport {
     /// `gh` is available, or on a pre-#1375 daemon — a client shows nothing then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_rate_limit: Option<crate::github_rate_limit::RateLimitSnapshot>,
+    /// Whether the daemon was started to host every selectable service, as
+    /// opposed to a `--services` subset (#2226). `daemon restart` preserves the
+    /// selection from this rather than inferring it from the service names, so
+    /// a service added in a later release still auto-enables. Absent from an
+    /// older daemon, which `restart` then reads by its names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosts_all: Option<bool>,
     /// Git provenance (commit SHA, dirty flag, dates) of the daemon binary,
     /// flattened as sibling fields of [`version`](Self::version) so two builds
     /// of the same crate version can be told apart (#1374). Every field is
