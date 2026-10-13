@@ -59,6 +59,18 @@ pub(crate) struct MessagesRequest {
     pub output_config: Option<OutputConfig>,
 }
 
+impl MessagesRequest {
+    /// The effort for this turn: the latest per-message
+    /// `output_config.effort`, else the request's.
+    pub(crate) fn effective_effort(&self) -> Option<Effort> {
+        self.messages
+            .iter()
+            .rev()
+            .find_map(|m| m.output_config.as_ref().and_then(|o| o.effort))
+            .or_else(|| self.output_config.as_ref().and_then(|o| o.effort))
+    }
+}
+
 /// The `system` field: a string or a list of text blocks.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -113,6 +125,10 @@ pub(crate) struct InputMessage {
     pub role: Role,
     /// What was said.
     pub content: MessageContent,
+    /// Per-turn output control (Claude Code's `per-turn-control` beta, seen
+    /// 2026-10-14); only `effort` is accepted here.
+    #[serde(default)]
+    pub output_config: Option<OutputConfig>,
 }
 
 /// A message's content: a string or a list of blocks.
@@ -346,6 +362,15 @@ pub(crate) enum ThinkingDisplay {
     Summarized,
     /// The block is returned empty, with a signature.
     Omitted,
+    /// Claude Code's `thinking-display-updates` beta (seen 2026-10-14):
+    /// periodic updates of the reasoning. Served like `summarized`, since the
+    /// gateway streams whatever reasoning the upstream returns.
+    Updates,
+    /// A display mode newer than the gateway; the policy rejects it unless
+    /// unknown fields are downgraded to warnings, in which case it is served
+    /// like `summarized`.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Extended-thinking configuration.
@@ -378,13 +403,18 @@ impl ThinkingConfig {
         !matches!(self, Self::Disabled {})
     }
 
-    /// The display mode (default `summarized`).
+    /// The effective display mode: `omitted`, or `summarized` for every
+    /// mode that returns reasoning text.
     pub(crate) fn display(&self) -> ThinkingDisplay {
         match self {
-            Self::Enabled { display, .. } | Self::Adaptive { display } => {
-                display.unwrap_or_default()
+            Self::Enabled {
+                display: Some(ThinkingDisplay::Omitted),
+                ..
             }
-            Self::Disabled {} | Self::BetweenTools {} => ThinkingDisplay::Summarized,
+            | Self::Adaptive {
+                display: Some(ThinkingDisplay::Omitted),
+            } => ThinkingDisplay::Omitted,
+            _ => ThinkingDisplay::Summarized,
         }
     }
 }
@@ -611,6 +641,7 @@ mod tests {
             "output_config": {"effort": "xhigh"}
         }))
         .unwrap();
+        assert_eq!(request.effective_effort(), Some(Effort::Xhigh));
         assert_eq!(request.system.unwrap().joined(), "a\n\nb");
         assert_eq!(request.messages.len(), 4);
         assert_eq!(request.messages[3].role, Role::System);
@@ -619,6 +650,21 @@ mod tests {
         assert_eq!(thinking.display(), ThinkingDisplay::Omitted);
         assert!(thinking.wants_thinking());
         assert_eq!(request.output_config.unwrap().effort, Some(Effort::Xhigh));
+    }
+
+    #[test]
+    fn a_per_turn_effort_overrides_the_request_effort() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "output_config": {"effort": "low"},
+            "messages": [
+                {"role": "user", "content": "a"},
+                {"role": "system", "content": "b", "output_config": {"effort": "high"}},
+                {"role": "user", "content": "c"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(request.effective_effort(), Some(Effort::High));
     }
 
     #[test]
@@ -652,6 +698,11 @@ mod tests {
         let between: ThinkingConfig =
             serde_json::from_value(json!({"type": "between_tools"})).unwrap();
         assert!(between.wants_thinking());
+        for display in ["updates", "future-mode"] {
+            let config: ThinkingConfig =
+                serde_json::from_value(json!({"type": "adaptive", "display": display})).unwrap();
+            assert_eq!(config.display(), ThinkingDisplay::Summarized);
+        }
     }
 
     #[test]

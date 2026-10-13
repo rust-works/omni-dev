@@ -335,11 +335,17 @@ impl AnthropicStream {
             let at = self.cursor;
             if self.blocks[at].kind == BlockKind::Thinking {
                 let block = &self.blocks[at];
-                let signed = match self.settings.display {
-                    ThinkingDisplay::Summarized => block.thinking.as_str(),
-                    ThinkingDisplay::Omitted => "",
+                let signed = if self.settings.display == ThinkingDisplay::Omitted {
+                    ""
+                } else {
+                    block.thinking.as_str()
                 };
-                let signature = self.settings.signer.sign(signed, &block.payload);
+                let payload = super::responses::signing_payload(
+                    &block.payload,
+                    &block.thinking,
+                    self.settings.display == ThinkingDisplay::Omitted,
+                );
+                let signature = self.settings.signer.sign(signed, &payload);
                 out.push(json!({"type": "content_block_delta", "index": at,
                                 "delta": {"type": "signature_delta", "signature": signature}}));
             }
@@ -482,15 +488,12 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|e| e["delta"]["type"] == "thinking_delta")
                 .count();
-            match display {
-                ThinkingDisplay::Summarized => {
-                    assert_eq!(thinking_deltas, 1);
-                    assert_eq!(signer.verify("hm", &signature).as_deref(), Some("p"));
-                }
-                ThinkingDisplay::Omitted => {
-                    assert_eq!(thinking_deltas, 0);
-                    assert_eq!(signer.verify("", &signature).as_deref(), Some("p"));
-                }
+            if display == ThinkingDisplay::Omitted {
+                assert_eq!(thinking_deltas, 0);
+                assert_eq!(signer.verify("", &signature).as_deref(), Some("p"));
+            } else {
+                assert_eq!(thinking_deltas, 1);
+                assert_eq!(signer.verify("hm", &signature).as_deref(), Some("p"));
             }
         }
     }

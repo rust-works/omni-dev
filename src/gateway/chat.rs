@@ -45,7 +45,7 @@ pub(crate) fn plan_reasoning(
     levels: &[Effort],
     report: &mut PolicyReport,
 ) -> ReasoningPlan {
-    let explicit = request.output_config.as_ref().and_then(|o| o.effort);
+    let explicit = request.effective_effort();
     let clamp = |e: Effort| clamp_effort(e, levels);
     match (&request.thinking, style) {
         (Some(ThinkingConfig::Enabled { budget_tokens, .. }), ReasoningStyle::ThinkingOrEffort) => {
