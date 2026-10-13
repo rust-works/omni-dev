@@ -53,7 +53,7 @@ pub struct GatewayService {
 
 impl GatewayService {
     /// Starts the service from the environment and settings.json.
-    pub async fn start() -> Self {
+    pub fn start() -> Self {
         let token_path = match token_path() {
             Ok(path) => Some(path),
             Err(err) => {
@@ -65,18 +65,17 @@ impl GatewayService {
             Box::new(|| GatewayConfig::from_env(&ConfigOverrides::default())),
             token_path,
         )
-        .await
     }
 
     /// Starts the service with an injected loader and token file.
-    pub(crate) async fn start_with(load: Loader, token_path: Option<PathBuf>) -> Self {
+    pub(crate) fn start_with(load: Loader, token_path: Option<PathBuf>) -> Self {
         let service = Self {
             slot: StdMutex::new(Slot::Restarting),
             lifecycle: tokio::sync::Mutex::new(()),
             load,
             token_path,
         };
-        let slot = service.launch().await;
+        let slot = service.launch();
         *service.lock() = slot;
         service
     }
@@ -88,7 +87,7 @@ impl GatewayService {
     }
 
     /// Loads the configuration and binds the server.
-    async fn launch(&self) -> Slot {
+    fn launch(&self) -> Slot {
         let config = match (self.load)() {
             Ok(config) => config,
             Err(err) if err.downcast_ref::<GatewayConfigError>().is_some() => {
@@ -107,7 +106,7 @@ impl GatewayService {
             Err(err) => return Slot::Failed(format!("{err:#}")),
         };
         let summary = config.describe();
-        match GatewayServer::start(config, token.clone()).await {
+        match GatewayServer::start(config, token.clone()) {
             Ok(server) => {
                 tracing::info!(
                     port = server.port(),
@@ -134,7 +133,7 @@ impl GatewayService {
         if let Slot::Running { server, .. } = old {
             server.shutdown().await;
         }
-        let slot = self.launch().await;
+        let slot = self.launch();
         let failure = match &slot {
             Slot::Failed(message) => Some(message.clone()),
             _ => None,
@@ -278,7 +277,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unconfigured_service_is_healthy_and_binds_nothing() {
-        let service = GatewayService::start_with(loader(vec![]), None).await;
+        let service = GatewayService::start_with(loader(vec![]), None);
         assert_eq!(service.name(), SERVICE_NAME);
         let status = service.status().await;
         assert!(status.healthy);
@@ -303,7 +302,7 @@ mod tests {
             ),
             ("OMNI_DEV_GATEWAY_FLAVOR", "nonsense".to_string()),
         ];
-        let service = GatewayService::start_with(loader(vars), None).await;
+        let service = GatewayService::start_with(loader(vars), None);
         let status = service.status().await;
         assert!(!status.healthy);
         assert!(status.summary.contains("nonsense"));
@@ -313,7 +312,7 @@ mod tests {
             "OMNI_DEV_GATEWAY_UPSTREAM_URL",
             "http://127.0.0.1:1".to_string(),
         )];
-        let service = GatewayService::start_with(loader(missing_token_dir), None).await;
+        let service = GatewayService::start_with(loader(missing_token_dir), None);
         assert!(service.status().await.summary.contains("data directory"));
     }
 
@@ -329,7 +328,7 @@ mod tests {
             ("OMNI_DEV_GATEWAY_PORT", "0".to_string()),
             ("OMNI_DEV_GATEWAY_MODEL", "m".to_string()),
         ];
-        let service = GatewayService::start_with(loader(vars), Some(token_file.clone())).await;
+        let service = GatewayService::start_with(loader(vars), Some(token_file.clone()));
         let status = service.handle("status", Value::Null).await.unwrap();
         assert_eq!(status["state"], "running");
         let port = status["port"].as_u64().unwrap();
@@ -376,7 +375,7 @@ mod tests {
             ),
             ("OMNI_DEV_GATEWAY_PORT", port.to_string()),
         ];
-        let service = GatewayService::start_with(loader(vars), Some(dir.path().join("t"))).await;
+        let service = GatewayService::start_with(loader(vars), Some(dir.path().join("t")));
         let (a, b) = tokio::join!(service.restart(), service.restart());
         a.unwrap();
         b.unwrap();
@@ -400,7 +399,7 @@ mod tests {
             ),
             ("OMNI_DEV_GATEWAY_PORT", port.to_string()),
         ];
-        let service = GatewayService::start_with(loader(vars), Some(dir.path().join("t"))).await;
+        let service = GatewayService::start_with(loader(vars), Some(dir.path().join("t")));
         let status = service.status().await;
         assert!(!status.healthy);
         assert!(status.summary.contains("already in use"));

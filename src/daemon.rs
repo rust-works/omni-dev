@@ -201,7 +201,7 @@ pub async fn build_default_registry(
         // The Anthropic Messages gateway (#2226). Binds only when an upstream is
         // configured, and a configuration error leaves it unhealthy rather than
         // failing the daemon.
-        registry.register(Arc::new(GatewayService::start().await));
+        registry.register(Arc::new(GatewayService::start()));
     }
     // Periodically log a summary of the GitHub API-call counters (#1387): once
     // ~5s after boot, every 10 minutes, and once on shutdown. Best-effort, no
