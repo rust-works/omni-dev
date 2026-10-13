@@ -41,7 +41,9 @@ pub(crate) struct ChatStreamParser {
     splitter: Option<ThinkTagSplitter>,
     segment: Segment,
     next_segment: usize,
-    tools: HashSet<u64>,
+    tools: HashSet<String>,
+    /// The call the last tool delta belonged to.
+    last_tool: Option<String>,
 }
 
 impl ChatStreamParser {
@@ -53,6 +55,7 @@ impl ChatStreamParser {
             segment: Segment::None,
             next_segment: 0,
             tools: HashSet::new(),
+            last_tool: None,
         }
     }
 
@@ -158,15 +161,15 @@ impl ChatStreamParser {
     fn tool_calls(&mut self, calls: &[Value], out: &mut Vec<UpstreamEvent>) {
         self.close_segment(out);
         for (position, call) in calls.iter().enumerate() {
-            let index = call
-                .get("index")
-                .and_then(Value::as_u64)
-                .unwrap_or(position as u64);
-            let key = format!("tool{index}");
-            if self.tools.insert(index) {
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|i| !i.is_empty());
+            let key = tool_key(call, id, position, self.last_tool.as_deref());
+            if self.tools.insert(key.clone()) {
                 out.push(UpstreamEvent::ToolStart {
                     key: key.clone(),
-                    id: call.get("id").and_then(Value::as_str).map(str::to_string),
+                    id: id.map(str::to_string),
                     name: call
                         .pointer("/function/name")
                         .and_then(Value::as_str)
@@ -174,6 +177,7 @@ impl ChatStreamParser {
                         .to_string(),
                 });
             }
+            self.last_tool = Some(key.clone());
             if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str) {
                 out.push(UpstreamEvent::ToolArgs {
                     key,
@@ -193,6 +197,24 @@ impl ChatStreamParser {
     fn bump(&mut self) -> usize {
         self.next_segment += 1;
         self.next_segment
+    }
+}
+
+/// The segment key of a streamed tool-call delta.
+///
+/// OpenAI sends an `index` on every delta, which identifies the call. Some
+/// servers omit it: they either send each call whole (each with its own `id`)
+/// or continue the previous call with an id-less fragment. So without an
+/// index, a new `id` starts a call and an id-less fragment continues the last
+/// one; only the very first id-less delta falls back to its position.
+fn tool_key(call: &Value, id: Option<&str>, position: usize, last: Option<&str>) -> String {
+    if let Some(index) = call.get("index").and_then(Value::as_u64) {
+        return format!("tool{index}");
+    }
+    match (id, last) {
+        (Some(id), _) => format!("tool-id:{id}"),
+        (None, Some(last)) => last.to_string(),
+        (None, None) => format!("tool{position}"),
     }
 }
 
@@ -328,6 +350,38 @@ mod tests {
         );
         assert!(parser.push(" [DONE] ").unwrap().is_none());
         assert!(parser.push("").unwrap().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_calls_without_an_index_are_keyed_by_id() {
+        let mut parser = ChatStreamParser::new(false);
+        let mut out = Vec::new();
+        for chunk in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"a","function":{"name":"x","arguments":"{\"p\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"1}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"b","function":{"name":"y","arguments":"{}"}}]}}]}"#,
+        ] {
+            out.extend(parser.push(chunk).unwrap().unwrap());
+        }
+        let starts: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                UpstreamEvent::ToolStart { key, name, .. } => Some((key.as_str(), name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, [("tool-id:a", "x"), ("tool-id:b", "y")]);
+        assert!(out.contains(&UpstreamEvent::ToolArgs {
+            key: "tool-id:a".into(),
+            json: "1}".into()
+        }));
+
+        let mut anonymous = ChatStreamParser::new(false);
+        let out = anonymous
+            .push(r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"z","arguments":"{}"}}]}}]}"#)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&out[0], UpstreamEvent::ToolStart { key, .. } if key == "tool0"));
     }
 
     #[test]

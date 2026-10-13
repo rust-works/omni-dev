@@ -201,12 +201,17 @@ impl AppState {
     ) -> Result<reqwest::Response, GatewayError> {
         let mut request = self.http.post(url).json(body);
         if let Some(key) = &self.config.api_key {
-            request = request.bearer_auth(key.expose_secret());
-            if self.config.protocol == UpstreamProtocol::Anthropic
+            // One credential header, in the form the upstream expects: an
+            // Anthropic-compatible endpoint reads `Authorization: Bearer` as an
+            // OAuth token, so it gets `x-api-key`; OpenAI-protocol upstreams and
+            // Fireworks' Anthropic surface take a bearer key.
+            request = if self.config.protocol == UpstreamProtocol::Anthropic
                 && self.config.flavor != super::flavor::Flavor::Fireworks
             {
-                request = request.header("x-api-key", key.expose_secret());
-            }
+                request.header("x-api-key", key.expose_secret())
+            } else {
+                request.bearer_auth(key.expose_secret())
+            };
         }
         for (name, value) in extra_headers {
             request = request.header(*name, value);
@@ -273,15 +278,19 @@ impl GatewayServer {
     /// Binds `127.0.0.1:<port>` (fail-closed: a taken port is an error) and
     /// starts serving. `token` is the resolved gateway token (never from argv).
     pub async fn start(config: GatewayConfig, token: String) -> Result<Self> {
-        let listener =
-            tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, config.port)))
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to bind the gateway to 127.0.0.1:{} (already in use?)",
-                        config.port
-                    )
-                })?;
+        // `SO_REUSEADDR`, like the browser bridge (#990): a restart rebinds the
+        // same port while just-closed client connections sit in `TIME_WAIT`. It
+        // does not allow a second live listener, so a taken port still fails.
+        let listener = crate::browser::bridge::bind_loopback_reuse(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            config.port,
+        )))
+        .with_context(|| {
+            format!(
+                "failed to bind the gateway to 127.0.0.1:{} (already in use?)",
+                config.port
+            )
+        })?;
         let port = listener.local_addr()?.port();
         let max_body = config.max_body_bytes;
         let state = AppState::new(config, token, port)?;
@@ -641,14 +650,33 @@ async fn pump(
     }
     if !ended {
         if let Some(event) = sse.finish() {
-            if let Ok(Some(out)) = feed(&mut parser, &mut builder, &event.data) {
-                emit(tx, out).await;
+            match feed(&mut parser, &mut builder, &event.data) {
+                Ok(Some(out)) => {
+                    emit(tx, out).await;
+                }
+                Ok(None) => ended = true,
+                Err(error) => {
+                    emit(tx, builder.fail(&error)).await;
+                    return Err(error);
+                }
             }
         }
     }
     let mut out = Vec::new();
     for event in parser.finish() {
         out.extend(builder.push(event));
+    }
+    if !ended && !builder.saw_finish() {
+        // The connection closed before `[DONE]`, a `finish_reason` or
+        // `response.completed`: the reply was cut off. Ending it with
+        // `message_stop` would pass a truncated answer (or a half-written tool
+        // call) off as complete, so it ends with an `error` event instead,
+        // which clients retry.
+        emit(tx, out).await;
+        let error =
+            GatewayError::bad_gateway("the upstream stream ended before the reply was complete");
+        emit(tx, builder.fail(&error)).await;
+        return Err(error);
     }
     out.extend(builder.finish());
     emit(tx, out).await;

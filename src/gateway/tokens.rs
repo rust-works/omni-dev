@@ -34,8 +34,8 @@ pub(crate) fn estimate(request: &MessagesRequest) -> u64 {
     }
     for message in &request.messages {
         extra += PER_MESSAGE;
-        for block in message.content.clone().into_blocks() {
-            let (c, e) = block_cost(&block);
+        for block in message.content.blocks().iter() {
+            let (c, e) = block_cost(block);
             chars += c;
             extra += e;
         }

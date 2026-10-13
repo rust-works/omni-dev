@@ -142,11 +142,14 @@ pub(crate) enum MessageContent {
 }
 
 impl MessageContent {
-    /// The content as a list of blocks.
-    pub(crate) fn into_blocks(self) -> Vec<ContentBlock> {
+    /// The content as blocks, borrowed when it already is a list (base64
+    /// images can be megabytes, so the common case copies nothing).
+    pub(crate) fn blocks(&self) -> std::borrow::Cow<'_, [ContentBlock]> {
         match self {
-            Self::Text(text) => vec![ContentBlock::Text { text }],
-            Self::Blocks(blocks) => blocks,
+            Self::Text(text) => {
+                std::borrow::Cow::Owned(vec![ContentBlock::Text { text: text.clone() }])
+            }
+            Self::Blocks(blocks) => std::borrow::Cow::Borrowed(blocks),
         }
     }
 }
@@ -222,6 +225,11 @@ pub(crate) enum ContentBlock {
         /// The referenced tool.
         tool_name: String,
     },
+    /// A block type newer than the gateway. The policy rejects it unless
+    /// unknown fields are downgraded to warnings, in which case it is dropped
+    /// (and reported as ignored).
+    #[serde(other)]
+    Unknown,
 }
 
 /// A tool result's content: a string or blocks.
@@ -742,7 +750,8 @@ mod tests {
 
     #[test]
     fn content_shorthand_becomes_one_text_block() {
-        let blocks = MessageContent::Text("hi".into()).into_blocks();
+        let content = MessageContent::Text("hi".into());
+        let blocks = content.blocks();
         assert!(matches!(&blocks[..], [ContentBlock::Text { text }] if text == "hi"));
     }
 }

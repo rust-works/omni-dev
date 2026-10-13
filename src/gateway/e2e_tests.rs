@@ -820,3 +820,65 @@ async fn omitted_reasoning_is_still_replayed() {
         "The user wants a haiku."
     );
 }
+
+#[tokio::test]
+async fn a_truncated_stream_ends_with_an_error_not_a_clean_stop() {
+    let out = stream_snapshot(
+        "chat_truncated.sse",
+        message(true),
+        &[],
+        "/v1/chat/completions",
+    )
+    .await;
+    assert!(!out.contains("message_stop"), "{out}");
+    assert!(out.contains("event: error"), "{out}");
+    assert!(out.contains("ended before the reply was complete"), "{out}");
+}
+
+#[tokio::test]
+async fn unknown_block_types_are_dropped_under_warn() {
+    let h = Harness::start(&[("OMNI_DEV_GATEWAY_UNKNOWN_FIELDS", "warn")]).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]
+        })))
+        .mount(&h.upstream)
+        .await;
+    let mut request = message(false);
+    request["messages"] = json!([
+        {"role": "user", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "hologram", "data": 1}
+        ]},
+        {"role": "assistant", "content": [{"type": "hologram"}, {"type": "text", "text": "a"}]},
+        {"role": "user", "content": "b"}
+    ]);
+    let response = h.post("/v1/messages", &request).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["x-omni-dev-gateway-ignored"],
+        "content block type `hologram`"
+    );
+    let sent = &h.upstream_bodies().await[0];
+    assert_eq!(
+        sent["messages"][0],
+        json!({"role": "user", "content": "hi"})
+    );
+}
+
+#[tokio::test]
+async fn passthrough_to_anthropic_sends_only_x_api_key() {
+    let h = Harness::start(&[("OMNI_DEV_GATEWAY_UPSTREAM_PROTOCOL", "anthropic")]).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"type": "message", "content": []})),
+        )
+        .mount(&h.upstream)
+        .await;
+    assert_eq!(h.post("/v1/messages", &message(false)).await.status(), 200);
+    let requests = h.upstream.received_requests().await.unwrap();
+    let headers = &requests[0].headers;
+    assert_eq!(headers.get("x-api-key").unwrap(), "upstream-key");
+    assert!(headers.get("authorization").is_none());
+}
