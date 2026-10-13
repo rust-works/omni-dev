@@ -55,10 +55,40 @@ struct Message {
 /// [`Option`] wrapper on the parent ([`OpenAiRequest::response_format`])
 /// keeps the wire body byte-identical to today's when no schema is set.
 #[derive(Serialize, Debug)]
-struct ResponseFormatField {
+pub(crate) struct ResponseFormatField {
     #[serde(rename = "type")]
     kind: &'static str,
     json_schema: JsonSchemaSpec,
+}
+
+impl ResponseFormatField {
+    /// The `json_schema` envelope for `schema`, with the request-ignored
+    /// `name` label OpenAI requires. Shared with the Anthropic gateway's
+    /// `output_config.format` translation (#2226) so the two never disagree
+    /// about the wire shape.
+    pub(crate) fn json_schema(schema: serde_json::Value, strict: bool) -> Self {
+        Self {
+            kind: "json_schema",
+            json_schema: JsonSchemaSpec {
+                name: "response",
+                strict,
+                schema,
+            },
+        }
+    }
+}
+
+/// The chat-completions endpoint for an OpenAI-protocol `base_url` (one
+/// without the `/v1` suffix); a trailing slash is tolerated.
+pub(crate) fn chat_completions_url(base_url: &str) -> String {
+    format!("{}/v1/chat/completions", base_url.trim_end_matches('/'))
+}
+
+/// Whether `model` is a GPT-5 / o-series model, which takes
+/// `max_completion_tokens` instead of `max_tokens` and accepts only the
+/// default temperature.
+pub(crate) fn uses_max_completion_tokens(model: &str) -> bool {
+    model.starts_with("gpt-5") || model.starts_with("o1")
 }
 
 /// Inner spec of an OpenAI `response_format: json_schema` envelope.
@@ -231,8 +261,7 @@ impl OpenAiAiClient {
     /// `?`-propagation site at the call site whose error branch could
     /// never fire.
     fn get_api_url(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        let url = format!("{base}/v1/chat/completions");
+        let url = chat_completions_url(&self.base_url);
         debug!(base_url = %self.base_url, full_url = %url, "Constructed OpenAI-compatible API URL");
         url
     }
@@ -257,7 +286,7 @@ impl OpenAiAiClient {
 
     /// Determines if this model is GPT-5 series (uses max_completion_tokens instead of max_tokens).
     fn is_gpt5_series(&self) -> bool {
-        self.model.starts_with("gpt-5") || self.model.starts_with("o1")
+        uses_max_completion_tokens(&self.model)
     }
 
     /// Returns the cached probed context length, if any.
@@ -535,14 +564,9 @@ impl AiClient for OpenAiAiClient {
                 "Preparing OpenAI-compatible API request (with options)"
             );
 
-            let response_format = options.response_schema.map(|schema| ResponseFormatField {
-                kind: "json_schema",
-                json_schema: JsonSchemaSpec {
-                    name: "response",
-                    strict: true,
-                    schema,
-                },
-            });
+            let response_format = options
+                .response_schema
+                .map(|schema| ResponseFormatField::json_schema(schema, true));
 
             let request = self.build_request(system_prompt, user_prompt, response_format);
             self.send_inner(request).await
@@ -949,14 +973,7 @@ mod tests {
             "required": ["answer"],
             "additionalProperties": false,
         });
-        let response_format = Some(ResponseFormatField {
-            kind: "json_schema",
-            json_schema: JsonSchemaSpec {
-                name: "response",
-                strict: true,
-                schema: schema.clone(),
-            },
-        });
+        let response_format = Some(ResponseFormatField::json_schema(schema.clone(), true));
         let request = client.build_request("sys", "user", response_format);
         let body = serde_json::to_value(&request).unwrap();
         assert_eq!(body["response_format"]["type"], "json_schema");
@@ -975,14 +992,7 @@ mod tests {
         let client =
             OpenAiAiClient::new_openai("gpt-5".to_string(), "key".to_string(), None).unwrap();
         let schema = serde_json::json!({ "type": "object", "additionalProperties": false });
-        let response_format = Some(ResponseFormatField {
-            kind: "json_schema",
-            json_schema: JsonSchemaSpec {
-                name: "response",
-                strict: true,
-                schema: schema.clone(),
-            },
-        });
+        let response_format = Some(ResponseFormatField::json_schema(schema.clone(), true));
         let request = client.build_request("sys", "user", response_format);
         let body = serde_json::to_value(&request).unwrap();
         assert_eq!(body["response_format"]["type"], "json_schema");
