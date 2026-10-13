@@ -2,6 +2,7 @@
 
 mod chat;
 mod claude;
+mod gateway;
 pub(crate) mod jev;
 
 pub use chat::{run_chat, ChatCommand};
@@ -25,6 +26,8 @@ pub enum AiSubcommands {
     Chat(ChatCommand),
     /// Claude Code diagnostics and inspection.
     Claude(claude::ClaudeCommand),
+    /// Anthropic Messages gateway in front of OpenAI-protocol upstreams.
+    Gateway(gateway::GatewayCommand),
     /// TypeSafe Jev typed judgments (choice, score, yes/no).
     Jev(jev::JevCommand),
 }
@@ -35,6 +38,7 @@ impl AiCommand {
         match self.command {
             AiSubcommands::Chat(cmd) => cmd.execute().await,
             AiSubcommands::Claude(cmd) => cmd.execute(),
+            AiSubcommands::Gateway(cmd) => cmd.execute().await,
             AiSubcommands::Jev(cmd) => cmd.execute().await,
         }
     }
