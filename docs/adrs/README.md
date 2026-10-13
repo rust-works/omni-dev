@@ -122,3 +122,4 @@ by Michael Nygard.
 | [ADR-0095](adr-0095.md)                                 | ✅ Accepted                              | 2026-10-07 | Extract Google Workspace Functionality into the Standalone gwi Project                      |
 | [ADR-0096](adr-0096.md)                                 | ✅ Accepted                              | 2026-10-07 | Persisted Closure History and Recreating Removed Worktrees                                  |
 | [ADR-0097](adr-0097.md)                                 | ✅ Accepted                              | 2026-10-07 | Per-Pull-Request Changelog Fragments                                                        |
+| [ADR-0098](adr-0098.md)                                 | ✅ Accepted                              | 2026-10-14 | A Default-Closed Anthropic Messages Gateway with a Classed Field Policy                     |
