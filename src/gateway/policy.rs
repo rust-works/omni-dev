@@ -115,6 +115,11 @@ pub const REQUEST_FIELDS: &[FieldRule] = &[
     rule("fallbacks", Ignored, "only the mapped model is called"),
     rule("fallback_credit_token", Ignored, "only the mapped model is called"),
     rule("container", Rejected, "server-side code execution has no upstream equivalent"),
+    rule(
+        "safeguards",
+        Rejected,
+        "Anthropic's server-side tool-use classifiers cannot run upstream, and a safety control is never dropped silently; Claude Code retries without it",
+    ),
     rule("mcp_servers", Rejected, "the MCP connector has no upstream equivalent"),
 ];
 
@@ -248,6 +253,10 @@ pub const ANTHROPIC_TOOL_TYPE_PREFIXES: &[&str] = &[
 /// `thinking.type` values, all translated.
 pub const THINKING_TYPES: &[&str] = &["enabled", "disabled", "adaptive", "between_tools"];
 
+/// `thinking.display` values. `updates` (Claude Code's
+/// `thinking-display-updates` beta) is served like `summarized`.
+pub const THINKING_DISPLAYS: &[&str] = &["summarized", "omitted", "updates"];
+
 /// Anthropic stop reasons, and whether the gateway can produce each.
 pub const STOP_REASONS: &[FieldRule] = &[
     rule("end_turn", Translated, "`finish_reason: stop`"),
@@ -343,6 +352,7 @@ pub(crate) fn check_request(
     }
     if let Some(Value::Array(messages)) = body.get("messages") {
         for (i, message) in messages.iter().enumerate() {
+            check_message_keys(message, &mut report, unknown)?;
             if let Some(Value::Array(blocks)) = message.get("content") {
                 for (j, block) in blocks.iter().enumerate() {
                     check_block(
@@ -362,6 +372,15 @@ pub(crate) fn check_request(
     }
     if let Some(thinking) = body.get("thinking").filter(|v| !v.is_null()) {
         check_thinking(thinking)?;
+        if let Some(display) = thinking.get("display").and_then(Value::as_str) {
+            if !THINKING_DISPLAYS.contains(&display) {
+                unknown_field(
+                    &mut report,
+                    unknown,
+                    &format!("thinking.display `{display}`"),
+                )?;
+            }
+        }
     }
     if let Some(Value::Object(output)) = body.get("output_config") {
         for (key, value) in output {
@@ -382,6 +401,36 @@ pub(crate) fn check_request(
         }
     }
     Ok(report)
+}
+
+/// Message-level keys: `role` and `content`, plus a per-turn
+/// `output_config` (Claude Code's `per-turn-control` beta) whose `effort` sets
+/// the effort for this turn. Anything else is unknown.
+fn check_message_keys(
+    message: &Value,
+    report: &mut PolicyReport,
+    unknown: UnknownFields,
+) -> Result<(), GatewayError> {
+    let Some(fields) = message.as_object() else {
+        return Ok(());
+    };
+    for (key, value) in fields {
+        if value.is_null() {
+            continue;
+        }
+        match key.as_str() {
+            "role" | "content" => {}
+            "output_config" => {
+                for (sub, sub_value) in value.as_object().into_iter().flatten() {
+                    if sub != "effort" && !sub_value.is_null() {
+                        unknown_field(report, unknown, &format!("messages.output_config.{sub}"))?;
+                    }
+                }
+            }
+            other => unknown_field(report, unknown, &format!("messages.{other}"))?,
+        }
+    }
+    Ok(())
 }
 
 /// Records `cache_control` and ignored per-block extras (`citations`,
@@ -709,6 +758,27 @@ mod tests {
     }
 
     #[test]
+    fn message_level_keys_are_checked() {
+        let per_turn =
+            json!([{"role": "system", "content": "s", "output_config": {"effort": "high"}}]);
+        assert!(check(with(base(), "messages", per_turn)).is_ok());
+        let format = json!([{"role": "user", "content": "s", "output_config": {"format": {}}}]);
+        assert!(check(with(base(), "messages", format)).is_err());
+        let extra = json!([{"role": "user", "content": "s", "name": "bob"}]);
+        assert!(check(with(base(), "messages", extra.clone()))
+            .unwrap_err()
+            .message
+            .contains("messages.name"));
+        let report = check_request(
+            with(base(), "messages", extra).as_object().unwrap(),
+            UnknownFields::Warn,
+        )
+        .unwrap();
+        assert!(report.ignored.contains("messages.name"));
+        assert!(check(with(base(), "messages", json!(["not an object"]))).is_ok());
+    }
+
+    #[test]
     fn cache_control_anywhere_sets_the_hint() {
         let top = check(with(base(), "cache_control", json!({"type": "ephemeral"}))).unwrap();
         assert!(top.cache_hint);
@@ -781,6 +851,18 @@ mod tests {
             assert!(check(with(base(), "thinking", json!({"type": kind}))).is_ok());
         }
         assert!(check(with(base(), "thinking", json!({"type": "deep"}))).is_err());
+        for display in THINKING_DISPLAYS {
+            let thinking = json!({"type": "adaptive", "display": display});
+            assert!(check(with(base(), "thinking", thinking)).is_ok());
+        }
+        let future = with(
+            base(),
+            "thinking",
+            json!({"type": "adaptive", "display": "vivid"}),
+        );
+        assert!(check(future.clone()).unwrap_err().message.contains("vivid"));
+        let report = check_request(future.as_object().unwrap(), UnknownFields::Warn).unwrap();
+        assert!(report.ignored.contains("thinking.display `vivid`"));
     }
 
     #[test]

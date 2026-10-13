@@ -18,13 +18,49 @@ use super::lower::{prompt_cache_key, Lowered, ReplayedReasoning, Turn, UserPart}
 
 /// The signature payload of a Responses reasoning item: what the next turn
 /// needs to send it back.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ReasoningPayload {
-    /// The item id.
+    /// The Responses reasoning item id (empty for the Chat target).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
     /// The encrypted reasoning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_content: Option<String>,
+    /// Reasoning text hidden from the client by `display: omitted`, carried
+    /// so the next turn can still replay it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// The payload to sign for a thinking block. With `display: omitted` the
+/// client never sees the reasoning, so the text travels inside the signed
+/// payload instead and the next turn can still replay it — which Fireworks
+/// needs for multi-turn tool use.
+pub(crate) fn signing_payload(payload: &str, text: &str, omitted: bool) -> String {
+    if !omitted || text.is_empty() {
+        return payload.to_string();
+    }
+    let mut decoded = if payload.is_empty() {
+        ReasoningPayload::default()
+    } else {
+        match ReasoningPayload::decode(payload) {
+            Some(decoded) => decoded,
+            None => return payload.to_string(),
+        }
+    };
+    decoded.text = Some(text.to_string());
+    decoded.encode()
+}
+
+/// The reasoning text a verified block replays: what the client saw, else
+/// the text an omitted block carried in its payload.
+pub(crate) fn replay_text(visible: &str, payload: &str) -> String {
+    if !visible.is_empty() {
+        return visible.to_string();
+    }
+    ReasoningPayload::decode(payload)
+        .and_then(|p| p.text)
+        .unwrap_or_default()
 }
 
 impl ReasoningPayload {
@@ -193,7 +229,7 @@ fn input(lowered: &Lowered, ctx: &mut BuildContext<'_>) -> Vec<Value> {
 /// A replayable `reasoning` input item, or `None` when the thinking block was
 /// signed by the Chat target and carries no Responses item.
 fn reasoning_item(reasoning: &ReplayedReasoning) -> Option<Value> {
-    let payload = ReasoningPayload::decode(&reasoning.payload)?;
+    let payload = ReasoningPayload::decode(&reasoning.payload).filter(|p| !p.id.is_empty())?;
     let summary: Vec<Value> = if reasoning.text.is_empty() {
         Vec::new()
     } else {
@@ -294,6 +330,7 @@ pub(crate) fn parse_response(body: &Value) -> Result<Completion, GatewayError> {
                         .get("encrypted_content")
                         .and_then(Value::as_str)
                         .map(str::to_string),
+                    text: None,
                 }
                 .encode(),
             }),
@@ -390,6 +427,7 @@ mod tests {
         let payload = ReasoningPayload {
             id: "rs_1".into(),
             encrypted_content: Some("ENC".into()),
+            text: None,
         }
         .encode();
         let sig = signer.sign("prior", &payload);
@@ -507,7 +545,8 @@ mod tests {
             payload,
             ReasoningPayload {
                 id: "rs_9".into(),
-                encrypted_content: Some("E".into())
+                encrypted_content: Some("E".into()),
+                text: None
             }
         );
         assert_eq!(completion.reasoning[1].text, "raw");
@@ -534,5 +573,34 @@ mod tests {
             .contains("boom"));
         assert!(parse_response(&json!({})).is_err());
         assert!(ReasoningPayload::decode("").is_none());
+    }
+
+    #[test]
+    fn omitted_reasoning_travels_in_the_payload() {
+        assert_eq!(signing_payload("", "r", false), "");
+        assert_eq!(signing_payload("", "", true), "");
+        assert_eq!(signing_payload("opaque", "r", true), "opaque");
+        let chat = signing_payload("", "hidden", true);
+        assert_eq!(chat, r#"{"text":"hidden"}"#);
+        assert_eq!(replay_text("", &chat), "hidden");
+        assert_eq!(replay_text("seen", &chat), "seen");
+        assert_eq!(replay_text("", ""), "");
+        let responses = ReasoningPayload {
+            id: "rs".into(),
+            encrypted_content: Some("E".into()),
+            text: None,
+        }
+        .encode();
+        let both = ReasoningPayload::decode(&signing_payload(&responses, "hidden", true)).unwrap();
+        assert_eq!(
+            (both.id.as_str(), both.text.as_deref()),
+            ("rs", Some("hidden"))
+        );
+        // A chat-produced payload carries no Responses item to replay.
+        let replayed = ReplayedReasoning {
+            text: "hidden".into(),
+            payload: chat,
+        };
+        assert!(reasoning_item(&replayed).is_none());
     }
 }

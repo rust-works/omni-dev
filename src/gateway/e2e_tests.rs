@@ -22,10 +22,15 @@ struct Harness {
     upstream: MockServer,
     server: GatewayServer,
     client: reqwest::Client,
+    token: String,
 }
 
 impl Harness {
     async fn start(vars: &[(&str, &str)]) -> Self {
+        Self::start_with_token(vars, TOKEN).await
+    }
+
+    async fn start_with_token(vars: &[(&str, &str)], token: &str) -> Self {
         let upstream = MockServer::start().await;
         let mut env = MapEnv::new()
             .with("OMNI_DEV_GATEWAY_UPSTREAM_URL", &upstream.uri())
@@ -36,11 +41,12 @@ impl Harness {
             env = env.with(k, v);
         }
         let config = GatewayConfig::from_env_with(&env, &ConfigOverrides::default()).unwrap();
-        let server = GatewayServer::start(config, TOKEN.into()).await.unwrap();
+        let server = GatewayServer::start(config, token.into()).await.unwrap();
         Self {
             upstream,
             server,
             client: reqwest::Client::new(),
+            token: token.to_string(),
         }
     }
 
@@ -51,7 +57,7 @@ impl Harness {
     async fn post(&self, path: &str, body: &Value) -> reqwest::Response {
         self.client
             .post(self.url(path))
-            .header("x-api-key", TOKEN)
+            .bearer_auth(&self.token)
             .header("anthropic-version", "2023-06-01")
             .json(body)
             .send()
@@ -702,4 +708,115 @@ async fn passthrough_forwards_exact_counts_and_errors() {
     let body: Value = overloaded.json().await.unwrap();
     assert_eq!(body["error"]["type"], "overloaded_error");
     assert!(body["error"]["message"].as_str().unwrap().contains("busy"));
+}
+
+// ── A recorded Claude Code session ──────────────────────────────────
+
+/// Replays the requests a real `claude -p` session sent through the gateway
+/// (captured 2026-10-14, scrubbed; see the fixture's `_note`), checking the
+/// gateway's answer to each and what reached the upstream.
+#[tokio::test]
+async fn a_recorded_claude_code_session_replays() {
+    let session: Value = serde_json::from_str(&fixture("claude_code_session.json")).unwrap();
+    let h =
+        Harness::start_with_token(&[("OMNI_DEV_GATEWAY_FLAVOR", "fireworks")], "e2e-token").await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(fixture("chat_text.sse")))
+        .mount(&h.upstream)
+        .await;
+
+    // Turn 1 as sent: `safeguards` is a safety control the gateway refuses to
+    // drop silently, so it is rejected (Claude Code retries without it).
+    let turn1 = session["turn1"].clone();
+    let rejected = h.post("/v1/messages?beta=true", &turn1).await;
+    assert_eq!(rejected.status(), 400);
+    let body: Value = rejected.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("safeguards"));
+
+    // Turn 1 as Claude Code retries it: accepted, `display: updates` included.
+    let mut retried = turn1;
+    retried.as_object_mut().unwrap().remove("safeguards");
+    assert_eq!(retried["thinking"]["display"], "updates");
+    let accepted = h.post("/v1/messages?beta=true", &retried).await;
+    assert_eq!(accepted.status(), 200);
+    assert_eq!(
+        accepted.headers()["x-omni-dev-gateway-ignored"],
+        "context_management, metadata"
+    );
+    assert!(accepted
+        .text()
+        .await
+        .unwrap()
+        .contains("event: message_stop"));
+
+    // Turn 2 replays the gateway-signed thinking block from turn 1.
+    let turn2 = h.post("/v1/messages?beta=true", &session["turn2"]).await;
+    assert_eq!(turn2.status(), 200);
+    assert_eq!(
+        turn2.headers()["x-omni-dev-gateway-ignored"],
+        "context_management, metadata"
+    );
+
+    let bodies = h.upstream_bodies().await;
+    let sent = bodies.last().unwrap();
+    assert_eq!(sent["reasoning_effort"], "medium");
+    assert!(sent.get("thinking").is_none());
+    assert_eq!(sent["tools"].as_array().unwrap().len(), 21);
+    let messages = sent["messages"].as_array().unwrap();
+    let assistant = messages.iter().find(|m| m["role"] == "assistant").unwrap();
+    assert_eq!(assistant["reasoning_content"], "I will run the command.");
+    assert_eq!(assistant["tool_calls"][0]["function"]["name"], "Bash");
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        ["system", "user", "system", "assistant", "tool", "system"]
+    );
+}
+
+#[tokio::test]
+async fn omitted_reasoning_is_still_replayed() {
+    // With `display: omitted` the client never sees the reasoning, but the
+    // gateway's signature carries it, so the next turn still replays it.
+    let h = Harness::start(&[("OMNI_DEV_GATEWAY_FLAVOR", "fireworks")]).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(fixture("chat_thinking_text.sse")))
+        .mount(&h.upstream)
+        .await;
+    let mut first = message(true);
+    first["thinking"] = json!({"type": "adaptive", "display": "omitted"});
+    let stream = h.post("/v1/messages", &first).await.text().await.unwrap();
+    assert!(!stream.contains("thinking_delta"));
+    let signature = stream
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .map(|d| serde_json::from_str::<Value>(d).unwrap())
+        .find(|e| e["delta"]["type"] == "signature_delta")
+        .unwrap()["delta"]["signature"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut second = message(false);
+    second["thinking"] = json!({"type": "adaptive", "display": "omitted"});
+    second["messages"] = json!([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "", "signature": signature},
+            {"type": "text", "text": "Autumn moon rises"}
+        ]},
+        {"role": "user", "content": "again"}
+    ]);
+    h.post("/v1/messages", &second).await;
+    let bodies = h.upstream_bodies().await;
+    assert_eq!(
+        bodies[1]["messages"][1]["reasoning_content"],
+        "The user wants a haiku."
+    );
 }
