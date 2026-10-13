@@ -227,106 +227,15 @@ Read-only access to Datadog v1/v2 endpoints. Authentication uses
 | `datadog_hosts_list` | List active hosts |
 | `datadog_downtime_list` | List downtimes; supports `active_only` |
 
-### Gmail (8 tools)
+### Gmail and Drive (moved to gwi)
 
-Read access (search, messages, threads, labels, drafts) via OAuth2. Authentication
-uses `GMAIL_CLIENT_ID` + `GMAIL_CLIENT_SECRET` + a refresh token stored by
-`omni-dev gmail auth login`. See [Gmail Guide](gmail.md) and
-[ADR-0063](adrs/adr-0063.md).
-
-Every tool below (except `gmail_account_list`) takes an optional `account`
-parameter selecting a named Gmail account configured via `gmail account`
-(see [Gmail Guide — Multiple accounts](gmail.md#multiple-accounts) and
-[ADR-0066](adrs/adr-0066.md)); call `gmail_account_list` first to discover
-valid names.
-
-| Tool | Purpose |
-|------|---------|
-| `gmail_auth_status` | Credential-presence flags and granted scope only — never calls the Gmail API |
-| `gmail_search` | Search messages (Gmail query syntax); ids-only by default, `enrich: true` adds From/Subject/Date/snippet |
-| `gmail_message_read` | Read a single message (`format`: `minimal`/`metadata`/`full`/`raw`); `output_file` writes to disk |
-| `gmail_thread_read` | Read a full thread (every message); always truncation-guarded |
-| `gmail_label_list` | List labels with unread/total counts. Label add/remove is CLI-only in this release |
-| `gmail_account_list` | List configured Gmail accounts — name, cached email, scope, default. Never a secret |
-| `gmail_draft_list` | List drafts with their `draft_id` (plus `message_id`, `thread_id`, recipients, subject, date, snippet); `query`, `limit` (default 50) |
-| `gmail_draft_show` | Read one draft by `draft_id` (`format`: `minimal`/`metadata`/`full`/`raw`); `output_file` writes the YAML to disk. Draft create/update is CLI-only |
-
-### Drive (15 tools)
-
-Read access to file metadata/content, Sheets and Docs, plus gated content writes
-and backup lease acquisition via OAuth2. Authentication uses `DRIVE_CLIENT_ID`,
-`DRIVE_CLIENT_SECRET` and the refresh token saved by `omni-dev drive auth login`.
-Writes need a write-capable OAuth grant and an operator `write_permissions`
-rule; leases apply unless the deciding rule sets `require_lease: false`.
-Plain Drive writes, Docs/Sheets create and structure/format/delete/protection
-verbs, and lease restore/release/prune remain CLI-only.
-See [Drive Guide](drive.md) and [ADR-0069](adrs/adr-0069.md).
-
-Every tool below (except `drive_account_list`) takes an optional `account`
-parameter selecting a named Drive account configured via `drive account`
-(see [Drive Guide — Multiple accounts](drive.md#multiple-accounts)); call
-`drive_account_list` first to discover valid names.
-
-| Tool                  | Purpose                                                                                                                                                                                          |
-|-----------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `drive_auth_status`   | Credential-presence flags and granted scope only — never calls the Drive API                                                                                                                     |
-| `drive_search`        | Search files (Drive query syntax); returns full metadata per hit, including checksums when present                                                                                               |
-| `drive_dedupe`        | Find files sharing the same content hash within a query's results, grouped by `md5Checksum`                                                                                                      |
-| `drive_file_read`     | Read a file's metadata (default) or content (`format: "content"`); `output_file` writes binary content to disk; `verify: true` checks the fetched SHA-256 against Drive's reported checksum      |
-| `drive_sheets_info`   | Show a spreadsheet's title and the sheets (tabs) it contains — dimensions and hidden flag per tab, no cell data                                                                                  |
-| `drive_sheets_read`   | Read cell values from one range/sheet, or every sheet in the workbook (capped at 200 sheets); `render` controls formatted/unformatted/formula rendering; `output_file` writes the result to disk |
-| `drive_docs_info`     | Show a document's title, revision id and structural outline — named ranges, per-tab heading text with index ranges, no full body                                                                 |
-| `drive_docs_read`     | Read a document's structural elements with `[start,end)` index ranges; `tab`/`suggestions_view` narrow the result; `output_file` writes it to disk                                               |
-| `drive_docs_replace`  | Replace literal text (case-sensitive by default); `dry_run`, lease and account; returns tagged YAML with errors on refusals                                                                      |
-| `drive_docs_append`   | Append text from `text` or `text_path`; same gate, lease and preview semantics                                                                                                                   |
-| `drive_sheets_write`  | Overwrite values from inline rows or `values_path` (auto/csv/tsv/json); `input` defaults to user-entered                                                                                         |
-| `drive_sheets_append` | Append rows to a table, with the same inputs and policy as write                                                                                                                                 |
-| `drive_sheets_clear`  | Clear values in a range or tab while preserving formatting                                                                                                                                       |
-| `drive_lease_acquire` | Authenticate, back up and return a file lease; optional `expiry_minutes` (1–1440) and account                                                                                                    |
-
-| `drive_account_list` | List configured Drive accounts — name, cached email, scope, default. Never a secret |
-
-#### Writing to Sheets and Docs
-
-Preview first, then acquire a lease and pass its token to the real write. For example:
-
-```json
-{"name":"drive_docs_replace","arguments":{"document_id":"DOC_ID","search":"draft","replace":"final","dry_run":true,"account":"work"}}
-{"name":"drive_lease_acquire","arguments":{"file_id":"DOC_ID","expiry_minutes":30,"account":"work"}}
-{"name":"drive_docs_replace","arguments":{"document_id":"DOC_ID","search":"draft","replace":"final","lease":"TOKEN_FROM_ACQUIRE","account":"work"}}
-```
-
-`dry_run` defaults to false. A preview makes no mutation and needs no lease;
-it neither reserves a version nor authorizes the real call. All outcomes are
-complete tagged YAML (`result.status` for writes; top-level `status` for
-acquisition). Successful previews, applied writes, `acquired` and
-`already-leased` return success; refusals and failures set MCP `is_error: true`
-while retaining their structured data. Inputs from local files cannot use `-`
-for stdin. `values_format` applies only to `values_path`. Named account selection
-applies to credentials, write rules and the native backup folder together.
-
-Acquisition uses the same device-owner prompt as the CLI: Touch ID or account
-password, or Touch ID only when the operator selects `biometrics_only`. Native
-Docs/Sheets need that account's `lease_backup_folder_id`. The operator alone
-can configure a headless waiver; tools expose no policy or authentication flags.
-One authorized lease permits repeated writes to its file until fixed expiry.
-
-`refused-no-lease` needs acquisition. `refused-lease-stale` needs a fresh backup:
-release the old token with `omni-dev drive lease release` before reacquiring,
-or wait for expiry. MCP-only clients must wait or ask the operator, since
-acquisition returns an existing live token even if stale. `stale-revision`
-means Docs rejected its per-call revision: reread and retry through the complete
-engine, which may then refuse the backup lease as stale. For replacement,
-`occurrences` is a body-only preview estimate, excluding headers, footers and
-footnotes; zero still sends a real request, and `occurrences_changed` is authoritative.
-
-The OS prompt can wait up to 120 seconds. Cancellation or timeout is not
-rollback: a write or acquisition may have completed without a delivered result.
-Inspect state before retrying, particularly append. After an acquisition has
-finished, explicitly repeat it for the same file/account to recover a live token
-via `already-leased`, without another prompt or backup. Do not automatically
-race acquisitions. See [ADR-0091](adrs/adr-0091.md).
-
+The 23 Gmail and Drive tools (`gmail_*` and `drive_*`) are no longer served by
+`omni-dev-mcp`. They moved to `gwi-mcp`, the MCP server of
+[rust-works/gwi](https://github.com/rust-works/gwi), under the same tool names
+([#2203](https://github.com/rust-works/omni-dev/issues/2203),
+[ADR-0095](adrs/adr-0095.md)). Add `gwi-mcp` to your MCP client as a second server and
+run `gwi import` to copy your accounts from `~/.omni-dev`. See the
+[gwi repository](https://github.com/rust-works/gwi) for the tool catalog.
 
 ### AI / Config (5 tools)
 
@@ -544,7 +453,7 @@ a value of `0` disables truncation entirely.
   assistant launched the server from inside the repo you expected.
 - **Tool not found:** confirm the binary was built with `--features mcp`.
   `omni-dev-mcp --help` should print without error if the build succeeded.
-- **Atlassian / Datadog / Gmail tools return auth errors:** run the matching
+- **Atlassian / Datadog tools return auth errors:** run the matching
   `*_auth_status` tool first to confirm credentials are visible to the
   process. Environment variables exported in your shell are not inherited
   unless the MCP client launched the server from that shell.
@@ -552,9 +461,8 @@ a value of `0` disables truncation entirely.
 ## See also
 
 - [ADR-0021](adrs/adr-0021.md) — MCP server via second binary
-- [ADR-0063](adrs/adr-0063.md) — Gmail OAuth2 authorization-code + PKCE design
+- [ADR-0095](adrs/adr-0095.md) — Gmail and Drive moved to gwi (and `gwi-mcp`)
 - [JIRA-Flavoured Markdown spec](specs/jfm.md) — also served as
   `omni-dev://specs/jfm`
 - [User Guide — Atlassian Integration](user-guide.md#atlassian---jira-and-confluence-integration)
 - [User Guide — Datadog Integration](user-guide.md#datadog-integration)
-- [User Guide — Gmail Integration](user-guide.md#gmail-integration)

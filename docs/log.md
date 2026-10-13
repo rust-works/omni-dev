@@ -33,310 +33,21 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `commit` (HEAD *before* removal), `had_uncommitted`, and `used_force`; for
   `prune`: a JSON `pruned` list of `{path, branch, commit}`. See
   [Recovering a removed worktree](#recovering-a-removed-worktree).
-- **`kind: "drivemutation"`** — one per `omni-dev drive rename`/`drive
-  move`/`drive create`/`drive upload`/`drive edit`/`drive sheets *` attempt,
-  written from
-  *inside* the mutation itself so it covers every current and future caller
-  (CLI today, MCP later), not just the CLI. Includes a refused move
-  (`Blocked`, ADR-0070) or create/upload/edit (`Blocked` by the folder
-  write-permission gate, ADR-0071, issue #1574) — no mutating API call
-  happens for those, but the refusal is itself the security-relevant event.
-  Tagged `service: "drive"`, with `command` set to `["drive",
-  "<operation>"]` and the outcome detail in the free-form `context` map:
-  `file_id`, `file_name`, `status`, and — only when present —
-  `added_principals`/`removed_principals` (comma-separated,
-  `move`-only) and `crosses_drive_boundary` (`move`-only), plus
-  `resolved_folder_id`/`decided_by_folder_id`/`decided_by_depth`
-  (the folder the write-permission gate evaluated against, and which
-  configured rule, if any, decided the verdict — absent for the ungated
-  `rename`/`move`), and `decided_by_file_id` when a **file** rule decided
-  it (issue [#1612](https://github.com/rust-works/omni-dev/issues/1612)).
-  `decided_by_file_id` is mutually exclusive with `decided_by_folder_id`,
-  deliberately: a file id never appears in the folder field, so an existing
-  `--query decided_by_folder_id:<id>` cannot start matching a different
-  kind of id. A file rule matches the target itself, so it walks no chain —
-  `decided_by_depth` and `resolved_folder_id` are both absent alongside it.
-  See [docs/drive.md](drive.md#write-permissions).
+- **`kind: "drivemutation"`** — **legacy, read-only.** Older omni-dev releases wrote
+  one per Drive, Docs, Sheets or Slides mutation attempt (tagged `service: "drive"`,
+  `command` `["drive", "<operation>"]`, the outcome detail in the free-form `context`
+  map). The Drive commands moved to [gwi](https://github.com/rust-works/gwi) in
+  [#2203](https://github.com/rust-works/omni-dev/issues/2203) /
+  [ADR-0095](adrs/adr-0095.md), so omni-dev no longer writes this kind. `omni-dev log`
+  still decodes and displays existing records, and every filter and `--query` term
+  keeps working over them (`omni-dev log --query kind:drivemutation`). The per-field
+  documentation for these records is maintained in
+  [gwi's `docs/log.md`](https://github.com/rust-works/gwi/blob/main/docs/log.md); gwi writes the same shape to its own log.
 
-  Cell writes through the Sheets API (issue
-  [#1589](https://github.com/rust-works/omni-dev/issues/1589),
-  [ADR-0073](adrs/adr-0073.md)) use this same kind, with `operation` of
-  `sheets-write`/`sheets-append`/`sheets-clear`/`sheets-create`/
-  `sheets-find-replace` — so
-  `command` reads `["drive", "sheets-write"]` even though the CLI spells it
-  `drive sheets write`. They add five more omit-if-absent context keys:
-  `range` (the A1 range as composed and sent), and `updated_range`,
-  `updated_rows`, `updated_columns`, `updated_cells` (what the API reported
-  actually changing). `updated_range` can differ from `range` — the server
-  resolves an open-ended range against the sheet's real extent — which is
-  what makes `omni-dev log --query kind:drivemutation` able to answer "how
-  much did that write touch", not just "a write happened".
+- **`kind: "audit"`** — **legacy, read-only.** Written by older releases to the
+  **separate** `audit.jsonl` sink, never to this file; see [Audit log](#audit-log).
 
-  `sheets-find-replace` also records `occurrences_changed` and a compact
-  scope/count summary. Its `--find` and `--replacement` values are document
-  content and are redacted from the invocation log and absent from mutation
-  records.
-
-  Structural edits (issue
-  [#1613](https://github.com/rust-works/omni-dev/issues/1613),
-  [ADR-0075](adrs/adr-0075.md)) use the same kind again, with `operation` of
-  `sheets-add-sheet`/`sheets-rename-sheet`/`sheets-insert-rows`/
-  `sheets-insert-columns` — **one record per verb**, which is also one per
-  `spreadsheets.batchUpdate` request, since each verb sends a batch of
-  exactly one. They add four more omit-if-absent context keys: `sheet_id`
-  (the stable numeric id the API addresses, which survives a later rename
-  and so is the only durable answer to "which tab was this"), `sheet_title`
-  (its title at the time), `sheet_new_title` (the title a `rename-sheet`
-  moved it *to* — set by that verb alone, since `sheet_title` necessarily
-  holds the title the sheet had before, and without it a record could say
-  which tab was renamed but not to what), and `dimension_range` (e.g.
-  `"ROWS 5:7"`, 1-based inclusive like the CLI's `--at`). `dimension_range`
-  is the structural analogue of `range`, for effects A1 notation cannot
-  express, and is omitted for a span that spans nothing; a structural verb
-  sets no `range` and no cell counts. `move-rows`/`move-columns` (issue
-  [#1834](https://github.com/rust-works/omni-dev/issues/1834)) add one more
-  omit-if-absent context key, `move_to`: the raw 1-based `--before` value —
-  `None` for every other verb. It is distinct from `dimension_range`, which
-  for these two verbs holds the *source* span that moved, not the
-  destination.
-
-  Destructive edits (issue
-  [#1623](https://github.com/rust-works/omni-dev/issues/1623),
-  [ADR-0077](adrs/adr-0077-sheets-deletion-via-batchupdate.md)) use the same
-  kind again, with `operation` of `sheets-delete-sheet`/`sheets-delete-rows`/
-  `sheets-delete-columns`/`sheets-delete-range` — same
-  one-record-per-verb-and-per-request shape as the structural edits above,
-  and the same four structural context keys (`sheet_id`, `sheet_title`,
-  `dimension_range` for the two dimension-delete verbs). They add one more
-  omit-if-absent context key: `grid_range` (e.g. `"rows 2-4, columns 2-3"`,
-  1-based inclusive like the CLI's `--start-row`/`--end-row`/
-  `--start-column`/`--end-column`) — the `deleteRange` analogue of
-  `dimension_range`, which only ever spans one axis and so cannot record a
-  rectangle. `delete-sheet` sets neither `dimension_range` nor `grid_range`.
-  Every `--dry-run`, additive or destructive, is unlogged — `record_attempt`
-  only ever runs for a real mutation attempt — and a destructive one stays
-  structural-only besides: no cell content is ever read or logged for any
-  structural verb, delete included.
-
-  Formatting, data validation and protected ranges (issue
-  [#1643](https://github.com/rust-works/omni-dev/issues/1643),
-  [ADR-0078](adrs/adr-0078.md)) use the same kind again, still **one record
-  per verb**: `update-borders` can set up to four `Border` sides in a single
-  request, which is the first case where one request carries more than one
-  independently-toggleable effect, but it is still one request, so the
-  one-record-per-verb-per-request equivalence ADR-0075 §7 established holds.
-  New `operation` values: `sheets-format-cells`, `sheets-update-borders`,
-  `sheets-merge-cells`, `sheets-unmerge-cells`,
-  `sheets-auto-resize-dimension`, `sheets-update-dimension-properties`,
-  `sheets-duplicate-sheet`, `sheets-reorder-sheet`, `sheets-hide-sheet`,
-  `sheets-show-sheet`, `sheets-move-rows`, `sheets-move-columns`
-  (issue [#1834](https://github.com/rust-works/omni-dev/issues/1834)),
-  `sheets-set-data-validation`,
-  `sheets-clear-data-validation`, `sheets-protect-range`,
-  `sheets-update-protection`, `sheets-unprotect-range`. Six more
-  omit-if-absent context keys: `fields_changed` (a human-readable summary of
-  which `CellFormat`/border/dimension-property fields a verb set — the
-  formatting analogue of `dimension_range`, needed because a single request
-  here can carry more than one named effect), `discarded_cells`
-  (`merge-cells` only — the non-top-left, non-blank cells a merge
-  discarded, as `"A1: value"` strings, so the one formatting request that
-  destroys data has a record saying exactly what was lost),
-  `validation_type` (the condition type a `set-data-validation` applied, or
-  `"cleared"`), `protected_range_id` (the stable numeric id of a protected
-  range a protection verb acted on — server-assigned for `protect-range`,
-  otherwise the one resolved against), and `protection_editors_added`/
-  `protection_editors_removed` (comma-separated).
-
-  Filter views and the basic filter (issue
-  [#1794](https://github.com/rust-works/omni-dev/issues/1794),
-  [ADR-0081](adrs/adr-0081.md)) use the same kind again. New `operation`
-  values: `sheets-set-basic-filter`, `sheets-clear-basic-filter`,
-  `sheets-add-filter-view`, `sheets-update-filter-view`,
-  `sheets-delete-filter-view`. One more omit-if-absent context key:
-  `filter_view_id` (the stable numeric id of a filter view acted on —
-  server-assigned for `add-filter-view`, otherwise the one resolved
-  against; absent for `set-basic-filter`/`clear-basic-filter`, which
-  reuse `sheet_id` instead, since a basic filter is scoped to a sheet
-  rather than id-addressed). `fields_changed` is reused as-is for
-  `update-filter-view`'s changed-field summary.
-
-  Charts and slicers (issue
-  [#1797](https://github.com/rust-works/omni-dev/issues/1797),
-  [ADR-0081](adrs/adr-0081.md) §3) use the same kind again. New `operation`
-  values: `sheets-add-chart`, `sheets-update-chart`, `sheets-delete-chart`,
-  `sheets-add-slicer`, `sheets-update-slicer`, `sheets-delete-slicer`. One
-  more omit-if-absent context key: `embedded_object_id` (the stable numeric
-  id of a chart or slicer acted on — server-assigned for `add-chart`/
-  `add-slicer`, otherwise the one resolved against; one key for both kinds,
-  since `deleteEmbeddedObject` itself addresses both by the same `objectId`
-  with no discriminator). `sheet_id` is reused for the sheet the object is
-  anchored on (`None` for a chart put on its own new sheet, which doesn't
-  exist yet); `fields_changed` is reused for the changed-field summary and,
-  for `update-chart`/`update-slicer`/`delete-chart`/`delete-slicer` (every
-  verb that resolves against an existing object), has the object's
-  type/title/anchor appended — the ADR-0081 §3 preview text, in the audit
-  trail as well as the `--dry-run` report.
-
-  Moving/resizing an existing chart or slicer, and setting a chart's border
-  colour (issue [#1837](https://github.com/rust-works/omni-dev/issues/1837))
-  use the same kind again. New `operation` values: `sheets-move-chart`,
-  `sheets-move-slicer`, `sheets-update-chart-border`. No new context key:
-  `embedded_object_id` and `fields_changed` are reused exactly as above, and
-  `sheet_id` records the destination sheet for a move — including a
-  resize-only call, which carries the object's *current* anchor's sheet
-  forward — and is `None` only for a `--new-sheet` move, which has no
-  destination sheet yet.
-
-  Banded ranges (issue
-  [#1832](https://github.com/rust-works/omni-dev/issues/1832),
-  [ADR-0082](adrs/adr-0082-banded-ranges.md)) use the same kind again. New
-  `operation` values: `sheets-add-banding`, `sheets-update-banding`,
-  `sheets-delete-banding`. One more omit-if-absent context key:
-  `banded_range_id` (the stable numeric id of a banded range acted on —
-  server-assigned for `add-banding`, otherwise the one resolved against),
-  mirroring `filter_view_id`'s precedent. `sheet_id` is reused for the
-  sheet the banded range sits on.
-
-  Dimension groups (issue
-  [#1833](https://github.com/rust-works/omni-dev/issues/1833),
-  [ADR-0084](adrs/adr-0084-dimension-groups.md)) use the same kind again.
-  New `operation` values: `sheets-add-dimension-group`,
-  `sheets-update-dimension-group`, `sheets-delete-dimension-group`. No new
-  context key: a dimension group carries no id of its own, so `sheet_id`
-  and `dimension_range` (already used by the insert/delete-dimension
-  structural verbs) are reused for the sheet and span a group acts on, and
-  `fields_changed` (already used by the dimension-property formatting
-  verbs) records `collapsed=true`/`collapsed=false` for
-  `sheets-update-dimension-group`.
-
-  `update-sheet-properties` (issue #1835,
-  [ADR-0085](adrs/adr-0085.md)) uses the same kind again, with
-  `operation` of `sheets-update-sheet-properties`. It may set several
-  properties (frozen rows/columns, hidden gridlines, tab color,
-  right-to-left) in one request, so it needs no new context key: it reuses
-  `fields_changed` for a comma-joined summary of what it set (e.g.
-  `"frozenRowCount=2, tabColorStyle=#FF8800"`), the same key `format-cells`
-  and friends already write, rather than introducing one of its own.
-
-  `update-workbook-properties` (issue #1836,
-  [ADR-0086](adrs/adr-0086-workbook-properties.md)) uses the same kind
-  again, with `operation` of `sheets-update-workbook-properties`. Like
-  `update-sheet-properties` it may set several properties (locale, time
-  zone, auto-recalc, iterative calculation) in one request, so it reuses
-  `fields_changed` rather than a new key, but the summary it writes is a
-  prose join rather than `update-sheet-properties`' `key=value` pairs —
-  e.g. `"locale -> 'en_US', auto-recalc -> ON_CHANGE, iterative calculation
-  -> on (max 50 iterations, threshold 0.01)"`, or `"iterative calculation ->
-  off"` when clearing it — the same string `--dry-run`/the real-run
-  confirmation print, from the one `workbook_properties_summary` helper
-  that builds it. It is the one structural verb with no sheet target at
-  all, so `sheet_id`/`sheet_title` are always absent on its records,
-  unlike every other `sheets-*` operation.
-
-  `insert-range` (issue #1838) uses the same kind again, with `operation`
-  of `sheets-insert-range`. It is `delete-range`'s exact inverse and so
-  needs no new context key either: it reuses `grid_range` (introduced
-  above for `delete-range`) to record the same rectangle notation. Unlike
-  the destructive edits above, `insert-range` is gated `sheets-structure`,
-  not `sheets-delete` — no cell value is discarded, cells are shifted
-  within the sheet and the vacated cells become empty — so `grid_range`
-  is not exclusively a destructive-edit signal: a `sheets-insert-range`
-  record carries it too, and only the `operation` value tells the two
-  apart.
-
-  `auto-fill` (issue #1840, [ADR-0083](adrs/adr-0083.md) §1) uses the same
-  kind again, with `operation` of `sheets-auto-fill` and gated
-  `sheets-write`. No new context key for the destination itself: `range`
-  (introduced above for `write`/`append`/`clear`) is reused for the
-  destination's A1 address, and `fields_changed` for a prose summary of the
-  effect — the destination, the source range it extends, the direction, and
-  the alternate-series flag. That summary is deliberately **tense-neutral**:
-  the same string is rendered under both `Would …` and `Applied: …`, so it
-  never describes a completed mutation in the conditional.
-
-  Two new keys. `overwritten_cells`: the non-blank cells in the destination
-  that were overwritten, as **bare A1 addresses** — deliberately not
-  `"A1: value"` like `discarded_cells`, since a fill's values are Sheets'
-  own series detection and this crate never records them, before or after
-  the request. `overwritten_cells_are_upper_bound`: present (and `"true"`)
-  only for `auto-fill --range`, where Sheets decides for itself which cells
-  in the named range are the source and which are filled — some of the
-  listed cells are the source and were never touched. Absent means the list
-  is exact, which is `--source` and every other verb.
-
-  `text-to-columns` (issue #1843, [ADR-0083](adrs/adr-0083.md) §§1, 5) uses
-  the same kind and keys again, with `operation` of
-  `sheets-text-to-columns`, gated by `sheets-write` **and**
-  `sheets-structure`. `range` carries the source column's A1
-  address (not the spill span — the request log's `range` key is always
-  the value that started the write for every verb in this tranche), and
-  `fields_changed` the tense-neutral summary: the source, the delimiter,
-  and the upper-bound width and spill span. `overwritten_cells_are_upper_bound`
-  is **always** `"true"` for this verb, unlike `auto-fill`'s form-dependent
-  flag — the API decides for itself how many columns each row's split
-  needs, so the locally computed span can only ever be an upper bound, and
-  `overwritten_cells` never carries the split pieces or the source's
-  values, only the bare A1 addresses of the cells the split might reach.
-  Under `--delimiter auto` the span is not even a bound (Sheets picks the
-  separator too, and was measured picking a tab, which the local split
-  never tries), but the key has no third state; that caveat is carried in
-  the rendered output rather than in the record.
-
-  `trim-whitespace` and `delete-duplicates` (issue #1844,
-  [ADR-0083](adrs/adr-0083.md) §§1, 2, 6) use the same kind, with
-  `operation` of `sheets-trim-whitespace` and `sheets-delete-duplicates`.
-  They are the tranche's one pair taking **different gates** —
-  `sheets-write` for the trim, `sheets-delete` for the dedupe — so a
-  `decided_by_*` chain on one says nothing about the other. Neither adds a
-  context key: `fields_changed` carries the server's own count
-  (`cellsChangedCount`, `duplicatesRemovedCount`) plus the range, or says
-  the API reported no count.
-
-  Both counts are present as `0` rather than omitted when nothing
-  changed — measured live — so `fields_changed` reading "trimmed 0
-  cell(s)" is the ordinary no-op case, not a missing value. The
-  "the API reported no count" wording is reserved for a reply that
-  carried no response object at all.
-
-  `delete-duplicates` deliberately records **no** cell or row list. ADR-0083
-  §6 places it in the server-decided preview tier — Sheets chooses the rows
-  by an equality rule this crate does not reproduce — so there is nothing
-  to record that the tool could vouch for. `trim-whitespace` records none
-  either: its real run reports the server's exact count instead of
-  re-reading the range, so the candidate list exists only in the `--dry-run`
-  outcome, which writes no mutation record at all.
-
-  Text writes through the Docs API (issue
-  [#1615](https://github.com/rust-works/omni-dev/issues/1615),
-  [ADR-0076](adrs/adr-0076.md)) use this same kind, with `operation` of
-  `docs-replace`/`docs-append`/`docs-insert`/`docs-delete` (or `slides-replace`
-  for Slides text replacement), and add three more omit-if-absent context
-  keys: `occurrences_changed` (what the *server* reported changing, which
-  can differ from the client-side `--dry-run` estimate), `inserted_chars`,
-  and `required_revision_id` (the revision lease presented, recorded so a
-  `stale-revision` refusal is as auditable as a success — an opaque,
-  short-lived id, not a secret).
-
-  Anchored edits ([ADR-0094](adrs/adr-0094.md)) reuse these keys:
-  insertion reports `inserted_chars`, and deletion reports its status and
-  required revision. Resolved ranges, tab ids and paragraph/removal counts are
-  in the command outcome, rather than new log context fields.
-
-  **The searched, replacement, appended, inserted and deleted text, including
-  anchor text, are never recorded in these metadata fields.** They
-  are user prose, and often the most sensitive thing in the invocation —
-  sharper than the Sheets case, where an A1 range is metadata rather than
-  content. Only counts and the opaque revision id go in.
-
-- **`kind: "audit"`** — written to the **separate** `audit.jsonl` sink, never
-  to this file — see [Audit log](#audit-log). Every other `kind` above stays
-  exactly as described regardless of the audit log's existence: a leased
-  Drive write (issue [#1664](https://github.com/rust-works/omni-dev/issues/1664),
-  [ADR-0080](adrs/adr-0080.md)) still produces its normal `drivemutation`
-  record here, correlated to its `audit` record by the shared
-  `invocation_id`.
-
-Every HTTP, `gh`, `worktree`, and `drivemutation` record shares an
+Every HTTP, `gh` and `worktree` record shares an
 `invocation_id` with the invocation that issued it, so you can pull a run and
 all of its requests with a single `--id`.
 
@@ -360,19 +71,20 @@ The directory is created `0700` and the file `0600`, the same posture as other
 
 ## Environment variables
 
-| Variable | Effect |
-|----------|--------|
-| `OMNI_DEV_LOG_FILE` | Override the log path. |
-| `OMNI_DEV_LOG_DISABLE=1` | Disable logging entirely. |
-| `OMNI_DEV_LOG_BODIES=1` | Opt in to recording request/response bodies (off by default; payloads are large and may contain customer content). |
-| `OMNI_DEV_LOG_HEADERS=1` | Opt in to recording (redacted) request/response headers. |
-| `OMNI_DEV_LOG_MAX_SIZE` | Enable automatic size-capped rotation on write, e.g. `10mb` (unix only; see [Bounding growth](#bounding-growth)). |
-| `OMNI_DEV_LOG_KEEP_FILES` | Number of rotated files to keep when rotation is enabled (default `3`). |
-| `OMNI_DEV_AUDIT_LOG_FILE` | Override the **audit** log path — see [Audit log](#audit-log); none of the other variables above affect it. |
+| Variable                  | Effect                                                                                                                              |
+|---------------------------|-------------------------------------------------------------------------------------------------------------------------------------|
+| `OMNI_DEV_LOG_FILE`       | Override the log path.                                                                                                              |
+| `OMNI_DEV_LOG_DISABLE=1`  | Disable logging entirely.                                                                                                           |
+| `OMNI_DEV_LOG_BODIES=1`   | Opt in to recording request/response bodies (off by default; payloads are large and may contain customer content).                  |
+| `OMNI_DEV_LOG_HEADERS=1`  | Opt in to recording (redacted) request/response headers.                                                                            |
+| `OMNI_DEV_LOG_MAX_SIZE`   | Enable automatic size-capped rotation on write, e.g. `10mb` (unix only; see [Bounding growth](#bounding-growth)).                   |
+| `OMNI_DEV_LOG_KEEP_FILES` | Number of rotated files to keep when rotation is enabled (default `3`).                                                             |
+| `OMNI_DEV_AUDIT_LOG_FILE` | Override the path `omni-dev log --audit` reads — see [Audit log](#audit-log) (legacy); none of the other variables above affect it. |
 
 Logging is **best effort**: a write failure is swallowed (logged only at
-`tracing::debug`) and can never change the command's exit code. The audit log
-is the deliberate exception — see [Audit log](#audit-log).
+`tracing::debug`) and can never change the command's exit code. (The legacy
+audit log was the one fail-closed exception; omni-dev no longer writes it — see
+[Audit log](#audit-log).)
 
 ## `omni-dev log`
 
@@ -419,9 +131,9 @@ below. The `prune` subcommand trims it; see [Bounding growth](#bounding-growth).
   `hostname` (alias `host`), `system_user` (alias `user`), `cwd`, and
   `auth_principal` (alias `principal`). Field matching is shared with the flags,
   so `--status 5xx` and `status:5xx` behave identically.
-- **`status` is kind-aware:** for every kind but `drivemutation` it matches the
-  HTTP `status_code` (class or comparator syntax, below). A `drivemutation`
-  record has no `status_code` — its domain status (`blocked`, `written`,
+- **`status` is kind-aware:** for every kind but the legacy `drivemutation` it
+  matches the HTTP `status_code` (class or comparator syntax, below). A
+  `drivemutation` record has no `status_code` — its domain status (`blocked`, `written`,
   `stale-revision`, ...) lives in the `context` map instead, so `status:` there
   matches `context["status"]` by exact case-insensitive equality, e.g.
   `kind:drivemutation status:blocked`.
@@ -640,20 +352,31 @@ rotation only renames them.
 runtime directory, reusing the same `LogRecord` schema and the same
 `omni-dev log` reader — pass `--audit` to read it instead of `log.jsonl`; see
 [Filters](#filters)/[Output](#output) above, all of which apply unchanged.
-It exists to serve the opposite guarantee from everything above: where
-`log.jsonl` is best-effort, prunable, and can be disabled outright,
-`audit.jsonl` is **fail-closed** — an operation whose audit record cannot be
-written does not happen — and exempt from every growth bound this page just
-described:
 
-| | `log.jsonl` | `audit.jsonl` |
-|---|---|---|
-| On a write failure | Swallowed; the command's exit code is unaffected | Propagated; the caller aborts the operation it was about to audit |
-| `OMNI_DEV_LOG_DISABLE=1` | Suppresses all writes | No effect |
-| `omni-dev log prune` | Trims by age/size | Refuses `--audit` outright (`log prune does not support --audit`), **and** refuses any resolved log path that names the audit file — e.g. `OMNI_DEV_LOG_FILE` pointed at `audit.jsonl` directly, via a `..` segment, or via a symlink (redundant in practice since #1747: the aliasing `OMNI_DEV_LOG_FILE` fails to resolve at all before `prune` ever runs — kept as defense in depth for a caller that bypasses normal path resolution) |
-| `OMNI_DEV_LOG_MAX_SIZE` rotation | Applies | Never applies, regardless of the setting or how `OMNI_DEV_LOG_FILE` is spelled |
-| Path override | `OMNI_DEV_LOG_FILE` | `OMNI_DEV_AUDIT_LOG_FILE` |
-| Location when unset | `<state dir>/omni-dev/log.jsonl` | `<state dir>/omni-dev/audit.jsonl` |
+**It is legacy.** Its only writer was the Drive leased-write lifecycle
+([ADR-0080](adrs/adr-0080.md)), which moved to
+[gwi](https://github.com/rust-works/gwi) with the rest of Drive
+([#2203](https://github.com/rust-works/omni-dev/issues/2203),
+[ADR-0095](adrs/adr-0095.md)). omni-dev no longer writes `audit.jsonl`, and it never
+deletes, truncates, rotates or prunes an existing one: a file left by an older
+release stays exactly as it was and stays readable with `omni-dev log --audit`.
+gwi writes its own `audit.jsonl` under its own state directory; records are not
+merged, so history from before the move stays here. The fail-closed guarantee those
+records were written under (an operation whose audit record could not be written did
+not happen) is gwi's to keep and is documented in
+[gwi's `docs/log.md`](https://github.com/rust-works/gwi/blob/main/docs/log.md).
+
+What remains in omni-dev is the read side and the guards that keep the file out of
+the request log's reach:
+
+|                                  | `log.jsonl`                      | `audit.jsonl`                                                                                                                      |
+|----------------------------------|----------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| Written by omni-dev              | Yes (best effort)                | No (legacy; read-only)                                                                                                             |
+| `OMNI_DEV_LOG_DISABLE=1`         | Suppresses all writes            | No effect                                                                                                                          |
+| `omni-dev log prune`             | Trims by age/size                | Refuses `--audit` outright (`log prune does not support --audit`), **and** refuses any resolved log path that names the audit file |
+| `OMNI_DEV_LOG_MAX_SIZE` rotation | Applies                          | Never applies                                                                                                                      |
+| Path override                    | `OMNI_DEV_LOG_FILE`              | `OMNI_DEV_AUDIT_LOG_FILE`                                                                                                          |
+| Location when unset              | `<state dir>/omni-dev/log.jsonl` | `<state dir>/omni-dev/audit.jsonl`                                                                                                 |
 
 `--audit` is a flag on the bare search form (`omni-dev log --audit ...`) and,
 separately, on `prune` (`omni-dev log prune --audit`, always refused, above);
@@ -665,132 +388,17 @@ simply fails to resolve — compared by file identity (the `same-file` crate
 — inode on unix, a file handle on Windows — falling back to a normalized
 path when one side doesn't exist yet), not merely by identical spelling, so
 a `..` segment, a relative-vs-absolute spelling, or a symlink can't slip
-past the check. The two sinks are siblings by default but not otherwise
-mutually exclusive by construction, so this misconfiguration is caught once,
-centrally, at path resolution ([#1747](https://github.com/rust-works/omni-dev/issues/1747))
-rather than by each consumer of the request-log path separately: neither a
-best-effort append, rotation, nor `prune` can ever reach `audit.jsonl`
-through an aliasing `OMNI_DEV_LOG_FILE`, since none of them get a path to
-act on in the first place.
+past the check
+([#1747](https://github.com/rust-works/omni-dev/issues/1747)). Neither a
+best-effort append, rotation, nor `prune` can therefore reach `audit.jsonl`
+through an aliasing `OMNI_DEV_LOG_FILE`.
 
 Every record carries `kind: "audit"` and, in `context`, an `integration` key
-(`"drive"` today, so a later integration's audit trail is additive rather
-than a rename), a `file_id`, and a `verdict` — alongside the usual
-invocation/HTTP fields. `RecordKind::Audit` is the schema landed by issue
-[#1664](https://github.com/rust-works/omni-dev/issues/1664)
-([ADR-0080](adrs/adr-0080.md) §11); what populates it is the Drive
-leased-write lifecycle, landing across that same issue's phases.
-
-**`drive lease acquire`** writes one record per attempt, `command: ["drive",
-"lease-acquire"]`, regardless of outcome — `verdict` is `acquired`,
-`acquired-headless-waiver` (ADR-0080 §8/§13, issue #1677: proceeded under the
-headless opt-out, no human ever prompted), `already-leased`,
-`refused-native-document`, `refused-concurrent-change` (issue #1693: the
-file changed while its backup was being taken, so no lease could vouch for
-that backup — `error` names what moved), `denied`, `unavailable`, or
-`failed`, matching `AcquireResult`'s own kebab-case status — plus, on
-`already-leased`/`refused-concurrent-change`/`failed`, the
-`-backup-orphaned` suffix (issue #1690): this attempt took a real backup
-before discovering it isn't referenced by any ledger row, and reclaiming
-that backup itself then failed, so it is now truly orphaned (`drive lease
-prune` cannot see it either). An `acquired` record additionally carries
-`lease_id` (the token), `version_after`/`modified_time_after` (the Drive
-state actually recorded into the ledger — re-read after the backup, not the
-pre-authentication snapshot, for the same TOCTOU reason the ledger itself
-does), `backup_location` (a local path for a byte backup, or the backup
-copy's own file id for a native-document backup),
-`backup_sha256`/`backup_size` (byte backups only), and `auth_policy`
-(`device-owner` or `biometrics-only`). An
-`already-leased`/`refused-concurrent-change`/`failed` record also carries
-`backup_location` whenever this attempt took a backup (a
-`refused-concurrent-change` always did), whether or not reclaiming it
-succeeded — the `-backup-orphaned` suffix is what distinguishes the two. Unlike a leased *write*'s own record (below), this
-one is best-effort rather than write-ahead/fail-closed: acquiring mutates no
-Drive content — by the time the record is written the consent, the backup
-and the ledger row have already durably happened, so a
-logging failure is warned and does not turn a successful acquisition into a
-reported failure.
-
-A leased **write** produces records in **both** files, correlated by
-`invocation_id`: its ordinary `drivemutation` record here in `log.jsonl`
-(ADR-0070/0071/0073/0075/0076/0077/0078), and, in `audit.jsonl`, one or
-two `audit` records from `crate::drive::lease::check` — shared by every
-leased-write engine (`drive edit`, the five Sheets engines and `drive docs
-write`). Their `command` is `["drive", <operation>]` with the **verb's**
-operation name — `["drive", "edit"]`, `["drive", "sheets-delete-sheet"]`,
-`["drive", "docs-replace"]` — byte-for-byte the `command` of the same
-write's `drivemutation` record, so `--query 'command:sheets-delete-sheet'`
-matches both files and the audit record names the verb that ran, not
-merely which engine ran it:
-
-- A refusal that never reaches the mutating call writes **one** best-effort
-  record — `verdict: refused-no-lease`, `refused-lease-expired`,
-  `refused-lease-wrong-file` or `refused-lease-stale`, mirroring the
-  engine's own reported result, or `failed` with the `error` when the
-  ledger lock could not be taken. There is no mutation to pair a
-  write-ahead record around.
-- A presented lease that checks out writes a **write-ahead** `pending`
-  intent record carrying `lease_id`, `version_before` and
-  `modified_time_before`, `fsync`ed before the mutating API call this
-  lease authorises, and fail-closed: if this record cannot be written the
-  write itself is refused rather than proceeding unaudited (the one place
-  in the whole ADR this contract applies, per §11). After the mutating
-  call returns, a best-effort **outcome** record follows with the same
-  `lease_id`: `verdict: allowed` with `version_after`/`modified_time_after`
-  (from `files.update`'s own response for `drive edit`, from the post-write
-  `files.get` the ledger refresh already pays for on Sheets/Docs), or
-  `verdict: failed` with the API `error` — including a Docs `412` on
-  `writeControl.requiredRevisionId`, which the CLI reports as
-  `stale-revision`: the *lease* was not stale, the mutation simply did not
-  happen, and the error says why.
-
-- A Sheets `batchUpdate` that answers **2xx but whose reply cannot be
-  parsed** is still a mutation that happened (issue #2021): its outcome
-  record is `verdict: allowed` (with `version_after`, and the ledger is
-  refreshed), and its `drivemutation` record has `status:
-  applied-reply-unreadable`, `error` set to the parse detail, and
-  `fields_changed` set to the change summary — never `failed`. Only a
-  non-2xx response, or a transport failure before any status arrives,
-  records `failed`.
-
-An intent record with no matching outcome is itself the signal that
-something was interrupted mid-write — the whole point of writing the
-former durably before the latter can even be attempted.
-
-**`drive lease restore <TOKEN>`** writes its own top-level, best-effort
-record, `command: ["drive", "lease-restore"]`, in addition to the
-generic write-ahead/outcome pair its internal fresh-lease acquisition and
-restore write already produce (both keyed on the *fresh* token). This one
-names **both** tokens (ADR-0080 §10/§11): `lease_id` is the fresh token
-once minted (or the existing one, for `already-leased`), and
-`restored_from_lease_id` is always the backup lease's own token — the
-`<TOKEN>` argument — so `--query 'restored_from_lease_id:<token>'` finds
-every restore attempt made from one backup regardless of outcome. `verdict`
-matches `drive lease restore`'s own reported status: `restored`,
-`restored-sheet`, `restored-headless-waiver`,
-`restored-sheet-headless-waiver`, `sheet-already-restored`,
-`no-such-backup-token`, `no-typed-restore-path`,
-`backup-too-large-for-simple-upload`, `refused-no-visible-parents`,
-`blocked`, `already-leased`, `refused-native-document`,
-`refused-concurrent-change`, `denied`, `unavailable`, `failed`, or
-`fresh-lease-but-write-failed`.
-
-Restore *supersedes* the backup lease it restores from (issue #1685): the
-internal fresh-lease acquisition releases that row in the same ledger write
-that records the new one, so its `command: ["drive", "lease-acquire"]`
-record additionally carries `superseded_lease_id` — the backup token — on
-the `acquired` verdict, and only when a row was actually released. It is
-the record to look for to answer "when did this lease stop being live?"
-when that happened without a `release`.
-
-**`drive lease release <TOKEN>`** writes one best-effort record per
-attempt, `command: ["drive", "lease-release"]`, with `lease_id` the token
-presented (even on a refusal, so a presented-but-dead token is greppable)
-and `verdict` matching the command's own status: `released`,
-`release-not-live` (already expired or already released; the row is left
-untouched), `release-no-such-token`, or `failed` carrying the error. A
-release makes no Drive call, so there is no `drivemutation` record to join
-against.
+(`"drive"` in every record omni-dev wrote), a `file_id`, and a `verdict`,
+alongside the usual invocation/HTTP fields. Because the records are Drive
+lease-lifecycle events (`lease-acquire`, `lease-restore`, `lease-release` and the
+write-ahead/outcome pairs of leased writes), their verdict vocabulary is documented
+with the lease feature in gwi, not here.
 
 ## Redaction posture
 
@@ -870,13 +478,3 @@ field is `#[serde(default)]` and every optional field is `skip_serializing_if`.
 A newer reader never chokes on an older line, and an older reader never chokes on
 a newer one — the same forward-rolling contract the daemon wire types use. The
 record id is time-sortable, so sorting lines by `id` ≈ sorting by time.
-
-### Slides replacement
-
-`drive slides replace` records operation `slides-replace` in `drivemutation`
-records. Outcomes include `replaced`, `blocked`, `stale-revision`, lease refusals,
-and `applied-response-unreadable` (HTTP success; inspect before retrying). Records
-include file identity, revision and server-reported occurrences when available.
-Search/replacement prose and server diagnostics are excluded because an error
-may echo request text. Dry runs emit no mutation record. Drive lease audit pairs
-use `slides-replace` and conclude an unreadable successful response as `allowed`.

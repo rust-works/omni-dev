@@ -4,6 +4,14 @@ omni-dev is an open-source, locally-run command-line tool. This policy
 covers the Google APIs (Drive and Gmail) it can access on your behalf via
 OAuth.
 
+The Drive and Gmail integrations have moved out of omni-dev to the separate
+[gwi](https://github.com/rust-works/gwi) project
+([#2203](https://github.com/rust-works/omni-dev/issues/2203)). Current omni-dev
+releases no longer contact Google's APIs; `omni-dev drive` and `omni-dev gmail`
+remain only as stubs that print a pointer to gwi. This policy continues to
+describe how earlier omni-dev releases that included those integrations handled
+your data, and the tokens and archives they left on your machine.
+
 ## What this is
 
 omni-dev runs entirely on your own machine as a CLI binary. There is no
@@ -17,7 +25,7 @@ visible to, the project maintainers or any third party.
 Depending on the scopes you grant during `omni-dev drive auth login` /
 `omni-dev gmail auth login`, the tool can read and, for scopes you opt into,
 write Drive file content/metadata and Gmail messages — see
-[docs/drive.md](drive.md) and [docs/gmail.md](gmail.md) for exactly what
+[docs/drive.md](https://github.com/rust-works/gwi/blob/main/docs/drive.md) and [docs/gmail.md](https://github.com/rust-works/gwi/blob/main/docs/gmail.md) for exactly what
 each command and scope does. Data is used only to carry out the command you
 invoked (e.g. searching Drive, reading a message, syncing mail to local
 `.eml` files) and is not collected, aggregated, or transmitted anywhere by
@@ -43,8 +51,9 @@ any server other than Google's own APIs.
 
 ## Third-party AI access
 
-omni-dev optionally exposes Drive/Gmail commands to an AI assistant (e.g.
-Claude) via a local MCP server (`omni-dev-mcp`, see [docs/mcp.md](mcp.md)).
+Earlier omni-dev releases optionally exposed Drive/Gmail commands to an AI
+assistant (e.g. Claude) via a local MCP server (`omni-dev-mcp`, see
+[docs/mcp.md](mcp.md)); those tools now live in gwi's `gwi-mcp`.
 This only runs if you explicitly configure your AI client to launch it, and
 it communicates over local stdio — it is your own local integration, not a
 channel omni-dev opens on your behalf.

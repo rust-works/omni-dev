@@ -1661,7 +1661,7 @@ omni-dev retries both automatically:
 
 No other status is retried. A 401 or 422 fails on the first attempt.
 
-Jev uses the REST-client timeouts shared with Atlassian, Datadog and Gmail,
+Jev uses the REST-client timeouts shared with Atlassian and Datadog,
 **not** the AI backends' 300 s `OMNI_DEV_AI_TIMEOUT_SECS`:
 
 | Variable                             | Purpose                                    | Default |
