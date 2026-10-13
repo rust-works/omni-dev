@@ -19,6 +19,10 @@ scopes:
     description: "TypeSafe Jev System One API client and CLI surface"
     examples: ["jev: add system-one REST client", "jev: implement choice/score/noul commands"]
     file_patterns: ["src/jev.rs", "src/jev/**", "src/cli/ai/jev.rs", "src/cli/ai/jev/**"]
+  - name: "gateway"
+    description: "Anthropic Messages gateway in front of OpenAI-protocol upstreams"
+    examples: ["gateway: add responses upstream", "gateway: map refusal stop reason"]
+    file_patterns: ["src/gateway.rs", "src/gateway/**", "src/cli/ai/gateway.rs", "src/bin/anthropic_api_drift.rs", "tests/fixtures/gateway/**"]
   - name: "cli"
     description: "Command-line interface and argument parsing"
     examples: ["cli: add twiddle contextual options", "cli: improve help text"]
