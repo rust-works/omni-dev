@@ -1,0 +1,12 @@
+data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"The user "}}]}
+
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"wants a haiku."}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"Autumn moon rises"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"\nquiet"}}],"usage":null}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":20,"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":30}}}
+
+data: [DONE]
+

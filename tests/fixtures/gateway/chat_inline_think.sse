@@ -1,0 +1,10 @@
+data: {"choices":[{"index":0,"delta":{"content":"<think>"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"short plan</th"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"ink>\n\nDone."}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
