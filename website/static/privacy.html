@@ -45,7 +45,7 @@
 
 <header>
   <h1>omni-dev — Privacy Policy</h1>
-  <p>How the Drive/Gmail OAuth integration accesses and stores your data.</p>
+  <p>How the (now relocated) Drive/Gmail OAuth integration accesses and stores your data.</p>
 </header>
 
 <div class="container">
@@ -53,6 +53,14 @@
 <p>omni-dev is an open-source, locally-run command-line tool. This policy
 covers the Google APIs (Drive and Gmail) it can access on your behalf via
 OAuth.</p>
+
+<p>The Drive and Gmail integrations have moved out of omni-dev to the
+separate <a href="https://github.com/rust-works/gwi">gwi</a> project.
+Current omni-dev releases no longer contact Google's APIs;
+<code>omni-dev drive</code> and <code>omni-dev gmail</code> remain only as
+stubs that print a pointer to gwi. This policy continues to describe how
+earlier omni-dev releases that included those integrations handled your
+data, and the tokens and archives they left on your machine.</p>
 
 <h2>What this is</h2>
 <p>omni-dev runs entirely on your own machine as a CLI binary. There is no
@@ -67,9 +75,9 @@ any third party.</p>
 login</code> / <code>omni-dev gmail auth login</code>, the tool can read
 and, for scopes you opt into, write Drive file content/metadata and Gmail
 messages &mdash; see the
-<a href="https://github.com/rust-works/omni-dev/blob/main/docs/drive.md">Drive</a>
+<a href="https://github.com/rust-works/gwi/blob/main/docs/drive.md">Drive</a>
 and
-<a href="https://github.com/rust-works/omni-dev/blob/main/docs/gmail.md">Gmail</a>
+<a href="https://github.com/rust-works/gwi/blob/main/docs/gmail.md">Gmail</a>
 docs for exactly what each command and scope does. Data is used only to
 carry out the command you invoked (e.g. searching Drive, reading a
 message, syncing mail to local <code>.eml</code> files) and is not
@@ -96,8 +104,8 @@ collected, aggregated, or transmitted anywhere by omni-dev itself.</p>
 service, or any server other than Google's own APIs.</p>
 
 <h2>Third-party AI access</h2>
-<p>omni-dev optionally exposes Drive/Gmail commands to an AI assistant
-(e.g. Claude) via a local MCP server (<code>omni-dev-mcp</code>, see the
+<p>Earlier omni-dev releases optionally exposed Drive/Gmail commands to an AI
+assistant (e.g. Claude) via a local MCP server (<code>omni-dev-mcp</code>, see the
 <a href="https://github.com/rust-works/omni-dev/blob/main/docs/mcp.md">MCP docs</a>).
 This only runs if you explicitly configure your AI client to launch it,
 and it communicates over local stdio &mdash; it is your own local

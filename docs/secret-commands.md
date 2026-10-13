@@ -16,8 +16,9 @@ applies: the process environment beats settings.json, so an exported
 
 `_COMMAND` fetches the secret **on demand** from a store that does not keep it as
 plaintext on disk. The secrets covered are the ones listed under each service's
-own page (AI backends, Jev, Atlassian, Datadog, Gmail, Drive, Snowflake, the
-browser bridge); `GMAIL_CLIENT_SECRET` is not one of them.
+own page (AI backends, Jev, Atlassian, Datadog, Snowflake, the browser bridge). The
+Gmail and Drive secrets moved to [gwi](https://github.com/rust-works/gwi)
+([ADR-0095](adrs/adr-0095.md)), which documents its own `_COMMAND` support.
 
 ## What it protects, and what it does not
 
@@ -119,18 +120,14 @@ command needs the secret; keep the file `0600`, as omni-dev writes it.
 would replace your store. So when the map it would write to holds a
 `NAME_COMMAND` for a secret it would write, it **refuses**, before opening a
 browser or writing anything, and tells you which one. A `NAME_COMMAND` exported
-in your environment is refused too, for `gmail auth login` and `drive auth login`,
-because it would shadow the saved value. `drive auth login` also writes the client
-secret, so a `DRIVE_CLIENT_SECRET_COMMAND` blocks it until you remove that line;
-a login that skips command-fetched secrets is a possible follow-up. Store the new value in
+in your environment is refused too, because it would shadow the saved value.
+A login that skips command-fetched secrets is a possible follow-up. Store the new value in
 your store (or remove the `_COMMAND` line) and run the command again. `auth
 logout` removes the `NAME`, `NAME_FILE` and `NAME_COMMAND` entries.
 
 ## Not covered yet
 
-Named Drive and Gmail accounts (`drive.accounts.<name>`, `gmail.accounts.<name>`)
-accept `client_secret_file` and `refresh_token_file` but not a `_command` field.
-Reading the OS keychain directly, without a command, is also not built; see
+Reading the OS keychain directly, without a command, is not built; see
 [ADR-0090](adrs/adr-0090.md).
 
 Atlassian Server/Data Center PATs use `ATLASSIAN_PAT_COMMAND` (or

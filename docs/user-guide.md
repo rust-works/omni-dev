@@ -12,7 +12,7 @@ intelligence.
 5. [Claude Code Integration](#claude-code-integration)
 6. [Atlassian Integration](#atlassian---jira-and-confluence-integration)
 7. [Datadog Integration](#datadog-integration)
-8. [Gmail Integration](#gmail-integration)
+8. [Gmail and Drive (moved to gwi)](#gmail-and-drive-moved-to-gwi)
 9. [Contextual Intelligence](#contextual-intelligence)
 10. [Workflows](#workflows)
 11. [Advanced Usage](#advanced-usage)
@@ -1754,51 +1754,28 @@ omni-dev datadog hosts list --filter env:prod
 Every Datadog CLI subcommand has a matching `datadog_*` MCP tool — see
 [docs/mcp.md](mcp.md#datadog-14-tools).
 
-## Gmail Integration
+## Gmail and Drive (moved to gwi)
 
-omni-dev exposes read access (and, opt-in, label mutation) to the Gmail v1
-API through the `omni-dev gmail` command tree, plus a durable local
-archive via `gmail sync`. New to this integration? Follow the
-**[Gmail Quickstart](gmail-quickstart.md)** for a zero-to-synced-archive
-walkthrough. The full reference — prerequisites (bring-your-own Google
-Cloud OAuth2 client), authentication, every subcommand with worked
-examples, rate-limit behaviour, and troubleshooting — lives in
-**[docs/gmail.md](gmail.md)**.
+The `gmail` and `drive` command trees (Drive includes Docs, Sheets and Slides) and their
+MCP tools are no longer part of omni-dev. They moved to
+[rust-works/gwi](https://github.com/rust-works/gwi) (binaries `gwi` and `gwi-mcp`, configuration
+in `~/.gwi/`) — see [ADR-0095](adrs/adr-0095.md) and
+[#2203](https://github.com/rust-works/omni-dev/issues/2203).
 
-Quick orientation:
+To carry on where you left off:
 
 ```bash
-# One-time OAuth2 client setup (create your own Google Cloud project first —
-# see docs/gmail.md#prerequisites), then log in (opens a browser)
-export GMAIL_CLIENT_ID=...
-export GMAIL_CLIENT_SECRET=...
-omni-dev gmail auth login
-omni-dev gmail auth status
-
-# Search, read, and browse
-omni-dev gmail search --query 'label:finance after:2026/01/01' --limit 50
-omni-dev gmail read <message-id>
-omni-dev gmail thread <thread-id>
-omni-dev gmail label list
-
-# Label mutation needs the gmail.modify scope (auth login --modify), as do
-# draft create/update and insert
-omni-dev gmail label add <message-id> --label IMPORTANT
-omni-dev gmail label remove <message-id> --label UNREAD
-
-# Maintain a durable local archive (.eml files + a JSONL manifest)
-omni-dev gmail sync --output-dir ~/mail-archive --query 'label:finance'
+# Install gwi (see its README for the current install instructions), then copy your
+# Gmail/Drive accounts, lease settings and Drive lease ledger from ~/.omni-dev.
+# The import copies and never modifies or removes omni-dev's files.
+gwi import
 ```
 
-Every read-only Gmail CLI subcommand except `sync` has a matching
-`gmail_*` MCP tool — see [docs/mcp.md](mcp.md#gmail-8-tools). Label
-mutation and `sync` (a long-running bulk filesystem operation, a poor fit
-for a synchronous MCP call) are CLI-only in this release.
+Environment variables read by the moved code change prefix from `OMNI_DEV_` to `GWI_`; the
+unprefixed `GMAIL_*` and `DRIVE_*` credential names are unchanged.
 
-A second mailbox doesn't need a second `--profile` — an `--account NAME`
-flag (scoped to `gmail` commands) selects a named Gmail account
-independently of everything else in your environment; see
-[gmail.md#multiple-accounts](gmail.md#multiple-accounts).
+For one release, `omni-dev gmail ...` and `omni-dev drive ...` remain as hidden stubs that
+exit non-zero with a message pointing at gwi; the next minor release deletes them.
 
 ## Contextual Intelligence
 

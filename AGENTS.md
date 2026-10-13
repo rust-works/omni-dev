@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`src/lib.rs` exposes the Rust library; `src/main.rs` runs the `omni-dev` CLI. Feature-specific modules live under `src/` (for example, `src/drive/`, `src/git/`, and `src/daemon/`). The optional MCP binary is `src/mcp_server.rs` and requires the `mcp` feature. Integration tests are in `tests/`; unit tests usually sit beside their implementation. Snapshots live in `tests/snapshots/` and module-local `snapshots/` directories. The VS Code extension is in `editors/vscode/`, the site in `website/`, reference assets in `assets/`, and architecture notes and contributor recipes in `docs/`.
+`src/lib.rs` exposes the Rust library; `src/main.rs` runs the `omni-dev` CLI. Feature-specific modules live under `src/` (for example, `src/atlassian/`, `src/git/`, and `src/daemon/`). The optional MCP binary is `src/mcp_server.rs` and requires the `mcp` feature. Integration tests are in `tests/`; unit tests usually sit beside their implementation. Snapshots live in `tests/snapshots/` and module-local `snapshots/` directories. The VS Code extension is in `editors/vscode/`, the site in `website/`, reference assets in `assets/`, and architecture notes and contributor recipes in `docs/`.
 
 ## Build, Test, and Development Commands
 
@@ -26,7 +26,7 @@ Add focused `#[test]` or `#[tokio::test]` cases near changed Rust code and integ
 
 ## Commit & Pull Request Guidelines
 
-Use scoped conventional commits, such as `feat(drive): add sheet metadata` or `fix(cli): reject invalid input`. Valid types and scopes are listed in `.omni-dev/commit-guidelines.md` and `.omni-dev/scopes.yaml`; CI checks commit messages. In PRs, use `.github/pull_request_template.md`: explain the change and why, link the issue, report tests and coverage, and include screenshots for UI changes. Update user-facing docs, and add a changelog fragment for notable changes, never edit `CHANGELOG.md` itself: `changelog.d/<issue>.<type>.md` for the crate, and `changelog.d/vscode/<issue>.<type>.md` for a user-visible `editors/vscode/` change (see `changelog.d/README.md`). The Changelog Check workflow (`scripts/changelog.py check-pr`) enforces both, and `docs/RELEASE.md#changelog-check` lists the opt-out commit trailers.
+Use scoped conventional commits, such as `feat(atlassian): add sprint listing` or `fix(cli): reject invalid input`. Valid types and scopes are listed in `.omni-dev/commit-guidelines.md` and `.omni-dev/scopes.yaml`; CI checks commit messages. In PRs, use `.github/pull_request_template.md`: explain the change and why, link the issue, report tests and coverage, and include screenshots for UI changes. Update user-facing docs, and add a changelog fragment for notable changes, never edit `CHANGELOG.md` itself: `changelog.d/<issue>.<type>.md` for the crate, and `changelog.d/vscode/<issue>.<type>.md` for a user-visible `editors/vscode/` change (see `changelog.d/README.md`). The Changelog Check workflow (`scripts/changelog.py check-pr`) enforces both, and `docs/RELEASE.md#changelog-check` lists the opt-out commit trailers.
 
 ## Worktree Practice
 

@@ -26,15 +26,10 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 - **[Datadog Guide](datadog.md)** - Authentication, metrics, monitors, dashboards, logs, events, SLOs, downtimes, hosts; CLI and MCP forms
 
-### Gmail Integration
+### Gmail and Drive (moved to gwi)
 
-- **[Gmail Quickstart](gmail-quickstart.md)** - zero-to-synced-archive walkthrough: OAuth2 setup, authentication, and your first `gmail sync`
-- **[Gmail Guide](gmail.md)** - OAuth2 authentication, search, messages, threads, labels, mailbox sync/archive; CLI and MCP forms
-
-### Drive Integration
-
-- **[Drive Quickstart](drive-quickstart.md)** - zero-to-first-search walkthrough: OAuth2 setup, authentication, and your first `drive search`/`drive read`
-- **[Drive Guide](drive.md)** - OAuth2 authentication (read-only `drive.readonly` scope), multiple accounts, search, read metadata/content; CLI form (MCP tools tracked by [issue #1525](https://github.com/rust-works/omni-dev/issues/1525))
+- **[ADR-0095](adrs/adr-0095.md)** - the Gmail and Drive command trees, library modules and MCP tools moved to [rust-works/gwi](https://github.com/rust-works/gwi) (binaries `gwi` and `gwi-mcp`, `gwi import` copies your accounts); `omni-dev gmail`/`drive` remain as hidden stubs for one release
+- **[gwi extraction plan](plan/gwi-extraction.md)** - inventory, procedures and phases
 
 ### Browser Bridge
 
@@ -155,8 +150,7 @@ Each file in [`plan/`](plan/) carries a `**Status:**` header (`Built`, `In Progr
 | **Configuration Quality** | [Best Practices](configuration-best-practices.md) | [Config Internals](plan/config-internals.md) |
 | **Atlassian Integration** | [User Guide - Atlassian](user-guide.md#atlassian---jira-and-confluence-integration) | [JFM Spec](specs/jfm.md) |
 | **Datadog Integration** | [Datadog Guide](datadog.md) | [User Guide - Datadog](user-guide.md#datadog-integration) · [README - Datadog](../README.md#-datadog-integration-read-only) |
-| **Gmail Integration** | [Gmail Guide](gmail.md) | [Gmail Quickstart](gmail-quickstart.md) · [User Guide - Gmail](user-guide.md#gmail-integration) · [README - Gmail](../README.md#-gmail-integration) |
-| **Drive Integration** | [Drive Guide](drive.md) | [Drive Quickstart](drive-quickstart.md) · [README - Drive](../README.md#-drive-integration-read-only) |
+| **Gmail and Drive (gwi)** | [ADR-0095](adrs/adr-0095.md) | [gwi extraction plan](plan/gwi-extraction.md) · [User Guide - Gmail and Drive](user-guide.md#gmail-and-drive-moved-to-gwi) · [README - Gmail and Drive](../README.md#-gmail-and--drive-moved-to-gwi) |
 | **MCP Server** | [MCP Reference](mcp.md) | [README - MCP Server](../README.md#-mcp-server) |
 | **Worktrees View** | [Worktrees Service](worktrees-service.md) | [ADR-0040](adrs/adr-0040.md) · [README - Worktrees](../README.md#️-worktrees) |
 

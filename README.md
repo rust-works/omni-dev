@@ -292,116 +292,22 @@ All Datadog subcommands are also exposed as MCP tools (`datadog_*`) — see
 [docs/mcp.md](docs/mcp.md#datadog-14-tools). For the full guide covering
 every family with worked examples, see [docs/datadog.md](docs/datadog.md).
 
-### 📧 Gmail Integration
+### 📧 Gmail and 📁 Drive (moved to gwi)
 
-Authenticate against your own Gmail account via OAuth2 (loopback
-authorization-code + PKCE), search/read/label messages and threads, and
-maintain a durable local archive with `gmail sync`. New to this
-integration? Start with the
-[Gmail Quickstart](docs/gmail-quickstart.md) for a zero-to-synced-archive
-walkthrough; see the [Gmail integration guide](docs/gmail.md) for
-prerequisites (you bring your own Google Cloud OAuth2 client — Gmail read
-scopes require Google's CASA security assessment to distribute otherwise),
-authentication setup, rate-limit behaviour, and troubleshooting.
+The `gmail` and `drive` command trees (Drive includes Docs, Sheets and Slides), their
+23 MCP tools and the `omni_dev::{gmail,drive}` library modules have moved to
+[**gwi**](https://github.com/rust-works/gwi) (*Google Workspace Interface*), a standalone
+project with its own binaries (`gwi`, `gwi-mcp`), configuration (`~/.gwi/`) and release
+cadence ([#2203](https://github.com/rust-works/omni-dev/issues/2203),
+[ADR-0095](docs/adrs/adr-0095.md)). `gwi import` copies your existing Gmail and Drive
+accounts, lease settings and Drive lease ledger from `~/.omni-dev`, and never modifies
+or removes the originals. Environment variables read by the moved code change prefix from
+`OMNI_DEV_` to `GWI_`; the unprefixed `GMAIL_*` and `DRIVE_*` credential names are
+unchanged.
 
-```bash
-# One-time: create your own Google Cloud OAuth2 client (see docs/gmail.md),
-# then authenticate (opens a browser)
-export GMAIL_CLIENT_ID=...
-export GMAIL_CLIENT_SECRET=...
-omni-dev gmail auth login
-
-# Verify the credentials by calling users.getProfile
-omni-dev gmail auth status
-
-# Search, read messages/threads, and manage labels
-omni-dev gmail search --query 'label:finance after:2026/01/01' --limit 50
-omni-dev gmail read <message-id>
-omni-dev gmail thread <thread-id>
-omni-dev gmail label list
-
-# Maintain a durable local archive (.eml files + a JSONL manifest)
-omni-dev gmail sync --output-dir ~/mail-archive --query 'label:finance'
-```
-
-An OAuth2 client left in Google's "Testing" publishing status issues
-refresh tokens that expire after 7 days — see
-[docs/gmail.md](docs/gmail.md#prerequisites) for how to avoid re-running
-`auth login` weekly.
-
-Every read-only Gmail subcommand except `sync` is also exposed as an MCP
-tool (`gmail_*`) — see [docs/mcp.md](docs/mcp.md#gmail-8-tools); `sync` is
-CLI-only (a long-running bulk filesystem operation, a poor fit for a
-synchronous MCP call). For the full guide, see
-[docs/gmail.md](docs/gmail.md).
-
-### 📁 Drive Integration
-
-Authenticate against your own Google Drive account via OAuth2 (loopback
-authorization-code + PKCE, the same flow as Gmail), then search files, read
-their metadata or content, find duplicates, rename/move files, and create,
-upload, or replace file content. Every write is opt-in twice over. First by
-OAuth scope: the default `drive.readonly` covers search/read/dedupe;
-rename/move need `drive.metadata` (`drive auth login --write`), the narrowest
-write scope Google offers; create/upload need `drive.file`
-(`--write-file`); and editing a file omni-dev did not itself create needs the
-unrestricted `drive` scope (`--write-full`). Second by a **local**,
-folder-scoped gate: `create`/`upload`/`edit` resolve the target's ancestor
-folder chain against per-account rules in `settings.json` — closest ancestor
-wins, deny beats allow, and **a write with no matching rule is denied** — so
-an OAuth grant alone never authorizes a mutation (see
-[ADR-0071](docs/adrs/adr-0071.md)). Inspect that gate with `drive permissions
-show/lookup-folder/check` before granting anything. There is still no
-trash/share/permission-mutation capability anywhere in this surface. `drive
-move` is separately security-gated: it refuses any move that would change a
-file's visibility by default (see [ADR-0070](docs/adrs/adr-0070.md)).
-New to this integration? Start with the
-[Drive Quickstart](docs/drive-quickstart.md) for a zero-to-first-search
-walkthrough; see the [Drive integration guide](docs/drive.md) for
-prerequisites (you bring your own Google Cloud OAuth2 client, independent
-of Gmail's), authentication setup, rate-limit behaviour, and
-troubleshooting.
-
-```bash
-# One-time: create your own Google Cloud OAuth2 client (see docs/drive.md),
-# then authenticate (opens a browser)
-export DRIVE_CLIENT_ID=...
-export DRIVE_CLIENT_SECRET=...
-omni-dev drive auth login
-
-# Verify the credentials by calling about.get
-omni-dev drive auth status
-
-# Search and read file metadata/content
-omni-dev drive search "name contains 'report'"
-omni-dev drive read <file-id>
-omni-dev drive read <file-id> --content --out-file report.pdf
-
-# Rename/move need the opt-in drive.metadata scope
-omni-dev drive auth login --write
-omni-dev drive rename <file-id> "New Name.pdf"
-omni-dev drive move <file-id> --to <folder-id>
-
-# Creating/uploading/editing content needs a content scope *and* a
-# folder rule in settings.json permitting the destination
-omni-dev drive auth login --write-file          # or --write-full to edit
-omni-dev drive permissions show                 # what is configured
-omni-dev drive permissions check <folder-id> --operation create  # what it decides
-omni-dev drive create --name notes.txt --parent <folder-id>
-omni-dev drive upload ./report.pdf --parent <folder-id>
-omni-dev drive edit <file-id> --content ./report.pdf   # or --content - for stdin
-```
-
-An OAuth2 client left in Google's "Testing" publishing status issues
-refresh tokens that expire after 7 days — see
-[docs/drive.md](docs/drive.md#prerequisites) for how to avoid re-running
-`auth login` weekly.
-
-Five read-only MCP tools (`drive_*`) mirror the CLI's `auth status`,
-`search`, `dedupe`, `read`, and `account list` — see
-[docs/mcp.md](docs/mcp.md#drive-5-tools). The mutating verbs —
-`rename`/`move`/`create`/`upload`/`edit` — have no MCP equivalent. For the
-full guide, see [docs/drive.md](docs/drive.md).
+For one release, `omni-dev gmail ...` and `omni-dev drive ...` remain as hidden stubs that
+accept any arguments and exit non-zero with a message pointing at gwi; the next minor
+release deletes them.
 
 ### 🎙️ Transcript Fetching
 
@@ -702,7 +608,7 @@ omni-dev over stdio instead of shelling out to the CLI. The server is
 delivered as a second binary, `omni-dev-mcp`, gated behind the `mcp` Cargo
 feature (see [ADR-0021](docs/adrs/adr-0021.md)).
 
-Tools cover seven domains:
+Tools cover six domains:
 
 | Domain | Examples |
 |--------|----------|
@@ -711,7 +617,6 @@ Tools cover seven domains:
 | **Confluence** (13) | read/write/search/create/delete/download/children, comments, labels, user search |
 | **Atlassian shared** (2) | `atlassian_auth_status`, `atlassian_convert` (offline JFM ↔ ADF) |
 | **Datadog** (14) | metrics, monitors, dashboards, logs, events, SLOs, hosts, downtimes, metrics catalog |
-| **Gmail** (8) | `gmail_auth_status`, `gmail_account_list`, `gmail_search`, `gmail_message_read`, `gmail_thread_read`, `gmail_label_list`, `gmail_draft_list`, `gmail_draft_show` |
 | **AI / Config** (5) | `ai_chat` (one-shot chat), `claude_skills_*` (sync / clean / status for `.claude/skills/` distribution), `config_models_show` |
 
 Resources exposed via URI templates:
