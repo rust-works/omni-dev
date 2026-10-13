@@ -269,11 +269,7 @@ pub struct RequestLogContext {
 
 impl Default for RequestLogContext {
     fn default() -> Self {
-        Self {
-            invocation_id: new_id(),
-            source: Source::Cli,
-            mcp_tool: None,
-        }
+        Self::cli()
     }
 }
 
@@ -2051,7 +2047,14 @@ mod tests {
             .with("OMNI_DEV_LOG_FILE", shared_str)
             .with("OMNI_DEV_AUDIT_LOG_FILE", shared_str);
 
-        assert!(log_file_path_with(&env).is_none());
+        let mut resolved = Some(PathBuf::new());
+        let logs = crate::test_support::capture_at(tracing::Level::WARN, || {
+            resolved = log_file_path_with(&env);
+        });
+
+        assert!(resolved.is_none());
+        assert!(logs.contains("resolves to the audit log"), "{logs}");
+        assert!(logs.contains(shared_str), "{logs}");
     }
 
     #[test]
