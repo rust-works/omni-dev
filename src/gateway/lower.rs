@@ -283,7 +283,7 @@ fn lower_assistant(
                 signature,
             } => match signer.verify(&thinking, &signature) {
                 Some(payload) if replay_reasoning => turn.reasoning.push(ReplayedReasoning {
-                    text: thinking,
+                    text: super::responses::replay_text(&thinking, &payload),
                     payload,
                 }),
                 Some(_) => report.ignore("thinking (not replayable on this upstream)"),

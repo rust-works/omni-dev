@@ -157,11 +157,17 @@ pub(crate) struct ResponseContext<'a> {
 impl ResponseContext<'_> {
     /// A signed thinking block for `reasoning`, honouring the display mode.
     pub(crate) fn thinking_block(&self, reasoning: &Reasoning) -> OutputBlock {
-        let thinking = match self.display {
-            ThinkingDisplay::Summarized => reasoning.text.clone(),
-            ThinkingDisplay::Omitted => String::new(),
+        let thinking = if self.display == ThinkingDisplay::Omitted {
+            String::new()
+        } else {
+            reasoning.text.clone()
         };
-        let signature = self.signer.sign(&thinking, &reasoning.payload);
+        let payload = super::responses::signing_payload(
+            &reasoning.payload,
+            &reasoning.text,
+            self.display == ThinkingDisplay::Omitted,
+        );
+        let signature = self.signer.sign(&thinking, &payload);
         OutputBlock::Thinking {
             thinking,
             signature,

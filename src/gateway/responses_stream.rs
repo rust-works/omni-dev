@@ -99,6 +99,7 @@ impl ResponsesStreamParser {
                                 .get("encrypted_content")
                                 .and_then(Value::as_str)
                                 .map(str::to_string),
+                            text: None,
                         };
                         out.push(UpstreamEvent::ReasoningPayload {
                             key: format!("r{oi}"),
