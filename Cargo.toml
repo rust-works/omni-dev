@@ -4,7 +4,7 @@ version = "0.46.0"
 edition = "2021"
 authors = ["John Ky <newhoggy@gmail.com>"]
 license = "BSD-3-Clause"
-description = "AI-powered git commit rewriter, PR generator, and MCP server for Jira, Confluence, Datadog, Gmail, and Drive."
+description = "AI-powered git commit rewriter, PR generator, and MCP server for Jira, Confluence, and Datadog."
 repository = "https://github.com/rust-works/omni-dev"
 homepage = "https://github.com/rust-works/omni-dev"
 documentation = "https://docs.rs/omni-dev"
@@ -48,19 +48,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 yaml-rust-davvid = "0.6"
 serde_json = "1.0"
-# RFC 4180 CSV for `drive sheets read`/`write` (issue #1589). Deliberately a
-# dependency rather than hand-rolled: parsing `--values` means quoted fields
-# containing commas, doubled quotes and embedded newlines, and a subtly wrong
-# parser there writes silently-corrupted cells into a real spreadsheet.
-csv = "1.3"
 termcolor = "1.1"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-# The embedded IANA zone database, so `sheets update-workbook-properties
-# --time-zone` can refuse an unknown zone locally: the Sheets API accepts one
-# with a 200 and silently resets the workbook to `Etc/GMT` (issue #1938).
-# Compile-time data, no system-zoneinfo I/O.
-chrono-tz = "0.10"
 tempfile = "3.27"
 # Cross-platform file-identity comparison (inode on unix, a file handle on
 # Windows) for request_log.rs's audit-file collision guard (issue #1694) —
@@ -125,30 +115,6 @@ quick-xml = "0.41"
 # src/utils/http.rs name `http::Response::builder()` to reconstruct a
 # reqwest::Response from buffered parts (the retry_if 403/429 retry driver).
 http = "1"
-# Already in the tree transitively via url/reqwest; a direct dep lets
-# src/gmail/raw_message.rs decode RFC 2231 `filename*=...` attachment
-# filenames without pulling in a full MIME-parsing crate.
-percent-encoding = "2.3"
-# Full MIME/multipart parser, used only by src/gmail/attachments.rs to back
-# `gmail sync --extract-attachments` (real boundary parsing + CTE decoding,
-# which raw_message.rs's cheap heuristic scanner deliberately avoids).
-mail-parser = "0.11"
-# RFC 5322 message builder (same author as mail-parser), used only by
-# src/gmail/compose.rs to back `gmail draft create` (#1923): RFC 2047 encoded
-# words, RFC 2231 filenames, multipart/mixed and base64 parts. The default
-# `gethostname` feature only picks the Message-ID's host part, so it's off:
-# it would write the machine's hostname into every draft. compose.rs sets the
-# account's own domain instead (#1953).
-mail-builder = { version = "1.0.0", default-features = false }
-# Live stderr progress bars for `gmail sync`'s full-mailbox pass
-# (`src/cli/gmail/sync/progress.rs`, #1502) — the only consumer; no-ops
-# automatically when stderr isn't a terminal.
-indicatif = "0.18"
-# HTML-to-Markdown conversion (html5ever under the hood), used only by
-# src/gmail/render.rs to back `gmail render`/`gmail read -o markdown`'s
-# text/html body fallback (#1513) when a message has no text/plain part —
-# mail-parser resolves MIME structure but does no HTML rendering itself.
-htmd = "0.5"
 
 # Splits a `<NAME>_COMMAND` secret-helper value into argv without a shell
 # (#2011, ADR-0090). Already in the tree via `cc`.
@@ -180,28 +146,6 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
   "CFNumber",
   "CFString",
 ] }
-# LocalAuthentication for the Drive write lease's Touch ID/device-owner
-# prompt (`drive lease acquire`, ADR-0080 §7) — the crate's third OS trust
-# surface and second `#[allow(unsafe_code)]` module after the Accessibility
-# FFI above. `LAContext` is an Objective-C class with a block-based async
-# completion handler, unlike Accessibility's plain-C surface, so this uses
-# the upstream-generated bindings rather than hand-rolled `extern "C"`
-# declarations (ADR-0080 §7 explains the asymmetry with ADR-0058 §6's
-# choice). `objc2`/`block2` are the same crates' own dependencies, not
-# pulled in freshly. Deliberately **not** optional — the lease is not
-# behind a feature flag.
-objc2 = { version = "0.6", default-features = false, features = ["std"] }
-block2 = { version = "0.6", default-features = false, features = ["std"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = [
-  "std",
-  "NSString",
-  "NSError",
-] }
-objc2-local-authentication = { version = "0.3.2", default-features = false, features = [
-  "std",
-  "LAContext",
-  "block2",
-] }
 
 [features]
 mcp = ["dep:rmcp"]
@@ -220,13 +164,9 @@ proptest = "1"
 wiremock = "0.6"
 rmcp = { version = "3.1", features = ["client", "server", "transport-io", "macros"] }
 # `test-util` (pause/advance the tokio clock) is not implied by `full` — used
-# by src/utils/rate_limit.rs's TokenBucket tests to drive its
-# tokio::time::Instant-based pacing deterministically instead of real sleeps.
+# by `#[tokio::test(start_paused = true)]` tests to drive timers
+# deterministically instead of real sleeps.
 tokio = { version = "1.52", features = ["test-util"] }
-# `in_memory` (a vt100-backed `InMemoryTerm`) lets src/cli/gmail/sync/
-# progress.rs's tests see which lines survive a sequence of `MultiProgress`
-# redraws (#1652).
-indicatif = { version = "0.18", features = ["in_memory"] }
 
 [lib]
 name = "omni_dev"
