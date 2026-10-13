@@ -43,6 +43,10 @@ enum Slot {
 /// Hosts the gateway under the daemon.
 pub struct GatewayService {
     slot: StdMutex<Slot>,
+    /// Serializes restart and shutdown. Without it, two overlapping restarts
+    /// could both bind: the second's failure would overwrite the first's
+    /// `Running` slot, leaving a server serving with nothing left to stop it.
+    lifecycle: tokio::sync::Mutex<()>,
     load: Loader,
     token_path: Option<PathBuf>,
 }
@@ -68,6 +72,7 @@ impl GatewayService {
     pub(crate) async fn start_with(load: Loader, token_path: Option<PathBuf>) -> Self {
         let service = Self {
             slot: StdMutex::new(Slot::Restarting),
+            lifecycle: tokio::sync::Mutex::new(()),
             load,
             token_path,
         };
@@ -124,6 +129,7 @@ impl GatewayService {
     /// Stops the running server (if any), re-reads the configuration and
     /// starts again. The lock is never held across an await.
     async fn restart(&self) -> Result<()> {
+        let _serial = self.lifecycle.lock().await;
         let old = std::mem::replace(&mut *self.lock(), Slot::Restarting);
         if let Slot::Running { server, .. } = old {
             server.shutdown().await;
@@ -246,6 +252,7 @@ impl DaemonService for GatewayService {
     }
 
     async fn shutdown(&self) {
+        let _serial = self.lifecycle.lock().await;
         let old = std::mem::replace(&mut *self.lock(), Slot::Restarting);
         if let Slot::Running { server, .. } = old {
             server.shutdown().await;
@@ -354,6 +361,31 @@ mod tests {
             service.handle("status", Value::Null).await.unwrap()["state"],
             "restarting"
         );
+    }
+
+    #[tokio::test]
+    async fn overlapping_restarts_leave_one_tracked_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = squatter.local_addr().unwrap().port();
+        drop(squatter);
+        let vars = vec![
+            (
+                "OMNI_DEV_GATEWAY_UPSTREAM_URL",
+                "http://127.0.0.1:1".to_string(),
+            ),
+            ("OMNI_DEV_GATEWAY_PORT", port.to_string()),
+        ];
+        let service = GatewayService::start_with(loader(vars), Some(dir.path().join("t"))).await;
+        let (a, b) = tokio::join!(service.restart(), service.restart());
+        a.unwrap();
+        b.unwrap();
+        let status = service.handle("status", Value::Null).await.unwrap();
+        assert_eq!(status["state"], "running");
+        assert_eq!(status["port"], port);
+        // The tracked server is the one holding the port: shutting it down frees it.
+        service.shutdown().await;
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
     }
 
     #[tokio::test]

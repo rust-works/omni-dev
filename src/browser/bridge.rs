@@ -261,7 +261,7 @@ pub struct BridgeServer {
 /// does *not* permit a second live listener on the same address, so the
 /// fail-closed-on-a-live-squatter guarantee (see
 /// `start_fails_closed_on_taken_control_port`) is unchanged.
-fn bind_loopback_reuse(addr: SocketAddr) -> std::io::Result<TcpListener> {
+pub(crate) fn bind_loopback_reuse(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()?
     } else {

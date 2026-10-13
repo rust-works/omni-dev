@@ -114,6 +114,14 @@ impl GatewayError {
     pub(crate) fn from_upstream(status: u16, body: &str, retry_after: Option<String>) -> Self {
         let detail = upstream_message(body);
         let (status_code, kind, message) = match status {
+            400 | 422 if is_context_length_error(body) && completion_overflows(body) => (
+                StatusCode::BAD_REQUEST,
+                ErrorKind::InvalidRequest,
+                format!(
+                    "max_tokens does not fit the upstream model's context window; lower it (Claude \
+                     Code: CLAUDE_CODE_MAX_OUTPUT_TOKENS) or map a model with a larger context: {detail}"
+                ),
+            ),
             400 | 422 if is_context_length_error(body) => (
                 StatusCode::BAD_REQUEST,
                 ErrorKind::InvalidRequest,
@@ -271,6 +279,46 @@ pub(crate) fn is_context_length_error(body: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// Whether a context-length error is about the *requested output* rather than
+/// the prompt: the prompt fits, but `max_tokens` on top of it does not.
+/// Rewording that as "prompt is too long" would make a client compact a
+/// conversation that is not the problem.
+///
+/// vLLM (and servers that copy its wording) say how the request splits, e.g.
+/// "maximum context length is 8192 tokens. However, you requested 32500 tokens
+/// (500 in the messages, 32000 in the completion)"; the prompt overflows only
+/// when its own share reaches the limit. Without those numbers, an error that
+/// names the output budget is taken to be about it.
+pub(crate) fn completion_overflows(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let number_after = |marker: &str| -> Option<u64> {
+        let at = lower.find(marker)? + marker.len();
+        let digits: String = lower[at..]
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    };
+    let limit = number_after("maximum context length is");
+    let prompt = lower.find(" in the messages").and_then(|end| {
+        let start = lower[..end].rfind(|c: char| !c.is_ascii_digit())? + 1;
+        lower[start..end].parse::<u64>().ok()
+    });
+    if let (Some(limit), Some(prompt)) = (limit, prompt) {
+        return prompt < limit;
+    }
+    [
+        "in the completion",
+        "max_tokens",
+        "max_completion_tokens",
+        "max_new_tokens",
+        "max output",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -307,6 +355,33 @@ mod tests {
         let err = GatewayError::from_upstream(400, body, None);
         assert!(err.message.starts_with(PROMPT_TOO_LONG), "{}", err.message);
         assert!(err.message.contains("8192"));
+    }
+
+    #[test]
+    fn an_oversized_max_tokens_is_not_a_long_prompt() {
+        let vllm = |messages: u64| {
+            format!(
+                r#"{{"message":"This model's maximum context length is 8192 tokens. However, you requested {} tokens ({messages} in the messages, 32000 in the completion)."}}"#,
+                messages + 32000
+            )
+        };
+        let output = GatewayError::from_upstream(400, &vllm(500), None);
+        assert!(
+            output.message.starts_with("max_tokens does not fit"),
+            "{}",
+            output.message
+        );
+        let prompt = GatewayError::from_upstream(400, &vllm(9000), None);
+        assert!(
+            prompt.message.starts_with(PROMPT_TOO_LONG),
+            "{}",
+            prompt.message
+        );
+        let named = r#"{"error":{"message":"context length exceeded: max_tokens too large"}}"#;
+        assert!(completion_overflows(named));
+        assert!(!completion_overflows(
+            r#"{"error":{"code":"context_length_exceeded"}}"#
+        ));
     }
 
     #[test]

@@ -63,10 +63,15 @@ pub(crate) fn plan_reasoning(
                 effort: clamp(explicit.unwrap_or_else(|| effort_for_budget(*budget_tokens))),
             }
         }
-        (Some(ThinkingConfig::Disabled {}), ReasoningStyle::ThinkingOrEffort) => ReasoningPlan {
-            thinking: Some(json!({"type": "disabled"})),
-            effort: None,
-        },
+        (Some(ThinkingConfig::Disabled {}), ReasoningStyle::ThinkingOrEffort) => {
+            if explicit.is_some() {
+                report.ignore("output_config.effort (thinking is disabled)");
+            }
+            ReasoningPlan {
+                thinking: Some(json!({"type": "disabled"})),
+                effort: None,
+            }
+        }
         (Some(ThinkingConfig::Disabled {}), ReasoningStyle::Effort) => {
             if explicit.is_some() {
                 report.ignore("output_config.effort (thinking is disabled)");
@@ -630,8 +635,12 @@ mod tests {
         let mut disabled = base();
         disabled["thinking"] = json!({"type": "disabled"});
         disabled["output_config"] = json!({"effort": "low"});
-        let fw = build("fireworks", "m", disabled.clone()).0.unwrap();
-        assert_eq!(fw["thinking"], json!({"type": "disabled"}));
+        let (fw, report) = build("fireworks", "m", disabled.clone());
+        assert_eq!(fw.unwrap()["thinking"], json!({"type": "disabled"}));
+        assert!(report
+            .ignored
+            .iter()
+            .any(|i| i.contains("thinking is disabled")));
         let (generic, report) = build("generic", "m", disabled);
         assert!(generic.unwrap().get("reasoning_effort").is_none());
         assert!(report

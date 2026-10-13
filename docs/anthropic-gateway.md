@@ -84,7 +84,7 @@ them.
 | `OMNI_DEV_GATEWAY_UPSTREAM_URL` | `--upstream-url` | (required) | Upstream base URL. A trailing `/v1` is dropped; the gateway appends `/v1/...` itself. |
 | `OMNI_DEV_GATEWAY_UPSTREAM_PROTOCOL` | `--upstream-protocol` | `chat` | `chat` (Chat Completions), `responses` (Responses API) or `anthropic` (passthrough). |
 | `OMNI_DEV_GATEWAY_FLAVOR` | `--flavor` | `generic` | `generic`, `openai` or `fireworks`: which provider quirks apply. |
-| `OMNI_DEV_GATEWAY_API_KEY` | — | none | Upstream key, sent as `Authorization: Bearer` (and `x-api-key` in passthrough, except to Fireworks). Optional for local servers. |
+| `OMNI_DEV_GATEWAY_API_KEY` | — | none | Upstream key, sent as `Authorization: Bearer`, or as `x-api-key` in passthrough to anything but Fireworks. Optional for local servers. |
 | `OMNI_DEV_GATEWAY_MODEL` | `--model` | none | Default upstream model. |
 | `OMNI_DEV_GATEWAY_MODEL_MAP` | `--map` (repeatable) | none | `pattern=model,...`; see [Model mapping](#model-mapping). |
 | `OMNI_DEV_GATEWAY_TOKEN` | — | persisted file | The inbound token. Without it, the token file is used (and created). |
@@ -239,7 +239,10 @@ Streaming re-frames OpenAI's chunks as Anthropic's full event sequence:
 and usage, then `message_stop`. Anthropic blocks must not interleave. When an
 upstream interleaves the arguments of parallel tool calls, the gateway streams
 the first call live and buffers the others until it closes. A failure part-way
-through ends the stream with an `error` event.
+through ends the stream with an `error` event. So does an upstream connection
+that closes before the reply is complete (no `[DONE]`, `finish_reason` or
+`response.completed`): a cut-off answer, or a half-written tool call, is never
+passed off as a finished turn.
 
 ## Reasoning and thinking signatures
 
@@ -291,7 +294,7 @@ with a status the Anthropic SDKs and Claude Code already handle.
 
 | Upstream answer | Gateway answer |
 |---|---|
-| 400 / 422 | `400 invalid_request_error`. A context-length error is reworded to start with `prompt is too long`, which makes Claude Code compact the conversation and retry. |
+| 400 / 422 | `400 invalid_request_error`. A context-length error is reworded to start with `prompt is too long`, which makes Claude Code compact the conversation and retry. When the prompt fits but `max_tokens` on top of it does not, the message says so instead, since compacting would not help. |
 | 401 / 403 | `403 permission_error` naming `OMNI_DEV_GATEWAY_API_KEY`. Not 401, which would tell Claude Code its own key is wrong. |
 | 404 | `404 not_found_error` |
 | 408 / 504 | `504 timeout_error` |

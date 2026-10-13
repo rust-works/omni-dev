@@ -131,6 +131,8 @@ pub(crate) struct AnthropicStream {
     usage: UpstreamUsage,
     refusal: Option<String>,
     saw_tool: bool,
+    /// Whether the upstream said why it stopped.
+    saw_finish: bool,
     done: bool,
 }
 
@@ -147,8 +149,15 @@ impl AnthropicStream {
             usage: UpstreamUsage::default(),
             refusal: None,
             saw_tool: false,
+            saw_finish: false,
             done: false,
         }
+    }
+
+    /// Whether the upstream reported why it stopped. A stream that ends
+    /// without saying so was cut off, not finished.
+    pub(crate) fn saw_finish(&self) -> bool {
+        self.saw_finish
     }
 
     /// `message_start` and the first `ping`.
@@ -233,7 +242,10 @@ impl AnthropicStream {
                     self.advance(&mut out);
                 }
             }
-            UpstreamEvent::Finish(finish) => self.finish = finish,
+            UpstreamEvent::Finish(finish) => {
+                self.finish = finish;
+                self.saw_finish = true;
+            }
             UpstreamEvent::Usage(usage) => self.usage = usage,
         }
         out

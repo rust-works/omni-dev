@@ -175,13 +175,13 @@ pub(crate) fn lower(
 
     let mut turns = Vec::new();
     for (i, message) in request.messages.iter().enumerate() {
-        let blocks = message.content.clone().into_blocks();
+        let blocks = message.content.blocks();
         match message.role {
-            Role::User => lower_user(blocks, i, &mut turns)?,
-            Role::System => turns.push(Turn::System(lower_system(blocks, i)?)),
+            Role::User => lower_user(&blocks, i, &mut turns)?,
+            Role::System => turns.push(Turn::System(lower_system(&blocks, i)?)),
             Role::Assistant => {
                 let turn =
-                    lower_assistant(blocks, i, signer, replay_reasoning, &mut names, report)?;
+                    lower_assistant(&blocks, i, signer, replay_reasoning, &mut names, report)?;
                 turns.push(Turn::Assistant(turn));
             }
         }
@@ -215,7 +215,7 @@ fn describe_tool(description: Option<&str>, examples: &[Value]) -> Option<String
 }
 
 fn lower_user(
-    blocks: Vec<ContentBlock>,
+    blocks: &[ContentBlock],
     i: usize,
     turns: &mut Vec<Turn>,
 ) -> Result<(), GatewayError> {
@@ -228,8 +228,8 @@ fn lower_user(
                 is_error,
             } => turns.push(Turn::ToolResult(lower_tool_result(
                 tool_use_id,
-                content,
-                is_error,
+                content.as_ref(),
+                *is_error,
             ))),
             ContentBlock::ToolUse { .. } => {
                 return Err(GatewayError::invalid(format!(
@@ -250,11 +250,13 @@ fn lower_user(
     Ok(())
 }
 
-fn lower_system(blocks: Vec<ContentBlock>, i: usize) -> Result<String, GatewayError> {
+fn lower_system(blocks: &[ContentBlock], i: usize) -> Result<String, GatewayError> {
     let mut texts = Vec::new();
     for block in blocks {
         match content_part(block) {
             Some(UserPart::Text(text)) => texts.push(text),
+            // An unknown block the operator chose to ignore (`warn`) is dropped.
+            None if matches!(block, ContentBlock::Unknown) => {}
             _ => {
                 return Err(GatewayError::invalid(format!(
                     "messages[{i}]: a system message may contain only text"
@@ -266,7 +268,7 @@ fn lower_system(blocks: Vec<ContentBlock>, i: usize) -> Result<String, GatewayEr
 }
 
 fn lower_assistant(
-    blocks: Vec<ContentBlock>,
+    blocks: &[ContentBlock],
     i: usize,
     signer: &Signer,
     replay_reasoning: bool,
@@ -277,22 +279,22 @@ fn lower_assistant(
     let mut texts = Vec::new();
     for block in blocks {
         match block {
-            ContentBlock::Text { text } => texts.push(text),
+            ContentBlock::Text { text } => texts.push(text.as_str()),
             ContentBlock::Thinking {
                 thinking,
                 signature,
-            } => match signer.verify(&thinking, &signature) {
+            } => match signer.verify(thinking, signature) {
                 Some(payload) if replay_reasoning => turn.reasoning.push(ReplayedReasoning {
-                    text: super::responses::replay_text(&thinking, &payload),
+                    text: super::responses::replay_text(thinking, &payload),
                     payload,
                 }),
                 Some(_) => report.ignore("thinking (not replayable on this upstream)"),
                 None => report.ignore("thinking (signature not from this gateway)"),
             },
-            ContentBlock::RedactedThinking {} => {}
+            ContentBlock::RedactedThinking {} | ContentBlock::Unknown => {}
             ContentBlock::ToolUse { id, name, input } => turn.tool_calls.push(ToolCall {
-                id,
-                name: names.wire(&name),
+                id: id.clone(),
+                name: names.wire(name),
                 arguments: input.to_string(),
             }),
             _ => {
@@ -303,20 +305,20 @@ fn lower_assistant(
             }
         }
     }
-    turn.text = join_text(texts.iter().map(String::as_str));
+    turn.text = join_text(texts.into_iter());
     Ok(turn)
 }
 
 fn lower_tool_result(
-    call_id: String,
-    content: Option<ToolResultContent>,
+    call_id: &str,
+    content: Option<&ToolResultContent>,
     is_error: bool,
 ) -> ToolResultTurn {
     let mut texts = Vec::new();
     let mut images = Vec::new();
     match content {
         None => {}
-        Some(ToolResultContent::Text(text)) => texts.push(text),
+        Some(ToolResultContent::Text(text)) => texts.push(text.clone()),
         Some(ToolResultContent::Blocks(blocks)) => {
             for block in blocks {
                 match content_part(block) {
@@ -332,7 +334,7 @@ fn lower_tool_result(
         text = format!("[tool error] {text}");
     }
     ToolResultTurn {
-        call_id,
+        call_id: call_id.to_string(),
         text,
         images,
     }
@@ -340,10 +342,10 @@ fn lower_tool_result(
 
 /// Renders a user-side block (text, image, document, search result, tool
 /// reference) as a [`UserPart`]; `None` for blocks that have no user-side
-/// rendering.
-fn content_part(block: ContentBlock) -> Option<UserPart> {
+/// rendering (and for an unknown block the operator chose to ignore).
+fn content_part(block: &ContentBlock) -> Option<UserPart> {
     match block {
-        ContentBlock::Text { text } => Some(UserPart::Text(text)),
+        ContentBlock::Text { text } => Some(UserPart::Text(text.clone())),
         ContentBlock::Image { source } => Some(UserPart::Image(source.to_url())),
         ContentBlock::Document {
             source,
@@ -351,9 +353,9 @@ fn content_part(block: ContentBlock) -> Option<UserPart> {
             context,
         } => {
             let body = match source {
-                DocumentSource::Text { data } => data,
+                DocumentSource::Text { data } => data.clone(),
                 DocumentSource::Content { content } => match content {
-                    DocumentContent::Text(text) => text,
+                    DocumentContent::Text(text) => text.clone(),
                     DocumentContent::Blocks(blocks) => {
                         join_text(blocks.iter().map(|b| b.text.as_str()))
                     }
@@ -361,9 +363,9 @@ fn content_part(block: ContentBlock) -> Option<UserPart> {
             };
             let header = format!(
                 "[Document{}]",
-                title.map(|t| format!(": {t}")).unwrap_or_default()
+                title.as_ref().map(|t| format!(": {t}")).unwrap_or_default()
             );
-            let parts = [Some(header), context, Some(body)];
+            let parts = [Some(header), context.clone(), Some(body)];
             Some(UserPart::Text(
                 parts.into_iter().flatten().collect::<Vec<_>>().join("\n"),
             ))
@@ -382,7 +384,8 @@ fn content_part(block: ContentBlock) -> Option<UserPart> {
         ContentBlock::Thinking { .. }
         | ContentBlock::RedactedThinking {}
         | ContentBlock::ToolUse { .. }
-        | ContentBlock::ToolResult { .. } => None,
+        | ContentBlock::ToolResult { .. }
+        | ContentBlock::Unknown => None,
     }
 }
 
@@ -599,7 +602,7 @@ mod tests {
 
     #[test]
     fn an_empty_tool_result_is_empty_text() {
-        let turn = lower_tool_result("c".into(), None, false);
+        let turn = lower_tool_result("c", None, false);
         assert_eq!(turn.text, "");
     }
 }
