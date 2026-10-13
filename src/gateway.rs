@@ -9,12 +9,12 @@
 //! upstreams, the gateway lets other tools reach them through the Anthropic API.
 //! The engine is split like the browser bridge and Snowflake services:
 //!
-//! - wire types and the request policy: [`anthropic`], [`policy`];
-//! - translation: [`lower`] (conversation), [`chat`] / [`responses`] (request
-//!   and reply), [`completion`] (reply → Anthropic), [`stream`] and the two
-//!   stream parsers (SSE re-framing), [`passthrough`];
-//! - support: [`config`], [`models`], [`flavor`], [`signature`],
-//!   [`think_tags`], [`sse`], [`tokens`], [`error`];
+//! - wire types and the request policy: `anthropic`, [`policy`];
+//! - translation: `lower` (conversation), `chat` / `responses` (request
+//!   and reply), `completion` (reply → Anthropic), `stream` and the two
+//!   stream parsers (SSE re-framing), `passthrough`;
+//! - support: [`config`], [`models`], [`flavor`], `signature`,
+//!   `think_tags`, `sse`, `tokens`, `error`;
 //! - the HTTP surface: [`server`].
 //!
 //! The standalone `omni-dev ai gateway serve` and the daemon's

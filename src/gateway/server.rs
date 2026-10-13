@@ -1,6 +1,6 @@
 //! The gateway's HTTP surface: an axum server on `127.0.0.1`.
 //!
-//! Every request passes [`guard`] first — a loopback `Host` (DNS-rebinding
+//! Every request passes `guard` first — a loopback `Host` (DNS-rebinding
 //! defence), no browser `Origin`/`Sec-Fetch-Site` (a web page the operator
 //! visits must not reach it), and the gateway token as `x-api-key` or
 //! `Authorization: Bearer` (what the Anthropic SDKs and Claude Code send) —
@@ -64,7 +64,7 @@ pub(crate) struct Stats {
     last_error: Mutex<Option<String>>,
 }
 
-/// A snapshot of [`Stats`].
+/// A snapshot of the server's request counters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct StatsSnapshot {
     /// Requests received.
