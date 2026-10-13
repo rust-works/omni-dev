@@ -706,3 +706,18 @@ pub(crate) mod shallow_repo {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[cfg(test)]
+mod capture_writer_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn capture_writer_collects_writes_and_flush_is_a_no_op() {
+        let mut writer = CaptureWriter::default();
+        assert_eq!(writer.write(b"hello ").unwrap(), 6);
+        writer.write_all(b"world").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(&*writer.0.lock().unwrap(), b"hello world");
+    }
+}

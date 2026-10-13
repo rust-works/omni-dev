@@ -885,8 +885,17 @@ where
 
 /// Tries multiple environment variables with fallback to settings.
 pub fn get_env_vars(keys: &[&str]) -> Result<String> {
+    get_env_vars_with(&SystemEnv, Settings::load, keys)
+}
+
+/// Pure core of [`get_env_vars`]: the first of `keys` that resolves wins.
+fn get_env_vars_with<E, F>(env: &E, load: F, keys: &[&str]) -> Result<String>
+where
+    E: EnvSource,
+    F: Fn() -> Result<Settings>,
+{
     for key in keys {
-        if let Ok(value) = get_env_var(key) {
+        if let Ok(value) = get_env_var_with(env, &load, key) {
             return Ok(value);
         }
     }
@@ -1722,6 +1731,40 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Environment variable not found: MISSING"));
+    }
+
+    #[test]
+    fn get_env_vars_with_returns_the_first_key_that_resolves() {
+        let env = MapEnv::new().with("SECOND", "two").with("THIRD", "three");
+        let value = get_env_vars_with(
+            &env,
+            || Ok(Settings::default()),
+            &["FIRST", "SECOND", "THIRD"],
+        )
+        .unwrap();
+        assert_eq!(value, "two");
+    }
+
+    #[test]
+    fn get_env_vars_with_falls_back_to_settings_for_a_later_key() {
+        let env = MapEnv::new();
+        let value = get_env_vars_with(
+            &env,
+            || Ok(settings_with_profile()),
+            &["MISSING", "ATLASSIAN_EMAIL"],
+        )
+        .unwrap();
+        assert_eq!(value, "base@x.com");
+    }
+
+    #[test]
+    fn get_env_vars_with_names_every_key_when_none_resolves() {
+        let env = MapEnv::new();
+        let err = get_env_vars_with(&env, || Ok(Settings::default()), &["A", "B"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("None of the environment variables found"));
+        assert!(err.contains("\"A\"") && err.contains("\"B\""));
     }
 
     #[test]

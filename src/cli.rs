@@ -187,33 +187,41 @@ impl Cli {
             Self::load_settings_or_default,
         )?;
 
-        match self.command {
-            Commands::Ai(ai_cmd) => ai_cmd.execute().await,
-            Commands::Git(git_cmd) => git_cmd.execute().await,
-            Commands::Commands(commands_cmd) => commands_cmd.execute(),
-            Commands::Atlassian(cmd) => cmd.execute().await,
-            Commands::Browser(cmd) => cmd.execute().await,
+        self.command.dispatch().await
+    }
+}
+
+impl Commands {
+    /// Runs the selected command. Split from [`Cli::execute`] so dispatch can
+    /// be tested without the process-global profile check in front of it.
+    async fn dispatch(self) -> Result<()> {
+        match self {
+            Self::Ai(ai_cmd) => ai_cmd.execute().await,
+            Self::Git(git_cmd) => git_cmd.execute().await,
+            Self::Commands(commands_cmd) => commands_cmd.execute(),
+            Self::Atlassian(cmd) => cmd.execute().await,
+            Self::Browser(cmd) => cmd.execute().await,
             #[cfg(unix)]
-            Commands::Daemon(cmd) => cmd.execute().await,
-            Commands::Datadog(cmd) => cmd.execute().await,
-            Commands::Drive(cmd) => cmd.execute("drive"),
-            Commands::Gmail(cmd) => cmd.execute("gmail"),
+            Self::Daemon(cmd) => cmd.execute().await,
+            Self::Datadog(cmd) => cmd.execute().await,
+            Self::Drive(cmd) => cmd.execute("drive"),
+            Self::Gmail(cmd) => cmd.execute("gmail"),
             #[cfg(unix)]
-            Commands::Snowflake(cmd) => cmd.execute().await,
+            Self::Snowflake(cmd) => cmd.execute().await,
             #[cfg(unix)]
-            Commands::Worktrees(cmd) => cmd.execute().await,
+            Self::Worktrees(cmd) => cmd.execute().await,
             #[cfg(unix)]
-            Commands::Sessions(cmd) => cmd.execute().await,
+            Self::Sessions(cmd) => cmd.execute().await,
             #[cfg(unix)]
-            Commands::ClaudeWrap(cmd) => cmd.execute().await,
+            Self::ClaudeWrap(cmd) => cmd.execute().await,
             #[cfg(unix)]
-            Commands::CodexWrap(cmd) => cmd.execute().await,
-            Commands::Transcript(cmd) => cmd.execute().await,
-            Commands::Log(log_cmd) => log_cmd.execute(),
-            Commands::Config(config_cmd) => config_cmd.execute(),
-            Commands::Resources(resources_cmd) => resources_cmd.execute(),
-            Commands::Completions(completions_cmd) => completions_cmd.execute(),
-            Commands::HelpAll(help_cmd) => help_cmd.execute(),
+            Self::CodexWrap(cmd) => cmd.execute().await,
+            Self::Transcript(cmd) => cmd.execute().await,
+            Self::Log(log_cmd) => log_cmd.execute(),
+            Self::Config(config_cmd) => config_cmd.execute(),
+            Self::Resources(resources_cmd) => resources_cmd.execute(),
+            Self::Completions(completions_cmd) => completions_cmd.execute(),
+            Self::HelpAll(help_cmd) => help_cmd.execute(),
         }
     }
 }
@@ -238,6 +246,20 @@ impl Cli {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The hidden `gmail`/`drive` stubs (#2203) reach the dispatch arm and fail
+    /// with the message naming gwi, whatever arguments follow.
+    #[tokio::test]
+    async fn moved_commands_fail_through_the_dispatch_with_the_gwi_message() {
+        for command in ["gmail", "drive"] {
+            let cli = Cli::try_parse_from(["omni-dev", command, "messages", "--any-flag"]).unwrap();
+            let err = cli.command.dispatch().await.unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("`omni-dev {command}` has moved to gwi")),
+                "{err}"
+            );
+        }
+    }
 
     // ── global arg-id collision tests (#1420) ──
 
