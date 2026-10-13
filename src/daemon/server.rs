@@ -598,6 +598,7 @@ async fn handle_builtin(
             // #1374); the runtime rate-limit reading (#1375) is injected after.
             let mut report = StatusReport::current(registry.statuses().await);
             report.github_rate_limit = registry.github_rate_limit();
+            report.hosts_all = registry.hosts_all();
             match serde_json::to_value(report) {
                 Ok(payload) => DaemonReply::ok(payload),
                 Err(e) => DaemonReply::err(format!("failed to encode status: {e}")),

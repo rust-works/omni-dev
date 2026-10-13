@@ -139,6 +139,7 @@ pub async fn build_default_registry(
     services: &ServiceSelection,
 ) -> Result<ServiceRegistry> {
     let mut registry = ServiceRegistry::new();
+    registry.set_hosts_all(matches!(services, ServiceSelection::All));
     if services.includes(DaemonServiceKind::Bridge) {
         let bridge = BridgeService::start(bridge_config, bridge_token_file, bridge_token_path)?;
         registry.register(Arc::new(bridge));
@@ -266,5 +267,6 @@ mod tests {
         // one of the selectable kinds, so it rides along in any subset.
         let names: Vec<_> = registry.services().iter().map(|s| s.name()).collect();
         assert_eq!(names, vec![services::snowflake::SERVICE_NAME, "github"]);
+        assert_eq!(registry.hosts_all(), Some(false));
     }
 }
