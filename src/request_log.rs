@@ -721,7 +721,7 @@ fn append_line_no_rotation(path: &std::path::Path, line: &str) -> anyhow::Result
     if bodies_enabled() {
         match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive) {
             Ok(mut guard) => guard.write_all(line.as_bytes())?,
-            Err((mut file, _)) => file.write_all(line.as_bytes())?,
+            Err((mut file, _)) => file.write_all(line.as_bytes())?, // patchcov: coverage ignore-line reason="a blocking flock only fails on EINTR/ENOLCK, which a test cannot provoke; the fallback writes unlocked, as the best-effort contract requires"
         }
     } else {
         let mut file = file;
@@ -2067,6 +2067,72 @@ mod tests {
             .with("OMNI_DEV_AUDIT_LOG_FILE", audit.to_str().unwrap());
 
         assert!(log_file_path_with(&env).is_none());
+    }
+
+    fn prune_options(dry_run: bool) -> PruneOptions {
+        PruneOptions {
+            older_than: None,
+            max_size: Some(1),
+            dry_run,
+        }
+    }
+
+    #[test]
+    fn prune_refuses_the_audit_file_by_direct_path() {
+        let audit = audit_file_path().unwrap();
+
+        let err = prune(&audit, &prune_options(false)).err().unwrap();
+
+        assert!(err.to_string().contains("audit log"), "{err}");
+    }
+
+    #[test]
+    fn prune_refuses_a_dot_dot_spelling_of_the_audit_file() {
+        let audit = audit_file_path().unwrap();
+        let dotted = audit
+            .parent()
+            .unwrap()
+            .join("sub/..")
+            .join(audit.file_name().unwrap());
+
+        let err = prune(&dotted, &prune_options(false)).err().unwrap();
+
+        assert!(err.to_string().contains("audit log"), "{err}");
+    }
+
+    #[test]
+    fn prune_refuses_the_audit_file_even_under_dry_run() {
+        // Exemption from pruning is the point, and `omni-dev log --audit` is
+        // the supported way to read the file — a read-only dry run is not a
+        // carve-out.
+        let audit = audit_file_path().unwrap();
+
+        let err = prune(&audit, &prune_options(true)).err().unwrap();
+
+        assert!(err.to_string().contains("audit log"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_with_rotation_refuses_to_rotate_the_audit_file() {
+        let audit = audit_file_path().unwrap();
+        // Even a cap of one byte must not rotate (or lock) the audit file.
+        let cfg = RotationConfig {
+            max_size: 1,
+            keep_files: 1,
+        };
+
+        append_with_rotation(&audit, "{}\n", &cfg).unwrap();
+
+        assert!(
+            !sibling(&audit, ".1").exists(),
+            "the audit file must never be rotated"
+        );
+        assert!(
+            !sibling(&audit, ".lock").exists(),
+            "a refused rotation must not create a lock file next to the audit file"
+        );
+        assert!(audit.exists(), "the line is still appended (best effort)");
     }
 
     #[test]

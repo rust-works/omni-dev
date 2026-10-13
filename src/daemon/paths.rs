@@ -579,4 +579,46 @@ mod tests {
         let err = create_new_file_0600(&path).unwrap_err();
         assert!(!is_already_exists_error(&err), "{err:?}");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_lock_file_exclusive_is_busy_while_held_and_free_after_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.lock");
+
+        let held = try_lock_file_exclusive(&path).unwrap();
+        // `flock` conflicts across open file descriptions, even in-process.
+        assert!(matches!(
+            try_lock_file_exclusive(&path),
+            Err(FileLockError::Busy)
+        ));
+
+        drop(held);
+        // The lock file is never unlinked; dropping only releases the lock.
+        assert!(path.exists());
+        drop(try_lock_file_exclusive(&path).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_lock_file_exclusive_creates_the_file_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.lock");
+        let _lock = try_lock_file_exclusive(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn try_lock_file_exclusive_reports_io_when_the_file_cannot_be_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        // A missing parent directory is not contention.
+        let path = dir.path().join("no-such-parent").join("child.lock");
+        assert!(matches!(
+            try_lock_file_exclusive(&path),
+            Err(FileLockError::Io(_))
+        ));
+    }
 }
