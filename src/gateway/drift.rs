@@ -421,7 +421,7 @@ class MessageCreateParamsStreaming(MessageCreateParamsBase):
         let fields = class_fields(PARAMS, "MessageCreateParamsBase");
         let expected: BTreeSet<String> = ["max_tokens", "messages", "brand_new"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect();
         assert_eq!(fields, expected);
         assert_eq!(
@@ -456,7 +456,7 @@ class MessageCreateParamsStreaming(MessageCreateParamsBase):
         categories.insert(
             category.to_string(),
             CategoryDrift {
-                new_upstream: new_upstream.iter().map(|s| s.to_string()).collect(),
+                new_upstream: new_upstream.iter().map(ToString::to_string).collect(),
                 local_only: ["safeguards".to_string()].into(),
             },
         );
@@ -505,8 +505,10 @@ class MessageCreateParamsStreaming(MessageCreateParamsBase):
         let union = |members: &[(&str, &str)]| -> String {
             members
                 .iter()
-                .map(|(module, class)| format!("from .{module} import {class}\n"))
-                .collect()
+                .fold(String::new(), |mut out, (module, class)| {
+                    let _ = writeln!(out, "from .{module} import {class}");
+                    out
+                })
         };
         let typed = |class: &str, value: &str| {
             format!("class {class}(TypedDict):\n    type: Required[Literal[\"{value}\"]]\n")
