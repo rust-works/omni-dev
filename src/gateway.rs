@@ -28,6 +28,7 @@ pub(crate) mod chat;
 pub(crate) mod chat_stream;
 pub(crate) mod completion;
 pub mod config;
+pub mod drift;
 #[cfg(test)]
 mod e2e_tests;
 pub(crate) mod error;
