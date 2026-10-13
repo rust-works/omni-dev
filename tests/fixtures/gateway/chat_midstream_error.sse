@@ -1,0 +1,4 @@
+data: {"choices":[{"index":0,"delta":{"content":"Partial"}}]}
+
+data: {"error":{"message":"upstream worker crashed","code":502}}
+
