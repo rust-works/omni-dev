@@ -1,5 +1,5 @@
 //! Small terminal helpers shared by the raw-mode secret prompts in
-//! `cli::ai::chat`, `cli::gmail::auth`, and `cli::drive::auth`.
+//! `cli::ai::chat`.
 
 use crossterm::terminal::disable_raw_mode;
 

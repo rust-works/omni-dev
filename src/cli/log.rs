@@ -17,10 +17,6 @@ use crate::request_log;
 use crate::utils::env::{EnvSource, SystemEnv};
 use query::Filter;
 
-/// Shared relative-duration parser, also reused by `drive lease prune`'s own
-/// `--older-than` (#1678) so both prune commands accept the identical
-/// `30m`/`2h`/`1d`/`1w` syntax.
-pub(crate) use query::parse_since;
 /// Shared `--since`/`--until` parser (relative durations, dates, or RFC3339),
 /// reused by the `count` subcommand so its time bounds match `omni-dev log`.
 pub(crate) use query::parse_time_bound;

@@ -11,8 +11,9 @@
 //! - **Best effort.** [`record`] swallows every error (logging only at
 //!   `tracing::debug`); a logging failure can never change the program's exit
 //!   code. Honors `OMNI_DEV_LOG_DISABLE=1` for an absolute opt-out of this
-//!   log only — [`record_audit`]'s fail-closed sink is deliberately exempt
-//!   (see its own doc comment).
+//!   log only. The separate `audit.jsonl` (written by the Drive lease audit
+//!   trail before it moved to gwi, #2203) is never rotated, pruned or disabled
+//!   by it; omni-dev still reads that file but no longer writes it.
 //! - **No secrets.** Auth headers/tokens are never written; only a non-secret
 //!   `auth_principal` identity is kept. Headers are redacted centrally
 //!   ([`redact_headers`]), secret-bearing URL query/fragment parameter values
@@ -40,8 +41,11 @@ const LOG_FILE_NAME: &str = "log.jsonl";
 
 /// Default audit log file name under the runtime directory — a sibling of
 /// [`LOG_FILE_NAME`] ([ADR-0080](../docs/adrs/adr-0080.md) §11). Distinctness
-/// from the default `log.jsonl` path is enforced at write time by
-/// [`record_audit`], not merely implied by having a different constant.
+/// from the default `log.jsonl` path is enforced by
+/// [`resolves_to_audit_file`], not merely implied by having a different
+/// constant. omni-dev no longer writes this file (its only writer, the Drive
+/// lease audit trail, moved to gwi, #2203); it still reads, and refuses to
+/// rotate or prune, what an earlier version left there.
 const AUDIT_FILE_NAME: &str = "audit.jsonl";
 
 /// Number of rotated log files kept by default when
@@ -68,22 +72,17 @@ pub enum RecordKind {
     /// recovery-relevant metadata (path/branch/commit) in `context`.
     /// See `crate::cli::git` worktree subcommands.
     Worktree,
-    /// One per Drive/Sheets/Docs content-mutating attempt — `create`,
-    /// `upload`, `edit`, `rename`, `move`, and every Sheets/Docs write,
-    /// structural, delete or protection verb — including a refused
-    /// `Blocked` attempt for any of them, where the refusal itself is the
-    /// security-relevant event. Covers every operation via `command`/
-    /// `context`, mirroring how [`RecordKind::Worktree`] covers multiple
-    /// verbs rather than one kind per verb. See `crate::drive`.
+    /// One per Drive/Sheets/Docs content-mutating attempt. **Read-only legacy
+    /// kind**: omni-dev no longer writes it (the Drive commands moved to
+    /// [gwi](https://github.com/rust-works/gwi), #2203), but `omni-dev log`
+    /// still decodes and renders the records an earlier version left in
+    /// `log.jsonl`.
     DriveMutation,
-    /// One per leased-write lifecycle event — lease acquire, a write under
-    /// a lease, expiry/release, restore, and every refusal along the way —
-    /// written to the separate, fail-closed `audit.jsonl` sink rather than
-    /// this log ([ADR-0080](../docs/adrs/adr-0080.md) §11). Distinct from
-    /// [`RecordKind::DriveMutation`], which stays the best-effort record
-    /// written here for the same underlying API call: a leased write
-    /// produces both, correlated by `invocation_id`. See
-    /// [`record_audit`]/[`audit_file_path`].
+    /// One per leased-write lifecycle event, from the separate `audit.jsonl`
+    /// ([ADR-0080](../docs/adrs/adr-0080.md) §11). **Read-only legacy kind**:
+    /// omni-dev no longer writes it (its only writer, the Drive lease audit
+    /// trail, moved to gwi, #2203), but `omni-dev log --audit` still reads the
+    /// file an earlier version left behind. See [`audit_file_path`].
     Audit,
     /// A kind written by a newer version that this reader does not know.
     #[serde(other)]
@@ -368,9 +367,7 @@ pub fn headers_enabled() -> bool {
 
 /// The default location of an omni-dev runtime file: `state_dir` (falling
 /// back to `data_dir`) joined with `omni-dev/<component>`. `pub(crate)`
-/// rather than private: the Drive lease ledger and its default backup
-/// directory (`drive::lease::ledger::ledger_path`,
-/// `cli::drive::lease::default_backup_dir`) resolve their own location the
+/// rather than private so other runtime files can resolve their location the
 /// same way and share this rather than re-deriving it.
 pub(crate) fn omni_dev_state_subpath(component: &str) -> Option<PathBuf> {
     let base = dirs::state_dir().or_else(dirs::data_dir)?;
@@ -421,16 +418,14 @@ pub(crate) fn log_file_path_with(env: &impl EnvSource) -> Option<PathBuf> {
 /// [`log_file_path`]'s default, resolved through the same two helpers so
 /// the two sinks' policy can't drift apart. Since either can be redirected
 /// independently via its own env override, nothing here *guarantees* the
-/// two stay distinct; [`record_audit`] checks that at write time instead
-/// of merely assuming it.
+/// two stay distinct; [`resolves_to_audit_file`] checks that wherever omni-dev
+/// would rotate or prune a path instead of merely assuming it.
 ///
 /// The body is the same in every build; only `test_audit_file_override`
 /// differs. In a release build it is always `None`, so the env override
-/// and the real default are all there is. In a test build it routes
-/// **per thread** (see that function): a thread that opted into nothing
-/// is pinned to a shared scratch file and never sees the env var or the
-/// real default, so no test can pollute another's file — or the machine's
-/// — by omission.
+/// and the real default are all there is. In a test build it is pinned to a
+/// shared scratch file, so no test can read or pollute the machine's real
+/// `audit.jsonl` by omission.
 pub fn audit_file_path() -> Option<PathBuf> {
     test_audit_file_override().or_else(|| audit_file_path_with(&SystemEnv))
 }
@@ -546,8 +541,7 @@ fn normalize_with_budget(path: &Path, hops: u32) -> PathBuf {
 
 /// Whether `a` and `b` name the same file, robust to `..` segments,
 /// relative-vs-absolute spellings, and symlinks — unlike a raw `PathBuf`
-/// compare, which [`record_audit`]'s collision guard used to rely on and
-/// which all three pass straight through.
+/// compare, which all three pass straight through.
 ///
 /// Delegates to the [`same_file`](mod@same_file) crate's `is_same_file`
 /// first — real file-identity comparison (inode on unix, a file handle on
@@ -599,37 +593,15 @@ fn test_audit_file_override() -> Option<PathBuf> {
     None
 }
 
-/// The per-thread routing a test build applies before falling back to the
-/// scratch default (`crate::test_support::AuditLogGuard` sets it).
-///
-/// Per thread rather than via an env var, and defaulting to the scratch
-/// file rather than to the real machine default, both on purpose. Dozens of
-/// engine tests exercise a leased write without caring about the audit
-/// record it writes; if those fell through to the real default, any of them
-/// would silently write into the machine's actual `audit.jsonl`. So an
-/// un-opted thread is pinned to the scratch file unconditionally, and only
-/// a thread holding an [`crate::test_support::AuditLogGuard`] sees its own
-/// isolated path. A test that wants to observe `OMNI_DEV_AUDIT_LOG_FILE`
-/// honoring an override calls [`audit_file_path_with`] directly with an
-/// injected [`EnvSource`] instead of going through this ambient routing at
-/// all (STYLE-0028).
-///
-/// Being per-thread does mean the writes a test wants to observe must
-/// happen on the test's own thread: `#[tokio::test]`'s current-thread
-/// runtime and even a `multi_thread` runtime's root future both run
-/// there, but a `spawn_blocking`/`tokio::spawn`ed write lands in the
-/// shared scratch file instead.
+/// Test builds resolve the audit file to the scratch default instead of the
+/// real machine's, so a test that reads [`audit_file_path`] (the `log --audit`
+/// tests) can never touch a developer's actual `audit.jsonl`. A test that wants
+/// to observe `OMNI_DEV_AUDIT_LOG_FILE` honoring an override calls
+/// [`audit_file_path_with`] directly with an injected [`EnvSource`] instead
+/// (STYLE-0028).
 #[cfg(test)]
 fn test_audit_file_override() -> Option<PathBuf> {
-    TEST_AUDIT_ROUTE
-        .with(|slot| slot.borrow().clone())
-        .or_else(default_audit_file_path)
-}
-
-#[cfg(test)]
-thread_local! {
-    pub(crate) static TEST_AUDIT_ROUTE: std::cell::RefCell<Option<PathBuf>> =
-        const { std::cell::RefCell::new(None) };
+    default_audit_file_path()
 }
 
 /// Where [`audit_file_path`] lands when `OMNI_DEV_AUDIT_LOG_FILE` is unset.
@@ -640,22 +612,9 @@ fn default_audit_file_path() -> Option<PathBuf> {
 
 /// Test-build variant of the function above: one shared scratch path for
 /// the whole test binary's process lifetime, never the real machine's
-/// default. Reached for any un-opted thread, via `test_audit_file_override`.
-///
-/// ADR-0080 §9/§11 made `check_and_lock_lease` (and `drive lease acquire`)
-/// write an audit record on essentially every lease-checking code path, so
-/// *any* test anywhere in the crate that exercises a leased write or an
-/// acquire without itself redirecting the audit log would otherwise
-/// silently write real-looking rows into a developer's or CI runner's
-/// actual `audit.jsonl` — which is exactly what happened before this
-/// fallback existed. A test that wants to inspect its *own* audit output
-/// redirects explicitly (`crate::test_support::AuditLogGuard`) rather than
-/// rely on this shared fallback, which many tests write into concurrently
-/// — and which is why a fail-closed intent write to it never fails
-/// (nothing ever makes it unwritable, unlike a test's own redirected
-/// path). The `tempdir` is deliberately never cleaned up (`mem::forget`)
-/// — a `cargo test` process is short-lived, and the alternative is the
-/// actual risk this function exists to close off.
+/// default. The `tempdir` is deliberately never cleaned up (`mem::forget`) —
+/// a `cargo test` process is short-lived, and the alternative is writing
+/// into a developer's or CI runner's actual `audit.jsonl`.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 fn default_audit_file_path() -> Option<PathBuf> {
@@ -687,94 +646,23 @@ pub fn record(entry: &LogRecord) {
 /// The fallible append used by [`record`]; all errors flow back to be swallowed.
 ///
 /// Refuses a [`RecordKind::Audit`] entry outright: that kind belongs to the
-/// fail-closed sink only ([`record_audit`]), and routing it through this
-/// best-effort path would silently subject a forensic record to
+/// separate `audit.jsonl` (no longer written by omni-dev, #2203), and routing
+/// it through this best-effort path would subject a forensic record to
 /// `OMNI_DEV_LOG_DISABLE`, rotation and `prune`.
 fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
     use anyhow::{ensure, Context};
 
     ensure!(
         entry.kind != RecordKind::Audit,
-        "an audit-kind record must go through record_audit(), not record()"
+        "an audit-kind record does not belong in log.jsonl; omni-dev no longer writes audit.jsonl"
     );
     let path = log_file_path().context("could not resolve the log file path")?;
     append_record_to(&path, entry, append_line)
 }
 
-/// Appends one record to the fail-closed audit sink (`audit.jsonl`), for a
-/// leased-write lifecycle event or refusal
-/// ([ADR-0080](../docs/adrs/adr-0080.md) §11).
-///
-/// Unlike [`record`], this is **not** best-effort: it is not gated on
-/// [`disabled`] (`OMNI_DEV_LOG_DISABLE` has no effect here — exemption from
-/// that switch is the point of a forensic log), takes no part in rotation or
-/// [`prune`], and returns every error to the caller instead of swallowing
-/// it. A caller whose write-ahead intent record fails to land here must not
-/// perform the mutation it was about to audit — that is what "fail-closed"
-/// means for this sink; see `record`'s own doc comment for the contrasting,
-/// deliberately best-effort contract every other record in this module
-/// keeps.
-///
-/// Refuses outright if `entry.kind` isn't [`RecordKind::Audit`]. The reverse
-/// misconfiguration — `OMNI_DEV_LOG_FILE` naming the audit file, which would
-/// otherwise let best-effort records land in the fail-closed sink — no
-/// longer needs a check here: [`log_file_path`] itself now refuses to
-/// resolve a path that aliases [`audit_file_path`]
-/// ([#1747](https://github.com/rust-works/omni-dev/issues/1747), ADR-0080
-/// §11), so no request-log path this function could be handed ever collides
-/// with `path` in the first place.
-///
-/// The appended line is `fsync`ed (`sync_data`, then the parent directory
-/// on unix so a freshly created file's entry is durable too) before this
-/// returns — the one place in the module that pays for it. "Durably
-/// written before the mutating call" (ADR-0080 §11) has to survive more
-/// than the process dying: a plain `write` only reaches the page cache,
-/// which an OS crash or power loss between this return and the mutating
-/// call would discard, leaving a mutation with no intent record — the
-/// exact gap the sink exists to make impossible. Two syncs per leased
-/// write are cheap; the best-effort request log deliberately pays neither.
-pub fn record_audit(entry: &LogRecord) -> anyhow::Result<()> {
-    use anyhow::Context;
-
-    let path = audit_file_path().context("could not resolve the audit log file path")?;
-    record_audit_to(path, entry)
-}
-
-/// [`record_audit`], reading through an injected [`EnvSource`] (STYLE-0028)
-/// instead of the ambient, thread-local-routed [`audit_file_path`] /
-/// [`log_file_path`] — a `MapEnv`-driven seam for tests that want to assert
-/// on the write itself without process-global env mutation or the
-/// scratch-file safety net getting in the way. No production caller needs
-/// this: every ambient caller wants the scratch-pin safety net, so this
-/// seam only exists for direct unit testing.
-#[cfg(test)]
-fn record_audit_with(env: &impl EnvSource, entry: &LogRecord) -> anyhow::Result<()> {
-    use anyhow::Context;
-
-    let path = audit_file_path_with(env).context("could not resolve the audit log file path")?;
-    record_audit_to(path, entry)
-}
-
-/// Shared write path for [`record_audit`] and `record_audit_with`: `path` is
-/// already resolved, so this only validates and appends.
-fn record_audit_to(path: PathBuf, entry: &LogRecord) -> anyhow::Result<()> {
-    use anyhow::ensure;
-
-    ensure!(
-        entry.kind == RecordKind::Audit,
-        "record_audit() requires a RecordKind::Audit entry, got {:?}",
-        entry.kind
-    );
-    append_record_to(&path, entry, append_line_synced)
-}
-
 /// Serializes `entry` and appends it to `path` via `append`, creating a
-/// missing `0700` parent directory first. Shared by [`try_record`] (passing
-/// [`append_line`], which opts into rotation when configured) and
-/// [`record_audit`] (passing [`append_line_synced`], which never rotates
-/// regardless of `OMNI_DEV_LOG_MAX_SIZE` and syncs the line to disk) — the
-/// two differ only in path resolution and which appender they hand in, not
-/// in how a line actually gets written.
+/// missing `0700` parent directory first. [`try_record`] passes
+/// [`append_line`], which opts into rotation when configured.
 fn append_record_to(
     path: &Path,
     entry: &LogRecord,
@@ -805,8 +693,7 @@ fn append_record_to(
 /// `O_APPEND` single-write atomicity and takes no lock.
 ///
 /// `log.jsonl`'s own writer — opts into size-capped rotation
-/// ([`rotation_config`]) when configured. The audit sink deliberately does
-/// **not** call this; see [`append_line_no_rotation`].
+/// ([`rotation_config`]) when configured.
 #[cfg(unix)]
 fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
     // Opt-in size-capped rotation takes over the write: it must stat, maybe
@@ -818,36 +705,10 @@ fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
 }
 
 /// The same append as [`append_line`], minus the `OMNI_DEV_LOG_MAX_SIZE`
-/// rotation check — used directly by the audit sink
-/// ([ADR-0080](../docs/adrs/adr-0080.md) §11: exempt from rotation by
-/// design, not merely by leaving `OMNI_DEV_LOG_MAX_SIZE` unset) and by
-/// [`append_line`] itself once rotation is confirmed inactive.
+/// rotation check — used by [`append_line`] itself once rotation is confirmed
+/// inactive, and by the rotation path once it holds the lock.
 #[cfg(unix)]
 fn append_line_no_rotation(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
-    append_line_unrotated(path, line, false)
-}
-
-/// [`append_line_no_rotation`] plus a `sync_data` on the handle before it
-/// closes, so the line is on disk (not merely in the page cache) when this
-/// returns, and — for the append that *created* the file — an `fsync` of
-/// the parent directory too: creating a file does not persist its new
-/// directory entry, so without that a crash right after the first leased
-/// write could lose the whole file, not just the line. The audit sink's
-/// appender — see [`record_audit`] for why it is the one writer that pays
-/// for either.
-///
-/// One function for both platforms, unlike its `append_line`/
-/// `append_line_no_rotation` neighbours: the platform difference (off unix
-/// there is no directory sync at all, since a directory cannot be opened as
-/// a `File` there) lives entirely in [`append_line_unrotated`], so a
-/// separate `#[cfg(not(unix))]` twin here would only be a second place to
-/// keep in step.
-fn append_line_synced(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
-    append_line_unrotated(path, line, true)
-}
-
-#[cfg(unix)]
-fn append_line_unrotated(path: &std::path::Path, line: &str, sync: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let file = std::fs::OpenOptions::new()
@@ -857,93 +718,28 @@ fn append_line_unrotated(path: &std::path::Path, line: &str, sync: bool) -> anyh
         .open(path)?;
     crate::daemon::paths::ensure_handle_0600(&file)?;
 
-    // Whether this append needs the parent-directory `fsync` below, decided
-    // from the handle we already hold: an empty file is one this call may
-    // just have created, so it pays for the sync; a file with content was
-    // created by an earlier append, which synced the directory itself.
-    // An existing-but-empty file costs one spare `fsync`. The one case
-    // where this skips a sync the entry still needs is the concurrent
-    // window described below. Before issue #1697 every append paid it, so
-    // a 2,000-row `drive lease prune` cost 2,000 directory syncs to persist
-    // one directory entry.
-    //
-    // Deliberately *not* an `O_CREAT | O_EXCL` probe, which would report
-    // creation exactly rather than conservatively: `O_EXCL` refuses to
-    // follow a symlink, so an `OMNI_DEV_AUDIT_LOG_FILE` pointing at one
-    // would start failing `ENOENT` — and in a fail-closed sink a failed
-    // append refuses the write it was auditing. Both approaches leave the
-    // same residue anyway, so the exact answer buys nothing. That residue
-    // is the window between the creating append's data sync and its
-    // directory sync: a creator that dies inside it leaves a file no later
-    // append re-syncs, and a *concurrent* appender (nothing serializes the
-    // whole append across processes) that lands inside it sees a non-empty
-    // file and returns before the entry is durable. Every-append syncing
-    // closed the second case; it is accepted here as a narrow window —
-    // milliseconds, since it spans the creator's own `sync_data`, which is
-    // `F_FULLFSYNC` on macOS — that matters only if the machine crashes
-    // inside it, once per audit file.
-    let sync_parent = sync && file.metadata()?.len() == 0;
-
     if bodies_enabled() {
         match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive) {
-            Ok(mut guard) => {
-                guard.write_all(line.as_bytes())?;
-                if sync {
-                    guard.sync_data()?;
-                }
-            }
-            Err((mut file, _)) => {
-                file.write_all(line.as_bytes())?;
-                if sync {
-                    file.sync_data()?;
-                }
-            }
+            Ok(mut guard) => guard.write_all(line.as_bytes())?,
+            Err((mut file, _)) => file.write_all(line.as_bytes())?,
         }
     } else {
         let mut file = file;
         file.write_all(line.as_bytes())?;
-        if sync {
-            file.sync_data()?;
-        }
-    }
-
-    if sync_parent {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
     }
     Ok(())
 }
 
 /// Non-unix fallback: `O_APPEND | O_CREATE` single write, no advisory lock and
 /// no mode tightening (those are unix concepts). Size-capped rotation is a
-/// unix-only feature and is not applied here, so this already matches
-/// [`append_line_no_rotation`]'s contract exactly — there is nothing left to
-/// differ, so the audit sink reuses this same function on non-unix targets.
+/// unix-only feature and is not applied here.
 #[cfg(not(unix))]
 fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
-    append_line_no_rotation(path, line)
-}
-
-/// See [`append_line`]'s doc comment on non-unix targets.
-#[cfg(not(unix))]
-fn append_line_no_rotation(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
-    append_line_unrotated(path, line, false)
-}
-
-/// See the unix variant. No directory sync here, whether or not this append
-/// created the file: a directory cannot be opened as a `File` off unix. The
-/// data sync is still applied.
-#[cfg(not(unix))]
-fn append_line_unrotated(path: &std::path::Path, line: &str, sync: bool) -> anyhow::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .open(path)?;
     file.write_all(line.as_bytes())?;
-    if sync {
-        file.sync_data()?;
-    }
     Ok(())
 }
 
@@ -1464,548 +1260,6 @@ fn build_worktree_record(outcome: WorktreeOutcome, ctx: RequestLogContext) -> Lo
     rec.error = outcome.error;
     rec.duration_ms = Some(outcome.duration.as_millis() as u64);
     rec.context = outcome.context;
-    rec
-}
-
-/// The outcome of one Drive mutation attempt.
-///
-/// `Default` so a caller names only the fields its verb actually has: this
-/// struct is shared by every mutating verb and most leave most of it empty.
-/// Note `duration` defaults to zero, which is never the right value — every
-/// construction site sets it explicitly.
-#[derive(Debug, Clone, Default)]
-pub struct DriveMutationOutcome {
-    /// The verb — `"rename"`, `"move"`, `"sheets-write"`, … ; becomes the
-    /// record's `command` as `["drive", <operation>]`.
-    pub operation: &'static str,
-    /// The Drive file id acted on.
-    pub file_id: String,
-    /// The file's name at the time of the attempt.
-    pub file_name: String,
-    /// The domain outcome (e.g. `"moved"`, `"blocked"`, `"already-in-folder"`,
-    /// `"failed"` — kebab-case, matching `MoveResult`'s
-    /// `#[serde(tag = "status", rename_all = "kebab-case")]`).
-    pub status: String,
-    /// Principals gaining access, when the visibility diff detected an
-    /// increase. Empty for `rename` (which never changes visibility) and
-    /// for a `move` with no visibility change.
-    pub added_principals: Vec<String>,
-    /// Principals losing access — the decrease-side counterpart of
-    /// `added_principals`.
-    pub removed_principals: Vec<String>,
-    /// Whether the file moved across a My Drive / Shared Drive boundary.
-    pub crosses_drive_boundary: bool,
-    /// The folder the write-permission gate evaluated against (issue
-    /// #1574) — the `--parent` for `create`/`upload`, the target's current
-    /// parent for `edit`. `None` for `rename`/`move` (never gated), for a
-    /// `content_edit` outcome that short-circuited before the gate (a
-    /// Google-native-document refusal), and for any verdict a `file_id`
-    /// rule decided (issue #1612), which is settled at depth −1 without
-    /// evaluating a folder at all. In that last case `decided_by_file_id`
-    /// carries the id instead.
-    pub resolved_folder_id: Option<String>,
-    /// The folder id of the configured rule that decided the write-gate
-    /// verdict, when one did (as opposed to the bare default policy).
-    /// Paired with `decided_by_depth`.
-    pub decided_by_folder_id: Option<String>,
-    /// How many levels above `resolved_folder_id` that rule's folder sits.
-    pub decided_by_depth: Option<usize>,
-    /// The file id of the configured rule that decided the write-gate
-    /// verdict, when a **file** rule did (issue #1612).
-    ///
-    /// Mutually exclusive with `decided_by_folder_id`, deliberately: a file
-    /// id must never appear in the folder field, or an existing
-    /// `omni-dev log --query decided_by_folder_id:X` would silently start
-    /// matching a different kind of id. A file rule matches the target
-    /// itself, so it has no depth and walks no chain — `decided_by_depth`
-    /// and `resolved_folder_id` are both `None` alongside it.
-    pub decided_by_file_id: Option<String>,
-    /// The A1 range a Sheets write targeted (issue #1589). `None` for every
-    /// non-Sheets verb.
-    pub range: Option<String>,
-    /// The server-normalised range the Sheets API reported writing or
-    /// clearing. Can differ from [`Self::range`]: the server resolves an
-    /// open-ended range against the sheet's actual extent.
-    pub updated_range: Option<String>,
-    /// Rows the Sheets API reported writing.
-    pub updated_rows: Option<i64>,
-    /// Columns the Sheets API reported writing.
-    pub updated_columns: Option<i64>,
-    /// Cells the Sheets API reported writing — the number that answers "how
-    /// much did that write actually touch".
-    pub updated_cells: Option<i64>,
-    /// The stable numeric id of the sheet a structural verb acted on
-    /// (issue #1613). Unlike a title it survives a later rename, so it is
-    /// the only durable answer to "which tab was this". `None` for every
-    /// non-structural verb.
-    pub sheet_id: Option<i64>,
-    /// The sheet's title at the time of the attempt — for `add-sheet`, the
-    /// title being created.
-    pub sheet_title: Option<String>,
-    /// The title a `rename-sheet` moved the sheet *to*. Set by that verb
-    /// alone: it is the only structural verb whose effect a record could not
-    /// otherwise reconstruct, since [`Self::sheet_title`] necessarily holds
-    /// the title the sheet had before. `None` everywhere else.
-    pub sheet_new_title: Option<String>,
-    /// The rows or columns a structural verb spanned, e.g. `"ROWS 5:7"`,
-    /// 1-based and inclusive like the CLI's `--at`. The structural analogue
-    /// of [`Self::range`], for effects A1 notation cannot express; absent
-    /// for verbs that span no dimension.
-    pub dimension_range: Option<String>,
-    /// The 1-based `--before` value of a `move-rows`/`move-columns` verb
-    /// (issue #1834), numbered as the sheet stood *before* the move —
-    /// matching the CLI flag and [`Self::dimension_range`]'s own numbering.
-    /// `None` for every other verb.
-    pub move_to: Option<i64>,
-    /// The rectangular cell range a `delete-range` verb spanned (issue
-    /// #1623), e.g. `"rows 2-10, columns 2-4"`, 1-based inclusive like the
-    /// CLI's `--start-row`/`--end-row`/`--start-column`/`--end-column`. The
-    /// `deleteRange` analogue of [`Self::dimension_range`], which only ever
-    /// spans one axis. `None` for every other verb.
-    pub grid_range: Option<String>,
-    /// Occurrences the Docs API reported changing (issue #1615). `None` for
-    /// every verb but `docs replace`.
-    ///
-    /// The *server's* count, not the client-side estimate `--dry-run`
-    /// previews — the two can differ, and only this one says what actually
-    /// happened.
-    pub occurrences_changed: Option<i64>,
-    /// Characters inserted by a `docs append` or a `docs create --text`.
-    pub inserted_chars: Option<i64>,
-    /// The revision lease presented on a `documents.batchUpdate` (issue
-    /// #1615).
-    ///
-    /// Recorded so a `stale-revision` refusal is as auditable as a success.
-    /// An opaque, per-user, short-lived id — not a secret, and not user
-    /// content. The searched, replacement and inserted **text** are
-    /// deliberately never recorded; `docs/log.md` documents what is.
-    pub required_revision_id: Option<String>,
-    /// A human-readable summary of what a formatting/dimension-property
-    /// verb changed (issue #1643) — `format-cells`' populated `CellFormat`
-    /// fields, `update-borders`' sides and style, `merge-cells`'/
-    /// `unmerge-cells`' effect, or the dimension property set. The
-    /// formatting analogue of [`Self::dimension_range`]: these verbs can
-    /// send more than one field in a single request, so a single `range`-
-    /// or `dimension_range`-shaped key can't name the effect on its own.
-    pub fields_changed: Option<String>,
-    /// `merge-cells` only (issue #1643): the non-top-left, non-blank cells
-    /// a merge discarded, as `"A1: value"` strings — the one formatting
-    /// request that destroys data, so its record says exactly what was
-    /// lost rather than only that a merge happened.
-    pub discarded_cells: Vec<String>,
-    /// `auto-fill` only (issue #1840, [ADR-0083](../docs/adrs/adr-0083.md)
-    /// §6): the non-blank cells in the destination range that were (or,
-    /// under `--dry-run`, would be) overwritten, as **bare A1 addresses**
-    /// — deliberately not `"A1: value"` like [`Self::discarded_cells`],
-    /// since a fill's values are Sheets' own series detection and this
-    /// crate never sees them, before or after the request. Empty when the
-    /// destination has no non-blank cells, and for every other verb.
-    pub overwritten_cells: Vec<String>,
-    /// `auto-fill --range` and every `text-to-columns` run:
-    /// [`Self::overwritten_cells`] is an **upper bound**, not a list of
-    /// cells that were certainly overwritten. `auto-fill --range` lets
-    /// Sheets decide for itself which cells in the named range are the
-    /// source and which are filled, so some of the listed cells are the
-    /// source and were never touched; `text-to-columns` reports the span a
-    /// locally computed, non-quote-aware split *might* need, which the API
-    /// decides for itself and may need fewer columns of — and under
-    /// `--delimiter auto`, where Sheets picks the separator as well, it
-    /// is an estimate rather than a bound in either direction (this key
-    /// has no third state; that caveat is carried in the rendered
-    /// output). `false` for `auto-fill --source`, where the destination
-    /// is computed client-side and the list is exact, and for every
-    /// other verb.
-    pub overwritten_cells_upper_bound: bool,
-    /// The data validation condition type a `set-data-validation` applied
-    /// (issue #1643) — `"ONE_OF_LIST"`, `"NUMBER_BETWEEN"`, `"BOOLEAN"`,
-    /// `"CUSTOM_FORMULA"` — or `"cleared"` for `clear-data-validation`.
-    /// `None` for every non-validation verb.
-    pub validation_type: Option<String>,
-    /// The stable numeric id of a protected range a protection verb acted
-    /// on (issue #1643, [ADR-0077](../docs/adrs/adr-0077.md)). Set by
-    /// `protect-range` from the `addProtectedRange` reply (the id is
-    /// server-assigned, like [`Self::sheet_id`] for `add-sheet`) and by
-    /// `update-protection`/`unprotect-range` from the range they resolved
-    /// against.
-    pub protected_range_id: Option<i64>,
-    /// Editors a `protect-range`/`update-protection` granted an exemption
-    /// from the protection. Empty unless the verb actually changed the
-    /// editor list.
-    pub protection_editors_added: Vec<String>,
-    /// Editors an `update-protection` removed the exemption from — the
-    /// decrease-side counterpart of [`Self::protection_editors_added`].
-    pub protection_editors_removed: Vec<String>,
-    /// The stable numeric id of a filter view an `add-filter-view`/
-    /// `update-filter-view`/`delete-filter-view` acted on (issue #1794).
-    /// Set from the `addFilterView` reply for `add-filter-view` (the id is
-    /// server-assigned, like [`Self::protected_range_id`] for
-    /// `protect-range`) and from the id resolved against for
-    /// `update-filter-view`/`delete-filter-view`. `None` for
-    /// `set-basic-filter`/`clear-basic-filter`, which are scoped to a sheet
-    /// rather than a filter view — see [`Self::sheet_id`].
-    pub filter_view_id: Option<i64>,
-    /// The stable id of a named range a named-range verb acted on (issue
-    /// #1796, [ADR-0081](../docs/adrs/adr-0081.md) §2). Set by
-    /// `add-named-range` from the `addNamedRange` reply (server-assigned,
-    /// like [`Self::protected_range_id`]) and by `update-named-range`/
-    /// `delete-named-range` from the named range they resolved against.
-    pub named_range_id: Option<String>,
-    /// `delete-named-range` only (ADR-0081 §2): the A1 locations of every
-    /// formula referencing the name being removed, as `"Sheet!A1"` strings —
-    /// **never** the formula text or a cell's value, matching
-    /// [`Self::discarded_cells`]'s no-content-exposure line. Empty when
-    /// nothing references the name, and for every other named-range verb.
-    pub referencing_formula_locations: Vec<String>,
-    /// The stable numeric id of a chart or slicer an `add-chart`/
-    /// `update-chart`/`delete-chart`/`add-slicer`/`update-slicer`/
-    /// `delete-slicer` acted on (issue #1797). Set from the `addChart`/
-    /// `addSlicer` reply for the two adds (the id is server-assigned, like
-    /// [`Self::filter_view_id`] for `add-filter-view`) and from the id
-    /// resolved against otherwise. One key for both kinds — Sheets'
-    /// `deleteEmbeddedObject` itself addresses a chart or a slicer by the
-    /// same `objectId` with no discriminator naming which.
-    pub embedded_object_id: Option<i64>,
-    /// The stable numeric id of a banded range an `add-banding`/
-    /// `update-banding`/`delete-banding` acted on (issue #1832). Set from
-    /// the `addBanding` reply for `add-banding` (server-assigned, like
-    /// [`Self::filter_view_id`] for `add-filter-view`) and from the id
-    /// resolved against for `update-banding`/`delete-banding`.
-    pub banded_range_id: Option<i64>,
-    /// The API/validation error, when the attempt failed.
-    pub error: Option<String>,
-    /// Wall time of the attempt.
-    pub duration: Duration,
-}
-
-/// Appends one `kind: "drivemutation"` record from the active context.
-///
-/// Best effort and exit-code-safe: it goes through [`record`], which
-/// swallows every error, so a logging failure can never change the
-/// underlying rename/move result.
-///
-/// Deliberately called from *inside* `src/drive/rename.rs`/
-/// `src/drive/file_move.rs` themselves rather than the CLI layer — unlike
-/// [`record_worktree`], which is safe to call from `src/cli/git/worktree.rs`
-/// only because `git worktree` has no MCP surface at all. Drive move/rename
-/// may grow an MCP caller later, and "every move/rename must be logged" is a
-/// hard invariant that needs to hold for every current and future caller.
-/// This is also additive to (not redundant with) the automatic per-request
-/// `kind: "http"` records `crate::drive::client::DriveClient` already writes
-/// for every call it makes: a `Blocked` outcome makes *no* `files.update`
-/// call at all, so without this record the single most security-relevant
-/// event — "we refused this because visibility would change, here's exactly
-/// why" — would never appear in the log.
-pub fn record_drive_mutation(outcome: DriveMutationOutcome) {
-    record(&build_drive_mutation_record(outcome, current_context()));
-}
-
-/// Builds the `kind: "drivemutation"` record for `outcome` under `ctx`. Split
-/// out from [`record_drive_mutation`] so the record shape is unit-testable
-/// without touching the filesystem or environment.
-fn build_drive_mutation_record(outcome: DriveMutationOutcome, ctx: RequestLogContext) -> LogRecord {
-    let mut rec = LogRecord::new(RecordKind::DriveMutation, ctx.invocation_id);
-    rec.source = Some(ctx.source);
-    rec.mcp_tool = ctx.mcp_tool;
-    rec.service = Some("drive".to_string());
-    rec.command = vec!["drive".to_string(), outcome.operation.to_string()];
-    rec.error = outcome.error;
-    rec.duration_ms = Some(outcome.duration.as_millis() as u64);
-
-    let mut context = BTreeMap::new();
-    context.insert("file_id".to_string(), outcome.file_id);
-    context.insert("file_name".to_string(), outcome.file_name);
-    context.insert("status".to_string(), outcome.status);
-    if !outcome.added_principals.is_empty() {
-        context.insert(
-            "added_principals".to_string(),
-            outcome.added_principals.join(","),
-        );
-    }
-    if !outcome.removed_principals.is_empty() {
-        context.insert(
-            "removed_principals".to_string(),
-            outcome.removed_principals.join(","),
-        );
-    }
-    if outcome.crosses_drive_boundary {
-        context.insert("crosses_drive_boundary".to_string(), "true".to_string());
-    }
-    if let Some(resolved_folder_id) = outcome.resolved_folder_id {
-        context.insert("resolved_folder_id".to_string(), resolved_folder_id);
-    }
-    if let Some(decided_by_folder_id) = outcome.decided_by_folder_id {
-        context.insert("decided_by_folder_id".to_string(), decided_by_folder_id);
-    }
-    if let Some(decided_by_depth) = outcome.decided_by_depth {
-        context.insert("decided_by_depth".to_string(), decided_by_depth.to_string());
-    }
-    if let Some(decided_by_file_id) = outcome.decided_by_file_id {
-        context.insert("decided_by_file_id".to_string(), decided_by_file_id);
-    }
-    if let Some(range) = outcome.range {
-        context.insert("range".to_string(), range);
-    }
-    if let Some(updated_range) = outcome.updated_range {
-        context.insert("updated_range".to_string(), updated_range);
-    }
-    if let Some(rows) = outcome.updated_rows {
-        context.insert("updated_rows".to_string(), rows.to_string());
-    }
-    if let Some(cols) = outcome.updated_columns {
-        context.insert("updated_columns".to_string(), cols.to_string());
-    }
-    if let Some(cells) = outcome.updated_cells {
-        context.insert("updated_cells".to_string(), cells.to_string());
-    }
-    if let Some(sheet_id) = outcome.sheet_id {
-        context.insert("sheet_id".to_string(), sheet_id.to_string());
-    }
-    if let Some(sheet_title) = outcome.sheet_title {
-        context.insert("sheet_title".to_string(), sheet_title);
-    }
-    if let Some(sheet_new_title) = outcome.sheet_new_title {
-        context.insert("sheet_new_title".to_string(), sheet_new_title);
-    }
-    if let Some(dimension_range) = outcome.dimension_range {
-        context.insert("dimension_range".to_string(), dimension_range);
-    }
-    if let Some(move_to) = outcome.move_to {
-        context.insert("move_to".to_string(), move_to.to_string());
-    }
-    if let Some(grid_range) = outcome.grid_range {
-        context.insert("grid_range".to_string(), grid_range);
-    }
-    if let Some(occurrences) = outcome.occurrences_changed {
-        context.insert("occurrences_changed".to_string(), occurrences.to_string());
-    }
-    if let Some(chars) = outcome.inserted_chars {
-        context.insert("inserted_chars".to_string(), chars.to_string());
-    }
-    if let Some(revision) = outcome.required_revision_id {
-        context.insert("required_revision_id".to_string(), revision);
-    }
-    if let Some(fields_changed) = outcome.fields_changed {
-        context.insert("fields_changed".to_string(), fields_changed);
-    }
-    if !outcome.discarded_cells.is_empty() {
-        context.insert(
-            "discarded_cells".to_string(),
-            outcome.discarded_cells.join("; "),
-        );
-    }
-    if !outcome.overwritten_cells.is_empty() {
-        context.insert(
-            "overwritten_cells".to_string(),
-            outcome.overwritten_cells.join(", "),
-        );
-        // Emitted only when true: absent means exact, which is every verb
-        // but `auto-fill --range` and the overwhelmingly common case.
-        if outcome.overwritten_cells_upper_bound {
-            context.insert(
-                "overwritten_cells_are_upper_bound".to_string(),
-                "true".to_string(),
-            );
-        }
-    }
-    if let Some(validation_type) = outcome.validation_type {
-        context.insert("validation_type".to_string(), validation_type);
-    }
-    if let Some(protected_range_id) = outcome.protected_range_id {
-        context.insert(
-            "protected_range_id".to_string(),
-            protected_range_id.to_string(),
-        );
-    }
-    if !outcome.protection_editors_added.is_empty() {
-        context.insert(
-            "protection_editors_added".to_string(),
-            outcome.protection_editors_added.join(","),
-        );
-    }
-    if !outcome.protection_editors_removed.is_empty() {
-        context.insert(
-            "protection_editors_removed".to_string(),
-            outcome.protection_editors_removed.join(","),
-        );
-    }
-    if let Some(filter_view_id) = outcome.filter_view_id {
-        context.insert("filter_view_id".to_string(), filter_view_id.to_string());
-    }
-    if let Some(named_range_id) = outcome.named_range_id {
-        context.insert("named_range_id".to_string(), named_range_id);
-    }
-    if !outcome.referencing_formula_locations.is_empty() {
-        context.insert(
-            "referencing_formula_count".to_string(),
-            outcome.referencing_formula_locations.len().to_string(),
-        );
-        context.insert(
-            "referencing_formula_locations".to_string(),
-            outcome.referencing_formula_locations.join("; "),
-        );
-    }
-    if let Some(embedded_object_id) = outcome.embedded_object_id {
-        context.insert(
-            "embedded_object_id".to_string(),
-            embedded_object_id.to_string(),
-        );
-    }
-    if let Some(banded_range_id) = outcome.banded_range_id {
-        context.insert("banded_range_id".to_string(), banded_range_id.to_string());
-    }
-    rec.context = context;
-    rec
-}
-
-/// One event for the Drive write-lease audit trail (ADR-0080 §11).
-///
-/// Covers `drive lease acquire` succeeding or refusing, or a leased write's
-/// own intent/outcome pair — a single shape for all of them, the same way
-/// [`DriveMutationOutcome`] is one shape for every mutating verb. The
-/// `verdict` field (kebab-case, mirroring every other `*Result::log_status`
-/// in this codebase) is what distinguishes them, not a separate Rust type
-/// per event kind.
-#[derive(Debug, Clone, Default)]
-pub struct AuditOutcome {
-    /// The audited command, e.g. `["drive", "lease-acquire"]` or `["drive",
-    /// "edit"]` — becomes the record's `command`, mirroring
-    /// [`DriveMutationOutcome::operation`].
-    pub command: Vec<String>,
-    /// Which integration this event belongs to (`"drive"` today; ADR-0080
-    /// §11 names Gmail/Atlassian as later, additive extensions).
-    pub integration: &'static str,
-    /// The Drive file id the lease/write concerns.
-    pub file_id: String,
-    /// The lease token, once one exists. Absent for an acquire attempt that
-    /// never reached minting one (denied/unavailable/refused before a
-    /// token was created).
-    pub lease_id: Option<String>,
-    /// What happened, kebab-case: `"acquired"`, `"refused-native-document"`,
-    /// `"denied"`, `"unavailable"`, `"failed"` for an acquire attempt;
-    /// `"pending"` (the write-ahead intent), then `"allowed"` or `"failed"`
-    /// (the outcome), or a single `"refused-no-lease"`,
-    /// `"refused-lease-expired"`, `"refused-lease-wrong-file"`,
-    /// `"refused-lease-stale"` / `"failed"` for a leased write that never
-    /// reached its mutating call (`crate::drive::lease::check::verdict`).
-    /// Free-form rather than a closed enum, like every other
-    /// `*Result::log_status` in this codebase — a later integration's
-    /// verdict vocabulary doesn't need a schema change here.
-    pub verdict: String,
-    /// The file's Drive `version` before the event, when relevant.
-    pub version_before: Option<String>,
-    /// The file's Drive `version` after, when relevant (e.g. the version an
-    /// acquire recorded into the ledger, or a leased write's post-write
-    /// version).
-    pub version_after: Option<String>,
-    /// `modifiedTime` paired with [`Self::version_before`].
-    pub modified_time_before: Option<String>,
-    /// `modifiedTime` paired with [`Self::version_after`].
-    pub modified_time_after: Option<String>,
-    /// Where an acquire's backup landed: a local path for a byte backup, or
-    /// the backup copy's own file id for a native-document backup.
-    pub backup_location: Option<String>,
-    /// SHA-256 of a byte backup, for later integrity verification. `None`
-    /// for a native-document backup (verified by Drive's own copy
-    /// semantics instead) and for anything that isn't an acquire.
-    pub backup_sha256: Option<String>,
-    /// Size in bytes of a byte backup.
-    pub backup_size: Option<u64>,
-    /// Which authentication policy (ADR-0080 §7) an acquire satisfied —
-    /// `"device-owner"` or `"biometrics-only"`.
-    pub auth_policy: Option<String>,
-    /// `drive lease restore` only: the *backup* lease's token the restore
-    /// read from — distinct from [`Self::lease_id`], the *fresh* token the
-    /// restore itself minted before writing (ADR-0080 §10/§11: "the restore
-    /// is audit-logged carrying both tokens"). `None` for every other
-    /// event.
-    pub restored_from_lease_id: Option<String>,
-    /// The lease this event ended early, when it ended one as a side effect
-    /// of doing something else: `drive lease acquire`'s supersede, set only
-    /// by `drive lease restore` naming the backup token it restores from
-    /// (issue #1685). Distinct from [`Self::lease_id`], the token the
-    /// acquire itself minted, and from a `drive lease release` record, whose
-    /// released token *is* its `lease_id`. `None` for every other event.
-    ///
-    /// A field rather than a verdict — unlike the headless waiver, which is
-    /// a flag and so became `acquired-headless-waiver` — because this
-    /// carries an identifier, exactly as [`Self::restored_from_lease_id`]
-    /// does, and a third verdict axis would multiply combinatorially with
-    /// the existing `-headless-waiver`/`-backup-orphaned` suffixes.
-    pub superseded_lease_id: Option<String>,
-    /// The error, when the event itself failed (an API/filesystem/ledger
-    /// error — distinct from an ordinary refusal, which is a `verdict`, not
-    /// an `error`).
-    pub error: Option<String>,
-}
-
-/// Appends one `kind: "audit"` record for `outcome`, fail-closed.
-///
-/// Propagates [`record_audit`]'s `Result` rather than swallowing it, since
-/// this is the sink whose whole purpose is to make a mutation with no
-/// accompanying record impossible (ADR-0080 §11). Callers on the write path
-/// (as opposed to `drive lease acquire`, which mutates no Drive content)
-/// must refuse the write itself when this returns `Err` — see
-/// `content_edit.rs`'s eventual write-ahead call site for the pattern.
-pub fn record_audit_event(outcome: AuditOutcome) -> anyhow::Result<()> {
-    record_audit(&build_audit_record(outcome, current_context()))
-}
-
-/// [`record_audit_event`], reading through an injected [`EnvSource`]
-/// (STYLE-0028) — see [`record_audit_with`].
-#[cfg(test)]
-fn record_audit_event_with(env: &impl EnvSource, outcome: AuditOutcome) -> anyhow::Result<()> {
-    record_audit_with(env, &build_audit_record(outcome, current_context()))
-}
-
-/// Builds the `kind: "audit"` record for `outcome` under `ctx`. Split out
-/// from [`record_audit_event`] so the record shape is unit-testable without
-/// touching the filesystem, mirroring [`build_drive_mutation_record`].
-fn build_audit_record(outcome: AuditOutcome, ctx: RequestLogContext) -> LogRecord {
-    let mut rec = LogRecord::new(RecordKind::Audit, ctx.invocation_id);
-    rec.source = Some(ctx.source);
-    rec.mcp_tool = ctx.mcp_tool;
-    rec.service = Some("drive".to_string());
-    rec.command = outcome.command;
-    rec.error = outcome.error;
-
-    let mut context = BTreeMap::new();
-    context.insert("integration".to_string(), outcome.integration.to_string());
-    context.insert("file_id".to_string(), outcome.file_id);
-    if let Some(lease_id) = outcome.lease_id {
-        context.insert("lease_id".to_string(), lease_id);
-    }
-    context.insert("verdict".to_string(), outcome.verdict);
-    if let Some(version) = outcome.version_before {
-        context.insert("version_before".to_string(), version);
-    }
-    if let Some(version) = outcome.version_after {
-        context.insert("version_after".to_string(), version);
-    }
-    if let Some(modified_time) = outcome.modified_time_before {
-        context.insert("modified_time_before".to_string(), modified_time);
-    }
-    if let Some(modified_time) = outcome.modified_time_after {
-        context.insert("modified_time_after".to_string(), modified_time);
-    }
-    if let Some(location) = outcome.backup_location {
-        context.insert("backup_location".to_string(), location);
-    }
-    if let Some(sha256) = outcome.backup_sha256 {
-        context.insert("backup_sha256".to_string(), sha256);
-    }
-    if let Some(size) = outcome.backup_size {
-        context.insert("backup_size".to_string(), size.to_string());
-    }
-    if let Some(auth_policy) = outcome.auth_policy {
-        context.insert("auth_policy".to_string(), auth_policy);
-    }
-    if let Some(restored_from) = outcome.restored_from_lease_id {
-        context.insert("restored_from_lease_id".to_string(), restored_from);
-    }
-    if let Some(superseded) = outcome.superseded_lease_id {
-        context.insert("superseded_lease_id".to_string(), superseded);
-    }
-    rec.context = context;
     rec
 }
 
@@ -2697,695 +1951,6 @@ mod tests {
     }
 
     #[test]
-    fn build_drive_mutation_record_stamps_kind_service_command_and_context() {
-        let ctx = RequestLogContext {
-            invocation_id: "inv-3".to_string(),
-            source: Source::Mcp,
-            mcp_tool: Some("drive_file_move".to_string()),
-        };
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "move",
-                file_id: "f1".to_string(),
-                file_name: "report.pdf".to_string(),
-                status: "blocked".to_string(),
-                added_principals: vec!["alice@example.com".to_string()],
-                removed_principals: vec![],
-                crosses_drive_boundary: true,
-                resolved_folder_id: Some("dest1".to_string()),
-                decided_by_folder_id: Some("dest1".to_string()),
-                decided_by_depth: Some(0),
-                error: None,
-                duration: Duration::from_millis(17),
-                ..Default::default()
-            },
-            ctx,
-        );
-        assert_eq!(rec.kind, RecordKind::DriveMutation);
-        assert_eq!(rec.invocation_id, "inv-3");
-        assert_eq!(rec.source, Some(Source::Mcp));
-        assert_eq!(rec.mcp_tool.as_deref(), Some("drive_file_move"));
-        assert_eq!(rec.service.as_deref(), Some("drive"));
-        assert_eq!(rec.command, vec!["drive".to_string(), "move".to_string()]);
-        assert_eq!(rec.duration_ms, Some(17));
-        assert_eq!(rec.context.get("file_id").map(String::as_str), Some("f1"));
-        assert_eq!(
-            rec.context.get("file_name").map(String::as_str),
-            Some("report.pdf")
-        );
-        assert_eq!(
-            rec.context.get("status").map(String::as_str),
-            Some("blocked")
-        );
-        assert_eq!(
-            rec.context.get("added_principals").map(String::as_str),
-            Some("alice@example.com")
-        );
-        assert_eq!(rec.context.get("removed_principals"), None);
-        assert_eq!(
-            rec.context
-                .get("crosses_drive_boundary")
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            rec.context.get("resolved_folder_id").map(String::as_str),
-            Some("dest1")
-        );
-        assert_eq!(
-            rec.context.get("decided_by_folder_id").map(String::as_str),
-            Some("dest1")
-        );
-        assert_eq!(
-            rec.context.get("decided_by_depth").map(String::as_str),
-            Some("0")
-        );
-    }
-
-    #[test]
-    fn build_drive_mutation_record_omits_empty_principal_lists_and_false_boundary() {
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "rename",
-                file_id: "f2".to_string(),
-                file_name: "old.txt".to_string(),
-                status: "moved".to_string(),
-                added_principals: vec![],
-                removed_principals: vec![],
-                crosses_drive_boundary: false,
-                resolved_folder_id: None,
-                decided_by_folder_id: None,
-                decided_by_depth: None,
-                error: None,
-                duration: Duration::from_millis(5),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(rec.context.get("added_principals"), None);
-        assert_eq!(rec.context.get("removed_principals"), None);
-        assert_eq!(rec.context.get("crosses_drive_boundary"), None);
-        assert_eq!(rec.context.get("resolved_folder_id"), None);
-        assert_eq!(rec.context.get("decided_by_folder_id"), None);
-        assert_eq!(rec.context.get("decided_by_depth"), None);
-    }
-
-    #[test]
-    fn build_drive_mutation_record_includes_the_structural_context_keys() {
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "sheets-insert-rows",
-                file_id: "s1".to_string(),
-                file_name: "Budget".to_string(),
-                status: "changed".to_string(),
-                sheet_id: Some(118_293),
-                sheet_title: Some("Q2".to_string()),
-                dimension_range: Some("ROWS 5:7".to_string()),
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(rec.command, vec!["drive", "sheets-insert-rows"]);
-        assert_eq!(
-            rec.context.get("sheet_id").map(String::as_str),
-            Some("118293")
-        );
-        assert_eq!(
-            rec.context.get("sheet_title").map(String::as_str),
-            Some("Q2")
-        );
-        assert_eq!(
-            rec.context.get("dimension_range").map(String::as_str),
-            Some("ROWS 5:7")
-        );
-        // A structural verb has no A1 range and reports no cell counts, so
-        // those keys stay absent rather than being written as empty.
-        assert_eq!(rec.context.get("range"), None);
-        assert_eq!(rec.context.get("updated_cells"), None);
-        // An insert renames nothing.
-        assert_eq!(rec.context.get("sheet_new_title"), None);
-        // An insert spans one dimension, not a rectangle.
-        assert_eq!(rec.context.get("grid_range"), None);
-        // Only a move has a destination.
-        assert_eq!(rec.context.get("move_to"), None);
-    }
-
-    #[test]
-    fn build_drive_mutation_record_includes_the_move_to_key_for_a_move() {
-        // Issue #1834: `dimension_range` names the span that moved, which
-        // is only half the effect — without `move_to` the record could not
-        // say where it went. Both are 1-based and numbered as the sheet
-        // stood before the move, matching `--at`/`--count`/`--before`.
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "sheets-move-rows",
-                file_id: "s1".to_string(),
-                file_name: "Budget".to_string(),
-                status: "changed".to_string(),
-                sheet_id: Some(118_293),
-                sheet_title: Some("Q2".to_string()),
-                dimension_range: Some("ROWS 2:3".to_string()),
-                move_to: Some(6),
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(rec.command, vec!["drive", "sheets-move-rows"]);
-        assert_eq!(
-            rec.context.get("dimension_range").map(String::as_str),
-            Some("ROWS 2:3")
-        );
-        assert_eq!(rec.context.get("move_to").map(String::as_str), Some("6"));
-        assert_eq!(rec.context.get("grid_range"), None);
-    }
-
-    #[test]
-    fn build_drive_mutation_record_includes_the_grid_range_key_for_a_delete_range() {
-        // The `deleteRange` analogue of the dimension_range test above (issue
-        // #1623): a rectangle spans both axes at once, so it gets its own
-        // key rather than overloading `dimension_range`, which
-        // `StructureVerb::dimension` reports `None` for on this verb.
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "sheets-delete-range",
-                file_id: "s1".to_string(),
-                file_name: "Budget".to_string(),
-                status: "changed".to_string(),
-                sheet_id: Some(118_293),
-                sheet_title: Some("Q2".to_string()),
-                grid_range: Some("rows 2-4, columns 2-3".to_string()),
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(
-            rec.context.get("grid_range").map(String::as_str),
-            Some("rows 2-4, columns 2-3")
-        );
-        assert_eq!(rec.context.get("dimension_range"), None);
-    }
-
-    #[test]
-    fn build_drive_mutation_record_includes_the_formatting_validation_and_protection_keys() {
-        // issue #1643: the formatting/validation/protection verbs' new
-        // context keys, including the three collection fields that only
-        // write a key when non-empty (`discarded_cells`,
-        // `protection_editors_added`, `protection_editors_removed`).
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "sheets-merge-cells",
-                file_id: "s1".to_string(),
-                file_name: "Budget".to_string(),
-                status: "changed".to_string(),
-                fields_changed: Some("merged A1:B2".to_string()),
-                discarded_cells: vec!["B1: gone".to_string()],
-                validation_type: Some("ONE_OF_LIST".to_string()),
-                protected_range_id: Some(42),
-                protection_editors_added: vec!["alice@example.com".to_string()],
-                protection_editors_removed: vec!["bob@example.com".to_string()],
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(
-            rec.context.get("fields_changed").map(String::as_str),
-            Some("merged A1:B2")
-        );
-        assert_eq!(
-            rec.context.get("discarded_cells").map(String::as_str),
-            Some("B1: gone")
-        );
-        assert_eq!(
-            rec.context.get("validation_type").map(String::as_str),
-            Some("ONE_OF_LIST")
-        );
-        assert_eq!(
-            rec.context.get("protected_range_id").map(String::as_str),
-            Some("42")
-        );
-        assert_eq!(
-            rec.context
-                .get("protection_editors_added")
-                .map(String::as_str),
-            Some("alice@example.com")
-        );
-        assert_eq!(
-            rec.context
-                .get("protection_editors_removed")
-                .map(String::as_str),
-            Some("bob@example.com")
-        );
-    }
-
-    #[test]
-    fn build_drive_mutation_record_omits_the_formatting_validation_and_protection_keys_when_unset()
-    {
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "sheets-write",
-                file_id: "s1".to_string(),
-                file_name: "Budget".to_string(),
-                status: "written".to_string(),
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(rec.context.get("fields_changed"), None);
-        assert_eq!(rec.context.get("discarded_cells"), None);
-        assert_eq!(rec.context.get("validation_type"), None);
-        assert_eq!(rec.context.get("protected_range_id"), None);
-        assert_eq!(rec.context.get("protection_editors_added"), None);
-        assert_eq!(rec.context.get("protection_editors_removed"), None);
-    }
-
-    #[test]
-    fn build_drive_mutation_record_records_both_titles_for_a_rename() {
-        // The one structural verb whose effect is otherwise unrecoverable
-        // from its record: `sheet_title` necessarily holds the *old* title.
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "sheets-rename-sheet",
-                file_id: "s1".to_string(),
-                file_name: "Budget".to_string(),
-                status: "changed".to_string(),
-                sheet_id: Some(118_293),
-                sheet_title: Some("Q2".to_string()),
-                sheet_new_title: Some("Q2 (final)".to_string()),
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(
-            rec.context.get("sheet_title").map(String::as_str),
-            Some("Q2")
-        );
-        assert_eq!(
-            rec.context.get("sheet_new_title").map(String::as_str),
-            Some("Q2 (final)")
-        );
-        // A rename spans no dimension.
-        assert_eq!(rec.context.get("dimension_range"), None);
-    }
-
-    #[test]
-    fn build_drive_mutation_record_omits_structural_keys_for_a_cell_write() {
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "sheets-write",
-                file_id: "s1".to_string(),
-                file_name: "Budget".to_string(),
-                status: "written".to_string(),
-                range: Some("A1:B2".to_string()),
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(rec.context.get("sheet_id"), None);
-        assert_eq!(rec.context.get("sheet_title"), None);
-        assert_eq!(rec.context.get("sheet_new_title"), None);
-        assert_eq!(rec.context.get("dimension_range"), None);
-        assert_eq!(rec.context.get("grid_range"), None);
-    }
-
-    #[test]
-    fn build_drive_mutation_record_includes_range_and_every_sheets_count() {
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "sheets-write",
-                file_id: "s1".to_string(),
-                file_name: "Budget".to_string(),
-                status: "written".to_string(),
-                removed_principals: vec!["bob@example.com".to_string()],
-                range: Some("A1:B2".to_string()),
-                updated_range: Some("'Q1'!A1:B2".to_string()),
-                updated_rows: Some(3),
-                updated_columns: Some(2),
-                updated_cells: Some(6),
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(
-            rec.context.get("removed_principals").map(String::as_str),
-            Some("bob@example.com")
-        );
-        assert_eq!(rec.context.get("range").map(String::as_str), Some("A1:B2"));
-        assert_eq!(
-            rec.context.get("updated_range").map(String::as_str),
-            Some("'Q1'!A1:B2")
-        );
-        assert_eq!(
-            rec.context.get("updated_rows").map(String::as_str),
-            Some("3")
-        );
-        assert_eq!(
-            rec.context.get("updated_columns").map(String::as_str),
-            Some("2")
-        );
-        assert_eq!(
-            rec.context.get("updated_cells").map(String::as_str),
-            Some("6")
-        );
-    }
-
-    #[test]
-    fn auto_fill_record_includes_only_overwritten_addresses() {
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "sheets-auto-fill",
-                file_id: "sheet-1".into(),
-                file_name: "Budget".into(),
-                status: "changed".into(),
-                range: Some("'Q1'!A4:A5".into()),
-                overwritten_cells: vec!["A4".into(), "A5".into()],
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(
-            rec.context.get("overwritten_cells").map(String::as_str),
-            Some("A4, A5")
-        );
-        assert_eq!(
-            rec.context.get("range").map(String::as_str),
-            Some("'Q1'!A4:A5")
-        );
-        assert_eq!(rec.context.get("updated_cells"), None);
-        // `--source` computes the destination client-side, so the list is
-        // exact and the upper-bound marker stays absent.
-        assert_eq!(rec.context.get("overwritten_cells_are_upper_bound"), None);
-    }
-
-    /// `auto-fill --range` lets Sheets pick the source/destination split
-    /// itself, so the same list is an upper bound — some of those cells
-    /// are the source and were never touched. The record has to say so,
-    /// or a reader takes them for cells that certainly changed.
-    #[test]
-    fn auto_fill_range_form_marks_its_overwritten_cells_as_an_upper_bound() {
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "sheets-auto-fill",
-                file_id: "sheet-1".into(),
-                file_name: "Budget".into(),
-                status: "changed".into(),
-                range: Some("'Q1'!A1:A10".into()),
-                overwritten_cells: vec!["A1".into(), "A2".into()],
-                overwritten_cells_upper_bound: true,
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(
-            rec.context
-                .get("overwritten_cells_are_upper_bound")
-                .map(String::as_str),
-            Some("true")
-        );
-    }
-
-    /// `text-to-columns` never knows exactly how many columns the API's
-    /// own split will need, so every run's `overwritten_cells` is an
-    /// upper bound — unlike `auto-fill`, this is unconditional rather
-    /// than form-dependent.
-    #[test]
-    fn text_to_columns_record_always_marks_its_overwritten_cells_as_an_upper_bound() {
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "sheets-text-to-columns",
-                file_id: "sheet-1".into(),
-                file_name: "Budget".into(),
-                status: "changed".into(),
-                range: Some("'Q1'!A2:A4".into()),
-                fields_changed: Some(
-                    "split 'Q1'!A2:A4 on comma into up to 2 column(s), spill 'Q1'!B2:B4".into(),
-                ),
-                overwritten_cells: vec!["B3".into()],
-                overwritten_cells_upper_bound: true,
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(
-            rec.context.get("overwritten_cells").map(String::as_str),
-            Some("B3")
-        );
-        assert_eq!(
-            rec.context
-                .get("overwritten_cells_are_upper_bound")
-                .map(String::as_str),
-            Some("true")
-        );
-        // Never the split pieces or the source's contents — only the A1
-        // address and the prose summary (ADR-0083 §6).
-        assert!(!rec.context.get("fields_changed").unwrap().contains("a,b"));
-    }
-
-    #[test]
-    fn record_kind_drive_mutation_serializes_as_drivemutation_and_round_trips() {
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "rename",
-                file_id: "f1".to_string(),
-                file_name: "a.txt".to_string(),
-                status: "failed".to_string(),
-                added_principals: vec![],
-                removed_principals: vec![],
-                crosses_drive_boundary: false,
-                resolved_folder_id: None,
-                decided_by_folder_id: None,
-                decided_by_depth: None,
-                error: Some("boom".to_string()),
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        let line = serde_json::to_string(&rec).unwrap();
-        assert!(
-            line.contains("\"kind\":\"drivemutation\""),
-            "line was: {line}"
-        );
-        assert_eq!(RecordKind::DriveMutation.as_str(), "drivemutation");
-        let back: LogRecord = serde_json::from_str(&line).unwrap();
-        assert_eq!(back.kind, RecordKind::DriveMutation);
-        assert_eq!(
-            back.command,
-            vec!["drive".to_string(), "rename".to_string()]
-        );
-        assert_eq!(back.error.as_deref(), Some("boom"));
-    }
-
-    /// Confirms the existing `kind: "drivemutation"` record — reused, not a
-    /// new `RecordKind` — round-trips identically for the new `create`
-    /// operation issue #1574 adds (ADR-0071 §8).
-    #[test]
-    fn build_drive_mutation_record_round_trips_for_create_operation() {
-        let rec = build_drive_mutation_record(
-            DriveMutationOutcome {
-                operation: "create",
-                file_id: "f1".to_string(),
-                file_name: "New File".to_string(),
-                status: "created".to_string(),
-                added_principals: vec![],
-                removed_principals: vec![],
-                crosses_drive_boundary: false,
-                resolved_folder_id: Some("parent1".to_string()),
-                decided_by_folder_id: None,
-                decided_by_depth: None,
-                error: None,
-                duration: Duration::from_millis(1),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(rec.command, vec!["drive".to_string(), "create".to_string()]);
-        assert_eq!(
-            rec.context.get("resolved_folder_id").map(String::as_str),
-            Some("parent1")
-        );
-        assert_eq!(rec.context.get("decided_by_folder_id"), None);
-        let line = serde_json::to_string(&rec).unwrap();
-        let back: LogRecord = serde_json::from_str(&line).unwrap();
-        assert_eq!(back.kind, RecordKind::DriveMutation);
-    }
-
-    #[test]
-    fn record_kind_gh_serializes_as_gh_and_round_trips() {
-        let rec = build_gh_record(
-            GhOutcome {
-                label: "pr list".to_string(),
-                argv: argv(&["pr", "list"]),
-                exit_code: Some(1),
-                duration: Duration::from_millis(1),
-                error: Some("boom".to_string()),
-            },
-            RequestLogContext::default(),
-        );
-        let line = serde_json::to_string(&rec).unwrap();
-        assert!(line.contains("\"kind\":\"gh\""), "line was: {line}");
-        let back: LogRecord = serde_json::from_str(&line).unwrap();
-        assert_eq!(back.kind, RecordKind::Gh);
-        assert_eq!(back.command, argv(&["pr", "list"]));
-        assert_eq!(back.error.as_deref(), Some("boom"));
-    }
-
-    #[test]
-    fn build_audit_record_stamps_kind_service_command_and_context() {
-        let ctx = RequestLogContext {
-            invocation_id: "inv-4".to_string(),
-            source: Source::Cli,
-            mcp_tool: None,
-        };
-        let rec = build_audit_record(
-            AuditOutcome {
-                command: vec!["drive".to_string(), "lease-acquire".to_string()],
-                integration: "drive",
-                file_id: "f1".to_string(),
-                lease_id: Some("lease-1".to_string()),
-                verdict: "acquired".to_string(),
-                version_after: Some("42".to_string()),
-                modified_time_after: Some("2026-09-12T00:00:00Z".to_string()),
-                backup_location: Some("/tmp/backup".to_string()),
-                backup_sha256: Some("deadbeef".to_string()),
-                backup_size: Some(5),
-                auth_policy: Some("device-owner".to_string()),
-                ..Default::default()
-            },
-            ctx,
-        );
-        assert_eq!(rec.kind, RecordKind::Audit);
-        assert_eq!(rec.invocation_id, "inv-4");
-        assert_eq!(rec.source, Some(Source::Cli));
-        assert_eq!(rec.service.as_deref(), Some("drive"));
-        assert_eq!(
-            rec.command,
-            vec!["drive".to_string(), "lease-acquire".to_string()]
-        );
-        assert_eq!(
-            rec.context.get("integration").map(String::as_str),
-            Some("drive")
-        );
-        assert_eq!(rec.context.get("file_id").map(String::as_str), Some("f1"));
-        assert_eq!(
-            rec.context.get("lease_id").map(String::as_str),
-            Some("lease-1")
-        );
-        assert_eq!(
-            rec.context.get("verdict").map(String::as_str),
-            Some("acquired")
-        );
-        assert_eq!(
-            rec.context.get("version_after").map(String::as_str),
-            Some("42")
-        );
-        assert_eq!(
-            rec.context.get("modified_time_after").map(String::as_str),
-            Some("2026-09-12T00:00:00Z")
-        );
-        assert_eq!(
-            rec.context.get("backup_location").map(String::as_str),
-            Some("/tmp/backup")
-        );
-        assert_eq!(
-            rec.context.get("backup_sha256").map(String::as_str),
-            Some("deadbeef")
-        );
-        assert_eq!(
-            rec.context.get("backup_size").map(String::as_str),
-            Some("5")
-        );
-        assert_eq!(
-            rec.context.get("auth_policy").map(String::as_str),
-            Some("device-owner")
-        );
-    }
-
-    #[test]
-    fn build_audit_record_omits_absent_optional_context_keys() {
-        let rec = build_audit_record(
-            AuditOutcome {
-                command: vec!["drive".to_string(), "lease-acquire".to_string()],
-                integration: "drive",
-                file_id: "f1".to_string(),
-                verdict: "denied".to_string(),
-                error: Some("no".to_string()),
-                ..Default::default()
-            },
-            RequestLogContext::default(),
-        );
-        assert_eq!(rec.error.as_deref(), Some("no"));
-        assert_eq!(rec.context.get("lease_id"), None);
-        assert_eq!(rec.context.get("version_before"), None);
-        assert_eq!(rec.context.get("version_after"), None);
-        assert_eq!(rec.context.get("backup_location"), None);
-        assert_eq!(rec.context.get("backup_sha256"), None);
-        assert_eq!(rec.context.get("backup_size"), None);
-        assert_eq!(rec.context.get("auth_policy"), None);
-    }
-
-    #[test]
-    fn record_audit_event_writes_to_the_audit_sink() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        let env = MapEnv::new().with("OMNI_DEV_AUDIT_LOG_FILE", path.to_str().unwrap());
-
-        record_audit_event_with(
-            &env,
-            AuditOutcome {
-                command: vec!["drive".to_string(), "lease-acquire".to_string()],
-                integration: "drive",
-                file_id: "f1".to_string(),
-                verdict: "acquired".to_string(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let back: LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
-        assert_eq!(back.kind, RecordKind::Audit);
-        assert_eq!(
-            back.context.get("verdict").map(String::as_str),
-            Some("acquired")
-        );
-    }
-
-    #[test]
-    fn record_kind_audit_serializes_as_audit_and_round_trips() {
-        let rec = LogRecord {
-            kind: RecordKind::Audit,
-            id: new_id(),
-            invocation_id: new_id(),
-            ..LogRecord::default()
-        };
-        let line = serde_json::to_string(&rec).unwrap();
-        assert!(line.contains("\"kind\":\"audit\""), "line was: {line}");
-        assert_eq!(RecordKind::Audit.as_str(), "audit");
-        let back: LogRecord = serde_json::from_str(&line).unwrap();
-        assert_eq!(back.kind, RecordKind::Audit);
-    }
-
-    #[test]
-    fn audit_file_path_honors_env_override() {
-        let env = MapEnv::new().with("OMNI_DEV_AUDIT_LOG_FILE", "/tmp/omni-dev-test-audit.jsonl");
-        assert_eq!(
-            audit_file_path_with(&env),
-            Some(PathBuf::from("/tmp/omni-dev-test-audit.jsonl"))
-        );
-    }
-
-    #[test]
     fn audit_file_path_never_resolves_to_the_real_machine_default_when_unset() {
         // Regression test for a real incident: before this fallback
         // existed, any test exercising a leased write or `drive lease
@@ -3423,52 +1988,6 @@ mod tests {
     }
 
     #[test]
-    fn record_audit_writes_a_line_that_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        let env = MapEnv::new().with("OMNI_DEV_AUDIT_LOG_FILE", path.to_str().unwrap());
-
-        let rec = LogRecord {
-            kind: RecordKind::Audit,
-            id: new_id(),
-            invocation_id: new_id(),
-            ..LogRecord::default()
-        };
-        record_audit_with(&env, &rec).unwrap();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let back: LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
-        assert_eq!(back.kind, RecordKind::Audit);
-        assert_eq!(back.id, rec.id);
-    }
-
-    #[test]
-    fn record_audit_locks_and_syncs_the_handle_when_bodies_are_enabled() {
-        // `bodies_enabled()` gates a separate, otherwise-untested append
-        // path (an advisory `flock` around the write) inside
-        // `append_line_unrotated`; `record_audit`'s `sync=true` additionally
-        // exercises the `sync_data` call on the locked handle.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        let env = MapEnv::new()
-            .with("OMNI_DEV_LOG_BODIES", "1")
-            .with("OMNI_DEV_AUDIT_LOG_FILE", path.to_str().unwrap());
-        assert!(bodies_enabled_with(&env));
-
-        let rec = LogRecord {
-            kind: RecordKind::Audit,
-            id: new_id(),
-            invocation_id: new_id(),
-            ..LogRecord::default()
-        };
-        record_audit_with(&env, &rec).unwrap();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let back: LogRecord = serde_json::from_str(contents.trim_end()).unwrap();
-        assert_eq!(back.id, rec.id);
-    }
-
-    #[test]
     fn record_audit_fails_closed_when_the_write_errors() {
         // A directory is not a valid target for `OpenOptions::append`, so this
         // forces the same write failure a permission error or a missing parent
@@ -3483,26 +2002,6 @@ mod tests {
         };
         let err = append_record_to(dir.path(), &rec, append_line_no_rotation).unwrap_err();
         assert!(!err.to_string().is_empty());
-    }
-
-    #[test]
-    fn record_audit_is_exempt_from_omni_dev_log_disable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        let env = MapEnv::new()
-            .with("OMNI_DEV_LOG_DISABLE", "1")
-            .with("OMNI_DEV_AUDIT_LOG_FILE", path.to_str().unwrap());
-        assert!(disabled_with(&env));
-
-        let rec = LogRecord {
-            kind: RecordKind::Audit,
-            id: new_id(),
-            invocation_id: new_id(),
-            ..LogRecord::default()
-        };
-        record_audit_with(&env, &rec).unwrap();
-
-        assert!(path.exists());
     }
 
     #[test]
@@ -3537,26 +2036,10 @@ mod tests {
             ..LogRecord::default()
         };
         let err = try_record(&rec).unwrap_err();
-        assert!(err.to_string().contains("record_audit()"), "{err}");
-    }
-
-    #[test]
-    fn record_audit_refuses_a_non_audit_kind_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = MapEnv::new().with(
-            "OMNI_DEV_AUDIT_LOG_FILE",
-            dir.path().join("audit.jsonl").to_str().unwrap(),
+        assert!(
+            err.to_string().contains("no longer writes audit.jsonl"),
+            "{err}"
         );
-
-        let rec = LogRecord {
-            kind: RecordKind::Invocation,
-            id: new_id(),
-            invocation_id: new_id(),
-            ..LogRecord::default()
-        };
-        let err = record_audit_with(&env, &rec).unwrap_err();
-
-        assert!(err.to_string().contains("RecordKind::Audit"), "{err}");
     }
 
     #[test]
@@ -3583,32 +2066,6 @@ mod tests {
             .with("OMNI_DEV_LOG_FILE", dotted.to_str().unwrap())
             .with("OMNI_DEV_AUDIT_LOG_FILE", audit.to_str().unwrap());
 
-        assert!(log_file_path_with(&env).is_none());
-    }
-
-    #[test]
-    fn record_audit_with_succeeds_when_the_log_file_env_aliases_the_audit_path() {
-        // Once `log_file_path_with` itself refuses to resolve an aliasing
-        // `OMNI_DEV_LOG_FILE`, `record_audit_to` has no colliding request-log
-        // path to compare against, so the write it exists to protect
-        // proceeds normally — the refusal moved to path resolution
-        // (#1747), it did not disappear.
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("shared.jsonl");
-        let shared_str = shared.to_str().unwrap();
-        let env = MapEnv::new()
-            .with("OMNI_DEV_LOG_FILE", shared_str)
-            .with("OMNI_DEV_AUDIT_LOG_FILE", shared_str);
-
-        let rec = LogRecord {
-            kind: RecordKind::Audit,
-            id: new_id(),
-            invocation_id: new_id(),
-            ..LogRecord::default()
-        };
-        record_audit_with(&env, &rec).unwrap();
-
-        assert!(shared.exists());
         assert!(log_file_path_with(&env).is_none());
     }
 
@@ -3770,116 +2227,6 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-    }
-
-    /// Issue #1697 made the parent-directory `fsync` conditional on the
-    /// append having created the file. The condition is not observable from
-    /// outside (an `fsync` leaves no trace), so what is pinned here is what
-    /// a mistake in it would actually break: the creating append and every
-    /// append after it must still land, in order, at `0600`.
-    #[cfg(unix)]
-    #[test]
-    fn append_line_synced_appends_in_order_across_the_creating_and_later_writes() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-
-        append_line_synced(&path, "first\n").unwrap();
-        append_line_synced(&path, "second\n").unwrap();
-        append_line_synced(&path, "third\n").unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "first\nsecond\nthird\n"
-        );
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-
-    /// The re-tightening in `ensure_handle_0600` runs before the new
-    /// emptiness probe reads the same handle, so a pre-existing loose file
-    /// is still clamped on the synced path, not only on `append_line`'s.
-    #[cfg(unix)]
-    #[test]
-    fn append_line_synced_retightens_preexisting_loose_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        std::fs::write(&path, "old\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        append_line_synced(&path, "new\n").unwrap();
-
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\nnew\n");
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-
-    /// The synced appender's error arm. `record_audit_fails_closed_when_the_
-    /// write_errors` covers `append_line_no_rotation`'s, so without this the
-    /// one appender whose failure *refuses a Drive write* had none of its
-    /// own.
-    #[test]
-    fn append_line_synced_errors_when_the_target_is_a_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        std::fs::create_dir(&path).unwrap();
-
-        assert!(append_line_synced(&path, "line\n").is_err());
-    }
-
-    /// An empty-but-existing file takes the conservative branch (one spare
-    /// directory `fsync`) rather than being mistaken for something that
-    /// cannot be appended to.
-    #[test]
-    fn append_line_synced_appends_to_an_existing_empty_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        std::fs::write(&path, "").unwrap();
-
-        append_line_synced(&path, "line\n").unwrap();
-
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "line\n");
-    }
-
-    #[test]
-    fn off_list_secretish_headers_are_redacted() {
-        let mut headers = BTreeMap::new();
-        for name in [
-            "X-Auth-Token",
-            "x-amz-security-token",
-            "X-Goog-Api-Key",
-            "x-csrf-token",
-            "X-Vendor-Token",
-            "X-Omni-Bridge",
-        ] {
-            headers.insert(name.to_string(), "secret-value".to_string());
-        }
-        for name in [
-            "Content-Type",
-            "Accept",
-            "User-Agent",
-            "x-request-id",
-            "traceparent",
-        ] {
-            headers.insert(name.to_string(), "plain-value".to_string());
-        }
-        let out = redact_headers(&headers);
-        assert_eq!(out["X-Auth-Token"], "REDACTED");
-        assert_eq!(out["x-amz-security-token"], "REDACTED");
-        assert_eq!(out["X-Goog-Api-Key"], "REDACTED");
-        assert_eq!(out["x-csrf-token"], "REDACTED");
-        assert_eq!(out["X-Vendor-Token"], "REDACTED");
-        assert_eq!(out["X-Omni-Bridge"], "REDACTED");
-        assert_eq!(out["Content-Type"], "plain-value");
-        assert_eq!(out["Accept"], "plain-value");
-        assert_eq!(out["User-Agent"], "plain-value");
-        assert_eq!(out["x-request-id"], "plain-value");
-        assert_eq!(out["traceparent"], "plain-value");
     }
 
     #[test]
@@ -4477,106 +2824,6 @@ mod tests {
             },
         );
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn prune_refuses_the_audit_file_by_direct_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
-        let audit_path = dir.path().join("audit.jsonl");
-        std::fs::write(&audit_path, "{}\n").unwrap();
-
-        let err = prune(
-            &audit_path,
-            &PruneOptions {
-                older_than: None,
-                max_size: Some(1),
-                dry_run: false,
-            },
-        )
-        .err()
-        .unwrap();
-
-        assert!(err.to_string().contains("audit log"), "{err}");
-        assert_eq!(std::fs::read_to_string(&audit_path).unwrap(), "{}\n");
-    }
-
-    #[test]
-    fn prune_refuses_a_dot_dot_spelling_of_the_audit_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
-        let audit_path = dir.path().join("audit.jsonl");
-        std::fs::write(&audit_path, "{}\n").unwrap();
-        let dotted = dir.path().join("sub/../audit.jsonl");
-
-        let err = prune(
-            &dotted,
-            &PruneOptions {
-                older_than: None,
-                max_size: Some(1),
-                dry_run: false,
-            },
-        )
-        .err()
-        .unwrap();
-
-        assert!(err.to_string().contains("audit log"), "{err}");
-        assert_eq!(std::fs::read_to_string(&audit_path).unwrap(), "{}\n");
-    }
-
-    #[test]
-    fn prune_refuses_the_audit_file_even_under_dry_run() {
-        // Exemption from pruning is the point, and `omni-dev log --audit` is
-        // the supported way to read the file — a read-only dry run is not a
-        // carve-out.
-        let dir = tempfile::tempdir().unwrap();
-        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
-        let audit_path = dir.path().join("audit.jsonl");
-        std::fs::write(&audit_path, "{}\n").unwrap();
-
-        let err = prune(
-            &audit_path,
-            &PruneOptions {
-                older_than: None,
-                max_size: Some(1),
-                dry_run: true,
-            },
-        )
-        .err()
-        .unwrap();
-
-        assert!(err.to_string().contains("audit log"), "{err}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn append_with_rotation_refuses_to_rotate_the_audit_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let _audit = crate::test_support::AuditLogGuard::redirect(dir.path());
-        let audit_path = dir.path().join("audit.jsonl");
-        // Seed a file already over the cap so a request-log path would rotate.
-        std::fs::write(&audit_path, "0123456789012345\n").unwrap();
-        let cfg = RotationConfig {
-            max_size: 5,
-            keep_files: 1,
-        };
-
-        append_with_rotation(&audit_path, "new-line\n", &cfg).unwrap();
-
-        assert!(
-            !sibling(&audit_path, ".1").exists(),
-            "the audit file must never be rotated"
-        );
-        assert!(
-            !sibling(&audit_path, ".lock").exists(),
-            "a refused rotation must not create a lock file next to the audit file"
-        );
-        assert!(
-            std::fs::read_to_string(&audit_path)
-                .unwrap()
-                .contains("new-line"),
-            "the line is still appended (best effort)"
-        );
     }
 
     #[cfg(unix)]

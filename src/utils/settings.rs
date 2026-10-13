@@ -131,247 +131,6 @@ pub struct McpSettings {
     pub max_response_bytes: Option<usize>,
 }
 
-/// A single named Gmail account's stored OAuth2 credentials, inside the
-/// `gmail.accounts` map (issue #1500, [ADR-0066](../../docs/adrs/adr-0066.md)).
-///
-/// Orthogonal to [`Profile`]: selecting a Gmail account never changes the
-/// active `--profile`, and vice versa. See `email_address`'s own doc
-/// comment below for how it's populated and used — never for
-/// authentication itself.
-#[derive(Debug, Default, Deserialize)]
-pub struct GmailAccountSettings {
-    /// OAuth2 client id from the account's Google Cloud project.
-    #[serde(default)]
-    pub client_id: Option<String>,
-    /// OAuth2 client secret from the account's Google Cloud project.
-    #[serde(default)]
-    pub client_secret: Option<String>,
-    /// Absolute path to a file holding `client_secret` instead (#2008) —
-    /// the raw secret, not a `client_secret.json`. Setting both is an error.
-    #[serde(default)]
-    pub client_secret_file: Option<String>,
-    /// The long-lived refresh token obtained by `gmail auth login`.
-    #[serde(default)]
-    pub refresh_token: Option<String>,
-    /// Absolute path to a file holding `refresh_token` instead (#2008);
-    /// `gmail auth login` writes a new token there. Setting both is an
-    /// error.
-    #[serde(default)]
-    pub refresh_token_file: Option<String>,
-    /// The OAuth2 scope this account was authorized with.
-    #[serde(default)]
-    pub scope: Option<String>,
-    /// Mailbox address for this account. Populated opportunistically by
-    /// `gmail auth status` when absent, but may also be set by hand ahead of
-    /// the first login — e.g. to opt into `chrome_profile_from_email` below.
-    /// An explicit value is never overwritten by the `gmail auth status`
-    /// backfill. Never used for authentication itself, only for browser
-    /// targeting.
-    #[serde(default)]
-    pub email_address: Option<String>,
-
-    /// Opt-in (default `false`): resolve which local Chrome profile is
-    /// signed into `email_address` and launch `gmail auth login`'s
-    /// authorization URL targeting that profile, instead of the OS default
-    /// browser. Resolution failure (Chrome not installed, zero or multiple
-    /// matching profiles, ...) always falls back to the default browser —
-    /// never a hard login failure. Ignored when `browser_command` is set.
-    /// (issue #1505, [ADR-0067](../../docs/adrs/adr-0067.md))
-    #[serde(default)]
-    pub chrome_profile_from_email: bool,
-
-    /// Explicit browser launch command for `gmail auth login`, `{url}`
-    /// templated (or appended if no placeholder is present) — the manual
-    /// escape hatch, e.g. to target a specific Chrome profile by hand or a
-    /// non-Chrome browser entirely. Mirrors `SNOWFLAKE_BROWSER_COMMAND`
-    /// (`crate::snowflake`). Takes precedence over `chrome_profile_from_email`.
-    /// (issue #1505)
-    #[serde(default)]
-    pub browser_command: Option<String>,
-}
-
-/// The `gmail` section of `settings.json` — named Gmail accounts, selected
-/// per invocation via `--account` / `OMNI_DEV_GMAIL_ACCOUNT`
-/// (issue #1500, [ADR-0066](../../docs/adrs/adr-0066.md)).
-///
-/// An absent `gmail` block (or an empty `accounts` map) leaves Gmail
-/// credential resolution on today's exact legacy path — see
-/// `crate::gmail::account::resolve_account`.
-#[derive(Debug, Default, Deserialize)]
-pub struct GmailSettings {
-    /// The account `gmail account list`/credential resolution falls back to
-    /// when `--account`/`OMNI_DEV_GMAIL_ACCOUNT` is unset and more than one
-    /// account is configured.
-    #[serde(default)]
-    pub default_account: Option<String>,
-
-    /// Named accounts, keyed by the name passed to `--account`.
-    #[serde(default)]
-    pub accounts: HashMap<String, GmailAccountSettings>,
-}
-
-/// A single named Google Drive account's stored OAuth2 credentials, inside
-/// the `drive.accounts` map (issue #1520,
-/// [ADR-0069](../../docs/adrs/adr-0069.md)).
-///
-/// A field-for-field mirror of [`GmailAccountSettings`]: a Drive account and
-/// a Gmail account are different credential axes even when the underlying
-/// human is the same person, so the two blocks compose independently rather
-/// than one nesting under the other. See `email_address`'s own doc comment
-/// below for how it's populated and used — never for authentication itself.
-#[derive(Debug, Default, Deserialize)]
-pub struct DriveAccountSettings {
-    /// OAuth2 client id from the account's Google Cloud project.
-    #[serde(default)]
-    pub client_id: Option<String>,
-    /// OAuth2 client secret from the account's Google Cloud project.
-    #[serde(default)]
-    pub client_secret: Option<String>,
-    /// Absolute path to a file holding `client_secret` instead (#2008).
-    /// Setting both is an error.
-    #[serde(default)]
-    pub client_secret_file: Option<String>,
-    /// The long-lived refresh token obtained by `drive auth login`
-    /// (issue #1523).
-    #[serde(default)]
-    pub refresh_token: Option<String>,
-    /// Absolute path to a file holding `refresh_token` instead (#2008);
-    /// `drive auth login` writes a new token there. Setting both is an
-    /// error.
-    #[serde(default)]
-    pub refresh_token_file: Option<String>,
-    /// The OAuth2 scope this account was authorized with, as the raw string
-    /// Google granted. Stays a plain `String` here (unlike Gmail's
-    /// equivalent settings field, for the same reason): this is a
-    /// status-reporting cache of whatever was actually granted, not the
-    /// value driving a live login decision — that's
-    /// [`crate::drive::auth::DriveGrantedScopes`], read from this field via
-    /// [`crate::drive::auth::DriveGrantedScopes::from_granted`]
-    /// ([ADR-0070](../../docs/adrs/adr-0070.md), reversing
-    /// [ADR-0069](../../docs/adrs/adr-0069.md) §2's "no `DriveScope` enum,
-    /// read-only by design"; further generalized from a 2-variant enum to a
-    /// capability set by issue #1574).
-    #[serde(default)]
-    pub scope: Option<String>,
-    /// Google account address for this account. Populated opportunistically
-    /// by `drive auth status` when absent, but may also be set by hand ahead
-    /// of the first login — e.g. to opt into `chrome_profile_from_email`
-    /// below. An explicit value is never overwritten by the backfill. Never
-    /// used for authentication itself, only for browser targeting.
-    #[serde(default)]
-    pub email_address: Option<String>,
-
-    /// Opt-in (default `false`): resolve which local Chrome profile is
-    /// signed into `email_address` and launch `drive auth login`'s
-    /// authorization URL targeting that profile, instead of the OS default
-    /// browser. Resolution failure (Chrome not installed, zero or multiple
-    /// matching profiles, ...) always falls back to the default browser —
-    /// never a hard login failure. Ignored when `browser_command` is set.
-    /// (Inherited from Gmail by field —
-    /// [ADR-0067](../../docs/adrs/adr-0067.md) via
-    /// [ADR-0069](../../docs/adrs/adr-0069.md).)
-    #[serde(default)]
-    pub chrome_profile_from_email: bool,
-
-    /// Explicit browser launch command for `drive auth login`, `{url}`
-    /// templated (or appended if no placeholder is present) — the manual
-    /// escape hatch, e.g. to target a specific Chrome profile by hand or a
-    /// non-Chrome browser entirely. Mirrors `SNOWFLAKE_BROWSER_COMMAND`
-    /// (`crate::snowflake`). Takes precedence over
-    /// `chrome_profile_from_email`. (Inherited from Gmail by field —
-    /// [ADR-0067](../../docs/adrs/adr-0067.md).)
-    #[serde(default)]
-    pub browser_command: Option<String>,
-
-    /// Destination folder id for the Drive-side backup copy a native
-    /// (Google Sheets/Docs/Slides) `drive lease acquire` makes
-    /// ([ADR-0080](../../docs/adrs/adr-0080.md) §3) — per-account, for the
-    /// identical reason `write_permissions` is: a folder id only means
-    /// something inside the one Drive it was minted in. Absent means
-    /// `drive lease acquire` refuses every native-document target for this
-    /// account outright (`RefusedNativeDocument`), since there is nowhere
-    /// configured to put the copy.
-    #[serde(default)]
-    pub lease_backup_folder_id: Option<String>,
-
-    /// Folder-scoped write-permission rules gating `drive create`/`upload`/
-    /// `edit` for this account (issue #1574).
-    ///
-    /// Per-account, not a top-level `DriveSettings` field: a folder id is
-    /// only meaningful inside the one Drive it was minted in, exactly like
-    /// `client_id`/`refresh_token`/`scope` above are already per-account —
-    /// see [`crate::drive::write_gate`]'s module doc for the gate itself.
-    /// Absent or empty means every write is refused for this account
-    /// everywhere; there is deliberately no separate enabled/disabled
-    /// toggle (falls out of
-    /// [`crate::drive::write_gate::DriveOperation`]'s default policy
-    /// alone).
-    #[serde(default)]
-    pub write_permissions: WritePermissionsSettings,
-}
-
-/// The `write_permissions` block on one [`DriveAccountSettings`] — see its
-/// doc comment for why this is per-account.
-#[derive(Debug, Default, Deserialize)]
-pub struct WritePermissionsSettings {
-    /// The configured rules, evaluated by
-    /// [`crate::drive::write_gate::resolve`].
-    #[serde(default)]
-    pub rules: Vec<crate::drive::write_gate::FolderPermissionRule>,
-}
-
-/// The `drive` section of `settings.json` — named Google Drive accounts,
-/// selected per invocation via `--account` / `OMNI_DEV_DRIVE_ACCOUNT`
-/// (issue #1520, [ADR-0069](../../docs/adrs/adr-0069.md)).
-///
-/// An absent `drive` block (or an empty `accounts` map) means Drive is
-/// simply unconfigured — unlike [`GmailSettings`], there is no legacy
-/// credential path to fall back to, Drive being brand new.
-#[derive(Debug, Default, Deserialize)]
-pub struct DriveSettings {
-    /// The account credential resolution falls back to when
-    /// `--account`/`OMNI_DEV_DRIVE_ACCOUNT` is unset and more than one
-    /// account is configured.
-    #[serde(default)]
-    pub default_account: Option<String>,
-
-    /// Named accounts, keyed by the name passed to `--account`.
-    #[serde(default)]
-    pub accounts: HashMap<String, DriveAccountSettings>,
-}
-
-/// The `lease` section of `settings.json` — global, machine-wide policy for
-/// `drive lease acquire`/`restore`.
-///
-/// Sibling of `drive` rather than nested under it (issue #1677,
-/// [ADR-0080](../../docs/adrs/adr-0080.md) §13): none of these are
-/// meaningful per-Drive-account, they describe *this machine's* policy.
-/// Every field is optional; an unset field falls back to the built-in
-/// default, so an absent `lease` block preserves `drive lease`'s behaviour
-/// byte-for-byte. See `crate::drive::lease::settings` for the resolvers that
-/// layer a CLI flag and an env var on top of each of these.
-#[derive(Debug, Default, Clone, Deserialize)]
-pub struct LeaseSettings {
-    /// Default `--expiry-minutes` when the flag is omitted (ADR-0080 §5/§13).
-    #[serde(default)]
-    pub default_expiry_minutes: Option<i64>,
-
-    /// Default `--backup-dir` when the flag is omitted (ADR-0080 §3/§13).
-    #[serde(default)]
-    pub backup_dir: Option<PathBuf>,
-
-    /// Default authentication policy: `false` selects device-owner (the
-    /// default), `true` selects biometrics-only (ADR-0080 §7/§13).
-    #[serde(default)]
-    pub biometrics_only: bool,
-
-    /// Opt-out for headless/off-macOS contexts (ADR-0080 §8/§13): `true`
-    /// lets `drive lease acquire`/`restore` proceed with no device-owner
-    /// authenticator, waiving the human-presence guarantee.
-    #[serde(default)]
-    pub allow_headless: bool,
-}
-
 /// Defaults for the long-lived daemon, independent of the launcher's environment.
 #[derive(Debug, Default, Deserialize)]
 pub struct DaemonSettings {
@@ -402,21 +161,6 @@ pub struct Settings {
     /// Daemon tracing defaults; an absent section preserves the built-in filter.
     #[serde(default)]
     pub daemon: DaemonSettings,
-
-    /// Named Gmail accounts (issue #1500); an absent block yields
-    /// [`GmailSettings::default`], which is an empty account map.
-    #[serde(default)]
-    pub gmail: GmailSettings,
-
-    /// Named Google Drive accounts (issue #1520); an absent block yields
-    /// [`DriveSettings::default`], which is an empty account map.
-    #[serde(default)]
-    pub drive: DriveSettings,
-
-    /// Global Drive lease policy (issue #1677); an absent block yields
-    /// [`LeaseSettings::default`].
-    #[serde(default)]
-    pub lease: LeaseSettings,
 }
 
 /// Returns the active profile name from `raw` (the process environment), or
@@ -473,10 +217,9 @@ impl SettingsEnv {
 
     /// Wraps an already-loaded [`Settings`], skipping the disk read/parse
     /// [`load`](Self::load)/[`load_with_profile`](Self::load_with_profile)
-    /// perform — for callers (e.g. `load_credentials_for`/`status_for` in
-    /// `crate::gmail::auth`/`crate::drive::auth`) that already loaded
-    /// `Settings` to resolve an account and would otherwise discard it just
-    /// to re-read the same file a second time (issue #1533).
+    /// perform — for callers that already loaded `Settings` and would
+    /// otherwise discard it just to re-read the same file a second time
+    /// (issue #1533).
     pub fn from_settings(settings: Settings, profile: Option<&str>) -> Self {
         Self {
             settings,
@@ -627,7 +370,7 @@ impl Settings {
     ///
     /// The warning fires once per distinct failure per process, not once per
     /// call: a single command loads settings several times (client creation,
-    /// then each account/lease helper), and repeating an identical warning
+    /// then each helper), and repeating an identical warning
     /// for every read buried the refusal it explains. A successful load resets
     /// this, so a long-lived process warns again if the file breaks again.
     pub fn load_or_warn_default() -> Self {
@@ -952,158 +695,6 @@ impl Settings {
             "unknown profile '{name}'; known profiles: {known}"
         ))
     }
-
-    /// Merges the given key/value pairs into `gmail.accounts.<account>`,
-    /// creating the file, its parent directory, and any missing intermediate
-    /// objects as needed (issue #1500,
-    /// [ADR-0066](../../docs/adrs/adr-0066.md)). Same hardening and
-    /// unknown-field preservation as [`Settings::upsert_env_vars_in`] — no
-    /// new file-handling code.
-    ///
-    /// `vars` takes [`serde_json::Value`] rather than `&str` (widened in
-    /// #1523, PR #1528 review) because `GmailAccountSettings` has non-string
-    /// fields (`chrome_profile_from_email: bool`) — a hard-coded
-    /// `Value::String` wrap would write the JSON string `"true"` into a
-    /// `bool` field, and since `Settings` deserializes as one unit, the next
-    /// `Settings::load()` would hard-fail parsing the *entire* file. Callers
-    /// writing a string field pass `serde_json::Value::String(...)`
-    /// explicitly.
-    pub fn upsert_gmail_account(
-        path: &Path,
-        account: &str,
-        vars: &[(&str, serde_json::Value)],
-    ) -> Result<()> {
-        upsert_account(path, "gmail", account, vars)
-    }
-
-    /// Removes `gmail.accounts.<account>` entirely — an account is coherent
-    /// as a unit, unlike the key-by-key removal
-    /// [`Settings::remove_env_vars_in`] does. Also clears
-    /// `gmail.default_account` if it named the removed account, so
-    /// resolution (`src/gmail/account.rs::resolve_default_account`) falls
-    /// back to the sole-remaining-account rule instead of hard-erroring on
-    /// a dangling pointer (issue #1529). Returns `true` if the account was
-    /// present and removed, `false` when the file, `gmail`,
-    /// `gmail.accounts`, or the named account did not exist (the file is
-    /// left untouched in that case).
-    pub fn remove_gmail_account(path: &Path, account: &str) -> Result<bool> {
-        if !path.exists() {
-            return Ok(false);
-        }
-        let mut settings_value = read_or_default_settings(path)?;
-
-        let removed = object_at_mut(&mut settings_value, &["gmail", "accounts"])
-            .is_some_and(|accounts| accounts.remove(account).is_some());
-
-        if removed {
-            if let Some(gmail) = object_at_mut(&mut settings_value, &["gmail"]) {
-                if gmail.get("default_account").and_then(|v| v.as_str()) == Some(account) {
-                    gmail.remove("default_account");
-                }
-            }
-            write_settings(path, &settings_value)?;
-        }
-        Ok(removed)
-    }
-
-    /// Sets (`Some`) or clears (`None`) `gmail.default_account`. Always
-    /// writes, mirroring [`Settings::upsert_env_vars_in`]'s unconditional-write
-    /// semantics rather than [`Settings::remove_env_vars_in`]'s
-    /// changed-only one, since this is fundamentally an upsert of a single
-    /// scalar rather than a set of keys.
-    pub fn set_gmail_default_account(path: &Path, account: Option<&str>) -> Result<()> {
-        let mut settings_value = read_or_default_settings(path)?;
-
-        match account {
-            Some(name) => {
-                let gmail = ensure_object_at(&mut settings_value, &["gmail"])?;
-                gmail.insert(
-                    "default_account".to_string(),
-                    serde_json::Value::String(name.to_string()),
-                );
-            }
-            None => {
-                if let Some(gmail) = object_at_mut(&mut settings_value, &["gmail"]) {
-                    gmail.remove("default_account");
-                }
-            }
-        }
-
-        write_settings(path, &settings_value)
-    }
-
-    /// Merges the given key/value pairs into `drive.accounts.<account>`,
-    /// creating the file, its parent directory, and any missing intermediate
-    /// objects as needed (issue #1522,
-    /// [ADR-0069](../../docs/adrs/adr-0069.md)). Same hardening and
-    /// unknown-field preservation as [`Settings::upsert_env_vars_in`] — no
-    /// new file-handling code.
-    ///
-    /// `vars` takes [`serde_json::Value`], not `&str` — see
-    /// [`Settings::upsert_gmail_account`]'s doc comment for why (this
-    /// helper's twin, and the write path the PR #1528 review comment
-    /// flagged the bug against).
-    pub fn upsert_drive_account(
-        path: &Path,
-        account: &str,
-        vars: &[(&str, serde_json::Value)],
-    ) -> Result<()> {
-        upsert_account(path, "drive", account, vars)
-    }
-
-    /// Removes `drive.accounts.<account>` entirely — an account is coherent
-    /// as a unit, exactly like [`Settings::remove_gmail_account`]. Also
-    /// clears `drive.default_account` if it named the removed account, for
-    /// the same dangling-pointer reason (issue #1529) — Drive has no
-    /// legacy-credential fallback to soften a stale default the way
-    /// Gmail's resolution table can (ADR-0069 §3), so the failure would be
-    /// total. Returns `true` if the account was present and removed,
-    /// `false` when the file, `drive`, `drive.accounts`, or the named
-    /// account did not exist (the file is left untouched in that case).
-    pub fn remove_drive_account(path: &Path, account: &str) -> Result<bool> {
-        if !path.exists() {
-            return Ok(false);
-        }
-        let mut settings_value = read_or_default_settings(path)?;
-
-        let removed = object_at_mut(&mut settings_value, &["drive", "accounts"])
-            .is_some_and(|accounts| accounts.remove(account).is_some());
-
-        if removed {
-            if let Some(drive) = object_at_mut(&mut settings_value, &["drive"]) {
-                if drive.get("default_account").and_then(|v| v.as_str()) == Some(account) {
-                    drive.remove("default_account");
-                }
-            }
-            write_settings(path, &settings_value)?;
-        }
-        Ok(removed)
-    }
-
-    /// Sets (`Some`) or clears (`None`) `drive.default_account`. Always
-    /// writes, mirroring [`Settings::set_gmail_default_account`]'s
-    /// unconditional-write semantics — fundamentally an upsert of a single
-    /// scalar rather than a set of keys.
-    pub fn set_drive_default_account(path: &Path, account: Option<&str>) -> Result<()> {
-        let mut settings_value = read_or_default_settings(path)?;
-
-        match account {
-            Some(name) => {
-                let drive = ensure_object_at(&mut settings_value, &["drive"])?;
-                drive.insert(
-                    "default_account".to_string(),
-                    serde_json::Value::String(name.to_string()),
-                );
-            }
-            None => {
-                if let Some(drive) = object_at_mut(&mut settings_value, &["drive"]) {
-                    drive.remove("default_account");
-                }
-            }
-        }
-
-        write_settings(path, &settings_value)
-    }
 }
 
 /// Navigates `root` to the env object targeted by `profile` — the base `env`
@@ -1137,8 +728,8 @@ fn env_object_mut<'a>(
 /// returns the object at the end of the path. The creating counterpart of
 /// [`object_at_mut`], for upserts. Generalizes what were previously two
 /// hardcoded two-level walks (`env`, `profiles.<name>.env`) to an arbitrary
-/// depth, so a third settings substructure (`gmail.accounts.<name>`, issue
-/// #1500) reuses the same file-handling code rather than duplicating it.
+/// depth, so a further settings substructure reuses the same file-handling
+/// code rather than duplicating it.
 fn ensure_object_at<'a>(
     root: &'a mut serde_json::Value,
     segments: &[&str],
@@ -1185,132 +776,6 @@ fn read_or_default_settings(path: &Path) -> Result<serde_json::Value> {
     } else {
         Ok(serde_json::json!({}))
     }
-}
-
-/// The named-account secret fields that accept a `<field>_file` companion
-/// (#2008).
-const ACCOUNT_SECRET_FIELDS: &[&str] = &["client_secret", "refresh_token"];
-
-/// The shared body of [`Settings::upsert_gmail_account`] and
-/// [`Settings::upsert_drive_account`]: merges `vars` into
-/// `<section>.accounts.<account>`.
-///
-/// A secret field ([`ACCOUNT_SECRET_FIELDS`]) whose entry already names a
-/// `<field>_file` is written into that file instead, and the plain field is
-/// removed, so the secret never lands in settings.json and the entry can't
-/// hold both (#2008). Every file is checked
-/// ([`secret_env::plan_secret_file_write`]) before any is written, and all
-/// are written before settings.json, so a refused or failed secret write
-/// leaves settings.json untouched.
-///
-/// A `client_secret_file` that holds another value is not replaced when the
-/// incoming `client_id` differs from the entry's: that file is most likely
-/// shared with accounts of the other OAuth client, and replacing it would
-/// break them.
-fn upsert_account(
-    path: &Path,
-    section: &str,
-    account: &str,
-    vars: &[(&str, serde_json::Value)],
-) -> Result<()> {
-    let mut settings_value = read_or_default_settings(path)?;
-
-    let entry = ensure_object_at(&mut settings_value, &[section, "accounts", account])?;
-    let stored_client_id = entry
-        .get("client_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let mut secret_writes = Vec::new();
-    for (key, value) in vars {
-        if let Some(file) = account_secret_file(entry, key, value) {
-            let label = format!("{section}.accounts.{account}.{key}_file");
-            let secret = crate::utils::secret::Secret::new(value.as_str().unwrap_or_default());
-            if let Some(write) =
-                secret_env::plan_secret_file_write(&label, Path::new(&file), &secret)?
-            {
-                if *key == "client_secret" && write.replaces_existing() {
-                    refuse_client_change(&label, stored_client_id.as_deref(), vars)?;
-                }
-                secret_writes.push((write, secret));
-            } // patchcov: coverage ignore-line reason="this closing brace reports 0 hits under llvm-cov regardless of test count — verified locally: upsert_account_writes_a_secret_into_its_file_not_settings and several other tests complete the block above (the push on the line just before, and entry.remove(*key) right after, both measure as hit), yet this specific brace, immediately after an if-let whose scrutinee ends in a `?` operator, never registers a hit; an llvm-cov region-attribution artifact, not an untested path"
-            entry.remove(*key);
-        } else {
-            entry.insert((*key).to_string(), value.clone());
-        }
-    }
-
-    for (write, secret) in secret_writes {
-        write.write(&secret)?;
-    }
-    write_settings(path, &settings_value)
-}
-
-/// Refuses to replace the `client_secret_file` named by `label` when `vars`
-/// carries a `client_id` other than the entry's `stored` one — see
-/// [`upsert_account`].
-fn refuse_client_change(
-    label: &str,
-    stored: Option<&str>,
-    vars: &[(&str, serde_json::Value)],
-) -> Result<()> {
-    let incoming = vars
-        .iter()
-        .find(|(key, _)| *key == "client_id")
-        .and_then(|(_, value)| value.as_str());
-    if let (Some(stored), Some(incoming)) = (stored, incoming) {
-        if stored != incoming {
-            anyhow::bail!(
-                "{label} holds the secret of OAuth client {stored}, not {incoming}; refusing to \
-                 replace it, since other accounts may share it. Point {label} at a file of its \
-                 own, or remove it to store the secret in settings.json"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Resolves the secret field `<section>.accounts.<account>.<field>` from its
-/// plain `value` or its `<field>_file` companion, with the `<NAME>_FILE`
-/// rules (#2008); errors name the full settings key. `Ok(None)` means
-/// neither is set.
-///
-/// # Errors
-///
-/// See [`secret_env::SecretEnvError`].
-pub(crate) fn account_secret(
-    section: &str,
-    account: &str,
-    field: &str,
-    value: Option<&str>,
-    file: Option<&str>,
-) -> std::result::Result<Option<crate::utils::secret::Secret>, secret_env::SecretEnvError> {
-    let name = format!("{section}.accounts.{account}.{field}");
-    secret_env::resolve_secret_pair(&name, value, &format!("{name}_file"), file)
-}
-
-/// Whether a named-account secret field or its `_file` companion is set
-/// (non-empty), without reading the file — for presence-only reports. Only
-/// the MCP `*_auth_status` tools report a named account's presence flags.
-#[cfg(feature = "mcp")]
-pub(crate) fn account_secret_is_set(value: Option<&str>, file: Option<&str>) -> bool {
-    value.is_some_and(|v| !v.is_empty()) || file.is_some_and(|f| !f.is_empty())
-}
-
-/// The `<key>_file` path to write `value` into instead of `entry.<key>`, when
-/// `key` is a secret field, `value` a string, and the companion set.
-fn account_secret_file(
-    entry: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    value: &serde_json::Value,
-) -> Option<String> {
-    if !ACCOUNT_SECRET_FIELDS.contains(&key) || !value.is_string() {
-        return None;
-    }
-    entry
-        .get(&format!("{key}_file"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|file| !file.is_empty())
-        .map(str::to_string)
 }
 
 /// The single hardened write site for the settings file: creates the parent
@@ -1455,6 +920,45 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Serialises a test that points `HOME` at a fresh tempdir (so
+    /// `Settings::load()` reads a `settings.json` the test wrote) on the
+    /// crate-wide [`crate::test_support::HOME_ENV_MUTEX`], and restores `HOME`
+    /// and `OMNI_DEV_PROFILE` when dropped.
+    struct HomeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        home: Option<String>,
+        profile: Option<String>,
+        dir: TempDir,
+    }
+
+    impl HomeGuard {
+        fn take() -> Self {
+            let lock = crate::test_support::HOME_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = Self {
+                _lock: lock,
+                home: env::var("HOME").ok(),
+                profile: env::var(PROFILE_ENV_VAR).ok(),
+                dir: TempDir::new().unwrap(),
+            };
+            env::set_var("HOME", guard.dir.path());
+            env::remove_var(PROFILE_ENV_VAR);
+            guard
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            for (key, value) in [("HOME", &self.home), (PROFILE_ENV_VAR, &self.profile)] {
+                match value {
+                    Some(v) => env::set_var(key, v),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
     /// Builds a `Settings` with a base `env` and one profile, for the pure
     /// resolver tests (no disk, no process env).
     fn settings_with_profile() -> Settings {
@@ -1526,9 +1030,8 @@ mod tests {
         // #1744) — a missing settings.json resolves to defaults with no
         // warning (the ordinary case); this covers "file exists but doesn't
         // parse", which must warn rather than silently drop configuration.
-        let guard = crate::drive::test_support::EnvGuard::take();
-        let dir = guard.clear_credentials();
-        let settings_dir = dir.path().join(".omni-dev");
+        let guard = HomeGuard::take();
+        let settings_dir = guard.dir.path().join(".omni-dev");
         fs::create_dir_all(&settings_dir).unwrap();
         fs::write(settings_dir.join("settings.json"), "{not valid json").unwrap();
 
@@ -1536,16 +1039,14 @@ mod tests {
             let settings = Settings::load_or_warn_default();
             assert!(settings.env.is_empty());
             assert!(settings.profiles.is_empty());
-            assert!(settings.drive.accounts.is_empty());
         });
         assert!(logs.contains("settings.json"), "{logs}");
     }
 
     #[test]
     fn load_daemon_reads_the_daemon_section_of_settings_json() {
-        let guard = crate::drive::test_support::EnvGuard::take();
-        let dir = guard.clear_credentials();
-        let settings_dir = dir.path().join(".omni-dev");
+        let guard = HomeGuard::take();
+        let settings_dir = guard.dir.path().join(".omni-dev");
         fs::create_dir_all(&settings_dir).unwrap();
         fs::write(
             settings_dir.join("settings.json"),
@@ -1561,9 +1062,8 @@ mod tests {
 
     #[test]
     fn load_daemon_warns_and_falls_back_when_settings_json_fails_to_parse() {
-        let guard = crate::drive::test_support::EnvGuard::take();
-        let dir = guard.clear_credentials();
-        let settings_dir = dir.path().join(".omni-dev");
+        let guard = HomeGuard::take();
+        let settings_dir = guard.dir.path().join(".omni-dev");
         fs::create_dir_all(&settings_dir).unwrap();
         fs::write(settings_dir.join("settings.json"), "{not valid json").unwrap();
 
@@ -2141,120 +1641,6 @@ mod tests {
         assert!(settings.mcp.max_response_bytes.is_none());
     }
 
-    #[test]
-    fn settings_parse_gmail_section_from_json() {
-        let json = r#"{
-            "gmail": {
-                "default_account": "work",
-                "accounts": {
-                    "work": {
-                        "client_id": "id",
-                        "client_secret": "secret",
-                        "refresh_token": "token",
-                        "scope": "https://www.googleapis.com/auth/gmail.modify",
-                        "email_address": "alice@work.com"
-                    }
-                }
-            }
-        }"#;
-        let settings: Settings = serde_json::from_str(json).unwrap();
-        assert_eq!(settings.gmail.default_account.as_deref(), Some("work"));
-        let account = settings.gmail.accounts.get("work").unwrap();
-        assert_eq!(account.client_id.as_deref(), Some("id"));
-        assert_eq!(account.client_secret.as_deref(), Some("secret"));
-        assert_eq!(account.refresh_token.as_deref(), Some("token"));
-        assert_eq!(
-            account.scope.as_deref(),
-            Some("https://www.googleapis.com/auth/gmail.modify")
-        );
-        assert_eq!(account.email_address.as_deref(), Some("alice@work.com"));
-    }
-
-    #[test]
-    fn settings_without_gmail_key_defaults_empty() {
-        let settings: Settings = serde_json::from_str(r#"{ "env": {} }"#).unwrap();
-        assert!(settings.gmail.default_account.is_none());
-        assert!(settings.gmail.accounts.is_empty());
-    }
-
-    #[test]
-    fn settings_parse_drive_section_from_json() {
-        let json = r#"{
-            "drive": {
-                "default_account": "work",
-                "accounts": {
-                    "work": {
-                        "client_id": "id",
-                        "client_secret": "secret",
-                        "refresh_token": "token",
-                        "scope": "https://www.googleapis.com/auth/drive.readonly",
-                        "email_address": "alice@work.com"
-                    }
-                }
-            }
-        }"#;
-        let settings: Settings = serde_json::from_str(json).unwrap();
-        assert_eq!(settings.drive.default_account.as_deref(), Some("work"));
-        let account = settings.drive.accounts.get("work").unwrap();
-        assert_eq!(account.client_id.as_deref(), Some("id"));
-        assert_eq!(account.client_secret.as_deref(), Some("secret"));
-        assert_eq!(account.refresh_token.as_deref(), Some("token"));
-        assert_eq!(
-            account.scope.as_deref(),
-            Some("https://www.googleapis.com/auth/drive.readonly")
-        );
-        assert_eq!(account.email_address.as_deref(), Some("alice@work.com"));
-    }
-
-    #[test]
-    fn settings_without_drive_key_defaults_empty() {
-        let settings: Settings = serde_json::from_str(r#"{ "env": {} }"#).unwrap();
-        assert!(settings.drive.default_account.is_none());
-        assert!(settings.drive.accounts.is_empty());
-    }
-
-    #[test]
-    fn settings_parse_lease_section_from_json() {
-        let json = r#"{
-            "lease": {
-                "default_expiry_minutes": 45,
-                "backup_dir": "/tmp/drive-backups",
-                "biometrics_only": true,
-                "allow_headless": true
-            }
-        }"#;
-        let settings: Settings = serde_json::from_str(json).unwrap();
-        assert_eq!(settings.lease.default_expiry_minutes, Some(45));
-        assert_eq!(
-            settings.lease.backup_dir.as_deref(),
-            Some(Path::new("/tmp/drive-backups"))
-        );
-        assert!(settings.lease.biometrics_only);
-        assert!(settings.lease.allow_headless);
-    }
-
-    #[test]
-    fn settings_without_lease_key_defaults_all_unset() {
-        // An absent `lease` block must leave every field at its built-in
-        // default so `drive lease` behaves byte-for-byte as before (issue
-        // #1677).
-        let settings: Settings = serde_json::from_str(r#"{ "env": {} }"#).unwrap();
-        assert!(settings.lease.default_expiry_minutes.is_none());
-        assert!(settings.lease.backup_dir.is_none());
-        assert!(!settings.lease.biometrics_only);
-        assert!(!settings.lease.allow_headless);
-    }
-
-    #[test]
-    fn settings_lease_partial_section_leaves_others_default() {
-        let settings: Settings =
-            serde_json::from_str(r#"{ "lease": { "biometrics_only": true } }"#).unwrap();
-        assert!(settings.lease.biometrics_only);
-        assert!(settings.lease.default_expiry_minutes.is_none());
-        assert!(settings.lease.backup_dir.is_none());
-        assert!(!settings.lease.allow_headless);
-    }
-
     // ── free get_env_var seam (pure: injected raw env + lazy settings loader) ──
 
     #[test]
@@ -2395,13 +1781,13 @@ mod tests {
         }
     }
 
-    /// A settings file as the Google commands leave it: the `gmail`, `drive` and
+    /// A settings file as gwi leaves it in a shared home: the `gmail`, `drive` and
     /// `lease` blocks, a field no omni-dev type models, and an unrelated block
     /// from a product omni-dev has never heard of.
     ///
-    /// A literal rather than the typed structs: the Google types move to gwi
-    /// (#2203, ADR-0095), after which omni-dev no longer models these blocks but
-    /// must still carry them through its own writes (gwi's import reads them).
+    /// A literal rather than typed structs: the Google types moved to gwi
+    /// (#2203, ADR-0095), so omni-dev no longer models these blocks but must
+    /// still carry them through its own writes (gwi's import reads them).
     const GOOGLE_BLOCKS_SETTINGS: &str = r#"{
         "env": {"KEEP": "me"},
         "gmail": {
@@ -2728,723 +2114,5 @@ mod tests {
         let mut root = serde_json::json!({"gmail": {"accounts": {}}});
         assert!(object_at_mut(&mut root, &["gmail", "accounts", "work"]).is_none());
         assert!(object_at_mut(&mut root, &["missing", "accounts"]).is_none());
-    }
-
-    // ── gmail account writes (issue #1500) ─────────────────────────────
-
-    #[test]
-    fn upsert_gmail_account_creates_nested_path_and_preserves_siblings() {
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{"env": {"SHARED": "base"}, "gmail": {"accounts": {"personal": {"client_id": "keep"}}}, "extra": true}"#,
-        )
-        .unwrap();
-
-        Settings::upsert_gmail_account(
-            &path,
-            "work",
-            &[
-                ("client_id", serde_json::Value::String("id".to_string())),
-                (
-                    "refresh_token",
-                    serde_json::Value::String("token".to_string()),
-                ),
-            ],
-        )
-        .unwrap();
-
-        let val = read_json(&path);
-        assert_eq!(val["gmail"]["accounts"]["work"]["client_id"], "id");
-        assert_eq!(val["gmail"]["accounts"]["work"]["refresh_token"], "token");
-        assert_eq!(val["gmail"]["accounts"]["personal"]["client_id"], "keep");
-        assert_eq!(val["env"]["SHARED"], "base");
-        assert_eq!(val["extra"], true);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let file_mode = fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(file_mode & 0o777, 0o600);
-        }
-    }
-
-    /// Regression test for the PR #1528 review comment: writing a non-string
-    /// field (e.g. `chrome_profile_from_email: bool`) through
-    /// `upsert_gmail_account` must round-trip through `Settings::load()` —
-    /// before the `vars` type was widened to `serde_json::Value`, this
-    /// silently wrote the JSON string `"true"` into a `bool` field and broke
-    /// parsing of the entire settings file on next load.
-    #[test]
-    fn upsert_gmail_account_writes_a_bool_value_that_round_trips_through_settings_load() {
-        let (_tmp, path) = temp_settings_path();
-
-        Settings::upsert_gmail_account(
-            &path,
-            "work",
-            &[("chrome_profile_from_email", serde_json::Value::Bool(true))],
-        )
-        .unwrap();
-
-        let val = read_json(&path);
-        assert_eq!(
-            val["gmail"]["accounts"]["work"]["chrome_profile_from_email"],
-            true
-        );
-
-        let settings = Settings::load_from_path(&path).unwrap();
-        assert!(
-            settings.gmail.accounts["work"].chrome_profile_from_email,
-            "the bool field must deserialize back to `true`, not the string \"true\""
-        );
-    }
-
-    #[test]
-    fn remove_gmail_account_true_when_present_false_when_absent() {
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{"gmail": {"accounts": {"work": {"client_id": "id"}, "personal": {"client_id": "keep"}}}}"#,
-        )
-        .unwrap();
-
-        assert!(Settings::remove_gmail_account(&path, "work").unwrap());
-        let val = read_json(&path);
-        assert!(val["gmail"]["accounts"].get("work").is_none());
-        assert_eq!(val["gmail"]["accounts"]["personal"]["client_id"], "keep");
-
-        assert!(!Settings::remove_gmail_account(&path, "work").unwrap());
-    }
-
-    #[test]
-    fn remove_gmail_account_clears_default_account_when_it_named_the_removed_account() {
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{"gmail": {"default_account": "work", "accounts": {"work": {"client_id": "id"}, "personal": {"client_id": "keep"}}}}"#,
-        )
-        .unwrap();
-
-        assert!(Settings::remove_gmail_account(&path, "work").unwrap());
-        let val = read_json(&path);
-        assert!(val["gmail"].get("default_account").is_none());
-        assert_eq!(val["gmail"]["accounts"]["personal"]["client_id"], "keep");
-    }
-
-    #[test]
-    fn remove_gmail_account_leaves_default_account_untouched_when_it_names_a_different_account() {
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{"gmail": {"default_account": "personal", "accounts": {"work": {"client_id": "id"}, "personal": {"client_id": "keep"}}}}"#,
-        )
-        .unwrap();
-
-        assert!(Settings::remove_gmail_account(&path, "work").unwrap());
-        let val = read_json(&path);
-        assert_eq!(val["gmail"]["default_account"], "personal");
-    }
-
-    #[test]
-    fn remove_gmail_account_false_when_file_missing() {
-        let (_tmp, path) = temp_settings_path();
-        assert!(!Settings::remove_gmail_account(&path, "work").unwrap());
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn set_gmail_default_account_sets_and_clears() {
-        let (_tmp, path) = temp_settings_path();
-
-        Settings::set_gmail_default_account(&path, Some("work")).unwrap();
-        assert_eq!(read_json(&path)["gmail"]["default_account"], "work");
-
-        Settings::set_gmail_default_account(&path, None).unwrap();
-        assert!(read_json(&path)["gmail"].get("default_account").is_none());
-    }
-
-    // ── drive account writes (issue #1522) ─────────────────────────────
-
-    #[test]
-    fn upsert_drive_account_creates_nested_path_and_preserves_siblings() {
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{"env": {"SHARED": "base"}, "drive": {"accounts": {"personal": {"client_id": "keep"}}}, "extra": true}"#,
-        )
-        .unwrap();
-
-        Settings::upsert_drive_account(
-            &path,
-            "work",
-            &[
-                ("client_id", serde_json::Value::String("id".to_string())),
-                (
-                    "refresh_token",
-                    serde_json::Value::String("token".to_string()),
-                ),
-            ],
-        )
-        .unwrap();
-
-        let val = read_json(&path);
-        assert_eq!(val["drive"]["accounts"]["work"]["client_id"], "id");
-        assert_eq!(val["drive"]["accounts"]["work"]["refresh_token"], "token");
-        assert_eq!(val["drive"]["accounts"]["personal"]["client_id"], "keep");
-        assert_eq!(val["env"]["SHARED"], "base");
-        assert_eq!(val["extra"], true);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let file_mode = fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(file_mode & 0o777, 0o600);
-        }
-    }
-
-    // ── named-account `_file` secrets (#2008) ────────────────────────────
-
-    /// A settings file whose `drive.accounts.work` names `refresh_token_file`
-    /// (and optionally `client_secret_file`) under `dir`.
-    fn settings_with_secret_files(
-        path: &Path,
-        client_secret_file: Option<&Path>,
-        refresh_token_file: &Path,
-    ) {
-        let mut work = serde_json::json!({
-            "client_id": "id",
-            "refresh_token_file": refresh_token_file.to_str().unwrap(),
-        });
-        if let Some(file) = client_secret_file {
-            work["client_secret_file"] = serde_json::json!(file.to_str().unwrap());
-        }
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            path,
-            serde_json::json!({ "drive": { "accounts": { "work": work } } }).to_string(),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn account_secret_file_fields_deserialize() {
-        let (_tmp, path) = temp_settings_path();
-        settings_with_secret_files(&path, Some(Path::new("/s/cs")), Path::new("/s/rt"));
-        let settings = Settings::load_from_path(&path).unwrap();
-        let work = &settings.drive.accounts["work"];
-        assert_eq!(work.client_secret_file.as_deref(), Some("/s/cs"));
-        assert_eq!(work.refresh_token_file.as_deref(), Some("/s/rt"));
-        assert!(work.client_secret.is_none());
-    }
-
-    #[test]
-    fn upsert_account_writes_a_secret_into_its_file_not_settings() {
-        let (tmp, path) = temp_settings_path();
-        let token_file = tmp.path().join("refresh-token");
-        settings_with_secret_files(&path, None, &token_file);
-
-        Settings::upsert_drive_account(
-            &path,
-            "work",
-            &[
-                ("client_secret", serde_json::json!("plain-secret")),
-                ("refresh_token", serde_json::json!("new-token")),
-                ("scope", serde_json::json!("s")),
-            ],
-        )
-        .unwrap();
-
-        let raw = fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("new-token"), "{raw}");
-        let val = read_json(&path);
-        let work = &val["drive"]["accounts"]["work"];
-        assert!(work.get("refresh_token").is_none());
-        assert_eq!(work["refresh_token_file"], token_file.to_str().unwrap());
-        // A secret field without a companion is written as before.
-        assert_eq!(work["client_secret"], "plain-secret");
-        assert_eq!(work["scope"], "s");
-        assert_eq!(fs::read_to_string(&token_file).unwrap(), "new-token\n");
-    }
-
-    #[test]
-    fn upsert_account_drops_a_plain_field_that_would_conflict_with_its_file() {
-        let (tmp, path) = temp_settings_path();
-        let secret_file = tmp.path().join("client-secret");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            serde_json::json!({ "gmail": { "accounts": { "work": {
-                "client_secret": "stale",
-                "client_secret_file": secret_file.to_str().unwrap(),
-            }}}})
-            .to_string(),
-        )
-        .unwrap();
-
-        Settings::upsert_gmail_account(
-            &path,
-            "work",
-            &[("client_secret", serde_json::json!("fresh"))],
-        )
-        .unwrap();
-
-        let val = read_json(&path);
-        assert!(val["gmail"]["accounts"]["work"]
-            .get("client_secret")
-            .is_none());
-        assert_eq!(fs::read_to_string(&secret_file).unwrap(), "fresh\n");
-    }
-
-    #[test]
-    fn upsert_account_leaves_settings_untouched_when_the_secret_write_fails() {
-        let (tmp, path) = temp_settings_path();
-        let token_file = tmp.path().join("missing-dir").join("refresh-token");
-        settings_with_secret_files(&path, None, &token_file);
-        let before = fs::read_to_string(&path).unwrap();
-
-        let err = Settings::upsert_drive_account(
-            &path,
-            "work",
-            &[
-                ("scope", serde_json::json!("s")),
-                ("refresh_token", serde_json::json!("new-token")),
-            ],
-        )
-        .unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("drive.accounts.work.refresh_token_file"),
-            "{err}"
-        );
-        assert!(!err.to_string().contains("new-token"), "{err}");
-        assert_eq!(fs::read_to_string(&path).unwrap(), before);
-    }
-
-    /// Writes `contents` owner-only to `name` under `dir`.
-    fn owner_only(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
-        let file = dir.join(name);
-        fs::write(&file, contents).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        file
-    }
-
-    #[test]
-    fn upsert_account_checks_every_secret_file_before_writing_any() {
-        let (tmp, path) = temp_settings_path();
-        let secret_file = owner_only(tmp.path(), "client-secret", "old-secret\n");
-        let token_file = tmp.path().join("missing-dir").join("refresh-token");
-        settings_with_secret_files(&path, Some(&secret_file), &token_file);
-
-        Settings::upsert_drive_account(
-            &path,
-            "work",
-            &[
-                ("client_secret", serde_json::json!("new-secret")),
-                ("refresh_token", serde_json::json!("new-token")),
-            ],
-        )
-        .unwrap_err();
-
-        assert_eq!(fs::read_to_string(&secret_file).unwrap(), "old-secret\n");
-    }
-
-    #[test]
-    fn upsert_account_refuses_to_replace_a_client_secret_file_of_another_client() {
-        let (tmp, path) = temp_settings_path();
-        let secret_file = owner_only(tmp.path(), "client-secret", "old-secret\n");
-        let token_file = tmp.path().join("refresh-token");
-        settings_with_secret_files(&path, Some(&secret_file), &token_file);
-        let before = fs::read_to_string(&path).unwrap();
-
-        let err = Settings::upsert_drive_account(
-            &path,
-            "work",
-            &[
-                ("client_id", serde_json::json!("other-id")),
-                ("client_secret", serde_json::json!("other-secret")),
-                ("refresh_token", serde_json::json!("new-token")),
-            ],
-        )
-        .unwrap_err();
-
-        let message = err.to_string();
-        assert!(
-            message.contains("drive.accounts.work.client_secret_file"),
-            "{message}"
-        );
-        assert!(message.contains("other-id"), "{message}");
-        assert!(!message.contains("other-secret"), "{message}");
-        assert_eq!(fs::read_to_string(&secret_file).unwrap(), "old-secret\n");
-        assert!(!token_file.exists());
-        assert_eq!(fs::read_to_string(&path).unwrap(), before);
-    }
-
-    #[test]
-    fn upsert_account_replaces_a_client_secret_file_for_the_same_client() {
-        let (tmp, path) = temp_settings_path();
-        let secret_file = owner_only(tmp.path(), "client-secret", "old-secret\n");
-        let token_file = tmp.path().join("refresh-token");
-        settings_with_secret_files(&path, Some(&secret_file), &token_file);
-
-        Settings::upsert_drive_account(
-            &path,
-            "work",
-            &[
-                ("client_id", serde_json::json!("id")),
-                ("client_secret", serde_json::json!("rotated-secret")),
-                ("refresh_token", serde_json::json!("new-token")),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            fs::read_to_string(&secret_file).unwrap(),
-            "rotated-secret\n"
-        );
-        assert_eq!(fs::read_to_string(&token_file).unwrap(), "new-token\n");
-    }
-
-    #[test]
-    fn upsert_gmail_account_writes_a_refresh_token_into_its_file() {
-        let (tmp, path) = temp_settings_path();
-        let token_file = tmp.path().join("gmail-refresh-token");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            serde_json::json!({ "gmail": { "accounts": { "work": {
-                "refresh_token_file": token_file.to_str().unwrap(),
-            }}}})
-            .to_string(),
-        )
-        .unwrap();
-
-        Settings::upsert_gmail_account(
-            &path,
-            "work",
-            &[("refresh_token", serde_json::json!("gmail-token"))],
-        )
-        .unwrap();
-
-        assert!(!fs::read_to_string(&path).unwrap().contains("gmail-token"));
-        assert_eq!(fs::read_to_string(&token_file).unwrap(), "gmail-token\n");
-        let settings = Settings::load_from_path(&path).unwrap();
-        assert!(settings.gmail.accounts["work"].refresh_token.is_none());
-    }
-
-    /// Drive's twin of
-    /// `upsert_gmail_account_writes_a_bool_value_that_round_trips_through_settings_load`
-    /// — see that test's doc comment for the PR #1528 review comment this
-    /// closes.
-    #[test]
-    fn upsert_drive_account_writes_a_bool_value_that_round_trips_through_settings_load() {
-        let (_tmp, path) = temp_settings_path();
-
-        Settings::upsert_drive_account(
-            &path,
-            "work",
-            &[("chrome_profile_from_email", serde_json::Value::Bool(true))],
-        )
-        .unwrap();
-
-        let val = read_json(&path);
-        assert_eq!(
-            val["drive"]["accounts"]["work"]["chrome_profile_from_email"],
-            true
-        );
-
-        let settings = Settings::load_from_path(&path).unwrap();
-        assert!(
-            settings.drive.accounts["work"].chrome_profile_from_email,
-            "the bool field must deserialize back to `true`, not the string \"true\""
-        );
-    }
-
-    // ── write_permissions (issue #1574) ─────────────────────────────────
-
-    #[test]
-    fn write_permissions_field_round_trips_through_settings_load() {
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{
-                "drive": {
-                    "accounts": {
-                        "work": {
-                            "write_permissions": {
-                                "rules": [
-                                    {
-                                        "folder_id": "folder-1",
-                                        "recursive": true,
-                                        "allow": ["create", "upload"],
-                                        "deny": ["edit"]
-                                    }
-                                ]
-                            }
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let settings = Settings::load_from_path(&path).unwrap();
-        let rules = &settings.drive.accounts["work"].write_permissions.rules;
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].folder_id.as_deref(), Some("folder-1"));
-        assert!(rules[0].recursive);
-        assert!(rules[0]
-            .allow
-            .contains(&crate::drive::write_gate::DriveOperation::Create));
-        assert!(rules[0]
-            .allow
-            .contains(&crate::drive::write_gate::DriveOperation::Upload));
-        assert!(rules[0]
-            .deny
-            .contains(&crate::drive::write_gate::DriveOperation::Edit));
-    }
-
-    #[test]
-    fn write_permissions_absent_defaults_to_empty_rules() {
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{"drive": {"accounts": {"work": {"client_id": "id"}}}}"#,
-        )
-        .unwrap();
-
-        let settings = Settings::load_from_path(&path).unwrap();
-        assert!(settings.drive.accounts["work"]
-            .write_permissions
-            .rules
-            .is_empty());
-    }
-
-    /// Mirrors the crate-wide unknown-field-preserving convention every
-    /// other settings block already guarantees: a future field inside
-    /// `write_permissions` that this version of `omni-dev` doesn't know
-    /// about must survive an unrelated read-modify-write cycle untouched,
-    /// since writes go through the untyped `serde_json::Value` merge path
-    /// ([`read_or_default_settings`]/[`ensure_object_at`]), never a
-    /// round-trip through the typed struct.
-    #[test]
-    fn write_permissions_unknown_future_field_is_preserved_through_read_modify_write() {
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{
-                "drive": {
-                    "accounts": {
-                        "work": {
-                            "write_permissions": {
-                                "rules": [],
-                                "future_field": "not yet modeled"
-                            }
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        Settings::upsert_drive_account(
-            &path,
-            "work",
-            &[("client_id", serde_json::Value::String("id".to_string()))],
-        )
-        .unwrap();
-
-        let val = read_json(&path);
-        assert_eq!(
-            val["drive"]["accounts"]["work"]["write_permissions"]["future_field"],
-            "not yet modeled"
-        );
-        assert_eq!(val["drive"]["accounts"]["work"]["client_id"], "id");
-    }
-
-    #[test]
-    fn remove_drive_account_true_when_present_false_when_absent() {
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{"drive": {"accounts": {"work": {"client_id": "id"}, "personal": {"client_id": "keep"}}}}"#,
-        )
-        .unwrap();
-
-        assert!(Settings::remove_drive_account(&path, "work").unwrap());
-        let val = read_json(&path);
-        assert!(val["drive"]["accounts"].get("work").is_none());
-        assert_eq!(val["drive"]["accounts"]["personal"]["client_id"], "keep");
-
-        assert!(!Settings::remove_drive_account(&path, "work").unwrap());
-    }
-
-    #[test]
-    fn remove_drive_account_clears_default_account_when_it_named_the_removed_account() {
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{"drive": {"default_account": "work", "accounts": {"work": {"client_id": "id"}, "personal": {"client_id": "keep"}}}}"#,
-        )
-        .unwrap();
-
-        assert!(Settings::remove_drive_account(&path, "work").unwrap());
-        let val = read_json(&path);
-        assert!(val["drive"].get("default_account").is_none());
-        assert_eq!(val["drive"]["accounts"]["personal"]["client_id"], "keep");
-    }
-
-    #[test]
-    fn remove_drive_account_leaves_default_account_untouched_when_it_names_a_different_account() {
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{"drive": {"default_account": "personal", "accounts": {"work": {"client_id": "id"}, "personal": {"client_id": "keep"}}}}"#,
-        )
-        .unwrap();
-
-        assert!(Settings::remove_drive_account(&path, "work").unwrap());
-        let val = read_json(&path);
-        assert_eq!(val["drive"]["default_account"], "personal");
-    }
-
-    #[test]
-    fn remove_drive_account_false_when_file_missing() {
-        let (_tmp, path) = temp_settings_path();
-        assert!(!Settings::remove_drive_account(&path, "work").unwrap());
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn set_drive_default_account_sets_and_clears() {
-        let (_tmp, path) = temp_settings_path();
-
-        Settings::set_drive_default_account(&path, Some("work")).unwrap();
-        assert_eq!(read_json(&path)["drive"]["default_account"], "work");
-
-        Settings::set_drive_default_account(&path, None).unwrap();
-        assert!(read_json(&path)["drive"].get("default_account").is_none());
-    }
-
-    // ── file-id rules (issue #1612) ─────────────────────────────────────
-
-    /// Writes `rules` as an account's `write_permissions.rules` and loads it.
-    fn load_with_rules(rules_json: &str) -> Result<Settings> {
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            format!(
-                r#"{{"drive":{{"accounts":{{"work":{{"write_permissions":{{"rules":{rules_json}}}}}}}}}}}"#
-            ),
-        )
-        .unwrap();
-        Settings::load_from_path(&path)
-    }
-
-    #[test]
-    fn a_file_id_rule_round_trips_through_settings_load() {
-        let settings =
-            load_with_rules(r#"[{"file_id":"sheet-1","allow":["sheets-write"]}]"#).unwrap();
-        let rules = &settings.drive.accounts["work"].write_permissions.rules;
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].file_id.as_deref(), Some("sheet-1"));
-        assert_eq!(rules[0].folder_id, None);
-        assert!(!rules[0].recursive);
-        assert!(rules[0]
-            .allow
-            .contains(&crate::drive::write_gate::DriveOperation::SheetsWrite));
-    }
-
-    #[test]
-    fn folder_and_file_rules_coexist_in_one_list() {
-        let settings = load_with_rules(
-            r#"[{"folder_id":"f1","recursive":true,"allow":["create"]},
-                {"file_id":"x1","deny":["edit"]}]"#,
-        )
-        .unwrap();
-        let rules = &settings.drive.accounts["work"].write_permissions.rules;
-        assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].folder_id.as_deref(), Some("f1"));
-        assert_eq!(rules[1].file_id.as_deref(), Some("x1"));
-    }
-
-    #[test]
-    fn a_rule_naming_no_target_fails_the_whole_load() {
-        // Fail-closed: `active_account_rules` turns a load error into an
-        // empty rule set, which denies every write.
-        assert!(load_with_rules(r#"[{"allow":["create"]}]"#).is_err());
-    }
-
-    #[test]
-    fn a_rule_naming_both_targets_fails_the_whole_load() {
-        assert!(load_with_rules(r#"[{"folder_id":"f1","file_id":"x1"}]"#).is_err());
-    }
-
-    #[test]
-    fn recursive_true_on_a_file_rule_fails_the_whole_load() {
-        assert!(load_with_rules(r#"[{"file_id":"x1","recursive":true}]"#).is_err());
-    }
-
-    #[test]
-    fn an_older_binary_would_fail_closed_on_a_file_rule() {
-        // The backward-compatibility claim, pinned. An older binary has
-        // `folder_id: String` (required), so a file rule is a missing-field
-        // error there — exactly what this asserts by omitting `folder_id`
-        // from a shape that requires one. `Settings::load()` then fails and
-        // `active_account_rules` degrades to zero rules: every write denied,
-        // never silently widened. Same mechanism ADR-0073 §3 accepted for a
-        // new `DriveOperation` variant.
-        #[derive(Debug, serde::Deserialize)]
-        #[allow(dead_code)]
-        struct OldFolderPermissionRule {
-            folder_id: String,
-        }
-        let err = serde_json::from_str::<OldFolderPermissionRule>(r#"{"file_id":"x1"}"#)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("folder_id"), "{err}");
-    }
-
-    #[test]
-    fn upsert_drive_account_preserves_file_id_rules_it_cannot_understand() {
-        // Settings *writes* go through an untyped `serde_json::Value`
-        // merge, so an older binary running `drive auth login` cannot drop
-        // the file rules it failed to parse.
-        let (_tmp, path) = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{"drive":{"accounts":{"work":{"write_permissions":{"rules":[
-                {"file_id":"sheet-1","allow":["sheets-write"]}]}}}}}"#,
-        )
-        .unwrap();
-
-        Settings::upsert_drive_account(
-            &path,
-            "work",
-            &[("email", serde_json::Value::String("a@b.c".to_string()))],
-        )
-        .unwrap();
-
-        let reloaded = Settings::load_from_path(&path).unwrap();
-        let rules = &reloaded.drive.accounts["work"].write_permissions.rules;
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].file_id.as_deref(), Some("sheet-1"));
     }
 }

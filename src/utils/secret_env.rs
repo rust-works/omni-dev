@@ -77,11 +77,6 @@ pub const SECRET_ENV_VARS: &[&str] = &[
     // Datadog
     "DATADOG_API_KEY",
     "DATADOG_APP_KEY",
-    // Gmail (the client secret is exempt — see EXEMPT_SECRET_ENV_VARS)
-    "GMAIL_REFRESH_TOKEN",
-    // Drive
-    "DRIVE_CLIENT_SECRET",
-    "DRIVE_REFRESH_TOKEN",
     // Snowflake
     "SNOWFLAKE_TOKEN",
     "SNOWFLAKE_PRIVATE_KEY",
@@ -102,12 +97,6 @@ pub const EXEMPT_SECRET_ENV_VARS: &[(&str, &str)] = &[
         "GITHUB_TOKEN",
         "GitHub CLI child-environment output, never read by omni-dev; set alongside \
          GH_TOKEN so inherited credentials cannot override App authentication",
-    ),
-    (
-        "GMAIL_CLIENT_SECRET",
-        "GMAIL_CLIENT_SECRET_FILE already names a Google client_secret.json for \
-         `gmail auth import`; an installed-app OAuth client secret is not \
-         confidential, and that command already reads it from a file (ADR-0089)",
     ),
     (
         "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
@@ -421,8 +410,7 @@ pub fn secret_var(env: &impl EnvSource, name: &str) -> Result<Option<Secret>, Se
 /// [`secret_var`]'s rules, for secrets that are not environment variables:
 /// the named-account `client_secret`/`client_secret_file` and
 /// `refresh_token`/`refresh_token_file` fields in settings.json (#2008). The
-/// labels only name the pair in errors, e.g.
-/// `drive.accounts.work.client_secret`.
+/// labels only name the pair in errors, e.g. `section.accounts.work.client_secret`.
 ///
 /// # Errors
 ///
@@ -1532,8 +1520,6 @@ mod tests {
              another meaning; rename it or exempt the secret (ADR-0089, ADR-0090): \
              {collisions:#?}"
         );
-        // The known collision is why GMAIL_CLIENT_SECRET is exempt.
-        assert!(!SECRET_ENV_VARS.contains(&"GMAIL_CLIENT_SECRET"));
     }
 
     /// (d) Only the resolver, the settings writers and the `claude-cli` scrub
