@@ -3,7 +3,9 @@
 omni-dev can **serve** the Anthropic Messages API in front of a model that
 speaks the OpenAI protocol. Claude Code, the Anthropic SDKs and anything else
 that honours `ANTHROPIC_BASE_URL` can then use models from OpenAI, Ollama,
-LM Studio, vLLM, OpenRouter or Fireworks AI. The gateway accepts
+LM Studio, vLLM, OpenRouter or Fireworks AI, as well as native Claude on
+Bedrock with bearer authentication. A single listener can route each requested
+model to a different configured upstream. The gateway accepts
 Anthropic-shaped requests, translates them, calls the upstream, and translates
 the reply back, streaming included.
 
@@ -60,7 +62,7 @@ The token is created on first use and kept in `<data dir>/omni-dev/gateway.token
 |---|---|
 | `POST /v1/messages` | Translated, streaming (`stream: true`) and not. `?beta=true` (what Claude Code sends) is accepted. |
 | `POST /v1/messages/count_tokens` | An **estimate** (see [Limitations](#limitations)), marked by an `x-omni-dev-token-estimate: heuristic` header. Passthrough forwards it, falling back to the estimate when the upstream answers 404. |
-| `GET /v1/models` | The model map's exact names and the default model, in Anthropic's list shape. |
+| `GET /v1/models` | Single upstream: the map's exact names and default model. Named upstreams: exact route aliases plus the combined discovered catalog; ambiguous ownership or unavailable catalogs fail clearly. |
 | `GET /v1/models/{id}` | The model, if the map resolves it. |
 
 Message Batches, the Files API and the Admin API are not served. Every other
@@ -75,14 +77,15 @@ it. When the gateway ignored any part of the request (see
 
 Every setting is an environment variable, so the `env` block of
 `~/.omni-dev/settings.json` and `--profile` work as they do for the rest of
-omni-dev. `ai gateway serve` flags override the matching variables. One
-process serves one upstream; keep one profile per upstream to switch between
-them.
+omni-dev. `ai gateway serve` flags override the matching variables in legacy
+single-upstream mode. To route per request on one listener, use the
+[named upstream configuration](#named-upstreams-and-discovery) instead. Both
+modes work without CLI flags, including under the daemon.
 
 | Variable | Flag | Default | Meaning |
 |---|---|---|---|
 | `OMNI_DEV_GATEWAY_UPSTREAM_URL` | `--upstream-url` | (required) | Upstream base URL. A trailing `/v1` is dropped; the gateway appends `/v1/...` itself. |
-| `OMNI_DEV_GATEWAY_UPSTREAM_PROTOCOL` | `--upstream-protocol` | `chat` | `chat` (Chat Completions), `responses` (Responses API) or `anthropic` (passthrough). |
+| `OMNI_DEV_GATEWAY_UPSTREAM_PROTOCOL` | `--upstream-protocol` | `chat` | `chat` (Chat Completions), `responses` (Responses API), `anthropic` (passthrough), or `bedrock` (native Claude InvokeModel). |
 | `OMNI_DEV_GATEWAY_FLAVOR` | `--flavor` | `generic` | `generic`, `openai` or `fireworks`: which provider quirks apply. |
 | `OMNI_DEV_GATEWAY_API_KEY` | — | none | Upstream key, sent as `Authorization: Bearer`, or as `x-api-key` in passthrough to anything but Fireworks. Optional for local servers. |
 | `OMNI_DEV_GATEWAY_MODEL` | `--model` | none | Default upstream model. |
@@ -171,6 +174,153 @@ export OMNI_DEV_GATEWAY_MODEL=accounts/fireworks/models/glm-5p1
 Responses echo the model name the client sent. The upstream model is in the
 `x-omni-dev-gateway-upstream-model` header.
 
+## Named upstreams and discovery
+
+`OMNI_DEV_GATEWAY_UPSTREAMS` is a JSON array of named upstream objects;
+`OMNI_DEV_GATEWAY_ROUTES` is an optional JSON array of custom routes. They are
+strings in the settings `env` block, just like the existing gateway variables.
+For example, these environment values also work with `ai gateway serve`
+**without any flags**:
+
+```sh
+export OMNI_DEV_GATEWAY_UPSTREAMS='[
+  {"name":"chat","url":"http://localhost:8001","protocol":"chat",
+   "flavor":"fireworks","api_key_env":"OPENAI_API_KEY"},
+  {"name":"native","url":"https://runtime.example.invalid","protocol":"bedrock",
+   "api_key_env":"AWS_BEARER_TOKEN_BEDROCK",
+   "catalog_url":"https://catalog.example.invalid",
+   "catalog_paths":["/foundation-models?byProvider=Anthropic","/inference-profiles"]}
+]'
+export OMNI_DEV_GATEWAY_ROUTES='[
+  {"pattern":"claude-fast-*","upstream":"chat","model":"small-model"},
+  {"pattern":"claude-fast-native","upstream":"native","model":"example.claude-v1:0"},
+  {"pattern":"native-*","upstream":"native"}
+]'
+# Set OPENAI_API_KEY_FILE and AWS_BEARER_TOKEN_BEDROCK_FILE to owner-only secret
+# files, or use the corresponding _COMMAND secret helpers.
+omni-dev ai gateway serve
+```
+
+The reserved example hosts above are placeholders, not service endpoints.
+Replace them with explicitly trusted endpoints. Do not mix named mode with
+legacy `UPSTREAM_URL`, `UPSTREAM_PROTOCOL`, `FLAVOR`, `API_KEY`, `MODEL`,
+`MODEL_MAP` variables (including secret companions) or their CLI flags: this
+is rejected rather than silently ignoring one configuration. Shared settings
+such as port, token, concurrency cap and unknown-field policy still apply.
+
+Each upstream has:
+
+- a unique ASCII `name` and an HTTP(S) `url` (a trailing `/v1` is removed);
+- `protocol`: `chat` (default), `responses`, `anthropic`, or `bedrock`;
+- `flavor`: `generic` (default), `openai`, or `fireworks`;
+- optional `api_key_env`: the name of **that upstream's** registered secret variable
+  from `src/utils/secret_env.rs::SECRET_ENV_VARS`, for example `OPENAI_API_KEY`,
+  `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or `AWS_BEARER_TOKEN_BEDROCK`.
+  Arbitrary unregistered names are rejected so helper subprocess sanitation and
+  auth redaction cover the actual variable, not merely a lookup alias.
+  `OMNI_DEV_GATEWAY_TOKEN` cannot be an upstream reference, and no upstream key
+  may equal the resolved inbound token. `ANTHROPIC_AUTH_TOKEN` is allowed when
+  explicitly used as a distinct provider credential, not as the gateway token.
+  Its `_FILE` and `_COMMAND` companions use the existing secret resolver and
+  settings-layer precedence. Omit it for unauthenticated local servers. Keys
+  are never inherited from another upstream or from the inbound token;
+- optional `effort_levels` (comma-separated values) and `think_tags` (boolean,
+  default true), used for translation on that upstream;
+- optional `catalog_url` (defaults to `url`) and `catalog_paths` (an array of
+  path suffixes appended to that base URL, with optional query parameters).
+  Paths must begin with one `/`, cannot override the origin, and cannot have
+  a fragment. `[]` disables discovery for that upstream. Non-Bedrock defaults
+  to `["/v1/models"]`; **Bedrock defaults to `[]`**, because a runtime endpoint
+  does not universally list foundation models or inference profiles.
+
+Routes have a `pattern` (exact name or `*` glob), an `upstream` name and an
+optional **literal** `model` mapping. Omitting `model` preserves the requested
+name; it does not perform glob substitution. Exact routes always win, then
+the first matching glob in configuration order. Duplicate patterns are rejected.
+Custom routing does not consult catalogs, so it remains usable during catalog
+outages and can explicitly resolve conflicting ownership. There is no implicit
+default upstream in named mode.
+
+Otherwise the gateway discovers ownership by model identifier. Exactly one
+owner is required: no owner is `404 not_found_error`; multiple owners are
+`400 invalid_request_error`, with instructions to configure a route. All
+enabled catalogs must succeed before discovery can establish unique ownership:
+a partial catalog failure is `502 api_error`, **even if another catalog already
+advertises the model**. The gateway never fans inference out, and never sends
+a failed inference to a different upstream. A model disappearing from a provider
+during the cache lifetime may fail there until refresh; that does not cause fallback.
+
+Discovery is lazy and shared by requests and `/v1/models`. A complete result,
+including missing model lookups, is cached for **60 seconds**; a refresh failure
+is cached for **5 seconds**. Concurrent refreshes coalesce. Expired successful
+ownership is **not** served stale after a failure. Restarting the gateway clears
+the cache. Refresh has a **15-second total deadline**, at most **32 upstreams**,
+**4 catalog paths per upstream**, **16 pages per path**, **1 MiB per page**,
+and **16,384 unique identifiers**. Pagination loops and limit overruns fail,
+rather than returning an incomplete supported-model list.
+
+Supported JSON catalogs are `data: [{id}]` (OpenAI/Anthropic-compatible),
+`models: [{name}]` or `models: [{model}]` (local compatible servers),
+`modelSummaries: [{modelId, modelArn?}]` (ListFoundationModels),
+`inferenceProfileSummaries: [{inferenceProfileId, inferenceProfileArn?}]`
+(ListInferenceProfiles), or an array of identifier strings. IDs and ARNs are
+both usable. Supported cursors are `nextToken` → `nextToken`, `next_token` →
+`next_token`, `next_page_token` → `page_token`, `next_page` → `page`, or
+`has_more: true` with `last_id` (else the last identifier) → `after`. Tokens
+are URL-encoded as query values, never followed as URLs. Malformed or unsupported
+pagination is rejected. Select compatible paths for your provider rather than
+assuming one universal catalog service.
+
+`GET /v1/models` returns deduplicated, sorted exact route aliases and discovered
+IDs. Infinite glob aliases cannot be enumerated; they can still be requested.
+Ambiguous discovered IDs fail listing unless a custom route owns them. A catalog
+outage fails listing even though explicit routes remain callable. Listing,
+model lookup and token counting use the same inbound token guard as inference;
+discovery and all outbound requests share the gateway concurrency budget.
+
+### Native Bedrock Claude
+
+Set `protocol: "bedrock"` on a named upstream, or use the existing single-upstream
+`OMNI_DEV_GATEWAY_UPSTREAM_PROTOCOL=bedrock` with `UPSTREAM_URL` and model mapping.
+The gateway uses **bearer authentication**, matching the existing Bedrock AI
+client's configurable-base-URL contract. It adds **no SigV4 signing or AWS IAM
+credential chain**. An endpoint requiring IAM signing needs a separately
+configured compatible bearer-authenticated endpoint; IAM-only service catalogs
+will fail rather than trigger credential discovery or a different auth method.
+
+Configure trusted catalog paths/base URLs only if they support this auth
+contract. Native ListFoundationModels and ListInferenceProfiles response shapes
+are understood, but the runtime host is **not** assumed to implement either
+control-plane API. Compatible catalog endpoints or explicit routes with
+`catalog_paths: []` are supported alternatives. Configure catalogs to advertise
+Claude models suitable for InvokeModel; this is not a Converse adapter for
+other Bedrock model families.
+
+The gateway calls `/model/{URL-encoded model ID or ARN}/invoke` or
+`/invoke-with-response-stream`. It removes the body's `model` and `stream`,
+sets `anthropic_version: "bedrock-2023-05-31"`, and moves the `anthropic-beta`
+header values into `anthropic_beta`. Native tools, tool results, thinking,
+redacted thinking and provider signatures are passed through unmodified, not
+lowered or re-signed. The upstream validates native feature support, as in
+Anthropic passthrough; the translation field-policy table below applies to
+Chat/Responses, not native passthrough. Replies retain native content and usage;
+the model reported to the client is its requested alias.
+
+Streaming requests advertise `application/vnd.amazon.eventstream` and
+`x-amzn-bedrock-accept: application/json`. Binary AWS event-stream frames are
+incrementally decoded (length/header bounds and both CRCs checked), including
+base64 `chunk.bytes` envelopes and raw JSON chunk payloads, and emitted as
+Anthropic SSE events. Native thinking/signature/tool JSON deltas are preserved.
+Exceptions, bad CRCs, malformed payloads and truncated frames end with an SSE
+`error`, not a fabricated successful completion. EOF without `message_stop` is
+an error; `message_stop` is withheld until EOF and all trailing framing have been
+validated, so a late error cannot follow successful termination. Native Bedrock
+token counting is the explicitly marked local heuristic; no unsupported runtime
+count-tokens endpoint is assumed. It accepts native content, including base64 PDF
+documents, without imposing translation restrictions. Opaque native blocks use
+serialized-size estimates, not document parsing or an exact provider tokenizer;
+binary documents may have substantially different actual token counts.
+
 ## Security
 
 The gateway is a new listening surface, so it is default-closed like the
@@ -189,6 +339,11 @@ the reasoning.
   permission_error`.
 - The upstream key never reaches the client, and the gateway token never
   reaches the upstream.
+- Redirects are disabled for inference and discovery, even to the same host.
+  Upstream URLs cannot contain userinfo, queries or fragments. Catalog requests
+  carry only their owning upstream's credential; an explicit `catalog_url` is
+  a separate trust grant to send **that same key** to that host. Never configure
+  an untrusted catalog host. Inbound headers are not copied wholesale.
 - Each upstream call is recorded in the [request log](log.md) under the
   `anthropic-gateway` service, with auth headers redacted. Bodies are
   recorded only with `OMNI_DEV_LOG_BODIES`.
@@ -463,6 +618,10 @@ cargo run --bin anthropic-api-drift -- --output-dir /tmp/drift
 ```
 
 ## Limitations
+
+These translation limitations apply to Chat/Responses; Anthropic passthrough
+and native Bedrock preserve provider-native content and signatures. Bedrock
+authentication and discovery limits are described [above](#native-bedrock-claude).
 
 - **`count_tokens` is an estimate**, about four characters per token plus
   per-message, per-tool and per-image overheads. An exact count needs the
