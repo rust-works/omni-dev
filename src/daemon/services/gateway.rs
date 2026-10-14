@@ -179,7 +179,7 @@ impl GatewayService {
             }
             Slot::NotConfigured => (
                 true,
-                "not configured (set OMNI_DEV_GATEWAY_UPSTREAM_URL, then restart)".to_string(),
+                "not configured (set OMNI_DEV_GATEWAY_UPSTREAM_URL or OMNI_DEV_GATEWAY_UPSTREAMS, then restart)".to_string(),
             ),
             Slot::Failed(message) => (false, format!("failed: {message}")),
             Slot::Restarting => (true, "restarting".to_string()),
@@ -403,5 +403,67 @@ mod tests {
         let status = service.status().await;
         assert!(!status.healthy);
         assert!(status.summary.contains("already in use"));
+    }
+    #[tokio::test]
+    async fn named_upstreams_work_from_config_only_and_restart_rereads_routes() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let chat = MockServer::start().await;
+        let bedrock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"choices":[{"message":{"content":"chat"},"finish_reason":"stop"}]}),
+            ))
+            .expect(1)
+            .mount(&chat)
+            .await;
+        Mock::given(method("POST")).and(path("/model/native/invoke"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"msg_1","model":"native","content":[{"type":"text","text":"bedrock"}],"type":"message","role":"assistant","stop_reason":"end_turn"}))).expect(1).mount(&bedrock).await;
+        let switched = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&switched);
+        let upstreams = json!([
+            {"name":"chat","url":chat.uri(),"catalog_paths":[]},
+            {"name":"native","url":bedrock.uri(),"protocol":"bedrock"}
+        ])
+        .to_string();
+        let load: Loader = Box::new(move || {
+            let target = if flag.load(Ordering::Relaxed) {
+                "native"
+            } else {
+                "chat"
+            };
+            let env = MapEnv::new()
+                .with("OMNI_DEV_GATEWAY_UPSTREAMS", &upstreams)
+                .with(
+                    "OMNI_DEV_GATEWAY_ROUTES",
+                    &json!([{"pattern":"alias","upstream":target,"model":"native"}]).to_string(),
+                )
+                .with("OMNI_DEV_GATEWAY_PORT", "0");
+            GatewayConfig::from_env_with(&env, &ConfigOverrides::default())
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let service = GatewayService::start_with(load, Some(dir.path().join("token")));
+        let client = reqwest::Client::new();
+        for (switch, expected) in [(false, "chat"), (true, "bedrock")] {
+            if switch {
+                switched.store(true, Ordering::Relaxed);
+                service.restart().await.unwrap();
+            }
+            let env = service.handle("env", Value::Null).await.unwrap();
+            let response = client.post(format!("{}/v1/messages", env["ANTHROPIC_BASE_URL"].as_str().unwrap()))
+                .bearer_auth(env["ANTHROPIC_AUTH_TOKEN"].as_str().unwrap())
+                .json(&json!({"model":"alias","max_tokens":10,"messages":[{"role":"user","content":"hi"}]})).send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            let reply: Value = response.json().await.unwrap();
+            assert_eq!(reply["content"][0]["text"], expected);
+            assert_eq!(reply["model"], "alias");
+            assert!(service.status().await.healthy);
+        }
+        service.shutdown().await;
     }
 }
