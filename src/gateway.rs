@@ -24,6 +24,7 @@
 //! `docs/anthropic-gateway.md`.
 
 pub(crate) mod anthropic;
+pub(crate) mod bedrock;
 pub(crate) mod chat;
 pub(crate) mod chat_stream;
 pub(crate) mod completion;
@@ -39,6 +40,9 @@ pub(crate) mod passthrough;
 pub mod policy;
 pub(crate) mod responses;
 pub(crate) mod responses_stream;
+pub mod routing;
+#[cfg(test)]
+mod routing_tests;
 pub mod server;
 pub(crate) mod signature;
 pub(crate) mod sse;

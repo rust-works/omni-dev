@@ -315,7 +315,7 @@ Options:
       --upstream-url <URL>
           Upstream base URL, e.g. `https://api.fireworks.ai/inference` or `http://localhost:11434`
       --upstream-protocol <UPSTREAM_PROTOCOL>
-          Protocol the upstream speaks [possible values: chat, responses, anthropic]
+          Protocol the upstream speaks [possible values: chat, responses, anthropic, bedrock]
       --flavor <FLAVOR>
           Upstream provider family, for its quirks [possible values: generic, openai, fireworks]
       --model <MODEL>

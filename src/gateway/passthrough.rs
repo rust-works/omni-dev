@@ -120,6 +120,7 @@ pub(crate) async fn count_tokens(
     let original = Value::Object(body.clone());
     let mut report = PolicyReport::default();
     prepare(&mut body, state, &mut report)?;
+    let _permit = state.permit()?;
     let url = format!("{}/v1/messages/count_tokens", state.config.upstream_url);
     match state
         .send(&url, &Value::Object(body), &forwarded(headers))

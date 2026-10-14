@@ -120,6 +120,7 @@ pub(crate) struct AppState {
     token: Arc<String>,
     signer: Arc<Signer>,
     http: reqwest::Client,
+    discovery: Arc<super::routing::Discovery>,
     permits: Arc<Semaphore>,
     stats: Arc<Stats>,
     port: u16,
@@ -128,7 +129,18 @@ pub(crate) struct AppState {
 
 impl AppState {
     fn new(config: GatewayConfig, token: String, port: u16) -> Result<Self> {
+        if config
+            .routing
+            .upstreams
+            .iter()
+            .filter_map(|u| u.api_key.as_ref())
+            .chain(config.api_key.iter())
+            .any(|k| auth::constant_time_eq(k.expose_secret().trim(), &token))
+        {
+            anyhow::bail!("upstream keys must not equal the inbound gateway token");
+        }
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(config.connect_timeout)
             .read_timeout(config.read_timeout)
             .build()
@@ -139,10 +151,39 @@ impl AppState {
             permits: Arc::new(Semaphore::new(config.max_concurrent)),
             config: Arc::new(config),
             http,
+            discovery: Arc::new(super::routing::Discovery::default()),
             stats: Arc::new(Stats::default()),
             port,
             warned: Arc::new(Mutex::new(HashSet::new())),
         })
+    }
+
+    pub(crate) fn record_stream_error(&self, error: &GatewayError) {
+        self.stats.record_error(error);
+    }
+
+    async fn selected(&self, body: &Map<String, Value>) -> Result<Self, GatewayError> {
+        if self.config.routing.upstreams.is_empty() {
+            return Ok(self.clone());
+        }
+        let requested = body
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| GatewayError::invalid("model: nonempty string required"))?;
+        let _permit = self.permit()?;
+        let (index, model) = self
+            .discovery
+            .resolve(&self.config.routing, &self.http, requested)
+            .await?;
+        let mut selected = self.clone();
+        selected.config = Arc::new(self.config.routing.selected(
+            &self.config,
+            index,
+            requested,
+            &model,
+        ));
+        Ok(selected)
     }
 
     /// Takes a concurrency permit, or answers `429` when the gateway is at
@@ -200,6 +241,16 @@ impl AppState {
         extra_headers: &[(&'static str, String)],
     ) -> Result<reqwest::Response, GatewayError> {
         let mut request = self.http.post(url).json(body);
+        if self
+            .config
+            .api_key
+            .as_ref()
+            .is_some_and(|k| auth::constant_time_eq(k.expose_secret().trim(), &self.token))
+        {
+            return Err(GatewayError::invalid(
+                "upstream key must not equal the inbound gateway token",
+            ));
+        }
         if let Some(key) = &self.config.api_key {
             // One credential header, in the form the upstream expects: an
             // Anthropic-compatible endpoint reads `Authorization: Bearer` as an
@@ -258,7 +309,11 @@ pub(crate) fn annotate(headers: &mut HeaderMap, report: &PolicyReport, model: &s
 
 /// The `count_tokens` estimate response.
 pub(crate) fn estimate_response(request: &MessagesRequest) -> Response {
-    let mut response = Json(tokens::response_body(tokens::estimate(request))).into_response();
+    estimated_tokens_response(tokens::estimate(request))
+}
+
+fn estimated_tokens_response(input_tokens: u64) -> Response {
+    let mut response = Json(tokens::response_body(input_tokens)).into_response();
     response.headers_mut().insert(
         tokens::ESTIMATE_HEADER,
         HeaderValue::from_static("heuristic"),
@@ -459,6 +514,11 @@ async fn handle_messages(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, GatewayError> {
     let body = json_object(body)?;
+    let selected = state.selected(&body).await?;
+    let state = &selected;
+    if state.config.protocol == UpstreamProtocol::Bedrock {
+        return super::bedrock::messages(state, headers, body).await;
+    }
     if state.config.protocol == UpstreamProtocol::Anthropic {
         return super::passthrough::messages(state, headers, body).await;
     }
@@ -466,7 +526,9 @@ async fn handle_messages(
     let model = state.config.models.resolve(&request.model)?;
     let replay = match state.config.protocol {
         UpstreamProtocol::Chat => state.config.flavor.replays_reasoning(),
-        UpstreamProtocol::Responses | UpstreamProtocol::Anthropic => true,
+        UpstreamProtocol::Responses | UpstreamProtocol::Anthropic | UpstreamProtocol::Bedrock => {
+            true
+        }
     };
     let lowered = lower::lower(&request, &state.signer, replay, &mut report)?;
     let mut ctx = BuildContext {
@@ -479,7 +541,7 @@ async fn handle_messages(
             format!("{}/v1/responses", state.config.upstream_url),
             responses::build_request(&request, &lowered, &mut ctx)?,
         ),
-        UpstreamProtocol::Chat | UpstreamProtocol::Anthropic => (
+        UpstreamProtocol::Chat | UpstreamProtocol::Anthropic | UpstreamProtocol::Bedrock => (
             crate::claude::ai::openai::chat_completions_url(&state.config.upstream_url),
             chat::build_request(&request, &lowered, &mut ctx)?,
         ),
@@ -516,7 +578,7 @@ async fn handle_messages(
     drop(permit);
     let completion: Completion = match state.config.protocol {
         UpstreamProtocol::Responses => responses::parse_response(&reply)?,
-        UpstreamProtocol::Chat | UpstreamProtocol::Anthropic => {
+        UpstreamProtocol::Chat | UpstreamProtocol::Anthropic | UpstreamProtocol::Bedrock => {
             chat::parse_response(&reply, state.config.think_tags)?
         }
     };
@@ -565,7 +627,7 @@ fn stream_response(
 ) -> Response {
     let parser = match state.config.protocol {
         UpstreamProtocol::Responses => StreamParser::Responses(ResponsesStreamParser::default()),
-        UpstreamProtocol::Chat | UpstreamProtocol::Anthropic => {
+        UpstreamProtocol::Chat | UpstreamProtocol::Anthropic | UpstreamProtocol::Bedrock => {
             StreamParser::Chat(ChatStreamParser::new(state.config.think_tags))
         }
     };
@@ -702,16 +764,25 @@ async fn count_tokens(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    state.stats.requests.fetch_add(1, Ordering::Relaxed);
     let result = async {
         let body = json_object(body)?;
+        let selected = state.selected(&body).await?;
+        let state = &selected;
         if state.config.protocol == UpstreamProtocol::Anthropic {
-            return super::passthrough::count_tokens(&state, &headers, body).await;
+            return super::passthrough::count_tokens(state, &headers, body).await;
         }
-        let (request, _) = parse_request(&state, body)?;
-        Ok(estimate_response(&request))
+        let _permit = state.permit()?;
+        if state.config.protocol == UpstreamProtocol::Bedrock {
+            return Ok(estimated_tokens_response(tokens::estimate_native(&body)?));
+        }
+        Ok(estimate_response(&parse_request(state, body)?.0))
     }
     .await;
-    result.unwrap_or_else(IntoResponse::into_response)
+    result.unwrap_or_else(|error| {
+        state.stats.record_error(&error);
+        error.into_response()
+    })
 }
 
 /// One Anthropic model object.
@@ -720,7 +791,26 @@ fn model_object(id: &str) -> Value {
 }
 
 async fn list_models(State(state): State<AppState>) -> Response {
-    let ids = state.config.models.listed();
+    state.stats.requests.fetch_add(1, Ordering::Relaxed);
+    let ids = if state.config.routing.upstreams.is_empty() {
+        state.config.models.listed()
+    } else {
+        let result = async {
+            let _permit = state.permit()?;
+            state
+                .discovery
+                .listed(&state.config.routing, &state.http)
+                .await
+        }
+        .await;
+        match result {
+            Ok(ids) => ids,
+            Err(error) => {
+                state.stats.record_error(&error);
+                return error.into_response();
+            }
+        }
+    };
     Json(json!({
         "data": ids.iter().map(|id| model_object(id)).collect::<Vec<_>>(),
         "has_more": false,
@@ -731,9 +821,21 @@ async fn list_models(State(state): State<AppState>) -> Response {
 }
 
 async fn get_model(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match state.config.models.resolve(&id) {
+    state.stats.requests.fetch_add(1, Ordering::Relaxed);
+    let result = if state.config.routing.upstreams.is_empty() {
+        state.config.models.resolve(&id)
+    } else {
+        state
+            .selected(&serde_json::from_value(json!({"model": id})).unwrap_or_default())
+            .await
+            .map(|_| id.clone())
+    };
+    match result {
         Ok(_) => Json(model_object(&id)).into_response(),
-        Err(error) => error.into_response(),
+        Err(error) => {
+            state.stats.record_error(&error);
+            error.into_response()
+        }
     }
 }
 
@@ -754,6 +856,35 @@ pub(crate) mod tests {
             .with("OMNI_DEV_GATEWAY_MODEL", "up-default");
         let config = GatewayConfig::from_env_with(&env, &ConfigOverrides::default()).unwrap();
         AppState::new(config, "tok".into(), 1).unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_rejects_whitespace_equivalent_inbound_credentials_before_network_io() {
+        let upstream = wiremock::MockServer::start().await;
+        for protocol in ["chat", "responses", "anthropic", "bedrock"] {
+            for credential in [
+                "synthetic-inbound ",
+                " synthetic-inbound",
+                "\t synthetic-inbound \t",
+            ] {
+                let mut state = state("generic", protocol);
+                state.token = Arc::new("synthetic-inbound".into());
+                // Exercise the send-time defense independently of startup.
+                Arc::make_mut(&mut state.config).api_key =
+                    Some(crate::utils::secret::Secret::new(credential));
+                let error = state
+                    .send(&upstream.uri(), &json!({}), &[])
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.status, StatusCode::BAD_REQUEST);
+                assert_eq!(
+                    error.message,
+                    "upstream key must not equal the inbound gateway token"
+                );
+                assert!(!error.message.contains("synthetic-inbound"));
+            }
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
     }
 
     #[test]

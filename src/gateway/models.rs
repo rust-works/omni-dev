@@ -21,6 +21,13 @@ pub struct ModelMap {
 }
 
 impl ModelMap {
+    pub(crate) fn single(requested: &str, model: &str) -> Self {
+        Self {
+            rules: vec![(requested.to_string(), model.to_string())],
+            default: None,
+        }
+    }
+
     /// Builds a map from `pattern=model` entries and an optional default.
     pub fn new(entries: &[String], default: Option<String>) -> Result<Self> {
         let mut rules = Vec::new();
@@ -96,7 +103,7 @@ impl ModelMap {
 }
 
 /// Whether `text` matches `pattern`, where `*` matches any run of characters.
-fn glob_matches(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, text: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     let (first, rest) = parts.split_first().unwrap_or((&"", &[]));
     let Some(mut remaining) = text.strip_prefix(first) else {

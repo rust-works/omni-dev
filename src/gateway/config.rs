@@ -3,8 +3,8 @@
 //!
 //! Reads go through an injected [`EnvSource`] (STYLE-0028); the upstream key
 //! and the gateway token go through the secret resolver (STYLE-0030), so both
-//! accept `<NAME>_FILE` and `<NAME>_COMMAND` companions. One process serves
-//! one upstream: per-upstream settings live in a profile per upstream.
+//! accept `<NAME>_FILE` and `<NAME>_COMMAND` companions. Named upstreams and
+//! model routes can optionally replace the legacy single-upstream settings.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,11 +18,11 @@ use super::models::ModelMap;
 use super::policy::UnknownFields;
 use crate::utils::env::{non_empty_var, EnvSource};
 use crate::utils::secret::Secret;
-use crate::utils::secret_env::secret_var;
+use crate::utils::secret_env::{secret_var, secret_var_is_set};
 
 /// Upstream base URL (required).
 pub const UPSTREAM_URL_VAR: &str = "OMNI_DEV_GATEWAY_UPSTREAM_URL";
-/// Upstream protocol: `chat`, `responses` or `anthropic`.
+/// Upstream protocol: `chat`, `responses`, `anthropic` or `bedrock`.
 pub const UPSTREAM_PROTOCOL_VAR: &str = "OMNI_DEV_GATEWAY_UPSTREAM_PROTOCOL";
 /// Upstream flavor: `generic`, `openai` or `fireworks`.
 pub const FLAVOR_VAR: &str = "OMNI_DEV_GATEWAY_FLAVOR";
@@ -56,7 +56,7 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Error)]
 pub enum GatewayConfigError {
     /// No upstream URL is configured; the daemon service stays idle.
-    #[error("no upstream configured: set {UPSTREAM_URL_VAR} (or pass --upstream-url)")]
+    #[error("no upstream configured: set {UPSTREAM_URL_VAR}, OMNI_DEV_GATEWAY_UPSTREAMS, or pass --upstream-url")]
     NotConfigured,
 }
 
@@ -91,6 +91,8 @@ pub struct GatewayConfig {
     pub api_key: Option<Secret>,
     /// Model mapping.
     pub models: ModelMap,
+    /// Optional named upstreams and model routes (config-only routing mode).
+    pub routing: super::routing::RoutingConfig,
     /// Listening port (`0` = OS-assigned).
     pub port: u16,
     /// Reasoning effort levels the upstream model accepts.
@@ -130,11 +132,32 @@ impl GatewayConfig {
 
     /// [`from_env`](Self::from_env) over an injected [`EnvSource`].
     pub fn from_env_with(env: &impl EnvSource, overrides: &ConfigOverrides) -> Result<Self> {
+        let routing = super::routing::RoutingConfig::from_env(env)?;
+        if !routing.upstreams.is_empty()
+            && (overrides.upstream_url.is_some()
+                || overrides.protocol.is_some()
+                || overrides.flavor.is_some()
+                || overrides.model.is_some()
+                || !overrides.model_map.is_empty()
+                || [
+                    UPSTREAM_URL_VAR,
+                    UPSTREAM_PROTOCOL_VAR,
+                    FLAVOR_VAR,
+                    MODEL_VAR,
+                    MODEL_MAP_VAR,
+                ]
+                .iter()
+                .any(|key| non_empty_var(env, key).is_some())
+                || secret_var_is_set(env, API_KEY_VAR))
+        {
+            bail!("named upstreams cannot be mixed with legacy upstream/model settings or flags");
+        }
         let raw_url = overrides
             .upstream_url
             .clone()
             .filter(|u| !u.trim().is_empty())
             .or_else(|| non_empty_var(env, UPSTREAM_URL_VAR))
+            .or_else(|| routing.upstreams.first().map(|u| u.url.clone()))
             .ok_or(GatewayConfigError::NotConfigured)?;
         let upstream_url = normalize_base_url(&raw_url)?;
 
@@ -198,6 +221,7 @@ impl GatewayConfig {
             flavor,
             api_key,
             models,
+            routing,
             port,
             effort_levels,
             think_tags,
@@ -212,6 +236,13 @@ impl GatewayConfig {
     /// A one-line description of where the gateway sends requests.
     #[must_use]
     pub fn describe(&self) -> String {
+        if !self.routing.upstreams.is_empty() {
+            return format!(
+                "{} named upstream(s), {} custom route(s), cached model discovery",
+                self.routing.upstreams.len(),
+                self.routing.routes.len()
+            );
+        }
         let default = self.models.default_model().unwrap_or("(none)");
         format!(
             "upstream: {} ({} protocol, {} flavor), default model: {default}, {} mapping rule(s)",
@@ -244,7 +275,7 @@ pub fn port_from_env(env: &impl EnvSource) -> Result<u16> {
 
 /// Trims a trailing `/` and `/v1`, so `https://x/v1` and `https://x` both
 /// work (the gateway appends `/v1/...` itself), and checks the scheme.
-fn normalize_base_url(raw: &str) -> Result<String> {
+pub(crate) fn normalize_base_url(raw: &str) -> Result<String> {
     let trimmed = raw.trim().trim_end_matches('/');
     let trimmed = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
     let parsed = reqwest::Url::parse(trimmed)
@@ -252,10 +283,18 @@ fn normalize_base_url(raw: &str) -> Result<String> {
     if !matches!(parsed.scheme(), "http" | "https") {
         bail!("{UPSTREAM_URL_VAR}={raw}: only http and https upstreams are supported");
     }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.host_str().is_none()
+    {
+        bail!("upstream URL must have a host and no userinfo, query or fragment");
+    }
     Ok(trimmed.to_string())
 }
 
-fn parse_effort_levels(raw: &str) -> Result<Vec<Effort>> {
+pub(crate) fn parse_effort_levels(raw: &str) -> Result<Vec<Effort>> {
     let mut levels = Vec::new();
     for token in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
         let Some(effort) = Effort::parse(token) else {

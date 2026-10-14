@@ -22,9 +22,10 @@ use crate::gateway::{
     long_about = "Anthropic Messages gateway in front of OpenAI-protocol upstreams.\n\nServes \
 `/v1/messages` (streaming and not), `/v1/messages/count_tokens` and `/v1/models` on \
 127.0.0.1, translating to an OpenAI Chat Completions or Responses upstream (OpenAI, Ollama, \
-LM Studio, vLLM, OpenRouter, Fireworks) or passing through to an Anthropic-compatible one. \
+LM Studio, vLLM, OpenRouter, Fireworks), passing through to an Anthropic-compatible one, \
+or invoking native Bedrock Claude with bearer authentication. \
 Point Claude Code or an Anthropic SDK at it with the values `omni-dev ai gateway env` prints. \
-Configure the upstream with OMNI_DEV_GATEWAY_* variables (settings.json and --profile \
+Configure upstreams and optional model-based routing with OMNI_DEV_GATEWAY_* variables (settings.json and --profile \
 apply); see docs/anthropic-gateway.md."
 )]
 pub struct GatewayCommand {

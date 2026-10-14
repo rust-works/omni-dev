@@ -24,6 +24,8 @@ pub enum UpstreamProtocol {
     /// Anthropic Messages (`/v1/messages`): passthrough with model mapping and
     /// an auth swap, no translation.
     Anthropic,
+    /// Native Bedrock Claude InvokeModel, authenticated with a bearer token.
+    Bedrock,
 }
 
 impl UpstreamProtocol {
@@ -34,6 +36,7 @@ impl UpstreamProtocol {
             Self::Chat => "chat",
             Self::Responses => "responses",
             Self::Anthropic => "anthropic",
+            Self::Bedrock => "bedrock",
         }
     }
 
@@ -43,8 +46,9 @@ impl UpstreamProtocol {
             "chat" => Ok(Self::Chat),
             "responses" => Ok(Self::Responses),
             "anthropic" => Ok(Self::Anthropic),
+            "bedrock" => Ok(Self::Bedrock),
             other => {
-                bail!("unknown upstream protocol `{other}` (expected chat, responses or anthropic)")
+                bail!("unknown upstream protocol `{other}` (expected chat, responses, anthropic or bedrock)")
             }
         }
     }
@@ -218,6 +222,7 @@ mod tests {
             UpstreamProtocol::Chat,
             UpstreamProtocol::Responses,
             UpstreamProtocol::Anthropic,
+            UpstreamProtocol::Bedrock,
         ] {
             assert_eq!(UpstreamProtocol::parse(&p.to_string()).unwrap(), p);
         }
