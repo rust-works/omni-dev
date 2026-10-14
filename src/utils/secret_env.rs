@@ -68,6 +68,8 @@ pub const SECRET_ENV_VARS: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "OPENAI_API_KEY",
     "OPENAI_AUTH_TOKEN",
+    // Native Bedrock bearer authentication (gateway explicit key reference).
+    "AWS_BEARER_TOKEN_BEDROCK",
     // Jev
     "TYPESAFE_API_KEY",
     "OMNI_DEV_JEV_API_KEY",
