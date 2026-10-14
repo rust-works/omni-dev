@@ -124,7 +124,9 @@ pub(crate) fn resolve_existing_token_with(
     }
 }
 
-fn read_token_file(path: &Path) -> Result<String> {
+/// Reads an owner-only (`0600`) token file, trimmed; shared with the Anthropic
+/// gateway's persisted token (#2226).
+pub(crate) fn read_token_file(path: &Path) -> Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

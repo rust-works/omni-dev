@@ -54,7 +54,7 @@ pub struct RunCommand {
 
     /// Host only this comma-separated subset of services (default: all).
     /// Overrides `OMNI_DEV_DAEMON_SERVICES`. Values: browser-bridge, snowflake,
-    /// worktrees, sessions.
+    /// worktrees, sessions, anthropic-gateway.
     #[arg(long, value_name = "SVC", value_delimiter = ',')]
     pub services: Vec<DaemonServiceKind>,
 }

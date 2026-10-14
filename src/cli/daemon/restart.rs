@@ -29,7 +29,7 @@ pub struct RestartCommand {
 
     /// Re-bake this comma-separated subset of services (default: preserve
     /// whatever the running daemon currently hosts). Values: browser-bridge,
-    /// snowflake, worktrees, sessions.
+    /// snowflake, worktrees, sessions, anthropic-gateway.
     #[arg(long, value_name = "SVC", value_delimiter = ',')]
     pub services: Vec<DaemonServiceKind>,
 }
@@ -114,9 +114,10 @@ fn resolve_services(
         return ServiceSelection::resolve(flag, None);
     }
     match running {
-        Some(report) => {
-            ServiceSelection::from_service_names(report.services.iter().map(|s| s.name.as_str()))
-        }
+        Some(report) => ServiceSelection::from_running(
+            report.services.iter().map(|s| s.name.as_str()),
+            report.hosts_all,
+        ),
         None => ServiceSelection::All,
     }
 }
@@ -229,5 +230,28 @@ mod tests {
             ])),
         );
         assert_eq!(selection, ServiceSelection::All);
+    }
+
+    #[test]
+    fn a_reported_subset_is_preserved_even_without_the_gateway() {
+        let mut running = report(&[
+            "browser-bridge",
+            "snowflake",
+            "worktrees",
+            "sessions",
+            "github",
+        ]);
+        running.hosts_all = Some(false);
+        assert_eq!(
+            resolve_services(&[], Some(&running)),
+            ServiceSelection::Only(vec![
+                DaemonServiceKind::Bridge,
+                DaemonServiceKind::Snowflake,
+                DaemonServiceKind::Worktrees,
+                DaemonServiceKind::Sessions,
+            ])
+        );
+        running.hosts_all = Some(true);
+        assert_eq!(resolve_services(&[], Some(&running)), ServiceSelection::All);
     }
 }

@@ -695,6 +695,45 @@ mod tests {
     }
 
     #[test]
+    fn gateway_sibling_credentials_do_not_reach_either_command_helper() {
+        // Run the helper in an isolated test child with synthetic parent secrets,
+        // never mutating this test process's global environment or using real keys.
+        const CHILD: &str = "OMNI_DEV_SECRET_SANITATION_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok("1") {
+            for current in ["OPENAI_API_KEY", "AWS_BEARER_TOKEN_BEDROCK"] {
+                let probe =
+                    "for name in OPENAI_API_KEY OPENAI_API_KEY_FILE OPENAI_API_KEY_COMMAND \
+                    AWS_BEARER_TOKEN_BEDROCK AWS_BEARER_TOKEN_BEDROCK_FILE \
+                    AWS_BEARER_TOKEN_BEDROCK_COMMAND; do \
+                    eval 'present=${'\"$name\"'+set}'; \
+                    [ -z \"$present\" ] || exit 7; done; printf sanitized";
+                let key = resolve(current, &sh(probe), limits(30)).unwrap();
+                assert_eq!(key.expose_secret(), "sanitized");
+            }
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .env_clear()
+            .env(CHILD, "1")
+            .arg("--exact")
+            .arg("utils::secret_env::command::tests::gateway_sibling_credentials_do_not_reach_either_command_helper");
+        for name in ["OPENAI_API_KEY", "AWS_BEARER_TOKEN_BEDROCK"] {
+            child
+                .env(name, "synthetic-sibling-key")
+                .env(file_var_name(name), "/not-a-real-secret-file")
+                .env(command_var_name(name), "not-a-real-helper");
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "sanitation child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn the_limits_default_and_read_the_env_source() {
         let defaults = Limits::from_env(&MapEnv::new());
         assert_eq!(defaults.timeout, Duration::from_secs(60));

@@ -79,6 +79,8 @@ use server::DaemonOptions;
 #[cfg(unix)]
 use services::bridge::BridgeService;
 #[cfg(unix)]
+use services::gateway::GatewayService;
+#[cfg(unix)]
 use services::github_counters::GithubCountersService;
 #[cfg(unix)]
 use services::sessions::SessionsService;
@@ -137,6 +139,7 @@ pub async fn build_default_registry(
     services: &ServiceSelection,
 ) -> Result<ServiceRegistry> {
     let mut registry = ServiceRegistry::new();
+    registry.set_hosts_all(matches!(services, ServiceSelection::All));
     if services.includes(DaemonServiceKind::Bridge) {
         let bridge = BridgeService::start(bridge_config, bridge_token_file, bridge_token_path)?;
         registry.register(Arc::new(bridge));
@@ -193,6 +196,12 @@ pub async fn build_default_registry(
             .with_journal_dir(paths::sessions_journal_dir_for_socket(socket_path));
         sessions.start_watcher();
         registry.register(Arc::new(sessions));
+    }
+    if services.includes(DaemonServiceKind::Gateway) {
+        // The Anthropic Messages gateway (#2226). Binds only when an upstream is
+        // configured, and a configuration error leaves it unhealthy rather than
+        // failing the daemon.
+        registry.register(Arc::new(GatewayService::start()));
     }
     // Periodically log a summary of the GitHub API-call counters (#1387): once
     // ~5s after boot, every 10 minutes, and once on shutdown. Best-effort, no
@@ -255,8 +264,9 @@ mod tests {
 
         // Only the selected service is constructed, plus the always-on GitHub
         // API-call counter logger (#1387) — daemon-wide observability that is not
-        // one of the four selectable kinds, so it rides along in any subset.
+        // one of the selectable kinds, so it rides along in any subset.
         let names: Vec<_> = registry.services().iter().map(|s| s.name()).collect();
         assert_eq!(names, vec![services::snowflake::SERVICE_NAME, "github"]);
+        assert_eq!(registry.hosts_all(), Some(false));
     }
 }

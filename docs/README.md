@@ -14,6 +14,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 - **[Local Overrides](local-overrides.md)** - Personal configuration customization
 - **[Configuration Best Practices](configuration-best-practices.md)** - Writing effective scopes and guidelines
 - **[AI Backends](ai-backends.md)** - Claude API, Claude CLI, OpenAI, Ollama, and Bedrock setup
+- **[Anthropic Gateway](anthropic-gateway.md)** - `omni-dev ai gateway serve/env/fields`: serve the Anthropic Messages API to Claude Code and the Anthropic SDKs from an OpenAI-protocol model (OpenAI, Ollama, LM Studio, vLLM, OpenRouter, Fireworks); field policy, reasoning, daemon service
 - **[Jev (TypeSafe System One)](jev.md)** - `omni-dev ai jev choice/score/noul/ask`: typed probabilistic judgments (pick-one, rate-on-a-scale, yes/no probability) instead of generated text; credentials, `--jev-model`, ordering caveats
 - **[Examples](examples.md)** - Real-world usage examples across different project types
 

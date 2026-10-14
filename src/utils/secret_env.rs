@@ -68,6 +68,8 @@ pub const SECRET_ENV_VARS: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "OPENAI_API_KEY",
     "OPENAI_AUTH_TOKEN",
+    // Native Bedrock bearer authentication (gateway explicit key reference).
+    "AWS_BEARER_TOKEN_BEDROCK",
     // Jev
     "TYPESAFE_API_KEY",
     "OMNI_DEV_JEV_API_KEY",
@@ -82,6 +84,9 @@ pub const SECRET_ENV_VARS: &[&str] = &[
     "SNOWFLAKE_PRIVATE_KEY",
     // Browser bridge
     "OMNI_BRIDGE_TOKEN",
+    // Anthropic gateway (#2226): the upstream key and the inbound token
+    "OMNI_DEV_GATEWAY_API_KEY",
+    "OMNI_DEV_GATEWAY_TOKEN",
 ];
 
 /// Secret-shaped names that are deliberately **not** read through this

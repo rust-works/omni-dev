@@ -28,7 +28,7 @@ pub struct StartCommand {
     /// Host only this comma-separated subset of services (default: all), baked
     /// into the generated launchd plist / systemd unit so it survives the
     /// service-manager exec. Overrides `OMNI_DEV_DAEMON_SERVICES`. Values:
-    /// browser-bridge, snowflake, worktrees, sessions.
+    /// browser-bridge, snowflake, worktrees, sessions, anthropic-gateway.
     #[arg(long, value_name = "SVC", value_delimiter = ',')]
     pub services: Vec<DaemonServiceKind>,
 }
