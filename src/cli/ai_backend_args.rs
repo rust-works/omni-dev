@@ -97,7 +97,7 @@ pub struct AiBackendArgs {
     /// session to load MCP servers from `~/.claude/settings.json`.
     ///
     /// **Only use deliberately.** MCP servers commonly hold OAuth tokens
-    /// (Gmail, Drive, Slack, …) and may be arbitrary network-attached services;
+    /// (mail, file storage, Slack, …) and may be arbitrary network-attached services;
     /// enabling this exposes them to the nested session. By default the
     /// session runs with `--strict-mcp-config` and no MCP servers load.
     /// Equivalent to setting `OMNI_DEV_CLAUDE_CLI_ALLOW_MCP=true`.

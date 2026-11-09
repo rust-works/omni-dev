@@ -373,7 +373,7 @@ pub(crate) mod test_util {
     ///
     /// Aliases the crate-wide [`crate::test_support::HOME_ENV_MUTEX`] rather
     /// than declaring its own `Mutex<()>`, so Atlassian's HOME mutation also
-    /// serialises against every other domain's (Datadog, Gmail, …) — see
+    /// serialises against every other domain's (Datadog, Snowflake, …) — see
     /// that static's doc comment for why an independent mutex here provides
     /// no real exclusion.
     pub(crate) static AUTH_ENV_MUTEX: &std::sync::Mutex<()> = &crate::test_support::HOME_ENV_MUTEX;

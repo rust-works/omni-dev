@@ -1,8 +1,8 @@
 //! Shared POSIX-style tokenizer for a user-supplied browser-launch command
 //! string (e.g. `SNOWFLAKE_BROWSER_COMMAND`).
 //!
-//! Promoted out of `crate::snowflake` when a second consumer appeared (the
-//! Gmail login, since moved to gwi, #2203) — this tokenizer is non-trivial
+//! Promoted out of `crate::snowflake` when a second consumer appeared (an
+//! OAuth login flow, since moved to gwi, #2203) — this tokenizer is non-trivial
 //! escaping logic worth sharing as soon as a second caller needs it.
 
 use anyhow::{bail, Result};

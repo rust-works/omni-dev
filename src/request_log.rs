@@ -76,13 +76,17 @@ pub enum RecordKind {
     /// kind**: omni-dev no longer writes it (the Drive commands moved to
     /// [gwi](https://github.com/rust-works/gwi), #2203), but `omni-dev log`
     /// still decodes and renders the records an earlier version left in
-    /// `log.jsonl`.
+    /// `log.jsonl`. Removal condition: once no supported upgrade path can meet a
+    /// `log.jsonl` written before #2203 (an unknown kind decodes as
+    /// [`RecordKind::Unknown`], so dropping it loses only the rendered label).
     DriveMutation,
     /// One per leased-write lifecycle event, from the separate `audit.jsonl`
     /// ([ADR-0080](../docs/adrs/adr-0080.md) §11). **Read-only legacy kind**:
     /// omni-dev no longer writes it (its only writer, the Drive lease audit
     /// trail, moved to gwi, #2203), but `omni-dev log --audit` still reads the
-    /// file an earlier version left behind. See [`audit_file_path`].
+    /// file an earlier version left behind. See [`audit_file_path`]. Removal
+    /// condition: the same as [`RecordKind::DriveMutation`], applied to
+    /// `audit.jsonl`, together with `omni-dev log --audit` itself.
     Audit,
     /// A kind written by a newer version that this reader does not know.
     #[serde(other)]

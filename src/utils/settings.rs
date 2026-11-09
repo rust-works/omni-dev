@@ -2186,26 +2186,26 @@ mod tests {
     fn ensure_object_at_creates_nested_path_at_arbitrary_depth() {
         let mut root = serde_json::json!({});
         {
-            let map = ensure_object_at(&mut root, &["gmail", "accounts", "work"]).unwrap();
+            let map = ensure_object_at(&mut root, &["service", "accounts", "work"]).unwrap();
             map.insert("client_id".to_string(), serde_json::json!("id"));
         }
-        assert_eq!(root["gmail"]["accounts"]["work"]["client_id"], "id");
+        assert_eq!(root["service"]["accounts"]["work"]["client_id"], "id");
     }
 
     #[test]
     fn ensure_object_at_replaces_non_object_nodes_along_path() {
-        let mut root = serde_json::json!({"gmail": "bogus"});
+        let mut root = serde_json::json!({"service": "bogus"});
         {
-            let map = ensure_object_at(&mut root, &["gmail", "accounts", "work"]).unwrap();
+            let map = ensure_object_at(&mut root, &["service", "accounts", "work"]).unwrap();
             map.insert("client_id".to_string(), serde_json::json!("id"));
         }
-        assert_eq!(root["gmail"]["accounts"]["work"]["client_id"], "id");
+        assert_eq!(root["service"]["accounts"]["work"]["client_id"], "id");
     }
 
     #[test]
     fn object_at_mut_none_when_any_segment_absent() {
-        let mut root = serde_json::json!({"gmail": {"accounts": {}}});
-        assert!(object_at_mut(&mut root, &["gmail", "accounts", "work"]).is_none());
+        let mut root = serde_json::json!({"service": {"accounts": {}}});
+        assert!(object_at_mut(&mut root, &["service", "accounts", "work"]).is_none());
         assert!(object_at_mut(&mut root, &["missing", "accounts"]).is_none());
     }
 }
