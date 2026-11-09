@@ -231,7 +231,8 @@ Read-only access to Datadog v1/v2 endpoints. Authentication uses
 
 The `gmail_*` and `drive_*` tools are no longer served by `omni-dev-mcp`. They moved to
 `gwi-mcp`, the MCP server of [rust-works/gwi](https://github.com/rust-works/gwi); add it to
-your MCP client as a second server ([ADR-0095](adrs/adr-0095.md)).
+your MCP client as a second server ([ADR-0095](adrs/adr-0095.md)); `gwi import` copies your
+accounts from `~/.omni-dev`.
 
 ### AI / Config (5 tools)
 

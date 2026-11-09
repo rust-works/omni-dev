@@ -1760,7 +1760,8 @@ The `gmail` and `drive` command trees and their MCP tools are no longer part of 
 They moved to [rust-works/gwi](https://github.com/rust-works/gwi) — see
 [ADR-0095](adrs/adr-0095.md). To carry on where you left off, install gwi (see its README) and
 run `gwi import`, which copies your accounts and settings from `~/.omni-dev` and never modifies
-or removes them. gwi's own README documents its configuration and environment variables.
+or removes them. Environment variables read by the moved code change prefix from `OMNI_DEV_` to
+`GWI_`; the unprefixed `GMAIL_*` and `DRIVE_*` credential names are unchanged.
 
 For one release, `omni-dev gmail ...` and `omni-dev drive ...` remain as hidden stubs that
 exit non-zero with a message pointing at gwi; the next minor release deletes them.

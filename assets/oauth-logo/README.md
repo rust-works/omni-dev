@@ -4,7 +4,8 @@ Source and rendered logo for the OAuth consent screen of the Google Cloud
 project (Google Auth Platform → Branding → App logo) behind the integration
 that moved to [gwi](https://github.com/rust-works/gwi) (#2203). omni-dev no
 longer uses it, but gwi has no copy of its own yet, so this directory stays as
-the only source until gwi takes it over, and can then be deleted. The design matches the existing VS Code extension icon
+the only source until gwi takes it over, and can then be deleted. The design
+matches the existing VS Code extension icon
 ([`editors/vscode/media/icon.svg`](../../editors/vscode/media/icon.svg)):
 a blue-to-indigo gradient rounded square with a white node-graph glyph.
 
