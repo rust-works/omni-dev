@@ -183,8 +183,8 @@ push closed nothing. Signatures are lost (rewritten commits cannot keep them).
    2. **Stub deletion.** Not started: the next minor release deletes the stubs.
    3. **Wrap-up.** Done ([#2236](https://github.com/rust-works/omni-dev/issues/2236)): the
       Google-only dependencies were dropped (`chore(cargo)` in the stub-release PR), the
-      packaged crate is 8.2 MiB compressed (v0.47.0; the cap is 10 MiB), `cargo deny`'s bans, licenses and sources pass, and the remaining docs, comments
-      and fixtures were reworded. Kept on purpose: the 27 relocated ADR copies (links into
+      packaged crate is 8.2 MiB compressed (v0.47.0; the cap is 10 MiB), `cargo deny`'s bans,
+      licenses and sources pass, and the remaining docs, comments and fixtures were reworded. Kept on purpose: the 27 relocated ADR copies (links into
       them stay valid), `docs/PRIVACY.md` and `website/static/privacy.html` (the policy URL a
       Google consent screen may point at; gwi has no policy page yet), `assets/oauth-logo/`
       (gwi has no copy), the `gmail`/`drive`/`lease` settings preservation, and the legacy
