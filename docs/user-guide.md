@@ -1756,23 +1756,11 @@ Every Datadog CLI subcommand has a matching `datadog_*` MCP tool — see
 
 ## Gmail and Drive (moved to gwi)
 
-The `gmail` and `drive` command trees (Drive includes Docs, Sheets and Slides) and their
-MCP tools are no longer part of omni-dev. They moved to
-[rust-works/gwi](https://github.com/rust-works/gwi) (binaries `gwi` and `gwi-mcp`, configuration
-in `~/.gwi/`) — see [ADR-0095](adrs/adr-0095.md) and
-[#2203](https://github.com/rust-works/omni-dev/issues/2203).
-
-To carry on where you left off:
-
-```bash
-# Install gwi (see its README for the current install instructions), then copy your
-# Gmail/Drive accounts, lease settings and Drive lease ledger from ~/.omni-dev.
-# The import copies and never modifies or removes omni-dev's files.
-gwi import
-```
-
-Environment variables read by the moved code change prefix from `OMNI_DEV_` to `GWI_`; the
-unprefixed `GMAIL_*` and `DRIVE_*` credential names are unchanged.
+The `gmail` and `drive` command trees and their MCP tools are no longer part of omni-dev.
+They moved to [rust-works/gwi](https://github.com/rust-works/gwi) — see
+[ADR-0095](adrs/adr-0095.md). To carry on where you left off, install gwi (see its README) and
+run `gwi import`, which copies your accounts and settings from `~/.omni-dev` and never modifies
+or removes them. gwi's own README documents its configuration and environment variables.
 
 For one release, `omni-dev gmail ...` and `omni-dev drive ...` remain as hidden stubs that
 exit non-zero with a message pointing at gwi; the next minor release deletes them.

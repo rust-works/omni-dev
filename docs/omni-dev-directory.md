@@ -44,11 +44,6 @@ chain — see [settings.json](#settingsjson).
 Missing files are not an error. Each loader falls through to a lower-precedence
 tier (or to the embedded default, where one exists) and omni-dev continues.
 
-> `gmail-sync.yaml` (the account list for `gmail sync-all`) is no longer an
-> omni-dev file: the Gmail commands moved to [gwi](https://github.com/rust-works/gwi)
-> ([ADR-0095](adrs/adr-0095.md)), which reads its own copy. omni-dev ignores the
-> file if it is still present.
-
 ## Precedence
 
 ### Chain A — hierarchical resolution

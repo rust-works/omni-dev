@@ -294,16 +294,10 @@ every family with worked examples, see [docs/datadog.md](docs/datadog.md).
 
 ### 📧 Gmail and 📁 Drive (moved to gwi)
 
-The `gmail` and `drive` command trees (Drive includes Docs, Sheets and Slides), their
-23 MCP tools and the `omni_dev::{gmail,drive}` library modules have moved to
+These commands, their MCP tools and library modules now live in
 [**gwi**](https://github.com/rust-works/gwi) (*Google Workspace Interface*), a standalone
-project with its own binaries (`gwi`, `gwi-mcp`), configuration (`~/.gwi/`) and release
-cadence ([#2203](https://github.com/rust-works/omni-dev/issues/2203),
-[ADR-0095](docs/adrs/adr-0095.md)). `gwi import` copies your existing Gmail and Drive
-accounts, lease settings and Drive lease ledger from `~/.omni-dev`, and never modifies
-or removes the originals. Environment variables read by the moved code change prefix from
-`OMNI_DEV_` to `GWI_`; the unprefixed `GMAIL_*` and `DRIVE_*` credential names are
-unchanged.
+project ([ADR-0095](docs/adrs/adr-0095.md)). `gwi import` copies your existing accounts and
+settings from `~/.omni-dev`; see the [user guide](docs/user-guide.md#gmail-and-drive-moved-to-gwi).
 
 For one release, `omni-dev gmail ...` and `omni-dev drive ...` remain as hidden stubs that
 accept any arguments and exit non-zero with a message pointing at gwi; the next minor

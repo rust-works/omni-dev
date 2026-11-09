@@ -150,7 +150,6 @@ Each file in [`plan/`](plan/) carries a `**Status:**` header (`Built`, `In Progr
 | **Configuration Quality** | [Best Practices](configuration-best-practices.md) | [Config Internals](plan/config-internals.md) |
 | **Atlassian Integration** | [User Guide - Atlassian](user-guide.md#atlassian---jira-and-confluence-integration) | [JFM Spec](specs/jfm.md) |
 | **Datadog Integration** | [Datadog Guide](datadog.md) | [User Guide - Datadog](user-guide.md#datadog-integration) · [README - Datadog](../README.md#-datadog-integration-read-only) |
-| **Gmail and Drive (gwi)** | [ADR-0095](adrs/adr-0095.md) | [gwi extraction plan](plan/gwi-extraction.md) · [User Guide - Gmail and Drive](user-guide.md#gmail-and-drive-moved-to-gwi) · [README - Gmail and Drive](../README.md#-gmail-and--drive-moved-to-gwi) |
 | **MCP Server** | [MCP Reference](mcp.md) | [README - MCP Server](../README.md#-mcp-server) |
 | **Worktrees View** | [Worktrees Service](worktrees-service.md) | [ADR-0040](adrs/adr-0040.md) · [README - Worktrees](../README.md#️-worktrees) |
 
