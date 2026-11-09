@@ -578,7 +578,7 @@ export OMNI_DEV_CLAUDE_CLI_ALLOW_MCP=true
 
 With this flag the `--strict-mcp-config` argument is removed, so the nested
 session can load any MCP server you have configured. **Be aware:** MCP
-servers frequently hold OAuth tokens (Gmail, Drive, Slack) or expose internal
+servers frequently hold OAuth tokens (mail, file storage, Slack) or expose internal
 network services — enabling this exposes them to the nested session. Use
 deliberately.
 

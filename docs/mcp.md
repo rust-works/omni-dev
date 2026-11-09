@@ -229,13 +229,9 @@ Read-only access to Datadog v1/v2 endpoints. Authentication uses
 
 ### Gmail and Drive (moved to gwi)
 
-The 23 Gmail and Drive tools (`gmail_*` and `drive_*`) are no longer served by
-`omni-dev-mcp`. They moved to `gwi-mcp`, the MCP server of
-[rust-works/gwi](https://github.com/rust-works/gwi), under the same tool names
-([#2203](https://github.com/rust-works/omni-dev/issues/2203),
-[ADR-0095](adrs/adr-0095.md)). Add `gwi-mcp` to your MCP client as a second server and
-run `gwi import` to copy your accounts from `~/.omni-dev`. See the
-[gwi repository](https://github.com/rust-works/gwi) for the tool catalog.
+The `gmail_*` and `drive_*` tools are no longer served by `omni-dev-mcp`. They moved to
+`gwi-mcp`, the MCP server of [rust-works/gwi](https://github.com/rust-works/gwi); add it to
+your MCP client as a second server ([ADR-0095](adrs/adr-0095.md)).
 
 ### AI / Config (5 tools)
 
@@ -461,7 +457,6 @@ a value of `0` disables truncation entirely.
 ## See also
 
 - [ADR-0021](adrs/adr-0021.md) — MCP server via second binary
-- [ADR-0095](adrs/adr-0095.md) — Gmail and Drive moved to gwi (and `gwi-mcp`)
 - [JIRA-Flavoured Markdown spec](specs/jfm.md) — also served as
   `omni-dev://specs/jfm`
 - [User Guide — Atlassian Integration](user-guide.md#atlassian---jira-and-confluence-integration)
