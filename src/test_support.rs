@@ -17,8 +17,8 @@
 /// own module's tests — while `HOME` itself is shared process-wide state, so
 /// two modules' tests can still interleave and race on it. That exact
 /// pattern caused the flaky race fixed for Atlassian in issue #950, and
-/// resurfaced as a Gmail-vs-Datadog race (both mutating `HOME` under their
-/// own independent mutex) in issue #1465.
+/// resurfaced as a cross-domain race (two domains' tests both mutating `HOME`
+/// under their own independent mutex) in issue #1465.
 pub(crate) static HOME_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Thread-scoped log buffer backing [`capture_at`].

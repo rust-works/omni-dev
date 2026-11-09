@@ -279,7 +279,7 @@ mod tests {
     /// `Mutex<()>` here provides no real exclusion against
     /// `cli::ai::chat::tests`'s own separate lock, despite this comment's
     /// stated intent (see issue #1465, where the same independent-mutex
-    /// pattern caused a real Gmail-vs-Datadog race).
+    /// pattern caused a real cross-domain race).
     static AI_CHAT_ENV_LOCK: &std::sync::Mutex<()> = &crate::test_support::HOME_ENV_MUTEX;
 
     const AI_CHAT_KEYS: &[&str] = &[
