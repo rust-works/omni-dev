@@ -147,7 +147,9 @@ async fn run_bridge_request(params: BrowserBridgeRequestParams) -> Result<String
         .await
         .with_context(|| format!("Failed to reach bridge at {endpoint} (is it running?)"))?;
 
+    // patchcov: coverage ignore reason="process-bound: reached only after BridgeClient::send gets a reply from a live bridge on a local port, which the unit tests do not run; the serializer call is a plain to_string over the already-parsed envelope"
     serde_norway::to_string(&resp).context("Failed to serialize bridge response as YAML")
+    // patchcov: coverage end
 }
 
 #[cfg(test)]

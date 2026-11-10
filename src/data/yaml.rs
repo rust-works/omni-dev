@@ -169,9 +169,9 @@ mod tests {
         assert_eq!(test_data.description, deserialized.description);
 
         // The diff_content may have a trailing newline added by YAML literal block formatting
-        assert!(
-            deserialized.diff_content == test_data.diff_content
-                || deserialized.diff_content == format!("{}\n", test_data.diff_content)
+        assert_eq!(
+            deserialized.diff_content.trim_end_matches('\n'),
+            test_data.diff_content
         );
     }
 
@@ -187,10 +187,21 @@ mod tests {
 
         // YAML literal blocks may add trailing newlines, so check content preservation
         assert_eq!(original.description, deserialized.description);
-        assert!(
-            deserialized.diff_content == original.diff_content
-                || deserialized.diff_content == format!("{}\n", original.diff_content)
+        assert_eq!(
+            deserialized.diff_content.trim_end_matches('\n'),
+            original.diff_content
         );
+    }
+
+    #[test]
+    fn tagged_values_serialize_as_their_inner_value() {
+        let tagged: serde_norway::Value = serde_norway::from_str("!custom hello").unwrap();
+        assert!(matches!(tagged, serde_norway::Value::Tagged(_)));
+
+        let yaml_output = to_yaml(&tagged).unwrap();
+
+        assert!(yaml_output.contains("hello"));
+        assert!(!yaml_output.contains("custom"));
     }
 
     #[test]

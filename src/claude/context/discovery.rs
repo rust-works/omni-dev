@@ -1134,6 +1134,50 @@ scopes:
         Ok(())
     }
 
+    // ── ProjectDiscovery::discover ───────────────────────────────────
+
+    #[test]
+    fn discover_loads_scopes_and_feature_contexts() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let config_dir = dir.path().join(".omni-dev");
+        let contexts_dir = config_dir.join("context").join("feature-contexts");
+        std::fs::create_dir_all(&contexts_dir)?;
+        std::fs::write(
+            config_dir.join("scopes.yaml"),
+            "scopes:\n  - name: custom\n    description: Custom scope\n    examples: []\n    file_patterns: []\n",
+        )?;
+        std::fs::write(
+            contexts_dir.join("auth.yaml"),
+            "name: auth\ndescription: Auth work\nscope: custom\nconventions:\n  - be careful\n",
+        )?;
+
+        let context = ProjectDiscovery::new(dir.path().to_path_buf(), config_dir).discover()?;
+
+        assert!(context.valid_scopes.iter().any(|s| s.name == "custom"));
+        let feature = context
+            .feature_contexts
+            .get("auth")
+            .expect("auth feature context should load");
+        assert_eq!(feature.scope, "custom");
+        Ok(())
+    }
+
+    #[test]
+    fn discover_ignores_malformed_scopes_and_feature_contexts() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let config_dir = dir.path().join(".omni-dev");
+        let contexts_dir = config_dir.join("context").join("feature-contexts");
+        std::fs::create_dir_all(&contexts_dir)?;
+        std::fs::write(config_dir.join("scopes.yaml"), "scopes: [not valid")?;
+        std::fs::write(contexts_dir.join("broken.yaml"), "name: [not valid")?;
+
+        let context = ProjectDiscovery::new(dir.path().to_path_buf(), config_dir).discover()?;
+
+        assert!(context.valid_scopes.is_empty());
+        assert!(context.feature_contexts.is_empty());
+        Ok(())
+    }
+
     // ── load_project_scopes_only ─────────────────────────────────────
 
     #[test]

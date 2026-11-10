@@ -276,8 +276,7 @@ impl CreatePrCommand {
             "Read PR details YAML from file"
         );
 
-        let final_pr_content: PrContent = serde_norway::from_str(&final_pr_yaml)
-            .context("Failed to parse PR details YAML. Please check the file format.")?;
+        let final_pr_content = parse_pr_details(&final_pr_yaml)?;
 
         debug!(
             title = %final_pr_content.title,
@@ -1474,6 +1473,12 @@ fn clean_branch_name(branch: &str) -> String {
     branch.replace(['/', '-', '_'], " ")
 }
 
+/// Parses the (possibly user-edited) PR details YAML file.
+fn parse_pr_details(yaml: &str) -> Result<PrContent> {
+    serde_norway::from_str(yaml)
+        .context("Failed to parse PR details YAML. Please check the file format.")
+}
+
 /// Returns the first line of a text block, trimmed.
 fn extract_first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("").trim()
@@ -2066,6 +2071,25 @@ mod run_create_pr_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- parse_pr_details ---
+
+    #[test]
+    fn parse_pr_details_reads_title_and_description() -> Result<()> {
+        let content = parse_pr_details("title: Add thing\ndescription: |\n  Body\n  more\n")?;
+        assert_eq!(content.title, "Add thing");
+        assert_eq!(content.description, "Body\nmore\n");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_pr_details_reports_a_malformed_file() {
+        let result = parse_pr_details("title: [unterminated");
+        assert!(matches!(
+            result,
+            Err(ref e) if e.to_string().contains("Failed to parse PR details YAML")
+        ));
+    }
 
     // --- parse_bool_string ---
 
