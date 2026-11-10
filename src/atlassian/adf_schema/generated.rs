@@ -19,11 +19,11 @@
 pub const UPSTREAM_PACKAGE: &str = "@atlaskit/adf-schema";
 
 /// Upstream npm package version this snapshot was generated from.
-pub const UPSTREAM_VERSION: &str = "57.6.21";
+pub const UPSTREAM_VERSION: &str = "57.7.39";
 
 /// SHA-256 of the upstream tarball that produced this snapshot.
 pub const UPSTREAM_TARBALL_SHA256: &str =
-    "9f17f6d3cb3baf053f3ca069d023c0b76e9efda31e5416c903ddf3341449d2be";
+    "1118a1da8afce6d51d89c189c8fbf831f3431f0d97fdedd2bc1862c75c97865c";
 
 /// SHA-256 of the vendored `assets/adf-schema/full.json` bytes.
 pub const UPSTREAM_FULL_JSON_SHA256: &str =
