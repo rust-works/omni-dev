@@ -150,14 +150,18 @@ async fn run_fetch(params: TranscriptFetchParams) -> Result<String> {
 async fn run_info(url: &str) -> Result<String> {
     let yt = Youtube::new()?;
     let info = yt.info(url).await?;
+    // patchcov: coverage ignore reason="network-bound: reached only after Youtube::info fetches a real video page, which a unit test must not do; the serializer call is a plain to_string"
     serde_norway::to_string(&info).context("Failed to serialize media info as YAML")
+    // patchcov: coverage end
 }
 
 /// Lists available caption tracks and serializes them as YAML.
 async fn run_list_langs(url: &str) -> Result<String> {
     let yt = Youtube::new()?;
     let langs = yt.list_languages(url).await?;
+    // patchcov: coverage ignore reason="network-bound: reached only after Youtube::list_languages fetches a real video page, which a unit test must not do; the serializer call is a plain to_string"
     serde_norway::to_string(&langs).context("Failed to serialize languages as YAML")
+    // patchcov: coverage end
 }
 
 #[cfg(test)]
