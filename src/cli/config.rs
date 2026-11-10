@@ -95,7 +95,7 @@ impl ShowCommand {
 /// carrying a `source: embedded|user|project|override` field. Returns the
 /// rendered YAML text.
 fn render_merged_yaml(config: &crate::claude::model_config::ModelConfiguration) -> Result<String> {
-    let yaml = serde_yaml::to_string(config)?;
+    let yaml = serde_norway::to_string(config)?;
     Ok(prepend_layer_summary(&yaml, config))
 }
 

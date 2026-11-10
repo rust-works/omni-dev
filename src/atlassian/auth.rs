@@ -597,7 +597,7 @@ mod tests {
             Some("https://status.atlassian.net")
         );
 
-        let yaml = serde_yaml::to_string(&status).unwrap();
+        let yaml = serde_norway::to_string(&status).unwrap();
         assert!(!yaml.contains("sekret-do-not-leak"), "leaked token: {yaml}");
         assert!(!yaml.contains("person@example.com"), "leaked email: {yaml}");
     }
@@ -860,7 +860,7 @@ mod tests {
         let scope = scope_status_from(&pat_env().with(ATLASSIAN_EMAIL, "leftover@example.com"));
         assert_eq!(scope.configuration_state, ConfigurationState::Configured);
         assert_eq!(scope.auth_mode, Some(AuthMode::Bearer));
-        let yaml = serde_yaml::to_string(&scope).unwrap();
+        let yaml = serde_norway::to_string(&scope).unwrap();
         assert!(yaml.contains("has_pat: true"));
         assert!(!yaml.contains("private-pat"));
         assert!(!yaml.contains("leftover@example.com"));

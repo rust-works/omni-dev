@@ -504,8 +504,8 @@ fn format_output(value: &Value, format: OutputFormat) -> Result<String> {
     match format {
         // `to_string_pretty` has no trailing newline; add one for parity.
         OutputFormat::Json => Ok(format!("{}\n", serde_json::to_string_pretty(value)?)),
-        // `serde_yaml` already emits a trailing newline.
-        OutputFormat::Yaml => Ok(serde_yaml::to_string(value)?),
+        // `serde_norway` already emits a trailing newline.
+        OutputFormat::Yaml => Ok(serde_norway::to_string(value)?),
         OutputFormat::Csv => delimited_output(value, ','),
         OutputFormat::Tsv => delimited_output(value, '\t'),
     }

@@ -160,7 +160,7 @@ pub fn parse(raw: &str, fetched_at: DateTime<Utc>) -> Result<VideoMetadata> {
 /// YAML is corrupt or carries no parseable `fetched_at` — callers treat that as
 /// "sidecar missing" and re-fetch.
 pub fn read_fetched_at(yaml: &str) -> Option<DateTime<Utc>> {
-    serde_yaml::from_str::<SidecarStamp>(yaml)
+    serde_norway::from_str::<SidecarStamp>(yaml)
         .ok()
         .map(|s| s.fetched_at)
 }
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn serialised_sidecar_round_trips_and_skips_empties() {
         let meta = parse(NO_MICROFORMAT, fixed_fetched_at()).unwrap();
-        let yaml = serde_yaml::to_string(&meta).unwrap();
+        let yaml = serde_norway::to_string(&meta).unwrap();
         // microformat-only fields are omitted when absent
         assert!(!yaml.contains("like_count"));
         assert!(!yaml.contains("category"));
@@ -378,14 +378,14 @@ mod tests {
         assert!(yaml.contains("schema: 1"));
         assert!(yaml.contains("video_id: noMicro1234"));
         assert!(yaml.contains("fetched_at:"));
-        let back: VideoMetadata = serde_yaml::from_str(&yaml).unwrap();
+        let back: VideoMetadata = serde_norway::from_str(&yaml).unwrap();
         assert_eq!(back, meta);
     }
 
     #[test]
     fn read_fetched_at_recovers_stamp() {
         let meta = parse(WITH_MICROFORMAT, fixed_fetched_at()).unwrap();
-        let yaml = serde_yaml::to_string(&meta).unwrap();
+        let yaml = serde_norway::to_string(&meta).unwrap();
         assert_eq!(read_fetched_at(&yaml), Some(fixed_fetched_at()));
     }
 

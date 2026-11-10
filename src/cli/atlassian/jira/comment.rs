@@ -294,7 +294,7 @@ async fn run_edit_comment(
         .await?;
     println!("Comment {comment_id} updated on {key}.");
     let yaml =
-        serde_yaml::to_string(&updated).context("Failed to serialize updated comment as YAML")?;
+        serde_norway::to_string(&updated).context("Failed to serialize updated comment as YAML")?;
     print!("{yaml}");
     Ok(())
 }

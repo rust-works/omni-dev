@@ -26,7 +26,7 @@ use crate::cli::atlassian::helpers::{
 type ResolvedWriteBody = (
     Option<AdfDocument>,
     String,
-    std::collections::BTreeMap<String, serde_yaml::Value>,
+    std::collections::BTreeMap<String, serde_norway::Value>,
     Vec<CustomFieldSection>,
     Option<String>,
 );

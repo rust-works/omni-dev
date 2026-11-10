@@ -501,7 +501,7 @@ mod tests {
         let ContentBlock::Text(text) = &result.content[0] else {
             panic!("text");
         };
-        let report: serde_json::Value = serde_yaml::from_str(&text.text).unwrap();
+        let report: serde_json::Value = serde_norway::from_str(&text.text).unwrap();
         assert_eq!(report["verdict"], "needs_review");
         assert!(report.get("github_cache").is_none());
     }

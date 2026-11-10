@@ -146,7 +146,7 @@ fn print_report(report: &StatusReport, format: OutputFormat) -> Result<()> {
             let output = StatusOutput {
                 targets: &report.targets,
             };
-            let yaml = serde_yaml::to_string(&output)
+            let yaml = serde_norway::to_string(&output)
                 .context("Failed to serialize status report as YAML")?;
             print!("{yaml}");
         }
@@ -373,7 +373,7 @@ mod tests {
         let output = StatusOutput {
             targets: &report.targets,
         };
-        let yaml = serde_yaml::to_string(&output).unwrap();
+        let yaml = serde_norway::to_string(&output).unwrap();
         assert!(yaml.contains("root: /repo"));
         assert!(yaml.contains("points_to:"));
         assert!(yaml.contains(".claude/skills/alpha/"));

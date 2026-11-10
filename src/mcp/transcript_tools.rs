@@ -150,14 +150,14 @@ async fn run_fetch(params: TranscriptFetchParams) -> Result<String> {
 async fn run_info(url: &str) -> Result<String> {
     let yt = Youtube::new()?;
     let info = yt.info(url).await?;
-    serde_yaml::to_string(&info).context("Failed to serialize media info as YAML")
+    serde_norway::to_string(&info).context("Failed to serialize media info as YAML")
 }
 
 /// Lists available caption tracks and serializes them as YAML.
 async fn run_list_langs(url: &str) -> Result<String> {
     let yt = Youtube::new()?;
     let langs = yt.list_languages(url).await?;
-    serde_yaml::to_string(&langs).context("Failed to serialize languages as YAML")
+    serde_norway::to_string(&langs).context("Failed to serialize languages as YAML")
 }
 
 #[cfg(test)]

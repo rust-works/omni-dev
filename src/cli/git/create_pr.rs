@@ -276,7 +276,7 @@ impl CreatePrCommand {
             "Read PR details YAML from file"
         );
 
-        let final_pr_content: PrContent = serde_yaml::from_str(&final_pr_yaml)
+        let final_pr_content: PrContent = serde_norway::from_str(&final_pr_yaml)
             .context("Failed to parse PR details YAML. Please check the file format.")?;
 
         debug!(

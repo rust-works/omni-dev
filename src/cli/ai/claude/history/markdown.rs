@@ -182,7 +182,7 @@ fn build_frontmatter_yaml(events: &[Event], options: RenderOptions<'_>) -> Resul
         event_count: events.len(),
     };
 
-    serde_yaml::to_string(&frontmatter).context("Failed to serialise frontmatter as YAML")
+    serde_norway::to_string(&frontmatter).context("Failed to serialise frontmatter as YAML")
 }
 
 fn last_string_field(events: &[Event], kinds: &[&str], field: &str) -> Option<String> {
@@ -966,15 +966,15 @@ mod tests {
 
     #[test]
     fn frontmatter_quotes_branch_with_special_chars() {
-        // Branch with a colon would break unquoted YAML; serde_yaml must quote it.
+        // Branch with a colon would break unquoted YAML; serde_norway must quote it.
         let out = render_lines(&[serde_json::json!({
             "type": "assistant",
             "gitBranch": "feat: with-colon",
             "message": { "content": [{"type":"text","text":"hi"}] },
         })]);
-        // Round-trip through serde_yaml to assert validity.
+        // Round-trip through serde_norway to assert validity.
         let body = out.split("---\n").nth(1).unwrap();
-        let _: serde_yaml::Value = serde_yaml::from_str(body).unwrap();
+        let _: serde_norway::Value = serde_norway::from_str(body).unwrap();
     }
 
     #[test]

@@ -254,7 +254,7 @@ Deterministic checks run before AI processing. Scope validity and format are ver
 | `git2` | Native git operations without shelling out to `git` |
 | `reqwest` | HTTP client for AI provider APIs |
 | `tokio` | Async runtime for concurrent API requests |
-| `serde` + `serde_yaml` | Structured data exchange (YAML is the primary format — see ADR-0001) |
+| `serde` + `serde_norway` | Structured data exchange (YAML is the primary format — see ADR-0001) |
 | `serde_json` | JSON parsing for API responses and settings |
 | `anyhow` | Application-level error propagation with context chains |
 | `thiserror` | Typed errors for the AI client layer (`ClaudeError`) |

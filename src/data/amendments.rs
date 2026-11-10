@@ -75,7 +75,7 @@ impl AmendmentFile {
     /// Saves amendments to a YAML file with proper multiline formatting.
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let yaml_content =
-            serde_yaml::to_string(self).context("Failed to serialize amendments to YAML")?;
+            serde_norway::to_string(self).context("Failed to serialize amendments to YAML")?;
 
         // Post-process YAML to use literal block scalars for multiline messages
         let formatted_yaml = self.format_multiline_yaml(&yaml_content);

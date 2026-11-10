@@ -344,7 +344,7 @@ pub fn load_project_scopes_only(context_dir: &Path) -> Vec<ScopeDefinition> {
             return vec![];
         }
     };
-    match serde_yaml::from_str::<ScopesConfig>(&scopes_yaml) {
+    match serde_norway::from_str::<ScopesConfig>(&scopes_yaml) {
         Ok(config) => config.scopes,
         Err(e) => {
             tracing::warn!(
@@ -390,7 +390,7 @@ pub fn load_scopes_file_strict(context_dir: &Path) -> Result<ScopesFile> {
     }
     let raw = fs::read_to_string(&scopes_path)
         .with_context(|| format!("Failed to read scopes file: {}", scopes_path.display()))?;
-    serde_yaml::from_str(&raw)
+    serde_norway::from_str(&raw)
         .with_context(|| format!("Failed to parse scopes file: {}", scopes_path.display()))
 }
 
@@ -414,7 +414,7 @@ pub fn load_commit_rules(context_dir: &Path) -> CommitRules {
         }
     };
 
-    match serde_yaml::from_str::<CommitRules>(&rules_yaml) {
+    match serde_norway::from_str::<CommitRules>(&rules_yaml) {
         Ok(rules) => rules,
         Err(e) => {
             let path = rules_path.display();
@@ -653,7 +653,7 @@ impl ProjectDiscovery {
         let scopes_path = resolve_config_file(dir, "scopes.yaml");
         if scopes_path.exists() {
             let scopes_yaml = fs::read_to_string(&scopes_path)?;
-            match serde_yaml::from_str::<ScopesConfig>(&scopes_yaml) {
+            match serde_norway::from_str::<ScopesConfig>(&scopes_yaml) {
                 Ok(scopes_config) => {
                     context.valid_scopes = scopes_config.scopes;
                 }
@@ -753,7 +753,7 @@ impl ProjectDiscovery {
             if let Some(name) = entry.file_name().to_str() {
                 if name.ends_with(".yaml") || name.ends_with(".yml") {
                     let content = fs::read_to_string(entry.path())?;
-                    match serde_yaml::from_str::<FeatureContext>(&content) {
+                    match serde_norway::from_str::<FeatureContext>(&content) {
                         Ok(feature_context) => {
                             let feature_name = name
                                 .trim_end_matches(".yaml")

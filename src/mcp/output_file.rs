@@ -29,7 +29,7 @@ pub fn write_to_file_yaml(path: &str, content: &str, format: &str) -> Result<Str
         bytes: content.len(),
         format: format.to_string(),
     };
-    serde_yaml::to_string(&summary).context("Failed to serialize write summary as YAML")
+    serde_norway::to_string(&summary).context("Failed to serialize write summary as YAML")
 }
 
 #[cfg(test)]

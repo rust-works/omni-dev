@@ -67,7 +67,7 @@ impl GetCommand {
         let api = ConfluenceApi::new(client);
         let value = api.get_content_restrictions(&self.id).await?;
         let yaml =
-            serde_yaml::to_string(&value).context("Failed to serialize restrictions as YAML")?;
+            serde_norway::to_string(&value).context("Failed to serialize restrictions as YAML")?;
         print!("{yaml}");
         Ok(())
     }

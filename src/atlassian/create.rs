@@ -102,7 +102,7 @@ pub struct ResolvedJiraCreate {
     /// Validated ADF body.
     pub adf: ValidatedAdfDocument,
     /// Scalar custom field values keyed by human-readable name.
-    pub custom_scalars: BTreeMap<String, serde_yaml::Value>,
+    pub custom_scalars: BTreeMap<String, serde_norway::Value>,
     /// Rich-text custom field sections extracted from the body.
     pub custom_sections: Vec<CustomFieldSection>,
     /// Frontmatter values shadowed by an explicit override.
@@ -120,12 +120,14 @@ pub fn resolve_jira_create(
     override_project: Option<&str>,
     override_summary: Option<&str>,
     override_issue_type: Option<&str>,
-    set_field_overrides: Vec<(String, serde_yaml::Value)>,
+    set_field_overrides: Vec<(String, serde_norway::Value)>,
 ) -> Result<ResolvedJiraCreate> {
     let (fm_yaml, raw_body) = split_frontmatter(document)?;
 
     let fm: JiraCreateFrontmatter = match fm_yaml {
-        Some(yaml) => serde_yaml::from_str(yaml).context("Failed to parse JFM frontmatter YAML")?,
+        Some(yaml) => {
+            serde_norway::from_str(yaml).context("Failed to parse JFM frontmatter YAML")?
+        }
         None => JiraCreateFrontmatter::default(),
     };
 
@@ -195,7 +197,7 @@ pub async fn create_resolved_jira_issue(
     summary: &str,
     adf: &ValidatedAdfDocument,
     labels: &[String],
-    custom_scalars: &BTreeMap<String, serde_yaml::Value>,
+    custom_scalars: &BTreeMap<String, serde_norway::Value>,
     custom_sections: &[CustomFieldSection],
 ) -> Result<JiraCreatedIssue> {
     let custom_fields = if custom_scalars.is_empty() && custom_sections.is_empty() {

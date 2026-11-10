@@ -169,7 +169,7 @@ fn print_report(report: &CleanReport, dry_run: bool, format: OutputFormat) -> Re
                 dry_run,
                 actions: &report.actions,
             };
-            let yaml = serde_yaml::to_string(&output)
+            let yaml = serde_norway::to_string(&output)
                 .context("Failed to serialize clean report as YAML")?;
             print!("{yaml}");
         }
@@ -621,7 +621,7 @@ mod tests {
             dry_run: false,
             actions: &report.actions,
         };
-        let yaml = serde_yaml::to_string(&output).unwrap();
+        let yaml = serde_norway::to_string(&output).unwrap();
         assert!(yaml.contains("type: unlinked"));
         assert!(yaml.contains("type: preserved"));
         assert!(yaml.contains("type: exclude_removed"));

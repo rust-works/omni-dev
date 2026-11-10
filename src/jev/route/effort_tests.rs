@@ -402,7 +402,7 @@ fn serialization_and_text_keep_native_levels_and_close_call_evidence() {
     let route = &routes["custom"];
     let json = serde_json::to_value(route).unwrap();
     let yaml: serde_json::Value =
-        serde_yaml::from_str(&serde_yaml::to_string(route).unwrap()).unwrap();
+        serde_norway::from_str(&serde_norway::to_string(route).unwrap()).unwrap();
     assert_eq!(json, yaml);
     let e = &json["stages"]["implement"]["effort_by_model"]["small,alternative"][0];
     assert_eq!(e["level"], "quick");
@@ -636,7 +636,7 @@ async fn class_only_route_omits_effort_questions_and_output_for_builtin_and_cust
     assert_eq!(depends_on.len(), 1);
     let json = serde_json::to_value(&report).unwrap();
     let yaml: serde_json::Value =
-        serde_yaml::from_str(&serde_yaml::to_string(&report).unwrap()).unwrap();
+        serde_norway::from_str(&serde_norway::to_string(&report).unwrap()).unwrap();
     assert_eq!(json, yaml);
     for provider in ["openai", "anthropic", "custom"] {
         for stage in ["design", "implement", "review"] {

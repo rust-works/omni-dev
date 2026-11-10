@@ -2661,10 +2661,10 @@ async fn confluence_compare_round_trip_with_fixture_page() -> Result<()> {
 
     // Capture the cursor for the Background section. Parse the YAML
     // structurally so we don't trip over quoting differences.
-    let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("parse YAML output");
+    let parsed: serde_norway::Value = serde_norway::from_str(&yaml).expect("parse YAML output");
     let sections = parsed
         .get("sections")
-        .and_then(serde_yaml::Value::as_sequence)
+        .and_then(serde_norway::Value::as_sequence)
         .expect("sections array");
     let cursor = sections
         .iter()
@@ -2922,7 +2922,7 @@ async fn jev_tools_return_reports_through_the_mcp_binary() -> Result<()> {
     let ContentBlock::Text(text) = &result.content[0] else {
         panic!("text report");
     };
-    let report: serde_json::Value = serde_yaml::from_str(&text.text)?;
+    let report: serde_json::Value = serde_norway::from_str(&text.text)?;
     assert_eq!(report["verdict"], "needs_review");
     assert_eq!(report["comment"]["id"], 123);
     let requests = mock.received_requests().await.unwrap();

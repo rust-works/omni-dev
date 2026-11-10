@@ -192,7 +192,7 @@ impl Tiers {
     /// Parses and validates a tiers file: at least two tiers, non-empty
     /// unique names and descriptions, and no tier named [`NO_DESIGN`].
     pub fn parse(yaml: &str) -> Result<Self> {
-        let file: TiersFile = serde_yaml::from_str(yaml).context("Failed to parse tiers file")?;
+        let file: TiersFile = serde_norway::from_str(yaml).context("Failed to parse tiers file")?;
         if file.tiers.len() < MIN_TIERS {
             bail!(
                 "a tiers file needs at least {MIN_TIERS} tiers, got {}",
@@ -301,7 +301,7 @@ pub fn build_route_questions_for_mode(
     ladders: &[Ladder],
     effort_advice: bool,
 ) -> Result<BTreeMap<String, Question>> {
-    let templates: BTreeMap<String, Question> = serde_yaml::from_str(STAGE_QUESTIONS_YAML)
+    let templates: BTreeMap<String, Question> = serde_norway::from_str(STAGE_QUESTIONS_YAML)
         .context("Failed to parse the embedded stage questions")?;
     for stage in Stage::ALL {
         if !templates.contains_key(stage.template_key()) {
@@ -2457,8 +2457,8 @@ mod tests {
                 json["draft_comments"],
                 serde_json::json!(["triage draft.md", "scope.md"])
             );
-            let yaml: serde_yaml::Value =
-                serde_yaml::from_str(&serde_yaml::to_string(&issue).unwrap()).unwrap();
+            let yaml: serde_norway::Value =
+                serde_norway::from_str(&serde_norway::to_string(&issue).unwrap()).unwrap();
             assert_eq!(yaml["draft_comments"][0].as_str(), Some("triage draft.md"));
             let text = render_issue_block(&issue, 1000, &[], TerminalStyle::default());
             assert!(text.contains("draft comments (preview): [\"triage draft.md\", \"scope.md\"]"));
@@ -2712,7 +2712,7 @@ mod tests {
         assert_eq!(route.close_calls, [Stage::Implement]);
         let json = serde_json::to_value(route).unwrap();
         let yaml: serde_json::Value =
-            serde_yaml::from_str(&serde_yaml::to_string(route).unwrap()).unwrap();
+            serde_norway::from_str(&serde_norway::to_string(route).unwrap()).unwrap();
         assert_eq!(json, yaml);
         assert_eq!(json["close_calls"], serde_json::json!(["implement"]));
         for stage in Stage::ALL {
@@ -3259,8 +3259,8 @@ mod tests {
             assert_eq!(json["open_questions"]["choice"], label);
             assert_eq!(json["open_questions"]["confidence"], 0.8);
             assert_eq!(json["open_questions"]["probabilities"][label], 0.8);
-            let yaml: serde_yaml::Value =
-                serde_yaml::from_str(&serde_yaml::to_string(&issue).unwrap()).unwrap();
+            let yaml: serde_norway::Value =
+                serde_norway::from_str(&serde_norway::to_string(&issue).unwrap()).unwrap();
             assert_eq!(yaml["open_questions"]["choice"].as_str(), Some(label));
             assert!(
                 render_issue_block(&issue, 1000, &[], TerminalStyle::default())
@@ -4960,7 +4960,7 @@ mod tests {
         assert_eq!(providers["anthropic"]["class_from"], "design");
         assert_eq!(providers["openai"]["class_from"], "implement");
 
-        let yaml = serde_yaml::to_string(&report).unwrap();
+        let yaml = serde_norway::to_string(&report).unwrap();
         assert!(
             yaml.contains("class: opus\n      class_from: design\n"),
             "{yaml}"

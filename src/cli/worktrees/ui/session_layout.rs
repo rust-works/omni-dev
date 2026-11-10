@@ -131,7 +131,7 @@ pub fn load(path: Option<PathBuf>) -> SavedLayout {
     let Ok(contents) = fs::read_to_string(&path) else {
         return SavedLayout::default();
     };
-    match serde_yaml::from_str::<SavedLayout>(&contents) {
+    match serde_norway::from_str::<SavedLayout>(&contents) {
         Ok(layout) => layout.prune(Path::is_dir),
         Err(e) => {
             // Worth a log line — a corrupt file is a real (if harmless)
@@ -164,7 +164,7 @@ pub fn save(layout: &SavedLayout, path: Option<PathBuf>) -> Result<()> {
         version: 1,
         ..layout.clone()
     };
-    let contents = serde_yaml::to_string(&stored).context("failed to serialize the layout")?;
+    let contents = serde_norway::to_string(&stored).context("failed to serialize the layout")?;
     let tmp_path = path.with_extension("yaml.tmp");
     fs::write(&tmp_path, contents)
         .with_context(|| format!("failed to write {}", tmp_path.display()))?;
@@ -223,7 +223,7 @@ mod tests {
 
         // Read back without pruning (the paths are fictional).
         let contents = fs::read_to_string(&path).unwrap();
-        let after: SavedLayout = serde_yaml::from_str(&contents).unwrap();
+        let after: SavedLayout = serde_norway::from_str(&contents).unwrap();
         assert_eq!(after, before);
         assert_eq!(after.version, 1);
     }
@@ -305,9 +305,9 @@ mod tests {
         for kind in [TabKind::Shell, TabKind::Claude, TabKind::Codex] {
             assert_eq!(TabKind::from(SavedTabKind::from(kind)), kind);
         }
-        let parsed: SavedTab = serde_yaml::from_str("path: /a\n").unwrap();
+        let parsed: SavedTab = serde_norway::from_str("path: /a\n").unwrap();
         assert_eq!(parsed.kind, SavedTabKind::Shell);
-        let claude: SavedTab = serde_yaml::from_str("path: /a\nkind: claude\n").unwrap();
+        let claude: SavedTab = serde_norway::from_str("path: /a\nkind: claude\n").unwrap();
         assert_eq!(claude.kind, SavedTabKind::Claude);
     }
 

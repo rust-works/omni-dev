@@ -791,7 +791,7 @@ fn parse_write_content(
 fn serialize_search_results(
     results: &crate::atlassian::confluence_types::ConfluenceSearchResults,
 ) -> Result<String> {
-    serde_yaml::to_string(results).context("Failed to serialize search results")
+    serde_norway::to_string(results).context("Failed to serialize search results")
 }
 
 /// Build the download summary from the manifest produced by `run_download`.
@@ -819,7 +819,7 @@ fn build_download_summary(output_dir: &std::path::Path) -> Result<String> {
         page_count: pages.len(),
         pages,
     };
-    serde_yaml::to_string(&summary).context("Failed to serialize download summary")
+    serde_norway::to_string(&summary).context("Failed to serialize download summary")
 }
 
 /// Resolves the download output directory, creating a tempdir when omitted.

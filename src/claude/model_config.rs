@@ -427,14 +427,14 @@ impl ModelRegistry {
     /// first entry is treated as the embedded catalog and a parse failure
     /// there is a hard error.
     pub(crate) fn from_layers(layers: &[(ModelSource, String)]) -> Result<Self> {
-        let mut merged: serde_yaml::Value =
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::default());
+        let mut merged: serde_norway::Value =
+            serde_norway::Value::Mapping(serde_norway::Mapping::default());
         let mut model_sources: HashMap<String, ModelSource> = HashMap::new();
         let mut provider_sources: HashMap<String, ModelSource> = HashMap::new();
         let mut declared_versions: Vec<(ModelSource, Option<String>)> = Vec::new();
 
         for (source, yaml) in layers {
-            let value: serde_yaml::Value = match serde_yaml::from_str(yaml) {
+            let value: serde_norway::Value = match serde_norway::from_str(yaml) {
                 Ok(v) => v,
                 Err(e) => {
                     if matches!(source, ModelSource::Embedded) {
@@ -467,7 +467,7 @@ impl ModelRegistry {
 
         warn_on_version_mismatch(&declared_versions);
 
-        let mut config: ModelConfiguration = serde_yaml::from_value(merged)
+        let mut config: ModelConfiguration = serde_norway::from_value(merged)
             .map_err(|e| anyhow!("Failed to deserialize merged model configuration: {e}"))?;
 
         for spec in &mut config.models {
@@ -827,13 +827,13 @@ fn read_optional_yaml(path: &Path) -> Option<String> {
 ///
 /// All other top-level keys (such as `version`) are last-writer-wins.
 fn merge_layer_into(
-    dest: &mut serde_yaml::Value,
-    src: serde_yaml::Value,
+    dest: &mut serde_norway::Value,
+    src: serde_norway::Value,
     source: ModelSource,
     model_sources: &mut HashMap<String, ModelSource>,
     provider_sources: &mut HashMap<String, ModelSource>,
 ) {
-    use serde_yaml::Value;
+    use serde_norway::Value;
 
     let Value::Mapping(src_map) = src else {
         // Top-level isn't a mapping — treat the layer as a wholesale
@@ -844,7 +844,7 @@ fn merge_layer_into(
     };
 
     if !matches!(dest, Value::Mapping(_)) {
-        *dest = Value::Mapping(serde_yaml::Mapping::new());
+        *dest = Value::Mapping(serde_norway::Mapping::new());
     }
     let Value::Mapping(dest_map) = dest else {
         unreachable!("dest is a mapping after the check above");
@@ -862,13 +862,13 @@ fn merge_layer_into(
 }
 
 fn merge_models_into(
-    dest_map: &mut serde_yaml::Mapping,
-    key: serde_yaml::Value,
-    incoming: serde_yaml::Value,
+    dest_map: &mut serde_norway::Mapping,
+    key: serde_norway::Value,
+    incoming: serde_norway::Value,
     source: ModelSource,
     model_sources: &mut HashMap<String, ModelSource>,
 ) {
-    use serde_yaml::Value;
+    use serde_norway::Value;
 
     let Value::Sequence(incoming_seq) = incoming else {
         // Not a sequence — replace whatever is there.
@@ -899,10 +899,11 @@ fn merge_models_into(
             continue;
         };
 
-        if let Some(existing) = dest_seq
-            .iter_mut()
-            .find(|e| e.get("api_identifier").and_then(serde_yaml::Value::as_str) == Some(&api_id))
-        {
+        if let Some(existing) = dest_seq.iter_mut().find(|e| {
+            e.get("api_identifier")
+                .and_then(serde_norway::Value::as_str)
+                == Some(&api_id)
+        }) {
             deep_merge(existing, entry);
         } else {
             dest_seq.push(entry);
@@ -913,13 +914,13 @@ fn merge_models_into(
 }
 
 fn merge_providers_into(
-    dest_map: &mut serde_yaml::Mapping,
-    key: serde_yaml::Value,
-    incoming: serde_yaml::Value,
+    dest_map: &mut serde_norway::Mapping,
+    key: serde_norway::Value,
+    incoming: serde_norway::Value,
     source: ModelSource,
     provider_sources: &mut HashMap<String, ModelSource>,
 ) {
-    use serde_yaml::Value;
+    use serde_norway::Value;
 
     let Value::Mapping(incoming_providers) = incoming else {
         dest_map.insert(key, incoming);
@@ -928,9 +929,9 @@ fn merge_providers_into(
 
     let dest_value = dest_map
         .entry(key)
-        .or_insert_with(|| Value::Mapping(serde_yaml::Mapping::new()));
+        .or_insert_with(|| Value::Mapping(serde_norway::Mapping::new()));
     if !matches!(dest_value, Value::Mapping(_)) {
-        *dest_value = Value::Mapping(serde_yaml::Mapping::new());
+        *dest_value = Value::Mapping(serde_norway::Mapping::new());
     }
     let Value::Mapping(dest_providers) = dest_value else {
         unreachable!("dest is a mapping after the check above");
@@ -953,8 +954,8 @@ fn merge_providers_into(
 
 /// Recursive deep-merge: mappings are merged key-by-key, sequences and
 /// scalars are replaced wholesale.
-fn deep_merge(dest: &mut serde_yaml::Value, src: serde_yaml::Value) {
-    use serde_yaml::Value;
+fn deep_merge(dest: &mut serde_norway::Value, src: serde_norway::Value) {
+    use serde_norway::Value;
     match (dest, src) {
         (Value::Mapping(d), Value::Mapping(s)) => {
             for (k, v) in s {

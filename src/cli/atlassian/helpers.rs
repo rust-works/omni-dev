@@ -285,7 +285,7 @@ pub fn print_jira_dry_run_with_custom_fields(
     title: &str,
     assignee: Option<&str>,
     reporter: Option<&str>,
-    scalars: &std::collections::BTreeMap<String, serde_yaml::Value>,
+    scalars: &std::collections::BTreeMap<String, serde_norway::Value>,
     sections: &[crate::atlassian::document::CustomFieldSection],
 ) -> Result<()> {
     println!("Dry run for {key}:");
@@ -319,7 +319,7 @@ pub fn print_jira_dry_run_with_custom_fields(
         println!("\nCustom field scalars (frontmatter):");
         for (name, value) in scalars {
             let rendered =
-                serde_yaml::to_string(value).context("Failed to serialize scalar as YAML")?;
+                serde_norway::to_string(value).context("Failed to serialize scalar as YAML")?;
             println!("  {name}: {}", rendered.trim());
         }
     }
@@ -1295,7 +1295,7 @@ mod tests {
         let mut scalars = std::collections::BTreeMap::new();
         scalars.insert(
             "Planned / Unplanned Work".to_string(),
-            serde_yaml::Value::String("Unplanned".to_string()),
+            serde_norway::Value::String("Unplanned".to_string()),
         );
         let sections = [CustomFieldSection {
             name: "Acceptance Criteria".to_string(),

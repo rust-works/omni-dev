@@ -174,7 +174,7 @@ fn render_sync_report(report: &sync::SyncReport, format: OutputFormat) -> Result
                 actions: &report.actions,
                 errors: &report.errors,
             };
-            serde_yaml::to_string(&output).context("Failed to serialize sync report as YAML")
+            serde_norway::to_string(&output).context("Failed to serialize sync report as YAML")
         }
     }
 }
@@ -220,7 +220,7 @@ fn render_clean_report(report: &clean::CleanReport, format: OutputFormat) -> Res
                 dry_run: false,
                 actions: &report.actions,
             };
-            serde_yaml::to_string(&output).context("Failed to serialize clean report as YAML")
+            serde_norway::to_string(&output).context("Failed to serialize clean report as YAML")
         }
     }
 }
@@ -262,7 +262,7 @@ fn render_status_report(report: &status::StatusReport, format: OutputFormat) -> 
             let output = StatusOutput {
                 targets: &report.targets,
             };
-            serde_yaml::to_string(&output).context("Failed to serialize status report as YAML")
+            serde_norway::to_string(&output).context("Failed to serialize status report as YAML")
         }
     }
 }

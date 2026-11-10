@@ -35,7 +35,7 @@ use crate::atlassian::jira_types::TEXTAREA_CUSTOM_TYPE as CUSTOM_TEXTAREA;
 /// `customfield_<digits>` bypass the lookup. An unknown or ambiguous name
 /// produces an error naming the available editable fields.
 pub fn resolve_custom_fields(
-    scalars: &BTreeMap<String, serde_yaml::Value>,
+    scalars: &BTreeMap<String, serde_norway::Value>,
     sections: &[CustomFieldSection],
     editmeta: &EditMeta,
 ) -> Result<BTreeMap<String, serde_json::Value>> {
@@ -144,14 +144,14 @@ fn resolve_section_field<'a>(
 /// the empty RHS as YAML null (not a string), so a "clear the field"
 /// invocation arrives here as `Value::Null`.
 fn rich_text_scalar_to_api_value(
-    value: &serde_yaml::Value,
+    value: &serde_norway::Value,
     field: &EditMetaField,
     id: &str,
 ) -> Result<serde_json::Value> {
     let s = match value {
-        serde_yaml::Value::String(s) => s.clone(),
-        serde_yaml::Value::Null => String::new(),
-        serde_yaml::Value::Mapping(_) => return adf_mapping_to_api_value(value, field, id),
+        serde_norway::Value::String(s) => s.clone(),
+        serde_norway::Value::Null => String::new(),
+        serde_norway::Value::Mapping(_) => return adf_mapping_to_api_value(value, field, id),
         _ => bail!(
             "Field '{}' ({}) is a rich-text field; supply JFM markdown as a string or use a `<!-- field: {} ({}) -->` body section",
             field.name,
@@ -165,7 +165,7 @@ fn rich_text_scalar_to_api_value(
 
 /// Validates and forwards a raw ADF document supplied for a rich-text field.
 fn adf_mapping_to_api_value(
-    value: &serde_yaml::Value,
+    value: &serde_norway::Value,
     field: &EditMetaField,
     id: &str,
 ) -> Result<serde_json::Value> {
@@ -242,7 +242,7 @@ pub fn convert_textarea_string_values(
 /// Dispatches a scalar YAML value to the API shape expected for a given
 /// field schema.
 fn scalar_to_api_value(
-    value: &serde_yaml::Value,
+    value: &serde_norway::Value,
     field: &EditMetaField,
     id: &str,
 ) -> Result<serde_json::Value> {
@@ -272,7 +272,7 @@ fn scalar_to_api_value(
             // elements are never split — `Labels=["a,b"]` is the escape
             // hatch for a literal comma inside one element.
             let elements: Vec<String> = match value {
-                serde_yaml::Value::Sequence(seq) => seq
+                serde_norway::Value::Sequence(seq) => seq
                     .iter()
                     .map(|v| {
                         yaml_as_string(v).with_context(|| {
@@ -283,9 +283,9 @@ fn scalar_to_api_value(
                         })
                     })
                     .collect::<Result<_>>()?,
-                serde_yaml::Value::String(_)
-                | serde_yaml::Value::Number(_)
-                | serde_yaml::Value::Bool(_) => yaml_as_string(value)?
+                serde_norway::Value::String(_)
+                | serde_norway::Value::Number(_)
+                | serde_norway::Value::Bool(_) => yaml_as_string(value)?
                     .split(',')
                     .map(str::trim)
                     .filter(|part| !part.is_empty())
@@ -306,9 +306,9 @@ fn scalar_to_api_value(
             Ok(serde_json::Value::Array(items))
         }
         ("issuelink", _) => match value {
-            serde_yaml::Value::String(s) => Ok(serde_json::json!({ "key": s })),
+            serde_norway::Value::String(s) => Ok(serde_json::json!({ "key": s })),
             // Pre-shaped payloads ({"key": ...} / {"id": ...}) pass through.
-            serde_yaml::Value::Mapping(_) => yaml_to_json(value),
+            serde_norway::Value::Mapping(_) => yaml_to_json(value),
             _ => Err(anyhow!(
                 "expected an issue key string (e.g. 'PROJ-123') for issue-link field '{}'",
                 field.name
@@ -347,18 +347,18 @@ fn validate_option_value(field: &EditMetaField, id: &str, value: &str) -> Result
     )
 }
 
-fn yaml_as_string(value: &serde_yaml::Value) -> Result<String> {
+fn yaml_as_string(value: &serde_norway::Value) -> Result<String> {
     match value {
-        serde_yaml::Value::String(s) => Ok(s.clone()),
-        serde_yaml::Value::Bool(b) => Ok(b.to_string()),
-        serde_yaml::Value::Number(n) => Ok(n.to_string()),
+        serde_norway::Value::String(s) => Ok(s.clone()),
+        serde_norway::Value::Bool(b) => Ok(b.to_string()),
+        serde_norway::Value::Number(n) => Ok(n.to_string()),
         _ => Err(anyhow!("expected a scalar string value")),
     }
 }
 
-fn yaml_to_json(value: &serde_yaml::Value) -> Result<serde_json::Value> {
-    let s = serde_yaml::to_string(value).context("Failed to convert YAML to JSON")?;
-    serde_json::to_value(serde_yaml::from_str::<serde_json::Value>(&s)?)
+fn yaml_to_json(value: &serde_norway::Value) -> Result<serde_json::Value> {
+    let s = serde_norway::to_string(value).context("Failed to convert YAML to JSON")?;
+    serde_json::to_value(serde_norway::from_str::<serde_json::Value>(&s)?)
         .context("Failed to convert YAML value to JSON")
 }
 
@@ -367,7 +367,7 @@ fn yaml_to_json(value: &serde_yaml::Value) -> Result<serde_json::Value> {
 /// The value is parsed as YAML when possible so `--set-field "Points=8"`
 /// becomes a number and `--set-field "Enabled=true"` becomes a bool.
 /// Values that fail to parse as YAML fall back to plain strings.
-pub fn parse_set_field(input: &str) -> Result<(String, serde_yaml::Value)> {
+pub fn parse_set_field(input: &str) -> Result<(String, serde_norway::Value)> {
     let (name, value) = input
         .split_once('=')
         .ok_or_else(|| anyhow!("expected --set-field \"NAME=VALUE\", got '{input}'"))?;
@@ -375,8 +375,8 @@ pub fn parse_set_field(input: &str) -> Result<(String, serde_yaml::Value)> {
     if name.is_empty() {
         bail!("--set-field requires a non-empty name before '='");
     }
-    let yaml_value = serde_yaml::from_str::<serde_yaml::Value>(value)
-        .unwrap_or_else(|_| serde_yaml::Value::String(value.to_string()));
+    let yaml_value = serde_norway::from_str::<serde_norway::Value>(value)
+        .unwrap_or_else(|_| serde_norway::Value::String(value.to_string()));
     Ok((name, yaml_value))
 }
 
@@ -427,9 +427,9 @@ pub fn apply_user_field_overrides(
 /// Merges CLI `--set-field` overrides into a frontmatter scalar map,
 /// with CLI overriding frontmatter on name conflicts.
 pub fn merge_set_field_overrides(
-    frontmatter: BTreeMap<String, serde_yaml::Value>,
-    overrides: Vec<(String, serde_yaml::Value)>,
-) -> BTreeMap<String, serde_yaml::Value> {
+    frontmatter: BTreeMap<String, serde_norway::Value>,
+    overrides: Vec<(String, serde_norway::Value)>,
+) -> BTreeMap<String, serde_norway::Value> {
     let mut merged = frontmatter;
     for (name, value) in overrides {
         merged.insert(name, value);
@@ -585,7 +585,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Planned / Unplanned Work".to_string(),
-            serde_yaml::Value::String("Unplanned".to_string()),
+            serde_norway::Value::String("Unplanned".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -605,7 +605,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Risk".to_string(),
-            serde_yaml::Value::String("High".to_string()),
+            serde_norway::Value::String("High".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -625,7 +625,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Story points".to_string(),
-            serde_yaml::Value::Number(8.into()),
+            serde_norway::Value::Number(8.into()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(out.get("customfield_10003").unwrap(), &serde_json::json!(8));
@@ -637,9 +637,9 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Components".to_string(),
-            serde_yaml::Value::Sequence(vec![
-                serde_yaml::Value::String("backend".to_string()),
-                serde_yaml::Value::String("auth".to_string()),
+            serde_norway::Value::Sequence(vec![
+                serde_norway::Value::String("backend".to_string()),
+                serde_norway::Value::String("auth".to_string()),
             ]),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
@@ -666,9 +666,9 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Labels".to_string(),
-            serde_yaml::Value::Sequence(vec![
-                serde_yaml::Value::String("lock-state-v2".to_string()),
-                serde_yaml::Value::String("phase-1".to_string()),
+            serde_norway::Value::Sequence(vec![
+                serde_norway::Value::String("lock-state-v2".to_string()),
+                serde_norway::Value::String("phase-1".to_string()),
             ]),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
@@ -695,7 +695,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Team Tags".to_string(),
-            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("infra".to_string())]),
+            serde_norway::Value::Sequence(vec![serde_norway::Value::String("infra".to_string())]),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -719,9 +719,9 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Components".to_string(),
-            serde_yaml::Value::Sequence(vec![
-                serde_yaml::Value::String("backend".to_string()),
-                serde_yaml::Value::String("auth".to_string()),
+            serde_norway::Value::Sequence(vec![
+                serde_norway::Value::String("backend".to_string()),
+                serde_norway::Value::String("auth".to_string()),
             ]),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
@@ -751,7 +751,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Labels".to_string(),
-            serde_yaml::Value::String("a,b,c".to_string()),
+            serde_norway::Value::String("a,b,c".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &labels_meta()).unwrap();
         assert_eq!(
@@ -766,7 +766,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Components".to_string(),
-            serde_yaml::Value::String("backend,auth".to_string()),
+            serde_norway::Value::String("backend,auth".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -790,7 +790,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Components".to_string(),
-            serde_yaml::Value::String("backend,auth".to_string()),
+            serde_norway::Value::String("backend,auth".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -804,7 +804,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Labels".to_string(),
-            serde_yaml::Value::String(" a , , b ,".to_string()),
+            serde_norway::Value::String(" a , , b ,".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &labels_meta()).unwrap();
         assert_eq!(out.get("labels").unwrap(), &serde_json::json!(["a", "b"]));
@@ -816,7 +816,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Components".to_string(),
-            serde_yaml::Value::String("x,z".to_string()),
+            serde_norway::Value::String("x,z".to_string()),
         );
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         assert!(format!("{err:#}").contains("not an allowed option"));
@@ -825,7 +825,7 @@ mod tests {
     #[test]
     fn array_field_number_scalar_becomes_single_element() {
         let mut scalars = BTreeMap::new();
-        scalars.insert("Labels".to_string(), serde_yaml::Value::from(5));
+        scalars.insert("Labels".to_string(), serde_norway::Value::from(5));
         let out = resolve_custom_fields(&scalars, &[], &labels_meta()).unwrap();
         assert_eq!(out.get("labels").unwrap(), &serde_json::json!(["5"]));
     }
@@ -837,7 +837,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Labels".to_string(),
-            serde_yaml::Value::String(String::new()),
+            serde_norway::Value::String(String::new()),
         );
         let out = resolve_custom_fields(&scalars, &[], &labels_meta()).unwrap();
         assert_eq!(out.get("labels").unwrap(), &serde_json::json!([]));
@@ -850,7 +850,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Labels".to_string(),
-            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("a,b".to_string())]),
+            serde_norway::Value::Sequence(vec![serde_norway::Value::String("a,b".to_string())]),
         );
         let out = resolve_custom_fields(&scalars, &[], &labels_meta()).unwrap();
         assert_eq!(out.get("labels").unwrap(), &serde_json::json!(["a,b"]));
@@ -864,7 +864,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Parent".to_string(),
-            serde_yaml::Value::String("PROJ-123".to_string()),
+            serde_norway::Value::String("PROJ-123".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -879,7 +879,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Parent".to_string(),
-            serde_yaml::from_str("id: '10042'").unwrap(),
+            serde_norway::from_str("id: '10042'").unwrap(),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -892,7 +892,7 @@ mod tests {
     fn scalar_issuelink_field_rejects_non_string() {
         let editmeta = meta(&[("parent", "Parent", "issuelink", None)]);
         let mut scalars = BTreeMap::new();
-        scalars.insert("Parent".to_string(), serde_yaml::Value::Number(7.into()));
+        scalars.insert("Parent".to_string(), serde_norway::Value::Number(7.into()));
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         assert!(format!("{err:#}").contains("expected an issue key string"));
     }
@@ -914,7 +914,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "labels".to_string(),
-            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("a".to_string())]),
+            serde_norway::Value::Sequence(vec![serde_norway::Value::String("a".to_string())]),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(out.get("labels").unwrap(), &serde_json::json!(["a"]));
@@ -934,7 +934,7 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Description".to_string(),
-            serde_yaml::Value::String("A paragraph.".to_string()),
+            serde_norway::Value::String("A paragraph.".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         let value = out.get("description").unwrap();
@@ -952,7 +952,7 @@ mod tests {
             "string",
             Some(CUSTOM_TEXTAREA),
         )]);
-        let adf_yaml: serde_yaml::Value = serde_yaml::from_str(
+        let adf_yaml: serde_norway::Value = serde_norway::from_str(
             r"
 type: doc
 version: 1
@@ -983,7 +983,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Acceptance Criteria".to_string(),
-            serde_yaml::from_str("some: mapping").unwrap(),
+            serde_norway::from_str("some: mapping").unwrap(),
         );
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         assert!(format!("{err:#}").contains("must be a raw ADF document with `type: doc`"));
@@ -1002,7 +1002,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Acceptance Criteria".to_string(),
-            serde_yaml::from_str("{type: doc, version: 1, content: nope}").unwrap(),
+            serde_norway::from_str("{type: doc, version: 1, content: nope}").unwrap(),
         );
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         assert!(
@@ -1019,7 +1019,7 @@ content:
             "string",
             Some(CUSTOM_TEXTAREA),
         )]);
-        let adf_yaml: serde_yaml::Value = serde_yaml::from_str(
+        let adf_yaml: serde_norway::Value = serde_norway::from_str(
             r"
 type: doc
 version: 1
@@ -1059,7 +1059,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Acceptance Criteria".to_string(),
-            serde_yaml::Value::String("- one\n- two".to_string()),
+            serde_norway::Value::String("- one\n- two".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         let value = out.get("customfield_10088").unwrap();
@@ -1079,7 +1079,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Acceptance Criteria".to_string(),
-            serde_yaml::Value::String(String::new()),
+            serde_norway::Value::String(String::new()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -1101,7 +1101,7 @@ content:
             Some(CUSTOM_TEXTAREA),
         )]);
         let mut scalars = BTreeMap::new();
-        scalars.insert("Acceptance Criteria".to_string(), serde_yaml::Value::Null);
+        scalars.insert("Acceptance Criteria".to_string(), serde_norway::Value::Null);
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
             out.get("customfield_10088").unwrap(),
@@ -1122,7 +1122,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Acceptance Criteria".to_string(),
-            serde_yaml::Value::Number(42.into()),
+            serde_norway::Value::Number(42.into()),
         );
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         let msg = err.to_string();
@@ -1141,7 +1141,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Acceptance Criteria".to_string(),
-            serde_yaml::Value::String(
+            serde_norway::Value::String(
                 ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::".to_string(),
             ),
         );
@@ -1215,7 +1215,7 @@ content:
             ("customfield_2", "Beta", "string", None),
         ]);
         let mut scalars = BTreeMap::new();
-        scalars.insert("Gamma".to_string(), serde_yaml::Value::from("x"));
+        scalars.insert("Gamma".to_string(), serde_norway::Value::from("x"));
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Unknown custom field 'Gamma'"));
@@ -1234,7 +1234,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "customfield_10001".to_string(),
-            serde_yaml::Value::String("Unplanned".to_string()),
+            serde_norway::Value::String("Unplanned".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -1250,7 +1250,7 @@ content:
             ("customfield_2", "Duplicate", "string", None),
         ]);
         let mut scalars = BTreeMap::new();
-        scalars.insert("Duplicate".to_string(), serde_yaml::Value::from("x"));
+        scalars.insert("Duplicate".to_string(), serde_norway::Value::from("x"));
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Ambiguous"));
@@ -1264,7 +1264,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Components".to_string(),
-            serde_yaml::Value::String("solo".to_string()),
+            serde_norway::Value::String("solo".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -1279,7 +1279,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Components".to_string(),
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+            serde_norway::Value::Mapping(serde_norway::Mapping::new()),
         );
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         let msg = format!("{err:#}");
@@ -1293,8 +1293,8 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Components".to_string(),
-            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Sequence(vec![
-                serde_yaml::Value::String("nested".to_string()),
+            serde_norway::Value::Sequence(vec![serde_norway::Value::Sequence(vec![
+                serde_norway::Value::String("nested".to_string()),
             ])]),
         );
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
@@ -1305,7 +1305,7 @@ content:
     fn unsupported_schema_type_errors_with_field_name() {
         let editmeta = meta(&[("customfield_20000", "Reporter", "user", None)]);
         let mut scalars = BTreeMap::new();
-        scalars.insert("Reporter".to_string(), serde_yaml::Value::from("alice"));
+        scalars.insert("Reporter".to_string(), serde_norway::Value::from("alice"));
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("Unsupported field type 'user'"));
@@ -1329,10 +1329,10 @@ content:
             ),
         ]);
         let mut scalars = BTreeMap::new();
-        scalars.insert("Toggle".to_string(), serde_yaml::Value::Bool(true));
+        scalars.insert("Toggle".to_string(), serde_norway::Value::Bool(true));
         scalars.insert(
             "Number choice".to_string(),
-            serde_yaml::Value::Number(3.into()),
+            serde_norway::Value::Number(3.into()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -1356,7 +1356,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Work Attribution".to_string(),
-            serde_yaml::Value::String("Planned".to_string()),
+            serde_norway::Value::String("Planned".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -1376,7 +1376,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Work Attribution".to_string(),
-            serde_yaml::Value::String("Plnned".to_string()),
+            serde_norway::Value::String("Plnned".to_string()),
         );
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         let msg = format!("{err:#}");
@@ -1402,7 +1402,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Work Attribution".to_string(),
-            serde_yaml::Value::String("planned".to_string()),
+            serde_norway::Value::String("planned".to_string()),
         );
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         assert!(format!("{err:#}").contains("not an allowed option"));
@@ -1415,7 +1415,7 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Work Attribution".to_string(),
-            serde_yaml::Value::String("Anything".to_string()),
+            serde_norway::Value::String("Anything".to_string()),
         );
         let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
         assert_eq!(
@@ -1431,9 +1431,9 @@ content:
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Teams".to_string(),
-            serde_yaml::Value::Sequence(vec![
-                serde_yaml::Value::String("backend".to_string()),
-                serde_yaml::Value::String("frontend".to_string()),
+            serde_norway::Value::Sequence(vec![
+                serde_norway::Value::String("backend".to_string()),
+                serde_norway::Value::String("frontend".to_string()),
             ]),
         );
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
@@ -1448,10 +1448,13 @@ content:
     #[test]
     fn option_field_rejects_non_scalar_value() {
         let editmeta = meta(&[("customfield_opt", "Opt", "option", None)]);
-        let mut mapping = serde_yaml::Mapping::new();
-        mapping.insert(serde_yaml::Value::from("k"), serde_yaml::Value::from("v"));
+        let mut mapping = serde_norway::Mapping::new();
+        mapping.insert(
+            serde_norway::Value::from("k"),
+            serde_norway::Value::from("v"),
+        );
         let mut scalars = BTreeMap::new();
-        scalars.insert("Opt".to_string(), serde_yaml::Value::Mapping(mapping));
+        scalars.insert("Opt".to_string(), serde_norway::Value::Mapping(mapping));
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         assert!(format!("{err:#}").contains("expected a scalar string value"));
     }
@@ -1482,7 +1485,10 @@ content:
         // try a name lookup before erroring.
         let editmeta = meta(&[("customfield_ACTUAL", "My Field", "string", None)]);
         let mut scalars = BTreeMap::new();
-        scalars.insert("customfield_999".to_string(), serde_yaml::Value::from("x"));
+        scalars.insert(
+            "customfield_999".to_string(),
+            serde_norway::Value::from("x"),
+        );
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         assert!(err.to_string().contains("Unknown custom field"));
     }
@@ -1493,26 +1499,26 @@ content:
     fn parse_set_field_bare_string_value() {
         let (name, value) = parse_set_field("Status=Open").unwrap();
         assert_eq!(name, "Status");
-        assert_eq!(value, serde_yaml::Value::String("Open".to_string()));
+        assert_eq!(value, serde_norway::Value::String("Open".to_string()));
     }
 
     #[test]
     fn parse_set_field_numeric_value_becomes_number() {
         let (_name, value) = parse_set_field("Points=8").unwrap();
-        assert_eq!(value, serde_yaml::Value::Number(8.into()));
+        assert_eq!(value, serde_norway::Value::Number(8.into()));
     }
 
     #[test]
     fn parse_set_field_bool_value_becomes_bool() {
         let (_name, value) = parse_set_field("Enabled=true").unwrap();
-        assert_eq!(value, serde_yaml::Value::Bool(true));
+        assert_eq!(value, serde_norway::Value::Bool(true));
     }
 
     #[test]
     fn parse_set_field_preserves_spaces_in_name() {
         let (name, value) = parse_set_field("Planned / Unplanned Work=Unplanned").unwrap();
         assert_eq!(name, "Planned / Unplanned Work");
-        assert_eq!(value, serde_yaml::Value::String("Unplanned".to_string()));
+        assert_eq!(value, serde_norway::Value::String("Unplanned".to_string()));
     }
 
     #[test]
@@ -1520,7 +1526,7 @@ content:
         // Only the FIRST `=` splits name from value.
         let (name, value) = parse_set_field("Formula=a=b+c").unwrap();
         assert_eq!(name, "Formula");
-        assert_eq!(value, serde_yaml::Value::String("a=b+c".to_string()));
+        assert_eq!(value, serde_norway::Value::String("a=b+c".to_string()));
     }
 
     #[test]
@@ -1540,36 +1546,36 @@ content:
         let mut frontmatter = BTreeMap::new();
         frontmatter.insert(
             "Priority".to_string(),
-            serde_yaml::Value::String("Low".to_string()),
+            serde_norway::Value::String("Low".to_string()),
         );
         frontmatter.insert(
             "Keep".to_string(),
-            serde_yaml::Value::String("from-fm".to_string()),
+            serde_norway::Value::String("from-fm".to_string()),
         );
         let overrides = vec![(
             "Priority".to_string(),
-            serde_yaml::Value::String("High".to_string()),
+            serde_norway::Value::String("High".to_string()),
         )];
         let merged = merge_set_field_overrides(frontmatter, overrides);
         assert_eq!(
             merged.get("Priority"),
-            Some(&serde_yaml::Value::String("High".to_string()))
+            Some(&serde_norway::Value::String("High".to_string()))
         );
         assert_eq!(
             merged.get("Keep"),
-            Some(&serde_yaml::Value::String("from-fm".to_string()))
+            Some(&serde_norway::Value::String("from-fm".to_string()))
         );
     }
 
     #[test]
     fn merge_set_field_overrides_with_empty_overrides_preserves_frontmatter() {
         let mut frontmatter = BTreeMap::new();
-        frontmatter.insert("K".to_string(), serde_yaml::Value::from("v"));
+        frontmatter.insert("K".to_string(), serde_norway::Value::from("v"));
         let merged = merge_set_field_overrides(frontmatter, vec![]);
         assert_eq!(merged.len(), 1);
         assert_eq!(
             merged.get("K"),
-            Some(&serde_yaml::Value::String("v".to_string()))
+            Some(&serde_norway::Value::String("v".to_string()))
         );
     }
 

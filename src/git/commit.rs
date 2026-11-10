@@ -1956,7 +1956,7 @@ file_changes:
 diff_summary: ""
 diff_file: "/tmp/test.diff"
 "#;
-        let analysis: CommitAnalysis = serde_yaml::from_str(yaml).unwrap();
+        let analysis: CommitAnalysis = serde_norway::from_str(yaml).unwrap();
         assert!(analysis.file_diffs.is_empty());
     }
 
@@ -1971,7 +1971,7 @@ diff_file: "/tmp/test.diff"
             diff_file: String::new(),
             file_diffs: Vec::new(),
         };
-        let yaml = serde_yaml::to_string(&analysis).unwrap();
+        let yaml = serde_norway::to_string(&analysis).unwrap();
         assert!(!yaml.contains("file_diffs"));
     }
 
@@ -1990,7 +1990,7 @@ diff_file: "/tmp/test.diff"
                 byte_len: 42,
             }],
         };
-        let yaml = serde_yaml::to_string(&analysis).unwrap();
+        let yaml = serde_norway::to_string(&analysis).unwrap();
         assert!(yaml.contains("file_diffs"));
         assert!(yaml.contains("src/main.rs"));
         assert!(yaml.contains("byte_len: 42"));
