@@ -522,7 +522,7 @@ section: "Scope Appropriateness"
 rule: "scope-suggestion"
 explanation: "Consider a narrower scope."
 "#;
-        let issue: AiIssue = serde_yaml::from_str(yaml).unwrap();
+        let issue: AiIssue = serde_norway::from_str(yaml).unwrap();
         assert_eq!(issue.severity, "info");
         assert!(issue
             .reasoning
@@ -540,7 +540,7 @@ section: "Subject Line"
 rule: "imperative-mood"
 explanation: "Subject uses past tense"
 "#;
-        let issue: AiIssue = serde_yaml::from_str(yaml).unwrap();
+        let issue: AiIssue = serde_norway::from_str(yaml).unwrap();
         assert_eq!(issue.severity, "error");
         assert!(issue.reasoning.is_none());
     }

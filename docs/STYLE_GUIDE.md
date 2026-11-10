@@ -948,7 +948,7 @@ for:
    ```rust
    // Bad — silently returns empty vec on malformed YAML
    if let Ok(content) = fs::read_to_string(&path) {
-       if let Ok(config) = serde_yaml::from_str(&content) {
+       if let Ok(config) = serde_norway::from_str(&content) {
            return config.scopes;
        }
    }
@@ -956,7 +956,7 @@ for:
 
    // Good — warns so the user knows their file was ignored
    match fs::read_to_string(&path) {
-       Ok(content) => match serde_yaml::from_str(&content) {
+       Ok(content) => match serde_norway::from_str(&content) {
            Ok(config) => return config.scopes,
            Err(e) => tracing::warn!("Ignoring {}: {e}", path.display()),
        },

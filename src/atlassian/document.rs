@@ -91,7 +91,7 @@ pub struct JiraFrontmatter {
     /// `--all-fields`. Rich-text (ADF) custom fields are rendered into the
     /// document body as extra sections instead.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub custom_fields: BTreeMap<String, serde_yaml::Value>,
+    pub custom_fields: BTreeMap<String, serde_norway::Value>,
 }
 
 /// Lenient JIRA frontmatter used **only** by the `jira create` path.
@@ -126,7 +126,7 @@ pub struct JiraCreateFrontmatter {
     pub labels: Vec<String>,
 
     /// Scalar custom field values keyed by human-readable field name.
-    pub custom_fields: BTreeMap<String, serde_yaml::Value>,
+    pub custom_fields: BTreeMap<String, serde_norway::Value>,
 }
 
 /// Confluence-specific frontmatter fields.
@@ -193,7 +193,7 @@ impl JfmFrontmatter {
 
     /// Returns the JIRA custom field scalar map, or `None` when the
     /// frontmatter is not a JIRA variant.
-    pub fn jira_custom_fields(&self) -> Option<&BTreeMap<String, serde_yaml::Value>> {
+    pub fn jira_custom_fields(&self) -> Option<&BTreeMap<String, serde_norway::Value>> {
         match self {
             Self::Jira(fm) => Some(&fm.custom_fields),
             Self::Confluence(_) => None,
@@ -227,7 +227,7 @@ pub fn issue_to_jfm_document(issue: &JiraIssue, instance_url: &str) -> Result<Jf
         String::new()
     };
 
-    let mut custom_scalars: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
+    let mut custom_scalars: BTreeMap<String, serde_norway::Value> = BTreeMap::new();
     for field in &issue.custom_fields {
         render_custom_field(field, &mut body, &mut custom_scalars)?;
     }
@@ -254,7 +254,7 @@ pub fn issue_to_jfm_document(issue: &JiraIssue, instance_url: &str) -> Result<Jf
 fn render_custom_field(
     field: &JiraCustomField,
     body: &mut String,
-    scalars: &mut BTreeMap<String, serde_yaml::Value>,
+    scalars: &mut BTreeMap<String, serde_norway::Value>,
 ) -> Result<()> {
     if is_adf_document(&field.value) {
         let adf_doc: AdfDocument = serde_json::from_value(field.value.clone())
@@ -423,7 +423,7 @@ fn is_adf_document(value: &serde_json::Value) -> bool {
 /// - Primitives (bool/number/string) pass through unchanged.
 /// - Unknown objects pass through as a structured YAML mapping.
 /// - Null returns `None`.
-fn extract_custom_field_scalar(value: &serde_json::Value) -> Option<serde_yaml::Value> {
+fn extract_custom_field_scalar(value: &serde_json::Value) -> Option<serde_norway::Value> {
     use serde_json::Value as J;
     match value {
         J::Null => None,
@@ -436,14 +436,14 @@ fn extract_custom_field_scalar(value: &serde_json::Value) -> Option<serde_yaml::
             if extracted.is_empty() {
                 None
             } else {
-                Some(serde_yaml::Value::Sequence(extracted))
+                Some(serde_norway::Value::Sequence(extracted))
             }
         }
         J::Object(map) => {
             if let Some(v) = map.get("value").and_then(|v| v.as_str()) {
-                Some(serde_yaml::Value::String(v.to_string()))
+                Some(serde_norway::Value::String(v.to_string()))
             } else if let Some(name) = map.get("displayName").and_then(|v| v.as_str()) {
-                Some(serde_yaml::Value::String(name.to_string()))
+                Some(serde_norway::Value::String(name.to_string()))
             } else {
                 json_to_yaml(value)
             }
@@ -451,8 +451,8 @@ fn extract_custom_field_scalar(value: &serde_json::Value) -> Option<serde_yaml::
     }
 }
 
-fn json_to_yaml(value: &serde_json::Value) -> Option<serde_yaml::Value> {
-    serde_yaml::to_value(value).ok()
+fn json_to_yaml(value: &serde_json::Value) -> Option<serde_norway::Value> {
+    serde_norway::to_value(value).ok()
 }
 
 /// Converts a [`ContentItem`] into a [`JfmDocument`] with YAML frontmatter.
@@ -557,7 +557,7 @@ impl JfmDocument {
             )
         })?;
 
-        let frontmatter: JfmFrontmatter = serde_yaml::from_str(frontmatter_yaml)
+        let frontmatter: JfmFrontmatter = serde_norway::from_str(frontmatter_yaml)
             .context("Failed to parse JFM frontmatter YAML")?;
 
         Ok(Self { frontmatter, body })
@@ -565,7 +565,7 @@ impl JfmDocument {
 
     /// Renders the document back to a string with YAML frontmatter and markdown body.
     pub fn render(&self) -> Result<String> {
-        let frontmatter_yaml = serde_yaml::to_string(&self.frontmatter)
+        let frontmatter_yaml = serde_norway::to_string(&self.frontmatter)
             .context("Failed to serialize JFM frontmatter to YAML")?;
 
         let mut output = String::new();
@@ -689,7 +689,7 @@ mod tests {
         // A full round-tripped issue (instance/status/assignee present) must
         // parse — the create-irrelevant fields are simply ignored.
         let yaml = "type: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nproject: PROJ\nsummary: Title\nstatus: Open\nassignee: alice\nlabels:\n  - a\n";
-        let fm: JiraCreateFrontmatter = serde_yaml::from_str(yaml).unwrap();
+        let fm: JiraCreateFrontmatter = serde_norway::from_str(yaml).unwrap();
         assert_eq!(fm.r#type.as_deref(), Some("jira"));
         assert_eq!(fm.project.as_deref(), Some("PROJ"));
         assert_eq!(fm.summary.as_deref(), Some("Title"));
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn jira_create_frontmatter_all_fields_optional() {
-        let fm: JiraCreateFrontmatter = serde_yaml::from_str("{}").unwrap();
+        let fm: JiraCreateFrontmatter = serde_norway::from_str("{}").unwrap();
         assert!(fm.r#type.is_none());
         assert!(fm.project.is_none());
         assert!(fm.summary.is_none());
@@ -944,7 +944,7 @@ mod tests {
     #[test]
     fn jira_custom_fields_returns_scalars_for_jira_frontmatter() {
         let mut custom = BTreeMap::new();
-        custom.insert("K".to_string(), serde_yaml::Value::from("V"));
+        custom.insert("K".to_string(), serde_norway::Value::from("V"));
         let fm = JfmFrontmatter::Jira(JiraFrontmatter {
             instance: "https://org.atlassian.net".to_string(),
             key: "X-1".to_string(),
@@ -959,7 +959,7 @@ mod tests {
         });
         let got = fm.jira_custom_fields().unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got.get("K").unwrap(), &serde_yaml::Value::from("V"));
+        assert_eq!(got.get("K").unwrap(), &serde_norway::Value::from("V"));
     }
 
     #[test]
@@ -986,15 +986,15 @@ mod tests {
     fn extract_scalar_passes_through_primitives() {
         assert_eq!(
             extract_custom_field_scalar(&serde_json::json!(7)),
-            Some(serde_yaml::Value::from(7_i64))
+            Some(serde_norway::Value::from(7_i64))
         );
         assert_eq!(
             extract_custom_field_scalar(&serde_json::json!("hello")),
-            Some(serde_yaml::Value::String("hello".to_string()))
+            Some(serde_norway::Value::String("hello".to_string()))
         );
         assert_eq!(
             extract_custom_field_scalar(&serde_json::json!(true)),
-            Some(serde_yaml::Value::Bool(true))
+            Some(serde_norway::Value::Bool(true))
         );
         assert_eq!(extract_custom_field_scalar(&serde_json::Value::Null), None);
     }
@@ -1008,7 +1008,7 @@ mod tests {
         });
         assert_eq!(
             extract_custom_field_scalar(&value),
-            Some(serde_yaml::Value::String("Unplanned".to_string()))
+            Some(serde_norway::Value::String("Unplanned".to_string()))
         );
     }
 
@@ -1021,7 +1021,7 @@ mod tests {
         });
         assert_eq!(
             extract_custom_field_scalar(&value),
-            Some(serde_yaml::Value::String("Alice".to_string()))
+            Some(serde_norway::Value::String("Alice".to_string()))
         );
     }
 
@@ -1036,10 +1036,10 @@ mod tests {
         let extracted = extract_custom_field_scalar(&value).unwrap();
         assert_eq!(
             extracted,
-            serde_yaml::Value::Sequence(vec![
-                serde_yaml::Value::String("A".to_string()),
-                serde_yaml::Value::String("Bob".to_string()),
-                serde_yaml::Value::from(42_i64),
+            serde_norway::Value::Sequence(vec![
+                serde_norway::Value::String("A".to_string()),
+                serde_norway::Value::String("Bob".to_string()),
+                serde_norway::Value::from(42_i64),
             ])
         );
     }

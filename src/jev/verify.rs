@@ -492,7 +492,7 @@ fn parse_split_response(raw: &str) -> Result<SplitResponse> {
     if let Ok(parsed) = serde_json::from_str(trimmed) {
         return Ok(parsed);
     }
-    serde_yaml::from_str(strip_code_fence(trimmed))
+    serde_norway::from_str(strip_code_fence(trimmed))
         .with_context(|| format!("Failed to parse the statement splitter's response: {trimmed}"))
 }
 

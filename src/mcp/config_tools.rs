@@ -64,7 +64,7 @@ impl OmniDevServer {
 fn auth_status_result(
     status: &crate::atlassian::auth::AuthStatus,
 ) -> Result<CallToolResult, McpError> {
-    let yaml = serde_yaml::to_string(status)
+    let yaml = serde_norway::to_string(status)
         .map_err(|e| tool_error(anyhow::anyhow!("Failed to serialize auth status: {e}")))?;
     Ok(CallToolResult::success(vec![Content::text(yaml)]))
 }

@@ -61,7 +61,7 @@ pub(super) fn print_report(
                 actions: &report.actions,
                 errors: &report.errors,
             };
-            let yaml = serde_yaml::to_string(&output)
+            let yaml = serde_norway::to_string(&output)
                 .context("Failed to serialize sync report as YAML")?;
             print!("{yaml}");
         }
@@ -211,7 +211,7 @@ mod tests {
     fn yaml_render_includes_top_level_keys() {
         let report = SyncReport::default();
         let mut buf = Vec::new();
-        let yaml = serde_yaml::to_string(&SyncOutput {
+        let yaml = serde_norway::to_string(&SyncOutput {
             dry_run: false,
             actions: &report.actions,
             errors: &report.errors,
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn yaml_render_serialises_each_action_variant() {
         let report = report_with_one_of_each();
-        let yaml = serde_yaml::to_string(&SyncOutput {
+        let yaml = serde_norway::to_string(&SyncOutput {
             dry_run: true,
             actions: &report.actions,
             errors: &report.errors,
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn yaml_render_includes_format_for_each_action() {
         let report = report_with_one_of_each();
-        let yaml = serde_yaml::to_string(&SyncOutput {
+        let yaml = serde_norway::to_string(&SyncOutput {
             dry_run: false,
             actions: &report.actions,
             errors: &report.errors,

@@ -101,7 +101,7 @@ struct CreateParams {
     summary: String,
     labels: Vec<String>,
     adf: ValidatedAdfDocument,
-    custom_scalars: BTreeMap<String, serde_yaml::Value>,
+    custom_scalars: BTreeMap<String, serde_norway::Value>,
     custom_sections: Vec<CustomFieldSection>,
 }
 
@@ -155,7 +155,7 @@ impl CreateCommand {
     /// flags → frontmatter → derived/default.
     fn resolve_from_jfm(
         &self,
-        overrides: Vec<(String, serde_yaml::Value)>,
+        overrides: Vec<(String, serde_norway::Value)>,
     ) -> Result<CreateParams> {
         let input = read_input(self.file.as_deref())?;
         let resolved = resolve_jira_create(
@@ -838,7 +838,7 @@ mod tests {
         let mut params = sample_params();
         params.custom_scalars.insert(
             "Planned / Unplanned Work".to_string(),
-            serde_yaml::Value::String("Unplanned".to_string()),
+            serde_norway::Value::String("Unplanned".to_string()),
         );
         run_create(&client, &params).await.unwrap();
     }
@@ -888,7 +888,7 @@ mod tests {
         let params = cmd.resolve_params().unwrap();
         assert_eq!(
             params.custom_scalars.get("Priority"),
-            Some(&serde_yaml::Value::String("High".to_string()))
+            Some(&serde_norway::Value::String("High".to_string()))
         );
     }
 

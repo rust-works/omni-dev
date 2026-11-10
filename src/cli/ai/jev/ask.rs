@@ -63,9 +63,9 @@ impl AskCommand {
     }
 }
 
-/// Reads a `--questions` file through a **single** `serde_yaml` parse path.
+/// Reads a `--questions` file through a **single** `serde_norway` parse path.
 ///
-/// `serde_yaml` accepts JSON (YAML is a superset), so this covers both JSON
+/// `serde_norway` accepts JSON (YAML is a superset), so this covers both JSON
 /// and YAML question files without branching on file extension. Each spec
 /// is then checked with [`Question::validate_for_model`] — the same minimums
 /// and, for a model whose caps are known, the same caps the single-question
@@ -74,7 +74,7 @@ impl AskCommand {
 fn read_questions(path: &Path, model: &str) -> Result<BTreeMap<String, Question>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read questions file {}", path.display()))?;
-    let questions: BTreeMap<String, Question> = serde_yaml::from_str(&content)
+    let questions: BTreeMap<String, Question> = serde_norway::from_str(&content)
         .with_context(|| format!("Failed to parse questions file {}", path.display()))?;
     if questions.is_empty() {
         bail!("questions file {} defines no questions", path.display());

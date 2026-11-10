@@ -69,7 +69,7 @@ async fn run_move(
 }
 
 fn print_moved_page(moved: &MovedPage) -> Result<()> {
-    let yaml = serde_yaml::to_string(moved).context("Failed to serialize moved page as YAML")?;
+    let yaml = serde_norway::to_string(moved).context("Failed to serialize moved page as YAML")?;
     print!("{yaml}");
     Ok(())
 }

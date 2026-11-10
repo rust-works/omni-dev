@@ -44,7 +44,7 @@ fn yaml_scopes() -> BTreeMap<String, String> {
     let path = omni_dev_dir().join("scopes.yaml");
     let raw =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    let config: ScopesConfig = serde_yaml::from_str(&raw)
+    let config: ScopesConfig = serde_norway::from_str(&raw)
         .unwrap_or_else(|e| panic!("cannot parse {}: {e}", path.display()));
     config
         .scopes

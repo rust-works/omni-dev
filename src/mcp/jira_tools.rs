@@ -189,7 +189,7 @@ async fn download_to_yaml(
         output_dir: output_dir.to_string_lossy().into_owned(),
         files,
     };
-    serde_yaml::to_string(&result).context("Failed to serialize download result as YAML")
+    serde_norway::to_string(&result).context("Failed to serialize download result as YAML")
 }
 
 /// Resolves [`AttachmentDownloadParams::output_dir`] / [`AttachmentImagesParams::output_dir`]
@@ -220,7 +220,7 @@ pub(crate) async fn attachment_upload_yaml(
         key: key.to_string(),
         uploaded,
     };
-    serde_yaml::to_string(&result).context("Failed to serialize upload result as YAML")
+    serde_norway::to_string(&result).context("Failed to serialize upload result as YAML")
 }
 
 /// Deletes an attachment by ID (guarded by `confirm`) and returns YAML
@@ -236,7 +236,7 @@ pub(crate) async fn attachment_delete_yaml(
         ));
     }
     client.delete_attachment(attachment_id).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -293,7 +293,7 @@ pub(crate) async fn board_list_yaml(
         .collect();
     let total = boards.len() as u32;
     let view = crate::atlassian::jira_types::AgileBoardList { boards, total };
-    serde_yaml::to_string(&view).context("Failed to serialize boards as YAML")
+    serde_norway::to_string(&view).context("Failed to serialize boards as YAML")
 }
 
 pub(crate) async fn board_issues_yaml(
@@ -303,7 +303,7 @@ pub(crate) async fn board_issues_yaml(
     limit: u32,
 ) -> Result<String> {
     let result = client.get_board_issues(board_id, jql, limit).await?;
-    serde_yaml::to_string(&result).context("Failed to serialize board issues as YAML")
+    serde_norway::to_string(&result).context("Failed to serialize board issues as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -401,7 +401,7 @@ pub(crate) async fn sprint_list_yaml(
     limit: u32,
 ) -> Result<String> {
     let result = client.get_sprints(board_id, state, limit).await?;
-    serde_yaml::to_string(&result).context("Failed to serialize sprints as YAML")
+    serde_norway::to_string(&result).context("Failed to serialize sprints as YAML")
 }
 
 pub(crate) async fn sprint_issues_yaml(
@@ -411,7 +411,7 @@ pub(crate) async fn sprint_issues_yaml(
     limit: u32,
 ) -> Result<String> {
     let result = client.get_sprint_issues(sprint_id, jql, limit).await?;
-    serde_yaml::to_string(&result).context("Failed to serialize sprint issues as YAML")
+    serde_norway::to_string(&result).context("Failed to serialize sprint issues as YAML")
 }
 
 pub(crate) async fn sprint_add_yaml(
@@ -421,7 +421,7 @@ pub(crate) async fn sprint_add_yaml(
 ) -> Result<String> {
     let refs: Vec<&str> = issue_keys.iter().map(String::as_str).collect();
     client.add_issues_to_sprint(sprint_id, &refs).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 pub(crate) async fn sprint_create_yaml(
@@ -435,7 +435,7 @@ pub(crate) async fn sprint_create_yaml(
     let sprint = client
         .create_sprint(board_id, name, start_date, end_date, goal)
         .await?;
-    serde_yaml::to_string(&sprint).context("Failed to serialize sprint as YAML")
+    serde_norway::to_string(&sprint).context("Failed to serialize sprint as YAML")
 }
 
 pub(crate) async fn sprint_update_yaml(
@@ -450,7 +450,7 @@ pub(crate) async fn sprint_update_yaml(
     client
         .update_sprint(sprint_id, name, state, start_date, end_date, goal)
         .await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 /// Parameters for the `jira_sprint_delete` tool.
@@ -475,7 +475,7 @@ pub(crate) async fn sprint_delete_yaml(
         ));
     }
     client.delete_sprint(sprint_id).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -530,7 +530,7 @@ pub(crate) async fn version_list_yaml(
     let result = client
         .get_project_versions(project, released, archived)
         .await?;
-    serde_yaml::to_string(&result).context("Failed to serialize project versions as YAML")
+    serde_norway::to_string(&result).context("Failed to serialize project versions as YAML")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -555,7 +555,7 @@ pub(crate) async fn version_create_yaml(
             archived,
         )
         .await?;
-    serde_yaml::to_string(&version).context("Failed to serialize project version as YAML")
+    serde_norway::to_string(&version).context("Failed to serialize project version as YAML")
 }
 
 /// Parameters for the `jira_version_release` tool.
@@ -613,7 +613,7 @@ pub(crate) async fn version_release_yaml(
     client
         .update_project_version(version_id, None, None, Some(true), release_date, None, None)
         .await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 pub(crate) async fn version_archive_yaml(
@@ -623,7 +623,7 @@ pub(crate) async fn version_archive_yaml(
     client
         .update_project_version(version_id, None, None, None, None, Some(true), None)
         .await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 pub(crate) async fn version_rename_yaml(
@@ -635,7 +635,7 @@ pub(crate) async fn version_rename_yaml(
     client
         .update_project_version(version_id, Some(name), description, None, None, None, None)
         .await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 pub(crate) async fn version_delete_yaml(
@@ -653,7 +653,7 @@ pub(crate) async fn version_delete_yaml(
     client
         .delete_project_version(version_id, move_fix_issues_to, move_affected_issues_to)
         .await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -709,7 +709,7 @@ pub struct ComponentDeleteParams {
 
 pub(crate) async fn component_list_yaml(client: &AtlassianClient, project: &str) -> Result<String> {
     let components = client.get_project_components(project).await?;
-    serde_yaml::to_string(&components).context("Failed to serialize components as YAML")
+    serde_norway::to_string(&components).context("Failed to serialize components as YAML")
 }
 
 pub(crate) async fn component_create_yaml(
@@ -719,7 +719,7 @@ pub(crate) async fn component_create_yaml(
     description: Option<&str>,
 ) -> Result<String> {
     let component = client.create_component(project, name, description).await?;
-    serde_yaml::to_string(&component).context("Failed to serialize component as YAML")
+    serde_norway::to_string(&component).context("Failed to serialize component as YAML")
 }
 
 pub(crate) async fn component_update_yaml(
@@ -736,7 +736,7 @@ pub(crate) async fn component_update_yaml(
     client
         .update_component(component_id, name, description)
         .await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 pub(crate) async fn component_delete_yaml(
@@ -753,7 +753,7 @@ pub(crate) async fn component_delete_yaml(
     client
         .delete_component(component_id, move_issues_to)
         .await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -795,7 +795,7 @@ pub struct WatcherRemoveParams {
 
 pub(crate) async fn watcher_list_yaml(client: &AtlassianClient, key: &str) -> Result<String> {
     let watchers = client.get_watchers(key).await?;
-    serde_yaml::to_string(&watchers).context("Failed to serialize watchers as YAML")
+    serde_norway::to_string(&watchers).context("Failed to serialize watchers as YAML")
 }
 
 pub(crate) async fn watcher_add_yaml(
@@ -804,7 +804,7 @@ pub(crate) async fn watcher_add_yaml(
     account_id: &str,
 ) -> Result<String> {
     client.add_watcher(key, account_id).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 pub(crate) async fn watcher_remove_yaml(
@@ -819,7 +819,7 @@ pub(crate) async fn watcher_remove_yaml(
         ));
     }
     client.remove_watcher(key, account_id).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -857,7 +857,7 @@ pub struct LinkRemoveParams {
 
 pub(crate) async fn link_list_yaml(client: &AtlassianClient, key: &str) -> Result<String> {
     let links = client.get_issue_links(key).await?;
-    serde_yaml::to_string(&links).context("Failed to serialize issue links as YAML")
+    serde_norway::to_string(&links).context("Failed to serialize issue links as YAML")
 }
 
 pub(crate) async fn link_types_yaml(
@@ -865,7 +865,7 @@ pub(crate) async fn link_types_yaml(
     cache: &CatalogueCache,
 ) -> Result<String> {
     let types = cache.link_types(client).await?;
-    serde_yaml::to_string(&*types).context("Failed to serialize link types as YAML")
+    serde_norway::to_string(&*types).context("Failed to serialize link types as YAML")
 }
 
 pub(crate) async fn link_remove_yaml(
@@ -885,7 +885,7 @@ pub(crate) async fn link_remove_yaml(
         ));
     }
     client.remove_issue_link(link_id).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 /// Parameters for the `jira_link_remote_list` tool.
@@ -897,7 +897,7 @@ pub struct LinkRemoteListParams {
 
 pub(crate) async fn link_remote_list_yaml(client: &AtlassianClient, key: &str) -> Result<String> {
     let links = client.get_remote_issue_links(key).await?;
-    serde_yaml::to_string(&links).context("Failed to serialize remote issue links as YAML")
+    serde_norway::to_string(&links).context("Failed to serialize remote issue links as YAML")
 }
 
 /// Parameters for the `jira_link_remote_create` tool.
@@ -972,7 +972,7 @@ pub(crate) async fn link_remote_create_yaml(
     let id = client
         .create_remote_issue_link(key, url, title, summary, relationship, global_id)
         .await?;
-    serde_yaml::to_string(&serde_json::json!({ "status": "ok", "id": id }))
+    serde_norway::to_string(&serde_json::json!({ "status": "ok", "id": id }))
         .context("Failed to serialize status as YAML")
 }
 
@@ -996,7 +996,7 @@ pub(crate) async fn link_remote_delete_yaml(
         ));
     }
     client.delete_remote_issue_link(key, link_id).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 /// Parameters for the `jira_link_create` tool.
@@ -1033,7 +1033,7 @@ pub(crate) async fn link_create_yaml(
         );
     }
     client.create_issue_link(link_type, inward, outward).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 /// Parameters for the `jira_link_parent` tool.
@@ -1063,7 +1063,7 @@ pub(crate) async fn link_parent_yaml(
         );
     }
     client.set_issue_parent(child, parent).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1101,7 +1101,7 @@ pub(crate) async fn worklog_list_yaml(
     limit: u32,
 ) -> Result<String> {
     let result = client.get_worklogs(key, limit).await?;
-    serde_yaml::to_string(&result).context("Failed to serialize worklogs as YAML")
+    serde_norway::to_string(&result).context("Failed to serialize worklogs as YAML")
 }
 
 /// Parameters for the `jira_worklog_update` tool.
@@ -1145,7 +1145,7 @@ pub(crate) async fn worklog_add_yaml(
     client
         .add_worklog(key, time_spent, started, comment)
         .await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 pub(crate) async fn worklog_update_yaml(
@@ -1164,7 +1164,7 @@ pub(crate) async fn worklog_update_yaml(
     client
         .update_worklog(key, worklog_id, time_spent, started, comment)
         .await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 pub(crate) async fn worklog_delete_yaml(
@@ -1179,7 +1179,7 @@ pub(crate) async fn worklog_delete_yaml(
         ));
     }
     client.delete_worklog(key, worklog_id).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1204,7 +1204,7 @@ pub(crate) async fn label_add_yaml(
         return Err(anyhow!("No labels supplied."));
     }
     client.modify_issue_labels(key, labels, &[]).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 pub(crate) async fn label_remove_yaml(
@@ -1216,7 +1216,7 @@ pub(crate) async fn label_remove_yaml(
         return Err(anyhow!("No labels supplied."));
     }
     client.modify_issue_labels(key, &[], labels).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1258,7 +1258,7 @@ pub(crate) async fn field_list_yaml(
         }
         None => cached.iter().cloned().collect(),
     };
-    serde_yaml::to_string(&view).context("Failed to serialize fields as YAML")
+    serde_norway::to_string(&view).context("Failed to serialize fields as YAML")
 }
 
 pub(crate) async fn field_options_yaml(
@@ -1267,7 +1267,7 @@ pub(crate) async fn field_options_yaml(
     context_id: Option<&str>,
 ) -> Result<String> {
     let options = client.get_field_options(field_id, context_id).await?;
-    serde_yaml::to_string(&options).context("Failed to serialize field options as YAML")
+    serde_norway::to_string(&options).context("Failed to serialize field options as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1310,7 +1310,7 @@ pub(crate) async fn project_list_yaml(
         .collect();
     let total = projects.len() as u32;
     let view = crate::atlassian::jira_types::JiraProjectList { projects, total };
-    serde_yaml::to_string(&view).context("Failed to serialize projects as YAML")
+    serde_norway::to_string(&view).context("Failed to serialize projects as YAML")
 }
 
 pub(crate) async fn project_create_meta_yaml(
@@ -1319,7 +1319,7 @@ pub(crate) async fn project_create_meta_yaml(
     issue_type: &str,
 ) -> Result<String> {
     let meta = client.get_project_create_meta(project, issue_type).await?;
-    serde_yaml::to_string(&meta).context("Failed to serialize create metadata as YAML")
+    serde_norway::to_string(&meta).context("Failed to serialize create metadata as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1342,7 +1342,7 @@ pub(crate) async fn changelog_yaml(
     limit: u32,
 ) -> Result<String> {
     let entries = client.get_changelog(key, limit).await?;
-    serde_yaml::to_string(&entries).context("Failed to serialize changelog as YAML")
+    serde_norway::to_string(&entries).context("Failed to serialize changelog as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1373,7 +1373,7 @@ pub(crate) async fn delete_yaml(
         ));
     }
     client.delete_issue(key).await?;
-    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+    serde_norway::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -147,7 +147,7 @@ async fn run_bridge_request(params: BrowserBridgeRequestParams) -> Result<String
         .await
         .with_context(|| format!("Failed to reach bridge at {endpoint} (is it running?)"))?;
 
-    serde_yaml::to_string(&resp).context("Failed to serialize bridge response as YAML")
+    serde_norway::to_string(&resp).context("Failed to serialize bridge response as YAML")
 }
 
 #[cfg(test)]

@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         .collect();
     variants.push(("combined".into(), builtins));
     // Same concrete Anthropic models under versioned rung names exercise custom key handling.
-    let mut custom: serde_yaml::Value = serde_yaml::from_str(include_str!(
+    let mut custom: serde_norway::Value = serde_norway::from_str(include_str!(
         "../src/templates/jev-route-tiers-anthropic.yaml"
     ))?;
     if let Some(tiers) = custom["tiers"].as_sequence_mut() {
@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
         "versioned".into(),
         vec![Ladder::named(
             "versioned".into(),
-            Tiers::parse(&serde_yaml::to_string(&custom)?)?,
+            Tiers::parse(&serde_norway::to_string(&custom)?)?,
         )],
     ));
     for (name, ladders) in variants {

@@ -270,7 +270,7 @@ fn print_report(report: &SyncReport, dry_run: bool, format: OutputFormat) -> Res
                 actions: &report.actions,
                 errors: &report.errors,
             };
-            let yaml = serde_yaml::to_string(&output)
+            let yaml = serde_norway::to_string(&output)
                 .context("Failed to serialize sync report as YAML")?;
             print!("{yaml}");
         }
@@ -856,7 +856,7 @@ mod tests {
             actions: &report.actions,
             errors: &report.errors,
         };
-        let yaml = serde_yaml::to_string(&output).unwrap();
+        let yaml = serde_norway::to_string(&output).unwrap();
         assert!(yaml.contains("dry_run: true"));
         assert!(yaml.contains("type: linked"));
         assert!(yaml.contains("type: relinked"));

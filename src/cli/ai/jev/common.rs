@@ -74,7 +74,7 @@ pub(super) fn build_state_value(raw: &str, state_json: bool) -> Result<serde_jso
         return Ok(serde_json::Value::String(raw.to_string()));
     }
     let value: serde_json::Value =
-        serde_yaml::from_str(raw).context("Failed to parse --state-json state as JSON/YAML")?;
+        serde_norway::from_str(raw).context("Failed to parse --state-json state as JSON/YAML")?;
     match value {
         serde_json::Value::String(_)
         | serde_json::Value::Object(_)
@@ -142,7 +142,7 @@ pub(super) fn format_output<T: Serialize>(value: &T, format: JevFormat) -> Resul
             Ok(format!("{json}\n"))
         }
         JevFormat::Yaml => {
-            serde_yaml::to_string(value).context("Failed to serialize Jev response as YAML")
+            serde_norway::to_string(value).context("Failed to serialize Jev response as YAML")
         }
     }
 }

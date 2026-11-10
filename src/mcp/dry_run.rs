@@ -49,7 +49,7 @@ pub fn dry_run_request_yaml(
         path,
         body,
     };
-    serde_yaml::to_string(&req).context("Failed to serialize dry-run preview as YAML")
+    serde_norway::to_string(&req).context("Failed to serialize dry-run preview as YAML")
 }
 
 #[cfg(test)]

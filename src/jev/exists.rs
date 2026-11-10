@@ -885,7 +885,7 @@ mod tests {
         let client = JevClient::new(&server.uri(), "test").unwrap();
         let report = judge(retrieval, &client, "m").await.unwrap();
         assert_eq!(report.candidates_for_test(), vec![Some(0.1), Some(0.9)]);
-        assert!(serde_yaml::to_string(&report)
+        assert!(serde_norway::to_string(&report)
             .unwrap()
             .contains("score: 0.9"));
         assert!(serde_json::to_string(&report).unwrap().contains("actual"));

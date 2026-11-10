@@ -488,7 +488,7 @@ impl OmniDevServer {
 /// Pure: never touches the network and never reads any secret values.
 fn run_auth_status() -> Result<String> {
     let status = auth::status();
-    serde_yaml::to_string(&status).context("Failed to serialize Datadog auth status")
+    serde_norway::to_string(&status).context("Failed to serialize Datadog auth status")
 }
 
 async fn run_metrics_query(params: &DatadogMetricsQueryParams) -> Result<String> {
@@ -497,13 +497,13 @@ async fn run_metrics_query(params: &DatadogMetricsQueryParams) -> Result<String>
     let resp = MetricsApi::new(&client)
         .point_query(&params.query, from_ts, to_ts)
         .await?;
-    serde_yaml::to_string(&resp).context("Failed to serialize metrics query response")
+    serde_norway::to_string(&resp).context("Failed to serialize metrics query response")
 }
 
 async fn run_monitor_list(params: &DatadogMonitorListParams) -> Result<String> {
     let (client, _site) = create_client()?;
     let monitors = monitor_list_with(&client, params).await?;
-    serde_yaml::to_string(&monitors).context("Failed to serialize monitor list")
+    serde_norway::to_string(&monitors).context("Failed to serialize monitor list")
 }
 
 /// Splits the API call away from credential loading so tests can inject a
@@ -525,7 +525,7 @@ async fn monitor_list_with(
 async fn run_monitor_get(id: i64) -> Result<String> {
     let (client, _site) = create_client()?;
     let monitor = MonitorsApi::new(&client).get(id).await?;
-    serde_yaml::to_string(&monitor).context("Failed to serialize monitor")
+    serde_norway::to_string(&monitor).context("Failed to serialize monitor")
 }
 
 async fn run_monitor_search(params: &DatadogMonitorSearchParams) -> Result<String> {
@@ -533,7 +533,7 @@ async fn run_monitor_search(params: &DatadogMonitorSearchParams) -> Result<Strin
     let result = MonitorsApi::new(&client)
         .search(&params.query, params.limit.unwrap_or(0))
         .await?;
-    serde_yaml::to_string(&result).context("Failed to serialize monitor search results")
+    serde_norway::to_string(&result).context("Failed to serialize monitor search results")
 }
 
 async fn run_dashboard_list(params: &DatadogDashboardListParams) -> Result<String> {
@@ -542,13 +542,13 @@ async fn run_dashboard_list(params: &DatadogDashboardListParams) -> Result<Strin
         filter_shared: params.filter_shared,
     };
     let dashboards = DashboardsApi::new(&client).list(&filter).await?;
-    serde_yaml::to_string(&dashboards).context("Failed to serialize dashboard list")
+    serde_norway::to_string(&dashboards).context("Failed to serialize dashboard list")
 }
 
 async fn run_dashboard_get(id: &str) -> Result<String> {
     let (client, _site) = create_client()?;
     let dashboard = DashboardsApi::new(&client).get(id).await?;
-    serde_yaml::to_string(&dashboard).context("Failed to serialize dashboard")
+    serde_norway::to_string(&dashboard).context("Failed to serialize dashboard")
 }
 
 async fn run_logs_search(params: &DatadogLogsSearchParams) -> Result<String> {
@@ -562,7 +562,7 @@ async fn run_logs_search(params: &DatadogLogsSearchParams) -> Result<String> {
     let result = LogsApi::new(&client)
         .search_all(&params.filter, &from_str, &to_str, limit, sort)
         .await?;
-    serde_yaml::to_string(&result).context("Failed to serialize logs search results")
+    serde_norway::to_string(&result).context("Failed to serialize logs search results")
 }
 
 async fn run_events_list(params: &DatadogEventsListParams) -> Result<String> {
@@ -580,7 +580,7 @@ async fn run_events_list(params: &DatadogEventsListParams) -> Result<String> {
     let result = EventsApi::new(&client)
         .list_all(&filter, &from_str, &to_str, limit)
         .await?;
-    serde_yaml::to_string(&result).context("Failed to serialize events list")
+    serde_norway::to_string(&result).context("Failed to serialize events list")
 }
 
 async fn run_slo_list(params: &DatadogSloListParams) -> Result<String> {
@@ -594,13 +594,13 @@ async fn run_slo_list(params: &DatadogSloListParams) -> Result<String> {
     let slos = SloApi::new(&client)
         .list(&filter, params.limit.unwrap_or(0))
         .await?;
-    serde_yaml::to_string(&slos).context("Failed to serialize SLO list")
+    serde_norway::to_string(&slos).context("Failed to serialize SLO list")
 }
 
 async fn run_slo_get(id: &str) -> Result<String> {
     let (client, _site) = create_client()?;
     let slo = SloApi::new(&client).get(id).await?;
-    serde_yaml::to_string(&slo).context("Failed to serialize SLO")
+    serde_norway::to_string(&slo).context("Failed to serialize SLO")
 }
 
 async fn run_hosts_list(params: &DatadogHostsListParams) -> Result<String> {
@@ -613,7 +613,7 @@ async fn run_hosts_list(params: &DatadogHostsListParams) -> Result<String> {
     let result = HostsApi::new(&client)
         .list(&filter, params.limit.unwrap_or(0))
         .await?;
-    serde_yaml::to_string(&result).context("Failed to serialize hosts list")
+    serde_norway::to_string(&result).context("Failed to serialize hosts list")
 }
 
 async fn run_downtime_list(params: &DatadogDowntimeListParams) -> Result<String> {
@@ -621,7 +621,7 @@ async fn run_downtime_list(params: &DatadogDowntimeListParams) -> Result<String>
     let dts = DowntimesApi::new(&client)
         .list(params.active_only.unwrap_or(false))
         .await?;
-    serde_yaml::to_string(&dts).context("Failed to serialize downtime list")
+    serde_norway::to_string(&dts).context("Failed to serialize downtime list")
 }
 
 async fn run_metrics_catalog_list(params: &DatadogMetricsCatalogListParams) -> Result<String> {
@@ -629,7 +629,7 @@ async fn run_metrics_catalog_list(params: &DatadogMetricsCatalogListParams) -> R
     let result = MetricsCatalogApi::new(&client)
         .list(params.host.as_deref(), params.from)
         .await?;
-    serde_yaml::to_string(&result).context("Failed to serialize metrics catalog")
+    serde_norway::to_string(&result).context("Failed to serialize metrics catalog")
 }
 
 /// Resolves `--from` / `--to` strings into RFC 3339 timestamps suitable

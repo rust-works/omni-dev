@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use yaml_rust_davvid::YamlEmitter;
+use yaml_rust2::YamlEmitter;
 
 /// Serializes a data structure to a YAML string with proper multi-line formatting.
 pub fn to_yaml<T: Serialize>(data: &T) -> Result<String> {
@@ -13,9 +13,9 @@ pub fn to_yaml<T: Serialize>(data: &T) -> Result<String> {
 
     debug!("Starting YAML serialization with hybrid approach");
 
-    // First convert to serde_yaml::Value, then to yaml-rust format
-    let serde_value = serde_yaml::to_value(data).context("Failed to serialize to serde value")?;
-    debug!("Converted to serde_yaml::Value successfully");
+    // First convert to serde_norway::Value, then to yaml-rust2 format
+    let serde_value = serde_norway::to_value(data).context("Failed to serialize to serde value")?;
+    debug!("Converted to serde_norway::Value successfully");
 
     let yaml_rust_value = convert_serde_to_yaml_rust(&serde_value)?;
     debug!("Converted to yaml-rust format successfully");
@@ -39,15 +39,15 @@ pub fn to_yaml<T: Serialize>(data: &T) -> Result<String> {
     Ok(output)
 }
 
-/// Converts a `serde_yaml::Value` to `yaml_rust_davvid::Yaml`.
-fn convert_serde_to_yaml_rust(value: &serde_yaml::Value) -> Result<yaml_rust_davvid::Yaml> {
+/// Converts a `serde_norway::Value` to `yaml_rust2::Yaml`.
+fn convert_serde_to_yaml_rust(value: &serde_norway::Value) -> Result<yaml_rust2::Yaml> {
     use tracing::debug;
-    use yaml_rust_davvid::Yaml;
+    use yaml_rust2::Yaml;
 
     match value {
-        serde_yaml::Value::Null => Ok(Yaml::Null),
-        serde_yaml::Value::Bool(b) => Ok(Yaml::Boolean(*b)),
-        serde_yaml::Value::Number(n) => {
+        serde_norway::Value::Null => Ok(Yaml::Null),
+        serde_norway::Value::Bool(b) => Ok(Yaml::Boolean(*b)),
+        serde_norway::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(Yaml::Integer(i))
             } else if let Some(f) = n.as_f64() {
@@ -56,7 +56,7 @@ fn convert_serde_to_yaml_rust(value: &serde_yaml::Value) -> Result<yaml_rust_dav
                 Ok(Yaml::String(n.to_string()))
             }
         }
-        serde_yaml::Value::String(s) => {
+        serde_norway::Value::String(s) => {
             debug!(
                 string_length = s.len(),
                 string_preview = %s.lines().take(3).collect::<Vec<_>>().join("\\n"),
@@ -65,12 +65,12 @@ fn convert_serde_to_yaml_rust(value: &serde_yaml::Value) -> Result<yaml_rust_dav
             // For now, just convert normally - yaml-rust will make formatting decisions
             Ok(Yaml::String(s.clone()))
         }
-        serde_yaml::Value::Sequence(seq) => {
+        serde_norway::Value::Sequence(seq) => {
             let yaml_seq: Result<Vec<_>> = seq.iter().map(convert_serde_to_yaml_rust).collect();
             Ok(Yaml::Array(yaml_seq?))
         }
-        serde_yaml::Value::Mapping(map) => {
-            let mut yaml_map = yaml_rust_davvid::yaml::Hash::new();
+        serde_norway::Value::Mapping(map) => {
+            let mut yaml_map = yaml_rust2::yaml::Hash::new();
             for (k, v) in map {
                 let yaml_key = convert_serde_to_yaml_rust(k)?;
                 let yaml_value = convert_serde_to_yaml_rust(v)?;
@@ -78,7 +78,7 @@ fn convert_serde_to_yaml_rust(value: &serde_yaml::Value) -> Result<yaml_rust_dav
             }
             Ok(Yaml::Hash(yaml_map))
         }
-        serde_yaml::Value::Tagged(tagged) => {
+        serde_norway::Value::Tagged(tagged) => {
             // Handle tagged values by converting the inner value
             convert_serde_to_yaml_rust(&tagged.value)
         }
@@ -92,10 +92,10 @@ pub fn from_yaml<T: for<'de> Deserialize<'de>>(yaml: &str) -> Result<T> {
     debug!(
         yaml_length = yaml.len(),
         yaml_preview = %yaml.lines().take(10).collect::<Vec<_>>().join("\\n"),
-        "Deserializing YAML using serde_yaml"
+        "Deserializing YAML using serde_norway"
     );
 
-    let result = serde_yaml::from_str(yaml).context("Failed to deserialize YAML");
+    let result = serde_norway::from_str(yaml).context("Failed to deserialize YAML");
 
     debug!(
         success = result.is_ok(),
@@ -438,5 +438,54 @@ description: |
     fn from_yaml_invalid_input() {
         let result: Result<TestDiffContent> = from_yaml("not: valid: yaml: [{{");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn multiline_without_trailing_newline_uses_strip_chomping_and_round_trips_exactly() {
+        let original = TestDiffContent {
+            diff_content: "line1\nline2".to_string(),
+            description: "d".to_string(),
+        };
+
+        let yaml_output = to_yaml(&original).unwrap();
+
+        assert!(
+            yaml_output.contains("diff_content: |-\n  line1\n  line2"),
+            "unexpected output: {yaml_output}"
+        );
+        let restored: TestDiffContent = from_yaml(&yaml_output).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn multiline_with_trailing_newline_uses_clip_chomping_and_round_trips_exactly() {
+        let original = TestDiffContent {
+            diff_content: "line1\nline2\n".to_string(),
+            description: "d".to_string(),
+        };
+
+        let yaml_output = to_yaml(&original).unwrap();
+
+        assert!(
+            yaml_output.contains("diff_content: |\n  line1\n  line2\n"),
+            "unexpected output: {yaml_output}"
+        );
+        let restored: TestDiffContent = from_yaml(&yaml_output).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn multiline_that_cannot_be_a_literal_block_is_quoted_and_round_trips_exactly() {
+        // Trailing whitespace on a line is lost by a literal block scalar, so the
+        // emitter must fall back to a quoted scalar instead of corrupting it.
+        let original = TestDiffContent {
+            diff_content: "line1  \nline2".to_string(),
+            description: "d".to_string(),
+        };
+
+        let yaml_output = to_yaml(&original).unwrap();
+
+        let restored: TestDiffContent = from_yaml(&yaml_output).unwrap();
+        assert_eq!(restored, original);
     }
 }

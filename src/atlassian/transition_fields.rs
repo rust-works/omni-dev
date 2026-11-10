@@ -37,7 +37,7 @@ pub struct ResolvedTransitionFields {
 /// collides (hard error) with a `--set-field resolution=…` targeting the same
 /// field id.
 pub fn resolve_transition_fields(
-    scalars: &BTreeMap<String, serde_yaml::Value>,
+    scalars: &BTreeMap<String, serde_norway::Value>,
     resolution: Option<&str>,
     editmeta: &EditMeta,
 ) -> Result<ResolvedTransitionFields> {
@@ -87,11 +87,11 @@ mod tests {
         EditMeta { fields }
     }
 
-    fn scalar(name: &str, value: &str) -> BTreeMap<String, serde_yaml::Value> {
+    fn scalar(name: &str, value: &str) -> BTreeMap<String, serde_norway::Value> {
         let mut m = BTreeMap::new();
         m.insert(
             name.to_string(),
-            serde_yaml::Value::String(value.to_string()),
+            serde_norway::Value::String(value.to_string()),
         );
         m
     }

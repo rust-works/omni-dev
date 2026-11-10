@@ -480,7 +480,7 @@ impl ReadFormat {
 }
 
 fn yaml_result<T: serde::Serialize>(data: &T) -> Result<String> {
-    serde_yaml::to_string(data).context("Failed to serialize result as YAML")
+    serde_norway::to_string(data).context("Failed to serialize result as YAML")
 }
 
 fn ok_text(text: String) -> Result<CallToolResult, McpError> {
@@ -826,7 +826,7 @@ async fn jira_create_dry_run_preview(
     summary: &str,
     adf: Option<&ValidatedAdfDocument>,
     labels: &[String],
-    custom_scalars: &std::collections::BTreeMap<String, serde_yaml::Value>,
+    custom_scalars: &std::collections::BTreeMap<String, serde_norway::Value>,
     custom_sections: &[CustomFieldSection],
 ) -> Result<String> {
     let custom_fields = if custom_scalars.is_empty() && custom_sections.is_empty() {
@@ -868,13 +868,17 @@ async fn jira_create_dry_run_preview(
 
 /// Bridges a JSON `fields`/`custom_fields` map into the shared resolver's
 /// YAML-scalar shape (a `serde_json::Value` always serialises into a
-/// `serde_yaml::Value`, so `.ok()` never drops a field).
+/// `serde_norway::Value`, so `.ok()` never drops a field).
 fn json_fields_to_yaml_scalars(
     fields: &std::collections::BTreeMap<String, serde_json::Value>,
-) -> std::collections::BTreeMap<String, serde_yaml::Value> {
+) -> std::collections::BTreeMap<String, serde_norway::Value> {
     fields
         .iter()
-        .filter_map(|(name, value)| serde_yaml::to_value(value).ok().map(|y| (name.clone(), y)))
+        .filter_map(|(name, value)| {
+            serde_norway::to_value(value)
+                .ok()
+                .map(|y| (name.clone(), y))
+        })
         .collect()
 }
 

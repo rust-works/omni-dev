@@ -577,7 +577,7 @@ async fn fetch_and_write_metadata(
     path: &Path,
 ) -> Result<(), TranscriptError> {
     let meta = yt.fetch_video_metadata(id).await?;
-    let yaml = serde_yaml::to_string(&meta)
+    let yaml = serde_norway::to_string(&meta)
         .map_err(|e| TranscriptError::ParseError(format!("serialise metadata sidecar: {e}")))?;
     write_atomic(path, &yaml)?;
     Ok(())

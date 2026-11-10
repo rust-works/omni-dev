@@ -134,7 +134,7 @@ pub fn write_output<T: Serialize + JsonlSerialize>(
             Ok(true)
         }
         OutputFormat::Yaml => {
-            let rendered = serde_yaml::to_string(data).context("Failed to serialize as YAML")?;
+            let rendered = serde_norway::to_string(data).context("Failed to serialize as YAML")?;
             write!(out, "{rendered}").context("Failed to write YAML output")?;
             Ok(true)
         }
@@ -151,8 +151,8 @@ pub fn write_output<T: Serialize + JsonlSerialize>(
 }
 
 /// Serializes a single YAML value as one `---`-prefixed document.
-fn yaml_stream_doc(value: &serde_yaml::Value) -> Result<String> {
-    let s = serde_yaml::to_string(value).context("Failed to serialize YAML stream item")?;
+fn yaml_stream_doc(value: &serde_norway::Value) -> Result<String> {
+    let s = serde_norway::to_string(value).context("Failed to serialize YAML stream item")?;
     Ok(format!("---\n{s}"))
 }
 
@@ -162,8 +162,8 @@ fn yaml_stream_doc(value: &serde_yaml::Value) -> Result<String> {
 /// `---`-prefixed YAML document. Otherwise the whole value is emitted as a
 /// single `---`-prefixed document. The result always ends with a newline.
 fn format_yaml_stream<T: Serialize>(data: &T) -> Result<String> {
-    match serde_yaml::to_value(data).context("Failed to serialize as YAML stream")? {
-        serde_yaml::Value::Sequence(items) => items.iter().map(yaml_stream_doc).collect(),
+    match serde_norway::to_value(data).context("Failed to serialize as YAML stream")? {
+        serde_norway::Value::Sequence(items) => items.iter().map(yaml_stream_doc).collect(),
         other => yaml_stream_doc(&other),
     }
 }
@@ -433,14 +433,14 @@ mod tests {
         ];
         let out = format_yaml_stream(&data).unwrap();
 
-        let docs: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(&out)
-            .map(serde_yaml::Value::deserialize)
+        let docs: Vec<serde_norway::Value> = serde_norway::Deserializer::from_str(&out)
+            .map(serde_norway::Value::deserialize)
             .collect::<Result<_, _>>()
             .unwrap();
 
         assert_eq!(docs.len(), 2);
-        assert_eq!(docs[0]["key"], serde_yaml::Value::from("PROJ-1"));
-        assert_eq!(docs[1]["key"], serde_yaml::Value::from("PROJ-2"));
+        assert_eq!(docs[0]["key"], serde_norway::Value::from("PROJ-1"));
+        assert_eq!(docs[1]["key"], serde_norway::Value::from("PROJ-2"));
     }
 
     // ── write_output ───────────────────────────────────────────────

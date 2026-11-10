@@ -1675,7 +1675,7 @@ mod tests {
             "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
         );
         let report = run(default_opts(tgt.path(), Some(src.path()), markdown_only())).unwrap();
-        let yaml = serde_yaml::to_string(&report).unwrap();
+        let yaml = serde_norway::to_string(&report).unwrap();
         assert!(yaml.contains("format: markdown"), "yaml: {yaml}");
     }
 

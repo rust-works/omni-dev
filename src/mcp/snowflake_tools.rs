@@ -186,7 +186,7 @@ async fn call(socket: &Path, op: &str, payload: Value) -> Result<Value> {
 
 /// Serializes a daemon reply payload as YAML (the MCP output convention).
 fn to_yaml(value: &Value) -> Result<String> {
-    serde_yaml::to_string(value).context("Failed to serialize Snowflake reply as YAML")
+    serde_norway::to_string(value).context("Failed to serialize Snowflake reply as YAML")
 }
 
 #[cfg(test)]

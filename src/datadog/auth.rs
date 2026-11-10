@@ -365,7 +365,7 @@ mod tests {
         assert!(scope.has_app_key);
         assert_eq!(scope.site.as_deref(), Some("datadoghq.com"));
 
-        let yaml = serde_yaml::to_string(&status).unwrap();
+        let yaml = serde_norway::to_string(&status).unwrap();
         assert!(!yaml.contains("sekret-api-do-not-leak"));
         assert!(!yaml.contains("sekret-app-do-not-leak"));
     }

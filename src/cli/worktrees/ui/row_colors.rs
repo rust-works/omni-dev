@@ -81,7 +81,7 @@ impl RowColorStore {
         };
         let colors = match fs::read_to_string(&path) {
             Ok(contents) => {
-                let file: StoreFile = serde_yaml::from_str(&contents)
+                let file: StoreFile = serde_norway::from_str(&contents)
                     .with_context(|| format!("failed to parse {}", path.display()))?;
                 file.colors
             }
@@ -129,7 +129,7 @@ impl RowColorStore {
             version: 1,
             colors: self.colors.clone(),
         };
-        let contents = serde_yaml::to_string(&file).context("failed to serialize row colours")?;
+        let contents = serde_norway::to_string(&file).context("failed to serialize row colours")?;
         let tmp_path = self.path.with_extension("yaml.tmp");
         fs::write(&tmp_path, contents)
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
