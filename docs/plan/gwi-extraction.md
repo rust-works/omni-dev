@@ -184,7 +184,7 @@ push closed nothing. Signatures are lost (rewritten commits cannot keep them).
       `src/cli/moved.rs` and the hidden `Commands::Gmail`/`Drive` variants are deleted, so
       `gmail` and `drive` are unrecognised subcommands; the stub mentions in the README, user
       guide, docs index, privacy policy and `help_all_output` snapshot went with them. This
-      landed before gwi's first published release (point 7 of ADR-0095 was not yet met); the
+      landed before gwi's first published release (point 7 of ADR-0095 was not yet met; its addendum records why); the
       install path the stubs printed, `cargo install --git`, needs no release.
    3. **Wrap-up.** Done ([#2236](https://github.com/rust-works/omni-dev/issues/2236)): the
       Google-only dependencies were dropped (`chore(cargo)` in the stub-release PR), the
