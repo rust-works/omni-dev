@@ -7,8 +7,8 @@ OAuth.
 The Drive and Gmail integrations have moved out of omni-dev to the separate
 [gwi](https://github.com/rust-works/gwi) project
 ([#2203](https://github.com/rust-works/omni-dev/issues/2203)). Current omni-dev
-releases no longer contact Google's APIs; `omni-dev drive` and `omni-dev gmail`
-remain only as stubs that print a pointer to gwi. This policy continues to
+releases no longer contact Google's APIs, and the `drive` and `gmail` commands
+have been removed. This policy continues to
 describe how earlier omni-dev releases that included those integrations handled
 your data, and the tokens and archives they left on your machine.
 
