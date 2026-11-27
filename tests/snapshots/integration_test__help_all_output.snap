@@ -3945,15 +3945,6 @@ Options:
 
 ================================================================================
 
-omni-dev drive - Removed: moved to gwi (https://github.com/rust-works/gwi)
-
-Removed: moved to gwi (https://github.com/rust-works/gwi)
-
-Usage: drive
-
-
-================================================================================
-
 omni-dev git - Git-related operations
 
 Git-related operations
@@ -4399,15 +4390,6 @@ Arguments:
 
 Options:
   -h, --help  Print help
-
-
-================================================================================
-
-omni-dev gmail - Removed: moved to gwi (https://github.com/rust-works/gwi)
-
-Removed: moved to gwi (https://github.com/rust-works/gwi)
-
-Usage: gmail
 
 
 ================================================================================

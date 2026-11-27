@@ -25,7 +25,6 @@ pub mod format;
 pub mod git;
 pub mod help;
 pub mod log;
-pub mod moved;
 pub mod repo_arg;
 pub mod resources;
 #[cfg(unix)]
@@ -96,12 +95,6 @@ pub enum Commands {
     Daemon(daemon::DaemonCommand),
     /// Datadog: read-only API operations.
     Datadog(datadog::DatadogCommand),
-    /// Removed: moved to gwi (https://github.com/rust-works/gwi).
-    #[command(hide = true)]
-    Drive(moved::MovedCommand),
-    /// Removed: moved to gwi (https://github.com/rust-works/gwi).
-    #[command(hide = true)]
-    Gmail(moved::MovedCommand),
     /// Snowflake: run arbitrary SQL through the daemon's multiplexed sessions.
     #[cfg(unix)]
     Snowflake(snowflake::SnowflakeCommand),
@@ -204,8 +197,6 @@ impl Commands {
             #[cfg(unix)]
             Self::Daemon(cmd) => cmd.execute().await,
             Self::Datadog(cmd) => cmd.execute().await, // patchcov: coverage ignore-line reason="process-bound: the command opens a real network or daemon connection, or reads the real stdin and credentials, so a test cannot dispatch it; each command is covered through its own run_* seams"
-            Self::Drive(cmd) => cmd.execute("drive"),
-            Self::Gmail(cmd) => cmd.execute("gmail"),
             #[cfg(unix)]
             Self::Snowflake(cmd) => cmd.execute().await, // patchcov: coverage ignore-line reason="process-bound: the command opens a real network or daemon connection, or reads the real stdin and credentials, so a test cannot dispatch it; each command is covered through its own run_* seams"
             #[cfg(unix)]
@@ -247,15 +238,17 @@ impl Cli {
 mod tests {
     use super::*;
 
-    /// The hidden `gmail`/`drive` stubs (#2203) reach the dispatch arm and fail
-    /// with the message naming gwi, whatever arguments follow.
-    #[tokio::test]
-    async fn moved_commands_fail_through_the_dispatch_with_the_gwi_message() {
+    /// `gmail` and `drive` moved to gwi (#2203) and their one-release hidden
+    /// stubs were deleted (#2224), so both are plain unknown subcommands.
+    #[test]
+    fn gmail_and_drive_are_unrecognised_subcommands() {
         for command in ["gmail", "drive"] {
-            let cli = Cli::try_parse_from(["omni-dev", command, "messages", "--any-flag"]).unwrap();
-            let err = cli.command.dispatch().await.unwrap_err().to_string();
-            assert!(
-                err.contains(&format!("`omni-dev {command}` has moved to gwi")),
+            let Err(err) = Cli::try_parse_from(["omni-dev", command, "auth", "status"]) else {
+                panic!("`{command}` must not parse");
+            };
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::InvalidSubcommand,
                 "{err}"
             );
         }
