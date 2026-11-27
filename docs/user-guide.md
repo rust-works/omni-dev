@@ -1763,8 +1763,9 @@ run `gwi import`, which copies your accounts and settings from `~/.omni-dev` and
 or removes them. Environment variables read by the moved code change prefix from `OMNI_DEV_` to
 `GWI_`; the unprefixed `GMAIL_*` and `DRIVE_*` credential names are unchanged.
 
-For one release, `omni-dev gmail ...` and `omni-dev drive ...` remain as hidden stubs that
-exit non-zero with a message pointing at gwi; the next minor release deletes them.
+omni-dev no longer recognises the `gmail` and `drive` subcommands: the one-release stubs that
+pointed at gwi were deleted in [#2224](https://github.com/rust-works/omni-dev/issues/2224). Run
+`gwi gmail ...` and `gwi drive ...` instead.
 
 ## Contextual Intelligence
 

@@ -1,6 +1,6 @@
 # Extracting Google Workspace functionality into gwi
 
-**Status:** In Progress — phases 0-2 done, phase 3 under way in gwi; phase 4 stub removal in progress (code removed from omni-dev, hidden stubs remain; deleting the stubs is the next minor release)
+**Status:** In Progress — phases 0-2 done, phase 3 under way in gwi; phase 4 done in omni-dev (code removed in v0.47.0, which shipped hidden stubs; the stubs are deleted in the following minor release, [#2224](https://github.com/rust-works/omni-dev/issues/2224))
 **ADRs:** [ADR-0095](../adrs/adr-0095.md) · [gwi ADR-0001](https://github.com/rust-works/gwi/blob/main/docs/adrs/adr-0001.md)
 
 Tracking issue: [#2203](https://github.com/rust-works/omni-dev/issues/2203). New project:
@@ -171,16 +171,21 @@ push closed nothing. Signatures are lost (rewritten commits cannot keep them).
       Drive too.
    5. **Drive**, the same way (lease ledger, audit sink, write gate, macOS Touch ID code).
    6. A second release.
-4. **Remove from omni-dev.** In progress:
-   1. **Stub release.** In progress (this pull request): `src/gmail*`, `src/drive*`,
+4. **Remove from omni-dev.** Done:
+   1. **Stub release.** Done ([#2222](https://github.com/rust-works/omni-dev/pull/2222), v0.47.0): `src/gmail*`, `src/drive*`,
       `src/cli/{gmail,drive}*`, the five `src/mcp/{gmail,drive*}_tools.rs` modules, the 23
-      MCP tools and the Gmail/Drive docs are removed; `omni-dev gmail` and `omni-dev drive`
-      remain as hidden stubs (`src/cli/moved.rs`) that accept any arguments and exit non-zero
+      MCP tools and the Gmail/Drive docs are removed; the `gmail` and `drive` commands
+      remained as hidden stubs (`src/cli/moved.rs`) that accepted any arguments and exited non-zero
       naming gwi; `Settings` no longer models the `gmail`/`drive`/`lease` blocks but keeps
       them on load and write; `RecordKind::DriveMutation` and `Audit` stay as read-only
       legacy kinds; omni-dev no longer writes `audit.jsonl`; the 27 Google ADRs are marked
       relocated; `Removed` changelog fragment.
-   2. **Stub deletion.** Not started: the next minor release deletes the stubs.
+   2. **Stub deletion.** Done ([#2224](https://github.com/rust-works/omni-dev/issues/2224)):
+      `src/cli/moved.rs` and the hidden `Commands::Gmail`/`Drive` variants are deleted, so
+      `gmail` and `drive` are unrecognised subcommands; the stub mentions in the README, user
+      guide, docs index, privacy policy and `help_all_output` snapshot went with them. This
+      landed before gwi's first published release (point 7 of ADR-0095 was not yet met); the
+      install path the stubs printed, `cargo install --git`, needs no release.
    3. **Wrap-up.** Done ([#2236](https://github.com/rust-works/omni-dev/issues/2236)): the
       Google-only dependencies were dropped (`chore(cargo)` in the stub-release PR), the
       packaged crate is 8.2 MiB compressed (v0.47.0; the cap is 10 MiB), `cargo deny`'s bans,
@@ -188,8 +193,7 @@ push closed nothing. Signatures are lost (rewritten commits cannot keep them).
       them stay valid), `docs/PRIVACY.md` and `website/static/privacy.html` (the policy URL a
       Google consent screen may point at; gwi has no policy page yet), `assets/oauth-logo/`
       (gwi has no copy), the `gmail`/`drive`/`lease` settings preservation, and the legacy
-      `RecordKind::DriveMutation`/`Audit` decoders. The stub mentions in the README, user
-      guide and `help_all_output` snapshot go with the stub deletion (4.2).
+      `RecordKind::DriveMutation`/`Audit` decoders.
 
 ## Open items and risks
 

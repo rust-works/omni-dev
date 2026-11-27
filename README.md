@@ -299,9 +299,9 @@ These commands, their MCP tools and library modules now live in
 project ([ADR-0095](docs/adrs/adr-0095.md)). `gwi import` copies your existing accounts and
 settings from `~/.omni-dev`; see the [user guide](docs/user-guide.md#gmail-and-drive-moved-to-gwi).
 
-For one release, `omni-dev gmail ...` and `omni-dev drive ...` remain as hidden stubs that
-accept any arguments and exit non-zero with a message pointing at gwi; the next minor
-release deletes them.
+The `gmail` and `drive` subcommands are gone from omni-dev (the one-release stubs that
+pointed at gwi were deleted in [#2224](https://github.com/rust-works/omni-dev/issues/2224));
+run `gwi gmail ...` and `gwi drive ...` instead.
 
 ### 🎙️ Transcript Fetching
 

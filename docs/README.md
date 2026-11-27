@@ -29,7 +29,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 ### Gmail and Drive (moved to gwi)
 
-- **[ADR-0095](adrs/adr-0095.md)** - the Gmail and Drive command trees, library modules and MCP tools moved to [rust-works/gwi](https://github.com/rust-works/gwi) (binaries `gwi` and `gwi-mcp`, `gwi import` copies your accounts); `omni-dev gmail`/`drive` remain as hidden stubs for one release
+- **[ADR-0095](adrs/adr-0095.md)** - the Gmail and Drive command trees, library modules and MCP tools moved to [rust-works/gwi](https://github.com/rust-works/gwi) (binaries `gwi` and `gwi-mcp`, `gwi import` copies your accounts); the one-release `gmail`/`drive` stubs were deleted in [#2224](https://github.com/rust-works/omni-dev/issues/2224)
 - **[gwi extraction plan](plan/gwi-extraction.md)** - inventory, procedures and phases
 
 ### Browser Bridge
