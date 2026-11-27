@@ -86,7 +86,6 @@ impl JevClient {
                 request_log::record_http_result("jev", "POST", &url, started, result);
             },
             |status, _body| status == 429 || status == 529,
-            None,
         )
         .await
         .context("Failed to send request to Jev API")?;
