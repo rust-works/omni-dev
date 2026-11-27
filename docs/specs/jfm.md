@@ -279,7 +279,7 @@ refuse it.
 ### Source of truth
 
 The full content model for every container node is encoded in
-[`src/atlassian/adf_schema/mod.rs`](../../src/atlassian/adf_schema/mod.rs),
+[`src/atlassian/adf_schema.rs`](../../src/atlassian/adf_schema.rs),
 transcribed faithfully from the upstream `@atlaskit/adf-schema` npm package
 per [ADR-0023](../adrs/adr-0023.md). The pinned upstream version is recorded
 in the `SCHEMA_VERSION` and `UPSTREAM_TARBALL_SHA256` constants in that
