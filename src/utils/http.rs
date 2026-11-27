@@ -2,9 +2,8 @@
 //!
 //! [`retry_429`] is the literal-429-only driver behind the Atlassian and
 //! Datadog clients — a thin wrapper over [`retry_if`], the general driver
-//! that also lets a client retry its own quota-exhaustion signal (for example
-//! an HTTP 403 with a `reason` Atlassian/Datadog never emit). Both rebuild the request per
-//! attempt, log every attempt, and on a retryable response wait per
+//! that also lets a client retry its own overload signal (Jev's `529`, which
+//! Atlassian and Datadog never emit). Both rebuild the request per attempt, log every attempt, and on a retryable response wait per
 //! `Retry-After`, then `X-RateLimit-Reset`, then exponential backoff.
 //! Consolidating the previously per-verb loops also unified the
 //! `X-RateLimit-Reset` awareness that used to live only in Datadog (#1152).
@@ -96,17 +95,6 @@ const MAX_RETRIES: u32 = 3;
 /// `X-RateLimit-Reset` is present: `DEFAULT_RETRY_DELAY_SECS ^ (attempt + 1)`.
 const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
 
-/// Callback [`retry_if`] invokes instead of its default `eprintln!` when a
-/// retryable response is about to wait before retrying. Args are the HTTP
-/// status, the delay in seconds, and the 1-based attempt number — the same
-/// three values the default message prints.
-///
-/// Lets a caller with progress-bar context render the notice appropriately
-/// instead of a raw scrolling stderr line that can tear a live progress
-/// render. Callers without one (Atlassian, Datadog, Jev) pass `None` and keep
-/// the plain fallback.
-pub(crate) type RetryNotifyFn = dyn Fn(u16, u64, u32) + Send + Sync;
-
 /// Drives an HTTP request through the shared literal-429 retry loop.
 ///
 /// A thin [`retry_if`] wrapper retrying only `status == 429` — Atlassian and
@@ -117,7 +105,7 @@ where
     B: Fn() -> reqwest::RequestBuilder,
     L: Fn(Instant, &reqwest::Result<Response>),
 {
-    retry_if(build, log, |status, _body| status == 429, None).await
+    retry_if(build, log, |status, _body| status == 429).await
 }
 
 /// Drives an HTTP request through a retry loop with a caller-supplied
@@ -137,15 +125,11 @@ where
 /// ordinary [`Response`] whose body reads exactly as it would have
 /// unbuffered.
 ///
-/// `notify` (see [`RetryNotifyFn`]) overrides [`wait_for_retry`]'s default
-/// `eprintln!` when a retryable response is about to wait before retrying.
-///
 /// [`RequestBuilder`]: reqwest::RequestBuilder
 pub(crate) async fn retry_if<B, L, P>(
     build: B,
     log: L,
     is_retryable: P,
-    notify: Option<&RetryNotifyFn>,
 ) -> reqwest::Result<Response>
 where
     B: Fn() -> reqwest::RequestBuilder,
@@ -169,7 +153,7 @@ where
         let body = response.bytes().await?;
 
         if is_retryable(status.as_u16(), &body) && attempt < MAX_RETRIES {
-            wait_for_retry(&headers, status.as_u16(), attempt, notify).await;
+            wait_for_retry(&headers, status.as_u16(), attempt).await;
             attempt += 1;
             continue;
         }
@@ -200,25 +184,13 @@ where
 ///
 /// Consults, in order: `Retry-After`, then Datadog's `X-RateLimit-Reset`, then
 /// exponential backoff (`DEFAULT_RETRY_DELAY_SECS ^ (attempt + 1)`).
-async fn wait_for_retry(
-    headers: &reqwest::header::HeaderMap,
-    status: u16,
-    attempt: u32,
-    notify: Option<&RetryNotifyFn>,
-) {
+async fn wait_for_retry(headers: &reqwest::header::HeaderMap, status: u16, attempt: u32) {
     let delay = header_u64(headers, "Retry-After")
         .or_else(|| header_u64(headers, "X-RateLimit-Reset"))
         .unwrap_or_else(|| DEFAULT_RETRY_DELAY_SECS.pow(attempt + 1));
     let attempt_number = attempt + 1;
 
-    match notify {
-        Some(notify) => notify(status, delay, attempt_number),
-        None => {
-            eprintln!(
-                "Rate limited ({status}). Retrying in {delay}s (attempt {attempt_number})..."
-            );
-        }
-    }
+    eprintln!("Rate limited ({status}). Retrying in {delay}s (attempt {attempt_number})...");
     tokio::time::sleep(Duration::from_secs(delay)).await;
 }
 
@@ -418,7 +390,6 @@ mod tests {
             || client.get(&url),
             |_s, _r| {},
             |status, _body| status == 403,
-            None,
         )
         .await
         .unwrap();
@@ -441,49 +412,10 @@ mod tests {
             || client.get(&url),
             |_s, _r| {},
             |status, body| status == 403 && body == b"rateLimitExceeded",
-            None,
         )
         .await
         .unwrap();
         assert_eq!(resp.status().as_u16(), 403);
-    }
-
-    // ── retry_if: notify callback (#1651) ─────────────────────────────
-
-    #[tokio::test]
-    async fn retry_if_calls_notify_instead_of_eprintln_when_supplied() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/x"))
-            .respond_with(ResponseTemplate::new(429).append_header("Retry-After", "0"))
-            .up_to_n_times(1)
-            .with_priority(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/x"))
-            .respond_with(ResponseTemplate::new(200))
-            .with_priority(2)
-            .mount(&server)
-            .await;
-
-        let client = reqwest::Client::new();
-        let url = format!("{}/x", server.uri());
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = calls.clone();
-        let notify = move |status: u16, delay: u64, attempt: u32| {
-            recorded.lock().unwrap().push((status, delay, attempt));
-        };
-        let resp = retry_if(
-            || client.get(&url),
-            |_s, _r| {},
-            |status, _body| status == 429,
-            Some(&notify),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp.status().as_u16(), 200);
-        assert_eq!(*calls.lock().unwrap(), vec![(429, 0, 1)]);
     }
 
     #[tokio::test]
@@ -520,7 +452,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/x", server.uri());
-        let resp = retry_if(|| client.get(&url), |_s, _r| {}, |_s, _b| false, None)
+        let resp = retry_if(|| client.get(&url), |_s, _r| {}, |_s, _b| false)
             .await
             .unwrap();
         let body = resp.text().await.unwrap();
