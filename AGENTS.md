@@ -6,7 +6,7 @@
 
 ## Build, Test, and Development Commands
 
-Use Rust 1.88 or newer. From the repository root:
+Use Rust 1.88 or newer (1.92 or newer on macOS to build the optional `menu-bar` feature, which `./scripts/build.sh` enables through `--all-features`). From the repository root:
 
 - `cargo build` builds the default CLI and library.
 - `cargo run -- --help` runs the CLI locally.
