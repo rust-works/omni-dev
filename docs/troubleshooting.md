@@ -31,7 +31,7 @@ Common issues and solutions when using omni-dev.
    # Check Rust version
    rustc --version
    
-   # Update Rust (need 1.88+)
+   # Update Rust (need 1.88+, or 1.92+ for the macOS menu-bar feature)
    rustup update
    ```
 
