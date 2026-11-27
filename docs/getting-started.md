@@ -17,7 +17,8 @@ where to dig deeper.
 ## Prerequisites
 
 - **Rust 1.88+** — install via [rustup.rs](https://rustup.rs/) if you
-  don't have it. (`rustc --version` to check.)
+  don't have it. (`rustc --version` to check.) Building the optional macOS
+  `menu-bar` feature needs Rust 1.92+.
 - **Git** — any modern version.
 - **A git repository** with at least one feature-branch commit ahead of
   `main`. (If you don't have one handy, create a scratch branch first;
