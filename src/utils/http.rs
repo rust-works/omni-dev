@@ -3,8 +3,9 @@
 //! [`retry_429`] is the literal-429-only driver behind the Atlassian and
 //! Datadog clients — a thin wrapper over [`retry_if`], the general driver
 //! that also lets a client retry its own overload signal (Jev's `529`, which
-//! Atlassian and Datadog never emit). Both rebuild the request per attempt, log every attempt, and on a retryable response wait per
-//! `Retry-After`, then `X-RateLimit-Reset`, then exponential backoff.
+//! Atlassian and Datadog never emit). Both rebuild the request per attempt,
+//! log every attempt, and on a retryable response wait per `Retry-After`,
+//! then `X-RateLimit-Reset`, then exponential backoff.
 //! Consolidating the previously per-verb loops also unified the
 //! `X-RateLimit-Reset` awareness that used to live only in Datadog (#1152).
 
@@ -188,10 +189,15 @@ async fn wait_for_retry(headers: &reqwest::header::HeaderMap, status: u16, attem
     let delay = header_u64(headers, "Retry-After")
         .or_else(|| header_u64(headers, "X-RateLimit-Reset"))
         .unwrap_or_else(|| DEFAULT_RETRY_DELAY_SECS.pow(attempt + 1));
-    let attempt_number = attempt + 1;
-
-    eprintln!("Rate limited ({status}). Retrying in {delay}s (attempt {attempt_number})...");
+    eprintln!("{}", retry_notice(status, delay, attempt));
     tokio::time::sleep(Duration::from_secs(delay)).await;
+}
+
+/// The stderr notice [`wait_for_retry`] prints before it sleeps. `attempt`
+/// is the 0-based retry count [`retry_if`] keeps; the notice shows it 1-based.
+fn retry_notice(status: u16, delay: u64, attempt: u32) -> String {
+    let attempt_number = attempt + 1;
+    format!("Rate limited ({status}). Retrying in {delay}s (attempt {attempt_number})...")
 }
 
 /// Parses a header value as a `u64`, if present and numeric.
@@ -416,6 +422,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status().as_u16(), 403);
+    }
+
+    // ── retry_notice ─────────────────────────────────────────────────────
+
+    #[test]
+    fn retry_notice_names_the_status_the_delay_and_the_attempt_counted_from_one() {
+        assert_eq!(
+            retry_notice(429, 4, 1),
+            "Rate limited (429). Retrying in 4s (attempt 2)..."
+        );
     }
 
     #[tokio::test]
