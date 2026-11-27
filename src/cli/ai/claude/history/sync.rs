@@ -1004,7 +1004,7 @@ mod tests {
         sb.add("slug", "new", "new\n");
 
         // Backdate "old" session 30 days into the past.
-        let old_mtime = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+        let old_mtime = SystemTime::now() - Duration::from_hours(30 * 24);
         StdFile::open(&old_path)
             .unwrap()
             .set_modified(old_mtime)

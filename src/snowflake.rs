@@ -106,7 +106,7 @@ const SQL_PREVIEW_MAX: usize = 60;
 /// session-token validity (Snowflake's own drivers clamp their heartbeat
 /// frequency to 900–3600s), so an idle session renews comfortably before
 /// either token lapses.
-const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(900);
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_mins(15);
 /// Extra margin past the heartbeat interval when deciding to proactively renew
 /// an idle session's token before it would lapse mid-cycle.
 const HEARTBEAT_RENEW_MARGIN_SECS: i64 = 60;

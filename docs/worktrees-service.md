@@ -710,7 +710,7 @@ underlying ops are documented in the [companion contract](#companion-contract-fo
 
 ## Tray
 
-On a macOS `menu-bar` build (rustc 1.92+) the service contributes a **"Worktrees" submenu**:
+On a macOS `menu-bar` build the service contributes a **"Worktrees" submenu**:
 **one clickable line per open window** — the live stats and the focus action are
 the same item, not two separate rows. Each line shows the **main repository**
 name and, when the primary folder is a git repo, the live branch and ahead/behind

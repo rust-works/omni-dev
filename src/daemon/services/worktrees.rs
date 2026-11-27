@@ -127,14 +127,14 @@ const DEFAULT_PR_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// (vscode-pull-request-github's backoff ceiling, gh-dash's and GitLens's
 /// defaults). The backoff exists for battery and wakeups rather than budget — at
 /// 1 point per poll the budget never binds.
-const MAX_PR_POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const MAX_PR_POLL_INTERVAL: Duration = Duration::from_mins(30);
 
 /// How long after fresh work (a push, or an added target) the poller holds its
 /// fast [`DEFAULT_PR_POLL_INTERVAL`] cadence before escalating *within* pending
 /// (#1389, fix 5). Two minutes covers the window where a just-pushed run is most
 /// likely to report; past it, a still-pending badge (a long build, a zombie suite)
 /// is watched more cheaply. See [`next_pr_poll_delay`].
-const PENDING_FAST_WINDOW: Duration = Duration::from_secs(2 * 60);
+const PENDING_FAST_WINDOW: Duration = Duration::from_mins(2);
 
 /// The ceiling the poller escalates to *while still pending* once
 /// [`PENDING_FAST_WINDOW`] has passed (#1389, fix 5). Below the terminal
@@ -148,7 +148,7 @@ const PENDING_MAX_INTERVAL: Duration = Duration::from_secs(60);
 /// Five minutes makes the daemon's contribution to an already-strained budget
 /// negligible while still recovering promptly once the window resets — a pause in
 /// all but name. See [`budget_throttled_delay`].
-const BUDGET_THROTTLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const BUDGET_THROTTLE_INTERVAL: Duration = Duration::from_mins(5);
 
 /// Environment override for [`pr_debounce_interval`] — the settle window the PR
 /// poller waits after the change-notify fires before snapshotting (whole seconds;
