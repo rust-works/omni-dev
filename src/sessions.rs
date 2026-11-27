@@ -2848,7 +2848,7 @@ mod tests {
                         latest_stamp_ts: None,
                         reported: false,
                         agent: Agent::Claude,
-                        session_id: id.clone(),
+                        session_id: id,
                         cwd: None,
                         transcript_path: None,
                         repo: None,
@@ -2884,7 +2884,7 @@ mod tests {
                     key.clone(),
                     WindowEntry {
                         report: WindowReport {
-                            key: key.clone(),
+                            key,
                             folders: vec![],
                             tabs: 1,
                             terminals: 0,

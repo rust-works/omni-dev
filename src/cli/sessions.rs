@@ -2037,7 +2037,7 @@ mod tests {
                 stamp
             );
             // The stamp is the only difference from the unstamped payload.
-            let mut without = stamped.clone();
+            let mut without = stamped;
             without.as_object_mut().unwrap().remove("stamp");
             assert_eq!(without, bare);
             // The journal record is made from the same value.
